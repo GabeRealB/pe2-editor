@@ -1,0 +1,146 @@
+//! The editor's own settings - global, per user, beside eframe's saved layout - as `settings.toml`, readable and
+//! editable by hand: appearance, the external tools files open in, startup. A project's settings are its
+//! `project.toml`; the Settings pane shows both.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+pub const APP_ID: &str = "pe2-editor";
+const FILE: &str = "settings.toml";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    pub theme: Theme,
+    /// The accent color, as RGB.
+    pub accent: [u8; 3],
+    /// A zoom chosen by the user; none follows the monitor.
+    pub zoom: Option<f32>,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Appearance { theme: Theme::Dark, accent: [0x4d, 0x96, 0xd9], zoom: None }
+    }
+}
+
+/// How a picture is drawn larger than it is: `nearest` repeats each pixel (exact); the others smooth it for viewing -
+/// `bilinear` blends neighbors, `sharp` blends only at pixel edges (a nearest prescale then bilinear), `scale2x` and
+/// `scale3x` round diagonal edges without blending (EPX / `AdvMAME3x`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Upscale {
+    #[default]
+    Nearest,
+    Bilinear,
+    Sharp,
+    Scale2x,
+    Scale3x,
+}
+
+impl Upscale {
+    pub const ALL: [Upscale; 5] =
+        [Upscale::Nearest, Upscale::Bilinear, Upscale::Sharp, Upscale::Scale2x, Upscale::Scale3x];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscale::Nearest => "Nearest (exact)",
+            Upscale::Bilinear => "Bilinear",
+            Upscale::Sharp => "Sharp bilinear",
+            Upscale::Scale2x => "Scale2x",
+            Upscale::Scale3x => "Scale3x",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preview {
+    pub upscale: Upscale,
+    /// A texel grid over a picture, its spacing following the zoom.
+    pub grid: bool,
+}
+
+impl Default for Preview {
+    fn default() -> Self {
+        Preview { upscale: Upscale::default(), grid: true }
+    }
+}
+
+/// The command each kind of file opens with: `{file}` stands for the file (appended where it is absent); an empty
+/// command opens it with the system's default application.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tools {
+    pub image: String,
+    pub audio: String,
+    pub video: String,
+    pub text: String,
+    pub model: String,
+    pub hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Startup {
+    pub reopen_last_project: bool,
+}
+
+impl Default for Startup {
+    fn default() -> Self {
+        Startup { reopen_last_project: true }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    pub appearance: Appearance,
+    pub preview: Preview,
+    pub tools: Tools,
+    pub startup: Startup,
+    /// The project opened last (state, not a preference).
+    pub last_project: Option<PathBuf>,
+}
+
+/// Where the settings live: the editor's per-user storage directory.
+pub fn path() -> Option<PathBuf> {
+    eframe::storage_dir(APP_ID).map(|d| d.join(FILE))
+}
+
+impl EditorSettings {
+    /// The saved settings, or the defaults; a file that cannot be read is reported, not overwritten silently.
+    pub fn load() -> (EditorSettings, Option<String>) {
+        let Some(path) = path() else { return (EditorSettings::default(), None) };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(settings) => (settings, None),
+                Err(e) => (EditorSettings::default(), Some(format!("{}: {e}", path.display()))),
+            },
+            Err(_) => (EditorSettings::default(), None),
+        }
+    }
+
+    /// # Errors
+    /// The directory or the file cannot be written.
+    pub fn save(&self) -> Result<(), String> {
+        let path = path().ok_or("no settings directory on this system")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(
+            &path,
+            format!("# pe2-editor settings: edited from the editor's Settings pane, or by hand.\n\n{text}"),
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))
+    }
+}

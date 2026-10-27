@@ -1,0 +1,459 @@
+//! Extraction: a project's game layer, (re)written from its releases' discs by the declarations
+//! alone.
+//!
+//! Each disc of the layout is found among the project's roms by its size and sha1, and its file system is held to
+//! the layout (the same files, in disc order). Every declared asset is written as a bundle, `<group>/<name>.asset/`,
+//! its `asset.toml` the declaration's own fields (its slots filled, a stream's descriptor fields, ...) without what
+//! only extraction reads (`from`). An asset located in a disc slot is read from it - an ISO file's bytes (a `mixed`
+//! file's as 2336-byte sectors) or the license data -, checked against its sha1 and written as `native.<format>`.
+//! An asset located in a file's chunk slot is read from its stage container - `STAGE0.HED`'s or a `STAGE<N>.CDF`'s tables
+//! give the file's place, the file asset's slots the chunk's - as the chunk's payload. The layout's discs and stages
+//! are written as bundles too; folders, groups, files and streams carry their declarations alone.
+
+use anyhow::{Context, Result, bail};
+use formats::cdf::{self, Source};
+use formats::iso::{self, Image};
+use sha1::{Digest, Sha1};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use crate::declarations::{At, Declarations, Disc};
+use crate::{DiscImage, Game, Project};
+
+pub struct Options {
+    /// The releases to extract; every release of the project when empty.
+    pub releases: Vec<String>,
+    pub roms: Option<PathBuf>,
+    pub declarations: Option<PathBuf>,
+}
+
+pub struct Report {
+    pub layer: PathBuf,
+    pub assets: usize,
+    pub layouts: usize,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+#[must_use]
+pub fn sha1_hex(bytes: &[u8]) -> String {
+    hex(&Sha1::digest(bytes))
+}
+
+fn sha1_file(path: &Path) -> Result<String> {
+    let mut f = fs::File::open(path)?;
+    let (mut h, mut buf) = (Sha1::new(), vec![0; 1 << 22]);
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
+/// A disc image in `roms`, by size and sha1 (its name may differ).
+fn find_disc(roms: &Path, name: &str, size: u64, sha1: &str) -> Result<PathBuf> {
+    let named = roms.join(name);
+    let mut candidates = vec![];
+    if named.is_file() {
+        candidates.push(named.clone());
+    }
+    let mut others: Vec<PathBuf> = fs::read_dir(roms)
+        .with_context(|| format!("{}", roms.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && *p != named)
+        .collect();
+    others.sort();
+    candidates.extend(others);
+    for p in candidates {
+        if fs::metadata(&p)?.len() == size && sha1_file(&p)? == sha1 {
+            return Ok(p);
+        }
+    }
+    bail!("{name} (sha1 {sha1}) is not in {}", roms.display())
+}
+
+/// A disc opened for extraction: its image, its layout, and its root directory's files by name.
+struct OpenDisc {
+    image: Image,
+    layout: Disc,
+    files: BTreeMap<String, iso::Entry>,
+    path: PathBuf,
+}
+
+impl OpenDisc {
+    fn open(roms: &Path, name: &str, layout: &Disc) -> Result<OpenDisc> {
+        let i = &layout.image;
+        let path = find_disc(roms, &i.name, i.size, &i.sha1)?;
+        let mut image = Image::open(&path)?;
+        let mut entries = image.root()?;
+        if let Some(d) = entries.iter().find(|e| e.directory) {
+            bail!("{name}: the directory {} - the layout knows a flat root only", d.name);
+        }
+        entries.sort_by_key(|e| e.lba);
+        let on_disc: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        let declared: Vec<&str> = layout.slots.iter().filter(|s| s.ty != "license").map(|s| s.name.as_str()).collect();
+        if on_disc != declared {
+            bail!("{name}: the disc's files, in disc order, are {on_disc:?}; the layout says {declared:?}");
+        }
+        let files = entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+        Ok(OpenDisc { image, layout: layout.clone(), files, path })
+    }
+
+    /// A slot's bytes: the license data, or an ISO file's - a `mixed` file's as 2336-byte sectors.
+    fn slot(&mut self, name: &str) -> Result<Vec<u8>> {
+        let slot = self.layout.slots.iter().find(|s| s.name == name).with_context(|| format!("no slot {name}"))?;
+        match slot.ty.as_str() {
+            "license" => Ok(self.image.license()?),
+            "data" => {
+                let e = &self.files[name];
+                let mut bytes = self.image.data(e.lba, e.sectors())?;
+                bytes.truncate(e.size as usize);
+                Ok(bytes)
+            }
+            "mixed" => {
+                let e = &self.files[name];
+                Ok(self.image.mode2(e.lba, e.sectors())?)
+            }
+            other => bail!("slot {name}: no reading for type {other}"),
+        }
+    }
+}
+
+/// An ISO file of an open disc, read sector by sector.
+struct IsoFile<'a> {
+    image: &'a mut Image,
+    lba: u32,
+    size: u64,
+}
+
+impl Source for IsoFile<'_> {
+    fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let end = offset + len as u64;
+        if end > self.size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{len} bytes at {offset:#x} past the file"),
+            ));
+        }
+        let first = u32::try_from(offset / cdf::SECTOR).unwrap_or(u32::MAX);
+        let count = u32::try_from(end.div_ceil(cdf::SECTOR)).unwrap_or(u32::MAX) - first;
+        let bytes = self.image.data(self.lba + first, count)?;
+        let skip = usize::try_from(offset % cdf::SECTOR).unwrap_or(0);
+        Ok(bytes[skip..skip + len].to_vec())
+    }
+}
+
+impl OpenDisc {
+    fn iso_file(&mut self, name: &str) -> Result<IsoFile<'_>> {
+        let e = self.files.get(name).with_context(|| format!("no file {name}"))?;
+        let (lba, size) = (e.lba, u64::from(e.size));
+        Ok(IsoFile { image: &mut self.image, lba, size })
+    }
+}
+
+/// A stage's container as extraction reads it: where it is (a disc, its CDF) and its files' offsets.
+struct Container {
+    disc: String,
+    cdf: String,
+    files: HashMap<(Option<u32>, u32), u64>,
+}
+
+/// The stage containers of a release, opened as assets ask for them.
+struct Containers {
+    open: HashMap<(String, u32), Container>,
+}
+
+impl Containers {
+    fn get(&mut self, decl: &Declarations, discs: &mut Discs, release: &str, stage: u32) -> Result<&Container> {
+        let key = (release.to_string(), stage);
+        if !self.open.contains_key(&key) {
+            let layout = decl.layouts[release]
+                .get(&format!("stage{stage}"))
+                .with_context(|| format!("{release}: no stage {stage}"))?;
+            let at = layout.at.first().with_context(|| format!("{release} stage {stage}: no disc"))?;
+            let disc_name = at.disc.clone().with_context(|| format!("{release} stage {stage}: no disc"))?;
+            let disc = discs
+                .get_mut(&(release.to_string(), disc_name.clone()))
+                .with_context(|| format!("no disc {disc_name}"))?;
+            let (cdf_name, entries) = if stage == 0 {
+                let hed = disc.slot("STAGE0.HED")?;
+                ("STAGE0.CDF".to_string(), cdf::stage0_files(&hed)?)
+            } else {
+                let name = at.slots.first().cloned().with_context(|| format!("{release} stage {stage}: no CDF"))?;
+                let entries = cdf::stage_files(&mut disc.iso_file(&name)?)?;
+                (name, entries)
+            };
+            let files = entries.into_iter().map(|e| ((e.folder, e.id), e.offset)).collect();
+            self.open.insert(key.clone(), Container { disc: disc_name, cdf: cdf_name, files });
+        }
+        Ok(&self.open[&key])
+    }
+}
+
+/// A chunk slot's payload: the file the `at` names, in its stage's container, and the slot its file asset declares.
+fn chunk_payload(
+    decl: &Declarations,
+    discs: &mut Discs,
+    containers: &mut Containers,
+    files: &HashMap<(String, u32, Option<u32>, u32), String>,
+    release: &str,
+    at: &At,
+) -> Result<Vec<u8>> {
+    let (Some(stage), Some(file), Some(slot)) = (at.stage, at.file, at.slot.as_deref()) else {
+        bail!("not a chunk slot");
+    };
+    let file_asset = files
+        .get(&(release.to_string(), stage, at.folder, file))
+        .with_context(|| format!("no file asset at stage {stage} folder {:?} file {file}", at.folder))?;
+    let index = decl.assets[file_asset]
+        .slots
+        .iter()
+        .position(|s| s.name == slot)
+        .with_context(|| format!("{file_asset} has no slot {slot}"))?;
+    let container = containers.get(decl, discs, release, stage)?;
+    let offset =
+        *container.files.get(&(at.folder, file)).with_context(|| format!("stage {stage} has no file {file}"))?;
+    let (disc_name, cdf_name) = (container.disc.clone(), container.cdf.clone());
+    let disc = discs.get_mut(&(release.to_string(), disc_name)).context("the container's disc")?;
+    let mut src = disc.iso_file(&cdf_name)?;
+    let chunks = cdf::chunks(&mut src, offset)?;
+    let chunk = chunks.get(index).with_context(|| format!("{file_asset}: no chunk {index} on the disc"))?;
+    Ok(chunk.payload(&mut src)?)
+}
+
+fn quote(s: &str) -> String {
+    toml_edit::Value::from(s).to_string().trim().to_string()
+}
+
+/// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s.
+fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) -> String {
+    let mut lines =
+        vec!["# An asset bundle, written by extraction.".to_string(), String::new(), body.trim_end().to_string()];
+    if let Some(native) = native {
+        lines.push(format!("native = {}", quote(native)));
+    }
+    for (release, sha1) in originals {
+        lines.extend([String::new(), format!("[original.{release}]"), format!("sha1 = {}", quote(sha1))]);
+    }
+    lines.join("\n") + "\n"
+}
+
+/// A layout asset's `asset.toml`: its declaration without what only extraction reads (`at`).
+fn layout_toml(text: &str) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    doc.remove("at");
+    let body = doc.to_string();
+    let body = body.lines().skip_while(|l| l.starts_with('#') || l.is_empty()).collect::<Vec<_>>().join("\n");
+    Ok(format!("# An asset bundle, written by extraction: the layout and its slots.\n\n{body}\n"))
+}
+
+fn write_bundle(layer: &Path, path: &str, files: &[(&str, &[u8])]) -> Result<()> {
+    let dir = layer.join(format!("{path}.asset"));
+    fs::create_dir_all(&dir)?;
+    for (name, bytes) in files {
+        fs::write(dir.join(name), bytes).with_context(|| format!("{}", dir.join(name).display()))?;
+    }
+    Ok(())
+}
+
+type Discs = BTreeMap<(String, String), OpenDisc>;
+
+/// Every disc of the releases' layouts, opened and held to its layout.
+fn open_discs(game: &Game, decl: &Declarations, releases: &[String], roms: &Path) -> Result<Discs> {
+    let mut discs = Discs::new();
+    for release in releases {
+        let layouts =
+            decl.layouts.get(release).with_context(|| format!("{release}: the declarations have no layout"))?;
+        let wanted: &Vec<DiscImage> = &game.releases[release];
+        for (name, layout) in layouts {
+            let Some(disc) = &layout.disc else { continue };
+            if !wanted.iter().any(|d| d.sha1 == disc.image.sha1) {
+                bail!("{release} {name}: the project's discs do not include {} ({})", disc.image.name, disc.image.sha1);
+            }
+            discs.insert((release.clone(), name.clone()), OpenDisc::open(roms, name, disc)?);
+        }
+    }
+    Ok(discs)
+}
+
+/// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count.
+fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &mut Discs) -> Result<usize> {
+    // Where each file asset is, to find a chunk slot's file.
+    let mut files = HashMap::new();
+    for (path, asset) in &decl.assets {
+        for (release, loc) in &asset.from {
+            for at in loc.at.iter().filter(|a| a.disc.is_none() && a.slot.is_none()) {
+                if let (Some(stage), Some(file)) = (at.stage, at.file) {
+                    files.insert((release.clone(), stage, at.folder, file), path.clone());
+                }
+            }
+        }
+    }
+    let mut containers = Containers { open: HashMap::new() };
+    let textures = crate::textures::Index::new(decl);
+    let mut written = 0;
+    for (path, asset) in &decl.assets {
+        if asset.kind == "image" && matches!(asset.role.as_deref(), Some("texture" | "atlas")) {
+            let mut pngs = Vec::new();
+            let mut originals = vec![];
+            for release in releases.iter().filter(|r| asset.from.contains_key(*r)) {
+                let mut read = |at: &At| chunk_payload(decl, discs, &mut containers, &files, release, at);
+                let got = crate::textures::extract(decl, &textures, path, release, &mut read)
+                    .with_context(|| format!("{path}: {release}"))?;
+                if pngs.is_empty() {
+                    pngs = got;
+                }
+                originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
+            }
+            let toml = asset_toml(&asset.body, None, &originals);
+            let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
+            files.extend(pngs.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+            write_bundle(layer, path, &files)?;
+            written += 1;
+            continue;
+        }
+        let mut native: Option<Vec<u8>> = None;
+        let mut originals = vec![];
+        for release in releases {
+            let Some(loc) = asset.from.get(release) else { continue };
+            for at in &loc.at {
+                if at.disc.is_none() && at.slot.is_some() {
+                    let want = loc.sha1.as_deref().with_context(|| format!("{path}: {release} gives no sha1"))?;
+                    let bytes = chunk_payload(decl, discs, &mut containers, &files, release, at)
+                        .with_context(|| format!("{path}: {release}"))?;
+                    let got = sha1_hex(&bytes);
+                    if got != want {
+                        bail!("{path}: {release} {at:?} has sha1 {got}, the declaration {want}");
+                    }
+                    native.get_or_insert(bytes);
+                    continue;
+                }
+                let Some(disc_name) = &at.disc else { continue };
+                let want = loc.sha1.as_deref().with_context(|| format!("{path}: {release} gives no sha1"))?;
+                for slot in at.slots() {
+                    let disc = discs
+                        .get_mut(&(release.clone(), disc_name.clone()))
+                        .with_context(|| format!("{path}: {release} has no disc {disc_name}"))?;
+                    let bytes = disc.slot(slot).with_context(|| format!("{path}: {disc_name} {slot}"))?;
+                    let got = sha1_hex(&bytes);
+                    if got != want {
+                        bail!("{path}: {release} {disc_name} {slot} has sha1 {got}, the declaration {want}");
+                    }
+                    native.get_or_insert(bytes);
+                }
+            }
+            if let Some(sha1) = &loc.sha1 {
+                originals.push((release.clone(), sha1.clone()));
+            }
+        }
+        let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
+        let toml = asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals);
+        let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
+        if let Some(native) = &native {
+            files.push((&name, native));
+        }
+        write_bundle(layer, path, &files)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// The releases' discs and containers as bundles, their slots filled. Returns their count.
+fn write_layouts(layer: &Path, decl: &Declarations, releases: &[String], discs: &Discs) -> Result<usize> {
+    let mut written = 0;
+    for release in releases {
+        for (name, layout) in &decl.layouts[release] {
+            for at in &layout.at {
+                let disc_name =
+                    at.disc.as_deref().with_context(|| format!("disc/{release}/{name}: an at with no disc"))?;
+                let disc = discs
+                    .get(&(release.clone(), disc_name.to_string()))
+                    .with_context(|| format!("disc/{release}/{name}: {release} has no disc {disc_name}"))?;
+                for slot in at.slots() {
+                    if !disc.files.contains_key(slot) {
+                        bail!("disc/{release}/{name}: {disc_name} has no file {slot}");
+                    }
+                }
+            }
+            let toml = layout_toml(&layout.text)?;
+            write_bundle(layer, &format!("disc/{release}/{name}"), &[("asset.toml", toml.as_bytes())])?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// What made the layer: the declarations and the images, in the layer's `extraction.toml`.
+fn write_record(layer: &Path, decl_root: &Path, releases: &[String], discs: &Discs) -> Result<()> {
+    let mut lines = vec![
+        "# What made this layer (pe2-cli project extract): this machine's paths, so it stays in the layer.".to_string(),
+        String::new(),
+        format!("declarations = {}", quote(&fs::canonicalize(decl_root)?.to_string_lossy())),
+    ];
+    for release in releases {
+        lines.extend([String::new(), format!("[releases.{release}]"), "images = [".into()]);
+        for ((r, _), disc) in discs {
+            if r == release {
+                lines.push(format!(
+                    "    {{ path = {}, sha1 = {} }},",
+                    quote(&disc.path.to_string_lossy()),
+                    quote(&disc.layout.image.sha1)
+                ));
+            }
+        }
+        lines.push("]".into());
+    }
+    fs::write(layer.join("extraction.toml"), lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// (Re)write a project's game layer from its releases' discs.
+///
+/// # Errors
+/// The project names no game layer or an unknown release, the declarations do not load, a disc is missing or differs
+/// from its layout, an asset's bytes differ from its sha1, or a file cannot be written.
+pub fn extract(project: &Project, options: &Options) -> Result<Report> {
+    let game = project.game.as_ref().context("the project has no [game]")?;
+    let releases: Vec<String> =
+        if options.releases.is_empty() { game.releases.keys().cloned().collect() } else { options.releases.clone() };
+    for r in &releases {
+        if !game.releases.contains_key(r) {
+            bail!("{r}: not a release of this project ([game.releases])");
+        }
+    }
+    let decl_root = match &options.declarations {
+        Some(p) => p.clone(),
+        None => project.resolve(&game.declarations)?,
+    };
+    let decl = Declarations::load(&decl_root)?;
+    let roms = options.roms.clone().unwrap_or_else(|| game.roms.clone());
+    let layer = project.layer(&game.layer)?.path.clone();
+    let (root, abs_layer) = (fs::canonicalize(&project.root)?, std::path::absolute(&layer)?);
+    if abs_layer == root || !abs_layer.starts_with(&root) {
+        bail!("{}: the game layer must be a folder inside the project", layer.display());
+    }
+    if fs::symlink_metadata(&layer).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("{} is a link: the game layer is the extraction's own folder", layer.display());
+    }
+    // Every disc is opened first: a missing or foreign image stops extraction before the layer is touched.
+    let mut discs = open_discs(game, &decl, &releases, &roms)?;
+    if layer.exists() {
+        fs::remove_dir_all(&layer)?; // the layer is the extraction's alone
+    }
+    fs::create_dir_all(&layer)?;
+    let assets = write_assets(&layer, &decl, &releases, &mut discs)?;
+    let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
+    write_record(&layer, &decl_root, &releases, &discs)?;
+    Ok(Report { layer, assets, layouts })
+}

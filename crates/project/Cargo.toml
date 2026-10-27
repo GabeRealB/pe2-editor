@@ -1,0 +1,19 @@
+[package]
+name = "project"
+description = "Projects: project.toml, the declarations, bundles, and extraction from the discs"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+formats.workspace = true
+codecs.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+sha1.workspace = true
+toml.workspace = true
+toml_edit = "0.22"
+getrandom = "0.3"

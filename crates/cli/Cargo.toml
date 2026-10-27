@@ -1,0 +1,20 @@
+[package]
+name = "cli"
+description = "pe2-cli: every tool crate behind one multi-call binary"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pe2-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codecs.workspace = true
+project.workspace = true
+png.workspace = true
+anyhow.workspace = true
+clap.workspace = true
