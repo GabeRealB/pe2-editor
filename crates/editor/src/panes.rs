@@ -19,14 +19,23 @@ pub enum Pane {
     Preview,
     Inspector,
     References,
+    Problems,
     Project,
     Settings,
     Vram,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 7] =
-        [Pane::Assets, Pane::Preview, Pane::Vram, Pane::Inspector, Pane::References, Pane::Project, Pane::Settings];
+    pub const ALL: [Pane; 8] = [
+        Pane::Assets,
+        Pane::Preview,
+        Pane::Vram,
+        Pane::Inspector,
+        Pane::References,
+        Pane::Problems,
+        Pane::Project,
+        Pane::Settings,
+    ];
 
     pub fn icon(self) -> &'static str {
         match self {
@@ -34,6 +43,7 @@ impl Pane {
             Pane::Preview => icons::IMAGE,
             Pane::Inspector => icons::FILE_TEXT,
             Pane::References => icons::STACK,
+            Pane::Problems => icons::WARNING,
             Pane::Project => icons::HARD_DRIVES,
             Pane::Settings => icons::GEAR,
             Pane::Vram => icons::SQUARES_FOUR,
@@ -46,6 +56,7 @@ impl Pane {
             Pane::Preview => "Preview",
             Pane::Inspector => "Inspector",
             Pane::References => "References",
+            Pane::Problems => "Problems",
             Pane::Project => "Project",
             Pane::Settings => "Settings",
             Pane::Vram => "VRAM",
@@ -54,7 +65,7 @@ impl Pane {
 }
 
 /// The default layout: assets and project on the left, the preview in the middle, the inspector over the
-/// references on the right.
+/// references and problems on the right.
 pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let mut tiles = Tiles::default();
     let left = [Pane::Assets, Pane::Project].map(|p| tiles.insert_pane(p));
@@ -63,8 +74,8 @@ pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let center = tiles.insert_tab_tile(center.to_vec());
     let inspector = tiles.insert_pane(Pane::Inspector);
     let inspector = tiles.insert_tab_tile(vec![inspector]);
-    let references = tiles.insert_pane(Pane::References);
-    let references = tiles.insert_tab_tile(vec![references]);
+    let references = [Pane::References, Pane::Problems].map(|p| tiles.insert_pane(p));
+    let references = tiles.insert_tab_tile(references.to_vec());
     let right = tiles.insert_vertical_tile(vec![inspector, references]);
     if let Some(Tile::Container(egui_tiles::Container::Linear(linear))) = tiles.get_mut(right) {
         linear.shares.set_share(inspector, 2.0);
@@ -125,6 +136,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     scroll(ui, "inspector", |ui| crate::inspector::inspector_ui(ui, ws, nav, tools, message));
                 }
                 Pane::References => scroll(ui, "references", |ui| references_ui(ui, ws, nav)),
+                Pane::Problems => scroll(ui, "problems", |ui| problems_ui(ui, ws, nav)),
                 Pane::Project => scroll(ui, "project", |ui| project_ui(ui, ws, nav)),
                 Pane::Settings => {}
             }
@@ -473,7 +485,7 @@ fn pages_ui(ui: &mut egui::Ui, ws: &mut Workspace, path: &str, view: Preview, co
 
 /// An image's size in texels and its pages' width (64 halfwords at its depth).
 pub fn image_pages(asset: &project::index::Asset) -> (egui::Vec2, f32) {
-    let get = |k: &str| asset.fields.get(k);
+    let get = |k: &str| asset.fields().get(k);
     let size = get("size").and_then(toml::Value::as_array).cloned().unwrap_or_default();
     #[expect(clippy::cast_precision_loss, reason = "image sizes")]
     let dim = |i: usize| size.get(i).and_then(toml::Value::as_integer).unwrap_or(0) as f32;
@@ -805,7 +817,7 @@ fn references_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         });
     });
     let outgoing: Vec<(String, &Asset)> =
-        asset.fields.iter().flat_map(|(key, value)| outgoing_refs(ws, key, value)).collect();
+        asset.fields().iter().flat_map(|(key, value)| outgoing_refs(ws, key, value)).collect();
     theme::section(ui, &format!("References ({})", outgoing.len()), |ui| {
         if outgoing.is_empty() {
             ui.label(RichText::new("This asset references nothing").color(theme::weak()));
@@ -845,6 +857,60 @@ fn outgoing_refs<'a>(ws: &'a Workspace, field: &str, value: &toml::Value) -> Vec
         _ => {}
     }
     out
+}
+
+// --- problems ---------------------------------------------------------------------------------------------------------
+
+/// What the index finds wrong, each with the assets it is about; the references that resolve to nothing; whether the
+/// layers are watched and agents can connect.
+fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+    if let Some(e) = &ws.watch_error {
+        theme::section(ui, "Watching", |ui| {
+            ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
+        });
+    }
+    if let Some(e) = &ws.link_error {
+        theme::section(ui, "Agents", |ui| {
+            ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
+        });
+    }
+    let problems = &ws.index.problems;
+    theme::section(ui, &format!("Problems ({})", problems.len()), |ui| {
+        if problems.is_empty() {
+            ui.label(RichText::new("Nothing is wrong").color(theme::weak()));
+        }
+        for problem in problems {
+            ui.horizontal_wrapped(|ui| {
+                let tint = if problem.is_warning() { ui.visuals().warn_fg_color } else { ui.visuals().error_fg_color };
+                ui.label(RichText::new(icons::WARNING).color(tint));
+                for path in problem.paths() {
+                    let asset = path.strip_suffix(project::index::BUNDLE_SUFFIX);
+                    if ui.link(path).clicked()
+                        && let Some(asset) = asset
+                    {
+                        *nav = Some(asset.to_string());
+                    }
+                }
+                ui.label(RichText::new(problem.describe()).color(theme::weak()));
+            });
+        }
+    });
+    let dangling = &ws.index.dangling;
+    theme::section(ui, &format!("Dangling references ({})", dangling.len()), |ui| {
+        if dangling.is_empty() {
+            ui.label(RichText::new("Every reference resolves").color(theme::weak()));
+        }
+        egui::Grid::new("dangling").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
+            for r in dangling {
+                if ui.link(&r.from).clicked() {
+                    *nav = Some(r.from.clone());
+                }
+                ui.label(RichText::new(format!("slot {}", r.slot)).color(theme::weak()));
+                ui.label(RichText::new(format!("{} ({})", r.target, r.uid)).color(theme::weak()));
+                ui.end_row();
+            }
+        });
+    });
 }
 
 // --- project ----------------------------------------------------------------------------------------------------------

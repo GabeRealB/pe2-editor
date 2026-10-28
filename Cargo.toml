@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/formats", "crates/codecs", "crates/project", "crates/cli", "crates/editor"]
+members = ["crates/formats", "crates/codecs", "crates/project", "crates/preview", "crates/mcp", "crates/cli", "crates/editor"]
 
 [workspace.package]
 edition = "2024"
@@ -21,11 +21,27 @@ pedantic = { level = "warn", priority = -1 }
 formats = { path = "crates/formats" }
 codecs = { path = "crates/codecs" }
 project = { path = "crates/project" }
+preview = { path = "crates/preview" }
+mcp = { path = "crates/mcp" }
+# The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1"
+# Local sockets on every platform (a Unix domain socket, a Windows named pipe): agents reach a running editor by one.
+interprocess = "2.4"
+tokio = { version = "1", features = ["rt", "macros", "io-std", "sync"] }
+base64 = "0.22"
 anyhow = "1"
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "persistence"] }
 egui_tiles = { version = "0.18", features = ["serde"] }
 serde_json = "1"
 clap = { version = "4.5", features = ["derive"] }
+notify = "8"
+# SQLite in Rust, for the project cache's index (no C to build for any target). Pinned: it is pre-1.0. Its default
+# features bring mimalloc (C) and full-text search, which the cache needs neither of.
+turso = { version = "=0.8.3", default-features = false }
+pollster = "0.4"
+# Turso's `branches` takes a path current nightlies removed (core::intrinsics::abort) unless its std feature is on.
+branches = { version = "0.4", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 png = "0.18"
 sha1 = "0.10"

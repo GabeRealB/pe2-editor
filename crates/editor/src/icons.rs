@@ -28,6 +28,7 @@ pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
 pub const HARD_DRIVES: &str = "\u{E2A0}";
 pub const GEAR: &str = "\u{E270}";
 pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
+pub const WARNING: &str = "\u{E4E0}";
 
 /// Add the icon font behind the text fonts.
 pub fn install(ctx: &egui::Context) {

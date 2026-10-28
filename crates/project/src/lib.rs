@@ -1,9 +1,13 @@
 //! Projects: what a `project.toml` declares, the declarations a project is extracted by, and
 //! the extraction that fills its game layer with asset bundles.
 
+pub mod cache;
+pub mod changeset;
 pub mod declarations;
 pub mod extract;
 pub mod index;
+pub mod lock;
+pub mod store;
 pub mod textures;
 pub mod uid;
 
@@ -13,6 +17,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const FILE: &str = "project.toml";
+/// Where a project's layers live, each a directory with its changeset beside it.
+pub const LAYERS: &str = ".layers";
 
 #[derive(Deserialize)]
 struct ProjectFile {
@@ -54,7 +60,10 @@ pub struct DiscImage {
 #[derive(Deserialize)]
 struct LayerFile {
     name: String,
-    path: String,
+    /// The layer's directory; by default `.layers/<name>`.
+    path: Option<String>,
+    #[serde(default)]
+    read_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -76,7 +85,12 @@ pub struct Game {
 
 pub struct Layer {
     pub name: String,
+    /// Its directory.
     pub path: PathBuf,
+    /// Its changeset, beside its directory: `<path>.toml`.
+    pub changeset: PathBuf,
+    /// Only its maker writes it: stated in `project.toml`, or the game layer (extraction's alone).
+    pub read_only: bool,
 }
 
 pub struct Mount {
@@ -103,7 +117,7 @@ impl Project {
     /// # Errors
     /// Its `project.toml` cannot be read or parsed.
     pub fn load(directory: &Path) -> Result<Project> {
-        let root = std::path::absolute(directory)?;
+        let root = std::fs::canonicalize(directory).with_context(|| format!("{}", directory.display()))?;
         let path = root.join(FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
@@ -113,8 +127,18 @@ impl Project {
             declarations: g.declarations,
             releases: g.releases.into_iter().map(|(r, spec)| (r, spec.discs)).collect(),
         });
-        let layers =
-            file.layer.into_iter().map(|l| Layer { name: l.name, path: resolve_path(&root, &l.path) }).collect();
+        let game_layer = game.as_ref().map(|g| g.layer.clone());
+        let layers = file
+            .layer
+            .into_iter()
+            .map(|l| {
+                let path = resolve_path(&root, l.path.as_deref().unwrap_or(&format!("{LAYERS}/{}", l.name)));
+                let mut changeset = path.clone().into_os_string();
+                changeset.push(".toml");
+                let read_only = l.read_only || game_layer.as_deref() == Some(l.name.as_str());
+                Layer { name: l.name, path, changeset: PathBuf::from(changeset), read_only }
+            })
+            .collect();
         let mounts = file
             .mount
             .into_iter()

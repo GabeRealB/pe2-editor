@@ -9,6 +9,10 @@
 //! An asset located in a file's chunk slot is read from its stage container - `STAGE0.HED`'s or a `STAGE<N>.CDF`'s tables
 //! give the file's place, the file asset's slots the chunk's - as the chunk's payload. The layout's discs and stages
 //! are written as bundles too; folders, groups, files and streams carry their declarations alone.
+//!
+//! A bundle's `asset.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
+//! layer holds - each asset under its declared uid, each folder and `extraction.toml` under a new one - and marks the
+//! layer read-only, extraction's alone.
 
 use anyhow::{Context, Result, bail};
 use formats::cdf::{self, Source};
@@ -20,8 +24,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::changeset::Changeset;
 use crate::declarations::{At, Declarations, Disc};
-use crate::{DiscImage, Game, Project};
+use crate::lock::Lock;
+use crate::{DiscImage, Game, Project, uid};
 
 pub struct Options {
     /// The releases to extract; every release of the project when empty.
@@ -236,23 +242,32 @@ fn quote(s: &str) -> String {
     toml_edit::Value::from(s).to_string().trim().to_string()
 }
 
+/// A declaration's text without its uid, which the layer's changeset holds.
+fn without_uid(text: &str) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    doc.remove("uid");
+    Ok(doc.to_string())
+}
+
 /// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s.
-fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) -> String {
+fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) -> Result<String> {
+    let body = without_uid(body)?;
     let mut lines =
-        vec!["# An asset bundle, written by extraction.".to_string(), String::new(), body.trim_end().to_string()];
+        vec!["# An asset bundle, written by extraction.".to_string(), String::new(), body.trim().to_string()];
     if let Some(native) = native {
         lines.push(format!("native = {}", quote(native)));
     }
     for (release, sha1) in originals {
         lines.extend([String::new(), format!("[original.{release}]"), format!("sha1 = {}", quote(sha1))]);
     }
-    lines.join("\n") + "\n"
+    Ok(lines.join("\n") + "\n")
 }
 
 /// A layout asset's `asset.toml`: its declaration without what only extraction reads (`at`).
 fn layout_toml(text: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     doc.remove("at");
+    doc.remove("uid");
     let body = doc.to_string();
     let body = body.lines().skip_while(|l| l.starts_with('#') || l.is_empty()).collect::<Vec<_>>().join("\n");
     Ok(format!("# An asset bundle, written by extraction: the layout and its slots.\n\n{body}\n"))
@@ -316,7 +331,7 @@ fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &
                 }
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
-            let toml = asset_toml(&asset.body, None, &originals);
+            let toml = asset_toml(&asset.body, None, &originals)?;
             let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
             files.extend(pngs.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
             write_bundle(layer, path, &files)?;
@@ -358,7 +373,7 @@ fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &
             }
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
-        let toml = asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals);
+        let toml = asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?;
         let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
         if let Some(native) = &native {
             files.push((&name, native));
@@ -418,12 +433,44 @@ fn write_record(layer: &Path, decl_root: &Path, releases: &[String], discs: &Dis
     Ok(())
 }
 
-/// (Re)write a project's game layer from its releases' discs.
+/// The game layer's changeset, by real paths (a bundle's with `.asset`): every asset under its declared uid, every
+/// folder and the record under new ones, the layer read-only.
+fn write_changeset(project: &Project, layer: &str, decl: &Declarations, releases: &[String]) -> Result<()> {
+    let mut changeset = Changeset { read_only: true, ..Changeset::default() };
+    for (path, asset) in &decl.assets {
+        changeset.entries.insert(asset.uid.clone(), format!("{path}{}", crate::index::BUNDLE_SUFFIX));
+    }
+    for release in releases {
+        for (name, layout) in &decl.layouts[release] {
+            changeset
+                .entries
+                .insert(layout.uid.clone(), format!("disc/{release}/{name}{}", crate::index::BUNDLE_SUFFIX));
+        }
+    }
+    let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in changeset.entries.values() {
+        let mut at = path.as_str();
+        while let Some((parent, _)) = at.rsplit_once('/') {
+            folders.insert(parent.to_string());
+            at = parent;
+        }
+    }
+    let mut taken: std::collections::HashSet<String> = changeset.entries.keys().cloned().collect();
+    for path in folders.into_iter().chain(["extraction.toml".to_string()]) {
+        let id =
+            uid::text(uid::new(|id| taken.contains(&uid::text(id))).map_err(|e| anyhow::anyhow!("a new uid: {e}"))?);
+        taken.insert(id.clone());
+        changeset.entries.insert(id, path);
+    }
+    changeset.save(&project.layer(layer)?.changeset)
+}
+
+/// (Re)write a project's game layer from its releases' discs, holding the project's lock.
 ///
 /// # Errors
 /// The project names no game layer or an unknown release, the declarations do not load, a disc is missing or differs
 /// from its layout, an asset's bytes differ from its sha1, or a file cannot be written.
-pub fn extract(project: &Project, options: &Options) -> Result<Report> {
+pub fn extract(project: &Project, options: &Options, _lock: &Lock) -> Result<Report> {
     let game = project.game.as_ref().context("the project has no [game]")?;
     let releases: Vec<String> =
         if options.releases.is_empty() { game.releases.keys().cloned().collect() } else { options.releases.clone() };
@@ -455,5 +502,6 @@ pub fn extract(project: &Project, options: &Options) -> Result<Report> {
     let assets = write_assets(&layer, &decl, &releases, &mut discs)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
     write_record(&layer, &decl_root, &releases, &discs)?;
+    write_changeset(project, &game.layer, &decl, &releases)?;
     Ok(Report { layer, assets, layouts })
 }

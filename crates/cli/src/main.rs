@@ -30,6 +30,13 @@ enum Tool {
         #[command(subcommand)]
         command: UidCommand,
     },
+    /// Serve a project to agents over the Model Context Protocol, on stdio: through the editor while it has the
+    /// project open, else under the project lock, taken for each request alone
+    Mcp {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -149,14 +156,21 @@ fn main() -> Result<()> {
         Tool::Convert { command: ConvertCommand::Palette { input, output } } => palette_to_png(&input, &output)?,
         Tool::Project { command: ProjectCommand::Extract { project, release, roms, declarations } } => {
             let p = project::Project::load(&project)?;
+            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
+                eprintln!("waiting: the project is in use by {owner}");
+            })?;
             let options = project::extract::Options { releases: release, roms, declarations };
-            let report = project::extract::extract(&p, &options)?;
+            let report = project::extract::extract(&p, &options, &lock)?;
             println!(
                 "extracted {} assets and {} layout assets into {}",
                 report.assets,
                 report.layouts,
                 report.layer.display()
             );
+        }
+        Tool::Mcp { project } => {
+            let root = project::Project::load(&project)?.root;
+            mcp::server::serve_stdio(root)?;
         }
         Tool::Uid { command: UidCommand::New { count, project, declarations } } => {
             let root = if let Some(root) = declarations {

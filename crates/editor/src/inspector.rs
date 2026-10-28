@@ -37,7 +37,7 @@ pub fn inspector_ui(
     header_ui(ui, ws, &asset);
     let context = Context { piece: matches!(role(&asset), Some("texture" | "atlas")).then(|| asset.path.clone()) };
     let fields: Vec<(&String, &toml::Value)> =
-        asset.fields.iter().filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str())).collect();
+        asset.fields().iter().filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str())).collect();
     let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
     if !properties.is_empty() {
         theme::section(ui, "Properties", |ui| property_sheet(ui, ws, &properties, &context, nav));
@@ -487,7 +487,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 ui.end_row();
             }
         });
-        if let Some(original) = asset.fields.get("original").and_then(toml::Value::as_table) {
+        if let Some(original) = asset.fields().get("original").and_then(toml::Value::as_table) {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Original").small().color(theme::weak()));

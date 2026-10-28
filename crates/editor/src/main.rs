@@ -17,6 +17,7 @@ mod panes;
 mod settings;
 mod theme;
 mod upscale;
+mod watch;
 mod workspace;
 
 use eframe::egui;

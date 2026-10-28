@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::panes::{self, Pane, Panes};
 use crate::settings::EditorSettings;
-use crate::workspace::Workspace;
+use crate::workspace::{Update, Workspace};
 use crate::{icons, theme};
 
 const LAYOUT_KEY: &str = "layout";
@@ -52,6 +52,8 @@ pub struct Editor {
     /// monitor's size as measured with the previous frame's scale, so a size is read only once the scale holds.
     steady: (f32, u32),
     open_dialog: Option<String>,
+    /// A project that could not be opened because another process holds it: its directory and who holds it.
+    in_use: Option<(PathBuf, String)>,
     error: Option<String>,
     capture: Option<Capture>,
     /// The device's largest surface side in pixels, which the window must not outgrow; applied once, then taken.
@@ -92,6 +94,7 @@ impl Editor {
             zoomed_for: None,
             steady: (0.0, 0),
             open_dialog: None,
+            in_use: None,
             error: problem,
             capture: start.screenshot.map(|path| Capture { path, frames: 0, requested: false, done: Arc::default() }),
             max_surface: start.max_surface,
@@ -111,13 +114,43 @@ impl Editor {
     }
 
     fn open(&mut self, dir: &Path) {
+        // The project open now lets go of its lock first: opening it again must find it free.
+        self.workspace = None;
         match Workspace::open(dir) {
             Ok(ws) => {
                 self.settings.last_project = std::path::absolute(dir).ok();
                 self.workspace = Some(ws);
                 self.error = None;
             }
-            Err(e) => self.error = Some(format!("{}: {e:#}", dir.display())),
+            Err(e) => {
+                if let Some(project::lock::LockError::Held(owner)) = e.downcast_ref() {
+                    self.in_use = Some((dir.to_path_buf(), owner.clone()));
+                }
+                self.error = Some(format!("{}: {e:#}", dir.display()));
+            }
+        }
+    }
+
+    /// Bring in what changed on disk; open the project again when its `project.toml` changed, keeping the selection.
+    fn follow_disk(&mut self, ctx: &egui::Context) {
+        let Some(ws) = &mut self.workspace else { return };
+        ws.watch(ctx);
+        ws.answer_agents();
+        match ws.update() {
+            Update::Nothing => {}
+            Update::Refreshed(n) => {
+                self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
+            }
+            Update::Reopen => {
+                let (root, selected) = (ws.project.root.clone(), ws.selected.clone());
+                self.open(&root);
+                if let (Some(ws), Some(path)) = (&mut self.workspace, selected)
+                    && ws.index.assets.contains_key(&path)
+                {
+                    ws.navigate(path);
+                }
+                self.message = Some("project.toml changed: the project was opened again".into());
+            }
         }
     }
 
@@ -291,7 +324,9 @@ impl Editor {
         });
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    /// The status bar; true when its problem count was clicked.
+    fn status_bar(&self, ui: &mut egui::Ui) -> bool {
+        let mut show_problems = false;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let zoom = ui.ctx().zoom_factor();
             let mode = if self.settings.appearance.zoom.is_some() { "" } else { " (monitor)" };
@@ -301,6 +336,23 @@ impl Editor {
                 if !ws.index.dangling.is_empty() {
                     let text = format!("{} dangling references", ws.index.dangling.len());
                     ui.label(RichText::new(text).small().color(ui.visuals().warn_fg_color));
+                    ui.separator();
+                }
+                if !ws.index.problems.is_empty() {
+                    let n = ws.index.problems.len();
+                    let text = format!("{} {n} problem{}", icons::WARNING, if n == 1 { "" } else { "s" });
+                    let label = egui::Label::new(RichText::new(text).small().color(ui.visuals().error_fg_color))
+                        .sense(egui::Sense::click());
+                    show_problems = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                    ui.separator();
+                }
+                if let Some(e) = &ws.watch_error {
+                    ui.label(RichText::new("not watching").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
+                    ui.separator();
+                }
+                if let Some(e) = &ws.link_error {
+                    ui.label(RichText::new("agents cannot connect").small().color(ui.visuals().warn_fg_color))
+                        .on_hover_text(e);
                     ui.separator();
                 }
                 ui.label(RichText::new(format!("{} assets", ws.index.assets.len())).small().color(theme::weak()));
@@ -321,6 +373,38 @@ impl Editor {
                 }
             });
         });
+        show_problems
+    }
+
+    /// A project another process holds: it cannot be opened until that process lets go of it.
+    fn in_use_dialog(&mut self, ctx: &egui::Context) {
+        let Some((dir, owner)) = &self.in_use else { return };
+        let (mut retry, mut close) = (false, false);
+        egui::Window::new("Project in use")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(dir.display().to_string()).strong());
+                ui.add_space(4.0);
+                ui.label(format!("This project is in use by {owner}."));
+                ui.label(
+                    RichText::new("One process works on a project at a time; it can be opened once that one is done.")
+                        .color(theme::weak()),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    retry = ui.button("Retry").clicked();
+                    close = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        if retry {
+            let dir = dir.clone();
+            self.in_use = None;
+            self.open(&dir);
+        } else if close {
+            self.in_use = None;
+        }
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -400,6 +484,7 @@ impl eframe::App for Editor {
         }
         self.zoom(&ctx);
         self.capture(&ctx);
+        self.follow_disk(&ctx);
         if let Some(ws) = &mut self.workspace {
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {
                 ws.go_back();
@@ -414,7 +499,9 @@ impl eframe::App for Editor {
             ui.add_space(2.0);
             self.toolbar(ui);
         });
-        egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui));
+        if egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner {
+            self.show_pane(Pane::Problems);
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut behavior = Panes {
                 workspace: self.workspace.as_mut(),
@@ -437,6 +524,7 @@ impl eframe::App for Editor {
             }
         });
         self.open_dialog(&ctx);
+        self.in_use_dialog(&ctx);
         if self.settings != self.saved {
             if self.settings.appearance != self.saved.appearance {
                 theme::apply(&ctx, &self.settings.appearance);

@@ -15,11 +15,14 @@ workspace = true
 [dependencies]
 codecs.workspace = true
 project.workspace = true
+preview.workspace = true
+mcp.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 egui_tiles.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+notify.workspace = true
 png.workspace = true
 toml.workspace = true
 
