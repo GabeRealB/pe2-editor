@@ -36,6 +36,61 @@ impl Image {
     }
 }
 
+impl Image {
+    /// The image at most `side` pixels on its longer side: each pixel the average of the block it stands for, by
+    /// coverage (a transparent pixel adds nothing to the color). One already that small is kept as it is.
+    #[must_use]
+    pub fn thumbnail(&self, side: usize) -> Image {
+        let longest = self.width.max(self.height);
+        if longest <= side || self.width == 0 || self.height == 0 {
+            return Image { width: self.width, height: self.height, rgba: self.rgba.clone() };
+        }
+        let (width, height) =
+            ((self.width * side).div_ceil(longest).max(1), (self.height * side).div_ceil(longest).max(1));
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            let (y0, y1) =
+                (y * self.height / height, ((y + 1) * self.height / height).max(y * self.height / height + 1));
+            for x in 0..width {
+                let (x0, x1) = (x * self.width / width, ((x + 1) * self.width / width).max(x * self.width / width + 1));
+                let mut sum = [0u64; 4];
+                for sy in y0..y1.min(self.height) {
+                    for sx in x0..x1.min(self.width) {
+                        let at = (sy * self.width + sx) * 4;
+                        let alpha = u64::from(self.rgba[at + 3]);
+                        for c in 0..3 {
+                            sum[c] += u64::from(self.rgba[at + c]) * alpha;
+                        }
+                        sum[3] += alpha;
+                    }
+                }
+                let count = ((y1.min(self.height) - y0) * (x1.min(self.width) - x0)).max(1) as u64;
+                #[expect(clippy::cast_possible_truncation, reason = "averages of bytes are bytes")]
+                let channel = |c: usize| sum[c].checked_div(sum[3]).unwrap_or(0) as u8;
+                #[expect(clippy::cast_possible_truncation, reason = "an average of bytes is a byte")]
+                rgba.extend_from_slice(&[channel(0), channel(1), channel(2), (sum[3] / count) as u8]);
+            }
+        }
+        Image { width, height, rgba }
+    }
+
+    /// An image from PNG, as `png` writes it.
+    ///
+    /// # Errors
+    /// It is not an 8-bit RGBA PNG.
+    pub fn from_png(bytes: &[u8]) -> Result<Image> {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info()?;
+        let mut rgba = vec![0; reader.output_buffer_size().unwrap_or(0)];
+        let info = reader.next_frame(&mut rgba)?;
+        anyhow::ensure!(
+            info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight,
+            "not 8-bit RGBA"
+        );
+        rgba.truncate(info.buffer_size());
+        Ok(Image { width: info.width as usize, height: info.height as usize, rgba })
+    }
+}
+
 /// A rectangle in texels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {

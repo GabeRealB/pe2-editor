@@ -316,7 +316,8 @@ fn declaration(bytes: &[u8]) -> Declaration {
                 .filter_map(|v| v.get("name")?.as_str().map(str::to_string))
                 .collect();
             let name = table.get("name").and_then(toml::Value::as_str);
-            for (key, value) in &table {
+            // An asset's own `uid` (as declarations named it before changesets) is not a reference.
+            for (key, value) in table.iter().filter(|(key, _)| *key != "uid") {
                 references(value, name.unwrap_or(key), &mut out.references);
             }
         }
@@ -626,24 +627,43 @@ fn bundle_of(rel: &str) -> Option<String> {
     Some(asset)
 }
 
-/// Every reference in a value: a table holding a `uid` and a `res://` `path`, named by the enclosing slot's `name`
-/// or else the field it sits in.
+/// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
+/// reference is the asset's uid, `"uid://..."` - with a fragment naming a part of it (`#palettes/default`), which
+/// this leaves out -, or, as written before uids sufficed, a table of the uid and the bundle's `res://` path.
+#[must_use]
+pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
+    match value {
+        toml::Value::String(s) if s.starts_with("uid://") => {
+            Some((s.split_once('#').map_or(s.as_str(), |(uid, _)| uid).to_string(), None))
+        }
+        toml::Value::Table(t) => {
+            let uid = t.get("uid")?.as_str()?;
+            let rel = t.get("path")?.as_str()?.strip_prefix("res://")?;
+            Some((uid.to_string(), Some(rel.trim_end_matches(BUNDLE_SUFFIX).to_string())))
+        }
+        _ => None,
+    }
+}
+
+/// Every reference in a value (`reference`), named by the enclosing slot's `name` or else the field it sits in.
 fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String)>) {
     match value {
         toml::Value::Table(t) => {
-            if let (Some(toml::Value::String(uid)), Some(toml::Value::String(path))) = (t.get("uid"), t.get("path"))
-                && let Some(rel) = path.strip_prefix("res://")
-            {
-                let target = rel.trim_end_matches(BUNDLE_SUFFIX).to_string();
-                out.push((field.to_string(), uid.clone(), target));
+            if let Some((uid, path)) = reference(value) {
+                out.push((field.to_string(), uid, path.unwrap_or_default()));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
-            for (key, v) in t {
+            for (key, v) in t.iter().filter(|(key, _)| *key != "uid") {
                 references(v, name.unwrap_or(key), out);
             }
         }
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
+        toml::Value::String(_) => {
+            if let Some((uid, _)) = reference(value) {
+                out.push((field.to_string(), uid, String::new()));
+            }
+        }
         _ => {}
     }
 }
@@ -1425,12 +1445,12 @@ mod tests {
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
         write(&root, ".layers/base/g/a.asset/asset.toml", "uid = \"uid://a\"\nkind = \"image\"\n");
         write(&root, ".layers/base/g/a.asset/native.texels", "texels");
+        write(&root, ".layers/base/b.asset/asset.toml", "kind = \"file\"\nslot = \"uid://a#palettes/default\"\n");
         write(
             &root,
-            ".layers/base/b.asset/asset.toml",
-            "kind = \"file\"\nslot = { uid = \"uid://a\", path = \"res://g/a.asset\" }\n",
+            ".layers/base/f.asset/asset.toml",
+            "kind = \"file\"\nold = { uid = \"uid://a\", path = \"res://g/a.asset\" }\n",
         );
-        write(&root, ".layers/base/f.asset/asset.toml", "kind = \"file\"\n");
         std::fs::create_dir_all(root.join(".layers/top")).unwrap();
         root
     }
@@ -1462,7 +1482,8 @@ mod tests {
         assert_eq!(base.entries.get("uid://a").map(String::as_str), Some("g/a.asset"));
         assert_eq!(base.entries.len(), 4, "{base:?}");
         assert_eq!(index.assets["g/a"].uid.as_deref(), Some("uid://a"));
-        assert_eq!(index.referenced_by["g/a"].len(), 1);
+        // By uid alone, and in the older form with a path.
+        assert_eq!(index.referenced_by["g/a"].len(), 2);
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // Listed now, and read: nothing is listed or read again.
         let (_, again) = open(&root);

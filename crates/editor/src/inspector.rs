@@ -385,14 +385,13 @@ fn hash_ui(ui: &mut egui::Ui, hash: &str) {
 }
 
 fn is_reference(value: &toml::Value) -> bool {
-    value.get("uid").is_some_and(toml::Value::is_str)
-        && value.get("path").and_then(toml::Value::as_str).is_some_and(|p| p.starts_with("res://"))
+    project::index::reference(value).is_some()
 }
 
 /// A reference as a chip: its asset's icon and short name, opening it on a click; red where it names nothing.
 fn reference_chip(ui: &mut egui::Ui, ws: &Workspace, value: &toml::Value, nav: &mut Option<String>) {
-    let path = value.get("path").and_then(toml::Value::as_str).unwrap_or_default();
-    let target = path.trim_start_matches("res://").trim_end_matches(project::index::BUNDLE_SUFFIX);
+    let (uid, path) = project::index::reference(value).unwrap_or_default();
+    let target = path.unwrap_or(uid);
     match ws.target(value) {
         Some(asset) => {
             let (icon, tint) = icons::for_kind(asset.kind.as_deref());
@@ -407,7 +406,7 @@ fn reference_chip(ui: &mut egui::Ui, ws: &Workspace, value: &toml::Value, nav: &
             }
         }
         None => {
-            chip(ui, icons::FILE_DASHED, target, ui.visuals().error_fg_color).on_hover_text("No such asset");
+            chip(ui, icons::FILE_DASHED, &target, ui.visuals().error_fg_color).on_hover_text("No such asset");
         }
     }
 }

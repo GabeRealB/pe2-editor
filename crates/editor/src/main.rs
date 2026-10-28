@@ -20,6 +20,7 @@ mod layers;
 mod panes;
 mod settings;
 mod theme;
+mod thumbs;
 mod upscale;
 mod watch;
 mod windows;

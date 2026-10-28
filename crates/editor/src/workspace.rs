@@ -134,6 +134,8 @@ pub struct Workspace {
     pub history: History,
     /// The label of an edit a crash left half done, rolled back when the project was opened.
     pub recovered: Option<String>,
+    /// The tree's thumbnails, kept as artifacts in the cache.
+    pub thumbs: crate::thumbs::Thumbs,
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     _lock: Lock,
@@ -286,6 +288,10 @@ impl Workspace {
             None => History::open(&cache)?,
         };
         let mut index = Index::open(&project, &cache)?;
+        // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
+        let artifacts = project::artifacts::Artifacts::open(&cache)?;
+        let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
+        let thumbs = crate::thumbs::Thumbs::start(artifacts);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
@@ -296,6 +302,7 @@ impl Workspace {
             project,
             history,
             recovered,
+            thumbs,
             layers: index.layers(),
             layer_view,
             index,
@@ -439,6 +446,7 @@ impl Workspace {
         }
         self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
         self.strips.retain(|(image, _), _| !refreshed.assets.contains(image));
+        self.thumbs.forget(&refreshed.assets);
         self.drop_lost_selection();
         Update::Refreshed(refreshed.assets.len())
     }
@@ -527,6 +535,7 @@ impl Workspace {
             self.tree = Node::build(&self.index);
             self.pictures.clear();
             self.strips.clear();
+            self.thumbs.clear();
             self.drop_lost_selection();
         }
         self.refresh_editable();
@@ -812,9 +821,8 @@ impl Workspace {
     }
     /// The asset a reference value (`{ uid, path }`) names.
     pub fn target(&self, value: &toml::Value) -> Option<&Asset> {
-        let path =
-            value.get("path")?.as_str()?.trim_start_matches("res://").trim_end_matches(project::index::BUNDLE_SUFFIX);
-        self.index.resolve(value.get("uid")?.as_str()?, path)
+        let (uid, path) = project::index::reference(value)?;
+        self.index.resolve(&uid, path.as_deref().unwrap_or_default())
     }
 
     /// An image's palettes by name.

@@ -309,7 +309,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .iter()
         .map(|r| {
             let resolved = index.resolve(&r.uid, &r.target).map(|a| a.path.clone());
-            json!({ "slot": r.slot, "uid": r.uid, "target": r.target, "resolves_to": resolved })
+            json!({ "slot": r.slot, "uid": r.uid, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
         })
         .collect();
     let by: Vec<Value> = index
@@ -323,7 +323,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
 }
 
 fn reference(r: &Reference) -> Value {
-    json!({ "from": r.from, "slot": r.slot, "uid": r.uid, "target": r.target })
+    json!({ "from": r.from, "slot": r.slot, "uid": r.uid, "target": (!r.target.is_empty()).then_some(&r.target) })
 }
 
 fn problems(index: &Index, limit: usize) -> Value {

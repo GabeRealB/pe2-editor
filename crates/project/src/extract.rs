@@ -10,6 +10,9 @@
 //! give the file's place, the file asset's slots the chunk's - as the chunk's payload. The layout's discs and stages
 //! are written as bundles too; folders, groups, files and streams carry their declarations alone.
 //!
+//! A reference is written as the referenced asset's uid alone (`"uid://..."`), where the declarations hold its path
+//! beside it: the uid decides, and a path written into every referencing asset would go stale when the asset moved.
+//!
 //! A bundle's `asset.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
 //! layer holds - each asset under its declared uid, each folder and `extraction.toml` under a new one - and marks the
 //! layer read-only, extraction's alone.
@@ -242,11 +245,42 @@ fn quote(s: &str) -> String {
     toml_edit::Value::from(s).to_string().trim().to_string()
 }
 
-/// A declaration's text without its uid, which the layer's changeset holds.
+/// A declaration's text without its uid, which the layer's changeset holds, its references by uid alone.
 fn without_uid(text: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     doc.remove("uid");
+    uids_alone(doc.as_item_mut());
     Ok(doc.to_string())
+}
+
+/// A declaration's references - `{ uid, path = "res://..." }` - written as their uids alone, everywhere in an item.
+fn uids_alone(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(table) => table.iter_mut().for_each(|(_, item)| uids_alone(item)),
+        toml_edit::Item::ArrayOfTables(tables) => {
+            tables.iter_mut().for_each(|table| table.iter_mut().for_each(|(_, item)| uids_alone(item)));
+        }
+        toml_edit::Item::Value(value) => uids_alone_in(value),
+        toml_edit::Item::None => {}
+    }
+}
+
+fn uids_alone_in(value: &mut toml_edit::Value) {
+    match value {
+        toml_edit::Value::InlineTable(table) => {
+            let uid = table.get("uid").and_then(toml_edit::Value::as_str).map(str::to_string);
+            let path = table.get("path").and_then(toml_edit::Value::as_str).is_some_and(|p| p.starts_with("res://"));
+            if let (Some(uid), true) = (uid, path) {
+                let decor = value.decor().clone();
+                *value = toml_edit::Value::from(uid);
+                *value.decor_mut() = decor;
+                return;
+            }
+            table.iter_mut().for_each(|(_, v)| uids_alone_in(v));
+        }
+        toml_edit::Value::Array(array) => array.iter_mut().for_each(uids_alone_in),
+        _ => {}
+    }
 }
 
 /// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s.
@@ -268,6 +302,7 @@ fn layout_toml(text: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     doc.remove("at");
     doc.remove("uid");
+    uids_alone(doc.as_item_mut());
     let body = doc.to_string();
     let body = body.lines().skip_while(|l| l.starts_with('#') || l.is_empty()).collect::<Vec<_>>().join("\n");
     Ok(format!("# An asset bundle, written by extraction: the layout and its slots.\n\n{body}\n"))

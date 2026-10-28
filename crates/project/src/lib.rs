@@ -1,6 +1,7 @@
 //! Projects: what a `project.toml` declares, the declarations a project is extracted by, and
 //! the extraction that fills its game layer with asset bundles.
 
+pub mod artifacts;
 pub mod cache;
 pub mod changeset;
 pub mod declarations;

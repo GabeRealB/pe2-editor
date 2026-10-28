@@ -487,9 +487,25 @@ impl TreeView<'_> {
         pick: &mut Option<String>,
     ) -> Option<egui::Response> {
         let asset = node.asset.as_deref()?;
-        let kind = self.ws.index.assets.get(asset).and_then(|a| a.kind.as_deref());
-        let job = labelled(ui.style(), kind, name, !self.ws.is_editable(asset));
-        let response = ui.add(egui::Button::selectable(self.ws.selected.as_deref() == Some(asset), job).truncate());
+        let found = self.ws.index.assets.get(asset);
+        let kind = found.and_then(|a| a.kind.as_deref());
+        let dim = !self.ws.is_editable(asset);
+        let selected = self.ws.selected.as_deref() == Some(asset);
+        // An image with a picture shows its thumbnail in place of its kind's icon, once it is made.
+        let thumbnail = found.filter(|a| preview::has_picture(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), a));
+        let button = match thumbnail {
+            Some(texture) => {
+                let side = ui.text_style_height(&egui::TextStyle::Body);
+                let tint = if dim { Color32::from_white_alpha(115) } else { Color32::WHITE };
+                let image = egui::Image::new((texture, egui::vec2(side, side))).maintain_aspect_ratio(true).tint(tint);
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let color = if dim { theme::text().gamma_multiply(DIMMED) } else { theme::text() };
+                let name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, color);
+                egui::Button::selectable(selected, (image, name))
+            }
+            None => egui::Button::selectable(selected, labelled(ui.style(), kind, name, dim)),
+        };
+        let response = ui.add(button.truncate());
         if self.reveal == Some(asset) {
             response.scroll_to_me(Some(egui::Align::Center));
         }
@@ -1128,16 +1144,12 @@ fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&str>, nav: 
 fn outgoing_refs<'a>(ws: &'a Workspace, field: &str, value: &toml::Value) -> Vec<(String, &'a Asset)> {
     let mut out = Vec::new();
     match value {
-        toml::Value::Table(t) => {
-            if let (Some(uid), Some(path)) =
-                (t.get("uid").and_then(toml::Value::as_str), t.get("path").and_then(toml::Value::as_str))
-            {
-                let target = path.trim_start_matches("res://").trim_end_matches(project::index::BUNDLE_SUFFIX);
-                if let Some(asset) = ws.index.resolve(uid, target) {
-                    out.push((field.to_string(), asset));
-                }
-                return out;
+        _ if project::index::reference(value).is_some() => {
+            if let Some(asset) = ws.target(value) {
+                out.push((field.to_string(), asset));
             }
+        }
+        toml::Value::Table(t) => {
             let name = t.get("name").and_then(toml::Value::as_str);
             for (k, v) in t {
                 out.extend(outgoing_refs(ws, name.unwrap_or(k), v));
