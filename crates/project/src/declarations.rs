@@ -68,10 +68,12 @@
 //! A file's image slot lists its `pages` - an `image`, or a place where the page holds palettes only - each image
 //! filling the pages its width needs; where a file holds an image in two chunks, each entry says which of its pages
 //! that chunk holds (`first`, `count`). A palette slot (or a palette resource of a bundle) lists its `palettes`: an
-//! image's palette by name (`image`, `palette`), or a `name`d run of `entries` colors nothing is known to draw with,
-//! placed by `slot` and `at`. An image chunk stores each page from its row to the bottom of its slot, within the
-//! 256-row column, every bit around its images zero; a palette chunk stores the rectangle its palettes span, or its
-//! `upload` (a whole slot, or `at` and `size` in one), every color outside its palettes zero.
+//! image's palette by name (`image`, `palette`), or a `name`d run of `entries` colors placed by `slot` and `at`, which
+//! no image owns: an image palette no slot names takes its colors from the run uploaded at its place (the system's
+//! text palettes, which every dialogue atlas is drawn with). An image chunk stores each page from its row to the
+//! bottom of its slot, within the 256-row column, every bit around its images zero; a palette chunk stores the
+//! rectangle its palettes span, or its `upload` (a whole slot, or `at` and `size` in one), every color outside its
+//! palettes zero.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -189,7 +191,7 @@ pub struct PageEntry {
     pub at: Option<[u32; 2]>,
 }
 
-/// A palette a slot uploads: an image's, by name, or a named run of colors nothing is known to draw with.
+/// A palette a slot uploads: an image's, by name, or a named run of colors no image owns.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PaletteEntry {
     pub image: Option<Reference>,

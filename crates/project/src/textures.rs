@@ -25,18 +25,27 @@ struct PaletteSource {
 /// release and place.
 pub struct Index {
     palettes: HashMap<(String, String), PaletteSource>,
+    /// The named runs a slot uploads (colors no image owns: the system's text palettes), by VRAM slot and place.
+    runs: HashMap<(String, [u32; 2]), PaletteSource>,
     files: HashMap<(String, u32, Option<u32>, u32), String>,
 }
 
 impl Index {
     #[must_use]
     pub fn new(decl: &Declarations) -> Index {
-        let mut palettes = HashMap::new();
+        let (mut palettes, mut runs) = (HashMap::new(), HashMap::new());
         let mut note = |file: &str, slot: &str, resource: Option<usize>, in_pages: bool, entries: &[PaletteEntry]| {
             for e in entries {
-                let (Some(image), Some(palette)) = (&e.image, &e.palette) else { continue };
-                let source = PaletteSource { file: file.to_string(), slot: slot.to_string(), resource, in_pages };
-                palettes.entry((image.target().to_string(), palette.clone())).or_insert(source);
+                let source = || PaletteSource { file: file.to_string(), slot: slot.to_string(), resource, in_pages };
+                match (&e.image, &e.palette, &e.slot, e.at) {
+                    (Some(image), Some(palette), ..) => {
+                        palettes.entry((image.target().to_string(), palette.clone())).or_insert_with(source);
+                    }
+                    (None, _, Some(vram), Some(at)) => {
+                        runs.entry((vram.target().to_string(), at)).or_insert_with(source);
+                    }
+                    _ => {}
+                }
             }
         };
         let mut files = HashMap::new();
@@ -57,7 +66,7 @@ impl Index {
                 }
             }
         }
-        Index { palettes, files }
+        Index { palettes, runs, files }
     }
 }
 
@@ -113,9 +122,12 @@ pub fn extract(
     let mut out = vec![("native.texels".to_string(), codecs::texture::texel_bytes(&texels, tex.bpp))];
     for palette in &tex.palettes {
         let (Some(slot), Some(place)) = (&palette.slot, palette.at) else { continue }; // an executable's
+        // A slot naming the image's palette uploads it; else a named run at its place (a palette the system uploads
+        // for every image drawn with it).
         let source = index
             .palettes
             .get(&(path.to_string(), palette.name.clone()))
+            .or_else(|| index.runs.get(&(slot.target().to_string(), place)))
             .with_context(|| format!("{}: no file uploads it", palette.name))?;
         let vram = place_of(decl, slot.target(), place)?;
         let colors = variant_colors(decl, source, release, reader.read, vram, tex.entries(&palette.name))
