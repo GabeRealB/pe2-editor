@@ -73,7 +73,7 @@ impl PaneKind {
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Assets | PaneKind::Vram | PaneKind::Settings)
+        matches!(self, PaneKind::Assets | PaneKind::Vram | PaneKind::Settings | PaneKind::Preview)
     }
 
     pub fn title(self) -> &'static str {
@@ -645,15 +645,58 @@ fn preview_ui(
     nav: &mut Option<String>,
     view: &mut Preview,
 ) {
+    // A plain file: its text or bytes.
+    if let Some((_, entry)) = subject.and_then(|s| ws.entry_at(s))
+        && entry.kind == project::index::Kind::File
+    {
+        let disk = entry.disk.clone();
+        ws.viewer.ui(ui, &disk);
+        return;
+    }
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)) else {
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
     };
     let shown = ws.pictures_of(asset);
     if shown.is_empty() {
-        ui.label(RichText::new("Nothing to preview for this asset yet").color(theme::weak()));
+        files_view_ui(ui, ws, &asset.clone());
         return;
     }
+    scroll(ui, "preview", |ui| pictures_ui(ui, ws, nav, view, shown));
+}
+
+/// An asset without a picture: one of its files at a time, as text or bytes - its native form first, by default.
+fn files_view_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
+    if asset.files.is_empty() {
+        ui.label(RichText::new("Nothing to preview for this asset").color(theme::weak()));
+        return;
+    }
+    let default = asset.files.iter().find(|f| f.name != project::index::ASSET_FILE).unwrap_or(&asset.files[0]);
+    let mut chosen = ws.viewed_file.get(&asset.path).cloned().unwrap_or_else(|| default.name.clone());
+    if !asset.files.iter().any(|f| f.name == chosen) {
+        chosen.clone_from(&default.name);
+    }
+    ui.horizontal_wrapped(|ui| {
+        for file in &asset.files {
+            ui.selectable_value(&mut chosen, file.name.clone(), &file.name);
+        }
+    });
+    ws.viewed_file.insert(asset.path.clone(), chosen.clone());
+    ui.add_space(4.0);
+    if let Some(file) = asset.files.iter().find(|f| f.name == chosen) {
+        let path = file.path.clone();
+        ws.viewer.ui(ui, &path);
+    }
+}
+
+/// An asset's pictures: its own, or those its slots hold.
+fn pictures_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    nav: &mut Option<String>,
+    view: &mut Preview,
+    shown: Vec<(Option<String>, String)>,
+) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Upscaling").small().color(theme::weak()));
         upscale_picker(ui, &mut view.upscale);

@@ -167,6 +167,9 @@ pub struct Workspace {
     pub variant_choice: HashMap<String, usize>,
     /// A field being edited in the inspector.
     pub field_edit: Option<FieldEdit>,
+    /// The files shown as text or bytes, and which file of an asset without a picture is shown.
+    pub viewer: crate::viewer::Viewer,
+    pub viewed_file: HashMap<String, String>,
     /// An asset's declaration being edited in the inspector, as text: the asset, the text.
     pub declaration_draft: Option<(String, String)>,
 }
@@ -324,6 +327,8 @@ impl Workspace {
             strips: HashMap::new(),
             variant_choice: HashMap::new(),
             field_edit: None,
+            viewer: crate::viewer::Viewer::default(),
+            viewed_file: HashMap::new(),
             declaration_draft: None,
         };
         workspace.refresh_editable();
