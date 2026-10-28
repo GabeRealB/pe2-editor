@@ -7,6 +7,7 @@ pub mod declarations;
 pub mod extract;
 pub mod index;
 pub mod lock;
+pub mod stack;
 pub mod store;
 pub mod textures;
 pub mod uid;
@@ -83,14 +84,30 @@ pub struct Game {
     pub releases: BTreeMap<String, Vec<DiscImage>>,
 }
 
+/// What a layer may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Assets and plain files: the game layer, a mod's assets, the project's own.
+    Assets,
+    /// Plain files only - code. A mount is one whose content is an external tree left where it is.
+    Files,
+}
+
 pub struct Layer {
     pub name: String,
-    /// Its directory.
+    pub kind: LayerKind,
+    /// Its content's directory: in `.layers/`, or a mounted tree.
     pub path: PathBuf,
-    /// Its changeset, beside its directory: `<path>.toml`.
+    /// Where its content appears in the resolved project: empty for a layer at the top, the mount point for a mount.
+    pub at: String,
+    /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
     pub changeset: PathBuf,
-    /// Only its maker writes it: stated in `project.toml`, or the game layer (extraction's alone).
+    /// Its content is written only by its maker: stated in `project.toml`, or the game layer (extraction's alone).
     pub read_only: bool,
+    /// Whether its changeset is the project's to write: a mount's is, though its tree may be read-only.
+    pub changeset_writable: bool,
+    /// A mount, which `project.toml` declares apart (`[[mount]]`) until mounts move into the stack.
+    pub mounted: bool,
 }
 
 pub struct Mount {
@@ -128,22 +145,48 @@ impl Project {
             releases: g.releases.into_iter().map(|(r, spec)| (r, spec.discs)).collect(),
         });
         let game_layer = game.as_ref().map(|g| g.layer.clone());
-        let layers = file
-            .layer
-            .into_iter()
-            .map(|l| {
-                let path = resolve_path(&root, l.path.as_deref().unwrap_or(&format!("{LAYERS}/{}", l.name)));
-                let mut changeset = path.clone().into_os_string();
-                changeset.push(".toml");
-                let read_only = l.read_only || game_layer.as_deref() == Some(l.name.as_str());
-                Layer { name: l.name, path, changeset: PathBuf::from(changeset), read_only }
-            })
-            .collect();
-        let mounts = file
+        let mounts: Vec<Mount> = file
             .mount
             .into_iter()
-            .map(|m| Mount { at: m.at, path: resolve_path(&root, &m.path), read_only: m.read_only })
+            .map(|m| Mount {
+                at: m.at.trim_matches('/').to_string(),
+                path: resolve_path(&root, &m.path),
+                read_only: m.read_only,
+            })
             .collect();
+        // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
+        let mut layers: Vec<Layer> = mounts
+            .iter()
+            .map(|m| Layer {
+                name: m.at.clone(),
+                kind: LayerKind::Files,
+                path: std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()),
+                at: m.at.clone(),
+                changeset: root.join(LAYERS).join(format!("{}.toml", m.at)),
+                read_only: m.read_only,
+                changeset_writable: true,
+                mounted: true,
+            })
+            .collect();
+        for l in file.layer {
+            let path = resolve_path(&root, l.path.as_deref().unwrap_or(&format!("{LAYERS}/{}", l.name)));
+            let mut changeset = path.clone().into_os_string();
+            changeset.push(".toml");
+            let read_only = l.read_only || game_layer.as_deref() == Some(l.name.as_str());
+            if layers.iter().any(|m| m.name == l.name) {
+                bail!("{}: the layer {} is named as a mount point is", root.join(FILE).display(), l.name);
+            }
+            layers.push(Layer {
+                name: l.name,
+                kind: LayerKind::Assets,
+                path,
+                at: String::new(),
+                changeset: PathBuf::from(changeset),
+                read_only,
+                changeset_writable: !read_only,
+                mounted: false,
+            });
+        }
         Ok(Project { root, game, layers, mounts })
     }
 

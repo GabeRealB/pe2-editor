@@ -8,16 +8,21 @@
 //!
 //! Under `WSLg` the editor talks X11: `WSLg`'s Wayland compositor disconnects it when it resizes on a scaled display (the
 //! event loop ends in "Broken pipe"). `PE2_EDITOR_BACKEND=wayland` or `x11` chooses either anywhere.
+//!
+//! Panes moved into windows of their own open as native windows; `PE2_EDITOR_EMBED_WINDOWS=1` draws those windows
+//! inside the main one instead (and so in its screenshots).
 
 mod app;
 mod external;
 mod icons;
 mod inspector;
+mod layers;
 mod panes;
 mod settings;
 mod theme;
 mod upscale;
 mod watch;
+mod windows;
 mod workspace;
 
 use eframe::egui;

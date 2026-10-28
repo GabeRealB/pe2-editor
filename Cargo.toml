@@ -46,4 +46,6 @@ serde = { version = "1", features = ["derive"] }
 png = "0.18"
 sha1 = "0.10"
 toml = { version = "0.8", features = ["preserve_order"] }
+# Edits to project.toml that keep its comments and layout; the version `toml` reads with.
+toml_edit = "0.22"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }

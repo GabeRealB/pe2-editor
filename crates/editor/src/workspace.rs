@@ -1,13 +1,14 @@
-//! An open project as the editor holds it: its index, kept up to date by a watcher on its layers, the asset tree, the
-//! selection with its history, the pictures decoded so far, and the link agents reach it by (`mcp::link`).
+//! An open project as the editor holds it: its index, kept up to date by a watcher on its layers, the tree of its
+//! entries, the selection with its history, the pictures decoded so far, the user's view of the layers (eyes, hand
+//! locks, the active layer), and the link agents reach it by (`mcp::link`).
 
 use anyhow::Result;
 use eframe::egui;
 use project::Project;
 use project::cache::Cache;
-use project::index::{Asset, Index};
+use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -15,13 +16,17 @@ use std::time::Duration;
 use crate::settings::Upscale;
 use crate::watch::{Change, Watch};
 
-/// A directory of the asset tree: its subdirectories and, where an asset has this path, that asset. An image with
-/// several variants - its other looks - is a virtual folder of them: choosing one shows the image so.
+/// A node of the tree of the resolved project: its children and, where an entry has this path, that entry (its real
+/// path, a bundle's with `.asset`) and the asset it is, or that it is a plain file. An image with several variants -
+/// its other looks - is a virtual folder of them: choosing one shows the image so.
 #[derive(Default)]
 pub struct Node {
     pub children: BTreeMap<String, Node>,
     pub asset: Option<String>,
     pub entry: Option<Entry>,
+    /// The resolved entry here, by its real path.
+    pub path: Option<String>,
+    pub file: bool,
 }
 
 /// A virtual entry: an image and one of its variants.
@@ -34,17 +39,26 @@ pub struct Entry {
 impl Node {
     fn build(index: &Index) -> Node {
         let mut root = Node::default();
-        for (path, asset) in &index.assets {
+        for (real, entry) in &index.entries {
+            let path = real.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(real);
             let mut node = &mut root;
             for part in path.split('/') {
                 node = node.children.entry(part.to_string()).or_default();
             }
-            node.asset = Some(path.clone());
-            let names = variant_names(asset);
-            if names.len() > 1 {
-                for (i, name) in names.into_iter().enumerate() {
-                    let entry = Some(Entry { image: path.clone(), variant: i });
-                    node.children.insert(name, Node { entry, ..Node::default() });
+            node.path = Some(real.clone());
+            match entry.kind {
+                Kind::Folder => {}
+                Kind::File => node.file = true,
+                Kind::Asset => {
+                    let Some(asset) = index.assets.get(path) else { continue };
+                    node.asset = Some(path.to_string());
+                    let names = variant_names(asset);
+                    if names.len() > 1 {
+                        for (i, name) in names.into_iter().enumerate() {
+                            let entry = Some(Entry { image: path.to_string(), variant: i });
+                            node.children.insert(name, Node { entry, ..Node::default() });
+                        }
+                    }
                 }
             }
         }
@@ -82,9 +96,40 @@ pub struct Shown {
     pub size: egui::Vec2,
 }
 
+/// One user's view of the stack, kept in the project cache (`editor/layers.toml`), so toggling a layer never changes a
+/// tracked file: the layers hidden from the view (the eyes), the layers locked by hand, the active layer, and the
+/// layer shown alone, if one is - a mode over the others, which leaves them as they were when it ends.
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LayerView {
+    #[serde(default)]
+    pub hidden: BTreeSet<String>,
+    #[serde(default)]
+    pub locked: BTreeSet<String>,
+    #[serde(default)]
+    pub active: Option<String>,
+    /// Shown alone: the layers above it hidden, those below shown, every other layer locked, and it the active one.
+    #[serde(default)]
+    pub solo: Option<String>,
+}
+
+impl LayerView {
+    /// The layers hidden from the view: the eyes', or, while a layer is shown alone, the layers above it.
+    fn hidden(&self, layers: &[LayerInfo]) -> BTreeSet<String> {
+        match &self.solo {
+            Some(solo) => layers.iter().skip_while(|l| l.name != *solo).skip(1).map(|l| l.name.clone()).collect(),
+            None => self.hidden.clone(),
+        }
+    }
+}
+
+const LAYER_VIEW: &str = "editor/layers.toml";
+
 pub struct Workspace {
     pub project: Project,
     pub index: Index,
+    /// The stack as the layer panel shows it, bottom to top.
+    pub layers: Vec<LayerInfo>,
+    pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     _lock: Lock,
     cache_dir: PathBuf,
@@ -98,6 +143,9 @@ pub struct Workspace {
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
     pub tree: Node,
+    /// The tree's paths (an asset's without `.asset`) that can be modified, and the folders holding one: the rest is
+    /// drawn dimmed.
+    editable: HashSet<String>,
     pub selected: Option<String>,
     back: Vec<String>,
     forward: Vec<String>,
@@ -192,10 +240,17 @@ impl Workspace {
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
         let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
         let cache = Cache::open(&project, &lock)?;
-        let index = Index::open(&project, &cache)?;
+        let mut index = Index::open(&project, &cache)?;
+        let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default();
+        index.set_hidden(&layer_view.hidden(&index.layers()));
         let tree = Node::build(&index);
-        Ok(Workspace {
+        let mut workspace = Workspace {
             project,
+            layers: index.layers(),
+            layer_view,
             index,
             _lock: lock,
             cache_dir: cache.dir,
@@ -205,6 +260,7 @@ impl Workspace {
             requests: None,
             link_error: None,
             tree,
+            editable: HashSet::new(),
             selected: None,
             back: vec![],
             forward: vec![],
@@ -213,7 +269,9 @@ impl Workspace {
             pictures: HashMap::new(),
             strips: HashMap::new(),
             variant_choice: HashMap::new(),
-        })
+        };
+        workspace.refresh_editable();
+        Ok(workspace)
     }
 
     /// Start watching the layers, once: every change on disk is then brought in by `update`.
@@ -298,20 +356,219 @@ impl Workspace {
         if refreshed.project_file {
             return Update::Reopen;
         }
+        self.layers = self.index.layers();
+        self.tree = Node::build(&self.index);
+        self.refresh_editable();
         if refreshed.assets.is_empty() {
             return Update::Nothing;
         }
         self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
         self.strips.retain(|(image, _), _| !refreshed.assets.contains(image));
-        self.tree = Node::build(&self.index);
-        if self.selected.as_ref().is_some_and(|s| !self.index.assets.contains_key(s)) {
-            self.selected = None;
-        }
+        self.drop_lost_selection();
         Update::Refreshed(refreshed.assets.len())
     }
 
     pub fn selected_asset(&self) -> Option<&Asset> {
         self.index.assets.get(self.selected.as_deref()?)
+    }
+
+    /// The entry at a tree path when it is not an asset (a plain file, a folder): its real path and the entry.
+    pub fn entry_at(&self, path: &str) -> Option<(&String, &project::index::Entry)> {
+        if self.index.assets.contains_key(path) {
+            return None;
+        }
+        self.index.entries.get_key_value(path)
+    }
+
+    /// Whether a tree path is an asset or an entry of the view.
+    pub fn exists(&self, path: &str) -> bool {
+        self.index.assets.contains_key(path) || self.index.entries.contains_key(path)
+    }
+
+    fn drop_lost_selection(&mut self) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|s| !self.index.assets.contains_key(s) && !self.index.entries.contains_key(s))
+        {
+            self.selected = None;
+        }
+    }
+
+    // --- the layers ---------------------------------------------------------------------------------------------------
+
+    /// A layer is locked by nature where only its maker writes it - the game layer, a read-only tree - or by hand.
+    pub fn locked_by_nature(layer: &LayerInfo) -> bool {
+        layer.read_only || (!layer.mounted && !layer.writable)
+    }
+
+    pub fn is_locked(&self, layer: &LayerInfo) -> bool {
+        Self::locked_by_nature(layer) || self.layer_view.locked.contains(&layer.name) || self.locked_by_solo(layer)
+    }
+
+    /// Locked because another layer is shown alone.
+    pub fn locked_by_solo(&self, layer: &LayerInfo) -> bool {
+        self.layer_view.solo.as_ref().is_some_and(|solo| *solo != layer.name)
+    }
+
+    /// Hidden from the view: by its eye, or because a layer below it is shown alone.
+    pub fn is_hidden(&self, layer: &LayerInfo) -> bool {
+        self.layer_view.hidden(&self.layers).contains(&layer.name)
+    }
+
+    /// The active layer: the one shown alone, else the user's choice, else the topmost asset layer not locked by
+    /// nature.
+    pub fn active_layer(&self) -> Option<&LayerInfo> {
+        let chosen = self.layer_view.solo.as_ref().or(self.layer_view.active.as_ref());
+        let chosen = chosen.and_then(|a| self.layers.iter().find(|l| l.name == *a));
+        chosen.or_else(|| self.layers.iter().rev().find(|l| !l.mounted && !Self::locked_by_nature(l)))
+    }
+
+    /// What the layer panel shows for an entry beside its name: the layer that overrode or moved it, or the one of the
+    /// user's own that made it; nothing for what comes from the game or a mounted tree untouched.
+    pub fn badge(&self, real: &str) -> Option<String> {
+        let entry = self.index.entries.get(real)?;
+        if let Some(layer) = entry.overrides.last() {
+            return Some(format!("overridden in {layer}"));
+        }
+        if let Some(layer) = &entry.moved {
+            return Some(format!("moved by {layer}"));
+        }
+        let home = self.layers.iter().find(|l| l.name == entry.home)?;
+        (!home.mounted && !Self::locked_by_nature(home)).then(|| entry.home.clone())
+    }
+
+    fn save_layer_view(&self) -> Result<()> {
+        let path = self.cache_dir.join(LAYER_VIEW);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        project::cache::write_atomic(&path, toml::to_string(&self.layer_view)?.as_bytes())
+    }
+
+    /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
+    fn apply_eyes(&mut self) -> Result<()> {
+        if self.index.set_hidden(&self.layer_view.hidden(&self.layers)) {
+            self.tree = Node::build(&self.index);
+            self.pictures.clear();
+            self.strips.clear();
+            self.drop_lost_selection();
+        }
+        self.refresh_editable();
+        self.save_layer_view()
+    }
+
+    /// Which entries can be modified: those whose content comes from a layer that is not locked - by nature, by hand
+    /// or by a solo - and, while a layer is soloed, every entry it creates, overrides or moves; with the folders
+    /// holding any of them.
+    fn refresh_editable(&mut self) {
+        let unlocked: HashSet<&str> =
+            self.layers.iter().filter(|l| !self.is_locked(l)).map(|l| l.name.as_str()).collect();
+        let solo = self.layer_view.solo.as_deref();
+        let mut editable = HashSet::new();
+        for (real, entry) in &self.index.entries {
+            let touched = solo.is_some_and(|solo| {
+                entry.home == solo || entry.overrides.iter().any(|l| l == solo) || entry.moved.as_deref() == Some(solo)
+            });
+            if !unlocked.contains(entry.layer.as_str()) && !touched {
+                continue;
+            }
+            let mut path = real.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(real);
+            while editable.insert(path.to_string()) {
+                let Some((parent, _)) = path.rsplit_once('/') else { break };
+                path = parent;
+            }
+        }
+        self.editable = editable;
+    }
+
+    /// Whether what is at a tree path can be modified, or holds something that can.
+    pub fn is_editable(&self, path: &str) -> bool {
+        self.editable.contains(path)
+    }
+
+    /// Toggle a layer's eye.
+    ///
+    /// # Errors
+    /// The user's view cannot be saved.
+    /// While a layer is soloed, the solo decides what is shown: the eyes wait until it ends.
+    pub fn toggle_eye(&mut self, name: &str) -> Result<()> {
+        if self.layer_view.solo.is_some() {
+            return Ok(());
+        }
+        if !self.layer_view.hidden.remove(name) {
+            self.layer_view.hidden.insert(name.to_string());
+        }
+        self.apply_eyes()
+    }
+
+    /// Show a layer alone - the layers above it hidden, those below shown (its entries stand on them), every other
+    /// layer locked, it the active one - or, when it is shown alone already, end that: the eyes, locks and active
+    /// layer are as they were.
+    ///
+    /// # Errors
+    /// The user's view cannot be saved.
+    pub fn solo(&mut self, name: &str) -> Result<()> {
+        self.layer_view.solo =
+            if self.layer_view.solo.as_deref() == Some(name) { None } else { Some(name.to_string()) };
+        self.apply_eyes()
+    }
+
+    /// Lock a layer by hand, or unlock it.
+    ///
+    /// # Errors
+    /// The user's view cannot be saved.
+    pub fn toggle_lock(&mut self, name: &str) -> Result<()> {
+        if self.layer_view.solo.is_some() {
+            return Ok(());
+        }
+        if !self.layer_view.locked.remove(name) {
+            self.layer_view.locked.insert(name.to_string());
+        }
+        self.refresh_editable();
+        self.save_layer_view()
+    }
+
+    /// Make a layer the active one: where new entries, edits and overrides go.
+    ///
+    /// # Errors
+    /// The user's view cannot be saved.
+    pub fn activate(&mut self, name: &str) -> Result<()> {
+        if self.layer_view.solo.is_some() {
+            return Ok(());
+        }
+        self.layer_view.active = Some(name.to_string());
+        self.save_layer_view()
+    }
+
+    /// The stack's own layers (not the mounts), bottom to top.
+    pub fn stack_order(&self) -> Vec<String> {
+        self.layers.iter().filter(|l| !l.mounted).map(|l| l.name.clone()).collect()
+    }
+
+    /// Put the stack's own layers in this order (bottom to top), if it keeps what each needs: written to
+    /// `project.toml`, which the watcher sees and the project is opened again.
+    ///
+    /// # Errors
+    /// Why the order cannot be: a layer it would put below one it needs, or `project.toml` not written.
+    pub fn reorder(&self, order: &[String]) -> Result<()> {
+        project::stack::reorder(&self.project, &self.layers, order)
+    }
+
+    /// Add a new, empty layer at the top of the stack.
+    ///
+    /// # Errors
+    /// The name is not one a layer may take, or it cannot be written.
+    pub fn add_layer(&self, name: &str) -> Result<()> {
+        project::stack::add(&self.project, name)
+    }
+
+    /// Take a layer out of the stack; its files stay on disk.
+    ///
+    /// # Errors
+    /// Another layer needs it, it is the game layer or a mount, or `project.toml` cannot be rewritten.
+    pub fn remove_layer(&self, name: &str) -> Result<()> {
+        project::stack::remove(&self.project, &self.layers, name)
     }
 
     pub fn can_go_back(&self) -> bool {

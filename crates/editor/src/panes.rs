@@ -13,8 +13,9 @@ use crate::settings::{EditorSettings, Preview, Theme, Tools, Upscale};
 use crate::workspace::{Entry, Node, Workspace, cells_of};
 use crate::{icons, theme};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Pane {
+/// What a pane shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PaneKind {
     Assets,
     Preview,
     Inspector,
@@ -23,58 +24,121 @@ pub enum Pane {
     Project,
     Settings,
     Vram,
+    Layers,
+    Layer,
 }
 
-impl Pane {
-    pub const ALL: [Pane; 8] = [
-        Pane::Assets,
-        Pane::Preview,
-        Pane::Vram,
-        Pane::Inspector,
-        Pane::References,
-        Pane::Problems,
-        Pane::Project,
-        Pane::Settings,
+impl PaneKind {
+    pub const ALL: [PaneKind; 10] = [
+        PaneKind::Assets,
+        PaneKind::Preview,
+        PaneKind::Vram,
+        PaneKind::Layer,
+        PaneKind::Inspector,
+        PaneKind::References,
+        PaneKind::Problems,
+        PaneKind::Layers,
+        PaneKind::Project,
+        PaneKind::Settings,
     ];
 
     pub fn icon(self) -> &'static str {
         match self {
-            Pane::Assets => icons::FOLDER,
-            Pane::Preview => icons::IMAGE,
-            Pane::Inspector => icons::FILE_TEXT,
-            Pane::References => icons::STACK,
-            Pane::Problems => icons::WARNING,
-            Pane::Project => icons::HARD_DRIVES,
-            Pane::Settings => icons::GEAR,
-            Pane::Vram => icons::SQUARES_FOUR,
+            PaneKind::Assets => icons::FOLDER,
+            PaneKind::Preview => icons::IMAGE,
+            PaneKind::Inspector => icons::FILE_TEXT,
+            PaneKind::References => icons::STACK,
+            PaneKind::Problems => icons::WARNING,
+            PaneKind::Project => icons::HARD_DRIVES,
+            PaneKind::Settings => icons::GEAR,
+            PaneKind::Vram => icons::SQUARES_FOUR,
+            PaneKind::Layers => icons::STACK_SIMPLE,
+            PaneKind::Layer => icons::GIT_DIFF,
         }
+    }
+
+    /// Whether it may be open several times, each instance with its own state; the others are singletons.
+    pub fn several(self) -> bool {
+        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Vram)
+    }
+
+    /// Whether it shows one asset or entry: the selection, or the one an instance is pinned to.
+    pub fn shows_subject(self) -> bool {
+        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References)
+    }
+
+    /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
+    /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
+    fn scrolls_itself(self) -> bool {
+        matches!(self, PaneKind::Assets | PaneKind::Vram | PaneKind::Settings)
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Pane::Assets => "Assets",
-            Pane::Preview => "Preview",
-            Pane::Inspector => "Inspector",
-            Pane::References => "References",
-            Pane::Problems => "Problems",
-            Pane::Project => "Project",
-            Pane::Settings => "Settings",
-            Pane::Vram => "VRAM",
+            PaneKind::Assets => "Assets",
+            PaneKind::Preview => "Preview",
+            PaneKind::Inspector => "Inspector",
+            PaneKind::References => "References",
+            PaneKind::Problems => "Problems",
+            PaneKind::Project => "Project",
+            PaneKind::Settings => "Settings",
+            PaneKind::Vram => "VRAM",
+            PaneKind::Layers => "Layers",
+            PaneKind::Layer => "Layer",
         }
     }
 }
 
-/// The default layout: assets and project on the left, the preview in the middle, the inspector over the
-/// references and problems on the right.
+/// A pane in a layout: its kind, and which instance of it (a singleton's is 0, as is the first of the others).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Pane {
+    pub kind: PaneKind,
+    pub instance: u32,
+}
+
+impl Pane {
+    pub const fn first(kind: PaneKind) -> Pane {
+        Pane { kind, instance: 0 }
+    }
+}
+
+/// What an instance keeps of its own: the entry it is pinned to (its real path), where it does not follow the
+/// selection - unlinked from it, as an inspector locked to one asset.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneState {
+    #[serde(default)]
+    pub pinned: Option<String>,
+}
+
+/// What a tab asks for, done once every layout is drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaneAction {
+    /// Another instance of its kind, beside it.
+    Another,
+    /// Show this entry, whatever is selected.
+    Pin(String),
+    /// Follow the selection again.
+    Follow,
+    /// Into a window of its own.
+    ToNewWindow,
+    /// Into another window; none: the main window.
+    ToWindow(Option<u64>),
+    /// Its tab closed: an instance after the first goes, a first instance is hidden in the main window.
+    Close,
+}
+
+/// The default layout: assets and project on the left, the preview, the VRAM and the active layer's changeset in the
+/// middle, the inspector over the layers, references and problems on the right.
 pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let mut tiles = Tiles::default();
-    let left = [Pane::Assets, Pane::Project].map(|p| tiles.insert_pane(p));
+    let left = [PaneKind::Assets, PaneKind::Project].map(|k| tiles.insert_pane(Pane::first(k)));
     let left = tiles.insert_tab_tile(left.to_vec());
-    let center = [Pane::Preview, Pane::Vram].map(|p| tiles.insert_pane(p));
+    let center = [PaneKind::Preview, PaneKind::Vram, PaneKind::Layer].map(|k| tiles.insert_pane(Pane::first(k)));
     let center = tiles.insert_tab_tile(center.to_vec());
-    let inspector = tiles.insert_pane(Pane::Inspector);
+    let inspector = tiles.insert_pane(Pane::first(PaneKind::Inspector));
     let inspector = tiles.insert_tab_tile(vec![inspector]);
-    let references = [Pane::References, Pane::Problems].map(|p| tiles.insert_pane(p));
+    let references =
+        [PaneKind::Layers, PaneKind::References, PaneKind::Problems].map(|k| tiles.insert_pane(Pane::first(k)));
     let references = tiles.insert_tab_tile(references.to_vec());
     let right = tiles.insert_vertical_tile(vec![inspector, references]);
     if let Some(Tile::Container(egui_tiles::Container::Linear(linear))) = tiles.get_mut(right) {
@@ -90,11 +154,6 @@ pub fn default_layout() -> egui_tiles::Tree<Pane> {
     egui_tiles::Tree::new(egui::Id::unique("pe2_editor_layout"), root, tiles)
 }
 
-/// The tile of a pane, if the layout has one.
-pub fn tile_of(tree: &egui_tiles::Tree<Pane>, pane: Pane) -> Option<TileId> {
-    tree.tiles.iter().find_map(|(id, tile)| matches!(tile, Tile::Pane(p) if *p == pane).then_some(*id))
-}
-
 /// What the layout needs to draw the panes: the open project, and where a click asks to go - `nav` for a link
 /// (the asset tree then reveals the asset), `pick` for a click in the tree itself (which must not scroll it).
 pub struct Panes<'a> {
@@ -102,13 +161,22 @@ pub struct Panes<'a> {
     pub nav: Option<String>,
     pub pick: Option<String>,
     pub settings: &'a mut EditorSettings,
+    pub layers: &'a mut crate::layers::LayersState,
+    /// Each instance's own state.
+    pub states: &'a mut std::collections::BTreeMap<Pane, PaneState>,
+    /// The windows a tab may move to, by id and title; and the one this layout is in (none: the main window).
+    pub windows: &'a [(u64, String)],
+    pub window: Option<u64>,
+    /// What tabs asked for, by tile.
+    pub actions: Vec<(TileId, PaneAction)>,
     /// A line for the status bar: what an action did, or why it failed.
     pub message: Option<String>,
 }
 
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
-        if *pane == Pane::Settings {
+        let pane = *pane;
+        if pane.kind == PaneKind::Settings {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 settings_ui(ui, self.settings, self.workspace.as_deref(), &mut self.message);
@@ -121,40 +189,68 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             });
             return UiResponse::None;
         };
-        egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            let nav = &mut self.nav;
-            match pane {
-                Pane::Assets => assets_ui(ui, ws, &mut self.pick),
-                Pane::Preview => {
-                    let view = &mut self.settings.preview;
-                    scroll(ui, "preview", |ui| preview_ui(ui, ws, nav, view));
+        // An instance pinned to an entry shows it; the others show the selection.
+        let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
+        let subject = pinned.clone().or_else(|| ws.selected.clone());
+        let (nav, pick, settings, layers, message) =
+            (&mut self.nav, &mut self.pick, &mut *self.settings, &mut *self.layers, &mut self.message);
+        let mut contents = |ui: &mut egui::Ui| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                if let Some(pinned) = pinned.as_deref().filter(|p| !ws.exists(p)) {
+                    ui.label(RichText::new(format!("{pinned} is no longer in the project")).color(theme::weak()));
+                    return;
                 }
-                Pane::Vram => vram_ui(ui, ws, nav, self.settings.preview.upscale),
-                Pane::Inspector => {
-                    let (tools, message) = (&self.settings.tools, &mut self.message);
-                    scroll(ui, "inspector", |ui| crate::inspector::inspector_ui(ui, ws, nav, tools, message));
+                let subject = subject.as_deref();
+                match pane.kind {
+                    PaneKind::Assets => assets_ui(ui, ws, pick),
+                    PaneKind::Preview => preview_ui(ui, ws, subject, nav, &mut settings.preview),
+                    PaneKind::Vram => vram_ui(ui, ws, nav, settings.preview.upscale),
+                    PaneKind::Inspector => {
+                        crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message);
+                    }
+                    PaneKind::References => references_ui(ui, ws, subject, nav),
+                    PaneKind::Problems => problems_ui(ui, ws, nav),
+                    PaneKind::Project => project_ui(ui, ws, nav),
+                    PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
+                    PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav),
+                    PaneKind::Settings => {}
                 }
-                Pane::References => scroll(ui, "references", |ui| references_ui(ui, ws, nav)),
-                Pane::Problems => scroll(ui, "problems", |ui| problems_ui(ui, ws, nav)),
-                Pane::Project => scroll(ui, "project", |ui| project_ui(ui, ws, nav)),
-                Pane::Settings => {}
-            }
-        });
+            });
+        };
+        if pane.kind.scrolls_itself() {
+            contents(ui);
+        } else {
+            egui::ScrollArea::vertical().id_salt(pane).auto_shrink(false).show(ui, contents);
+        }
         UiResponse::None
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
-        format!("{}  {}", pane.icon(), pane.title()).into()
+        let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
+        let pinned = self.states.get(pane).and_then(|s| s.pinned.as_deref()).map_or_else(String::new, |pinned| {
+            let name = pinned.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(pinned);
+            format!("  {}  {name}", icons::PUSH_PIN)
+        });
+        format!("{}  {}{number}{pinned}", pane.kind.icon(), pane.kind.title()).into()
     }
 
     fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile_id: TileId) -> bool {
         true
     }
 
-    fn on_tab_close(&mut self, tiles: &mut Tiles<Pane>, tile_id: TileId) -> bool {
-        tiles.set_visible(tile_id, false);
+    /// The app decides what closing does (`PaneAction::Close`): `egui_tiles` never removes the tile itself.
+    fn on_tab_close(&mut self, _tiles: &mut Tiles<Pane>, tile_id: TileId) -> bool {
+        self.actions.push((tile_id, PaneAction::Close));
         false
+    }
+
+    /// A tab's menu: another instance, pinning, moving between windows.
+    fn on_tab_button(&mut self, tiles: &mut Tiles<Pane>, tile_id: TileId, response: egui::Response) -> egui::Response {
+        let Some(Tile::Pane(pane)) = tiles.get(tile_id) else { return response };
+        let pane = *pane;
+        response.context_menu(|ui| self.tab_menu(ui, tile_id, pane));
+        response
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
@@ -177,6 +273,43 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         state: &egui_tiles::TabState,
     ) -> Color32 {
         if state.active { theme::text() } else { theme::weak() }
+    }
+}
+
+impl Panes<'_> {
+    fn tab_menu(&mut self, ui: &mut egui::Ui, tile_id: TileId, pane: Pane) {
+        let mut ask = |action| self.actions.push((tile_id, action));
+        if pane.kind.several() && ui.button(format!("{}  Another {}", icons::PLUS, pane.kind.title())).clicked() {
+            ask(PaneAction::Another);
+        }
+        if pane.kind.shows_subject() {
+            let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
+            let selected = self.workspace.as_ref().and_then(|ws| ws.selected.clone());
+            if pinned.is_some() {
+                if ui.button("Follow the selection").clicked() {
+                    ask(PaneAction::Follow);
+                }
+            } else if let Some(selected) = selected {
+                let name = selected.rsplit('/').next().unwrap_or(&selected).to_string();
+                let hint = "Keep showing it whatever is selected";
+                if ui.button(format!("{}  Pin to {name}", icons::PUSH_PIN)).on_hover_text(hint).clicked() {
+                    ask(PaneAction::Pin(selected));
+                }
+            }
+        }
+        ui.separator();
+        if ui.button(format!("{}  Move to a new window", icons::APP_WINDOW)).clicked() {
+            ask(PaneAction::ToNewWindow);
+        }
+        for (id, title) in self.windows {
+            if Some(*id) != self.window && ui.button(format!("Move to {title}")).clicked() {
+                ask(PaneAction::ToWindow(Some(*id)));
+            }
+        }
+        if self.window.is_some() && ui.button(format!("{}  Move to the main window", icons::ARROW_SQUARE_IN)).clicked()
+        {
+            ask(PaneAction::ToWindow(None));
+        }
     }
 }
 
@@ -222,8 +355,10 @@ impl TreeView<'_> {
             if child.children.is_empty() {
                 if let Some(entry) = &child.entry {
                     self.entry_label(ui, name, entry, chosen);
+                } else if child.asset.is_some() {
+                    ui.horizontal(|ui| self.asset_label(ui, name, child, pick));
                 } else {
-                    self.asset_label(ui, name, child.asset.as_deref(), pick);
+                    self.file_label(ui, name, child, pick);
                 }
                 continue;
             }
@@ -240,7 +375,7 @@ impl TreeView<'_> {
                 .show_header(ui, |ui| {
                     let label = match &child.entry {
                         Some(entry) => Some(self.entry_label(ui, name, entry, chosen)),
-                        None => self.asset_label(ui, name, child.asset.as_deref(), pick),
+                        None => self.asset_label(ui, name, child, pick),
                     };
                     if child.asset.is_some() || child.entry.is_some() {
                         if let Some(r) = label {
@@ -252,12 +387,15 @@ impl TreeView<'_> {
                         }
                     } else {
                         let icon = if open { icons::FOLDER_OPEN } else { icons::FOLDER };
-                        let label = egui::Label::new(RichText::new(format!("{icon}  {name}")).color(theme::weak()))
+                        let strength = if self.ws.is_editable(&path) { 1.0 } else { DIMMED };
+                        let tint = theme::weak().gamma_multiply(strength);
+                        let label = egui::Label::new(RichText::new(format!("{icon}  {name}")).color(tint))
                             .sense(egui::Sense::click())
                             .selectable(false);
                         if ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             set_open = Some(!open);
                         }
+                        self.badge(ui, child);
                     }
                 })
                 .body(|ui| self.ui(ui, child, &path, pick, chosen));
@@ -271,12 +409,9 @@ impl TreeView<'_> {
 
     /// A virtual entry: a variant (its palette's icon) or an atlas part.
     fn entry_label(&self, ui: &mut egui::Ui, name: &str, entry: &Entry, chosen: &mut Option<Entry>) -> egui::Response {
-        let (icon, tint) = (icons::PALETTE, theme::weak());
-        let mut job = egui::text::LayoutJob::default();
-        let font = egui::TextStyle::Body.resolve(ui.style());
-        job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), tint));
-        job.append(name, 7.0, egui::TextFormat::simple(font, theme::text()));
-        let response = ui.selectable_label(self.ws.is_chosen(entry), job);
+        let dim = !self.ws.is_editable(&entry.image);
+        let job = icon_and_name(ui.style(), icons::PALETTE, theme::weak(), theme::text(), name, dim);
+        let response = ui.add(egui::Button::selectable(self.ws.is_chosen(entry), job).truncate());
         if response.clicked() {
             *chosen = Some(entry.clone());
         }
@@ -287,30 +422,70 @@ impl TreeView<'_> {
         &self,
         ui: &mut egui::Ui,
         name: &str,
-        asset: Option<&str>,
+        node: &Node,
         pick: &mut Option<String>,
     ) -> Option<egui::Response> {
-        let asset = asset?;
+        let asset = node.asset.as_deref()?;
         let kind = self.ws.index.assets.get(asset).and_then(|a| a.kind.as_deref());
-        let response =
-            ui.selectable_label(self.ws.selected.as_deref() == Some(asset), labelled(ui.style(), kind, name));
+        let job = labelled(ui.style(), kind, name, !self.ws.is_editable(asset));
+        let response = ui.add(egui::Button::selectable(self.ws.selected.as_deref() == Some(asset), job).truncate());
         if self.reveal == Some(asset) {
             response.scroll_to_me(Some(egui::Align::Center));
         }
         if response.clicked() {
             *pick = Some(asset.to_string());
         }
+        self.badge(ui, node);
         Some(response)
+    }
+
+    /// A plain file, or a folder with nothing in it: selected by its real path.
+    fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<String>) {
+        let Some(path) = node.path.as_deref() else { return };
+        let icon = if node.file { icons::FILE } else { icons::FOLDER };
+        let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, !self.ws.is_editable(path));
+        ui.horizontal(|ui| {
+            let response = ui.add(egui::Button::selectable(self.ws.selected.as_deref() == Some(path), job).truncate());
+            if self.reveal == Some(path) {
+                response.scroll_to_me(Some(egui::Align::Center));
+            }
+            if response.clicked() {
+                *pick = Some(path.to_string());
+            }
+            self.badge(ui, node);
+        });
+    }
+
+    /// Beside an entry's name: the layer that overrode, moved or made it, where that is worth saying.
+    fn badge(&self, ui: &mut egui::Ui, node: &Node) {
+        if let Some(text) = node.path.as_deref().and_then(|p| self.ws.badge(p)) {
+            ui.label(RichText::new(text).small().color(theme::accent()));
+        }
     }
 }
 
-/// A name after its kind's icon, the icon in the kind's tint.
-fn labelled(style: &egui::Style, kind: Option<&str>, name: &str) -> egui::text::LayoutJob {
+/// A name after its kind's icon, the icon in the kind's tint; dimmed where it cannot be modified.
+fn labelled(style: &egui::Style, kind: Option<&str>, name: &str, dim: bool) -> egui::text::LayoutJob {
     let (icon, tint) = icons::for_kind(kind);
+    icon_and_name(style, icon, tint, theme::text(), name, dim)
+}
+
+/// What cannot be modified - from a locked layer, or not the soloed layer's - is drawn at this strength.
+const DIMMED: f32 = 0.45;
+
+fn icon_and_name(
+    style: &egui::Style,
+    icon: &str,
+    tint: Color32,
+    color: Color32,
+    name: &str,
+    dim: bool,
+) -> egui::text::LayoutJob {
+    let strength = if dim { DIMMED } else { 1.0 };
     let mut job = egui::text::LayoutJob::default();
     let font = egui::TextStyle::Body.resolve(style);
-    job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), tint));
-    job.append(name, 7.0, egui::TextFormat::simple(font, theme::text()));
+    job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), tint.gamma_multiply(strength)));
+    job.append(name, 7.0, egui::TextFormat::simple(font, color.gamma_multiply(strength)));
     job
 }
 
@@ -325,7 +500,8 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
     for asset in matches.iter().take(SHOWN) {
         let selected = ws.selected.as_deref() == Some(asset.path.as_str());
-        if ui.selectable_label(selected, labelled(ui.style(), asset.kind.as_deref(), &asset.path)).clicked() {
+        let job = labelled(ui.style(), asset.kind.as_deref(), &asset.path, !ws.is_editable(&asset.path));
+        if ui.add(egui::Button::selectable(selected, job).truncate()).clicked() {
             *pick = Some(asset.path.clone());
         }
     }
@@ -336,8 +512,14 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
 
 // --- preview ----------------------------------------------------------------------------------------------------------
 
-fn preview_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, view: &mut Preview) {
-    let Some(asset) = ws.selected_asset() else {
+fn preview_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    subject: Option<&str>,
+    nav: &mut Option<String>,
+    view: &mut Preview,
+) {
+    let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)) else {
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
     };
@@ -355,15 +537,19 @@ fn preview_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, v
     let ctx = ui.ctx().clone();
     let count = shown.len();
     for (slot, path) in shown {
-        ui.horizontal(|ui| {
-            if let Some(slot) = &slot {
-                ui.label(RichText::new(slot).strong());
-                if ui.link(&path).clicked() {
-                    *nav = Some(path.clone());
+        // The slot and the image's path on the left, cut short where the pane is narrow; its look on the right.
+        egui::containers::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                if let Some(slot) = &slot {
+                    ui.label(RichText::new(slot).strong());
+                    if theme::short_link(ui, &path).clicked() {
+                        *nav = Some(path.clone());
+                    }
                 }
-            }
-            variant_picker(ui, ws, &path);
-        });
+            },
+            |ui| variant_picker(ui, ws, &path),
+        );
         let role = ws.index.assets.get(&path).and_then(crate::workspace::role).map(str::to_string);
         let paged = ws.index.assets.get(&path).is_some_and(|a| {
             let (size, page_width) = image_pages(a);
@@ -796,8 +982,8 @@ fn vram_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, upsc
 
 // --- references -------------------------------------------------------------------------------------------------------
 
-fn references_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
-    let Some(asset) = ws.selected_asset() else {
+fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&str>, nav: &mut Option<String>) {
+    let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)) else {
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
     };
@@ -806,15 +992,12 @@ fn references_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         if incoming.is_empty() {
             ui.label(RichText::new("Nothing references this asset").color(theme::weak()));
         }
-        egui::Grid::new("incoming").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            for r in incoming {
-                if ui.link(&r.from).clicked() {
-                    *nav = Some(r.from.clone());
-                }
-                ui.label(RichText::new(format!("slot {}", r.slot)).color(theme::weak()));
-                ui.end_row();
+        for r in incoming {
+            let slot = RichText::new(format!("slot {}", r.slot)).color(theme::weak());
+            if theme::link_row(ui, &r.from, slot).clicked() {
+                *nav = Some(r.from.clone());
             }
-        });
+        }
     });
     let outgoing: Vec<(String, &Asset)> =
         asset.fields().iter().flat_map(|(key, value)| outgoing_refs(ws, key, value)).collect();
@@ -822,15 +1005,12 @@ fn references_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         if outgoing.is_empty() {
             ui.label(RichText::new("This asset references nothing").color(theme::weak()));
         }
-        egui::Grid::new("outgoing").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            for (slot, target) in &outgoing {
-                if ui.link(&target.path).clicked() {
-                    *nav = Some(target.path.clone());
-                }
-                ui.label(RichText::new(format!("slot {slot}")).color(theme::weak()));
-                ui.end_row();
+        for (slot, target) in &outgoing {
+            let slot = RichText::new(format!("slot {slot}")).color(theme::weak());
+            if theme::link_row(ui, &target.path, slot).clicked() {
+                *nav = Some(target.path.clone());
             }
-        });
+        }
     });
 }
 
@@ -885,7 +1065,7 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
                 ui.label(RichText::new(icons::WARNING).color(tint));
                 for path in problem.paths() {
                     let asset = path.strip_suffix(project::index::BUNDLE_SUFFIX);
-                    if ui.link(path).clicked()
+                    if theme::short_link(ui, path).clicked()
                         && let Some(asset) = asset
                     {
                         *nav = Some(asset.to_string());
@@ -900,16 +1080,16 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         if dangling.is_empty() {
             ui.label(RichText::new("Every reference resolves").color(theme::weak()));
         }
-        egui::Grid::new("dangling").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
-            for r in dangling {
-                if ui.link(&r.from).clicked() {
-                    *nav = Some(r.from.clone());
-                }
-                ui.label(RichText::new(format!("slot {}", r.slot)).color(theme::weak()));
-                ui.label(RichText::new(format!("{} ({})", r.target, r.uid)).color(theme::weak()));
-                ui.end_row();
+        for r in dangling {
+            let slot = RichText::new(format!("slot {}", r.slot)).color(theme::weak());
+            if theme::link_row(ui, &r.from, slot).clicked() {
+                *nav = Some(r.from.clone());
             }
-        });
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                theme::short(ui, RichText::new(format!("→ {} ({})", r.target, r.uid)).small().color(theme::weak()));
+            });
+        }
     });
 }
 
@@ -951,7 +1131,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         for layer in &p.layers {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&layer.name).strong());
-                ui.label(RichText::new(layer.path.display().to_string()).color(theme::weak()));
+                theme::short(ui, RichText::new(layer.path.display().to_string()).color(theme::weak()));
             });
         }
     });
@@ -959,22 +1139,20 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         for m in &p.mounts {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("res://{}", m.at)).strong());
-                ui.label(RichText::new(m.path.display().to_string()).color(theme::weak()));
                 if m.read_only {
                     badge(ui, "read only");
                 }
+                theme::short(ui, RichText::new(m.path.display().to_string()).color(theme::weak()));
             });
         }
     });
     if !ws.index.dangling.is_empty() {
         theme::section(ui, &format!("Dangling references ({})", ws.index.dangling.len()), |ui| {
             for r in &ws.index.dangling {
-                ui.horizontal(|ui| {
-                    if ui.link(&r.from).clicked() {
-                        *nav = Some(r.from.clone());
-                    }
-                    ui.colored_label(ui.visuals().error_fg_color, format!("{} → {}", r.slot, r.target));
-                });
+                let detail = RichText::new(format!("{} → {}", r.slot, r.target)).color(ui.visuals().error_fg_color);
+                if theme::link_row(ui, &r.from, detail).clicked() {
+                    *nav = Some(r.from.clone());
+                }
             }
         });
     }
@@ -1145,21 +1323,26 @@ fn project_settings_ui(
     let p = &ws.project;
     let file = p.root.join(project::FILE);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(file.display().to_string()).small().color(theme::weak()));
         if ui.small_button(format!("{}  Open project.toml", icons::ARROW_SQUARE_OUT)).clicked() {
             *message = Some(external::open(&file, "project.toml", tools).unwrap_or_else(|e| e));
         }
+        theme::short(ui, RichText::new(file.display().to_string()).small().color(theme::weak()));
     });
     let raw: toml::Table =
         std::fs::read_to_string(&file).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
     let grid = |ui: &mut egui::Ui, id: &str, rows: Vec<(String, String)>| {
         egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-            for (key, value) in rows {
+            for (key, value) in &rows {
                 ui.label(RichText::new(key).color(theme::weak()));
-                ui.monospace(value);
+                // The values (paths) go below the grid where they would not fit beside it.
+                ui.label(RichText::new(if value.len() > 48 { "" } else { value.as_str() }).monospace());
                 ui.end_row();
             }
         });
+        for (key, value) in rows.iter().filter(|(_, v)| v.len() > 48) {
+            ui.label(RichText::new(key).small().color(theme::weak()));
+            theme::short(ui, RichText::new(value).monospace());
+        }
     };
     match page {
         SettingsPage::ProjectGeneral => match &p.game {

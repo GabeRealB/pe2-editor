@@ -142,8 +142,28 @@ impl Changeset {
     /// run of characters within it).
     #[must_use]
     pub fn ignores(&self, rel: &str) -> bool {
-        rel.split('/').any(|name| self.ignore.iter().any(|pattern| glob(pattern, name)))
+        ignored(&self.ignore, rel)
     }
+}
+
+/// Whether patterns leave out a path: a pattern matches a name in it, `*` standing for any run of characters within
+/// it.
+#[must_use]
+pub fn ignored(patterns: &[String], rel: &str) -> bool {
+    rel.split('/').any(|name| patterns.iter().any(|pattern| glob(pattern, name)))
+}
+
+/// The name patterns of a `.gitignore`: those matching a name anywhere (`*.o`, `__pycache__/`). A pattern anchored to
+/// a path or negated is not one, and is left out.
+#[must_use]
+pub fn gitignore_names(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+        .map(|l| l.strip_suffix('/').unwrap_or(l))
+        .filter(|l| !l.contains('/'))
+        .map(str::to_string)
+        .collect()
 }
 
 /// A name matched against a pattern where `*` is any run of characters.

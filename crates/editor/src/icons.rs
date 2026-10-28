@@ -29,6 +29,20 @@ pub const HARD_DRIVES: &str = "\u{E2A0}";
 pub const GEAR: &str = "\u{E270}";
 pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
 pub const WARNING: &str = "\u{E4E0}";
+pub const EYE: &str = "\u{E220}";
+pub const EYE_SLASH: &str = "\u{E224}";
+pub const LOCK_SIMPLE: &str = "\u{E308}";
+pub const LOCK_SIMPLE_OPEN: &str = "\u{E30A}";
+pub const DOTS_SIX_VERTICAL: &str = "\u{EAE2}";
+pub const PLUS: &str = "\u{E3D4}";
+pub const PLUGS_CONNECTED: &str = "\u{EB5A}";
+pub const STACK_SIMPLE: &str = "\u{E468}";
+pub const GIT_DIFF: &str = "\u{E27C}";
+pub const PUSH_PIN: &str = "\u{E3E2}";
+pub const APP_WINDOW: &str = "\u{E5DA}";
+pub const ARROW_SQUARE_IN: &str = "\u{E5DC}";
+pub const CHECK_CIRCLE: &str = "\u{E184}";
+pub const X_CIRCLE: &str = "\u{E4F8}";
 
 /// Add the icon font behind the text fonts.
 pub fn install(ctx: &egui::Context) {

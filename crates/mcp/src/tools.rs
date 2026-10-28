@@ -89,8 +89,9 @@ pub fn definitions() -> Vec<Tool> {
     vec![
         tool::<NoArgs>(
             "project",
-            "The project: its root, its layers bottom to top (which are read-only), how many assets, entries and \
-             problems it has, and who answers (the editor, when it has the project open, or pe2-cli).",
+            "The project: its root, its layers bottom to top (assets or files, a mount's mount point, which are \
+             read-only, their entries, operations and problems), how many assets, entries and problems it has, and \
+             who answers (the editor, when it has the project open, or pe2-cli).",
         ),
         tool::<FindArgs>(
             "find_assets",
@@ -205,12 +206,26 @@ fn summary(asset: &Asset) -> Value {
 fn project(view: &View) -> Value {
     let root = &view.project.root;
     let layers: Vec<Value> = view
-        .project
-        .layers
+        .index
+        .layers()
         .iter()
-        .map(|l| {
-            let path = l.path.strip_prefix(root).unwrap_or(&l.path);
-            json!({ "name": l.name, "path": path.display().to_string(), "read_only": l.read_only })
+        .zip(&view.project.layers)
+        .map(|(info, layer)| {
+            let path = layer.path.strip_prefix(root).unwrap_or(&layer.path);
+            let kind = match info.kind {
+                project::LayerKind::Assets => "assets",
+                project::LayerKind::Files => "files",
+            };
+            json!({
+                "name": info.name,
+                "kind": kind,
+                "mounted_at": (!info.at.is_empty()).then_some(&info.at),
+                "path": path.display().to_string(),
+                "read_only": info.read_only,
+                "entries": info.entries,
+                "operations": info.overrides + info.moves + info.deletes,
+                "problems": info.problems,
+            })
         })
         .collect();
     json!({

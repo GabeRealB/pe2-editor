@@ -18,6 +18,8 @@ struct Palette {
     weak: Color32,
     accent: Color32,
     link: Color32,
+    /// A layer shown alone, as a mixer lights a soloed channel.
+    solo: Color32,
 }
 
 const DARK: Palette = Palette {
@@ -30,6 +32,7 @@ const DARK: Palette = Palette {
     weak: Color32::from_rgb(0x8a, 0x93, 0xa0),
     accent: Color32::from_rgb(0x4d, 0x96, 0xd9),
     link: Color32::from_rgb(0x7f, 0xb8, 0xf0),
+    solo: Color32::from_rgb(0xe0, 0xa8, 0x3a),
 };
 
 const LIGHT: Palette = Palette {
@@ -42,6 +45,7 @@ const LIGHT: Palette = Palette {
     weak: Color32::from_rgb(0x66, 0x6f, 0x7b),
     accent: Color32::from_rgb(0x2f, 0x74, 0xc0),
     link: Color32::from_rgb(0x1d, 0x5f, 0xa8),
+    solo: Color32::from_rgb(0xb8, 0x7a, 0x12),
 };
 
 static PALETTE: RwLock<Palette> = RwLock::new(DARK);
@@ -56,6 +60,10 @@ pub fn background() -> Color32 {
 pub fn border() -> Color32 {
     palette().border
 }
+/// A surface raised over the panels: a card, a control.
+pub fn raised() -> Color32 {
+    palette().raised
+}
 pub fn text() -> Color32 {
     palette().text
 }
@@ -67,6 +75,9 @@ pub fn accent() -> Color32 {
 }
 pub fn link() -> Color32 {
     palette().link
+}
+pub fn solo() -> Color32 {
+    palette().solo
 }
 
 /// Mix two colors: `t` of `b` into `a`.
@@ -131,6 +142,26 @@ pub fn apply(ctx: &egui::Context, appearance: &Appearance) {
         ]
         .into();
     });
+}
+
+/// Text on one line, cut short where it does not fit, the whole of it shown on hover: a pane never runs past its edge.
+pub fn short(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Label::new(text).truncate())
+}
+
+/// A link on one line, cut short where it does not fit, the whole of it shown on hover.
+pub fn short_link(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let label = egui::Label::new(egui::RichText::new(text).color(link())).truncate().sense(egui::Sense::click());
+    let response = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() {
+        ui.painter().hline(response.rect.x_range(), response.rect.bottom(), Stroke::new(1.0, link()));
+    }
+    response
+}
+
+/// A row of a link on the left - cut short where the row is too narrow - and a detail on the right.
+pub fn link_row(ui: &mut egui::Ui, text: &str, detail: impl Into<egui::WidgetText>) -> egui::Response {
+    egui::containers::Sides::new().shrink_left().truncate().show(ui, |ui| short_link(ui, text), |ui| ui.label(detail)).0
 }
 
 /// A titled section of a pane: a small heading, then its contents on the background tone.

@@ -1,18 +1,24 @@
-//! The editor's window: a menu bar and a toolbar on top, the panes in a tile layout, a status bar below. The layout
-//! is remembered in eframe's storage, the editor's settings in their own `settings.toml`.
+//! The editor's window: a menu bar and a toolbar on top, the panes in a tile layout, a status bar below; and the
+//! windows panes were moved into (`windows.rs`). The layouts, the windows and each pane instance's state are
+//! remembered in eframe's storage, the editor's settings in their own `settings.toml`.
 
 use eframe::egui::{self, RichText};
+use egui_tiles::TileId;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-use crate::panes::{self, Pane, Panes};
+use crate::panes::{self, Pane, PaneAction, PaneKind, PaneState, Panes};
 use crate::settings::EditorSettings;
+use crate::windows::{Layouts, Window};
 use crate::workspace::{Update, Workspace};
 use crate::{icons, theme};
 
 const LAYOUT_KEY: &str = "layout";
+const WINDOWS_KEY: &str = "windows";
+const PANES_KEY: &str = "panes";
+const HOMES_KEY: &str = "homes";
 const SETTINGS_KEY: &str = "settings";
 /// Frames to wait before a screenshot, so the window has its size and the selection has scrolled into view.
 const CAPTURE_AFTER_FRAMES: u32 = 30;
@@ -33,12 +39,16 @@ struct Capture {
     path: PathBuf,
     frames: u32,
     requested: bool,
-    done: Arc<AtomicBool>,
+    /// Whether the image is still to be saved (1) or saved (0).
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub struct Editor {
     workspace: Option<Workspace>,
-    layout: egui_tiles::Tree<Pane>,
+    /// The main window's layout, the other windows', and each pane instance's state.
+    layouts: Layouts,
+    /// A window to bring to the front once it is drawn.
+    focus: Option<egui::ViewportId>,
     settings: EditorSettings,
     /// The settings as last saved: a change is saved, and a new appearance applied, at the end of the frame.
     saved: EditorSettings,
@@ -52,6 +62,7 @@ pub struct Editor {
     /// monitor's size as measured with the previous frame's scale, so a size is read only once the scale holds.
     steady: (f32, u32),
     open_dialog: Option<String>,
+    layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(PathBuf, String)>,
     error: Option<String>,
@@ -73,6 +84,11 @@ impl Editor {
         let stored = |key| cc.storage.and_then(|s| s.get_string(key));
         let layout =
             stored(LAYOUT_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(panes::default_layout);
+        let windows: Vec<Window> = stored(WINDOWS_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let states: Vec<(Pane, PaneState)> =
+            stored(PANES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let homes: Vec<(Pane, TileId)> =
+            stored(HOMES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let (mut settings, problem) = EditorSettings::load();
         if crate::settings::path().is_some_and(|p| !p.exists())
             && let Some(old) = stored(SETTINGS_KEY).and_then(|s| serde_json::from_str::<OldSettings>(&s).ok())
@@ -80,13 +96,24 @@ impl Editor {
             settings.appearance.zoom = old.zoom;
             settings.last_project = old.last_project;
         }
+        // Windows inside the main one rather than native ones: where native windows misbehave, and for screenshots,
+        // which eframe takes of the main window only.
+        if std::env::var_os("PE2_EDITOR_EMBED_WINDOWS").is_some() {
+            cc.egui_ctx.set_embed_viewports(true);
+        }
         icons::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &settings.appearance);
         let last = settings.startup.reopen_last_project.then(|| settings.last_project.clone()).flatten();
         let project = start.project.or(last);
         let mut editor = Editor {
             workspace: None,
-            layout,
+            layouts: Layouts {
+                main: layout,
+                windows,
+                states: states.into_iter().collect(),
+                homes: homes.into_iter().collect(),
+            },
+            focus: None,
             saved: settings.clone(),
             settings,
             message: None,
@@ -94,9 +121,15 @@ impl Editor {
             zoomed_for: None,
             steady: (0.0, 0),
             open_dialog: None,
+            layers_state: crate::layers::LayersState::default(),
             in_use: None,
             error: problem,
-            capture: start.screenshot.map(|path| Capture { path, frames: 0, requested: false, done: Arc::default() }),
+            capture: start.screenshot.map(|path| Capture {
+                path,
+                frames: 0,
+                requested: false,
+                pending: Arc::default(),
+            }),
             max_surface: start.max_surface,
         };
         if let Some(dir) = project {
@@ -105,10 +138,10 @@ impl Editor {
         if let (Some(ws), Some(asset)) = (&mut editor.workspace, start.select) {
             ws.navigate(asset);
         }
-        if let Some(pane) =
-            start.show.and_then(|name| Pane::ALL.into_iter().find(|p| p.title().eq_ignore_ascii_case(&name)))
+        if let Some(kind) =
+            start.show.and_then(|name| PaneKind::ALL.into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
         {
-            editor.show_pane(pane);
+            editor.show_pane(Pane::first(kind));
         }
         editor
     }
@@ -187,39 +220,82 @@ impl Editor {
     }
 
     fn pane_visible(&self, pane: Pane) -> bool {
-        panes::tile_of(&self.layout, pane).is_some_and(|id| self.layout.tiles.is_visible(id))
+        self.layouts.is_visible(pane)
     }
 
-    /// Show or hide a pane.
+    /// Show or hide a pane: one shown in a window of its own is hidden by returning it to the main window, hidden.
     fn toggle_pane(&mut self, pane: Pane) {
-        match panes::tile_of(&self.layout, pane) {
-            Some(id) if self.layout.tiles.is_visible(id) => self.layout.tiles.set_visible(id, false),
-            _ => self.show_pane(pane),
+        if self.layouts.is_visible(pane) {
+            self.layouts.hide(pane);
+        } else {
+            self.show_pane(pane);
         }
     }
 
-    /// Show a pane and bring its tab to the front; a pane the layout has not got joins the preview's tabs.
+    /// Show a pane and bring its tab to the front - and its window, where it is in one.
     fn show_pane(&mut self, pane: Pane) {
-        let id = if let Some(id) = panes::tile_of(&self.layout, pane) {
-            id
-        } else {
-            let id = self.layout.tiles.insert_pane(pane);
-            let group = panes::tile_of(&self.layout, Pane::Preview)
-                .and_then(|p| self.layout.tiles.parent_of(p))
-                .or_else(|| self.layout.root());
-            if let Some(egui_tiles::Tile::Container(container)) = group.and_then(|g| self.layout.tiles.get_mut(g)) {
-                container.add_child(id);
-            } else {
-                self.layout = panes::default_layout();
+        self.focus = self.layouts.show(pane);
+    }
+
+    /// The windows: each its own native window (an immediate viewport, drawn now, with the editor's state), with a
+    /// dock-back button; closing one docks its panes back.
+    fn show_windows(&mut self, ctx: &egui::Context, titles: &[(u64, String)]) -> Outcome {
+        let mut outcome = Outcome::default();
+        for window in &mut self.layouts.windows {
+            let id = window.id;
+            ctx.show_viewport_immediate(window.viewport(), window.builder(), |ui, _class| {
+                let bar = egui::Frame::new().fill(theme::background()).inner_margin(egui::Margin::symmetric(8, 4));
+                egui::Panel::top(egui::Id::unique(("window bar", id))).frame(bar).show(ui, |ui| {
+                    let dock = egui::Button::new(format!("{}  Dock back", icons::ARROW_SQUARE_IN));
+                    if ui.add(dock).on_hover_text("Return these panes to the main window").clicked() {
+                        outcome.docked.push(id);
+                    }
+                });
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    let mut behavior = Panes {
+                        workspace: self.workspace.as_mut(),
+                        nav: None,
+                        pick: None,
+                        settings: &mut self.settings,
+                        layers: &mut self.layers_state,
+                        states: &mut self.layouts.states,
+                        windows: titles,
+                        window: Some(id),
+                        actions: vec![],
+                        message: None,
+                    };
+                    window.tree.ui(&mut behavior, ui);
+                    outcome.take(behavior, Some(id));
+                });
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    outcome.docked.push(id);
+                }
+                window.remember_place(ui.ctx());
+            });
+        }
+        if let Some(focus) = self.focus.take() {
+            ctx.send_viewport_cmd_to(focus, egui::ViewportCommand::Focus);
+        }
+        outcome
+    }
+
+    /// Apply what the layouts asked for this frame.
+    fn apply(&mut self, outcome: Outcome) {
+        if let Some(message) = outcome.message {
+            self.message = Some(message);
+        }
+        if let Some(ws) = self.workspace.as_mut() {
+            if let Some(path) = outcome.nav {
+                ws.navigate(path);
+            } else if let Some(path) = outcome.pick {
+                ws.select(path);
             }
-            id
-        };
-        self.layout.tiles.set_visible(id, true);
-        if let Some(parent) = self.layout.tiles.parent_of(id)
-            && let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
-                self.layout.tiles.get_mut(parent)
-        {
-            tabs.set_active(id);
+        }
+        for window in outcome.docked {
+            self.layouts.dock_back(window);
+        }
+        for (window, tile, action) in outcome.actions {
+            self.layouts.act(window, tile, action);
         }
     }
 
@@ -244,19 +320,21 @@ impl Editor {
             });
             ui.menu_button("Edit", |ui| {
                 if ui.button(format!("{}  Settings…", icons::GEAR)).clicked() {
-                    self.show_pane(Pane::Settings);
+                    self.show_pane(Pane::first(PaneKind::Settings));
                 }
             });
             ui.menu_button("View", |ui| {
-                for pane in Pane::ALL {
+                for kind in PaneKind::ALL {
+                    let pane = Pane::first(kind);
                     let mut visible = self.pane_visible(pane);
-                    if ui.checkbox(&mut visible, pane.title()).clicked() {
+                    if ui.checkbox(&mut visible, kind.title()).clicked() {
                         self.toggle_pane(pane);
                     }
                 }
                 ui.separator();
-                if ui.button("Reset layout").clicked() {
-                    self.layout = panes::default_layout();
+                if ui.button("Reset layout").on_hover_text("Close the other windows and the extra instances").clicked()
+                {
+                    self.layouts = Layouts::new(panes::default_layout());
                 }
                 ui.separator();
                 let zoom = ui.ctx().zoom_factor();
@@ -436,22 +514,24 @@ impl Editor {
     }
 
     /// Advance a pending screenshot: request it once settled, close once it is saved.
+    /// Advance a pending screenshot: request it once settled, close once it is saved. The main window only: eframe
+    /// paints the other windows (immediate viewports) without taking screenshots of them.
     fn capture(&mut self, ctx: &egui::Context) {
         let Some(capture) = &mut self.capture else { return };
-        if capture.done.load(Ordering::Acquire) {
+        if capture.requested && capture.pending.load(Ordering::Acquire) == 0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         capture.frames += 1;
         if !capture.requested && capture.frames >= CAPTURE_AFTER_FRAMES {
             capture.requested = true;
-            let (path, done) = (capture.path.clone(), capture.done.clone());
-            let repaint = ctx.clone();
+            capture.pending.store(1, Ordering::Release);
+            let (path, pending, repaint) = (capture.path.clone(), capture.pending.clone(), ctx.clone());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |image| {
                 if let Err(e) = save_png(&path, &image) {
                     eprintln!("{}: {e}", path.display());
                 }
-                done.store(true, Ordering::Release);
+                pending.store(0, Ordering::Release);
                 repaint.request_repaint();
             })));
         }
@@ -500,29 +580,29 @@ impl eframe::App for Editor {
             self.toolbar(ui);
         });
         if egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner {
-            self.show_pane(Pane::Problems);
+            self.show_pane(Pane::first(PaneKind::Problems));
         }
+        let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
+        let mut outcome = Outcome::default();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut behavior = Panes {
                 workspace: self.workspace.as_mut(),
                 nav: None,
                 pick: None,
                 settings: &mut self.settings,
+                layers: &mut self.layers_state,
+                states: &mut self.layouts.states,
+                windows: &titles,
+                window: None,
+                actions: vec![],
                 message: None,
             };
-            self.layout.ui(&mut behavior, ui);
-            let (nav, pick) = (behavior.nav, behavior.pick);
-            if let Some(message) = behavior.message {
-                self.message = Some(message);
-            }
-            if let Some(ws) = self.workspace.as_mut() {
-                if let Some(path) = nav {
-                    ws.navigate(path);
-                } else if let Some(path) = pick {
-                    ws.select(path);
-                }
-            }
+            self.layouts.main.ui(&mut behavior, ui);
+            outcome.take(behavior, None);
         });
+        let windows = self.show_windows(&ctx, &titles);
+        outcome.merge(windows);
+        self.apply(outcome);
         self.open_dialog(&ctx);
         self.in_use_dialog(&ctx);
         if self.settings != self.saved {
@@ -537,9 +617,47 @@ impl eframe::App for Editor {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if let Ok(layout) = serde_json::to_string(&self.layout) {
+        let layouts = &self.layouts;
+        if let Ok(layout) = serde_json::to_string(&layouts.main) {
             storage.set_string(LAYOUT_KEY, layout);
         }
+        if let Ok(windows) = serde_json::to_string(&layouts.windows) {
+            storage.set_string(WINDOWS_KEY, windows);
+        }
+        // Maps keyed by a pane are lists: JSON keys are strings.
+        if let Ok(states) = serde_json::to_string(&layouts.states.iter().collect::<Vec<_>>()) {
+            storage.set_string(PANES_KEY, states);
+        }
+        if let Ok(homes) = serde_json::to_string(&layouts.homes.iter().collect::<Vec<_>>()) {
+            storage.set_string(HOMES_KEY, homes);
+        }
+    }
+}
+
+/// What the layouts asked for in a frame: where to go, a message, windows to dock back, tab actions by window.
+#[derive(Default)]
+struct Outcome {
+    nav: Option<String>,
+    pick: Option<String>,
+    message: Option<String>,
+    docked: Vec<u64>,
+    actions: Vec<(Option<u64>, TileId, PaneAction)>,
+}
+
+impl Outcome {
+    fn take(&mut self, behavior: Panes<'_>, window: Option<u64>) {
+        self.nav = self.nav.take().or(behavior.nav);
+        self.pick = self.pick.take().or(behavior.pick);
+        self.message = self.message.take().or(behavior.message);
+        self.actions.extend(behavior.actions.into_iter().map(|(tile, action)| (window, tile, action)));
+    }
+
+    fn merge(&mut self, other: Outcome) {
+        self.nav = self.nav.take().or(other.nav);
+        self.pick = self.pick.take().or(other.pick);
+        self.message = self.message.take().or(other.message);
+        self.docked.extend(other.docked);
+        self.actions.extend(other.actions);
     }
 }
 

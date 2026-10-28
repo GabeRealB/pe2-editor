@@ -26,12 +26,17 @@ struct Context {
 pub fn inspector_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
+    subject: Option<&str>,
     nav: &mut Option<String>,
     tools: &Tools,
     message: &mut Option<String>,
 ) {
-    let Some(asset) = ws.selected_asset().cloned() else {
-        ui.label(RichText::new("Select an asset").color(theme::weak()));
+    let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)).cloned() else {
+        if let Some((path, entry)) = subject.and_then(|s| ws.entry_at(s)) {
+            entry_ui(ui, path, entry, tools, message);
+        } else {
+            ui.label(RichText::new("Select an asset").color(theme::weak()));
+        }
         return;
     };
     header_ui(ui, ws, &asset);
@@ -249,22 +254,25 @@ fn reference_chip(ui: &mut egui::Ui, ws: &Workspace, value: &toml::Value, nav: &
     }
 }
 
+/// A reference or a cell as a chip: one widget, so that a row of them wraps where the pane is narrow.
 fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::Response {
-    egui::Frame::new()
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    job.append(icon, 0.0, egui::text::TextFormat::simple(font.clone(), tint));
+    job.append(text, 4.0, egui::text::TextFormat::simple(font, theme::link()));
+    let chip = egui::Button::new(job)
         .fill(tint.gamma_multiply(0.14))
         .stroke(egui::Stroke::new(1.0, tint.gamma_multiply(0.35)))
         .corner_radius(egui::CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(RichText::new(icon).color(tint));
-                ui.label(RichText::new(text).color(theme::link()));
-            });
-        })
-        .response
-        .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .min_size(egui::Vec2::ZERO)
+        // Its own width, whole: the row moves it to the next line rather than fold its text.
+        .wrap_mode(egui::TextWrapMode::Extend);
+    // Its padding set on the row itself and put back: a child Ui (a scope, a frame) is placed where the row is, and is
+    // never moved to the next line.
+    let padding = std::mem::replace(&mut ui.spacing_mut().button_padding, egui::vec2(6.0, 1.0));
+    let response = ui.add(chip);
+    ui.spacing_mut().button_padding = padding;
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // --- collections ------------------------------------------------------------------------------------------------------
@@ -461,6 +469,43 @@ fn cells_ui(ui: &mut egui::Ui, items: &[toml::Value]) {
 }
 
 // --- files ------------------------------------------------------------------------------------------------------------
+
+/// A plain file or a folder of the resolved project: where it comes from and where it is on disk.
+fn entry_ui(ui: &mut egui::Ui, path: &str, entry: &project::index::Entry, tools: &Tools, message: &mut Option<String>) {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let (icon, kind) = match entry.kind {
+        project::index::Kind::File => (icons::FILE, "file"),
+        _ => (icons::FOLDER, "folder"),
+    };
+    ui.label(RichText::new(format!("{icon}  {name}")).heading());
+    ui.label(RichText::new(path).small().color(theme::weak()));
+    theme::section(ui, "Entry", |ui| {
+        egui::Grid::new("entry").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+            let mut row = |label: &str, value: String| {
+                ui.label(RichText::new(label).color(theme::weak()));
+                ui.label(value);
+                ui.end_row();
+            };
+            row("Kind", kind.to_string());
+            row("Uid", entry.uid.clone());
+            row("Made by", entry.home.clone());
+            if !entry.overrides.is_empty() {
+                row("Overridden in", entry.overrides.join(", "));
+            }
+            if let Some(layer) = &entry.moved {
+                row("Moved by", layer.clone());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("On disk").color(theme::weak()));
+            theme::short(ui, entry.disk.display().to_string());
+        });
+        if entry.kind == project::index::Kind::File && ui.button(format!("{}  Open", icons::ARROW_SQUARE_OUT)).clicked()
+        {
+            *message = Some(external::open(&entry.disk, path, tools).unwrap_or_else(|e| e));
+        }
+    });
+}
 
 fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Option<String>) {
     if asset.files.is_empty() {
