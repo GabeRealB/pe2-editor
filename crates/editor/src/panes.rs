@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::external::{self, Category};
 use crate::inspector::{badge, size_text};
 use crate::settings::{EditorSettings, Preview, Theme, Tools, Upscale};
-use crate::workspace::{Entry, Node, Workspace, cells_of};
+use crate::workspace::{EditRequest, Entry, Node, Workspace, cells_of};
 use crate::{icons, theme};
 
 /// What a pane shows.
@@ -26,10 +26,11 @@ pub enum PaneKind {
     Vram,
     Layers,
     Layer,
+    History,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 10] = [
+    pub const ALL: [PaneKind; 11] = [
         PaneKind::Assets,
         PaneKind::Preview,
         PaneKind::Vram,
@@ -38,6 +39,7 @@ impl PaneKind {
         PaneKind::References,
         PaneKind::Problems,
         PaneKind::Layers,
+        PaneKind::History,
         PaneKind::Project,
         PaneKind::Settings,
     ];
@@ -54,6 +56,7 @@ impl PaneKind {
             PaneKind::Vram => icons::SQUARES_FOUR,
             PaneKind::Layers => icons::STACK_SIMPLE,
             PaneKind::Layer => icons::GIT_DIFF,
+            PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
         }
     }
 
@@ -85,6 +88,7 @@ impl PaneKind {
             PaneKind::Vram => "VRAM",
             PaneKind::Layers => "Layers",
             PaneKind::Layer => "Layer",
+            PaneKind::History => "History",
         }
     }
 }
@@ -137,8 +141,8 @@ pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let center = tiles.insert_tab_tile(center.to_vec());
     let inspector = tiles.insert_pane(Pane::first(PaneKind::Inspector));
     let inspector = tiles.insert_tab_tile(vec![inspector]);
-    let references =
-        [PaneKind::Layers, PaneKind::References, PaneKind::Problems].map(|k| tiles.insert_pane(Pane::first(k)));
+    let references = [PaneKind::Layers, PaneKind::History, PaneKind::References, PaneKind::Problems]
+        .map(|k| tiles.insert_pane(Pane::first(k)));
     let references = tiles.insert_tab_tile(references.to_vec());
     let right = tiles.insert_vertical_tile(vec![inspector, references]);
     if let Some(Tile::Container(egui_tiles::Container::Linear(linear))) = tiles.get_mut(right) {
@@ -169,6 +173,10 @@ pub struct Panes<'a> {
     pub window: Option<u64>,
     /// What tabs asked for, by tile.
     pub actions: Vec<(TileId, PaneAction)>,
+    /// Steps the History pane asked to undo (false) or redo (true), and how many.
+    pub steps: Option<(bool, usize)>,
+    /// An edit asked for in a pane.
+    pub edit: Option<EditRequest>,
     /// A line for the status bar: what an action did, or why it failed.
     pub message: Option<String>,
 }
@@ -192,8 +200,15 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         // An instance pinned to an entry shows it; the others show the selection.
         let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
         let subject = pinned.clone().or_else(|| ws.selected.clone());
-        let (nav, pick, settings, layers, message) =
-            (&mut self.nav, &mut self.pick, &mut *self.settings, &mut *self.layers, &mut self.message);
+        let (nav, pick, settings, layers, message, steps, edit) = (
+            &mut self.nav,
+            &mut self.pick,
+            &mut *self.settings,
+            &mut *self.layers,
+            &mut self.message,
+            &mut self.steps,
+            &mut self.edit,
+        );
         let mut contents = |ui: &mut egui::Ui| {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -203,17 +218,18 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 }
                 let subject = subject.as_deref();
                 match pane.kind {
-                    PaneKind::Assets => assets_ui(ui, ws, pick),
+                    PaneKind::Assets => assets_ui(ui, ws, pick, edit),
                     PaneKind::Preview => preview_ui(ui, ws, subject, nav, &mut settings.preview),
                     PaneKind::Vram => vram_ui(ui, ws, nav, settings.preview.upscale),
                     PaneKind::Inspector => {
-                        crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message);
+                        crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message, edit);
                     }
                     PaneKind::References => references_ui(ui, ws, subject, nav),
                     PaneKind::Problems => problems_ui(ui, ws, nav),
                     PaneKind::Project => project_ui(ui, ws, nav),
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
-                    PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav),
+                    PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
+                    PaneKind::History => history_ui(ui, ws, steps),
                     PaneKind::Settings => {}
                 }
             });
@@ -313,13 +329,53 @@ impl Panes<'_> {
     }
 }
 
+/// The session's history: what was done, the last of it marked, and what was undone and can be redone, greyed. A
+/// click on a step undoes or redoes everything up to it.
+fn history_ui(ui: &mut egui::Ui, ws: &Workspace, steps: &mut Option<(bool, usize)>) {
+    let (done, undone) = (ws.history.done(), ws.history.undone());
+    ui.label(
+        RichText::new("What was done since the project was opened: closing it ends the history.")
+            .small()
+            .color(theme::weak()),
+    );
+    ui.add_space(4.0);
+    if done.is_empty() && undone.is_empty() {
+        ui.label(RichText::new("Nothing done yet").color(theme::weak()));
+        return;
+    }
+    let row = |ui: &mut egui::Ui, step: &project::history::Step, current: bool, redone: bool| {
+        let mut text = RichText::new(&step.label);
+        if redone {
+            text = text.color(theme::weak());
+        }
+        let author = if step.author == "user" { String::new() } else { format!("  ·  {}", step.author) };
+        let response = ui.add(egui::Button::selectable(current, text).truncate()).on_hover_text(format!(
+            "{} file{}{author}",
+            step.paths().len(),
+            if step.paths().len() == 1 { "" } else { "s" }
+        ));
+        response.clicked()
+    };
+    for (i, step) in done.iter().enumerate() {
+        let last = i + 1 == done.len();
+        if row(ui, step, last, false) && !last {
+            *steps = Some((false, done.len() - 1 - i));
+        }
+    }
+    for (i, step) in undone.iter().rev().enumerate() {
+        if row(ui, step, false, true) {
+            *steps = Some((true, i + 1));
+        }
+    }
+}
+
 fn scroll(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::ScrollArea::vertical().id_salt(id).auto_shrink(false).show(ui, add_contents);
 }
 
 // --- assets -----------------------------------------------------------------------------------------------------------
 
-fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<String>) {
+fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<String>, edit: &mut Option<EditRequest>) {
     ui.add(
         egui::TextEdit::singleline(&mut ws.filter)
             .hint_text(format!("{}  Filter by path or kind", icons::MAGNIFYING_GLASS))
@@ -330,8 +386,9 @@ fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<String>) {
     let mut chosen = None;
     scroll(ui, "assets", |ui| {
         if filter.is_empty() {
-            let view = TreeView { ws, reveal: ws.reveal.as_deref() };
+            let view = TreeView { ws, reveal: ws.reveal.as_deref(), edit: std::cell::RefCell::new(None) };
             view.ui(ui, &ws.tree, "", pick, &mut chosen);
+            *edit = view.edit.into_inner().or(edit.take());
         } else {
             filtered_ui(ui, ws, &filter, pick);
         }
@@ -346,6 +403,8 @@ fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<String>) {
 struct TreeView<'a> {
     ws: &'a Workspace,
     reveal: Option<&'a str>,
+    /// An edit an entry's menu asked for.
+    edit: std::cell::RefCell<Option<EditRequest>>,
 }
 
 impl TreeView<'_> {
@@ -392,9 +451,11 @@ impl TreeView<'_> {
                         let label = egui::Label::new(RichText::new(format!("{icon}  {name}")).color(tint))
                             .sense(egui::Sense::click())
                             .selectable(false);
-                        if ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        let response = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if response.clicked() {
                             set_open = Some(!open);
                         }
+                        self.menu(&response, child);
                         self.badge(ui, child);
                     }
                 })
@@ -435,6 +496,7 @@ impl TreeView<'_> {
         if response.clicked() {
             *pick = Some(asset.to_string());
         }
+        self.menu(&response, node);
         self.badge(ui, node);
         Some(response)
     }
@@ -452,7 +514,19 @@ impl TreeView<'_> {
             if response.clicked() {
                 *pick = Some(path.to_string());
             }
+            self.menu(&response, node);
             self.badge(ui, node);
+        });
+    }
+
+    /// An entry's menu: its edits in the active layer.
+    fn menu(&self, response: &egui::Response, node: &Node) {
+        let Some(real) = node.path.as_deref() else { return };
+        response.context_menu(|ui| {
+            if let Some(request) = entry_menu(ui, self.ws, real) {
+                *self.edit.borrow_mut() = Some(request);
+                ui.close();
+            }
         });
     }
 
@@ -462,6 +536,42 @@ impl TreeView<'_> {
             ui.label(RichText::new(text).small().color(theme::accent()));
         }
     }
+}
+
+/// The edits of an entry (by its real path) the active layer can make: override, rename, delete, take back.
+fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &str) -> Option<EditRequest> {
+    let entry = ws.index.entries.get(real)?;
+    let layer = match ws.editable_layer() {
+        Ok(layer) => layer,
+        Err(why) => {
+            ui.label(RichText::new(why).color(theme::weak()));
+            return None;
+        }
+    };
+    let name = &layer.name;
+    let own = entry.home == *name;
+    let overridden = entry.overrides.iter().any(|l| l == name);
+    let uid = entry.uid.clone();
+    let mut request = None;
+    ui.label(RichText::new(format!("In the layer {name}")).small().color(theme::weak()));
+    if entry.kind != project::index::Kind::Folder && !own && !overridden {
+        let hint = "Copy the version below into the layer, to edit it there";
+        if ui.button(format!("Override in {name}")).on_hover_text(hint).clicked() {
+            request = Some(EditRequest::Override(uid.clone()));
+        }
+    }
+    if overridden && ui.button("Take the version below").on_hover_text("Drop the layer's copy").clicked() {
+        request = Some(EditRequest::Resolve(uid.clone(), project::edit::Resolution::TakeBase));
+    }
+    if ui.button("Rename…").clicked() {
+        request = Some(EditRequest::Rename(uid.clone(), real.to_string()));
+    }
+    let delete = if own { "Delete".to_string() } else { format!("Delete in {name}") };
+    let hint = if own { "Remove it from the layer" } else { "The layer hides it: the layers below keep it" };
+    if ui.button(delete).on_hover_text(hint).clicked() {
+        request = Some(EditRequest::Delete(uid));
+    }
+    request
 }
 
 /// A name after its kind's icon, the icon in the kind's tint; dimmed where it cannot be modified.

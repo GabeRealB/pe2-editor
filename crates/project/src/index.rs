@@ -128,6 +128,19 @@ pub struct CreateView {
     pub kind: Option<Kind>,
 }
 
+/// An entry as the layers below one see it: what an operation of that layer on it stands on.
+#[derive(Clone, Debug)]
+pub struct Below {
+    pub kind: Kind,
+    pub uid: String,
+    /// Its resolved path below the layer.
+    pub path: String,
+    /// Its content's hash: what an override records as its base. None for a folder.
+    pub hash: Option<String>,
+    /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
+    pub files: Vec<(String, PathBuf)>,
+}
+
 /// A layer in the stack as the layer panel shows it.
 #[derive(Clone, Debug)]
 pub struct LayerInfo {
@@ -1004,6 +1017,57 @@ impl Index {
         out
     }
 
+    /// A layer's changeset as the index read it.
+    #[must_use]
+    pub fn changeset(&self, layer: &str) -> Option<&Changeset> {
+        self.layers.iter().find(|l| l.name == layer).map(|l| &l.changeset)
+    }
+
+    /// The stack resolved without a layer and those above it: what that layer stands on.
+    fn below_layer(&self, layer: &str) -> Option<Resolution> {
+        let at = self.layers.iter().position(|l| l.name == layer)?;
+        Some(self.resolve_stack(&(at..self.layers.len()).collect()))
+    }
+
+    /// An entry as the layers below `layer` resolve it, by its uid.
+    #[must_use]
+    pub fn below(&self, layer: &str, uid: &str) -> Option<Below> {
+        let resolution = self.below_layer(layer)?;
+        let (path, node) = resolution.resolved.iter().find(|(_, n)| n.uid == uid)?;
+        let (content, content_path) = &node.content;
+        let source = &self.layers[*content];
+        let files =
+            match node.kind {
+                Kind::Asset => source.scan.bundles.get(content_path).map_or_else(Vec::new, |files| {
+                    files.iter().map(|(name, file)| (name.clone(), file.clone())).collect()
+                }),
+                Kind::File => {
+                    source.scan.files.get(content_path).map_or_else(Vec::new, |f| vec![(String::new(), f.clone())])
+                }
+                Kind::Folder => vec![],
+            };
+        Some(Below {
+            kind: node.kind,
+            uid: uid.to_string(),
+            path: path.clone(),
+            hash: self.content_hash(*content, content_path, node.kind),
+            files,
+        })
+    }
+
+    /// The entries the layers below `layer` resolve inside a folder (its path), by uid.
+    #[must_use]
+    pub fn below_inside(&self, layer: &str, folder: &str) -> Vec<(String, String)> {
+        let Some(resolution) = self.below_layer(layer) else { return vec![] };
+        let prefix = format!("{folder}/");
+        resolution
+            .resolved
+            .iter()
+            .filter(|(path, _)| path.starts_with(&prefix))
+            .map(|(path, node)| (node.uid.clone(), path.clone()))
+            .collect()
+    }
+
     /// The stack, bottom to top, as the layer panel shows it.
     #[must_use]
     pub fn layers(&self) -> Vec<LayerInfo> {
@@ -1114,8 +1178,13 @@ impl Index {
         for i in 0..self.layers.len() {
             let layer = &self.layers[i];
             let listed: HashSet<&String> = layer.changeset.entries.values().collect();
-            let mut unlisted: BTreeSet<String> =
-                layer.scan.paths().filter(|p| !listed.contains(p) && !below.contains(*p)).cloned().collect();
+            let copies = self.override_targets(i);
+            let mut unlisted: BTreeSet<String> = layer
+                .scan
+                .paths()
+                .filter(|p| !listed.contains(p) && !below.contains(*p) && !copies.contains(*p))
+                .cloned()
+                .collect();
             if !layer.writable || unlisted.is_empty() {
                 below.extend(layer.changeset.entries.values().cloned());
                 continue;
@@ -1194,6 +1263,24 @@ impl Index {
             below.extend(layer.changeset.entries.values().cloned());
         }
         Ok(())
+    }
+
+    /// Where a layer's overrides put their copies: each override's move target, else its entry's path below the
+    /// layer. Not unlisted content: the changeset accounts for them.
+    fn override_targets(&self, layer: usize) -> HashSet<String> {
+        let ops = &self.layers[layer].changeset.ops;
+        if !ops.values().any(|op| matches!(op, Op::Override { .. })) {
+            return HashSet::new();
+        }
+        let below = self.resolve_stack(&(layer..self.layers.len()).collect());
+        let path_of: HashMap<&str, &String> = below.resolved.iter().map(|(p, n)| (n.uid.as_str(), p)).collect();
+        ops.iter()
+            .filter_map(|(uid, op)| match op {
+                Op::Override { to: Some(to), .. } => Some(to.clone()),
+                Op::Override { to: None, .. } => path_of.get(uid.as_str()).map(|p| (*p).clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Build the assets at these real paths from the resolved stack and the records: their uid, the winning layer's

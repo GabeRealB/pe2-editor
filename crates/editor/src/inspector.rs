@@ -9,7 +9,7 @@ use project::index::Asset;
 
 use crate::external::{self, Category};
 use crate::settings::{Tools, Upscale};
-use crate::workspace::{Workspace, role};
+use crate::workspace::{EditRequest, FieldEdit, Workspace, role};
 use crate::{icons, theme};
 
 /// Fields the header shows, or that only extraction writes.
@@ -30,6 +30,7 @@ pub fn inspector_ui(
     nav: &mut Option<String>,
     tools: &Tools,
     message: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
 ) {
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)).cloned() else {
         if let Some((path, entry)) = subject.and_then(|s| ws.entry_at(s)) {
@@ -45,7 +46,7 @@ pub fn inspector_ui(
         asset.fields().iter().filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str())).collect();
     let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
     if !properties.is_empty() {
-        theme::section(ui, "Properties", |ui| property_sheet(ui, ws, &properties, &context, nav));
+        theme::section(ui, "Properties", |ui| property_sheet(ui, ws, &asset, &properties, &context, nav, edit));
     }
     for (key, value) in lists {
         let items = value.as_array().map_or(&[][..], Vec::as_slice);
@@ -54,6 +55,62 @@ pub fn inspector_ui(
         });
     }
     files_ui(ui, &asset, tools, message);
+    declaration_ui(ui, ws, &asset, edit);
+}
+
+/// Where an edit of an asset goes, as said beside its controls: the active layer - copied into it first where the asset
+/// comes from below - or why it cannot be edited.
+fn edit_target(ws: &Workspace, asset: &Asset) -> Result<String, String> {
+    let layer = ws.editable_layer()?;
+    let theirs = !asset.layers.contains(&layer.name);
+    Ok(if theirs { format!("Saving overrides it in {}", layer.name) } else { format!("Saved in {}", layer.name) })
+}
+
+/// The asset's declaration (`asset.toml`) as text, to edit and save whole: refused while it is not TOML.
+fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut Option<EditRequest>) {
+    let Some(uid) = asset.uid.clone() else { return };
+    if ws.declaration_draft.as_ref().is_some_and(|(a, _)| *a != asset.path) {
+        ws.declaration_draft = None;
+    }
+    let target = edit_target(ws, asset);
+    let id = ui.make_persistent_id(("declaration", &asset.path));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| ui.label(RichText::new("DECLARATION").small().strong().color(theme::weak())))
+        .body(|ui| {
+            let (_, draft) = ws.declaration_draft.get_or_insert_with(|| (asset.path.clone(), asset.text().to_string()));
+            let editable = target.is_ok();
+            ui.add_enabled(
+                editable,
+                egui::TextEdit::multiline(draft).code_editor().desired_rows(12).desired_width(f32::INFINITY),
+            );
+            let changed = draft.as_str() != asset.text();
+            let parsed = toml::from_str::<toml::Table>(draft);
+            ui.horizontal_wrapped(|ui| {
+                let save = ui.add_enabled(editable && changed && parsed.is_ok(), egui::Button::new("Save"));
+                if save.clicked() {
+                    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+                    *edit = Some(EditRequest::Write {
+                        uid: uid.clone(),
+                        file: project::index::ASSET_FILE.to_string(),
+                        bytes: draft.clone().into_bytes(),
+                        label: format!("Edit {name}'s declaration"),
+                        merge: None,
+                    });
+                }
+                if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
+                    *draft = asset.text().to_string();
+                }
+                match (&target, &parsed) {
+                    (_, Err(e)) => {
+                        let first = e.to_string().lines().next().unwrap_or_default().to_string();
+                        ui.label(RichText::new(first).small().color(ui.visuals().error_fg_color));
+                    }
+                    (Ok(note) | Err(note), Ok(_)) => {
+                        ui.label(RichText::new(note).small().color(theme::weak()));
+                    }
+                }
+            });
+        });
 }
 
 // --- header -----------------------------------------------------------------------------------------------------------
@@ -128,6 +185,40 @@ fn label_of(key: &str) -> String {
 fn property_sheet(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
+    asset: &Asset,
+    fields: &[(&String, &toml::Value)],
+    context: &Context,
+    nav: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
+) {
+    let editable = edit_target(ws, asset).is_ok();
+    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
+        for (key, value) in fields {
+            ui.label(RichText::new(label_of(key)).color(theme::weak()));
+            ui.horizontal_wrapped(|ui| {
+                let editing = ws.field_edit.as_ref().is_some_and(|f| f.asset == asset.path && f.key == **key);
+                if editing {
+                    field_editor(ui, ws, asset, key, value, edit);
+                    return;
+                }
+                value_ui(ui, ws, key, value, context, nav);
+                if editable && is_scalar(value) {
+                    let pencil = ui.add(egui::Button::new(RichText::new(icons::PENCIL_SIMPLE).small()).frame(false));
+                    if pencil.on_hover_text(edit_target(ws, asset).unwrap_or_default()).clicked() {
+                        ws.field_edit =
+                            Some(FieldEdit { asset: asset.path.clone(), key: (*key).clone(), text: raw_text(value) });
+                    }
+                }
+            });
+            ui.end_row();
+        }
+    });
+}
+
+/// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
+fn nested_sheet(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
     fields: &[(&String, &toml::Value)],
     context: &Context,
     nav: &mut Option<String>,
@@ -139,6 +230,73 @@ fn property_sheet(
             ui.end_row();
         }
     });
+}
+
+/// A value the inspector edits in place: a string, a number, a truth.
+fn is_scalar(value: &toml::Value) -> bool {
+    matches!(value, toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Boolean(_))
+}
+
+/// A scalar as it is typed: a string unquoted, a number as written.
+fn raw_text(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The value of a field being edited: committed (a step of the history, the same field's next edits joining it) on
+/// Enter or when it loses the keyboard; Escape leaves it.
+fn field_editor(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    asset: &Asset,
+    key: &str,
+    value: &toml::Value,
+    edit: &mut Option<EditRequest>,
+) {
+    let Some(field) = ws.field_edit.as_mut() else { return };
+    let parsed: Result<toml_edit::Value, String> = match value {
+        toml::Value::String(_) => Ok(field.text.as_str().into()),
+        toml::Value::Integer(_) => {
+            let text = field.text.trim();
+            let n = text.strip_prefix("0x").map_or_else(|| text.parse::<i64>(), |hex| i64::from_str_radix(hex, 16));
+            n.map(Into::into).map_err(|_| "a whole number".to_string())
+        }
+        toml::Value::Float(_) => field.text.trim().parse::<f64>().map(Into::into).map_err(|_| "a number".to_string()),
+        toml::Value::Boolean(_) => match field.text.trim() {
+            "true" => Ok(true.into()),
+            "false" => Ok(false.into()),
+            _ => Err("true or false".to_string()),
+        },
+        _ => Err("not edited here".to_string()),
+    };
+    let response = ui.add(egui::TextEdit::singleline(&mut field.text).desired_width(180.0));
+    response.request_focus();
+    let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+    if let Err(why) = &parsed {
+        ui.label(RichText::new(why).small().color(ui.visuals().error_fg_color));
+    }
+    if escape {
+        ws.field_edit = None;
+    } else if (enter || response.lost_focus())
+        && let Ok(new) = parsed
+    {
+        ws.field_edit = None;
+        let Ok(mut document) = asset.text().parse::<toml_edit::DocumentMut>() else { return };
+        document[key] = toml_edit::Item::Value(new);
+        if document.to_string() == asset.text() {
+            return;
+        }
+        let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+        *edit = Some(EditRequest::Write {
+            uid: asset.uid.clone().unwrap_or_default(),
+            file: project::index::ASSET_FILE.to_string(),
+            bytes: document.to_string().into_bytes(),
+            label: format!("Set {} of {name}", label_of(key).to_lowercase()),
+            merge: Some(format!("{}#{key}", asset.path)),
+        });
+    }
 }
 
 fn int(value: &toml::Value) -> Option<i64> {
@@ -208,7 +366,7 @@ fn value_ui(
             } else {
                 ui.vertical(|ui| {
                     let fields: Vec<(&String, &toml::Value)> = t.iter().collect();
-                    property_sheet(ui, ws, &fields, context, nav);
+                    nested_sheet(ui, ws, &fields, context, nav);
                 });
             }
         }

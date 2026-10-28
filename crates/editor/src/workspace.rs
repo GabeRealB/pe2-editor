@@ -2,10 +2,11 @@
 //! entries, the selection with its history, the pictures decoded so far, the user's view of the layers (eyes, hand
 //! locks, the active layer), and the link agents reach it by (`mcp::link`).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui;
 use project::Project;
 use project::cache::Cache;
+use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -129,6 +130,10 @@ pub struct Workspace {
     pub index: Index,
     /// The stack as the layer panel shows it, bottom to top.
     pub layers: Vec<LayerInfo>,
+    /// What was done this session, to undo and redo.
+    pub history: History,
+    /// The label of an edit a crash left half done, rolled back when the project was opened.
+    pub recovered: Option<String>,
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     _lock: Lock,
@@ -158,6 +163,40 @@ pub struct Workspace {
     strips: HashMap<(String, usize), Picture>,
     /// The variant an image is shown in (an index into `variants_of`); without one, its first.
     pub variant_choice: HashMap<String, usize>,
+    /// A field being edited in the inspector.
+    pub field_edit: Option<FieldEdit>,
+    /// An asset's declaration being edited in the inspector, as text: the asset, the text.
+    pub declaration_draft: Option<(String, String)>,
+}
+
+/// An edit asked for in a pane, of the entry with this uid, made in the active layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditRequest {
+    Override(String),
+    /// Override in this layer, not the active one: code, overridden in a files layer chosen for it.
+    OverrideIn(String, String),
+    /// Ask for a new name, then rename: the uid and the entry's real path.
+    Rename(String, String),
+    /// Rename to this real path.
+    RenameTo(String, String),
+    Delete(String),
+    Resolve(String, project::edit::Resolution),
+    /// Write a file of the entry (its `asset.toml`; empty: a plain file itself), labeled for the history; edits of one
+    /// merge key made in a row are one step.
+    Write {
+        uid: String,
+        file: String,
+        bytes: Vec<u8>,
+        label: String,
+        merge: Option<String>,
+    },
+}
+
+/// A field of an asset's declaration being edited in the inspector: the asset, the field, the text typed.
+pub struct FieldEdit {
+    pub asset: String,
+    pub key: String,
+    pub text: String,
 }
 
 /// What a watcher batch did to the workspace.
@@ -231,15 +270,21 @@ fn show(ctx: &egui::Context, path: &str, chosen: usize, upscale: Upscale, image:
 }
 
 impl Workspace {
-    /// Open the project in `dir`.
+    /// Open the project in `dir`; with a history, again, keeping this session's history: a change to `project.toml` -
+    /// an edit of the stack, or its undoing - opens the project again, and must not end the session's history.
     ///
     /// # Errors
     /// Its `project.toml` or its assets cannot be read.
-    pub fn open(dir: &Path) -> Result<Workspace> {
+    pub fn open_keeping(dir: &Path, history: Option<History>) -> Result<Workspace> {
         let project = Project::load(dir)?;
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
         let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
         let cache = Cache::open(&project, &lock)?;
+        // The history first: a transaction a crash left half done is rolled back before the index reads the files.
+        let (history, recovered) = match history {
+            Some(history) => (history, None),
+            None => History::open(&cache)?,
+        };
         let mut index = Index::open(&project, &cache)?;
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
@@ -249,6 +294,8 @@ impl Workspace {
         let tree = Node::build(&index);
         let mut workspace = Workspace {
             project,
+            history,
+            recovered,
             layers: index.layers(),
             layer_view,
             index,
@@ -269,6 +316,8 @@ impl Workspace {
             pictures: HashMap::new(),
             strips: HashMap::new(),
             variant_choice: HashMap::new(),
+            field_edit: None,
+            declaration_draft: None,
         };
         workspace.refresh_editable();
         Ok(workspace)
@@ -343,10 +392,36 @@ impl Workspace {
                 Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
             }
         }
+        self.take_in(&paths)
+    }
+
+    /// Give up the workspace, keeping its history for the project opened again.
+    pub fn into_history(self) -> History {
+        self.history
+    }
+
+    /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. The
+    /// index takes the change in at once, and what was selected when the step was made is shown again. Returns the
+    /// step's label and what the index made of it.
+    ///
+    /// # Errors
+    /// Nothing to undo or redo, files changed outside the editor (unless forced), or a file not written.
+    pub fn step(&mut self, redo: bool, force: bool) -> Result<(String, Update), StepError> {
+        let step = if redo { self.history.redo(force)? } else { self.history.undo(force)? };
+        let (label, paths, selection) = (step.label.clone(), step.paths(), step.selection.clone());
+        let update = self.take_in(&paths);
+        if let Some(path) = selection.filter(|p| self.exists(p)) {
+            self.navigate(path);
+        }
+        Ok((label, update))
+    }
+
+    /// Bring changed paths into the index, and the tree and pictures after it.
+    fn take_in(&mut self, paths: &[PathBuf]) -> Update {
         if paths.is_empty() {
             return Update::Nothing;
         }
-        let refreshed = match self.index.refresh(&self.project, &paths) {
+        let refreshed = match self.index.refresh(&self.project, paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 self.watch_error = Some(format!("the index could not follow a change: {e:#}"));
@@ -541,6 +616,75 @@ impl Workspace {
         self.save_layer_view()
     }
 
+    /// The layer edits go to: the active one, if it can be written now.
+    ///
+    /// # Errors
+    /// Why it cannot: none is active, it is locked (by nature, by hand, by a solo).
+    pub fn editable_layer(&self) -> Result<&LayerInfo, String> {
+        let layer = self.active_layer().ok_or("no layer is active")?;
+        if self.is_locked(layer) {
+            let why = if self.locked_by_solo(layer) { "while another layer is soloed" } else { "it is locked" };
+            return Err(format!("{} cannot be edited: {why}", layer.name));
+        }
+        Ok(layer)
+    }
+
+    /// Make an edit in the active layer: a step of the history, the index taking it in at once. Returns what was done.
+    ///
+    /// # Errors
+    /// The active layer cannot be written, the edit does not apply, or files cannot be written.
+    pub fn edit(&mut self, request: &EditRequest) -> anyhow::Result<String> {
+        use project::edit;
+        let name = match request {
+            // A files layer chosen for code: it is to be writable, as the active one is.
+            EditRequest::OverrideIn(_, layer) => {
+                let chosen = self.layers.iter().find(|l| l.name == *layer);
+                let chosen = chosen.with_context(|| format!("the project has no layer {layer}"))?;
+                if self.is_locked(chosen) {
+                    anyhow::bail!("{layer} is locked");
+                }
+                layer.clone()
+            }
+            _ => self.editable_layer().map_err(anyhow::Error::msg)?.name.clone(),
+        };
+        let uid = match request {
+            EditRequest::Override(uid)
+            | EditRequest::OverrideIn(uid, _)
+            | EditRequest::Rename(uid, _)
+            | EditRequest::RenameTo(uid, _)
+            | EditRequest::Delete(uid)
+            | EditRequest::Resolve(uid, _)
+            | EditRequest::Write { uid, .. } => uid.clone(),
+        };
+        // Code goes to a files layer: an override of it in an asset layer is asked of the user first
+        // (`override_choice`), and a write into it is made there.
+        if matches!(request, EditRequest::Override(_) | EditRequest::Write { .. })
+            && let Some(choices) = self.override_choice(&uid).map_err(anyhow::Error::msg)?
+        {
+            anyhow::bail!(
+                "code is overridden in a files layer ({})",
+                if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
+            );
+        }
+        let (project, index, history) = (&self.project, &self.index, &mut self.history);
+        let paths = match request {
+            EditRequest::Override(uid) | EditRequest::OverrideIn(uid, _) => {
+                edit::override_entry(project, index, &name, uid, history)?
+            }
+            EditRequest::Delete(uid) => edit::delete(project, index, &name, uid, history)?,
+            EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, uid, to, history)?,
+            EditRequest::Resolve(uid, resolution) => edit::resolve(project, index, &name, uid, *resolution, history)?,
+            EditRequest::Write { uid, file, bytes, label, merge } => {
+                edit::write_file(project, index, &name, uid, file, bytes, label.clone(), merge.clone(), history)?
+            }
+            EditRequest::Rename(..) => return Ok(String::new()),
+        };
+        self.history.note_selection(self.selected.clone());
+        let label = self.history.done().last().map_or_default(|s| s.label.clone());
+        self.take_in(&paths);
+        Ok(label)
+    }
+
     /// The stack's own layers (not the mounts), bottom to top.
     pub fn stack_order(&self) -> Vec<String> {
         self.layers.iter().filter(|l| !l.mounted).map(|l| l.name.clone()).collect()
@@ -551,24 +695,51 @@ impl Workspace {
     ///
     /// # Errors
     /// Why the order cannot be: a layer it would put below one it needs, or `project.toml` not written.
-    pub fn reorder(&self, order: &[String]) -> Result<()> {
-        project::stack::reorder(&self.project, &self.layers, order)
+    pub fn reorder(&mut self, order: &[String]) -> Result<()> {
+        project::stack::reorder(&self.project, &self.layers, order, &mut self.history)
     }
 
-    /// Add a new, empty layer at the top of the stack.
+    /// Add a new, empty layer of a kind at the top of the stack.
     ///
     /// # Errors
     /// The name is not one a layer may take, or it cannot be written.
-    pub fn add_layer(&self, name: &str) -> Result<()> {
-        project::stack::add(&self.project, name)
+    pub fn add_layer(&mut self, name: &str, kind: project::LayerKind) -> Result<()> {
+        project::stack::add(&self.project, name, kind, &mut self.history)
+    }
+
+    /// Where an override of an entry (by uid) goes: the active layer (none), or - code (an entry of a files layer)
+    /// while an asset layer is active - one of the files layers above its own, which can be written: the user's
+    /// choice, these the candidates (perhaps none: a files layer is to be made).
+    ///
+    /// # Errors
+    /// The active layer cannot be written, or holds plain files only and the entry is an asset.
+    pub fn override_choice(&self, uid: &str) -> Result<Option<Vec<String>>, String> {
+        use project::LayerKind;
+        let active = self.editable_layer()?;
+        let Some(entry) = self.index.entries.values().find(|e| e.uid == uid) else { return Ok(None) };
+        if active.kind == LayerKind::Files && entry.kind == project::index::Kind::Asset {
+            return Err(format!("{} is a files layer: it holds plain files, not assets", active.name));
+        }
+        let home = self.layers.iter().position(|l| l.name == entry.home);
+        let code = home.is_some_and(|h| self.layers[h].kind == LayerKind::Files);
+        if !code || active.kind == LayerKind::Files {
+            return Ok(None);
+        }
+        let above = home.map_or(0, |h| h + 1);
+        let candidates = self.layers[above..]
+            .iter()
+            .filter(|l| l.kind == LayerKind::Files && !l.mounted && !self.is_locked(l))
+            .map(|l| l.name.clone())
+            .collect();
+        Ok(Some(candidates))
     }
 
     /// Take a layer out of the stack; its files stay on disk.
     ///
     /// # Errors
     /// Another layer needs it, it is the game layer or a mount, or `project.toml` cannot be rewritten.
-    pub fn remove_layer(&self, name: &str) -> Result<()> {
-        project::stack::remove(&self.project, &self.layers, name)
+    pub fn remove_layer(&mut self, name: &str) -> Result<()> {
+        project::stack::remove(&self.project, &self.layers, name, &mut self.history)
     }
 
     pub fn can_go_back(&self) -> bool {

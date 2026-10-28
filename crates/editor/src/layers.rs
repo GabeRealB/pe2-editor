@@ -9,12 +9,14 @@ use project::index::{Kind, LayerInfo, OpStatus};
 
 use crate::icons;
 use crate::theme;
-use crate::workspace::Workspace;
+use crate::workspace::{EditRequest, Workspace};
 
 /// What the Layers pane keeps between frames: the name being typed for a new layer.
 #[derive(Default)]
 pub struct LayersState {
     pub new_layer: Option<String>,
+    /// The kind of the layer being added: plain files (true) or assets.
+    pub files: bool,
 }
 
 /// A layer's row being dragged: its name.
@@ -52,7 +54,8 @@ enum Action {
         target: String,
         above: bool,
     },
-    Add(String),
+    /// A new layer, of plain files (true) or of assets.
+    Add(String, bool),
     Remove(String),
 }
 
@@ -71,10 +74,13 @@ impl Action {
                 order.insert(at, layer.clone());
                 ws.reorder(&order).map(|()| Some(format!("{layer} moved")))
             }
-            Action::Add(name) => ws.add_layer(&name).map(|()| {
-                state.new_layer = None;
-                Some(format!("{name} added at the top of the stack"))
-            }),
+            Action::Add(name, files) => {
+                let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
+                ws.add_layer(&name, kind).map(|()| {
+                    state.new_layer = None;
+                    Some(format!("{name} added at the top of the stack"))
+                })
+            }
             Action::Remove(name) => {
                 ws.remove_layer(&name).map(|()| Some(format!("{name} taken out of the stack; its files are kept")))
             }
@@ -313,12 +319,14 @@ fn footer_ui(ui: &mut egui::Ui, ws: &Workspace, state: &mut LayersState, action:
             ui.horizontal(|ui| {
                 let edit = ui.add(egui::TextEdit::singleline(name).hint_text("name").desired_width(140.0));
                 edit.request_focus();
+                ui.selectable_value(&mut state.files, false, "Assets").on_hover_text("Assets and plain files");
+                ui.selectable_value(&mut state.files, true, "Files").on_hover_text("Plain files only: code, a patch");
                 let valid = project::stack::check_name(&ws.project, name.trim());
                 let add = ui.add_enabled(valid.is_ok(), egui::Button::new("Add"));
                 if add.clicked()
                     || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && valid.is_ok())
                 {
-                    *action = Some(Action::Add(name.trim().to_string()));
+                    *action = Some(Action::Add(name.trim().to_string(), state.files));
                 }
                 cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
                 if let Err(e) = valid
@@ -337,7 +345,7 @@ fn footer_ui(ui: &mut egui::Ui, ws: &Workspace, state: &mut LayersState, action:
 // --- the layer pane ---------------------------------------------------------------------------------------------------
 
 /// The Layer pane: the active layer's changeset.
-pub fn layer_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+pub fn layer_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
     let Some(layer) = ws.active_layer().cloned() else {
         ui.label(RichText::new("The project has no layers").color(theme::weak()));
         return;
@@ -382,12 +390,19 @@ pub fn layer_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
             }
         });
     }
-    operations_ui(ui, ws, &layer.name, nav);
+    let writable = ws.editable_layer().is_ok();
+    operations_ui(ui, ws, &layer.name, nav, writable.then_some(edit));
     creates_ui(ui, ws, &layer.name, nav);
 }
 
 /// A layer's overrides, moves and deletes, each with its status.
-fn operations_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<String>) {
+fn operations_ui(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    layer: &str,
+    nav: &mut Option<String>,
+    mut edit: Option<&mut Option<EditRequest>>,
+) {
     let operations = ws.index.operations(layer);
     theme::section(ui, &format!("Operations ({})", operations.len()), |ui| {
         if operations.is_empty() {
@@ -409,6 +424,9 @@ fn operations_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Optio
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon).color(tint)).on_hover_text(status);
                 ui.add_sized(egui::vec2(56.0, ui.spacing().interact_size.y), egui::Label::new(what));
+                if let Some(edit) = edit.as_deref_mut() {
+                    resolutions_ui(ui, op, edit);
+                }
                 path_link(ui, ws, op.path.as_deref().unwrap_or(&op.uid), nav);
             });
             if let Some(to) = to {
@@ -423,6 +441,35 @@ fn operations_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Optio
             ui.label(RichText::new(format!("… {} more", operations.len() - 500)).color(theme::weak()));
         }
     });
+}
+
+/// What can be done about an operation, as small buttons: a stale override kept or given up, an operation whose
+/// entry is gone dropped.
+fn resolutions_ui(ui: &mut egui::Ui, op: &project::index::OpView, edit: &mut Option<EditRequest>) {
+    use project::edit::Resolution;
+    let mut ask = |ui: &mut egui::Ui, text: &str, hint: &str, resolution| {
+        if ui.small_button(text).on_hover_text(hint).clicked() {
+            *edit = Some(EditRequest::Resolve(op.uid.clone(), resolution));
+        }
+    };
+    match (op.status, &op.op) {
+        (OpStatus::Stale, _) => {
+            ask(
+                ui,
+                "Keep mine",
+                "Keep the layer's version: its base becomes the version below now",
+                Resolution::KeepMine,
+            );
+            ask(ui, "Take below", "Drop the layer's version for the one below", Resolution::TakeBase);
+        }
+        (OpStatus::Unbound | OpStatus::Missing, _) => {
+            ask(ui, "Drop", "Drop the operation: what it acted on is gone", Resolution::Drop);
+        }
+        (_, Op::Override { .. }) => {
+            ask(ui, "Take below", "Drop the layer's version for the one below", Resolution::TakeBase);
+        }
+        (_, Op::Move { .. } | Op::Delete) => ask(ui, "Drop", "Undo this operation in the layer", Resolution::Drop),
+    }
 }
 
 /// The entries a layer creates, a row each (the game layer's run to thousands, so only the rows in view are drawn).

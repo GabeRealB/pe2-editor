@@ -25,6 +25,7 @@ serde_json.workspace = true
 notify.workspace = true
 png.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 
 # Choosing X11 over Wayland (main.rs) is Linux's alone.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -970,6 +970,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "toml_edit 0.22.27",
  "winit",
 ]
 
@@ -3268,6 +3269,7 @@ dependencies = [
  "getrandom 0.3.4",
  "pollster 0.4.0",
  "serde",
+ "serde_json",
  "sha1",
  "toml",
  "toml_edit 0.22.27",

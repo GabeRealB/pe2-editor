@@ -1,6 +1,7 @@
 //! Edits to the stack in `project.toml`: the layers' order, a layer added, a layer removed. Written in place, keeping
 //! the file's comments and layout, and checked first against what the layers need of each other (`Index::layers`): a
-//! layer stays above every layer it acts on or references. A layer removed leaves its files on disk.
+//! layer stays above every layer it acts on or references. A layer removed leaves its files on disk. Each edit is a
+//! transaction of the project's history (`history.rs`), so it can be undone.
 //!
 //! The mounts (`[[mount]]`) are files layers at the bottom of the stack, apart until mounts move into the stack: they
 //! are neither reordered nor removed here.
@@ -9,9 +10,9 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
-use crate::cache::write_atomic;
+use crate::history::History;
 use crate::index::LayerInfo;
-use crate::{FILE, LAYERS, Project};
+use crate::{FILE, LAYERS, LayerKind, Project};
 
 fn read(root: &Path) -> Result<DocumentMut> {
     let path = root.join(FILE);
@@ -19,8 +20,10 @@ fn read(root: &Path) -> Result<DocumentMut> {
     text.parse().with_context(|| format!("{}", path.display()))
 }
 
-fn write(root: &Path, document: &DocumentMut) -> Result<()> {
-    write_atomic(&root.join(FILE), document.to_string().as_bytes())
+fn write(root: &Path, document: &DocumentMut, history: &mut History, label: String) -> Result<()> {
+    let mut tx = history.begin(label);
+    tx.write(&root.join(FILE), document.to_string().as_bytes())?;
+    tx.commit().map(drop)
 }
 
 fn layer_tables(document: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
@@ -51,7 +54,7 @@ pub fn order_breaks(layers: &[LayerInfo], order: &[String]) -> Option<String> {
 ///
 /// # Errors
 /// The order breaks what a layer needs, does not name each layer once, or `project.toml` cannot be rewritten.
-pub fn reorder(project: &Project, layers: &[LayerInfo], order: &[String]) -> Result<()> {
+pub fn reorder(project: &Project, layers: &[LayerInfo], order: &[String], history: &mut History) -> Result<()> {
     if let Some(why) = order_breaks(layers, order) {
         bail!("{why}");
     }
@@ -78,7 +81,7 @@ pub fn reorder(project: &Project, layers: &[LayerInfo], order: &[String]) -> Res
         }
         tables.push(table);
     }
-    write(&project.root, &document)
+    write(&project.root, &document, history, "Reorder the layers".into())
 }
 
 /// A name a new layer may take: letters, digits, `_` and `-`, not a layer's or a mount point's already.
@@ -95,27 +98,31 @@ pub fn check_name(project: &Project, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Add a new, empty layer at the top of the stack: `.layers/<name>/` and its entry in `project.toml`.
+/// Add a new, empty layer of a kind at the top of the stack: `.layers/<name>/` and its entry in `project.toml`.
 ///
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
-pub fn add(project: &Project, name: &str) -> Result<()> {
+pub fn add(project: &Project, name: &str, kind: LayerKind, history: &mut History) -> Result<()> {
     check_name(project, name)?;
-    let directory = project.root.join(LAYERS).join(name);
-    std::fs::create_dir_all(&directory).with_context(|| format!("{}", directory.display()))?;
     let mut document = read(&project.root)?;
     let mut table = Table::new();
     table.insert("name", value(name));
     table.insert("path", value(format!("{LAYERS}/{name}")));
+    if kind == LayerKind::Files {
+        table.insert("kind", value("files"));
+    }
     layer_tables(&mut document)?.push(table);
-    write(&project.root, &document)
+    let mut tx = history.begin(format!("Add the layer {name}"));
+    tx.make_dir(&project.root.join(LAYERS).join(name))?;
+    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.commit().map(drop)
 }
 
 /// Take a layer out of the stack; its directory and changeset stay on disk.
 ///
 /// # Errors
 /// It is a mount or the game layer, another layer needs it, or `project.toml` cannot be rewritten.
-pub fn remove(project: &Project, layers: &[LayerInfo], name: &str) -> Result<()> {
+pub fn remove(project: &Project, layers: &[LayerInfo], name: &str, history: &mut History) -> Result<()> {
     if project.game.as_ref().is_some_and(|g| g.layer == name) {
         bail!("{name} is the game layer, which extraction fills");
     }
@@ -134,13 +141,16 @@ pub fn remove(project: &Project, layers: &[LayerInfo], name: &str) -> Result<()>
         .position(|t| name_of(t) == Some(name))
         .with_context(|| format!("the stack has no layer {name}"))?;
     tables.remove(at);
-    write(&project.root, &document)
+    write(&project.root, &document, history, format!("Take the layer {name} out of the stack"))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::Project;
+    use crate::cache::Cache;
+    use crate::history::History;
     use crate::index::{Dependency, LayerInfo};
+    use crate::lock::Lock;
     use crate::{LayerKind, stack};
 
     fn info(name: &str, below: &[&str]) -> LayerInfo {
@@ -169,27 +179,42 @@ mod tests {
                     \n# mine\n[[layer]]\nname = \"mod\"\n";
         std::fs::write(root.join("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let history = &mut history;
         let layers = [info("game", &[]), info("mod", &["game"])];
         let order = ["mod".to_string(), "game".to_string()];
         let why = stack::order_breaks(&layers, &order).unwrap();
         assert_eq!(why, "mod acts on 2 entries of game, so it stays above it");
-        assert!(stack::reorder(&project, &layers, &order).is_err());
-        stack::add(&project, "fixes").unwrap();
+        assert!(stack::reorder(&project, &layers, &order, history).is_err());
+        stack::add(&project, "fixes", LayerKind::Assets, history).unwrap();
         let project = Project::load(&root).unwrap();
-        assert!(stack::add(&project, "fixes").is_err());
+        assert!(stack::add(&project, "fixes", LayerKind::Assets, history).is_err());
+        stack::add(&project, "patch", LayerKind::Files, history).unwrap();
+        let read = Project::load(&root).unwrap();
+        assert_eq!(read.layer("patch").unwrap().kind, LayerKind::Files);
+        history.undo(false).unwrap();
+        let project = Project::load(&root).unwrap();
         let layers = [info("game", &[]), info("mod", &["game"]), info("fixes", &[])];
         let order: Vec<String> = ["game", "fixes", "mod"].map(String::from).into();
-        stack::reorder(&project, &layers, &order).unwrap();
+        stack::reorder(&project, &layers, &order, history).unwrap();
         let project = Project::load(&root).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["game", "fixes", "mod"]);
         assert!(root.join(".layers/fixes").is_dir());
         // Comments travel with their tables.
         let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
         assert!(text.starts_with("# the stack\n") && text.contains("# mine\n[[layer]]\nname = \"mod\""), "{text}");
-        assert!(stack::remove(&project, &layers, "game").is_err());
-        stack::remove(&project, &layers, "fixes").unwrap();
+        assert!(stack::remove(&project, &layers, "game", history).is_err());
+        stack::remove(&project, &layers, "fixes", history).unwrap();
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
         assert!(root.join(".layers/fixes").is_dir());
+        // Undone: taken out, reordered, added - back to the two layers, and the new layer's folder gone.
+        for _ in 0..3 {
+            history.undo(false).unwrap();
+        }
+        assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
+        assert!(!root.join(".layers/fixes").exists());
+        drop(lock);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -12,8 +12,9 @@ use std::sync::atomic::Ordering;
 use crate::panes::{self, Pane, PaneAction, PaneKind, PaneState, Panes};
 use crate::settings::EditorSettings;
 use crate::windows::{Layouts, Window};
-use crate::workspace::{Update, Workspace};
+use crate::workspace::{EditRequest, Update, Workspace};
 use crate::{icons, theme};
+use project::history::StepError;
 
 const LAYOUT_KEY: &str = "layout";
 const WINDOWS_KEY: &str = "windows";
@@ -62,6 +63,12 @@ pub struct Editor {
     /// monitor's size as measured with the previous frame's scale, so a size is read only once the scale holds.
     steady: (f32, u32),
     open_dialog: Option<String>,
+    /// A step that files changed outside the editor block: redo (true) or undo, and why.
+    force: Option<(bool, String)>,
+    /// An entry being renamed: its uid, its real path, the new name being typed.
+    renaming: Option<(String, String, String)>,
+    /// Code being overridden while an asset layer is active: which files layer takes it.
+    choosing: Option<Choosing>,
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(PathBuf, String)>,
@@ -121,6 +128,9 @@ impl Editor {
             zoomed_for: None,
             steady: (0.0, 0),
             open_dialog: None,
+            force: None,
+            renaming: None,
+            choosing: None,
             layers_state: crate::layers::LayersState::default(),
             in_use: None,
             error: problem,
@@ -147,11 +157,19 @@ impl Editor {
     }
 
     fn open(&mut self, dir: &Path) {
+        self.open_keeping(dir, None);
+    }
+
+    /// Open a project; with a history, the same project again, its session going on.
+    fn open_keeping(&mut self, dir: &Path, history: Option<project::history::History>) {
         // The project open now lets go of its lock first: opening it again must find it free.
         self.workspace = None;
-        match Workspace::open(dir) {
+        match Workspace::open_keeping(dir, history) {
             Ok(ws) => {
                 self.settings.last_project = std::path::absolute(dir).ok();
+                if let Some(label) = &ws.recovered {
+                    self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
+                }
                 self.workspace = Some(ws);
                 self.error = None;
             }
@@ -175,15 +193,222 @@ impl Editor {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
             }
             Update::Reopen => {
-                let (root, selected) = (ws.project.root.clone(), ws.selected.clone());
-                self.open(&root);
-                if let (Some(ws), Some(path)) = (&mut self.workspace, selected)
-                    && ws.index.assets.contains_key(&path)
-                {
-                    ws.navigate(path);
-                }
+                self.reopen();
                 self.message = Some("project.toml changed: the project was opened again".into());
             }
+        }
+    }
+
+    /// Open the project again - `project.toml` changed - keeping the session's history and the selection.
+    fn reopen(&mut self) {
+        let Some(ws) = self.workspace.take() else { return };
+        let (root, selected) = (ws.project.root.clone(), ws.selected.clone());
+        self.open_keeping(&root, Some(ws.into_history()));
+        if let (Some(ws), Some(path)) = (&mut self.workspace, selected)
+            && ws.exists(&path)
+        {
+            ws.navigate(path);
+        }
+    }
+
+    /// Undo the last step, or redo; forced over files changed outside the editor. Blocked by such files, it asks.
+    fn step(&mut self, redo: bool, force: bool) -> bool {
+        let Some(ws) = &mut self.workspace else { return false };
+        let verb = if redo { "Redo" } else { "Undo" };
+        match ws.step(redo, force) {
+            Ok((label, update)) => {
+                self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
+                if matches!(update, Update::Reopen) {
+                    self.reopen();
+                }
+                true
+            }
+            Err(StepError::Changed(paths)) => {
+                self.force = Some((redo, StepError::Changed(paths).to_string()));
+                false
+            }
+            Err(e) => {
+                self.message = Some(format!("{verb}: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Make an edit in the active layer; a rename first asks for the new name, and an override of code while an
+    /// asset layer is active asks which files layer takes it.
+    fn edit(&mut self, request: &EditRequest) {
+        if let EditRequest::Rename(uid, real) = request {
+            let name = real.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(real);
+            self.renaming = Some((uid.clone(), real.clone(), name.to_string()));
+            return;
+        }
+        let Some(ws) = &mut self.workspace else { return };
+        if let EditRequest::Override(uid) = request {
+            match ws.override_choice(uid) {
+                Err(why) => {
+                    self.message = Some(why);
+                    return;
+                }
+                Ok(Some(layers)) => {
+                    let entry = ws.index.entries.iter().find(|(_, e)| e.uid == *uid);
+                    let (path, home) = entry.map_or_default(|(p, e)| (p.clone(), e.home.clone()));
+                    self.choosing = Some(Choosing { uid: uid.clone(), path, home, layers, name: String::new() });
+                    return;
+                }
+                Ok(None) => {}
+            }
+        }
+        self.message = Some(match ws.edit(request) {
+            Ok(label) => label,
+            Err(e) => format!("{e:#}"),
+        });
+    }
+
+    /// Which files layer takes code being overridden: one of those above its own, or a new one (added, the project
+    /// opened again, then the override made in it).
+    fn choose_dialog(&mut self, ctx: &egui::Context) {
+        let Some(choosing) = &mut self.choosing else { return };
+        let (mut chosen, mut create, mut cancel) = (None, false, false);
+        let valid = self.workspace.as_ref().map(|ws| project::stack::check_name(&ws.project, choosing.name.trim()));
+        egui::Window::new("Override in a files layer")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!(
+                    "{} is code, from {}: it is overridden in a files layer above it, not in an asset layer.",
+                    choosing.path, choosing.home
+                ));
+                ui.add_space(6.0);
+                for layer in &choosing.layers {
+                    if ui.button(format!("Override in {layer}")).clicked() {
+                        chosen = Some(layer.clone());
+                    }
+                }
+                if choosing.layers.is_empty() {
+                    ui.label(RichText::new("No files layer can take it yet.").color(theme::weak()));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut choosing.name)
+                            .hint_text("new files layer")
+                            .desired_width(160.0),
+                    );
+                    let ok = valid.as_ref().is_some_and(Result::is_ok);
+                    create = ui.add_enabled(ok, egui::Button::new("Create and override")).clicked();
+                });
+                if let Some(Err(e)) = &valid
+                    && !choosing.name.trim().is_empty()
+                {
+                    ui.label(RichText::new(e.to_string()).small().color(ui.visuals().warn_fg_color));
+                }
+                ui.add_space(6.0);
+                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        if cancel {
+            self.choosing = None;
+        } else if let Some(layer) = chosen {
+            let uid = choosing.uid.clone();
+            self.choosing = None;
+            self.edit(&EditRequest::OverrideIn(uid, layer));
+        } else if create {
+            let (uid, name) = (choosing.uid.clone(), choosing.name.trim().to_string());
+            self.choosing = None;
+            let added = self.workspace.as_mut().map(|ws| ws.add_layer(&name, project::LayerKind::Files));
+            match added {
+                Some(Ok(())) => {
+                    // The new layer is in project.toml: the project, opened again, has it.
+                    self.reopen();
+                    self.edit(&EditRequest::OverrideIn(uid, name));
+                }
+                Some(Err(e)) => self.message = Some(format!("{e:#}")),
+                None => {}
+            }
+        }
+    }
+
+    /// The new name of an entry being renamed: in its folder, a bundle keeping its `.asset`.
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some((uid, real, name)) = &mut self.renaming else { return };
+        let (mut go, mut cancel) = (false, false);
+        let valid = !name.trim().is_empty() && !name.contains('/') && !name.starts_with('.');
+        egui::Window::new("Rename")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(real.trim_end_matches(project::index::BUNDLE_SUFFIX).to_string())
+                        .color(theme::weak()),
+                );
+                let field = ui.add(egui::TextEdit::singleline(name).desired_width(320.0));
+                field.request_focus();
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = valid;
+                }
+                ui.horizontal(|ui| {
+                    go |= ui.add_enabled(valid, egui::Button::new("Rename")).clicked();
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        if go {
+            let suffix = if real.ends_with(project::index::BUNDLE_SUFFIX) { project::index::BUNDLE_SUFFIX } else { "" };
+            let folder = real.rsplit_once('/').map_or_default(|(f, _)| format!("{f}/"));
+            let request = EditRequest::RenameTo(uid.clone(), format!("{folder}{}{suffix}", name.trim()));
+            self.renaming = None;
+            self.edit(&request);
+        } else if cancel {
+            self.renaming = None;
+        }
+    }
+
+    /// Steps blocked by files changed outside the editor: undone or redone anyway, or left.
+    fn force_dialog(&mut self, ctx: &egui::Context) {
+        let Some((redo, why)) = &self.force else { return };
+        let (redo, mut go, mut cancel) = (*redo, false, false);
+        egui::Window::new("Changed outside the editor")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!("Files this step touches {why}."));
+                ui.label(
+                    RichText::new(
+                        "Going on overwrites them; what it overwrites can be brought back by the opposite step.",
+                    )
+                    .color(theme::weak()),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    go = ui.button(if redo { "Redo anyway" } else { "Undo anyway" }).clicked();
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        if go {
+            self.force = None;
+            self.step(redo, true);
+        } else if cancel {
+            self.force = None;
+        }
+    }
+
+    /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo - unless a text field has the keyboard, which undoes its own text.
+    fn history_keys(&mut self, ctx: &egui::Context) {
+        if self.workspace.is_none() || ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let shortcut = |modifiers, key| egui::KeyboardShortcut::new(modifiers, key);
+        let (command, shift) = (egui::Modifiers::COMMAND, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        let redo = ctx.input_mut(|i| {
+            i.consume_shortcut(&shortcut(shift, egui::Key::Z)) || i.consume_shortcut(&shortcut(command, egui::Key::Y))
+        });
+        if redo {
+            self.step(true, false);
+        } else if ctx.input_mut(|i| i.consume_shortcut(&shortcut(command, egui::Key::Z))) {
+            self.step(false, false);
         }
     }
 
@@ -262,6 +487,8 @@ impl Editor {
                         windows: titles,
                         window: Some(id),
                         actions: vec![],
+                        steps: None,
+                        edit: None,
                         message: None,
                     };
                     window.tree.ui(&mut behavior, ui);
@@ -297,6 +524,16 @@ impl Editor {
         for (window, tile, action) in outcome.actions {
             self.layouts.act(window, tile, action);
         }
+        if let Some(request) = outcome.edit {
+            self.edit(&request);
+        }
+        if let Some((redo, count)) = outcome.steps {
+            for _ in 0..count {
+                if !self.step(redo, false) {
+                    break;
+                }
+            }
+        }
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -319,6 +556,22 @@ impl Editor {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let labels = self.workspace.as_ref().map(|ws| {
+                    let label = |step: Option<&project::history::Step>| step.map(|s| s.label.clone());
+                    (label(ws.history.done().last()), label(ws.history.undone().last()))
+                });
+                let (undo, redo) = labels.unwrap_or_default();
+                let item = |verb: &str, label: &Option<String>, keys: &str| {
+                    let text = label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"));
+                    egui::Button::new(text).shortcut_text(keys)
+                };
+                if ui.add_enabled(undo.is_some(), item("Undo", &undo, "Ctrl+Z")).clicked() {
+                    self.step(false, false);
+                }
+                if ui.add_enabled(redo.is_some(), item("Redo", &redo, "Ctrl+Shift+Z")).clicked() {
+                    self.step(true, false);
+                }
+                ui.separator();
                 if ui.button(format!("{}  Settings…", icons::GEAR)).clicked() {
                     self.show_pane(Pane::first(PaneKind::Settings));
                 }
@@ -565,6 +818,7 @@ impl eframe::App for Editor {
         self.zoom(&ctx);
         self.capture(&ctx);
         self.follow_disk(&ctx);
+        self.history_keys(&ctx);
         if let Some(ws) = &mut self.workspace {
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {
                 ws.go_back();
@@ -595,6 +849,8 @@ impl eframe::App for Editor {
                 windows: &titles,
                 window: None,
                 actions: vec![],
+                steps: None,
+                edit: None,
                 message: None,
             };
             self.layouts.main.ui(&mut behavior, ui);
@@ -605,6 +861,9 @@ impl eframe::App for Editor {
         self.apply(outcome);
         self.open_dialog(&ctx);
         self.in_use_dialog(&ctx);
+        self.force_dialog(&ctx);
+        self.rename_dialog(&ctx);
+        self.choose_dialog(&ctx);
         if self.settings != self.saved {
             if self.settings.appearance != self.saved.appearance {
                 theme::apply(&ctx, &self.settings.appearance);
@@ -634,6 +893,15 @@ impl eframe::App for Editor {
     }
 }
 
+/// Code being overridden: its uid, path and own layer, the files layers that can take it, a new one's name.
+struct Choosing {
+    uid: String,
+    path: String,
+    home: String,
+    layers: Vec<String>,
+    name: String,
+}
+
 /// What the layouts asked for in a frame: where to go, a message, windows to dock back, tab actions by window.
 #[derive(Default)]
 struct Outcome {
@@ -642,6 +910,8 @@ struct Outcome {
     message: Option<String>,
     docked: Vec<u64>,
     actions: Vec<(Option<u64>, TileId, PaneAction)>,
+    steps: Option<(bool, usize)>,
+    edit: Option<EditRequest>,
 }
 
 impl Outcome {
@@ -649,6 +919,8 @@ impl Outcome {
         self.nav = self.nav.take().or(behavior.nav);
         self.pick = self.pick.take().or(behavior.pick);
         self.message = self.message.take().or(behavior.message);
+        self.steps = self.steps.take().or(behavior.steps);
+        self.edit = self.edit.take().or(behavior.edit);
         self.actions.extend(behavior.actions.into_iter().map(|(tile, action)| (window, tile, action)));
     }
 
@@ -658,6 +930,8 @@ impl Outcome {
         self.message = self.message.take().or(other.message);
         self.docked.extend(other.docked);
         self.actions.extend(other.actions);
+        self.steps = self.steps.take().or(other.steps);
+        self.edit = self.edit.take().or(other.edit);
     }
 }
 

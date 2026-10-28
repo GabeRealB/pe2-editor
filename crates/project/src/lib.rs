@@ -4,7 +4,9 @@
 pub mod cache;
 pub mod changeset;
 pub mod declarations;
+pub mod edit;
 pub mod extract;
+pub mod history;
 pub mod index;
 pub mod lock;
 pub mod stack;
@@ -65,6 +67,8 @@ struct LayerFile {
     path: Option<String>,
     #[serde(default)]
     read_only: bool,
+    /// `files` for a layer of plain files only (code); an asset layer by default.
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +118,21 @@ pub struct Mount {
     pub at: String,
     pub path: PathBuf,
     pub read_only: bool,
+}
+
+impl Layer {
+    /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree.
+    #[must_use]
+    pub fn disk(&self, path: &str) -> PathBuf {
+        if self.at.is_empty() {
+            return self.path.join(path);
+        }
+        match path.strip_prefix(&self.at) {
+            Some("") => self.path.clone(),
+            Some(rest) => self.path.join(rest.trim_start_matches('/')),
+            None => self.path.join(path),
+        }
+    }
 }
 
 pub struct Project {
@@ -176,9 +195,16 @@ impl Project {
             if layers.iter().any(|m| m.name == l.name) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(FILE).display(), l.name);
             }
+            let kind = match l.kind.as_deref() {
+                None | Some("assets") => LayerKind::Assets,
+                Some("files") => LayerKind::Files,
+                Some(other) => {
+                    bail!("{}: the layer {}: no kind {other} (assets, files)", root.join(FILE).display(), l.name)
+                }
+            };
             layers.push(Layer {
                 name: l.name,
-                kind: LayerKind::Assets,
+                kind,
                 path,
                 at: String::new(),
                 changeset: PathBuf::from(changeset),
