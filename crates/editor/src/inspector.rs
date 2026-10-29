@@ -70,6 +70,7 @@ pub fn inspector_ui(
         return;
     };
     header_ui(ui, ws, &asset);
+    unapplied_ui(ui, ws, &asset, edit);
     let target = edit_target(ws, &asset);
     {
         let sheet = Sheet {
@@ -737,6 +738,45 @@ fn count(n: usize, plural: &str) -> String {
 }
 
 // --- import ---
+
+/// Where an asset's settings changed and are not applied: what applying makes again, and Apply, Revert, and Apply all
+/// where others wait too.
+fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut Option<EditRequest>) {
+    if !ws.unapplied(&asset.path) {
+        return;
+    }
+    // What applying makes again: its outputs, as its settings now say them.
+    let ops = ws.extensions.operations();
+    let tail = ws.extensions.tail(asset);
+    let (plan, _) = project::graph::Plan::of(asset.fields(), &ops, &tail);
+    let outputs: Vec<&str> = plan.outputs.iter().map(|o| o.name.as_str()).collect();
+    let others = ws.unapplied_count().saturating_sub(1);
+    let (mut apply, mut apply_all) = (false, false);
+    theme::section(ui, "Unapplied changes", |ui| {
+        let says = if outputs.is_empty() {
+            "Its settings changed; it makes nothing from them.".to_string()
+        } else {
+            format!("Its outputs are made from its settings as last applied. Applying makes again: {}.", outputs.join(", "))
+        };
+        ui.label(RichText::new(says).color(theme::weak()));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            apply = ui.button("Apply").on_hover_text("Make its outputs again from its settings as they are now").clicked();
+            if ui.button("Revert").on_hover_text("Put its settings back as last applied (an undoable step)").clicked() {
+                *edit = ws.revert_settings(&asset.path);
+            }
+            if others > 0 {
+                let text = format!("Apply all ({})", others + 1);
+                apply_all = ui.button(text).on_hover_text("Apply every asset's changed settings").clicked();
+            }
+        });
+    });
+    if apply_all {
+        ws.apply_all_settings();
+    } else if apply {
+        ws.apply_settings(&asset.path);
+    }
+}
 
 /// An asset's stack, top to bottom in the order it runs: each layer's operation and what sets it - a stored file with
 /// the formats it is and the tool it is edited in, an importer with a choice of those fitting its source and its

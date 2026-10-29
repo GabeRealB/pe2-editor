@@ -9,6 +9,7 @@
 //! pending when it came is.
 
 use project::Project;
+use project::applied::Applied;
 use project::ext::Extensions;
 use project::imports::Imports;
 use project::index::{Index, LayerInfo};
@@ -26,6 +27,8 @@ enum Job {
     Paths(Vec<PathBuf>),
     /// The layers hidden from view (the editor's eyes): every asset assembled again.
     Hidden(BTreeSet<String>),
+    /// These assets' settings were applied (`project::applied`): their outputs made again from them.
+    Applied(BTreeSet<String>),
 }
 
 /// The project as a take-in left it.
@@ -60,6 +63,7 @@ pub struct TakeIn {
 struct Worker {
     project: Project,
     index: Index,
+    applied: Arc<Applied>,
     imports: Imports,
     extensions: Arc<Extensions>,
     found: Vec<extensions::Found>,
@@ -71,6 +75,7 @@ impl TakeIn {
     pub fn start(
         project: Project,
         index: Index,
+        applied: Arc<Applied>,
         imports: Imports,
         extensions: Arc<Extensions>,
         found: Vec<extensions::Found>,
@@ -80,7 +85,7 @@ impl TakeIn {
         let (made, snapshots) = mpsc::channel();
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
         let wake = ctx.clone();
-        let mut worker = Worker { project, index, imports, extensions, found, tree };
+        let mut worker = Worker { project, index, applied, imports, extensions, found, tree };
         let thread = std::thread::Builder::new()
             .name("take-in".into())
             .spawn(move || {
@@ -121,6 +126,11 @@ impl TakeIn {
     /// Hide these layers from view; returns the job's ticket.
     pub fn hidden(&mut self, names: BTreeSet<String>) -> u64 {
         self.send(Job::Hidden(names))
+    }
+
+    /// Make these assets' outputs again from their settings as now applied; returns the job's ticket.
+    pub fn applied(&mut self, paths: BTreeSet<String>) -> u64 {
+        self.send(Job::Applied(paths))
     }
 
     /// The snapshots ready since the last poll, oldest first.
@@ -175,10 +185,12 @@ impl Worker {
         let ticket = jobs.iter().map(|(t, _)| *t).max().unwrap_or(0);
         let mut paths = Vec::new();
         let mut hidden = None;
+        let mut applied = BTreeSet::new();
         for (_, job) in jobs {
             match job {
                 Job::Paths(p) => paths.extend(p),
                 Job::Hidden(names) => hidden = Some(names),
+                Job::Applied(assets) => applied.extend(assets),
             }
         }
         paths.sort();
@@ -187,13 +199,21 @@ impl Worker {
         if let Some(names) = hidden
             && self.index.set_hidden(&names)
         {
-            // Every asset assembled again: their imports attached again.
+            // Every asset assembled again, with its settings as applied: their imports attached again.
+            self.applied.mark(&mut self.index, None);
             let _ = self.imports.attach(&mut self.index, &self.extensions);
             all = true;
         }
-        if paths.is_empty() {
-            return self.snapshot(ticket, BTreeSet::new(), all, None, None);
+        if !applied.is_empty() {
+            // Their outputs made from their settings as now applied.
+            self.applied.mark(&mut self.index, Some(&applied));
+            let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &applied);
         }
+        if paths.is_empty() {
+            return self.snapshot(ticket, applied, all, None, None);
+        }
+        // What the assets were before: a declaration changed is noted unapplied, against what it was.
+        let before = self.index.assets.clone();
         let refreshed = match self.index.refresh(&self.project, &paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
@@ -208,9 +228,24 @@ impl Worker {
         if extensions::found(Some(&self.index)) != self.found {
             return self.snapshot(ticket, refreshed.assets, all, Some("an extension changed"), None);
         }
-        // The assets the refresh assembled again, their imports attached again; the others keep theirs.
+        // The assets the refresh assembled again: their changed declarations noted, their settings as applied given
+        // them, their imports attached again; the others keep theirs.
+        for path in &refreshed.assets {
+            let Some(old) = before.get(path) else { continue };
+            let Some(uid) = old.uid.as_deref() else { continue };
+            match self.index.assets.get(path) {
+                Some(now) if now.uid.as_deref() == Some(uid) => {
+                    let _ = self.applied.changed(uid, old.text(), now.text());
+                }
+                Some(_) => {}
+                None => self.applied.forget(uid),
+            }
+        }
+        self.applied.mark(&mut self.index, Some(&refreshed.assets));
         let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
-        self.snapshot(ticket, refreshed.assets, all, None, None)
+        let mut changed = refreshed.assets;
+        changed.extend(applied);
+        self.snapshot(ticket, changed, all, None, None)
     }
 
     /// The index as it is now, handed over: the tree built again where anything changed.

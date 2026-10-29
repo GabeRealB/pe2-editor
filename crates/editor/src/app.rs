@@ -753,9 +753,9 @@ impl Editor {
         });
     }
 
-    /// The status bar; true when its problem count was clicked.
-    fn status_bar(&self, ui: &mut egui::Ui) -> bool {
-        let mut show_problems = false;
+    /// The status bar; whether its problem count was clicked, and whether its unapplied count was.
+    fn status_bar(&self, ui: &mut egui::Ui) -> (bool, bool) {
+        let (mut show_problems, mut apply_all) = (false, false);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let zoom = ui.ctx().zoom_factor();
             let mode = if self.settings.appearance.zoom.is_some() { "" } else { " (monitor)" };
@@ -777,6 +777,17 @@ impl Editor {
                 }
                 if let Some(e) = &ws.watch_error {
                     ui.label(RichText::new("not watching").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
+                    ui.separator();
+                }
+                // Assets whose outputs are made from their settings as last applied.
+                let unapplied = ws.unapplied_count();
+                if unapplied > 0 {
+                    let text = format!("{unapplied} unapplied");
+                    let label = egui::Label::new(RichText::new(text).small().color(ui.visuals().warn_fg_color))
+                        .sense(egui::Sense::click());
+                    let hint = "Assets with settings changed and not applied: their outputs are made from their settings \
+                                as last applied. Click to apply them all";
+                    apply_all = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint).clicked();
                     ui.separator();
                 }
                 // Taking changes in, off the window's thread; or other programs' changes waiting for it.
@@ -836,7 +847,7 @@ impl Editor {
                 }
             });
         });
-        show_problems
+        (show_problems, apply_all)
     }
 
     /// A project another process holds: it cannot be opened until that process lets go of it.
@@ -979,8 +990,12 @@ impl eframe::App for Editor {
             ui.add_space(2.0);
             self.toolbar(ui);
         });
-        if egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner {
+        let (show_problems, apply_all) = egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
+        if show_problems {
             self.show_pane(Pane::first(PaneKind::Problems));
+        }
+        if apply_all && let Some(ws) = self.workspace.as_mut() {
+            ws.apply_all_settings();
         }
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
         let mut outcome = Outcome::default();

@@ -58,7 +58,30 @@ type Listed = (String, Arc<HashSet<String>>);
 struct Known {
     importer: String,
     files: Vec<(String, Blob)>,
-    resolved: Arc<Imported>,
+    /// The settings it derived, the paths it derives them at, and its notes: resolved over the declaration as written
+    /// each time it is attached, as its settings may have changed unapplied.
+    made: Table,
+    derives: Vec<String>,
+    notes: Vec<String>,
+    /// Its last resolution, with the declaration it was over: resolved again only when that changed.
+    resolved: Mutex<Option<(String, Arc<Imported>)>>,
+}
+
+impl Known {
+    /// Its settings resolved over a declaration (`resolve`): as last resolved, where that was this declaration.
+    fn resolved(&self, asset: &Asset) -> Arc<Imported> {
+        let mut last = self.resolved.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((text, resolved)) = last.as_ref()
+            && text == asset.text()
+        {
+            return resolved.clone();
+        }
+        let mut resolved = resolve(asset.fields(), &self.made, &self.derives);
+        resolved.notes.clone_from(&self.notes);
+        let resolved = Arc::new(resolved);
+        *last = Some((asset.text().to_string(), resolved.clone()));
+        resolved
+    }
 }
 
 impl Imports {
@@ -187,14 +210,14 @@ impl Imports {
                     made_by: Some(import.importer.clone()),
                 });
             }
-            let resolved = &import.resolved;
+            let resolved = import.resolved(asset);
             problems.extend(resolved.overridden.iter().map(|setting| Problem::Overridden {
                 asset: path.clone(),
                 setting: setting.clone(),
             }));
             problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
             problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
-            asset.imported = Some(resolved.clone());
+            asset.imported = Some(resolved);
         }
         problems.extend(self.missing_parts(index, extensions, only));
         // The project's extensions not loaded, as problems of their assets.
@@ -276,10 +299,8 @@ impl Imports {
             anyhow::bail!("its import is kept as something else than an extension's type");
         };
         let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
-        let mut resolved = resolve(asset.fields(), &settings, &derives);
-        resolved.notes = notes;
         let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
-        Ok((made, trace.reads, Arc::new(Known { importer, files, resolved: Arc::new(resolved) })))
+        Ok((made, trace.reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
     }
 }
 
@@ -299,7 +320,7 @@ fn import_output(plan: &Plan) -> Option<(String, usize)> {
 
 /// The file an asset's stack takes as its import's source, from its bundle.
 fn source_file(asset: &Asset) -> Option<&BundleFile> {
-    let name = graph::import_of(asset.fields())?.source;
+    let name = graph::import_of(graph::exec::Node::fields(asset))?.source;
     asset.files.iter().find(|f| f.name == name && f.made_by.is_none())
 }
 

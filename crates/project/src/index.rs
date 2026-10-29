@@ -65,6 +65,16 @@ pub struct Asset {
     fields: OnceLock<toml::Table>,
     /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
     pub imported: Option<Arc<Imported>>,
+    /// Its declaration as last applied, where it has unapplied changes (`applied`): what the work graph makes its
+    /// outputs from.
+    pub applied: Option<Arc<AppliedDeclaration>>,
+}
+
+/// A declaration as last applied: its text, and its fields.
+#[derive(Clone, Debug, Default)]
+pub struct AppliedDeclaration {
+    pub text: String,
+    pub fields: toml::Table,
 }
 
 /// An asset's settings with what its import derived from its source in their places.
@@ -1608,6 +1618,7 @@ impl Index {
                 text: Arc::from(""),
                 fields: OnceLock::new(),
                 imported: None,
+                applied: None,
             };
             for (name, file) in layer.scan.bundles.get(&node.content.1).into_iter().flatten() {
                 let Some(record) = self.records.get(file) else { continue };

@@ -161,6 +161,8 @@ pub struct Workspace {
     pub window_requests: Vec<crate::drive::Request>,
     /// The take-in worker: it owns the index and the imports, and hands snapshots back.
     takein: crate::takein::TakeIn,
+    /// The assets' settings as last applied (`project::applied`): what their outputs are made from.
+    applied: Arc<project::applied::Applied>,
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
     /// setting), before an agent is answered, or on View > Refresh.
     pending: BTreeSet<PathBuf>,
@@ -320,6 +322,7 @@ pub struct Opened {
     pub recovered: Option<String>,
     index: Index,
     store: project::graph::store::Store,
+    applied: Arc<project::applied::Applied>,
     extensions: Arc<Extensions>,
     extensions_found: Vec<extensions::Found>,
     imports: project::imports::Imports,
@@ -366,6 +369,9 @@ impl Workspace {
             .unwrap_or_default();
         // The view first: hiding layers assembles the assets again, so the imports are attached to what it shows.
         index.set_hidden(&layer_view.hidden(&index.layers()));
+        // Their settings as last applied, which the work graph makes their outputs from.
+        let applied = Arc::new(project::applied::Applied::open(&cache)?);
+        applied.mark(&mut index, None);
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
         let _ = imports.attach_reporting(&mut index, &extensions, report);
@@ -384,6 +390,7 @@ impl Workspace {
             recovered,
             index,
             store,
+            applied,
             extensions,
             extensions_found,
             imports,
@@ -401,6 +408,7 @@ impl Workspace {
             history,
             index,
             store,
+            applied,
             extensions,
             extensions_found,
             imports,
@@ -416,6 +424,7 @@ impl Workspace {
         let takein = crate::takein::TakeIn::start(
             project.clone(),
             index,
+            applied.clone(),
             imports,
             extensions.clone(),
             extensions_found.clone(),
@@ -423,6 +432,7 @@ impl Workspace {
         );
         let mut workspace = Workspace {
             project,
+            applied,
             history,
             thumbs,
             extensions,
@@ -896,6 +906,46 @@ impl Workspace {
             return Err(format!("{} cannot be edited: {why}", layer.name));
         }
         Ok(layer)
+    }
+
+    /// Whether an asset has settings not applied yet: its outputs are made from its settings as last applied.
+    pub fn unapplied(&self, path: &str) -> bool {
+        let uid = self.index.assets.get(path).and_then(|a| a.uid.as_deref());
+        uid.is_some_and(|uid| self.applied.text(uid).is_some())
+    }
+
+    /// How many assets have settings not applied yet.
+    pub fn unapplied_count(&self) -> usize {
+        self.applied.pending().len()
+    }
+
+    /// Apply an asset's settings: its outputs made again from them.
+    pub fn apply_settings(&mut self, path: &str) {
+        let Some(uid) = self.index.assets.get(path).and_then(|a| a.uid.clone()) else { return };
+        if self.applied.apply(&uid) {
+            self.takein.applied(std::iter::once(path.to_string()).collect());
+        }
+    }
+
+    /// Apply every asset's settings.
+    pub fn apply_all_settings(&mut self) {
+        let uids: std::collections::BTreeSet<String> = self.applied.apply_all().into_iter().collect();
+        let paths = self.index.assets.values().filter(|a| a.uid.as_ref().is_some_and(|u| uids.contains(u)));
+        let paths: std::collections::BTreeSet<String> = paths.map(|a| a.path.clone()).collect();
+        if !paths.is_empty() {
+            self.takein.applied(paths);
+        }
+    }
+
+    /// The edit putting an asset's declaration back as last applied: its unapplied changes reverted, a step of the
+    /// history.
+    pub fn revert_settings(&self, path: &str) -> Option<EditRequest> {
+        let asset = self.index.assets.get(path)?;
+        let uid = asset.uid.clone()?;
+        let text = self.applied.text(&uid)?;
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let label = format!("Revert the settings of {name}");
+        Some(EditRequest::Write { uid, file: project::index::ASSET_FILE.to_string(), bytes: text.into_bytes(), label, merge: None })
     }
 
     /// Make an edit in the active layer: a step of the history, the index taking it in at once. Returns what was done.

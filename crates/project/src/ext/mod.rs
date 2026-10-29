@@ -591,7 +591,9 @@ impl Extensions {
     /// An asset's plan: its stack, then its kind's outputs; and what is wrong with it.
     #[must_use]
     pub fn plan(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
-        graph::Plan::of(asset.fields(), &self.operations(), &self.tail(asset))
+        // Its stack as last applied.
+        let fields = graph::exec::Node::fields(asset);
+        graph::Plan::of(fields, &self.operations(), &self.tail(asset))
     }
 
     /// An output of an asset, by its address (`native`, `picture/night`), through `engine`.
