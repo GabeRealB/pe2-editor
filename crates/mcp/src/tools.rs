@@ -72,10 +72,77 @@ struct PreviewArgs {
 #[derive(Deserialize, JsonSchema)]
 struct NoArgs {}
 
+/// What of the editor's window to read.
+#[derive(Deserialize, JsonSchema)]
+pub struct UiArgs {
+    /// Only this pane (its tab's title: `Inspector`, `Preview 2`); the whole window when absent.
+    #[serde(default)]
+    pub pane: Option<String>,
+    /// Only widgets whose label or value contains this text (case-insensitive), each with the labels it is within.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Give each widget's rectangle, in the window's points (`@x,y wxh`), for `editor_act`'s `at`.
+    #[serde(default)]
+    pub bounds: bool,
+}
+
+/// Something to do to a widget, or at a point of the window.
+#[derive(Deserialize, JsonSchema)]
+pub struct ActArgs {
+    /// The widget, by the id `editor_ui` gives it (`#3fa2c4d1`, with or without the `#`).
+    #[serde(default)]
+    pub node: Option<String>,
+    /// A point of the window in points, instead of a widget: `[x, y]`.
+    #[serde(default)]
+    pub at: Option<[f32; 2]>,
+    /// `click` (the default), `double_click`, `right_click`, `hover`, `focus`, `scroll_into_view`, `drag` (to `to`)
+    /// or `scroll` (by `by`).
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Where a drag ends: `[x, y]` in points.
+    #[serde(default)]
+    pub to: Option<[f32; 2]>,
+    /// How far to scroll, in points: `[dx, dy]`, positive moving the content right and down.
+    #[serde(default)]
+    pub by: Option<[f32; 2]>,
+}
+
+/// Text or keys to send to the editor.
+#[derive(Deserialize, JsonSchema)]
+pub struct TypeArgs {
+    /// Text to type into the focused widget.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Keys to press after it, in order: a key's name (`Enter`, `Escape`, `Tab`, `ArrowDown`, `A`, `F2`), with
+    /// modifiers before it (`ctrl+A`, `shift+Tab`, `ctrl+shift+Z`; `cmd` is Ctrl outside macOS).
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Focus this widget first (an id from `editor_ui`).
+    #[serde(default)]
+    pub node: Option<String>,
+}
+
+/// What of the window to capture.
+#[derive(Deserialize, JsonSchema)]
+pub struct ScreenshotArgs {
+    /// Only this pane (its tab's title); the whole window when absent.
+    #[serde(default)]
+    pub pane: Option<String>,
+}
+
 fn tool<T: JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
     let annotations = ToolAnnotations::new().read_only(true);
     Tool::new(name, description, Map::new()).with_input_schema::<T>().annotate(annotations)
 }
+
+/// A tool acting in the user's editor: what it does may change the project, through the editor's undoable edits.
+fn acting<T: JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
+    let annotations = ToolAnnotations::new().read_only(false).destructive(true).idempotent(false);
+    Tool::new(name, description, Map::new()).with_input_schema::<T>().annotate(annotations)
+}
+
+/// The tools that use the editor's window: only the editor answers them, across frames.
+pub const EDITOR_UI: [&str; 4] = ["editor_ui", "editor_act", "editor_type", "editor_screenshot"];
 
 /// An extension's tool as agents see it: by its name within its extension (`palette`), its arguments as it declares
 /// them.
@@ -142,6 +209,32 @@ fn own() -> Vec<Tool> {
             "Select an asset in the editor and reveal it in its tree, for the user to look at. Changes only what the \
              editor shows. Only when the editor has the project open.",
         ),
+        tool::<UiArgs>(
+            "editor_ui",
+            "The editor's window as its widgets: an indented tree of each widget's role, label, value and state \
+             (disabled, checked, selected, focused, expanded), with an id (`#3fa2c4d1`) to act on it by; the panes \
+             open. Of the main window, one pane or the widgets matching some text. Only when the editor has the \
+             project open.",
+        ),
+        acting::<ActArgs>(
+            "editor_act",
+            "Act in the editor as the user would: click, double-click, right-click, hover, focus or scroll to a \
+             widget by its id from editor_ui; or click, drag or scroll at a point. Returns what changed in the \
+             window's widgets once the editor has drawn the result. Edits it makes are the editor's own, undoable \
+             in its history. Only when the editor has the project open and the user lets agents use it (its \
+             settings, Agents).",
+        ),
+        acting::<TypeArgs>(
+            "editor_type",
+            "Type text and press keys in the editor, into the focused widget or one focused first. A text field \
+             commits on Enter. Returns what changed. Only when the editor has the project open and the user lets \
+             agents use it.",
+        ),
+        tool::<ScreenshotArgs>(
+            "editor_screenshot",
+            "The editor's window as the user sees it, as PNG: the main window, or one pane of it. Only when the \
+             editor has the project open.",
+        ),
     ]
 }
 
@@ -159,6 +252,7 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
         }
         "editor_selection" => editor_selection(view),
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
+        name if EDITOR_UI.contains(&name) => Err(NO_EDITOR.to_string()),
         _ => run_extension_tool(view, name, arguments),
     };
     match result {

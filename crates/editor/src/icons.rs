@@ -6,50 +6,76 @@ use pe2_ext::{Icon, Tint};
 use project::ext::Extensions;
 use std::sync::Arc;
 
-pub const FOLDER: &str = "\u{E24A}";
-pub const FOLDER_OPEN: &str = "\u{E256}";
-pub const FOLDERS: &str = "\u{E260}";
-pub const SQUARES_FOUR: &str = "\u{E464}";
-pub const FILE: &str = "\u{E230}";
-pub const FILE_TEXT: &str = "\u{E23A}";
-pub const FILE_DASHED: &str = "\u{E704}";
-pub const IMAGE: &str = "\u{E2CA}";
-pub const PALETTE: &str = "\u{E6C8}";
-pub const FILM_STRIP: &str = "\u{E792}";
-pub const WAVEFORM: &str = "\u{E802}";
-pub const SPEAKER_HIGH: &str = "\u{E44A}";
-pub const MUSIC_NOTES: &str = "\u{E340}";
-pub const DISC: &str = "\u{E564}";
-pub const STACK: &str = "\u{E466}";
-pub const TERMINAL_WINDOW: &str = "\u{EAE8}";
-pub const BINARY: &str = "\u{EE60}";
-pub const PACKAGE: &str = "\u{E390}";
-pub const CARET_LEFT: &str = "\u{E138}";
-pub const CARET_UP: &str = "\u{E13C}";
-pub const CARET_DOWN: &str = "\u{E136}";
-pub const X: &str = "\u{E4F6}";
-pub const CARET_RIGHT: &str = "\u{E13A}";
-pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
-pub const HARD_DRIVES: &str = "\u{E2A0}";
-pub const GEAR: &str = "\u{E270}";
-pub const ARROW_SQUARE_OUT: &str = "\u{E5DE}";
-pub const WARNING: &str = "\u{E4E0}";
-pub const EYE: &str = "\u{E220}";
-pub const EYE_SLASH: &str = "\u{E224}";
-pub const LOCK_SIMPLE: &str = "\u{E308}";
-pub const LOCK_SIMPLE_OPEN: &str = "\u{E30A}";
-pub const DOTS_SIX_VERTICAL: &str = "\u{EAE2}";
-pub const PLUS: &str = "\u{E3D4}";
-pub const PLUGS_CONNECTED: &str = "\u{EB5A}";
-pub const STACK_SIMPLE: &str = "\u{E468}";
-pub const GIT_DIFF: &str = "\u{E27C}";
-pub const PUSH_PIN: &str = "\u{E3E2}";
-pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
-pub const CLOCK_COUNTER_CLOCKWISE: &str = "\u{E1A0}";
-pub const APP_WINDOW: &str = "\u{E5DA}";
-pub const ARROW_SQUARE_IN: &str = "\u{E5DC}";
-pub const CHECK_CIRCLE: &str = "\u{E184}";
-pub const X_CIRCLE: &str = "\u{E4F8}";
+/// The icons the editor uses, each a constant, and all of them by name (`ICONS`) for what reads them back.
+macro_rules! icons {
+    ($($name:ident = $glyph:literal,)*) => {
+        $(pub const $name: &str = $glyph;)*
+        pub const ICONS: &[(&str, &str)] = &[$((stringify!($name), $name),)*];
+    };
+}
+
+icons! {
+    FOLDER = "\u{E24A}",
+    FOLDER_OPEN = "\u{E256}",
+    FOLDERS = "\u{E260}",
+    SQUARES_FOUR = "\u{E464}",
+    FILE = "\u{E230}",
+    FILE_TEXT = "\u{E23A}",
+    FILE_DASHED = "\u{E704}",
+    IMAGE = "\u{E2CA}",
+    PALETTE = "\u{E6C8}",
+    FILM_STRIP = "\u{E792}",
+    WAVEFORM = "\u{E802}",
+    SPEAKER_HIGH = "\u{E44A}",
+    MUSIC_NOTES = "\u{E340}",
+    DISC = "\u{E564}",
+    STACK = "\u{E466}",
+    TERMINAL_WINDOW = "\u{EAE8}",
+    BINARY = "\u{EE60}",
+    PACKAGE = "\u{E390}",
+    CARET_LEFT = "\u{E138}",
+    CARET_UP = "\u{E13C}",
+    CARET_DOWN = "\u{E136}",
+    X = "\u{E4F6}",
+    CARET_RIGHT = "\u{E13A}",
+    MAGNIFYING_GLASS = "\u{E30C}",
+    HARD_DRIVES = "\u{E2A0}",
+    GEAR = "\u{E270}",
+    ARROW_SQUARE_OUT = "\u{E5DE}",
+    WARNING = "\u{E4E0}",
+    EYE = "\u{E220}",
+    EYE_SLASH = "\u{E224}",
+    LOCK_SIMPLE = "\u{E308}",
+    LOCK_SIMPLE_OPEN = "\u{E30A}",
+    DOTS_SIX_VERTICAL = "\u{EAE2}",
+    PLUS = "\u{E3D4}",
+    PLUGS_CONNECTED = "\u{EB5A}",
+    STACK_SIMPLE = "\u{E468}",
+    GIT_DIFF = "\u{E27C}",
+    PUSH_PIN = "\u{E3E2}",
+    PENCIL_SIMPLE = "\u{E3B4}",
+    CLOCK_COUNTER_CLOCKWISE = "\u{E1A0}",
+    APP_WINDOW = "\u{E5DA}",
+    ARROW_SQUARE_IN = "\u{E5DC}",
+    CHECK_CIRCLE = "\u{E184}",
+    X_CIRCLE = "\u{E4F8}",
+}
+
+/// Text with the icons in it named (`[caret down]`), for reading it outside the window.
+pub fn spelled(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match ICONS.iter().find(|(_, glyph)| glyph.starts_with(c) && glyph.len() == c.len_utf8()) {
+            Some((name, _)) => {
+                out.push('[');
+                out.push_str(&name.to_lowercase().replace('_', " "));
+                out.push(']');
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
 
 /// Add the icon font behind the text fonts.
 pub fn install(ctx: &egui::Context) {

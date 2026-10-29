@@ -21,6 +21,9 @@ const WINDOWS_KEY: &str = "windows";
 const PANES_KEY: &str = "panes";
 const HOMES_KEY: &str = "homes";
 const SETTINGS_KEY: &str = "settings";
+/// How long the status bar says an agent is using the editor after it last acted.
+const AGENT_ACTED: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Frames to wait before a screenshot, so the window has its size and the selection has scrolled into view.
 const CAPTURE_AFTER_FRAMES: u32 = 30;
 /// The monitor height a zoom of 1 is made for.
@@ -76,6 +79,9 @@ pub struct Editor {
     capture: Option<Capture>,
     /// The device's largest surface side in pixels, which the window must not outgrow; applied once, then taken.
     max_surface: Option<u32>,
+    /// Agents using the window, and whether this session lets them act whatever the settings say.
+    drive: crate::drive::Driver,
+    agents_drive: bool,
 }
 
 pub struct Start {
@@ -84,6 +90,8 @@ pub struct Start {
     pub show: Option<String>,
     pub screenshot: Option<PathBuf>,
     pub max_surface: Option<u32>,
+    /// Agents may act in the editor this session, whatever the settings say.
+    pub agents_drive: bool,
 }
 
 impl Editor {
@@ -141,6 +149,8 @@ impl Editor {
                 pending: Arc::default(),
             }),
             max_surface: start.max_surface,
+            drive: crate::drive::Driver::new(),
+            agents_drive: start.agents_drive,
         };
         if let Some(dir) = project {
             editor.open(&dir);
@@ -686,6 +696,22 @@ impl Editor {
                     ui.label(RichText::new("not locked").small().color(ui.visuals().warn_fg_color)).on_hover_text(why);
                     ui.separator();
                 }
+                if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
+                    let recent = self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED);
+                    let (text, color) = if recent {
+                        ("an agent is using the editor", ui.visuals().warn_fg_color)
+                    } else {
+                        ("agents may use the editor", theme::weak())
+                    };
+                    ui.label(RichText::new(text).small().color(color)).on_hover_text(
+                        "Agents connected to the project may click, type and press keys here; what they edit is in \
+                         the history. Settings, Agents.",
+                    );
+                    if recent {
+                        ui.ctx().request_repaint_after(AGENT_ACTED);
+                    }
+                    ui.separator();
+                }
                 if let Some(e) = &ws.link_error {
                     ui.label(RichText::new("agents cannot connect").small().color(ui.visuals().warn_fg_color))
                         .on_hover_text(e);
@@ -823,6 +849,10 @@ impl eframe::App for Editor {
         self.zoom(&ctx);
         self.capture(&ctx);
         self.follow_disk(&ctx);
+        if let Some(ws) = &mut self.workspace {
+            self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
+        }
+        self.drive.update(&ctx, self.agents_drive || self.settings.agents.drive);
         self.history_keys(&ctx);
         if let Some(ws) = &mut self.workspace {
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {

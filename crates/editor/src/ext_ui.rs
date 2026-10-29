@@ -182,6 +182,9 @@ impl UiHost for Host<'_> {
     fn icon_button(&mut self, icon: pe2_ext::Icon, hint: &str) -> bool {
         let button = egui::Button::new(crate::icons::glyph(icon)).frame(false);
         let response = self.target.ui().add_enabled(self.frame.editable, button).on_hover_text(hint);
+        // Read out by its hint, not its glyph.
+        let enabled = response.enabled();
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, hint));
         let clicked = response.clicked();
         self.last = Some(response);
         clicked

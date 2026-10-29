@@ -1,10 +1,11 @@
 //! `pe2-editor`: the project editor. For now it browses: the project's assets as a tree, an asset's fields and slots,
 //! references followed both ways, pictures previewed - in panes that can be moved, split, resized and closed.
 //!
-//!     pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE]
+//!     pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive]
 //!
 //! `--select` opens an asset (`stages/akropolis/rooms/square/folder`), `--show` a pane (`settings`); `--screenshot`
-//! saves the window as a PNG once it has settled and exits - what scripts and checks use to see it.
+//! saves the window as a PNG once it has settled and exits - what scripts and checks use to see it. `--agents-drive`
+//! lets agents click, type and press keys in this session, as the Agents setting does for every one.
 //!
 //! Under `WSLg` the editor talks X11: `WSLg`'s Wayland compositor disconnects it when it resizes on a scaled display (the
 //! event loop ends in "Broken pipe"). `PE2_EDITOR_BACKEND=wayland` or `x11` chooses either anywhere.
@@ -13,6 +14,7 @@
 //! inside the main one instead (and so in its screenshots).
 
 mod app;
+mod drive;
 mod ext_ui;
 mod external;
 mod icons;
@@ -72,11 +74,13 @@ fn event_loop_builder() -> Option<eframe::EventLoopBuilderHook> {
 fn main() -> eframe::Result {
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);
+    let mut agents_drive = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--select") => select = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--screenshot") => screenshot = args.next().map(PathBuf::from),
+            Some("--agents-drive") => agents_drive = true,
             _ => project = Some(PathBuf::from(arg)),
         }
     }
@@ -102,7 +106,7 @@ fn main() -> eframe::Result {
                 state.device.on_uncaptured_error(Arc::new(|e| eprintln!("wgpu: {e}")));
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
-            let start = app::Start { project, select, show, screenshot, max_surface };
+            let start = app::Start { project, select, show, screenshot, max_surface, agents_drive };
             Ok(Box::new(app::Editor::new(cc, start)) as Box<dyn eframe::App>)
         }),
     )

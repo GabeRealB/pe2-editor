@@ -158,6 +158,8 @@ pub struct Workspace {
     /// The agents' link, started with the watcher; their requests, answered between frames.
     link: Option<mcp::link::Listener>,
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
+    /// Requests using the editor's window, which the app's driver answers across frames.
+    pub window_requests: Vec<crate::drive::Request>,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
     pub tree: Node,
@@ -318,6 +320,7 @@ impl Workspace {
             watch_error: None,
             link: None,
             requests: None,
+            window_requests: Vec::new(),
             link_error: None,
             tree,
             editable: HashSet::new(),
@@ -386,6 +389,10 @@ impl Workspace {
         let Some(requests) = &self.requests else { return };
         let pending: Vec<_> = requests.try_iter().collect();
         for (request, reply) in pending {
+            if request.uses_window() {
+                self.window_requests.push((request, reply));
+                continue;
+            }
             let selection = self.selected.clone();
             let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
             let editor = mcp::EditorState { selection, variant, show: None };

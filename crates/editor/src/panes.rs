@@ -269,6 +269,8 @@ pub struct Panes<'a> {
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
         let pane = *pane;
+        let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
+        crate::drive::note_pane(ui, format!("{}{number}", pane.kind.title()));
         if pane.kind == PaneKind::Settings {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -1348,6 +1350,7 @@ enum SettingsPage {
     Appearance,
     Tools,
     Startup,
+    Agents,
     ProjectGeneral,
     ProjectReleases,
     ProjectLayers,
@@ -1360,6 +1363,7 @@ impl SettingsPage {
             SettingsPage::Appearance => "Appearance",
             SettingsPage::Tools => "External tools",
             SettingsPage::Startup => "Startup",
+            SettingsPage::Agents => "Agents",
             SettingsPage::ProjectGeneral => "General",
             SettingsPage::ProjectReleases => "Releases",
             SettingsPage::ProjectLayers => "Layers and mounts",
@@ -1376,14 +1380,14 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
     egui::Panel::left("settings categories").resizable(false).default_size(170.0).show(ui, |ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("EDITOR").small().strong().color(theme::weak()));
-        for p in &PAGES[..3] {
+        for p in &PAGES[..4] {
             if ui.selectable_label(page == *p, p.title()).clicked() {
                 page = *p;
             }
         }
         ui.add_space(10.0);
         ui.label(RichText::new("PROJECT").small().strong().color(theme::weak()));
-        for p in &PAGES[3..] {
+        for p in &PAGES[4..] {
             if ui.add_enabled(ws.is_some(), egui::Button::selectable(page == *p, p.title())).clicked() {
                 page = *p;
             }
@@ -1407,6 +1411,25 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
                             }
                         });
                     }
+                    (SettingsPage::Agents, _) => {
+                        theme::section(ui, "Agents connected to the project", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "They read the project, and the editor's window: its widgets and how it looks.",
+                                )
+                                .color(theme::weak()),
+                            );
+                            ui.checkbox(&mut settings.agents.drive, "Let them use the editor: click, type, press keys");
+                            ui.label(
+                                RichText::new(
+                                    "What they edit goes through the history like your own edits, and can be undone. \
+                                     The status bar says when they may, and when one is.",
+                                )
+                                .small()
+                                .color(theme::weak()),
+                            );
+                        });
+                    }
                     (_, Some(ws)) => project_settings_ui(ui, page, ws, &settings.tools, message),
                     (_, None) => {
                         ui.label(RichText::new("No project open").color(theme::weak()));
@@ -1425,10 +1448,11 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
     });
 }
 
-const PAGES: [SettingsPage; 7] = [
+const PAGES: [SettingsPage; 8] = [
     SettingsPage::Appearance,
     SettingsPage::Tools,
     SettingsPage::Startup,
+    SettingsPage::Agents,
     SettingsPage::ProjectGeneral,
     SettingsPage::ProjectReleases,
     SettingsPage::ProjectLayers,

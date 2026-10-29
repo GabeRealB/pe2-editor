@@ -8,7 +8,10 @@
 //! for that request alone and answers it itself - so an agent's session never keeps the editor from opening the
 //! project, and one process touches it at a time.
 //!
-//! Read-only so far: writes wait for the write path, where they become operations in the active layer.
+//! The editor's window is served too, where the editor answers: its widgets read from its accessibility tree, and -
+//! where the user lets agents - clicks, keys and text sent to it as the user's own would be, its edits the editor's
+//! undoable ones. The rest is read-only: writes wait for the write path, where they become operations in the active
+//! layer.
 
 pub mod link;
 pub mod server;
@@ -17,7 +20,7 @@ mod tools;
 use rmcp::model::{CallToolResult, ReadResourceResult};
 use serde::{Deserialize, Serialize};
 
-pub use tools::definitions;
+pub use tools::{ActArgs, EDITOR_UI, ScreenshotArgs, TypeArgs, UiArgs, definitions};
 
 /// A request to the project.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +40,37 @@ pub enum Reply {
     Read(ReadResourceResult),
     /// The request could not be answered at all (a tool's own failures are results marked as errors).
     Error(String),
+}
+
+impl Reply {
+    /// A tool's answer as text.
+    #[must_use]
+    pub fn text(text: String) -> Reply {
+        Reply::Call(CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]))
+    }
+
+    /// A tool's failure.
+    #[must_use]
+    pub fn failed(message: String) -> Reply {
+        Reply::Call(CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)]))
+    }
+
+    /// A tool's answer as a picture with a caption.
+    #[must_use]
+    pub fn picture(caption: String, png: &[u8]) -> Reply {
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD.encode(png);
+        let content = vec![rmcp::model::ContentBlock::text(caption), rmcp::model::ContentBlock::image(png, "image/png")];
+        Reply::Call(CallToolResult::success(content))
+    }
+}
+
+impl Request {
+    /// A call of one of the tools that use the editor's window, which the editor answers across frames.
+    #[must_use]
+    pub fn uses_window(&self) -> bool {
+        matches!(self, Request::Call { name, .. } if EDITOR_UI.contains(&name.as_str()))
+    }
 }
 
 /// What the editor shows, where the editor answers: its selection, and an asset an agent asked it to show.

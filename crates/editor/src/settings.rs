@@ -100,6 +100,14 @@ impl Default for Startup {
     }
 }
 
+/// What agents connected to the project may do in the editor.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Agents {
+    /// Click, type and press keys, as the user would. Reading the window is always allowed.
+    pub drive: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
@@ -107,6 +115,7 @@ pub struct EditorSettings {
     pub preview: Preview,
     pub tools: Tools,
     pub startup: Startup,
+    pub agents: Agents,
     /// The project opened last (state, not a preference).
     pub last_project: Option<PathBuf>,
 }
