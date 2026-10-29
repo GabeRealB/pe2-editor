@@ -23,21 +23,33 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("image")
         .label("Image")
         .icon(Icon::Image, Tint::Picture)
-        .field(Field::new("mode").label("Mode").choices(MODES).brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))))
+        .field(
+            Field::new("mode")
+                .label("Mode")
+                .choices(MODES)
+                .brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))),
+        )
+        .field(Field::new("size").read_only())
         .field(Field::new("palettes").custom())
-        .field(Field::new("variants").custom())
         .field(Field::new("cells").custom())
+        .field(Field::new("variants").custom())
         .picture(Pictures)
         .thumbnail(|asset, side| {
             Pictures.has(asset).then(|| Pictures.draw(asset, 0).map(|image| image.thumbnail(side)))
         })
         .view("Picture", |asset| Box::new(view::ImageView::new(asset)))
-        .inspector("Collections", |_| Box::new(inspector::Collections::default()))
+        .inspector("Palettes, variants and cells", |_| Box::new(inspector::Collections::default()))
         .facts(tools::facts)
         .register();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
         r.role(&image, role).alias(role).label(label).register();
     }
+    // The stored forms, recognized by name: stored texels have no header to tell them by.
+    let texels = r.format("raw_texels").label("Stored texels").named("native.texels").register();
+    let bs = r.format("bs_picture").label("BS picture").named("native.bs").named("*.bs").register();
+    // Native: what they read is what the image is, its kind settings authored beside it.
+    r.importer("texels", &image).label("Stored texels").reads(&texels).native().register();
+    r.importer("bs", &image).label("Stored BS picture").reads(&bs).native().register();
     r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
     r.panel("vram", "VRAM", Icon::Grid, || Box::<vram::Vram>::default());
     r.tool("palette", tools::PALETTE, tools::PALETTE_ARGUMENTS, tools::palette);
@@ -79,14 +91,15 @@ pub fn is_texture(asset: &Asset) -> bool {
 /// An image's palettes by name, in the order it declares them.
 #[must_use]
 pub fn palette_names(asset: &Asset) -> Vec<String> {
-    asset.array("palettes").iter().filter_map(|v| v.get("name")?.as_str().map(str::to_string)).collect()
+    asset.parts("palettes").into_iter().map(|(name, _)| name.to_string()).collect()
 }
 
 /// An image's looks, by name: a texture's variants (the first its default); an atlas's default and its variants.
 #[must_use]
 pub fn looks(asset: &Asset) -> Vec<String> {
-    let named = asset.array("variants").iter().filter_map(|v| v.get("name")?.as_str().map(str::to_string));
-    if role(asset) == Some("atlas") && !asset.array("variants").is_empty() {
+    let variants = asset.parts("variants");
+    let named = variants.iter().map(|(name, _)| (*name).to_string());
+    if role(asset) == Some("atlas") && !variants.is_empty() {
         std::iter::once("default".to_string()).chain(named).collect()
     } else {
         named.collect()
@@ -98,16 +111,16 @@ pub fn looks(asset: &Asset) -> Vec<String> {
 fn look(asset: &Asset, variant: usize) -> (Option<usize>, HashMap<String, usize>) {
     let names = palette_names(asset);
     let index = |name: Option<&str>| name.and_then(|n| names.iter().position(|p| p == n));
-    let variants = asset.array("variants");
+    let variants = asset.parts("variants");
     if role(asset) == Some("atlas") {
         let overrides = variant
             .checked_sub(1)
-            .and_then(|v| variants.get(v)?.get("palettes")?.as_table().cloned())
+            .and_then(|v| variants.get(v)?.1.get("palettes")?.as_table().cloned())
             .unwrap_or_default();
         let chosen = overrides.iter().filter_map(|(cell, p)| Some((cell.clone(), index(p.as_str())?))).collect();
         return (None, chosen);
     }
-    let palette = variants.get(variant).and_then(|v| v.get("palette")).and_then(Value::as_str);
+    let palette = variants.get(variant).and_then(|(_, v)| v.get("palette")).and_then(Value::as_str);
     (index(palette).or(Some(0)), HashMap::new())
 }
 
@@ -166,16 +179,16 @@ pub fn cells(asset: &Asset) -> Vec<Cell> {
     let bpp = bpp(asset);
     let names = palette_names(asset);
     asset
-        .array("cells")
-        .iter()
-        .filter_map(|c| {
+        .parts("cells")
+        .into_iter()
+        .filter_map(|(name, c)| {
             let source = rect(c.get("rect")?)?;
             let own = bpp_of(c.get("mode"), bpp);
             #[expect(clippy::cast_precision_loss, reason = "texels per halfword")]
             let scale = texels_per_halfword(bpp) as f32 / texels_per_halfword(own) as f32;
             let rect = Rect { x: source.x * scale, ..source };
             let palette = c.get("palette").and_then(Value::as_str).and_then(|p| names.iter().position(|n| n == p));
-            Some(Cell { name: c.get("name")?.as_str()?.to_string(), rect, bpp: own, source, palette })
+            Some(Cell { name: name.to_string(), rect, bpp: own, source, palette })
         })
         .collect()
 }
@@ -384,9 +397,14 @@ mod tests {
             role = "atlas"
             mode = "indexed_4bpp"
             size = [2, 1]
-            palettes = [{ name = "warm" }, { name = "cold" }]
-            cells = [{ name = "dot", rect = [1, 0, 1, 1], palette = "warm" }]
-            variants = [{ name = "night", palettes = { dot = "cold" } }]
+            palettes.warm = {}
+            palettes.cold = {}
+            cells.dot = { rect = [1, 0, 1, 1], palette = "warm" }
+            variants.night = { palettes = { dot = "cold" } }
+
+            [import]
+            importer = "pe2.images@texels"
+            source = "native.texels"
             "#,
         )
         .unwrap();

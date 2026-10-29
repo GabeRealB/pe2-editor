@@ -8,7 +8,7 @@ use std::process::Command;
 
 const TARGET: &str = "wasm32-wasip3";
 /// The built-ins, by package: each a crate in a folder of this one.
-const BUILTINS: &[(&str, &str)] = &[("pe2-game", "game"), ("pe2-images", "images")];
+const BUILTINS: &[(&str, &str)] = &[("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images")];
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));

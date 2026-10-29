@@ -3,7 +3,7 @@
 //! draws a widget and returns what the user did with it this frame. A view shows an asset (a kind's view, in the
 //! preview or the inspector), or none (a panel).
 
-use crate::{Asset, Project, Rect, Texture, Value};
+use crate::{Asset, Icon, Project, Rect, Texture, Value};
 
 /// How a label is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +60,8 @@ pub trait UiHost {
     fn label(&mut self, text: &str, style: Style);
     /// A button; whether it was clicked.
     fn button(&mut self, text: &str) -> bool;
+    /// A button showing an icon of the host's set, what it does said on hovering it; whether it was clicked.
+    fn icon_button(&mut self, icon: Icon, hint: &str) -> bool;
     /// A checkbox over `value`; whether it was toggled.
     fn checkbox(&mut self, text: &str, value: &mut bool) -> bool;
     /// A word in a pill: a type, a flag.
@@ -74,6 +76,16 @@ pub trait UiHost {
     fn field(&mut self, key: &str, value: &Value);
     /// What hovering the last widget says.
     fn tooltip(&mut self, text: &str);
+    /// A one-line text field over `text`, `id` keeping it apart; whether it was committed this frame (Enter, or the
+    /// keyboard taken elsewhere).
+    fn text_edit(&mut self, id: &str, text: &mut String) -> bool;
+    /// A dropdown showing `selected`; the option chosen this frame.
+    fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize>;
+    /// Whether the asset shown can be edited: its layer is not locked, nor outside a solo.
+    fn editable(&self) -> bool;
+    /// Set a field of the asset shown - its whole value, or none to remove it - in one undoable step with the frame's
+    /// other changes. A table of parts keeps a line each.
+    fn set(&mut self, key: &str, value: Option<&Value>);
     /// A row: what is drawn on it is laid out left to right, until it is dropped.
     fn horizontal(&mut self) -> Box<dyn UiHost + '_>;
     /// A row that wraps where the pane is narrow.
@@ -121,6 +133,10 @@ impl<'a> Ui<'a> {
         self.host.button(text)
     }
 
+    pub fn icon_button(&mut self, icon: Icon, hint: &str) -> bool {
+        self.host.icon_button(icon, hint)
+    }
+
     pub fn checkbox(&mut self, text: &str, value: &mut bool) -> bool {
         self.host.checkbox(text, value)
     }
@@ -147,6 +163,27 @@ impl<'a> Ui<'a> {
 
     pub fn tooltip(&mut self, text: &str) {
         self.host.tooltip(text);
+    }
+
+    /// A one-line text field; whether it was committed this frame.
+    pub fn text_edit(&mut self, id: &str, text: &mut String) -> bool {
+        self.host.text_edit(id, text)
+    }
+
+    /// A dropdown; the option chosen this frame.
+    pub fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize> {
+        self.host.combo(id, selected, options)
+    }
+
+    /// Whether the asset shown can be edited.
+    #[must_use]
+    pub fn editable(&self) -> bool {
+        self.host.editable()
+    }
+
+    /// Set a field of the asset shown, or remove it.
+    pub fn set(&mut self, key: &str, value: Option<&Value>) {
+        self.host.set(key, value);
     }
 
     /// What `body` draws, in a row.

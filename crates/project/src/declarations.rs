@@ -46,7 +46,8 @@
 //!
 //! Textures and atlases are images (`kind = "image"`) by `role`, as backgrounds are: a slot that takes an image takes
 //! any of them. A texture is pixels in a `mode` - `indexed_4bpp`, `indexed_8bpp` or `direct_16bpp` - and a `size` in
-//! texels, uploaded to a `page` - the
+//! texels (its kind settings; its `[import]` section names the importer of its stored texels, `pe2.images@texels`, a
+//! background's `pe2.images@bs`), uploaded to a `page` - the
 //! VRAM slot and the halfword `at` in it - filling as many 64-halfword VRAM pages, side by side, as its width needs;
 //! and its `palettes`, each named, placed where its colors are uploaded (`slot`, `at`), or uploaded by an executable
 //! (`executable`), or none known (`no_palette`). A texture is drawn whole, with its palette. Its location lists where
@@ -236,28 +237,47 @@ impl Mode {
     }
 }
 
-/// A texture or an atlas: pixels in a mode, its page, the palettes it is drawn
-/// with, and an atlas's cells.
+/// A texture or an atlas - its kind settings: its mode and size, its page, its palettes (where each is uploaded) and an
+/// atlas's cells, the parts keyed by name in the order declared.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Texture {
     pub mode: Mode,
     pub size: [u32; 2],
     pub page: Option<Placement>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "keyed")]
     pub palettes: Vec<Palette>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "keyed")]
     pub cells: Vec<Cell>,
     #[serde(default)]
     pub no_palette: bool,
+}
+
+/// Parts keyed by name (`cells.disc_1 = { ... }`), in the order declared, each given its key as its `name`.
+fn keyed<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error;
+    let table = toml::Table::deserialize(deserializer)?;
+    table
+        .into_iter()
+        .map(|(name, value)| {
+            let mut value = value;
+            if let Some(fields) = value.as_table_mut() {
+                fields.insert("name".into(), toml::Value::String(name.clone()));
+            }
+            value.try_into().map_err(|e| D::Error::custom(format!("{name}: {e}")))
+        })
+        .collect()
 }
 
 impl Texture {
     /// How many colors a palette holds: the deepest of the cells drawn with it, or the image's depth.
     #[must_use]
     pub fn entries(&self, palette: &str) -> usize {
-        let depths =
-            self.cells.iter().filter(|c| c.palette.as_deref() == Some(palette)).map(|c| c.mode.unwrap_or(self.mode));
-        depths.map(|m| entries_at(m.bpp())).max().unwrap_or(entries_at(self.mode.bpp()))
+        let cells = self.cells.iter().filter(|c| c.palette.as_deref() == Some(palette));
+        cells.map(|c| entries_at(c.mode.unwrap_or(self.mode).bpp())).max().unwrap_or(entries_at(self.mode.bpp()))
     }
 }
 

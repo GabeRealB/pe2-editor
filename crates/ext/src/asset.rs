@@ -77,6 +77,12 @@ impl<'a> Asset<'a> {
         self.source.fields()
     }
 
+    /// A table of parts keyed by name (`cells.disc_1 = { ... }`), in the order declared; empty where it has none.
+    #[must_use]
+    pub fn parts(&self, key: &str) -> Vec<(&'a str, &'a Value)> {
+        self.field(key).and_then(Value::as_table).map_or_default(|t| t.iter().map(|(k, v)| (k.as_str(), v)).collect())
+    }
+
     /// A field's array; empty where it has none.
     #[must_use]
     pub fn array(&self, key: &str) -> &'a [Value] {

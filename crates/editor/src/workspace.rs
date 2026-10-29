@@ -174,10 +174,12 @@ pub struct Workspace {
     pictures: HashMap<(String, usize, Upscale), Picture>,
     /// Parts of pictures (palettes' strips), as the inspector shows them.
     pub parts: Parts,
-    /// The kinds' inspector views, by (asset, view).
-    inspector_views: HashMap<(String, usize), Box<dyn pe2_ext::View>>,
+    /// The inspector views - the kinds' and roles', or the importers' - by (asset, the importer's, view).
+    inspector_views: HashMap<(String, bool, usize), Box<dyn pe2_ext::View>>,
     /// The panels' views, by pane.
     panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
+    /// What a view set of the asset it shows this frame, for the app to make after drawing.
+    pub view_edit: Option<EditRequest>,
     /// The variant an image is shown in (an index into `variants_of`); without one, its first.
     pub variant_choice: HashMap<String, usize>,
     /// A field being edited in the inspector.
@@ -328,6 +330,7 @@ impl Workspace {
             parts: Parts::default(),
             inspector_views: HashMap::new(),
             panels: HashMap::new(),
+            view_edit: None,
             variant_choice: HashMap::new(),
             field_edit: None,
             viewer: crate::viewer::Viewer::default(),
@@ -459,7 +462,7 @@ impl Workspace {
         }
         self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
         self.parts.forget(&refreshed.assets);
-        self.inspector_views.retain(|(asset, _), _| !refreshed.assets.contains(asset));
+        self.inspector_views.retain(|(asset, ..), _| !refreshed.assets.contains(asset));
         self.panels.clear();
         self.views.retain(|(_, asset, _), _| !refreshed.assets.contains(asset));
         self.thumbs.forget(&refreshed.assets);
@@ -923,6 +926,8 @@ impl Workspace {
         nav: &mut Option<String>,
     ) {
         let look = self.variant(path);
+        // As the inspector's own fields: an asset from below is overridden into the active layer.
+        let editable = self.editable_layer().is_ok();
         let Some(asset) = self.index.assets.get(path) else { return };
         let views = self.extensions.views(asset);
         if views.is_empty() {
@@ -945,15 +950,22 @@ impl Workspace {
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
         };
-        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count };
-        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
+        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable };
+        let mut sets = vec![];
+        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
+        drop(host);
+        if !sets.is_empty() {
+            self.view_edit = crate::inspector::set_fields(asset, &sets);
+        }
     }
 
-    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet - made when first
-    /// shown.
-    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
+    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet, or (`import`) its
+    /// importer of its import settings - made when first shown.
+    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>, import: bool) {
         let look = self.variant(path);
+        // As the inspector's own fields: an asset from below is overridden into the active layer.
+        let editable = self.editable_layer().is_ok();
         let Some(asset) = self.index.assets.get(path) else { return };
         let lens = Lens {
             index: &self.index,
@@ -961,11 +973,22 @@ impl Workspace {
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
         };
-        for (i, def) in self.extensions.inspector(asset).into_iter().enumerate() {
-            let view = self.inspector_views.entry((path.to_string(), i)).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
-            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1 };
-            let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
+        let defs = if import {
+            self.extensions.importer_of(asset).map_or_default(|i| i.inspector.iter().collect())
+        } else {
+            self.extensions.inspector(asset)
+        };
+        for (i, def) in defs.into_iter().enumerate() {
+            let key = (path.to_string(), import, i);
+            let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
+            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable };
+            let mut sets = vec![];
+            let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
+            drop(host);
+            if !sets.is_empty() {
+                self.view_edit = crate::inspector::set_fields(asset, &sets);
+            }
         }
     }
 
@@ -983,8 +1006,10 @@ impl Workspace {
             looks: Some(&self.variant_choice),
         };
         // A panel's canvas is not a picture's: no texel grid over it.
-        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview: Preview { grid: false, ..preview }, count: 1 };
-        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
+        let preview = Preview { grid: false, ..preview };
+        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview, count: 1, editable: false };
+        let mut sets = vec![];
+        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
     }
 }

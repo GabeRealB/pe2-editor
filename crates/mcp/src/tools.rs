@@ -115,7 +115,8 @@ fn own() -> Vec<Tool> {
             "get_asset",
             "An asset as resolved: path, uid, kind, role, the layers creating and overriding it, its files (size, \
              sha1, layer), its looks where it has a picture, what its kind's extension tells of it (an image's \
-             palettes and cell count), and its declaration (asset.toml) as written.",
+             palettes and cell count), its importer and the importers that fit its source, and its declaration \
+             (asset.toml) as written.",
         ),
         tool::<AssetArgs>(
             "references",
@@ -304,6 +305,22 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     }
     for (key, value) in extensions.facts(asset) {
         fields.insert(key, serde_json::to_value(value).unwrap_or_default());
+    }
+    if let Some(importer) = extensions.importer_of(asset) {
+        fields.insert("importer".into(), json!({ "name": importer.name.to_string(), "label": importer.label }));
+    }
+    let fits: Vec<Value> = extensions
+        .importers_for(asset)
+        .into_iter()
+        .map(|(i, support)| match support {
+            pe2_ext::Support::Full => json!({ "name": i.name.to_string(), "label": i.label, "support": "full" }),
+            pe2_ext::Support::Partial { reason, offer } => {
+                json!({ "name": i.name.to_string(), "label": i.label, "support": "partial", "reason": reason, "offered": offer })
+            }
+        })
+        .collect();
+    if !fits.is_empty() {
+        fields.insert("importers".into(), json!(fits));
     }
     if let Some(error) = &asset.error {
         fields.insert("error".into(), json!(error));

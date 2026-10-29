@@ -13,7 +13,7 @@ include!(concat!(env!("OUT_DIR"), "/components.rs"));
 /// The built-in extensions linked in.
 #[must_use]
 pub fn linked() -> Vec<pe2_ext::Extension> {
-    vec![pe2_game::extension(), pe2_images::extension()]
+    vec![pe2_formats::extension(), pe2_game::extension(), pe2_images::extension()]
 }
 
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::import::{FormatDef, ImporterDef, Recognized, Signature, Support};
 use crate::{Asset, Image, Project, Result, Table, Value, View};
 
 /// An extension: its id, its version, the extensions it needs and its entry point. `extension!` makes it.
@@ -108,6 +109,11 @@ pub enum Icon {
     Binary,
     File,
     Folder,
+    /// Actions, for icon buttons.
+    CaretUp,
+    CaretDown,
+    Cross,
+    Plus,
 }
 
 /// The family an icon is tinted by.
@@ -263,6 +269,8 @@ pub struct Parts {
     pub roles: Vec<RoleDef>,
     pub panels: Vec<PanelDef>,
     pub tools: Vec<ToolDef>,
+    pub formats: Vec<FormatDef>,
+    pub importers: Vec<ImporterDef>,
 }
 
 #[derive(Clone)]
@@ -358,6 +366,34 @@ impl Registry {
     pub fn panel(&mut self, name: &str, label: &str, icon: Icon, make: impl Fn() -> Box<dyn View> + Send + Sync + 'static) {
         let name = Name::of(&self.id, name);
         self.parts.panels.push(PanelDef { name, label: label.to_string(), icon: Some(icon), make: Arc::new(make) });
+    }
+
+    /// A format, `<id>@<name>`: registered by `register` on what this returns.
+    pub fn format(&mut self, name: &str) -> FormatBuilder<'_> {
+        let def = FormatDef {
+            name: Name::of(&self.id, name),
+            label: name.to_string(),
+            media_type: None,
+            signatures: vec![],
+            sniff: None,
+        };
+        FormatBuilder { registry: self, def }
+    }
+
+    /// An importer, `<id>@<name>`, making assets of `kind`: registered by `register` on what this returns.
+    pub fn importer(&mut self, name: &str, kind: &Name) -> ImporterBuilder<'_> {
+        let def = ImporterDef {
+            name: Name::of(&self.id, name),
+            label: name.to_string(),
+            reads: vec![],
+            makes: kind.clone(),
+            native: false,
+            fields: vec![],
+            inspector: vec![],
+            check: None,
+            priority: 0,
+        };
+        ImporterBuilder { registry: self, def }
     }
 
     /// A tool for agents, `<id>@<name>`: what it does, its arguments as a JSON schema, its work.
@@ -499,3 +535,127 @@ impl RoleBuilder<'_> {
         name
     }
 }
+
+pub struct FormatBuilder<'a> {
+    registry: &'a mut Registry,
+    def: FormatDef,
+}
+
+impl FormatBuilder<'_> {
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Self {
+        self.def.label = label.to_string();
+        self
+    }
+
+    #[must_use]
+    pub fn media_type(mut self, media_type: &str) -> Self {
+        self.def.media_type = Some(media_type.to_string());
+        self
+    }
+
+    /// Recognized by these bytes at this offset.
+    #[must_use]
+    pub fn bytes(mut self, offset: usize, bytes: &[u8]) -> Self {
+        self.def.signatures.push(Signature::Bytes { offset, bytes: bytes.to_vec() });
+        self
+    }
+
+    /// Recognized by its file name: exact, or a suffix after `*`.
+    #[must_use]
+    pub fn named(mut self, name: &str) -> Self {
+        self.def.signatures.push(Signature::Name(name.to_string()));
+        self
+    }
+
+    /// Recognized as text: UTF-8 without a NUL byte.
+    #[must_use]
+    pub fn text(mut self) -> Self {
+        self.def.signatures.push(Signature::Text);
+        self
+    }
+
+    /// Recognized, where its signatures leave it open, by its name, its size and its first bytes.
+    #[must_use]
+    pub fn sniff(mut self, sniff: impl Fn(&str, u64, &[u8]) -> Option<Recognized> + Send + Sync + 'static) -> Self {
+        self.def.sniff = Some(Arc::new(sniff));
+        self
+    }
+
+    /// Register it; its name, which importers read it by.
+    #[expect(clippy::must_use_candidate, reason = "a format no importer of its extension reads needs no name")]
+    pub fn register(self) -> Name {
+        let name = self.def.name.clone();
+        self.registry.parts.formats.push(self.def);
+        name
+    }
+}
+
+pub struct ImporterBuilder<'a> {
+    registry: &'a mut Registry,
+    def: ImporterDef,
+}
+
+impl ImporterBuilder<'_> {
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Self {
+        self.def.label = label.to_string();
+        self
+    }
+
+    /// It reads this format.
+    #[must_use]
+    pub fn reads(mut self, format: &Name) -> Self {
+        self.def.reads.push(format.to_string());
+        self
+    }
+
+    /// It reads any format of this media type.
+    #[must_use]
+    pub fn reads_media(mut self, media_type: &str) -> Self {
+        self.def.reads.push(media_type.to_string());
+        self
+    }
+
+    /// It makes nothing: its outputs are its inputs, its settings how to read them.
+    #[must_use]
+    pub fn native(mut self) -> Self {
+        self.def.native = true;
+        self
+    }
+
+    /// A setting.
+    #[must_use]
+    pub fn field(mut self, field: Field) -> Self {
+        self.def.fields.push(field);
+        self
+    }
+
+    /// A view drawn with its settings in the properties pane: what its custom settings hold.
+    #[must_use]
+    pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self
+    }
+
+    /// How far it takes a source of its formats; without a check, fully.
+    #[must_use]
+    pub fn check(mut self, check: impl Fn(&Asset) -> Support + Send + Sync + 'static) -> Self {
+        self.def.check = Some(Arc::new(check));
+        self
+    }
+
+    #[must_use]
+    pub fn priority(mut self, priority: i32) -> Self {
+        self.def.priority = priority;
+        self
+    }
+
+    #[expect(clippy::must_use_candidate, reason = "an importer's name is seldom needed")]
+    pub fn register(self) -> Name {
+        let name = self.def.name.clone();
+        self.registry.parts.importers.push(self.def);
+        name
+    }
+}
+

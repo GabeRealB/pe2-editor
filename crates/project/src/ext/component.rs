@@ -364,6 +364,10 @@ impl host::HostUi for State {
         Ok(self.frame(&ui)?.button(&text))
     }
 
+    fn icon_button(&mut self, ui: Resource<Frame>, which: types::Icon, hint: String) -> wasmtime::Result<bool> {
+        Ok(self.frame(&ui)?.icon_button(icon(which), &hint))
+    }
+
     fn checkbox(&mut self, ui: Resource<Frame>, text: String, value: bool) -> wasmtime::Result<bool> {
         let mut value = value;
         self.frame(&ui)?.checkbox(&text, &mut value);
@@ -402,6 +406,37 @@ impl host::HostUi for State {
 
     fn tooltip(&mut self, ui: Resource<Frame>, text: String) -> wasmtime::Result<()> {
         self.frame(&ui)?.tooltip(&text);
+        Ok(())
+    }
+
+    fn text_edit(&mut self, ui: Resource<Frame>, id: String, text: String) -> wasmtime::Result<(String, bool)> {
+        let mut text = text;
+        let committed = self.frame(&ui)?.text_edit(&id, &mut text);
+        Ok((text, committed))
+    }
+
+    fn combo(
+        &mut self,
+        ui: Resource<Frame>,
+        id: String,
+        selected: String,
+        options: Vec<String>,
+    ) -> wasmtime::Result<Option<u32>> {
+        let chosen = self.frame(&ui)?.combo(&id, &selected, &options);
+        Ok(chosen.and_then(|i| u32::try_from(i).ok()))
+    }
+
+    fn editable(&mut self, ui: Resource<Frame>) -> wasmtime::Result<bool> {
+        Ok(self.frame(&ui)?.editable())
+    }
+
+    fn set(&mut self, ui: Resource<Frame>, key: String, value: Option<String>) -> wasmtime::Result<()> {
+        // A value that does not parse is an error, never a removal.
+        let value = match value {
+            Some(text) => Some(parse_value(&text).ok_or_else(|| wasmtime::Error::msg(format!("{key}: not TOML")))?),
+            None => None,
+        };
+        self.frame(&ui)?.set(&key, value.as_ref());
         Ok(())
     }
 
@@ -820,6 +855,10 @@ fn icon(icon: types::Icon) -> pe2_ext::Icon {
         types::Icon::Binary => pe2_ext::Icon::Binary,
         types::Icon::File => pe2_ext::Icon::File,
         types::Icon::Folder => pe2_ext::Icon::Folder,
+        types::Icon::CaretUp => pe2_ext::Icon::CaretUp,
+        types::Icon::CaretDown => pe2_ext::Icon::CaretDown,
+        types::Icon::Cross => pe2_ext::Icon::Cross,
+        types::Icon::Plus => pe2_ext::Icon::Plus,
     }
 }
 
@@ -835,11 +874,13 @@ fn tint(tint: types::Tint) -> pe2_ext::Tint {
 }
 
 /// Register what a component registered: its callbacks are calls into it.
+/// A view of an asset, made in its component.
+fn view(shared: &Arc<Shared>, handle: u32) -> impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static {
+    let shared = shared.clone();
+    move |asset: &Asset| -> Box<dyn View> { Box::new(ComponentView::new(shared.clone(), handle, Some(asset))) }
+}
+
 fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Shared>) -> Result<()> {
-    let view = |shared: &Arc<Shared>, handle: u32| {
-        let shared = shared.clone();
-        move |asset: &Asset| -> Box<dyn View> { Box::new(ComponentView::new(shared.clone(), handle, Some(asset))) }
-    };
     for (index, kind) in registration.kinds.into_iter().enumerate() {
         let index = u32::try_from(index)?;
         let mut builder = registry.kind(&kind.name).label(&kind.label);
@@ -907,6 +948,8 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
         registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
     }
+    apply_formats(registry, registration.formats, shared);
+    apply_importers(registry, registration.importers, shared)?;
     for tool in registration.tools {
         let (shared, handle, name) = (shared.clone(), tool.handle, tool.name.clone());
         registry.tool(&tool.name, &tool.description, &tool.schema, move |project, arguments| {
@@ -921,6 +964,72 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
             let answer = answer.map_err(|e| anyhow!(e))?;
             parse_value(&answer).with_context(|| format!("{name}: its answer is not TOML"))
         });
+    }
+    Ok(())
+}
+
+/// Register what a component's formats are, their sniffs calls into it.
+fn apply_formats(registry: &mut Registry, formats: Vec<g::FileFormat>, shared: &Arc<Shared>) {
+    for format in formats {
+        let mut builder = registry.format(&format.name).label(&format.label);
+        if let Some(media_type) = &format.media_type {
+            builder = builder.media_type(media_type);
+        }
+        for signature in &format.signatures {
+            builder = match signature {
+                g::Signature::Bytes((offset, bytes)) => builder.bytes(*offset as usize, bytes),
+                g::Signature::Name(name) => builder.named(name),
+                g::Signature::Text => builder.text(),
+            };
+        }
+        if format.sniff {
+            let (shared, handle) = (shared.clone(), format.handle);
+            builder = builder.sniff(move |name, size, head| {
+                let (name, head) = (name.to_string(), head.to_vec());
+                let version = shared
+                    .with(|r| r.call(QUICK, async |a, g| g.call_sniff(a, handle, name, size, head).await))
+                    .ok()
+                    .flatten()?;
+                Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
+            });
+        }
+        let _ = builder.register();
+    }
+}
+
+/// Register a component's importers, their checks calls into it.
+fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared: &Arc<Shared>) -> Result<()> {
+    for importer in importers {
+        let makes = Name::parse(&importer.makes).with_context(|| format!("{}: not a qualified kind", importer.makes))?;
+        let mut builder = registry.importer(&importer.name, &makes).label(&importer.label).priority(importer.priority);
+        for read in &importer.reads {
+            builder = match Name::parse(read) {
+                Some(format) => builder.reads(&format),
+                None => builder.reads_media(read),
+            };
+        }
+        if importer.native {
+            builder = builder.native();
+        }
+        for f in importer.fields {
+            builder = builder.field(field(shared, f));
+        }
+        for v in importer.inspector {
+            builder = builder.inspector(&v.name, view(shared, v.handle));
+        }
+        if importer.check {
+            let (shared, handle) = (shared.clone(), importer.handle);
+            builder = builder.check(move |asset| {
+                let support =
+                    shared.with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_check(a, handle, lent).await));
+                match support {
+                    Ok(g::Support::Full) => pe2_ext::Support::Full,
+                    Ok(g::Support::Partial((reason, offer))) => pe2_ext::Support::Partial { reason, offer },
+                    Err(e) => pe2_ext::Support::Partial { reason: format!("{e:#}"), offer: false },
+                }
+            });
+        }
+        let _ = builder.register();
     }
     Ok(())
 }

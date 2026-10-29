@@ -283,12 +283,19 @@ fn uids_alone_in(value: &mut toml_edit::Value) {
     }
 }
 
-/// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s.
+/// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s. An
+/// asset whose declaration has an `[import]` section names its native file there (`source`), not beside it, nor the
+/// format extraction names that file by.
 fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) -> Result<String> {
-    let body = without_uid(body)?;
+    let mut body = without_uid(body)?;
+    let mut doc: toml_edit::DocumentMut = body.parse()?;
+    let imported = doc.contains_table("import");
+    if imported && doc.remove("format").is_some() {
+        body = doc.to_string();
+    }
     let mut lines =
         vec!["# An asset bundle, written by extraction.".to_string(), String::new(), body.trim().to_string()];
-    if let Some(native) = native {
+    if let Some(native) = native.filter(|_| !imported) {
         lines.push(format!("native = {}", quote(native)));
     }
     for (release, sha1) in originals {

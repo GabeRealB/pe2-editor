@@ -92,7 +92,12 @@ pub struct Frame<'a> {
     pub look: usize,
     pub preview: Preview,
     pub count: usize,
+    /// Whether the asset can be edited.
+    pub editable: bool,
 }
+
+/// What a view set of the asset it shows this frame: each field's new value, or none to remove it.
+pub type Sets = Vec<(String, Option<Value>)>;
 
 /// A view's handle on a frame: where it draws, what it shows, what it can ask of the project.
 pub struct Host<'a> {
@@ -100,6 +105,7 @@ pub struct Host<'a> {
     lens: &'a Lens<'a>,
     textures: &'a mut Textures,
     nav: &'a mut Option<String>,
+    sets: &'a mut Sets,
     frame: Frame<'a>,
     /// The last widget drawn, for a tooltip.
     last: Option<egui::Response>,
@@ -118,9 +124,10 @@ impl<'a> Host<'a> {
         lens: &'a Lens<'a>,
         textures: &'a mut Textures,
         nav: &'a mut Option<String>,
+        sets: &'a mut Sets,
         frame: Frame<'a>,
     ) -> Host<'a> {
-        Host { target: Target::Pane(ui), lens, textures, nav, frame, last: None }
+        Host { target: Target::Pane(ui), lens, textures, nav, sets, frame, last: None }
     }
 
     fn sheet(&self, fields: bool) -> Sheet<'a> {
@@ -128,11 +135,11 @@ impl<'a> Host<'a> {
             Some(asset) if fields => self.lens.extensions.fields(asset).into_iter().cloned().collect(),
             _ => vec![],
         };
-        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields }
+        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: None }
     }
 
     fn child(&mut self, kind: Child) -> Box<dyn UiHost + '_> {
-        let Host { target, lens, textures, nav, frame, .. } = self;
+        let Host { target, lens, textures, nav, sets, frame, .. } = self;
         let parent = target.ui();
         let mut rect = parent.available_rect_before_wrap();
         let layout = match kind {
@@ -148,7 +155,7 @@ impl<'a> Host<'a> {
         };
         let child = parent.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
         let target = Target::Child { parent, child: Box::new(child) };
-        Box::new(Host { target, lens, textures, nav, frame: *frame, last: None })
+        Box::new(Host { target, lens, textures, nav, sets, frame: *frame, last: None })
     }
 }
 
@@ -167,6 +174,14 @@ impl UiHost for Host<'_> {
 
     fn button(&mut self, text: &str) -> bool {
         let response = self.target.ui().button(text);
+        let clicked = response.clicked();
+        self.last = Some(response);
+        clicked
+    }
+
+    fn icon_button(&mut self, icon: pe2_ext::Icon, hint: &str) -> bool {
+        let button = egui::Button::new(crate::icons::glyph(icon)).frame(false);
+        let response = self.target.ui().add_enabled(self.frame.editable, button).on_hover_text(hint);
         let clicked = response.clicked();
         self.last = Some(response);
         clicked
@@ -218,6 +233,40 @@ impl UiHost for Host<'_> {
         }
     }
 
+    fn text_edit(&mut self, id: &str, text: &mut String) -> bool {
+        let edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(120.0);
+        let response = self.target.ui().add_enabled(self.frame.editable, edit);
+        let committed = response.lost_focus();
+        self.last = Some(response);
+        committed
+    }
+
+    fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize> {
+        let mut chosen = None;
+        let editable = self.frame.editable;
+        let ui = self.target.ui();
+        ui.add_enabled_ui(editable, |ui| {
+            egui::ComboBox::from_id_salt(id).selected_text(selected).show_ui(ui, |ui| {
+                for (i, option) in options.iter().enumerate() {
+                    if ui.selectable_label(option == selected, option).clicked() {
+                        chosen = Some(i);
+                    }
+                }
+            });
+        });
+        chosen
+    }
+
+    fn editable(&self) -> bool {
+        self.frame.editable
+    }
+
+    fn set(&mut self, key: &str, value: Option<&Value>) {
+        if self.frame.editable && self.frame.asset.is_some() {
+            self.sets.push((key.to_string(), value.cloned()));
+        }
+    }
+
     fn horizontal(&mut self) -> Box<dyn UiHost + '_> {
         self.child(Child::Row(egui::Layout::left_to_right(egui::Align::Center)))
     }
@@ -231,7 +280,7 @@ impl UiHost for Host<'_> {
     }
 
     fn section(&mut self, title: &str) -> Box<dyn UiHost + '_> {
-        let Host { target, lens, textures, nav, frame, .. } = self;
+        let Host { target, lens, textures, nav, sets, frame, .. } = self;
         let parent = target.ui();
         parent.add_space(6.0);
         parent.label(RichText::new(title.to_uppercase()).small().strong().color(theme::weak()));
@@ -244,7 +293,7 @@ impl UiHost for Host<'_> {
         let width = prepared.content_ui.available_width();
         prepared.content_ui.set_width(width);
         let target = Target::Section { parent, prepared: Some(Box::new(prepared)) };
-        Box::new(Host { target, lens, textures, nav, frame: *frame, last: None })
+        Box::new(Host { target, lens, textures, nav, sets, frame: *frame, last: None })
     }
 
     fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>> {

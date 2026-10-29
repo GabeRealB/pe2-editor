@@ -25,6 +25,9 @@ pub const TERMINAL_WINDOW: &str = "\u{EAE8}";
 pub const BINARY: &str = "\u{EE60}";
 pub const PACKAGE: &str = "\u{E390}";
 pub const CARET_LEFT: &str = "\u{E138}";
+pub const CARET_UP: &str = "\u{E13C}";
+pub const CARET_DOWN: &str = "\u{E136}";
+pub const X: &str = "\u{E4F6}";
 pub const CARET_RIGHT: &str = "\u{E13A}";
 pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
 pub const HARD_DRIVES: &str = "\u{E2A0}";
@@ -85,6 +88,10 @@ pub fn glyph(icon: Icon) -> &'static str {
         Icon::Binary => BINARY,
         Icon::File => FILE,
         Icon::Folder => FOLDERS,
+        Icon::CaretUp => CARET_UP,
+        Icon::CaretDown => CARET_DOWN,
+        Icon::Cross => X,
+        Icon::Plus => PLUS,
     }
 }
 

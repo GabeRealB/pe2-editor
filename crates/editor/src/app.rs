@@ -524,7 +524,8 @@ impl Editor {
         for (window, tile, action) in outcome.actions {
             self.layouts.act(window, tile, action);
         }
-        if let Some(request) = outcome.edit {
+        let view_edit = self.workspace.as_mut().and_then(|ws| ws.view_edit.take());
+        if let Some(request) = outcome.edit.or(view_edit) {
             self.edit(&request);
         }
         if let Some((redo, count)) = outcome.steps {

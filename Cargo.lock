@@ -1492,6 +1492,7 @@ name = "extensions"
 version = "0.1.0"
 dependencies = [
  "pe2-ext",
+ "pe2-formats",
  "pe2-game",
  "pe2-images",
  "project",
@@ -3434,6 +3435,13 @@ dependencies = [
  "anyhow",
  "toml",
  "wit-bindgen 0.63.0",
+]
+
+[[package]]
+name = "pe2-formats"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
 ]
 
 [[package]]

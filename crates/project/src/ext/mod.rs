@@ -12,10 +12,11 @@ pub mod component;
 
 use anyhow::{Context, Result};
 use pe2_ext::{
-    Asset, Extension, Field, Icon, Image, KindDef, PanelDef, Project, Registry, RoleDef, Source, Table, Tint, ToolDef, Value,
-    ViewDef,
+    Asset, Extension, Field, FormatDef, Icon, Image, ImporterDef, KindDef, PanelDef, Project, Recognized, Registry, RoleDef,
+    Signature, Source, Support, Table, Tint, ToolDef, Value, ViewDef,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::path::PathBuf;
 
 use crate::index;
@@ -73,6 +74,10 @@ pub struct Extensions {
     roles: HashMap<String, RoleDef>,
     panels: Vec<PanelDef>,
     tools: Vec<ToolDef>,
+    formats: Vec<FormatDef>,
+    importers: HashMap<String, ImporterDef>,
+    /// The formats recognized in files, by their content's hash.
+    recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     kind_aliases: HashMap<String, String>,
     role_aliases: HashMap<String, String>,
@@ -178,6 +183,7 @@ impl Extensions {
         let mut seen = HashSet::new();
         let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
+        let names = names.chain(parts.formats.iter().map(|f| &f.name)).chain(parts.importers.iter().map(|i| &i.name));
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
@@ -187,6 +193,24 @@ impl Extensions {
             let reachable = owner == extension.id && kinds.iter().any(|k| k.name == role.kind)
                 || dependencies.contains(&owner) && self.kinds.contains_key(role.kind.as_str());
             anyhow::ensure!(reachable, "{} is on {}, which neither it nor what it requires registers", role.name, role.kind);
+        }
+        let reachable = |owner: &str, known: bool| owner == extension.id && known || dependencies.contains(&owner);
+        for importer in &parts.importers {
+            let own = kinds.iter().any(|k| k.name == importer.makes);
+            anyhow::ensure!(
+                reachable(importer.makes.extension(), own) && (own || self.kinds.contains_key(importer.makes.as_str())),
+                "{} makes {}, which neither it nor what it requires registers",
+                importer.name,
+                importer.makes
+            );
+            for read in importer.reads.iter().filter_map(|r| pe2_ext::Name::parse(r)) {
+                let own = parts.formats.iter().any(|f| f.name == read);
+                anyhow::ensure!(
+                    reachable(read.extension(), own) && (own || self.formats.iter().any(|f| f.name == read)),
+                    "{} reads {read}, which neither it nor what it requires registers",
+                    importer.name
+                );
+            }
         }
         let aliases = kinds.iter().filter_map(|k| k.alias.as_ref()).chain(roles.iter().filter_map(|r| r.alias.as_ref()));
         for alias in aliases {
@@ -209,6 +233,8 @@ impl Extensions {
         }
         self.panels.extend(parts.panels);
         self.tools.extend(parts.tools);
+        self.formats.extend(parts.formats);
+        self.importers.extend(parts.importers.into_iter().map(|i| (i.name.to_string(), i)));
         Ok(())
     }
 
@@ -354,6 +380,87 @@ impl Extensions {
             wanted.is_some_and(|w| self.kind_of(a).is_some_and(|k| k.name.as_str() == w))
                 || wanted.is_none() && a.kind.as_deref() == Some(kind)
         })
+    }
+
+    /// An asset's importer, as its import settings name it.
+    #[must_use]
+    pub fn importer_of(&self, asset: &index::Asset) -> Option<&ImporterDef> {
+        let name = asset.fields().get("import")?.get("importer")?.as_str()?;
+        self.importers.get(name)
+    }
+
+    /// An importer, by its qualified name.
+    #[must_use]
+    pub fn importer(&self, name: &str) -> Option<&ImporterDef> {
+        self.importers.get(name)
+    }
+
+    /// The formats a file is, by signatures and sniffs: from its first bytes, read once a content.
+    #[must_use]
+    pub fn recognize(&self, file: &index::BundleFile) -> Vec<(&FormatDef, Recognized)> {
+        let known = self.recognized.lock().ok().and_then(|r| r.get(&file.sha1).cloned());
+        let found = known.unwrap_or_else(|| {
+            let found = self.recognize_now(file);
+            if let Ok(mut recognized) = self.recognized.lock() {
+                recognized.insert(file.sha1.clone(), found.clone());
+            }
+            found
+        });
+        found.into_iter().map(|(i, r)| (&self.formats[i], r)).collect()
+    }
+
+    fn recognize_now(&self, file: &index::BundleFile) -> Vec<(usize, Recognized)> {
+        use std::io::Read;
+        const HEAD: u64 = 4096;
+        let mut head = Vec::new();
+        if let Ok(f) = std::fs::File::open(&file.path) {
+            let _ = f.take(HEAD).read_to_end(&mut head);
+        }
+        let text = match std::str::from_utf8(&head) {
+            Ok(t) => !t.contains('\0'),
+            // A cut through a character at the end of what was read: what is before it decides.
+            Err(e) => e.error_len().is_none() && !head[..e.valid_up_to()].contains(&0),
+        };
+        let named = |pattern: &str| match pattern.strip_prefix('*') {
+            Some(suffix) => file.name.ends_with(suffix),
+            None => file.name == pattern,
+        };
+        let mut out = vec![];
+        for (i, format) in self.formats.iter().enumerate() {
+            let signed = format.signatures.iter().any(|signature| match signature {
+                Signature::Bytes { offset, bytes } => head.get(*offset..offset + bytes.len()) == Some(bytes.as_slice()),
+                Signature::Name(pattern) => named(pattern),
+                Signature::Text => text,
+            });
+            let recognized = if signed {
+                Some(Recognized::default())
+            } else {
+                format.sniff.as_ref().and_then(|sniff| sniff(&file.name, file.size, &head))
+            };
+            out.extend(recognized.map(|r| (i, r)));
+        }
+        out
+    }
+
+    /// The importers that fit an asset's source - the file its import settings name - with how far each takes it, the
+    /// highest priority first. An importer not reading any of the source's formats is not listed.
+    #[must_use]
+    pub fn importers_for(&self, asset: &index::Asset) -> Vec<(&ImporterDef, Support)> {
+        let Some(source) = asset.fields().get("import").and_then(|i| i.get("source")).and_then(Value::as_str) else {
+            return vec![];
+        };
+        let Some(file) = asset.files.iter().find(|f| f.name == source) else { return vec![] };
+        let formats = self.recognize(file);
+        let read = |r: &str| formats.iter().any(|(f, _)| f.name.as_str() == r || f.media_type.as_deref() == Some(r));
+        let lent = self.lend(asset);
+        let mut out: Vec<(&ImporterDef, Support)> = self
+            .importers
+            .values()
+            .filter(|i| i.reads.iter().any(|r| read(r)))
+            .map(|i| (i, i.check.as_ref().map_or(Support::Full, |check| check(&lent))))
+            .collect();
+        out.sort_by(|(a, _), (b, _)| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
+        out
     }
 
     /// The views of an asset: its kind's, then its role's.

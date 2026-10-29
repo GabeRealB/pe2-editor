@@ -308,12 +308,12 @@ fn declaration(bytes: &[u8]) -> Declaration {
             out.kind = string("kind");
             out.role = string("role");
             out.uid = string("uid");
+            // An image's looks: its variants, keyed by name.
             out.variants = table
                 .get("variants")
-                .and_then(toml::Value::as_array)
+                .and_then(toml::Value::as_table)
                 .into_iter()
-                .flatten()
-                .filter_map(|v| v.get("name")?.as_str().map(str::to_string))
+                .flat_map(|t| t.keys().cloned())
                 .collect();
             let name = table.get("name").and_then(toml::Value::as_str);
             // An asset's own `uid` (as declarations named it before changesets) is not a reference.

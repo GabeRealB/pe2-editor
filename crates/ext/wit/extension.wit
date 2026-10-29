@@ -22,7 +22,7 @@ interface types {
         height: f32,
     }
 
-    enum icon { disc, stack, image, palette, grid, film, waveform, speaker, music, %package, terminal, text, binary, file, folder }
+    enum icon { disc, stack, image, palette, grid, film, waveform, speaker, music, %package, terminal, text, binary, file, folder, caret-up, caret-down, cross, plus }
 
     enum tint { structure, picture, motion, sound, code, plain }
 
@@ -30,7 +30,7 @@ interface types {
 }
 
 interface host {
-    use types.{image, rect, style};
+    use types.{image, rect, style, icon};
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
@@ -90,6 +90,8 @@ interface host {
     resource ui {
         label: func(text: string, style: style);
         button: func(text: string) -> bool;
+        /// A button showing an icon of the host's set, what it does said on hovering it; whether it was clicked.
+        icon-button: func(icon: icon, hint: string) -> bool;
         /// A checkbox showing `value`; its value after this frame.
         checkbox: func(text: string, value: bool) -> bool;
         badge: func(text: string);
@@ -100,6 +102,14 @@ interface host {
         /// A field, the host's way: its label and its reading (TOML value).
         field: func(key: string, value: string);
         tooltip: func(text: string);
+        /// A one-line text field showing `text`; its text after this frame, and whether it was committed.
+        text-edit: func(id: string, text: string) -> tuple<string, bool>;
+        /// A dropdown; the option chosen this frame.
+        combo: func(id: string, selected: string, options: list<string>) -> option<u32>;
+        /// Whether the asset shown can be edited.
+        editable: func() -> bool;
+        /// Set a field of the asset shown (TOML), or remove it.
+        set: func(key: string, value: option<string>);
         horizontal: func() -> ui;
         wrapped: func() -> ui;
         indented: func() -> ui;
@@ -181,11 +191,53 @@ interface guest {
         schema: string,
     }
 
+    /// How the host recognizes a format without calling back: bytes at an offset, a file name (exact, or `*` and a
+    /// suffix), or text.
+    variant signature {
+        bytes(tuple<u32, list<u8>>),
+        name(string),
+        text,
+    }
+
+    /// A format; its sniff, where it has one, called back by its handle.
+    record file-format {
+        handle: u32,
+        name: string,
+        label: string,
+        media-type: option<string>,
+        signatures: list<signature>,
+        sniff: bool,
+    }
+
+    /// An importer; its check, where it has one, called back by its handle.
+    record importer {
+        handle: u32,
+        name: string,
+        label: string,
+        /// Formats (qualified) or media types.
+        reads: list<string>,
+        /// The kind it makes, qualified.
+        makes: string,
+        native: bool,
+        fields: list<field>,
+        inspector: list<view>,
+        check: bool,
+        priority: s32,
+    }
+
+    /// How far an importer takes a source: fully, or partly with a reason and whether it is offered anyway.
+    variant support {
+        full,
+        partial(tuple<string, bool>),
+    }
+
     record registration {
         kinds: list<kind>,
         roles: list<role>,
         panels: list<panel>,
         tools: list<tool>,
+        formats: list<file-format>,
+        importers: list<importer>,
     }
 
     describe: func() -> about;
@@ -201,6 +253,10 @@ interface guest {
     format: func(field: u32, brief: bool, value: string) -> option<string>;
     /// What an agent is told of an asset of the kind (a TOML table).
     facts: func(kind: u32, asset: borrow<asset>) -> string;
+    /// A format's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
+    sniff: func(format: u32, name: string, size: u64, head: list<u8>) -> option<string>;
+    /// An importer's check of the source an asset names.
+    check: func(importer: u32, asset: borrow<asset>) -> support;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
 

@@ -11,6 +11,7 @@ members = [
     "crates/cli",
     "crates/editor",
     "extensions",
+    "extensions/formats",
     "extensions/game",
     "extensions/images",
 ]
@@ -40,6 +41,7 @@ wasmtime = { version = "50", default-features = false, features = ["anyhow", "ru
 wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
 # The built-in extensions (`extensions/`) and the list of them the editor ships.
 extensions = { path = "extensions" }
+pe2-formats = { path = "extensions/formats" }
 pe2-game = { path = "extensions/game" }
 pe2-images = { path = "extensions/images" }
 mcp = { path = "crates/mcp" }

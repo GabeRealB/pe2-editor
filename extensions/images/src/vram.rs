@@ -83,7 +83,7 @@ impl Uploads {
 
     /// A palette at its place: as many halfwords as the deepest cell drawn with it has colors.
     fn palette(&mut self, project: &dyn Project, image: &Asset, palette: usize) {
-        let declared = image.array("palettes").get(palette);
+        let declared = image.parts("palettes").get(palette).map(|(_, p)| *p);
         let Some((x, y)) = declared.and_then(|p| place(project, p)) else { return };
         let depth = bpp(image);
         let deepest = cells(image).iter().filter(|c| c.palette == Some(palette)).map(|c| c.bpp).max().unwrap_or(depth);

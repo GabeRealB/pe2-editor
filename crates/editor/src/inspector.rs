@@ -24,9 +24,16 @@ pub struct Sheet<'a> {
     pub index: &'a Index,
     pub extensions: &'a Extensions,
     pub fields: Vec<pe2_ext::Field>,
+    /// The table of the declaration the fields are in: none for the asset's own, `import` for its import settings.
+    pub within: Option<&'static str>,
 }
 
 impl Sheet<'_> {
+    /// A field's place in the declaration: `mode`, or `import.mode`.
+    fn path(&self, key: &str) -> String {
+        self.within.map_or_else(|| key.to_string(), |within| format!("{within}.{key}"))
+    }
+
     fn field(&self, key: &str) -> Option<&pe2_ext::Field> {
         self.fields.iter().find(|f| f.key == key)
     }
@@ -66,11 +73,12 @@ pub fn inspector_ui(
             index: &ws.index,
             extensions: &ws.extensions,
             fields: ws.extensions.fields(&asset).into_iter().cloned().collect(),
+            within: None,
         };
         let fields: Vec<(&String, &toml::Value)> = asset
             .fields()
             .iter()
-            .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && !sheet.custom(k))
+            .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && *k != "import" && !sheet.custom(k))
             .collect();
         let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
         let (field_edit, parts) = (&mut ws.field_edit, &mut ws.parts);
@@ -86,7 +94,8 @@ pub fn inspector_ui(
             });
         }
     }
-    ws.show_inspector_views(ui, &asset.path, nav);
+    ws.show_inspector_views(ui, &asset.path, nav, false);
+    import_ui(ui, ws, &asset, &target, nav, edit);
     files_ui(ui, &asset, tools, message);
     declaration_ui(ui, ws, &asset, edit);
 }
@@ -227,7 +236,7 @@ fn property_sheet(
         for (key, value) in fields {
             ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
             ui.horizontal_wrapped(|ui| {
-                let editing = field_edit.as_ref().is_some_and(|f| f.asset == asset.path && f.key == **key);
+                let editing = field_edit.as_ref().is_some_and(|f| f.asset == asset.path && f.key == sheet.path(key));
                 if editing {
                     field_editor(ui, field_edit, asset, key, value, sheet, edit);
                     return;
@@ -235,7 +244,7 @@ fn property_sheet(
                 let field = sheet.field(key);
                 let editable = editable && !field.is_some_and(|f| f.read_only);
                 if let Some(field) = field.filter(|f| editable && !f.choices.is_empty()) {
-                    choice_ui(ui, asset, key, value, field, edit);
+                    choice_ui(ui, sheet, asset, key, value, field, edit);
                     return;
                 }
                 value_ui(ui, sheet, key, value, nav);
@@ -243,7 +252,7 @@ fn property_sheet(
                     let pencil = ui.add(egui::Button::new(RichText::new(icons::PENCIL_SIMPLE).small()).frame(false));
                     if pencil.on_hover_text(target.clone().unwrap_or_default()).clicked() {
                         *field_edit =
-                            Some(FieldEdit { asset: asset.path.clone(), key: (*key).clone(), text: raw_text(value) });
+                            Some(FieldEdit { asset: asset.path.clone(), key: sheet.path(key), text: raw_text(value) });
                     }
                 }
             });
@@ -315,17 +324,26 @@ fn field_editor(
         && let Ok(new) = parsed
     {
         *field_edit = None;
-        if let Some(request) = set_field(asset, key, new, &sheet.label(key)) {
+        if let Some(request) = set_field(asset, sheet.within, key, new, &sheet.label(key)) {
             *edit = Some(request);
         }
     }
 }
 
-/// The edit setting a field of an asset's declaration, its layout kept; none where it changes nothing. Edits of the
-/// same field in a row merge into one step.
-fn set_field(asset: &Asset, key: &str, new: toml_edit::Value, label: &str) -> Option<EditRequest> {
+/// The edit setting a field of an asset's declaration - its own, or one of a table of it (`import`) - its layout kept;
+/// none where it changes nothing. Edits of the same field in a row merge into one step.
+fn set_field(
+    asset: &Asset,
+    within: Option<&str>,
+    key: &str,
+    new: toml_edit::Value,
+    label: &str,
+) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
-    document[key] = toml_edit::Item::Value(new);
+    match within {
+        Some(table) => document.get_mut(table)?.as_table_like_mut()?.insert(key, toml_edit::Item::Value(new)),
+        None => document.insert(key, toml_edit::Item::Value(new)),
+    };
     if document.to_string() == asset.text() {
         return None;
     }
@@ -335,13 +353,74 @@ fn set_field(asset: &Asset, key: &str, new: toml_edit::Value, label: &str) -> Op
         file: project::index::ASSET_FILE.to_string(),
         bytes: document.to_string().into_bytes(),
         label: format!("Set {} of {name}", label.to_lowercase()),
-        merge: Some(format!("{}#{key}", asset.path)),
+        merge: Some(format!("{}#{}{key}", asset.path, within.map_or_else(String::new, |w| format!("{w}.")))),
+    })
+}
+
+/// A value as `toml_edit` writes it: inline, tables as inline tables.
+fn inline(value: &toml::Value) -> toml_edit::Value {
+    match value {
+        toml::Value::String(s) => s.as_str().into(),
+        toml::Value::Integer(n) => (*n).into(),
+        toml::Value::Float(f) => (*f).into(),
+        toml::Value::Boolean(b) => (*b).into(),
+        toml::Value::Datetime(d) => d.to_string().parse().unwrap_or_else(|_| d.to_string().into()),
+        toml::Value::Array(items) => toml_edit::Value::Array(items.iter().map(inline).collect()),
+        toml::Value::Table(table) => {
+            toml_edit::Value::InlineTable(table.iter().map(|(k, v)| (k.as_str(), inline(v))).collect())
+        }
+    }
+}
+
+/// A field as written into a declaration: a table of parts (each entry a table) a line each, `cells.disc_1 = { ... }`,
+/// in its order; anything else inline.
+fn item(value: &toml::Value) -> toml_edit::Item {
+    match value {
+        toml::Value::Table(parts) if !parts.is_empty() && parts.values().all(toml::Value::is_table) => {
+            let mut table = toml_edit::Table::new();
+            table.set_dotted(true);
+            for (name, part) in parts {
+                table.insert(name, toml_edit::Item::Value(inline(part)));
+            }
+            toml_edit::Item::Table(table)
+        }
+        other => toml_edit::Item::Value(inline(other)),
+    }
+}
+
+/// The edit making what a view set of the asset it shows: each field's new value or its removal, its declaration's
+/// layout otherwise kept, in one step; none where it changes nothing.
+pub fn set_fields(asset: &Asset, sets: &[(String, Option<toml::Value>)]) -> Option<EditRequest> {
+    let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
+    for (key, value) in sets {
+        match value {
+            Some(value) => {
+                document.insert(key, item(value));
+            }
+            None => {
+                document.remove(key);
+            }
+        }
+    }
+    if document.to_string() == asset.text() {
+        return None;
+    }
+    let mut keys: Vec<&str> = sets.iter().map(|(k, _)| k.as_str()).collect();
+    keys.dedup();
+    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    Some(EditRequest::Write {
+        uid: asset.uid.clone().unwrap_or_default(),
+        file: project::index::ASSET_FILE.to_string(),
+        bytes: document.to_string().into_bytes(),
+        label: format!("Edit {} of {name}", keys.join(", ")),
+        merge: Some(format!("{}#{}", asset.path, keys.join(","))),
     })
 }
 
 /// A field with choices, edited by choosing one: each by its label, the value set at once.
 fn choice_ui(
     ui: &mut egui::Ui,
+    sheet: &Sheet,
     asset: &Asset,
     key: &str,
     value: &toml::Value,
@@ -350,7 +429,7 @@ fn choice_ui(
 ) {
     let current = field.choice(value).map_or_else(|| raw_text(value), str::to_string);
     let mut chosen = None;
-    egui::ComboBox::from_id_salt(("choice", &asset.path, key)).selected_text(current).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("choice", &asset.path, sheet.path(key))).selected_text(current).show_ui(ui, |ui| {
         for (choice, label) in &field.choices {
             if ui.selectable_label(choice == value, label).clicked() && choice != value {
                 chosen = Some(choice.clone());
@@ -364,7 +443,8 @@ fn choice_ui(
         toml::Value::Boolean(b) => Some(b.into()),
         _ => None,
     });
-    if let Some(request) = new.and_then(|new| set_field(asset, key, new, field.label.as_deref().unwrap_or(key))) {
+    let label = field.label.as_deref().unwrap_or(key);
+    if let Some(request) = new.and_then(|new| set_field(asset, sheet.within, key, new, label)) {
         *edit = Some(request);
     }
 }
@@ -613,6 +693,135 @@ fn count(n: usize, plural: &str) -> String {
     if n == 1 { format!("1 {}", plural.strip_suffix('s').unwrap_or(plural)) } else { format!("{n} {plural}") }
 }
 
+// --- import ---
+
+/// An asset's import settings, apart from its own: its importer, its source and the formats that is, the settings as
+/// the importer describes them, its views, and the other importers that fit the source.
+fn import_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    asset: &Asset,
+    target: &Result<String, String>,
+    nav: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
+) {
+    let Some(import) = asset.fields().get("import").and_then(toml::Value::as_table) else { return };
+    let name = import.get("importer").and_then(toml::Value::as_str).unwrap_or_default();
+    let source = import.get("source").and_then(toml::Value::as_str);
+    let importer = ws.extensions.importer(name);
+    let fits: Vec<(String, String, Option<pe2_ext::Support>)> = ws
+        .extensions
+        .importers_for(asset)
+        .into_iter()
+        .map(|(i, support)| (i.name.to_string(), i.label.clone(), Some(support)))
+        .collect();
+    let formats: Vec<String> = asset
+        .files
+        .iter()
+        .filter(|f| Some(f.name.as_str()) == source)
+        .flat_map(|f| ws.extensions.recognize(f).into_iter().map(|(format, _)| format.label.clone()))
+        .collect();
+    {
+        let sheet = Sheet {
+            index: &ws.index,
+            extensions: &ws.extensions,
+            fields: importer.map_or_default(|i| i.fields.clone()),
+            within: Some("import"),
+        };
+        let settings: Vec<(&String, &toml::Value)> = import
+            .iter()
+            .filter(|(k, v)| !matches!(k.as_str(), "importer" | "source") && !sheet.custom(k) && !is_table_list(v))
+            .collect();
+        let field_edit = &mut ws.field_edit;
+        theme::section(ui, "Import", |ui| {
+            egui::Grid::new(("import", &asset.path)).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(
+                ui,
+                |ui| {
+                    ui.label(RichText::new("Importer").color(theme::weak()));
+                    importer_row(ui, asset, name, importer, &fits, target.is_ok(), edit);
+                    ui.end_row();
+                    if let Some(source) = source {
+                        ui.label(RichText::new("Source").color(theme::weak()));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(source).monospace());
+                            for format in &formats {
+                                badge(ui, format);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                },
+            );
+            if !settings.is_empty() {
+                ui.add_space(4.0);
+                property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
+            }
+            if fits.len() > 1 || fits.iter().any(|(n, ..)| n != name) {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Importers for this source").small().color(theme::weak()));
+                for (fit, label, support) in &fits {
+                    ui.horizontal_wrapped(|ui| {
+                        let text = RichText::new(label);
+                        ui.label(if fit == name { text.strong() } else { text });
+                        match support {
+                            Some(pe2_ext::Support::Partial { reason, .. }) => {
+                                ui.label(RichText::new(reason).small().color(ui.visuals().warn_fg_color));
+                            }
+                            _ if fit == name => {
+                                ui.label(RichText::new("in use").small().color(theme::weak()));
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            }
+        });
+    }
+    ws.show_inspector_views(ui, &asset.path, nav, true);
+}
+
+/// The importer: its label and name, or - where the asset can be edited and several importers are offered for its
+/// source - a choice of them, switching as an undoable step.
+fn importer_row(
+    ui: &mut egui::Ui,
+    asset: &Asset,
+    name: &str,
+    importer: Option<&pe2_ext::ImporterDef>,
+    fits: &[(String, String, Option<pe2_ext::Support>)],
+    editable: bool,
+    edit: &mut Option<EditRequest>,
+) {
+    // Offered: fully supporting, or partly and offered anyway.
+    let offered: Vec<&(String, String, Option<pe2_ext::Support>)> =
+        fits.iter().filter(|(_, _, s)| !matches!(s, Some(pe2_ext::Support::Partial { offer: false, .. }))).collect();
+    ui.horizontal_wrapped(|ui| {
+        if editable && offered.len() > 1 {
+            let shown = importer.map_or(name, |i| i.label.as_str());
+            let mut chosen = None;
+            egui::ComboBox::from_id_salt(("importer", &asset.path)).selected_text(shown).show_ui(ui, |ui| {
+                for (fit, label, _) in &offered {
+                    if ui.selectable_label(fit == name, label).clicked() && fit != name {
+                        chosen = Some(fit.clone());
+                    }
+                }
+            });
+            let switched = chosen.and_then(|fit| set_field(asset, Some("import"), "importer", fit.as_str().into(), "importer"));
+            if let Some(switched) = switched {
+                *edit = Some(switched);
+            }
+        } else if let Some(importer) = importer {
+            ui.label(&importer.label);
+            ui.label(RichText::new(name).small().color(theme::weak()));
+            if importer.native {
+                badge(ui, "native");
+            }
+        } else {
+            let unknown = format!("{name}: no extension provides it");
+            ui.label(RichText::new(unknown).color(ui.visuals().error_fg_color));
+        }
+    });
+}
+
 // --- files ------------------------------------------------------------------------------------------------------------
 
 /// A plain file or a folder of the resolved project: where it comes from and where it is on disk.
@@ -698,5 +907,42 @@ pub fn size_text(bytes: u64) -> String {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / f64::from(1 << 20)),
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / f64::from(1 << 10)),
         b => format!("{b} bytes"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::item;
+
+    #[test]
+    fn a_table_of_parts_keeps_a_line_each_in_its_order() {
+        let mut document: toml_edit::DocumentMut = r#"kind = "image"
+mode = "indexed_4bpp"
+variants.day = { palette = "warm" }
+variants.night = { palette = "cold" }
+size = [2, 1]
+
+[import]
+importer = "pe2.images@texels"
+"#
+        .parse()
+        .unwrap();
+        let variants: toml::Value = toml::from_str::<toml::Table>(
+            r#"variants.night = { palette = "cold" }
+variants.dusk = { palette = "warm" }"#,
+        )
+        .unwrap()
+        .remove("variants")
+        .unwrap();
+        document.insert("variants", item(&variants));
+        let written = document.to_string();
+        assert!(
+            written.contains("variants.night = { palette = \"cold\" }\nvariants.dusk = { palette = \"warm\" }\n"),
+            "{written}"
+        );
+        assert!(!written.contains("day"), "{written}");
+        assert!(written.contains("[import]\nimporter = \"pe2.images@texels\""), "{written}");
+        let parsed: toml::Table = toml::from_str(&written).unwrap();
+        assert_eq!(parsed["variants"].as_table().unwrap().keys().collect::<Vec<_>>(), ["night", "dusk"]);
     }
 }
