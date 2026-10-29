@@ -14,7 +14,6 @@ pub mod index;
 pub mod lock;
 pub mod stack;
 pub mod store;
-pub mod textures;
 pub mod uid;
 
 use anyhow::{Context, Result, bail};

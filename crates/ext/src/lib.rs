@@ -12,6 +12,7 @@
 //! handle a view draws through, never the host's own types.
 
 mod asset;
+mod extract;
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
 pub mod guest;
@@ -23,6 +24,7 @@ mod ui;
 
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
+pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef};
 pub use image::{Image, Rect, Texture};
 pub use import::{Check, Export, FormatDef, Import, Imported, ImporterDef, Made, Recognized, Signature, Sniff, Support};
 pub use project::Project;

@@ -76,6 +76,7 @@ pub struct Extensions {
     tools: Vec<ToolDef>,
     formats: Vec<FormatDef>,
     importers: HashMap<String, ImporterDef>,
+    extractors: Vec<pe2_ext::ExtractorDef>,
     /// The formats recognized in files, by their content's hash.
     recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
@@ -184,6 +185,7 @@ impl Extensions {
         let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
         let names = names.chain(parts.formats.iter().map(|f| &f.name)).chain(parts.importers.iter().map(|i| &i.name));
+        let names = names.chain(parts.extractors.iter().map(|e| &e.name));
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
@@ -212,6 +214,20 @@ impl Extensions {
                 );
             }
         }
+        for extractor in &parts.extractors {
+            let own = kinds.iter().any(|k| k.name == extractor.kind);
+            anyhow::ensure!(
+                reachable(extractor.kind.extension(), own) && (own || self.kinds.contains_key(extractor.kind.as_str())),
+                "{} extracts {}, which neither it nor what it requires registers",
+                extractor.name,
+                extractor.kind
+            );
+            for role in &extractor.roles {
+                let known = roles.iter().any(|r| r.name == *role && r.kind == extractor.kind)
+                    || self.roles.get(role.as_str()).is_some_and(|r| r.kind == extractor.kind);
+                anyhow::ensure!(known, "{} extracts {role}, which is no role of {}", extractor.name, extractor.kind);
+            }
+        }
         let aliases = kinds.iter().filter_map(|k| k.alias.as_ref()).chain(roles.iter().filter_map(|r| r.alias.as_ref()));
         for alias in aliases {
             anyhow::ensure!(builtin, "only a built-in extension names a kind or role bare ({alias})");
@@ -235,6 +251,7 @@ impl Extensions {
         self.tools.extend(parts.tools);
         self.formats.extend(parts.formats);
         self.importers.extend(parts.importers.into_iter().map(|i| (i.name.to_string(), i)));
+        self.extractors.extend(parts.extractors);
         Ok(())
     }
 
@@ -417,6 +434,13 @@ impl Extensions {
     #[must_use]
     pub fn importer(&self, name: &str) -> Option<&ImporterDef> {
         self.importers.get(name)
+    }
+
+    /// The extractor of assets of a declared kind and role (`image`, `atlas`), where an extension registers one.
+    #[must_use]
+    pub fn extractor_for(&self, kind: &str, role: Option<&str>) -> Option<&pe2_ext::ExtractorDef> {
+        let (Some(kind), role) = self.qualify(kind, role) else { return None };
+        self.extractors.iter().find(|e| e.takes(kind, role))
     }
 
     /// The native files an asset's importer makes of its source, by name; none where its importer is unknown or makes

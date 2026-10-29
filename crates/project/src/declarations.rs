@@ -37,45 +37,12 @@
 //! `stages/<stage>/rooms/<room>`; Dryfield's day and night stages hold one room each as two instances, `<room>/day`
 //! and `<room>/night`, as `src/stages/dryfield` builds them.
 //!
-//! # VRAM and images
+//! # Assets of extensions' kinds
 //!
-//! VRAM is 1024 x 512 halfwords. A `vram_slot` (`engine/vram`) is a rectangle of it, `rect = [x, y, w, h]`, that
-//! uploads are placed in: a slot `within` another is part of it (the item preview's 96 drawn rows of its 128-row
-//! sheet); one that `borrows` another overwrites it while it is up, and whoever owns the other restores it (the item
-//! menu's previews over the room's sprite pages). Any other overlap is two uses of the same VRAM at different times.
-//!
-//! Textures and atlases are images (`kind = "image"`) by `role`, as backgrounds are: a slot that takes an image takes
-//! any of them. A texture is pixels in a `mode` - `indexed_4bpp`, `indexed_8bpp` or `direct_16bpp` - and a `size` in
-//! texels (its kind settings; its `[import]` section names the importer of its stored texels, `pe2.images@texels`, a
-//! background's `pe2.images@bs`), uploaded to a `page` - the
-//! VRAM slot and the halfword `at` in it - filling as many 64-halfword VRAM pages, side by side, as its width needs;
-//! and its `palettes`, each named, placed where its colors are uploaded (`slot`, `at`), or uploaded by an executable
-//! (`executable`), or none known (`no_palette`). A texture is drawn whole, with its palette. Its location lists where
-//! its first page is read, and the sha1s of its texels (a byte a texel at 4 and 8 bits, a halfword at 16, row by row)
-//! and of each palette's colors. A texture at its page's corner is as large as its non-zero texels and its cells -
-//! exactly, for a picture a menu draws whole; rounded up to 8 for a page that is sampled.
-//!
-//! An atlas is a texture whose regions are drawn separately - a sprite, a polygon, a glyph sampling a rectangle of it
-//! with a palette of its own - with `cells`, each a named `rect` in texels and the `palette` it is drawn with; a cell
-//! of another depth than the image's states its `mode`, its rectangle in texels of that depth (the UI sheet's 8-bit
-//! portrait among 4-bit icons). A palette holds the colors of the deepest cell drawn with it. The cells are those its
-//! users name: a room's view sprites (`view<N>_sprite_<i>`), the code's own tables (a clock's digits, the HUD's
-//! icons), a model's faces. A multi-page image whose pages are drawn with palettes of their own, where nothing names
-//! finer regions yet, is an atlas of `page_<n>` cells.
-//!
-//! An image's `variants` are its other looks: a texture's each a `palette`, the first its default; an atlas's each the
-//! `palettes` some of its cells take instead (`{ <cell> = <palette> }` - the UI sheet's `ammo_9mm` recolors three
-//! icons).
-//!
-//! A file's image slot lists its `pages` - an `image`, or a place where the page holds palettes only - each image
-//! filling the pages its width needs; where a file holds an image in two chunks, each entry says which of its pages
-//! that chunk holds (`first`, `count`). A palette slot (or a palette resource of a bundle) lists its `palettes`: an
-//! image's palette by name (`image`, `palette`), or a `name`d run of `entries` colors placed by `slot` and `at`, which
-//! no image owns: an image palette no slot names takes its colors from the run uploaded at its place (the system's
-//! text palettes, which every dialogue atlas is drawn with). An image chunk stores each page from its row to the
-//! bottom of its slot, within the 256-row column, every bit around its images zero; a palette chunk stores the
-//! rectangle its palettes span, or its `upload` (a whole slot, or `at` and `size` in one), every color outside its
-//! palettes zero.
+//! What a kind's declarations say beyond where an asset is - an image's mode, palettes and cells, a file's image and
+//! palette slots, a VRAM slot's rectangle - is its extension's to read: extraction lends the declarations to the
+//! extractor registered for the kind (`pe2.images` for textures and atlases), and keeps of them only what it reads
+//! itself (where an asset is, a file's chunk slots by name).
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -147,174 +114,17 @@ pub struct Asset {
     /// The declaration's own fields as TOML, without `from`: what its bundle's `asset.toml` starts with.
     #[serde(skip)]
     pub body: String,
+    /// The declaration as declared, `from` with it: what an extractor reads.
+    #[serde(skip)]
+    pub table: toml::Table,
 }
 
-impl Asset {
-    /// The declaration's own fields read as a kind's view (a texture, an atlas, a VRAM slot).
-    ///
-    /// # Errors
-    /// The fields do not have the view's shape.
-    pub fn view<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        Ok(toml::from_str(&self.body)?)
-    }
-}
-
-/// A file's chunk slot; an image or palette slot says what it uploads (the module's "VRAM and images").
+/// A file's chunk slot, by its name and type; what an image or palette slot uploads is its extension's to read.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ChunkSlot {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
-    #[serde(default)]
-    pub pages: Vec<PageEntry>,
-    #[serde(default)]
-    pub palettes: Vec<PaletteEntry>,
-    /// A bundle's resources.
-    #[serde(default)]
-    pub resources: Vec<Resource>,
-}
-
-/// A place in a VRAM slot, in halfwords from its corner.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Placement {
-    pub slot: Reference,
-    pub at: [u32; 2],
-}
-
-/// An image slot's page: an image (a texture or an atlas), or (palettes only) a placement.
-#[derive(Clone, Debug, Deserialize)]
-pub struct PageEntry {
-    pub image: Option<Reference>,
-    /// The first of the image's pages this chunk holds, where it holds not its first.
-    pub first: Option<usize>,
-    /// How many of them, where it holds not the rest.
-    pub count: Option<usize>,
-    pub slot: Option<Reference>,
-    pub at: Option<[u32; 2]>,
-}
-
-/// A palette a slot uploads: an image's, by name, or a named run of colors no image owns.
-#[derive(Clone, Debug, Deserialize)]
-pub struct PaletteEntry {
-    pub image: Option<Reference>,
-    pub palette: Option<String>,
-    pub name: Option<String>,
-    pub entries: Option<u32>,
-    pub slot: Option<Reference>,
-    pub at: Option<[u32; 2]>,
-}
-
-/// A bundle's resource slot.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Resource {
-    pub index: usize,
-    #[serde(rename = "type")]
-    pub ty: String,
-    #[serde(default)]
-    pub palettes: Vec<PaletteEntry>,
-}
-
-/// What a texel is: an index into a palette of 16 or 256 colors, or a color.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-pub enum Mode {
-    #[serde(rename = "indexed_4bpp")]
-    Indexed4,
-    #[serde(rename = "indexed_8bpp")]
-    Indexed8,
-    #[serde(rename = "direct_16bpp")]
-    Direct16,
-}
-
-impl Mode {
-    /// Its depth: bits a texel.
-    #[must_use]
-    pub fn bpp(self) -> u8 {
-        match self {
-            Mode::Indexed4 => 4,
-            Mode::Indexed8 => 8,
-            Mode::Direct16 => 16,
-        }
-    }
-}
-
-/// A texture or an atlas - its kind settings: its mode and size, its page, its palettes (where each is uploaded) and an
-/// atlas's cells, the parts keyed by name in the order declared.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Texture {
-    pub mode: Mode,
-    pub size: [u32; 2],
-    pub page: Option<Placement>,
-    #[serde(default, deserialize_with = "keyed")]
-    pub palettes: Vec<Palette>,
-    #[serde(default, deserialize_with = "keyed")]
-    pub cells: Vec<Cell>,
-    #[serde(default)]
-    pub no_palette: bool,
-}
-
-/// Parts keyed by name (`cells.disc_1 = { ... }`), in the order declared, each given its key as its `name`.
-fn keyed<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    use serde::de::Error;
-    let table = toml::Table::deserialize(deserializer)?;
-    table
-        .into_iter()
-        .map(|(name, value)| {
-            let mut value = value;
-            if let Some(fields) = value.as_table_mut() {
-                fields.insert("name".into(), toml::Value::String(name.clone()));
-            }
-            value.try_into().map_err(|e| D::Error::custom(format!("{name}: {e}")))
-        })
-        .collect()
-}
-
-impl Texture {
-    /// How many colors a palette holds: the deepest of the cells drawn with it, or the image's depth.
-    #[must_use]
-    pub fn entries(&self, palette: &str) -> usize {
-        let cells = self.cells.iter().filter(|c| c.palette.as_deref() == Some(palette));
-        cells.map(|c| entries_at(c.mode.unwrap_or(self.mode).bpp())).max().unwrap_or(entries_at(self.mode.bpp()))
-    }
-}
-
-fn entries_at(bpp: u8) -> usize {
-    match bpp {
-        4 => 16,
-        8 => 256,
-        _ => 0,
-    }
-}
-
-/// A named palette: where its colors are uploaded, or the executable that uploads them.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Palette {
-    pub name: String,
-    pub slot: Option<Reference>,
-    pub at: Option<[u32; 2]>,
-    pub executable: Option<String>,
-}
-
-/// A region of an atlas drawn on its own: a rectangle in texels (of its own mode, where it states one) and its
-/// palette.
-#[derive(Clone, Debug, Deserialize)]
-pub struct Cell {
-    pub name: String,
-    pub rect: [u32; 4],
-    pub palette: Option<String>,
-    pub mode: Option<Mode>,
-}
-
-/// A rectangle of VRAM uploads are placed in.
-#[derive(Clone, Debug, Deserialize)]
-pub struct VramSlot {
-    pub rect: [u32; 4],
-    pub within: Option<Reference>,
-    #[serde(default)]
-    pub borrows: Vec<Reference>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -416,7 +226,9 @@ impl Declarations {
             let doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("{}", path.display()))?;
             let group: toml::Table = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
             for (name, value) in group {
+                let table = value.as_table().cloned().unwrap_or_default();
                 let mut asset: Asset = value.try_into().with_context(|| format!("{}: [{name}]", path.display()))?;
+                asset.table = table;
                 let mut body = toml_edit::DocumentMut::new();
                 if let Some(table) = doc.get(&name).and_then(toml_edit::Item::as_table) {
                     for (key, item) in table.iter().filter(|(key, _)| *key != "from") {

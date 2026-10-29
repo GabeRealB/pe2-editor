@@ -6,6 +6,7 @@
 //! texture's pages over it), its inspector sections (palettes, variants, cells), what agents are told of it and its
 //! palette tool; and VRAM - its slots (`vram_slot`) and the panel showing what an asset uploads where.
 
+mod extract;
 mod inspector;
 mod ora;
 mod tools;
@@ -43,9 +44,12 @@ fn register(r: &mut Registry) -> Result<()> {
         .facts(tools::facts)
         .parts(parts)
         .register();
+    let mut roles = HashMap::new();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
-        r.role(&image, role).alias(role).label(label).register();
+        roles.insert(role, r.role(&image, role).alias(role).label(label).register());
     }
+    // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
+    let _ = r.extractor("textures", &image, &[roles["texture"].clone(), roles["atlas"].clone()], extract::begin);
     // The stored forms, recognized by name: stored texels have no header to tell them by.
     let texels = r.format("raw_texels").label("Stored texels").named("native.texels").register();
     let bs = r.format("bs_picture").label("BS picture").named("native.bs").named("*.bs").register();
@@ -248,7 +252,7 @@ pub fn pages(asset: &Asset) -> ((f32, f32), f32) {
     (pair(asset.field("size")).unwrap_or_default(), 64.0 * per)
 }
 
-/// A palette's file: its colors, as `project::textures` stores them.
+/// A palette's file: its colors, as the extraction (`extract`) and the import (`ora`) make them.
 pub(crate) fn colors_file(palette: &str) -> String {
     format!("native.{palette}.colors")
 }

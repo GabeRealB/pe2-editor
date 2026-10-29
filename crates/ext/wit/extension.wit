@@ -119,12 +119,24 @@ interface host {
         navigate: func(path: string);
     }
 
+    /// The declarations, lent to an extraction session's beginning.
+    resource declarations {
+        /// Every declaration of a kind (as declared: `file`, `image`, `vram_slot`), by path in path order, as TOML.
+        of-kind: func(kind: string) -> list<tuple<string, string>>;
+    }
+
+    /// A release's discs, lent for one asset's extraction.
+    resource discs {
+        /// A chunk's payload, by a location as a declaration gives it (TOML: `{ stage, folder, file, slot }`).
+        read: func(at: string) -> result<list<u8>, string>;
+    }
+
     log: func(message: string);
 }
 
 interface guest {
     use types.{image, rect, icon, tint};
-    use host.{asset, project, ui};
+    use host.{asset, project, ui, declarations, discs};
 
     /// An extension: its id, its version, what it requires (`pe2.images@^0.1`).
     record about {
@@ -237,6 +249,15 @@ interface guest {
         partial(tuple<string, bool>),
     }
 
+    /// An extractor: the native files of a kind's assets (of some of its roles, qualified; all where none) from the
+    /// discs, in sessions (`extraction`).
+    record extractor {
+        handle: u32,
+        name: string,
+        kind: string,
+        roles: list<string>,
+    }
+
     record registration {
         kinds: list<kind>,
         roles: list<role>,
@@ -244,6 +265,7 @@ interface guest {
         tools: list<tool>,
         formats: list<file-format>,
         importers: list<importer>,
+        extractors: list<extractor>,
     }
 
     describe: func() -> about;
@@ -284,6 +306,13 @@ interface guest {
     make-source: async func(importer: u32, asset: borrow<asset>) -> result<list<u8>, string>;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
+
+    /// An extraction session: begun with the declarations, then an asset at a time.
+    resource extraction {
+        begin: static async func(extractor: u32, declarations: borrow<declarations>) -> result<extraction, string>;
+        /// An asset's native files for a release, checked against its declaration.
+        extract: async func(path: string, release: string, discs: borrow<discs>) -> result<list<tuple<string, list<u8>>>, string>;
+    }
 
     /// A view, kept between frames: of an asset, or a panel's (no asset).
     resource view-state {

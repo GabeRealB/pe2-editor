@@ -10,7 +10,6 @@ workspace = true
 
 [dependencies]
 formats.workspace = true
-codecs.workspace = true
 anyhow.workspace = true
 pe2-ext.workspace = true
 tokio.workspace = true

@@ -43,6 +43,7 @@ struct Registered {
     tools: Vec<ToolDef>,
     formats: Vec<FormatDef>,
     importers: Vec<ImporterDef>,
+    extractors: Vec<crate::ExtractorDef>,
 }
 
 static REGISTERED: OnceLock<Registered> = OnceLock::new();
@@ -412,6 +413,7 @@ pub struct Component;
 
 impl g::Guest for Component {
     type ViewState = ViewState;
+    type Extraction = Extraction;
 
     fn describe() -> g::About {
         let extension = __pe2_extension();
@@ -427,10 +429,24 @@ impl g::Guest for Component {
         let mut registry = Registry::new(extension.id);
         (extension.register)(&mut registry).map_err(|e| format!("{e:#}"))?;
         let parts = registry.into_parts();
-        let mut numbered =
-            Registered { kinds: vec![], fields: vec![], views: vec![], tools: vec![], formats: vec![], importers: vec![] };
-        let mut out =
-            g::Registration { kinds: vec![], roles: vec![], panels: vec![], tools: vec![], formats: vec![], importers: vec![] };
+        let mut numbered = Registered {
+            kinds: vec![],
+            fields: vec![],
+            views: vec![],
+            tools: vec![],
+            formats: vec![],
+            importers: vec![],
+            extractors: vec![],
+        };
+        let mut out = g::Registration {
+            kinds: vec![],
+            roles: vec![],
+            panels: vec![],
+            tools: vec![],
+            formats: vec![],
+            importers: vec![],
+            extractors: vec![],
+        };
         for kind in &parts.kinds {
             out.kinds.push(g::Kind {
                 name: kind.name.local().to_string(),
@@ -480,8 +496,19 @@ impl g::Guest for Component {
             numbered.tools.push(tool);
         }
         imports(&parts.formats, &parts.importers, &mut out, &mut numbered);
+        for (handle, extractor) in parts.extractors.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
+            let handle = handle as u32;
+            out.extractors.push(g::Extractor {
+                handle,
+                name: extractor.name.local().to_string(),
+                kind: extractor.kind.to_string(),
+                roles: extractor.roles.iter().map(ToString::to_string).collect(),
+            });
+        }
         numbered.formats = parts.formats;
         numbered.importers = parts.importers;
+        numbered.extractors = parts.extractors;
         numbered.kinds = parts.kinds;
         REGISTERED.set(numbered).map_err(|_| "registered twice".to_string())?;
         Ok(out)
@@ -642,6 +669,42 @@ impl g::GuestViewState for ViewState {
         let asset = shown.as_ref().map(Lent::asset);
         let mut frame = Frame { ui: Handle::Lent(ui), project: &lens, asset, look: look as usize };
         self.0.borrow_mut().show(&mut crate::Ui::new(&mut frame));
+    }
+}
+
+/// An extraction session, kept between assets.
+pub struct Extraction(RefCell<Box<dyn crate::Extraction>>);
+
+/// The host's declarations, as an extractor reads them.
+struct Declarations<'a>(&'a host::Declarations);
+
+impl crate::Declared for Declarations<'_> {
+    fn declarations(&self, kind: &str) -> Vec<(String, Table)> {
+        self.0.of_kind(kind).into_iter().filter_map(|(path, text)| Some((path, toml::from_str(&text).ok()?))).collect()
+    }
+}
+
+/// The host's discs, as an extractor reads them.
+struct Discs<'a>(&'a host::Discs);
+
+impl crate::Discs for Discs<'_> {
+    fn read(&mut self, at: &Table) -> crate::Result<Vec<u8>> {
+        let at = toml::to_string(at)?;
+        self.0.read(&at).map_err(|e| crate::anyhow!(e))
+    }
+}
+
+impl g::GuestExtraction for Extraction {
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn begin(extractor: u32, declarations: &host::Declarations) -> Result<g::Extraction, String> {
+        let extractor = registered().extractors.get(extractor as usize).ok_or("no such extractor")?;
+        let session = (extractor.begin)(&Declarations(declarations)).map_err(|e| format!("{e:#}"))?;
+        Ok(g::Extraction::new(Extraction(RefCell::new(session))))
+    }
+
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn extract(&self, path: String, release: String, discs: &host::Discs) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.0.borrow_mut().extract(&path, &release, &mut Discs(discs)).map_err(|e| format!("{e:#}"))
     }
 }
 

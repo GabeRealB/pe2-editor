@@ -10,14 +10,19 @@
 //! give the file's place, the file asset's slots the chunk's - as the chunk's payload. The layout's discs and stages
 //! are written as bundles too; folders, groups, files and streams carry their declarations alone.
 //!
+//! An asset whose kind and role an extension extracts (`pe2.images@textures`: textures and atlases) is made by that
+//! extractor instead: its session begins with the declarations lent (what it needs of the other assets it reads once)
+//! and then makes each asset's native files, reading the chunks it needs from the discs and checking them against the
+//! declaration. The host knows no image format.
+//!
 //! A reference is written as the referenced asset's uid alone (`"uid://..."`), where the declarations hold its path
 //! beside it: the uid decides, and a path written into every referencing asset would go stale when the asset moved.
 //!
 //! An asset whose importer writes its source (an image's `pe2.images@ora`) is written as that source alone: exported
 //! from the native files read off the disc, and imported again to check that it makes them byte for byte and gives
 //! back the settings it derives (an image's size, its cells' rectangles), which its `asset.toml` then leaves out -
-//! extraction stops at an asset whose source would not. Its import is kept in the project cache, so the project opens without
-//! importing (`imports`).
+//! extraction stops at an asset whose source would not. Its import is kept in the project cache, so the project opens
+//! without importing (`imports`).
 //!
 //! A bundle's `asset.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
 //! layer holds - each asset under its declared uid, each folder and `extraction.toml` under a new one - and marks the
@@ -354,6 +359,31 @@ fn open_discs(game: &Game, decl: &Declarations, releases: &[String], roms: &Path
     Ok(discs)
 }
 
+/// The declarations as an extractor reads them: each asset's table as declared.
+struct Declared<'a>(&'a Declarations);
+
+impl pe2_ext::Declared for Declared<'_> {
+    fn declarations(&self, kind: &str) -> Vec<(String, toml::Table)> {
+        self.0.assets.iter().filter(|(_, a)| a.kind == kind).map(|(path, a)| (path.clone(), a.table.clone())).collect()
+    }
+}
+
+/// A release's discs as an extractor reads them: a chunk's payload by its location.
+struct Reader<'a> {
+    decl: &'a Declarations,
+    discs: &'a mut Discs,
+    containers: &'a mut Containers,
+    files: &'a HashMap<(String, u32, Option<u32>, u32), String>,
+    release: &'a str,
+}
+
+impl pe2_ext::Discs for Reader<'_> {
+    fn read(&mut self, at: &toml::Table) -> pe2_ext::Result<Vec<u8>> {
+        let at: At = at.clone().try_into().context("not a location")?;
+        chunk_payload(self.decl, self.discs, self.containers, self.files, self.release, &at)
+    }
+}
+
 /// What makes an asset's source of its native files: the extensions, and the imports kept of what they checked.
 struct Sourcing<'a> {
     extensions: &'a Extensions,
@@ -476,25 +506,32 @@ fn write_assets(
         }
     }
     let mut containers = Containers { open: HashMap::new() };
-    let textures = crate::textures::Index::new(decl);
+    let extensions = sourcing.extensions;
+    // An extractor's session, begun with the first of its assets.
+    let mut sessions: HashMap<String, Box<dyn pe2_ext::Extraction>> = HashMap::new();
     let mut written = 0;
     for (path, asset) in &decl.assets {
-        if asset.kind == "image" && matches!(asset.role.as_deref(), Some("texture" | "atlas")) {
-            let mut pngs = Vec::new();
+        if let Some(extractor) = extensions.extractor_for(&asset.kind, asset.role.as_deref()) {
+            let name = extractor.name.to_string();
+            if !sessions.contains_key(&name) {
+                let session = (extractor.begin)(&Declared(decl)).with_context(|| format!("{name} could not begin"))?;
+                sessions.insert(name.clone(), session);
+            }
+            let session = sessions.get_mut(&name).context("begun")?;
+            let mut made = Vec::new();
             let mut originals = vec![];
             for release in releases.iter().filter(|r| asset.from.contains_key(*r)) {
-                let mut read = |at: &At| chunk_payload(decl, discs, &mut containers, &files, release, at);
-                let got = crate::textures::extract(decl, &textures, path, release, &mut read)
-                    .with_context(|| format!("{path}: {release}"))?;
-                if pngs.is_empty() {
-                    pngs = got;
+                let mut reader = Reader { decl, discs, containers: &mut containers, files: &files, release };
+                let got = session.extract(path, release, &mut reader).with_context(|| format!("{path}: {release}"))?;
+                if made.is_empty() {
+                    made = got;
                 }
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
             let toml = asset_toml(&asset.body, None, &originals)?;
-            let (toml, pngs) = sourcing.bundle(path, asset, toml, pngs)?;
+            let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
             let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
-            files.extend(pngs.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+            files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
             write_bundle(layer, path, &files)?;
             written += 1;
             continue;

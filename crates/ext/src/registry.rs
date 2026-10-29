@@ -286,6 +286,7 @@ pub struct Parts {
     pub tools: Vec<ToolDef>,
     pub formats: Vec<FormatDef>,
     pub importers: Vec<ImporterDef>,
+    pub extractors: Vec<crate::ExtractorDef>,
 }
 
 #[derive(Clone)]
@@ -395,6 +396,26 @@ impl Registry {
             sniff: None,
         };
         FormatBuilder { registry: self, def }
+    }
+
+    /// An extractor, `<id>@<name>`, making the native files of assets of `kind` (of `roles`, qualified; of every role
+    /// where none is named) from the discs, its sessions begun by `begin`.
+    pub fn extractor(
+        &mut self,
+        name: &str,
+        kind: &Name,
+        roles: &[Name],
+        begin: impl Fn(&dyn crate::Declared) -> Result<Box<dyn crate::Extraction>> + Send + Sync + 'static,
+    ) -> Name {
+        let def = crate::ExtractorDef {
+            name: Name::of(&self.id, name),
+            kind: kind.clone(),
+            roles: roles.to_vec(),
+            begin: Arc::new(begin),
+        };
+        let name = def.name.clone();
+        self.parts.extractors.push(def);
+        name
     }
 
     /// An importer, `<id>@<name>`, making assets of `kind`: registered by `register` on what this returns.

@@ -3460,7 +3460,10 @@ name = "pe2-images"
 version = "0.1.0"
 dependencies = [
  "codecs",
+ "formats",
  "pe2-ext",
+ "serde",
+ "sha1",
  "toml",
 ]
 
@@ -3701,7 +3704,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "branches",
- "codecs",
  "formats",
  "getrandom 0.3.4",
  "pe2-ext",
