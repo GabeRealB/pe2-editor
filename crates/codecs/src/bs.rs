@@ -1,12 +1,16 @@
-//! BS version 2: the `PlayStation`'s MDEC still pictures, PE2's backgrounds.
+//! BS: the `PlayStation`'s MDEC pictures - PE2's backgrounds (version 2, 320x240) and its movies' frames (versions 2
+//! and 3, at the size their sectors say).
 //!
 //! An 8-byte header (`u16` MDEC code count / 2, magic `0x3800`, quantization scale, version), then a bitstream of
 //! 16-bit little-endian words, each read from its most significant bit. Every 16x16 macroblock is six 8x8 blocks - Cr,
 //! Cb, Y1..Y4 - each a signed 10-bit DC coefficient and MPEG-1 AC codes (a run of zeros, a level, a sign; `000001`
 //! escapes a 6-bit run and a 10-bit level) up to the end-of-block code `10`. Coefficients go in zigzag order, are
 //! dequantized (DC by 2, AC by the table times the scale over 8) and inverse-transformed with the MDEC's fixed-point
-//! cosine table; macroblocks fill the picture column by column. Decoding is for display: BS is lossy.
-//! (After `tools/peassets/bs_codec.py` and the public `PlayStation` STR documentation.)
+//! cosine table; macroblocks fill the picture column by column. Version 3 codes each DC as a difference from the
+//! previous block's of its channel (Cr, Cb, and the four lumas sharing one), times 4. A frame decodes to its YCbCr
+//! planes - luma at its size, chroma at half - which an export carries and an import compares, and to RGB to show.
+//! BS is lossy; decoding is deterministic. (After `tools/peassets/bs_codec.py`, which follows jPSXdec, and the public
+//! `PlayStation` STR documentation.)
 
 use std::collections::HashMap;
 use std::fmt;
@@ -88,21 +92,30 @@ const COS: [[i32; 8]; 8] = [
     [6392, -18205, 27245, -32139, 32138, -27246, 18204, -6393],
 ];
 
+/// Version 3's DC codes, chroma and luma: (code, the difference's width in bits).
+const V3_CHROMA_DC: [(&str, u32); 9] =
+    [("11111110", 8), ("1111110", 7), ("111110", 6), ("11110", 5), ("1110", 4), ("110", 3), ("10", 2), ("01", 1), ("00", 0)];
+const V3_LUMA_DC: [(&str, u32); 9] =
+    [("1111110", 8), ("111110", 7), ("11110", 6), ("1110", 5), ("110", 4), ("101", 3), ("01", 2), ("00", 1), ("100", 0)];
+
 #[derive(Debug)]
 pub enum Error {
     NotBs,
     Version(u16),
     End,
     Code,
+    /// A frame whose size is no whole number of macroblocks.
+    Size(usize, usize),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotBs => write!(f, "not a BS picture (no 0x3800 magic)"),
-            Error::Version(v) => write!(f, "BS version {v}: only version 2 decodes"),
+            Error::Version(v) => write!(f, "BS version {v}: versions 2 and 3 decode"),
             Error::End => write!(f, "the bitstream ends before the picture"),
             Error::Code => write!(f, "an unknown AC code"),
+            Error::Size(w, h) => write!(f, "a frame of {w}x{h}: not a size of macroblocks"),
         }
     }
 }
@@ -114,6 +127,19 @@ pub struct Picture {
     pub width: usize,
     pub height: usize,
     pub rgb: Vec<u8>,
+}
+
+/// A decoded frame: its YCbCr 4:2:0 planes - luma `width` by `height`, each chroma half that both ways, row by row,
+/// each sample the inverse transform's rounded (chroma offset by 128) - and RGB to show, from the unrounded samples.
+pub struct Frame {
+    pub width: usize,
+    pub height: usize,
+    pub y: Vec<u8>,
+    pub cb: Vec<u8>,
+    pub cr: Vec<u8>,
+    pub rgb: Vec<u8>,
+    /// The macroblocks the bitstream held; those after it are black.
+    pub macroblocks: usize,
 }
 
 struct Bits<'a> {
@@ -146,6 +172,33 @@ impl Bits<'_> {
         Ok(if v & (1 << (n - 1)) != 0 { v - (1 << n) } else { v })
     }
 
+    /// Version 3's DC difference, by its channel's code table, before it is multiplied by 4.
+    fn dc_difference(&mut self, table: &[(&str, u32)]) -> Result<i32, Error> {
+        // The codes are prefix-free: read a bit at a time until one matches.
+        let mut code = 0u32;
+        for len in 1..=8u32 {
+            code = (code << 1) | self.bits(1)?;
+            let Some(&(_, width)) =
+                table.iter().find(|(c, _)| c.len() == len as usize && u32::from_str_radix(c, 2).is_ok_and(|v| v == code))
+            else {
+                continue;
+            };
+            if width == 0 {
+                return Ok(0);
+            }
+            // The first bit is the sign: 0 below zero, 1 above.
+            let positive = self.bits(1)? == 1;
+            let magnitude = if width > 1 { self.bits(width - 1)?.cast_signed() } else { 0 };
+            return Ok(match (positive, width) {
+                (false, 1) => -1,
+                (true, 1) => 1,
+                (false, _) => magnitude - ((1 << width) - 1),
+                (true, _) => magnitude + (1 << (width - 1)),
+            });
+        }
+        Err(Error::Code)
+    }
+
     /// An AC coefficient as (zero run, level), or None at the end of the block.
     fn ac(&mut self) -> Result<Option<(u32, i32)>, Error> {
         let mut code = 0u32;
@@ -166,10 +219,14 @@ impl Bits<'_> {
     }
 }
 
-/// One block's samples, [row * 8 + column], from its coefficients.
-fn block(bits: &mut Bits<'_>, scale: f64) -> Result<[f64; 64], Error> {
+/// One block's samples, [row * 8 + column], from its coefficients: its DC read (version 2) or given (version 3).
+fn block(bits: &mut Bits<'_>, scale: f64, dc: Option<i32>) -> Result<[f64; 64], Error> {
     let mut coeffs = [0.0f64; 64];
-    coeffs[0] = f64::from(bits.signed(10)?) * QUANT[0];
+    let dc = match dc {
+        Some(dc) => dc,
+        None => bits.signed(10)?,
+    };
+    coeffs[0] = f64::from(dc) * QUANT[0];
     let mut i = 0usize;
     while let Some((run, level)) = bits.ac()? {
         i += 1 + run as usize;
@@ -201,40 +258,107 @@ fn channel(v: f64) -> u8 {
     v.clamp(0.0, 255.0) as u8
 }
 
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 first")]
+fn sample(v: f64) -> u8 {
+    v.round().clamp(0.0, 255.0) as u8
+}
+
 /// Decode a BS version 2 picture of PE2's background size, 320x240.
 ///
 /// # Errors
 /// The bytes are not BS version 2, or the bitstream ends or breaks before the last macroblock.
 pub fn decode(data: &[u8]) -> Result<Picture, Error> {
     let word = |i: usize| data.get(i..i + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    if data.len() >= HEADER && word(6) != 2 && word(2) == MAGIC {
+        return Err(Error::Version(word(6)));
+    }
+    let frame = decode_frame(data, WIDTH, HEIGHT)?;
+    if frame.macroblocks < (WIDTH / 16) * (HEIGHT / 16) {
+        return Err(Error::End);
+    }
+    Ok(Picture { width: frame.width, height: frame.height, rgb: frame.rgb })
+}
+
+/// Decode a BS frame of version 2 or 3 at its size, which its sectors say (whole macroblocks). A bitstream ending
+/// early leaves the macroblocks after it black.
+///
+/// # Errors
+/// The bytes are not BS of version 2 or 3, the size is no size of macroblocks, or no macroblock decodes.
+pub fn decode_frame(data: &[u8], width: usize, height: usize) -> Result<Frame, Error> {
+    let word = |i: usize| data.get(i..i + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
     if data.len() < HEADER || word(2) != MAGIC {
         return Err(Error::NotBs);
     }
-    if word(6) != 2 {
-        return Err(Error::Version(word(6)));
+    let version = word(6);
+    if !matches!(version, 2 | 3) {
+        return Err(Error::Version(version));
+    }
+    if width == 0 || height == 0 || width % 16 != 0 || height % 16 != 0 {
+        return Err(Error::Size(width, height));
     }
     let scale = f64::from(word(4)) / 8.0;
     let mut bits = Bits { data, pos: HEADER, word: 0, left: 0 };
-    let (mb_w, mb_h) = (WIDTH / 16, HEIGHT / 16);
-    let mut rgb = vec![0u8; WIDTH * HEIGHT * 3];
+    let (mb_w, mb_h) = (width / 16, height / 16);
+    let mut frame = Frame {
+        width,
+        height,
+        y: vec![0; width * height],
+        cb: vec![128; width * height / 4],
+        cr: vec![128; width * height / 4],
+        rgb: vec![0; width * height * 3],
+        macroblocks: 0,
+    };
+    // Version 3's DC predictors: Cr, Cb, and the lumas'.
+    let mut previous = [0i32; 3];
     for mb in 0..mb_w * mb_h {
+        let Ok(blocks) = macroblock(&mut bits, scale, version, &mut previous) else {
+            if mb == 0 {
+                return Err(Error::End);
+            }
+            break;
+        };
+        let [cr, cb, luma @ ..] = blocks;
         let (mx, my) = (mb / mb_h, mb % mb_h);
-        let cr = block(&mut bits, scale)?;
-        let cb = block(&mut bits, scale)?;
-        let mut luma = [[0.0f64; 64]; 4];
-        for l in &mut luma {
-            *l = block(&mut bits, scale)?;
-        }
         for y in 0..16 {
             for x in 0..16 {
                 let l = luma[(y / 8) * 2 + x / 8][(y % 8) * 8 + x % 8] + 128.0;
                 let (r, b) = (cr[(y / 2) * 8 + x / 2], cb[(y / 2) * 8 + x / 2]);
-                let at = ((my * 16 + y) * WIDTH + mx * 16 + x) * 3;
-                rgb[at] = channel(l + 1.402 * r);
-                rgb[at + 1] = channel(l - 0.3437 * b - 0.7143 * r);
-                rgb[at + 2] = channel(l + 1.772 * b);
+                let (px, py) = (mx * 16 + x, my * 16 + y);
+                let at = (py * width + px) * 3;
+                frame.rgb[at] = channel(l + 1.402 * r);
+                frame.rgb[at + 1] = channel(l - 0.3437 * b - 0.7143 * r);
+                frame.rgb[at + 2] = channel(l + 1.772 * b);
+                frame.y[py * width + px] = sample(l);
             }
         }
+        for y in 0..8 {
+            for x in 0..8 {
+                let at = (my * 8 + y) * (width / 2) + mx * 8 + x;
+                frame.cb[at] = sample(cb[y * 8 + x] + 128.0);
+                frame.cr[at] = sample(cr[y * 8 + x] + 128.0);
+            }
+        }
+        frame.macroblocks = mb + 1;
     }
-    Ok(Picture { width: WIDTH, height: HEIGHT, rgb })
+    Ok(frame)
+}
+
+/// One macroblock's six blocks - Cr, Cb, Y1..Y4 - as samples.
+fn macroblock(bits: &mut Bits<'_>, scale: f64, version: u16, previous: &mut [i32; 3]) -> Result<[[f64; 64]; 6], Error> {
+    let mut blocks = [[0.0f64; 64]; 6];
+    for (i, out) in blocks.iter_mut().enumerate() {
+        let dc = if version == 3 {
+            let (channel, table) = match i {
+                0 => (0, &V3_CHROMA_DC[..]),
+                1 => (1, &V3_CHROMA_DC[..]),
+                _ => (2, &V3_LUMA_DC[..]),
+            };
+            previous[channel] += bits.dc_difference(table)? * 4;
+            Some(previous[channel])
+        } else {
+            None
+        };
+        *out = block(bits, scale, dc)?;
+    }
+    Ok(blocks)
 }

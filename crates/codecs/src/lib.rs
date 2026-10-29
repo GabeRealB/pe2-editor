@@ -4,4 +4,5 @@
 pub mod bs;
 pub mod ora;
 pub mod texture;
+pub mod xa;
 pub mod zip;
