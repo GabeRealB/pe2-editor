@@ -32,6 +32,12 @@ pub trait Source {
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
         Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
     }
+    /// A file its operation makes, written through the host (`CallHost::writer`): only an asset lent for an
+    /// operation's run has one.
+    fn writer(&self, name: &str) -> Option<Result<Box<dyn crate::FileWriter>>> {
+        let _ = name;
+        None
+    }
 }
 
 /// An asset, lent for one call: what an extension keeps of it, it copies. Its kind and role are qualified names

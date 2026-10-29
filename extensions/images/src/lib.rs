@@ -16,7 +16,7 @@ mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
 pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, Field, File, Icon, Image, Part, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
+use pe2_ext::{Asset, Field, Icon, Image, Part, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -35,7 +35,10 @@ fn register(r: &mut Registry) -> Result<()> {
         .run(|call| {
             let image = call.take::<Texels>(0)?;
             let bytes = ora::export(&call.lend_settings(&image.derived).asset(), &image)?;
-            Ok(Typed::new(codecs::ora::MIMETYPE, vec![File::new(ora::SOURCE, bytes)]))
+            // Written through the host: kept there as it comes, never held twice here.
+            let mut file = call.writer(ora::SOURCE)?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            Ok(Typed::new(codecs::ora::MIMETYPE, vec![file.finish()?]))
         });
     let _ = r
         .op("ora")

@@ -10,6 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use toml::Table;
 
+use sha1::{Digest, Sha1};
+
 use super::store::{Store, Trace};
 use super::{Content, File, Ops, Plan, Retain, Typed, Value};
 
@@ -118,23 +120,70 @@ pub struct Reads {
     pub files: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration: Option<String>,
+    /// Other nodes' outputs read, each by `<node>#<address>` (its node as traces name it), with its hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outputs: BTreeMap<String, String>,
 }
 
 impl Reads {
     /// Add what another read: an output made from a kept one read what that one did.
     pub fn merge(&mut self, other: &Reads) {
         self.files.extend(other.files.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.outputs.extend(other.outputs.iter().map(|(k, v)| (k.clone(), v.clone())));
         if other.declaration.is_some() {
             self.declaration.clone_from(&other.declaration);
         }
     }
 
-    /// Whether the node still reads the same: each file read has its hash, the declaration its.
+    /// Whether the node still reads the same: each file read has its hash, the declaration its, and each other node's
+    /// output read its - made, where it must be, in `reach` (without which none can be told).
     #[must_use]
-    pub fn hold(&self, node: &dyn Node) -> bool {
+    pub fn hold(&self, node: &dyn Node, reach: Option<Reach<'_>>) -> bool {
         self.files.iter().all(|(name, sha1)| node.file_sha1(name).unwrap_or_default() == *sha1)
             && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
+            && (self.outputs.is_empty()
+                || reach.is_some_and(|reach| self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))))
+    }
+}
 
+/// The other nodes a node's operations may read the outputs of: each by a reference (TOML: `"uid://..."`, `{ uid,
+/// path }`, or a path), with its plan.
+pub trait World: Sync {
+    fn node(&self, reference: &toml::Value) -> Option<(&dyn Node, Plan)>;
+}
+
+/// What evaluation reaches beyond its node: the engine making other nodes' outputs, in a world of them.
+#[derive(Clone, Copy)]
+pub struct Reach<'a> {
+    pub engine: &'a Engine,
+    pub world: &'a dyn World,
+}
+
+thread_local! {
+    /// The outputs being made of other nodes on this thread, outermost first: one asked again is a cycle.
+    static MAKING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl<'a> Reach<'a> {
+    /// Another node's output, by its reference and its address: made, or found kept, in the world; with its hash.
+    ///
+    /// # Errors
+    /// No node is so named, it has no such output, it reads, through others, itself, or it cannot be made.
+    pub fn output(&self, reference: &toml::Value, address: &str) -> Result<(String, Given, &'a dyn Node)> {
+        let (node, plan) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
+        let read = format!("{}#{address}", id(node));
+        let cycle = MAKING.with(|m| m.borrow().contains(&read));
+        anyhow::ensure!(!cycle, "{read} reads, through others, itself");
+        MAKING.with(|m| m.borrow_mut().push(read.clone()));
+        let given = self.engine.output_in(Some(*self), &plan, node, address, None, true);
+        MAKING.with(|m| m.borrow_mut().pop());
+        Ok((read, given?, node))
+    }
+
+    /// The hash another node's output has now, by how a trace names it (`<node>#<address>`).
+    fn hash(&self, read: &str) -> Option<String> {
+        let (node, address) = read.rsplit_once('#')?;
+        self.output(&toml::Value::String(node.to_string()), address).ok().map(|(_, given, _)| given.hash)
     }
 }
 
@@ -194,7 +243,13 @@ pub struct Call<'a> {
     parameter: Option<&'a str>,
     recorder: Recorder<'a>,
     store: Option<&'a Store>,
+    reach: Option<Reach<'a>>,
+    /// Where the stored contents of other nodes' outputs read in its evaluation are.
+    others: &'a Others,
 }
+
+/// Where stored contents of other nodes' outputs are, by hash.
+type Others = Mutex<HashMap<String, std::path::PathBuf>>;
 
 impl<'a> Call<'a> {
     /// The value given to a port taking one.
@@ -249,10 +304,75 @@ impl<'a> Call<'a> {
         Ok(Typed { ty, also: names, files: vec![file], ..Typed::default() })
     }
 
+    /// Another node's output, by a reference to it and its address, recorded as read.
+    ///
+    /// # Errors
+    /// Nothing beyond its node is reachable here, or the output cannot be made.
+    pub fn output_of(&self, reference: &toml::Value, address: &str) -> Result<Arc<Value>> {
+        let reach = self.reach.context("no other node is reachable here")?;
+        let (read, given, node) = reach.output(reference, address)?;
+        let value = given.value.with_context(|| format!("{read}: made nothing"))?;
+        // Its stored contents are found where its node has them, or - its node having them nowhere a path names -
+        // kept in the store.
+        let mut stored = Vec::new();
+        stored_contents(&value, &mut stored);
+        let mut others = self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for sha1 in stored {
+            let path = match (reach.engine.store(), node.content_path(&sha1)) {
+                (_, Some(path)) => path,
+                (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1),
+                (None, None) => continue,
+            };
+            others.insert(sha1, path);
+        }
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outputs.insert(read, given.hash);
+        Ok(value)
+    }
+
+    /// Its node's settings, recorded as read (its declaration as a whole).
+    #[must_use]
+    pub fn fields(&self) -> &'a Table {
+        self.recorder.declaration();
+        self.recorder.node.fields()
+    }
+
+    /// A file being made, named `name`: held in memory while small, spilled to the store past `SPILL` bytes (where
+    /// there is a store), and finished into a file whose content is inline or stored - which readers cannot tell.
+    #[must_use]
+    pub fn writer(&self, name: &str) -> Writer {
+        Writer { name: name.to_string(), store: self.store.cloned(), memory: Vec::new(), spilled: None, hasher: Sha1::new(), size: 0 }
+    }
+
+    /// Copy a content into a writer, a range at a time: never read whole.
+    ///
+    /// # Errors
+    /// It cannot be read, or written.
+    pub fn copy(&self, content: &Content, into: &mut Writer) -> Result<()> {
+        use std::io::Write as _;
+        const RANGE: usize = 4 << 20;
+        let size = match content {
+            Content::Inline(bytes) => return into.write_all(bytes).map_err(Into::into),
+            Content::Stored { size, .. } => *size,
+        };
+        let mut at = 0;
+        while at < size {
+            let bytes = self.read_range(content, at, RANGE)?;
+            anyhow::ensure!(!bytes.is_empty(), "a content ends at {at} of its {size} bytes");
+            into.write_all(&bytes)?;
+            at += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Where a stored content is: in the store, or among its node's files.
     #[must_use]
     pub fn content_path(&self, sha1: &str) -> Option<std::path::PathBuf> {
-        self.store.map(|s| s.blob_path(sha1)).filter(|p| p.exists()).or_else(|| self.recorder.node.content_path(sha1))
+        let other = || self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha1).cloned();
+        self.store
+            .map(|s| s.blob_path(sha1))
+            .filter(|p| p.exists())
+            .or_else(other)
+            .or_else(|| self.recorder.node.content_path(sha1))
     }
 
     /// A content, whole.
@@ -262,7 +382,7 @@ impl<'a> Call<'a> {
     pub fn read(&self, content: &Content) -> Result<Vec<u8>> {
         match content {
             Content::Inline(bytes) => Ok(bytes.clone()),
-            Content::Stored { sha1, .. } => match self.store.map(|s| s.blob_path(sha1)).filter(|p| p.exists()) {
+            Content::Stored { sha1, .. } => match self.content_path(sha1) {
                 Some(path) => std::fs::read(&path).with_context(|| path.display().to_string()),
                 None => self.recorder.node.read_content(sha1),
             },
@@ -302,6 +422,84 @@ impl<'a> Call<'a> {
     }
 }
 
+/// A writer as an extension's operation writes through it (`CallHost::writer`).
+impl pe2_ext::FileWriter for Writer {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        std::io::Write::write_all(self, bytes).map_err(Into::into)
+    }
+
+    fn finish(self: Box<Self>) -> Result<File> {
+        Writer::finish(*self)
+    }
+}
+
+/// The hashes of a value's stored contents.
+fn stored_contents(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Typed(typed) => out.extend(typed.files.iter().filter_map(|f| match &f.content {
+            Content::Stored { sha1, .. } => Some(sha1.clone()),
+            Content::Inline(_) => None,
+        })),
+        Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
+        Value::Image(_) | Value::Table(_) | Value::Pcm(_) => {}
+    }
+}
+
+/// How large a content a writer holds in memory before spilling it to the store.
+pub const SPILL: usize = 1 << 20;
+
+/// A file being made (`Call::writer`): its bytes in memory up to `SPILL`, past it in a file of the store's, hashed as
+/// they come.
+pub struct Writer {
+    name: String,
+    store: Option<Store>,
+    memory: Vec<u8>,
+    spilled: Option<(std::fs::File, std::path::PathBuf)>,
+    hasher: Sha1,
+    size: u64,
+}
+
+impl std::io::Write for Writer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(bytes);
+        self.size += bytes.len() as u64;
+        if let Some((file, _)) = &mut self.spilled {
+            file.write_all(bytes)?;
+            return Ok(bytes.len());
+        }
+        self.memory.extend_from_slice(bytes);
+        if self.memory.len() > SPILL
+            && let Some(store) = &self.store
+        {
+            let (mut file, path) = store.spill().map_err(std::io::Error::other)?;
+            file.write_all(&self.memory)?;
+            self.memory = Vec::new();
+            self.spilled = Some((file, path));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.spilled.as_mut().map_or(Ok(()), |(file, _)| file.flush())
+    }
+}
+
+impl Writer {
+    /// The file made: its bytes inline, or - spilled - the blob of their hash in the store.
+    ///
+    /// # Errors
+    /// What was spilled cannot be written or kept.
+    pub fn finish(self) -> Result<File> {
+        let Writer { name, store, memory, spilled, hasher, size } = self;
+        let Some((mut file, path)) = spilled else { return Ok(File::new(&name, memory)) };
+        std::io::Write::flush(&mut file)?;
+        drop(file);
+        let sha1 = crate::extract::hex(&hasher.finalize());
+        store.context("spilled with no store")?.adopt(&path, &sha1)?;
+        Ok(File { name, content: Content::Stored { sha1, size } })
+    }
+}
+
 /// An output's value, or why it could not be made.
 pub type Made = std::result::Result<Arc<Value>, Arc<str>>;
 
@@ -318,7 +516,7 @@ pub fn evaluate(
     node: &dyn Node,
     wanted: &[(usize, Option<&str>)],
     known: &Known,
-    store: Option<&Store>,
+    (store, reach): (Option<&Store>, Option<Reach<'_>>),
 ) -> (Vec<Made>, Reads) {
     let reads = Mutex::new(Reads::default());
     let mut made: Vec<Option<Made>> = vec![None; wanted.len()];
@@ -330,7 +528,8 @@ pub fn evaluate(
             None => groups.push((*parameter, vec![i])),
         }
     }
-    let context = Evaluation { plan, ops, node, known, store, reads: &reads };
+    let others = Mutex::default();
+    let context = Evaluation { plan, ops, node, known, store, reach, reads: &reads, others: &others };
     for (parameter, members) in groups {
         let outputs: Vec<usize> = members.iter().map(|&i| wanted[i].0).collect();
         let values = context.run(&outputs, parameter);
@@ -349,7 +548,9 @@ struct Evaluation<'a> {
     node: &'a dyn Node,
     known: &'a Known,
     store: Option<&'a Store>,
+    reach: Option<Reach<'a>>,
     reads: &'a Mutex<Reads>,
+    others: &'a Others,
 }
 
 impl Evaluation<'_> {
@@ -426,7 +627,8 @@ impl Evaluation<'_> {
                 }
             }
         }
-        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store };
+        let others = self.others;
+        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others };
         let value = match run(&mut call) {
             Ok(value) => value,
             Err(e) => return fail(format!("{e:#}")),
@@ -493,9 +695,15 @@ impl Engine {
     /// An output's hash where it is kept and what it read still holds; none where it must be made.
     #[must_use]
     pub fn kept(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> Option<Trace> {
+        self.kept_in(None, plan, node, output, parameter)
+    }
+
+    /// An output's trace as `kept` finds it, what it read of other nodes told in `reach`.
+    #[must_use]
+    pub fn kept_in(&self, reach: Option<Reach<'_>>, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
-        (trace.node == id(node) && trace.reads.hold(node) && store.has(&trace.value)).then_some(trace)
+        (trace.node == id(node) && trace.reads.hold(node, reach) && store.has(&trace.value)).then_some(trace)
     }
 
     /// An output by its address (`native`, `picture/night`): found kept where its trace holds - its value then read only
@@ -513,10 +721,26 @@ impl Engine {
     /// # Errors
     /// As `output`.
     pub fn output_with(&self, plan: &Plan, node: &dyn Node, address: &str, supplied: Option<&str>, read: bool) -> Result<Given> {
+        self.output_in(None, plan, node, address, supplied, read)
+    }
+
+    /// An output as `output_with` makes it, its operations reaching other nodes' outputs in `reach`.
+    ///
+    /// # Errors
+    /// As `output`.
+    pub fn output_in(
+        &self,
+        reach: Option<Reach<'_>>,
+        plan: &Plan,
+        node: &dyn Node,
+        address: &str,
+        supplied: Option<&str>,
+        read: bool,
+    ) -> Result<Given> {
         let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
         let parameter = parameter.as_deref().or(supplied);
         let retained = plan.outputs[output].retain != Retain::Transient;
-        if retained && let Some(trace) = self.kept(plan, node, output, parameter) {
+        if retained && let Some(trace) = self.kept_in(reach, plan, node, output, parameter) {
             // Read where asked; one kept as this store does not read values is made again.
             let value = match (read, &self.store) {
                 (true, Some(store)) => store.get(&trace.value).ok().map(Arc::new),
@@ -526,8 +750,8 @@ impl Engine {
                 return Ok(Given { value, hash: trace.value, kept: true, reads: trace.reads });
             }
         }
-        let known = self.known(plan, node, output);
-        let (mut made, reads) = evaluate(plan, &self.ops, node, &[(output, parameter)], &known, self.store.as_ref());
+        let known = self.known(reach, plan, node, output);
+        let (mut made, reads) = evaluate(plan, &self.ops, node, &[(output, parameter)], &known, (self.store.as_ref(), reach));
         let value = made.pop().unwrap_or_else(|| Err("not made".into())).map_err(|e| anyhow!("{e}"))?;
         let hash = super::hash(&value);
         if retained && let Some(store) = &self.store {
@@ -548,17 +772,19 @@ impl Engine {
         let run = def.run.as_ref().with_context(|| format!("`{op}` makes nothing"))?;
         let reads = Mutex::new(Reads::default());
         let inputs = inputs.into_iter().map(|port| port.into_iter().map(|v| Input(Arc::new(v))).collect()).collect();
-        let mut call = Call { inputs, settings, parameter: None, recorder: Recorder { node, reads: &reads }, store: self.store.as_ref() };
+        let recorder = Recorder { node, reads: &reads };
+        let others = &Mutex::default();
+        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach: None, others };
         run(&mut call)
     }
 
     /// The plan's cached outputs found kept - but `except` - as what the steps making them are known to make.
-    fn known(&self, plan: &Plan, node: &dyn Node, except: usize) -> Known {
+    fn known(&self, reach: Option<Reach<'_>>, plan: &Plan, node: &dyn Node, except: usize) -> Known {
         let Some(store) = &self.store else { return Vec::new() };
-        let cached = plan.outputs.iter().enumerate().filter(|(i, o)| *i != except && o.retain == Retain::Cache && o.parameter.is_none());
+        let cached = plan.outputs.iter().enumerate().filter(|(i, o)| *i != except && o.retain != Retain::Transient && o.parameter.is_none());
         cached
             .filter_map(|(i, o)| {
-                let trace = self.kept(plan, node, i, None)?;
+                let trace = self.kept_in(reach, plan, node, i, None)?;
                 let value = store.get(&trace.value).ok()?;
                 Some((o.from, Arc::new(value), trace.reads))
             })

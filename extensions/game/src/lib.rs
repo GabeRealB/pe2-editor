@@ -14,6 +14,23 @@ fn hex(value: &Value) -> Option<String> {
     Some(format!("0x{:X}", value.as_integer()?))
 }
 
+/// A movie file's stack: its entries' movies, joined in order - the file as the disc stores it.
+const STREAM: &str = r#"[[stack]]
+op = "references"
+field = "entries"
+key = "movie"
+output = "native"
+
+[[stack]]
+op = "concatenate"
+name = "native.str"
+
+[[stack]]
+op = "output"
+name = "native"
+retain = "cache"
+"#;
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let kinds = [
@@ -40,6 +57,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("stream")
         .label("Movie file")
         .icon(Icon::Stack, Tint::Motion)
+        .stack(STREAM)
         .field(Field::new("entries").custom())
         .parts(entries)
         .inspector("Entries", |_| Box::new(Entries))

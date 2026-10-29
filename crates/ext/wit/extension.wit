@@ -83,7 +83,7 @@ interface types {
 }
 
 interface host {
-    use types.{image, rect, style, icon};
+    use types.{image, rect, style, icon, file};
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
@@ -100,6 +100,18 @@ interface host {
         size: func(name: string) -> option<u64>;
         /// Up to `len` bytes of a file from `offset`, read alone: fewer at its end.
         read-range: func(name: string, offset: u64, len: u32) -> result<list<u8>, string>;
+        /// A file the operation it is lent to makes, named `name`, written through the host: only the node lent to an
+        /// operation's run makes one.
+        writer: func(name: string) -> result<writer, string>;
+    }
+
+    /// A file being made, appended to a piece at a time and then finished: kept by the host as it comes - in memory
+    /// while small, past that in its store - so what crosses back is its content inline, or the blob it keeps by its
+    /// hash and size. A large output is never held whole in a component's memory.
+    resource writer {
+        append: func(bytes: list<u8>) -> result<_, string>;
+        /// The file made; the writer takes no more.
+        finish: func() -> result<file, string>;
     }
 
     /// The project, lent for a call: what an extension asks about other assets. The assets it returns are lent for

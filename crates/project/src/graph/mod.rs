@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use toml::{Table, Value as Toml};
 
 pub use pe2_ext::{Content, Data as Value, File, Image, Pcm, Port, Retain, Type, Typed};
@@ -130,6 +131,11 @@ pub const FILE: &str = "file";
 pub const CONSTANT: &str = "constant";
 pub const OUTPUT: &str = "output";
 pub const GRAPH: &str = "graph";
+/// Other nodes' outputs, by the references a field of the node's settings holds: `field` (dotted), each item's `key`
+/// where its items are tables, and the `output` taken of each.
+pub const REFERENCES: &str = "references";
+/// Files joined end to end into one, `name`d.
+pub const CONCATENATE: &str = "concatenate";
 /// The host's thumbnail: a picture made small (`side`, its longer side's pixels).
 pub const THUMBNAIL: &str = "thumbnail";
 /// The host's output keeping a node's result, where nothing in its stack keeps it and it is not a stored file.
@@ -155,6 +161,46 @@ impl Default for Ops {
             value.map(Value::Table).ok_or_else(|| anyhow::anyhow!("its `value` is not a table"))
         }));
         ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)));
+        ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {
+            let field = call.setting_str("field")?;
+            let key = call.settings().get("key").and_then(Toml::as_str);
+            let address = call.setting_str("output")?;
+            let mut at = call.fields().get(field.split('.').next().unwrap_or_default());
+            for part in field.split('.').skip(1) {
+                at = at.and_then(|v| v.get(part));
+            }
+            let items: Vec<&Toml> = match at {
+                Some(Toml::Table(table)) => table.values().collect(),
+                Some(Toml::Array(array)) => array.iter().collect(),
+                Some(_) => anyhow::bail!("its `{field}` is no list"),
+                None => Vec::new(),
+            };
+            let outputs = items.into_iter().enumerate().map(|(i, item)| {
+                let reference = match key {
+                    Some(key) => item.get(key).with_context(|| format!("{field}'s item {i} has no `{key}`"))?,
+                    None => item,
+                };
+                call.output_of(reference, address).map(|value| (*value).clone())
+            });
+            outputs.collect::<anyhow::Result<_>>().map(Value::List)
+        }));
+        ops.add(OpDef::new(CONCATENATE, "Concatenate", "1").input(port("files", Type::List(Box::new(Type::Any)))).makes(
+            Type::Bytes,
+            |call| {
+                let name = call.setting_str("name")?;
+                let Value::List(items) = call.take(0)?.take() else { anyhow::bail!("given no list") };
+                let mut writer = call.writer(name);
+                for (i, item) in items.iter().enumerate() {
+                    let file = match item {
+                        Value::Typed(typed) if typed.files.len() == 1 => &typed.files[0],
+                        other => anyhow::bail!("its item {i} is {}, not one file", other.ty()),
+                    };
+                    call.copy(&file.content, &mut writer)?;
+                }
+                let file = writer.finish()?;
+                Ok(Value::Typed(Typed { ty: pe2_ext::data::BYTES.to_string(), files: vec![file], ..Typed::default() }))
+            },
+        ));
         ops.add(OpDef::new(THUMBNAIL, "Thumbnail", "1").input(port("picture", Type::Image)).makes(Type::Image, |call| {
             let side = call.settings().get("side").and_then(Toml::as_integer).and_then(|s| usize::try_from(s).ok()).unwrap_or(32);
             match call.take(0)?.take() {

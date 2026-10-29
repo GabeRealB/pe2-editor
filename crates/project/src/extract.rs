@@ -61,7 +61,7 @@ pub struct Report {
     pub sources: usize,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
         s
@@ -708,14 +708,14 @@ fn write_assets(
             written += 1;
             continue;
         }
-        // A container assembled from its movies (a disc's movie file) has no bytes of its own: `check_assembled` holds
-        // its entries' movies, in order, to the disc's.
+        // A container assembled from its movies (a disc's movie file) has no bytes of its own: its stack joins its
+        // entries' movies, which `make_assembled` holds to the disc's.
         if asset.table.contains_key("entries") && asset.kind == "stream" {
             let originals: Vec<(String, String)> = releases
                 .iter()
                 .filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?)))
                 .collect();
-            let toml = asset_toml(&asset.body, None, &originals)?;
+            let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, None, &originals)?)?;
             write_bundle(layer, path, &[("asset.toml", toml.as_bytes())])?;
             written += 1;
             continue;
@@ -766,32 +766,138 @@ fn write_assets(
     Ok((written, sourcing.sources))
 }
 
-/// Hold each container assembled from its movies (a disc's movie file: its `entries`, each naming a movie, in order) to
-/// the disc's bytes: its movies' native files, written into the layer, joined in order have the file's sha1.
-fn check_assembled(layer: &Path, decl: &Declarations, releases: &[String]) -> Result<()> {
+/// A bundle of the layer as written, as a node of the work graph: its declaration and stored files as on disk, each
+/// file hashed once, when first asked.
+struct Written {
+    path: String,
+    uid: String,
+    dir: PathBuf,
+    declaration: String,
+    fields: toml::Table,
+    sha1s: std::sync::Mutex<HashMap<String, String>>,
+}
+
+impl Written {
+    fn open(layer: &Path, path: &str, uid: &str) -> Result<Written> {
+        let dir = layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX));
+        let declaration = fs::read_to_string(dir.join("asset.toml")).with_context(|| format!("{path}: its asset.toml"))?;
+        let fields = declaration.parse().with_context(|| format!("{path}: its asset.toml"))?;
+        Ok(Written { path: path.to_string(), uid: uid.to_string(), dir, declaration, fields, sha1s: std::sync::Mutex::default() })
+    }
+}
+
+impl crate::graph::exec::Node for Written {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn uid(&self) -> Option<&str> {
+        Some(&self.uid)
+    }
+
+    fn declaration(&self) -> &str {
+        &self.declaration
+    }
+
+    fn fields(&self) -> &toml::Table {
+        &self.fields
+    }
+
+    fn file_sha1(&self, name: &str) -> Option<String> {
+        let mut sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sha1) = sha1s.get(name) {
+            return Some(sha1.clone());
+        }
+        let sha1 = sha1_file(&self.dir.join(name)).ok()?;
+        sha1s.insert(name.to_string(), sha1.clone());
+        Some(sha1)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        let path = self.dir.join(name);
+        fs::read(&path).with_context(|| path.display().to_string())
+    }
+
+    fn file_size(&self, name: &str) -> Option<u64> {
+        fs::metadata(self.dir.join(name)).ok().map(|m| m.len())
+    }
+
+    fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
+        use std::io::Read;
+        let mut head = Vec::new();
+        if let Ok(file) = fs::File::open(self.dir.join(name)) {
+            let _ = file.take(len as u64).read_to_end(&mut head);
+        }
+        head
+    }
+
+    fn content_path(&self, sha1: &str) -> Option<PathBuf> {
+        let sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sha1s.iter().find(|(_, s)| *s == sha1).map(|(name, _)| self.dir.join(name))
+    }
+}
+
+/// The layer's bundles as the work graph reaches them, by uid or path: each read from disk when first asked for.
+struct Layer<'a> {
+    root: &'a Path,
+    uids: HashMap<&'a str, &'a str>,
+    /// By path: its uid, and the node once read.
+    nodes: HashMap<&'a str, (&'a str, std::sync::OnceLock<Option<Written>>)>,
+    ops: &'a crate::graph::Ops,
+}
+
+impl<'a> Layer<'a> {
+    fn new(root: &'a Path, decl: &'a Declarations, ops: &'a crate::graph::Ops) -> Layer<'a> {
+        let uids = decl.assets.iter().map(|(path, a)| (a.uid.as_str(), path.as_str())).collect();
+        let nodes = decl.assets.iter().map(|(path, a)| (path.as_str(), (a.uid.as_str(), std::sync::OnceLock::new()))).collect();
+        Layer { root, uids, nodes, ops }
+    }
+}
+
+impl crate::graph::exec::World for Layer<'_> {
+    fn node(&self, reference: &toml::Value) -> Option<(&dyn crate::graph::exec::Node, crate::graph::Plan)> {
+        let path = match reference.as_str().filter(|r| !r.starts_with("uid://")) {
+            Some(path) => path,
+            None => self.uids.get(crate::index::reference(reference)?.0.as_str())?,
+        };
+        let (path, (uid, slot)) = self.nodes.get_key_value(path)?;
+        let node = slot.get_or_init(|| Written::open(self.root, path, uid).ok()).as_ref()?;
+        let (plan, _) = crate::graph::Plan::of(&node.fields, self.ops, &[]);
+        Some((node as &dyn crate::graph::exec::Node, plan))
+    }
+}
+
+/// Make each container assembled from its movies (a disc's movie file: its `entries`, each naming a movie) by its
+/// stack, as the project will - its entries' movies, as written, joined - holding it to the disc's file, and keeping
+/// it in the store. Returns how many were made.
+fn make_assembled(layer: &Path, decl: &Declarations, releases: &[String], engine: &crate::graph::exec::Engine) -> Result<usize> {
+    let world = Layer::new(layer, decl, &engine.ops);
+    let reach = crate::graph::exec::Reach { engine, world: &world };
+    let mut made = 0;
     for (path, asset) in &decl.assets {
-        if asset.kind != "stream" {
+        if asset.kind != "stream" || !asset.table.contains_key("entries") {
             continue;
         }
-        let Some(entries) = asset.table.get("entries").and_then(toml::Value::as_table) else { continue };
-        let mut hasher = Sha1::new();
-        for (id, entry) in entries {
-            let movie = entry.get("movie").with_context(|| format!("{path}: its entry {id} names no movie"))?;
-            let reference: crate::declarations::Reference =
-                movie.clone().try_into().with_context(|| format!("{path}: its entry {id}'s movie is no reference"))?;
-            let native = layer.join(format!("{}{}", reference.target(), crate::index::BUNDLE_SUFFIX)).join("native.str");
-            let mut file = fs::File::open(&native).with_context(|| format!("{path}: {}", native.display()))?;
-            std::io::copy(&mut file, &mut hasher)?;
-        }
-        let got = hex(&hasher.finalize());
+        let (node, plan) =
+            crate::graph::exec::World::node(&world, &toml::Value::String(path.clone())).with_context(|| format!("{path}: not written"))?;
+        let result = plan.result_output().map(|o| plan.outputs[o].name.clone()).with_context(|| format!("{path}: its stack keeps no result"))?;
+        let given = engine.output_in(Some(reach), &plan, node, &result, None, true).with_context(|| format!("{path}: its movies could not be joined"))?;
+        let got = match given.value.as_deref() {
+            Some(crate::graph::Value::Typed(typed)) => match &typed.file()?.content {
+                crate::graph::Content::Stored { sha1, .. } => sha1.clone(),
+                crate::graph::Content::Inline(bytes) => sha1_hex(bytes),
+            },
+            _ => bail!("{path}: its stack made no file"),
+        };
         for release in releases {
             let Some(want) = asset.from.get(release).and_then(|l| l.sha1.as_deref()) else { continue };
             if got != want {
-                bail!("{path}: its movies, assembled in order, have sha1 {got}; the disc's file {want}");
+                bail!("{path}: its movies, joined in order, have sha1 {got}; the disc's file {want}");
             }
         }
+        made += 1;
     }
-    Ok(())
+    Ok(made)
 }
 
 /// The releases' discs and containers as bundles, their slots filled. Returns their count.
@@ -913,7 +1019,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
     let sourcing = Sourcing { extensions, engine: Imports::open(&cache)?.engine(extensions), sources: 0 };
     let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
-    check_assembled(&layer, &decl, &releases)?;
+    make_assembled(&layer, &decl, &releases, &Imports::open(&cache)?.engine(extensions))?;
     write_record(&layer, &decl_root, &releases, &discs)?;
     write_changeset(project, &game.layer, &decl, &releases)?;
     Ok(Report { layer, assets, layouts, sources })

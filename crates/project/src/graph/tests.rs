@@ -236,7 +236,7 @@ fn a_graph_layer_runs_what_its_outputs_reach() {
     let node = Bundle::new(GRAPH, &[("a.txt", "a"), ("b.txt", "b")]);
     let before = runs();
     let (joined, _) = plan.output("joined").unwrap();
-    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, None)], &Vec::new(), None);
+    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, None)], &Vec::new(), (None, None));
     assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBa");
     // `unused` is pruned; `t.repeat` is below the output asked for.
     let ran = runs();
@@ -245,7 +245,7 @@ fn a_graph_layer_runs_what_its_outputs_reach() {
     // A family's output, by its parameter's value; the tap inside the graph.
     let (repeated, times) = plan.output("repeated/3").unwrap();
     let (b, _) = plan.output("b").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(repeated, times.as_deref()), (b, None)], &Vec::new(), None);
+    let (made, _) = evaluate(&plan, &ops, &node, &[(repeated, times.as_deref()), (b, None)], &Vec::new(), (None, None));
     assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBaaBaaBa");
     assert_eq!(data(&node, made[1].as_ref().unwrap()), b"B");
 }
@@ -268,13 +268,13 @@ fn a_value_taken_once_is_moved() {
     let before = shared();
     // `upper` alone: the file's bytes are taken by it alone, and moved.
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), None);
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), (None, None));
     assert_eq!(made[0].as_ref().unwrap().as_ref(), &Value::Table(toml::from_str("len = 3").unwrap()));
     assert_eq!(shared(), before);
     // Asked for with `source`, the bytes are shared: upper copies them, the source is unchanged.
     let (source, _) = plan.output("source").unwrap();
     let (upper, _) = plan.output("upper").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)], &Vec::new(), None);
+    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)], &Vec::new(), (None, None));
     assert_eq!((data(&node, made[0].as_ref().unwrap()), data(&node, made[1].as_ref().unwrap())), (b"abc".to_vec(), b"ABC".to_vec()));
     assert!(shared() > before);
 }
@@ -285,7 +285,7 @@ fn a_failure_reaches_what_takes_from_it() {
     let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops, &[]);
     let node = Bundle::new(STACK, &[]);
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), None);
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), (None, None));
     assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: test/bundle: no file a.txt");
 }
 
@@ -392,4 +392,67 @@ fn an_output_is_a_family_of_the_parameter_it_reaches() {
     assert_eq!(plan.output("made/3").map(|(o, p)| (o, p.unwrap())), Some((0, "3".to_string())));
     let (_, problems) = Plan::of(&toml::from_str(&stack("[[stack]]\nop = \"t.pick\"\n")).unwrap(), &ops, &[]);
     assert_eq!(problems.iter().map(|p| p.what.as_str()).collect::<Vec<_>>(), ["`made` reaches operations of `times` and `which`: an output is one family"]);
+}
+
+/// Nodes reaching each other's outputs, by path.
+struct Nodes(Vec<Bundle>, Ops);
+
+impl super::exec::World for Nodes {
+    fn node(&self, reference: &toml::Value) -> Option<(&dyn Node, Plan)> {
+        let node = self.0.iter().find(|n| Some(n.path) == reference.as_str())?;
+        Some((node as &dyn Node, Plan::of(&node.fields, &self.1, &[]).0))
+    }
+}
+
+const PART: &str = "[[stack]]\nop = \"file\"\nfile = \"part.bin\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
+
+fn joining(parts: &str) -> String {
+    format!(
+        "parts = [{parts}]\n\n[[stack]]\nop = \"references\"\nfield = \"parts\"\noutput = \"native\"\n\n\
+         [[stack]]\nop = \"concatenate\"\nname = \"joined.bin\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n"
+    )
+}
+
+#[test]
+fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-reach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let mut a = Bundle::new(PART, &[("part.bin", "head-")]);
+    a.path = "test/a";
+    // Past what a writer holds in memory: the joined file is spilled to the store.
+    let big = "x".repeat(super::exec::SPILL);
+    let mut b = Bundle::new(PART, &[("part.bin", &big)]);
+    b.path = "test/b";
+    let mut joined = Bundle::new(&joining("\"test/a\", \"test/b\""), &[]);
+    joined.path = "test/joined";
+    let mut itself = Bundle::new(&joining("\"test/a\", \"test/itself\""), &[]);
+    itself.path = "test/itself";
+    let world = Nodes(vec![a, b, joined, itself], engine.ops.clone());
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let make = |path: &str| {
+        let (node, plan) = super::exec::World::node(&world, &toml::Value::String(path.into())).unwrap();
+        engine.output_in(Some(reach), &plan, node, "native", None, true)
+    };
+    let stored = |given: &super::exec::Given| match &given.value.as_deref() {
+        Some(Value::Typed(typed)) => match &typed.files[0].content {
+            Content::Stored { sha1, .. } => std::fs::read(engine.store().unwrap().blob_path(sha1)).unwrap(),
+            Content::Inline(_) => panic!("held in memory"),
+        },
+        _ => panic!("not a file"),
+    };
+    let first = make("test/joined").unwrap();
+    assert!(!first.kept);
+    assert_eq!(stored(&first), format!("head-{big}").into_bytes());
+    assert_eq!(first.reads.outputs.len(), 2);
+    assert!(make("test/joined").unwrap().kept);
+    // A part changed: made again.
+    world.0[0].files.lock().unwrap().insert("part.bin".into(), b"HEAD-".to_vec());
+    let changed = make("test/joined").unwrap();
+    assert!(!changed.kept);
+    assert_eq!(stored(&changed)[..5], *b"HEAD-");
+    // A node reading itself, through others or not, is a cycle.
+    let Err(cycle) = make("test/itself") else { panic!("a cycle made") };
+    assert!(format!("{cycle:#}").contains("reads, through others, itself"), "{cycle:#}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

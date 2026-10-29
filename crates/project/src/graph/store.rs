@@ -122,6 +122,36 @@ impl Store {
         Ok(Blob { sha1, size: bytes.len() as u64 })
     }
 
+    /// A file to write a content too large to hold into: `tmp/` in the store, adopted as a blob once written.
+    ///
+    /// # Errors
+    /// It cannot be made.
+    pub fn spill(&self) -> Result<(std::fs::File, PathBuf)> {
+        static SPILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = self.dir.join("tmp");
+        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        let n = SPILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("{}-{n}", std::process::id()));
+        let file = std::fs::File::create(&path).with_context(|| path.display().to_string())?;
+        Ok((file, path))
+    }
+
+    /// Adopt a written file as the blob of its hash: moved where blobs are kept (dropped where it is kept already).
+    ///
+    /// # Errors
+    /// It cannot be moved.
+    pub fn adopt(&self, written: &std::path::Path, sha1: &str) -> Result<()> {
+        let path = self.blob_path(sha1);
+        if path.exists() {
+            let _ = std::fs::remove_file(written);
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+        }
+        std::fs::rename(written, &path).with_context(|| path.display().to_string())
+    }
+
     /// Keep bytes as a blob, where a program can read them (`blob_path`).
     ///
     /// # Errors
@@ -212,7 +242,8 @@ impl Store {
         toml::from_str(&std::fs::read_to_string(self.value_path(hash)).ok()?).ok()
     }
 
-    /// A kept value: its files' contents by reference (read through `blob_path`), what is not a file's read now.
+    /// A kept value: its files' contents by reference (read through `blob_path`), what is not a file's read now. One
+    /// whose contents are not all kept is not.
     ///
     /// # Errors
     /// It is not kept, or a blob of it cannot be read.
@@ -221,6 +252,10 @@ impl Store {
         let file = |f: KeptFile| File { name: f.name, content: Content::Stored { sha1: f.blob.sha1, size: f.blob.size } };
         Ok(match kept {
             Kept::Typed { ty, also, files, settings, notes } => {
+                // Its contents by reference: each still kept (none removed but by the sweep, with the value).
+                if let Some(gone) = files.iter().find(|f| !self.blob_path(&f.blob.sha1).exists()) {
+                    anyhow::bail!("{hash}: its {} is no longer kept", gone.name);
+                }
                 Value::Typed(Typed { ty, also, files: files.into_iter().map(file).collect(), settings, notes })
             }
             Kept::Image { width, height, blob } => Value::Image(Image { width, height, rgba: self.read_blob(&blob)? }),

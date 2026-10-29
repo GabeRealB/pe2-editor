@@ -596,13 +596,46 @@ impl Extensions {
         graph::Plan::of(fields, &self.operations(), &self.tail(asset))
     }
 
-    /// An output of an asset, by its address (`native`, `picture/night`), through `engine`.
+    /// The assets whose outputs read those of these, through others or not: each referring to one whose stack reads
+    /// the outputs of what it refers to (a `references` layer). These not among them, unless they read each other.
+    #[must_use]
+    pub fn dependents(&self, index: &index::Index, paths: &std::collections::BTreeSet<String>) -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut next: Vec<&str> = paths.iter().map(String::as_str).collect();
+        while let Some(path) = next.pop() {
+            let referrers = index.referenced_by.get(path).into_iter().flatten().map(|r| r.from.as_str());
+            for from in referrers {
+                if found.contains(from) {
+                    continue;
+                }
+                let Some(asset) = index.assets.get(from) else { continue };
+                let (plan, _) = self.plan(asset);
+                if plan.steps.iter().any(|s| s.op == graph::REFERENCES) {
+                    found.insert(from.to_string());
+                    next.push(from);
+                }
+            }
+        }
+        found
+    }
+
+    /// An output of an asset of `index`, by its address (`native`, `picture/night`), through `engine`: what it reads
+    /// of other nodes made in the index.
     ///
     /// # Errors
     /// It has no such output, or it could not be made.
-    pub fn output(&self, engine: &graph::exec::Engine, asset: &index::Asset, address: &str, read: bool) -> Result<graph::exec::Given> {
+    pub fn output(
+        &self,
+        engine: &graph::exec::Engine,
+        index: &index::Index,
+        asset: &index::Asset,
+        address: &str,
+        read: bool,
+    ) -> Result<graph::exec::Given> {
         let (plan, _) = self.plan(asset);
-        engine.output(&plan, asset, address, read)
+        let world = Graph { index, extensions: self };
+        let reach = graph::exec::Reach { engine, world: &world };
+        engine.output_in(Some(reach), &plan, asset, address, None, read)
     }
 
     /// An engine for what is asked now, in passing: the extensions' operations, reading what the project's store
@@ -669,9 +702,10 @@ impl Extensions {
         Some(self.image(asset, &address))
     }
 
-    /// An output that is an image, made now.
+    /// An output that is an image, made now (of its node alone).
     fn image(&self, asset: &index::Asset, address: &str) -> Result<Image> {
-        let given = self.output(&self.engine(), asset, address, true)?;
+        let (plan, _) = self.plan(asset);
+        let given = self.engine().output(&plan, asset, address, true)?;
         match given.value.as_deref() {
             Some(graph::Value::Image(image)) => Ok(image.clone()),
             _ => anyhow::bail!("{address} is no picture"),
@@ -1032,6 +1066,25 @@ impl Project for Lens<'_> {
     }
 }
 
+/// The project's nodes as the work graph reaches them: by reference in the index, each with its plan.
+pub struct Graph<'a> {
+    pub index: &'a index::Index,
+    pub extensions: &'a Extensions,
+}
+
+impl graph::exec::World for Graph<'_> {
+    fn node(&self, reference: &toml::Value) -> Option<(&dyn graph::exec::Node, graph::Plan)> {
+        let asset: &index::Asset = if let Some(path) = reference.as_str().filter(|r| !r.starts_with("uid://")) {
+            self.index.assets.get(path)?
+        } else {
+            let (uid, path) = index::reference(reference)?;
+            self.index.resolve(&uid, path.as_deref().unwrap_or_default())?
+        };
+        let (plan, _) = self.extensions.plan(asset);
+        Some((asset as &dyn graph::exec::Node, plan))
+    }
+}
+
 /// What an extension's operation is lent of its node: its path, kind and role, its declared settings (recorded as
 /// read when it is lent), and contents read by their hashes.
 struct Hosted<'a> {
@@ -1073,6 +1126,10 @@ impl pe2_ext::CallHost for Hosted<'_> {
 
     fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.call.read_range(content, offset, len)
+    }
+
+    fn writer(&self, name: &str) -> Result<Box<dyn pe2_ext::FileWriter>> {
+        Ok(Box::new(self.call.writer(name)))
     }
 }
 

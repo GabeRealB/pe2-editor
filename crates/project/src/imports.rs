@@ -123,11 +123,14 @@ impl Imports {
         self.attach_some(index, extensions, None, report)
     }
 
-    /// Attach the imports of these assets alone - those a refresh changed (`Refreshed::assets`) - the others keeping
-    /// theirs: their problems made again, and those of the references from or to them naming parts. What it costs is
-    /// what changed; imports no asset makes any more are removed by the next full attach.
+    /// Attach the imports of these assets alone - those a refresh changed (`Refreshed::assets`) - and of those reading
+    /// their outputs (`Extensions::dependents`), the others keeping theirs: their problems made again, and those of the
+    /// references from or to them naming parts. What it costs is what changed; imports no asset makes any more are
+    /// removed by the next full attach.
     pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
-        self.attach_some(index, extensions, Some(changed), &|_, _, _| {})
+        let mut changed = changed.clone();
+        changed.extend(extensions.dependents(index, &changed));
+        self.attach_some(index, extensions, Some(&changed), &|_, _, _| {})
     }
 
     fn attach_some(
@@ -157,6 +160,9 @@ impl Imports {
             Some(only) => only.iter().filter_map(|p| index.assets.get(p).map(|a| &**a)).collect(),
         };
         let total = assets.len();
+        // What an import reads of other nodes, made in the index as it is.
+        let world = crate::ext::Graph { index: &*index, extensions };
+        let reach = graph::exec::Reach { engine: &engine, world: &world };
         for (i, asset) in assets.into_iter().enumerate() {
             if i % 256 == 0 {
                 report("Attaching what the importers made", i, total);
@@ -169,12 +175,12 @@ impl Imports {
             let Some((importer, output)) = import_output(&plan) else { continue };
             let plan = &plan;
             let key = engine.key(plan, asset, output, None);
-            if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset)) {
+            if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
                 attached.kept += 1;
                 found.push((asset.path.clone(), key, import.clone()));
                 continue;
             }
-            match self.import(asset, extensions, &engine, (importer, plan, output), &key) {
+            match self.import(asset, extensions, reach, (importer, plan, output), &key) {
                 Ok((made, reads, import)) => {
                     if made {
                         attached.made += 1;
@@ -282,16 +288,17 @@ impl Imports {
         &self,
         asset: &Asset,
         extensions: &Extensions,
-        engine: &Engine,
+        reach: graph::exec::Reach<'_>,
         (importer, plan, output): (String, &Plan, usize),
         key: &str,
     ) -> Result<(bool, Reads, Arc<Known>)> {
         // Found kept and readable as this store reads values, else made now.
-        let found = engine.kept(plan, asset, output, None).and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
+        let engine = reach.engine;
+        let found = engine.kept_in(Some(reach), plan, asset, output, None).and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
         let (made, (kept, trace)) = if let Some(found) = found {
             (false, found)
         } else {
-            engine.output(plan, asset, &plan.outputs[output].name, true)?;
+            engine.output_in(Some(reach), plan, asset, &plan.outputs[output].name, None, true)?;
             let trace = self.store.trace(key).context("its import was not kept")?;
             (true, (self.store.describe(&trace.value).context("its import was not kept")?, trace))
         };

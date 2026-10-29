@@ -63,7 +63,7 @@ impl Pictures {
                     let Ok(request) = request else { return };
                     let made = request.index.assets.get(&request.path).and_then(|asset| {
                         let address = extensions.picture_address(asset, request.look)?;
-                        Some(extensions.output(&engine, asset, &address, true))
+                        Some(extensions.output(&engine, &request.index, asset, &address, true))
                     });
                     let (picture, reads) = match made {
                         Some(Ok(given)) => match given.value.as_deref() {
@@ -96,7 +96,7 @@ impl Pictures {
         self.slots.retain(|(path, _), slot| match slot {
             Slot::Drawing(_) => true,
             Slot::Drawn(_, reads) => {
-                reads.as_ref().is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset)))
+                reads.as_ref().is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset, None)))
             }
         });
         self.index = index;

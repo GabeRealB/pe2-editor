@@ -289,6 +289,72 @@ mod tests {
         assert!(format!("{refused:#}").contains("rebuild it with this editor's SDK"), "{refused:#}");
     }
 
+    /// A texture lent as a node: its declaration alone.
+    struct Texture {
+        declaration: String,
+        fields: toml::Table,
+    }
+
+    impl project::graph::exec::Node for Texture {
+        fn path(&self) -> &'static str {
+            "test/texture"
+        }
+
+        fn uid(&self) -> Option<&str> {
+            None
+        }
+
+        fn declaration(&self) -> &str {
+            &self.declaration
+        }
+
+        fn fields(&self) -> &toml::Table {
+            &self.fields
+        }
+
+        fn file_sha1(&self, _: &str) -> Option<String> {
+            None
+        }
+
+        fn read(&self, name: &str) -> pe2_ext::Result<Vec<u8>> {
+            Err(pe2_ext::anyhow!("no file {name}"))
+        }
+    }
+
+    #[test]
+    fn a_component_writes_a_large_file_through_the_host() {
+        use project::graph::{Content, File, Typed, Value};
+        let dir = std::env::temp_dir().join(format!("pe2-ext-writer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = project::graph::store::Store::at(dir.clone()).unwrap();
+        let extensions = super::load();
+        let engine = project::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
+        // Noise, which a PNG cannot make small: the layers written are past what the host holds in memory.
+        let (width, height) = (1024, 512);
+        let mut x: u32 = 1;
+        let texels: Vec<u8> = (0..width * height * 2)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                x.to_be_bytes()[0]
+            })
+            .collect();
+        let declaration = format!("kind = \"image\"\nrole = \"texture\"\nmode = \"direct_16bpp\"\nsize = [{width}, {height}]\n");
+        let node = Texture { fields: declaration.parse().unwrap(), declaration };
+        let native = Value::Typed(Typed {
+            ty: "pe2.images@texels".into(),
+            files: vec![File::new("native.texels", texels)],
+            ..Typed::default()
+        });
+        let made = engine.run("pe2.images@ora_source", vec![vec![native]], &toml::Table::new(), &node).unwrap();
+        let Value::Typed(made) = made else { panic!("not a file") };
+        let Content::Stored { sha1, size } = &made.file().unwrap().content else { panic!("held in memory") };
+        assert!(*size > project::graph::exec::SPILL as u64, "{size} bytes");
+        let kept = std::fs::read(store.blob_path(sha1)).unwrap();
+        assert_eq!(kept.len() as u64, *size);
+        assert_eq!(&kept[30..54], b"mimetypeimage/openraster");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn each_component_says_who_it_is_without_running() {
         assert_eq!(COMPONENTS.len(), linked().len());

@@ -518,7 +518,7 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
     let given = if args.output == project::graph::THUMBNAIL {
         extensions.thumbnail(&engine, asset)
     } else {
-        extensions.output(&engine, asset, &args.output, true)
+        extensions.output(&engine, index, asset, &args.output, true)
     };
     let given = given.map_err(|e| format!("{e:#}"))?;
     let value = given.value.ok_or_else(|| format!("{}: {} made nothing", asset.path, args.output))?;

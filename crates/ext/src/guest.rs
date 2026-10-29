@@ -192,6 +192,29 @@ impl Source for Lent<'_> {
         let len = u32::try_from(len).unwrap_or(u32::MAX);
         self.resource().read_range(name, offset, len).map_err(crate::Error::msg)
     }
+
+    fn writer(&self, name: &str) -> Option<crate::Result<Box<dyn crate::FileWriter>>> {
+        let writer = self.resource().writer(name).map_err(crate::Error::msg);
+        Some(writer.map(|w| Box::new(HostWriter(Some(w))) as Box<dyn crate::FileWriter>))
+    }
+}
+
+/// A file being made through the host's writer: appended to there, finished into the file the host made.
+struct HostWriter(Option<host::Writer>);
+
+// SAFETY: a component runs on one thread.
+unsafe impl Send for HostWriter {}
+
+impl crate::FileWriter for HostWriter {
+    fn append(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        let writer = self.0.as_ref().ok_or_else(|| crate::anyhow!("finished"))?;
+        writer.append(bytes).map_err(crate::Error::msg)
+    }
+
+    fn finish(mut self: Box<Self>) -> crate::Result<crate::File> {
+        let writer = self.0.take().ok_or_else(|| crate::anyhow!("finished"))?;
+        writer.finish().map(file_from_wit).map_err(crate::Error::msg)
+    }
 }
 
 /// The project the host lent, its answers kept for the call: an asset a query returns lives as long as the project.
@@ -818,6 +841,10 @@ impl CallHost for NodeHost<'_> {
             }
             Content::Stored { sha1, .. } => Source::read_range(self.0, sha1, offset, len),
         }
+    }
+
+    fn writer(&self, name: &str) -> crate::Result<Box<dyn crate::FileWriter>> {
+        Source::writer(self.0, name).ok_or_else(|| crate::anyhow!("the host makes no files for this call"))?
     }
 }
 

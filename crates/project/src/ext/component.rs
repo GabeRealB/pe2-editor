@@ -54,6 +54,7 @@ mod bindings {
             "pe2:extension/host.texture": super::HostTexture,
             "pe2:extension/host.declarations": super::LentDeclarations,
             "pe2:extension/host.discs": super::LentDiscs,
+            "pe2:extension/host.writer": super::HostWriter,
         },
     });
 }
@@ -247,6 +248,10 @@ pub struct LentAsset {
 // SAFETY: a lent asset is read only during the call that lent it, on the thread making the call.
 unsafe impl Send for LentAsset {}
 
+/// A file an operation makes, held for the component writing it: the host's writer (`CallHost::writer`) until it is
+/// finished.
+pub struct HostWriter(Option<Box<dyn pe2_ext::FileWriter>>);
+
 /// A frame's UI as a view draws on it: the host's, lent for the frame, or a row, a section or a body of it.
 pub enum Frame {
     Lent(*mut (dyn UiHost + 'static)),
@@ -416,9 +421,37 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.read_range(&name, offset, len as usize).map_err(|e| format!("{e:#}")))
     }
 
+    fn writer(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Result<Resource<HostWriter>, String>> {
+        let made = match self.lent(&asset)?.writer(&name) {
+            Some(made) => made.map_err(|e| format!("{e:#}")),
+            None => Err(format!("{}: lent for no operation's run, it makes no files", self.lent(&asset)?.path())),
+        };
+        Ok(match made {
+            Ok(writer) => Ok(self.table.push(HostWriter(Some(writer)))?),
+            Err(e) => Err(e),
+        })
+    }
+
     fn drop(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<()> {
         self.found.retain(|&rep| rep != asset.rep());
         self.table.delete(asset)?;
+        Ok(())
+    }
+}
+
+impl host::HostWriter for State {
+    fn append(&mut self, writer: Resource<HostWriter>, bytes: Vec<u8>) -> wasmtime::Result<Result<(), String>> {
+        let Some(inner) = self.table.get_mut(&writer)?.0.as_mut() else { return Ok(Err("finished".into())) };
+        Ok(inner.append(&bytes).map_err(|e| format!("{e:#}")))
+    }
+
+    fn finish(&mut self, writer: Resource<HostWriter>) -> wasmtime::Result<Result<types::File, String>> {
+        let Some(inner) = self.table.get_mut(&writer)?.0.take() else { return Ok(Err("finished".into())) };
+        Ok(inner.finish().map(file_to_wit).map_err(|e| format!("{e:#}")))
+    }
+
+    fn drop(&mut self, writer: Resource<HostWriter>) -> wasmtime::Result<()> {
+        self.table.delete(writer)?;
         Ok(())
     }
 }
@@ -1617,6 +1650,10 @@ impl Source for Node<'_> {
 
     fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         self.host.read_range(&Node::content(name), offset, len)
+    }
+
+    fn writer(&self, name: &str) -> Option<Result<Box<dyn pe2_ext::FileWriter>>> {
+        Some(self.host.writer(name))
     }
 }
 

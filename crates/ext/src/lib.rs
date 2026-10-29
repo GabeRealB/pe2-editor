@@ -29,7 +29,7 @@ pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Rect, Texture};
-pub use data::{Call, CallHost, Content, File, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, Type, Typed, Value as Data};
+pub use data::{Call, CallHost, Content, File, FileWriter, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
 pub use registry::{

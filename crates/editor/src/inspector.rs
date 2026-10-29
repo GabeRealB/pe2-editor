@@ -70,7 +70,7 @@ pub fn inspector_ui(
         return;
     };
     header_ui(ui, ws, &asset);
-    unapplied_ui(ui, ws, &asset, edit);
+    unapplied_ui(ui, ws, &asset, nav, edit);
     let target = edit_target(ws, &asset);
     {
         let sheet = Sheet {
@@ -741,7 +741,7 @@ fn count(n: usize, plural: &str) -> String {
 
 /// Where an asset's settings changed and are not applied: what applying makes again, and Apply, Revert, and Apply all
 /// where others wait too.
-fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut Option<EditRequest>) {
+fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
     if !ws.unapplied(&asset.path) {
         return;
     }
@@ -750,6 +750,8 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut
     let tail = ws.extensions.tail(asset);
     let (plan, _) = project::graph::Plan::of(asset.fields(), &ops, &tail);
     let outputs: Vec<&str> = plan.outputs.iter().map(|o| o.name.as_str()).collect();
+    // And what reads them, made again with them.
+    let dependents = ws.extensions.dependents(&ws.index, &std::iter::once(asset.path.clone()).collect());
     let others = ws.unapplied_count().saturating_sub(1);
     let (mut apply, mut apply_all) = (false, false);
     theme::section(ui, "Unapplied changes", |ui| {
@@ -759,6 +761,17 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut
             format!("Its outputs are made from its settings as last applied. Applying makes again: {}.", outputs.join(", "))
         };
         ui.label(RichText::new(says).color(theme::weak()));
+        if !dependents.is_empty() {
+            let count = dependents.len();
+            ui.label(RichText::new(format!("And what read{} them:", if count == 1 { "s" } else { "" })).color(theme::weak()));
+            ui.horizontal_wrapped(|ui| {
+                for path in &dependents {
+                    if ui.link(path).on_hover_text("Show it").clicked() {
+                        *nav = Some(path.clone());
+                    }
+                }
+            });
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             apply = ui.button("Apply").on_hover_text("Make its outputs again from its settings as they are now").clicked();
@@ -823,6 +836,7 @@ fn stack_ui(
         .flatten()
         .filter(|(k, v)| k.as_str() != "op" && !sheet.custom(k) && !is_table_list(v))
         .collect();
+    let ops = ws.extensions.operations();
     let field_edit = &mut ws.field_edit;
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
@@ -865,10 +879,7 @@ fn stack_ui(
                         ui.label(RichText::new("Importer").color(theme::weak()));
                         importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
                     }
-                    _ => {
-                        ui.label(RichText::new("Operation").color(theme::weak()));
-                        ui.label(RichText::new(op).monospace());
-                    }
+                    _ => operation_row(ui, &ops, op, layer),
                 }
                 ui.end_row();
             }
@@ -879,6 +890,23 @@ fn stack_ui(
         }
         fits_ui(ui, &fits, name);
     });
+}
+
+/// A stack's layer of an operation: its label and name, then its settings, a row of their own under it.
+fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: &toml::Value) {
+    ui.label(RichText::new("Operation").color(theme::weak()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(ops.get(op).map_or(op, |def| def.label.as_str()));
+        ui.label(RichText::new(op).small().color(theme::weak()));
+    });
+    let settings: Vec<String> =
+        layer.as_table().into_iter().flatten().filter(|(k, _)| k.as_str() != "op").map(|(k, v)| format!("{k} = {v}")).collect();
+    if !settings.is_empty() {
+        ui.end_row();
+        ui.label("");
+        ui.label("");
+        ui.label(RichText::new(settings.join("   ")).monospace().small().color(theme::weak()));
+    }
 }
 
 /// The button editing a source in the tool its format is edited in: in the active layer, copied there first where the
@@ -1008,6 +1036,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
     if asset.files.is_empty() {
         return;
     }
+    let has_import = project::graph::import_of(asset.fields()).is_some();
     theme::section(ui, "Bundle", |ui| {
         egui::Grid::new("bundle files").num_columns(4).spacing([14.0, 4.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for f in &asset.files {
@@ -1019,9 +1048,15 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 ui.label(RichText::new(size_text(f.size)).small().color(theme::weak()));
                 match &f.made_by {
                     // Made of the source, kept in the cache: not the layer's to edit.
-                    Some(importer) => {
+                    Some(importer) if has_import => {
                         ui.label(RichText::new("imported").small().color(theme::weak())).on_hover_text(format!(
                             "Made of the source by {importer}, kept in the project cache; edit the source instead"
+                        ));
+                    }
+                    // Made by its stack of what it reads: kept in the cache.
+                    Some(maker) => {
+                        ui.label(RichText::new("made").small().color(theme::weak())).on_hover_text(format!(
+                            "Made by its stack ({maker}), kept in the project cache; edit what it is made of instead"
                         ));
                     }
                     None => {

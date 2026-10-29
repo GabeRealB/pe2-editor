@@ -321,6 +321,80 @@ pub trait CallHost {
     /// # Errors
     /// As `read`.
     fn read_range(&self, content: &Content, offset: u64, len: usize) -> Result<Vec<u8>>;
+    /// A file the operation makes, named `name`, written a piece at a time: held where the host holds what is large
+    /// (its store), or - by a host that holds nothing - in memory.
+    ///
+    /// # Errors
+    /// The host cannot make one.
+    fn writer(&self, name: &str) -> Result<Box<dyn FileWriter>> {
+        Ok(Box::new(InMemory { name: name.to_string(), bytes: Vec::new() }))
+    }
+}
+
+/// A file being made: appended to, then finished into its file - its content inline, or a blob the host keeps.
+pub trait FileWriter: Send {
+    /// # Errors
+    /// What is appended cannot be kept.
+    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+    /// # Errors
+    /// What was appended cannot be kept.
+    fn finish(self: Box<Self>) -> Result<File>;
+}
+
+/// A file made in memory, its content inline.
+struct InMemory {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl FileWriter for InMemory {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<File> {
+        Ok(File::new(&self.name, self.bytes))
+    }
+}
+
+/// A file an operation makes (`Call::writer`), as `std::io::Write`: what is written gathered into pieces of `PIECE`
+/// bytes, each appended to the host's writer, then finished into its file (`finish`). What is large is never held
+/// whole - by a component, never in its memory.
+pub struct Writer {
+    inner: Box<dyn FileWriter>,
+    piece: Vec<u8>,
+}
+
+impl Writer {
+    /// How much is gathered before it is appended.
+    pub const PIECE: usize = 256 << 10;
+
+    /// The file made: its content inline where it is small, else kept by the host.
+    ///
+    /// # Errors
+    /// What was written cannot be kept.
+    pub fn finish(mut self) -> Result<File> {
+        if !self.piece.is_empty() {
+            self.inner.append(&self.piece)?;
+        }
+        self.inner.finish()
+    }
+}
+
+impl std::io::Write for Writer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.piece.extend_from_slice(bytes);
+        if self.piece.len() >= Writer::PIECE {
+            self.inner.append(&self.piece).map_err(std::io::Error::other)?;
+            self.piece.clear();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An operation running: the values it is given by port, its settings, the value of its parameter as its output's
@@ -358,6 +432,15 @@ impl Call<'_> {
     pub fn take_all<T: crate::ty::ValueType>(&mut self, port: usize) -> Result<Vec<T::Value>> {
         let given = self.inputs.get_mut(port).map_or_else(Vec::new, std::mem::take);
         given.into_iter().map(|data| T::decode(data, self)).collect()
+    }
+
+    /// A file it makes, named `name`, written through `std::io::Write` and finished into its `File`: what is large is
+    /// kept by the host as it is written (`CallHost::writer`) rather than held.
+    ///
+    /// # Errors
+    /// The host cannot make one.
+    pub fn writer(&self, name: &str) -> Result<Writer> {
+        Ok(Writer { inner: self.host.writer(name)?, piece: Vec::new() })
     }
 
     /// A file's content, whole.
