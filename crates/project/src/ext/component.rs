@@ -1564,7 +1564,7 @@ fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared:
                     .job(cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_native(a, handle, lent).await))?;
                 let made = made.map_err(|e| pe2_ext::anyhow!("{e}"))?;
                 let settings = toml::from_str(&made.settings).context("the settings an import derived")?;
-                Ok(pe2_ext::Imported { files: made.files, settings })
+                Ok(pe2_ext::Imported { files: made.files, settings, notes: made.notes })
             });
         }
         for path in &importer.derives {
@@ -1681,7 +1681,7 @@ const SECTION: &str = "pe2-extension";
 
 /// The contract this host runs: the version of the WIT package (`pe2:extension@0.2.0`), the line it is of (`0.2`)
 /// running every component built against a version of the line no newer than it.
-pub const CONTRACT: &str = "0.2.0";
+pub const CONTRACT: &str = "0.3.0";
 
 /// What a component's guest interface is exported as, before its version.
 const GUEST: &str = "pe2:extension/guest@";

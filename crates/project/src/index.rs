@@ -77,6 +77,8 @@ pub struct Imported {
     pub overridden: Vec<String>,
     /// Parts the declaration has that the source no longer does (`cells.dot`).
     pub orphans: Vec<String>,
+    /// What the import took otherwise than the source has it, as its importer said.
+    pub notes: Vec<String>,
 }
 
 impl Asset {
@@ -259,6 +261,9 @@ pub enum Problem {
     MissingPart { asset: String, slot: String, target: String, part: String },
     /// An `extension` asset whose component is not loaded, and why.
     Extension { asset: String, error: String },
+    /// What an asset's import took otherwise than its source has it (colors matched to the nearest), as its importer
+    /// said: the build goes on with it.
+    Taken { asset: String, note: String },
 }
 
 impl Problem {
@@ -272,6 +277,7 @@ impl Problem {
             | Problem::Orphan { asset: path, .. }
             | Problem::MissingPart { asset: path, .. }
             | Problem::Extension { asset: path, .. }
+            | Problem::Taken { asset: path, .. }
             | Problem::Conflict { path, .. }
             | Problem::Unlisted { path, .. }
             | Problem::Missing { path, .. }
@@ -299,6 +305,7 @@ impl Problem {
             Problem::Orphan { part, .. } => format!("{part} has settings, but its source has no such part"),
             Problem::MissingPart { slot, target, part, .. } => format!("{slot} names {target}#{part}, which it does not have"),
             Problem::Extension { error, .. } => format!("the extension is not loaded: {error}"),
+            Problem::Taken { note, .. } => format!("its import: {note}"),
         }
     }
 
@@ -317,6 +324,7 @@ impl Problem {
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
             | Problem::MissingPart { .. }
+            | Problem::Taken { .. }
             | Problem::Extension { .. } => vec![],
         }
     }
@@ -324,7 +332,7 @@ impl Problem {
     /// Whether the build can go on with it: an override made from an older base still applies.
     #[must_use]
     pub fn is_warning(&self) -> bool {
-        matches!(self, Problem::Stale { .. } | Problem::Overridden { .. } | Problem::Orphan { .. })
+        matches!(self, Problem::Stale { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::Taken { .. })
     }
 }
 

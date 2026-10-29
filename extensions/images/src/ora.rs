@@ -209,6 +209,7 @@ fn layer_values(
     bpp: u8,
     palette: &[u16],
     known: Option<&Known>,
+    notes: &mut Vec<String>,
 ) -> Result<(usize, usize, Vec<u16>)> {
     let picture = ora::decode_png(&layer.png).map_err(|e| anyhow!("layer {}: {e}", layer.name))?;
     let values = match picture.pixels {
@@ -226,14 +227,16 @@ fn layer_values(
         Pixels::Rgba(pixels) => {
             let mut matcher = Matcher::new(palette);
             let width = picture.width.max(1);
-            pixels
+            let values = pixels
                 .into_iter()
                 .enumerate()
                 .map(|(i, p)| match known.and_then(|k| k.at(layer.x, layer.y, i % width, i / width)) {
                     Some(k) if palette.get(usize::from(k)).is_some_and(|&c| rgba(c) == p) => k,
                     _ => matcher.index(p),
                 })
-                .collect()
+                .collect();
+            notes.extend(matcher.note(&layer.name));
+            values
         }
     };
     Ok((picture.width, picture.height, values))
@@ -269,20 +272,41 @@ impl Known {
 /// Colors matched to a palette's indices: the first entry of the exact color, else the nearest.
 struct Matcher {
     colors: Vec<[u8; 4]>,
-    known: HashMap<[u8; 4], u16>,
+    /// Each color met: its index, and whether the palette has it exactly.
+    known: HashMap<[u8; 4], (u16, bool)>,
+    /// The texels whose color the palette lacks, taken as the nearest it has.
+    taken: usize,
 }
 
 impl Matcher {
     fn new(palette: &[u16]) -> Matcher {
-        Matcher { colors: palette.iter().map(|&c| rgba(c)).collect(), known: HashMap::new() }
+        Matcher { colors: palette.iter().map(|&c| rgba(c)).collect(), known: HashMap::new(), taken: 0 }
     }
 
     fn index(&mut self, pixel: [u8; 4]) -> u16 {
         let colors = &self.colors;
-        *self.known.entry(pixel).or_insert_with(|| {
+        let (index, exact) = *self.known.entry(pixel).or_insert_with(|| {
             let distance = |c: &[u8; 4]| c.iter().zip(pixel).map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2)).sum::<i32>();
-            let best = colors.iter().enumerate().min_by_key(|(_, c)| distance(c)).map_or(0, |(i, _)| i);
-            u16::try_from(best).unwrap_or(0)
+            let best = colors.iter().enumerate().min_by_key(|(_, c)| distance(c));
+            best.map_or((0, false), |(i, c)| (u16::try_from(i).unwrap_or(0), distance(c) == 0))
+        });
+        if !exact {
+            self.taken += 1;
+        }
+        index
+    }
+
+    /// What it took otherwise than the layer has it, said of `layer`; none where every color was its palette's.
+    fn note(&self, layer: &str) -> Option<String> {
+        let colors = self.known.values().filter(|(_, exact)| !exact).count();
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        (self.taken > 0).then(|| {
+            format!(
+                "layer {layer}: {} texel{} of {colors} color{} its palette lacks, taken as the nearest it has",
+                self.taken,
+                s(self.taken),
+                s(colors)
+            )
         })
     }
 }
@@ -303,12 +327,13 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
         document.group(PALETTES).map_or_default(|g| g.layers().map(|l| (l.name.as_str(), l)).collect());
     let mut colors: Vec<Option<Vec<u16>>> = Vec::with_capacity(names.len());
     let mut files = Vec::new();
+    let mut notes = Vec::new();
     for name in &names {
         let Some(strip) = strips.get(name.as_str()) else {
             colors.push(None);
             continue;
         };
-        let (w, _, values) = layer_values(strip, 16, &[], None)?;
+        let (w, _, values) = layer_values(strip, 16, &[], None, &mut notes)?;
         let row = values[..w.min(values.len())].to_vec();
         files.push((colors_file(name), row.iter().flat_map(|v| v.to_le_bytes()).collect()));
         colors.push(Some(row));
@@ -319,7 +344,7 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
     let base = document.layer(TEXELS_LAYER).ok_or_else(|| anyhow!("{source}: no layer {TEXELS_LAYER}"))?;
     let indices = document.group(INDICES);
     let known = indices.and_then(|g| g.layers().find(|l| l.name == TEXELS_LAYER)).map(|l| Known::read(l, bpp)).transpose()?;
-    let mut painted = vec![painting(base, bpp, 0, &palette(Some(0), bpp), known.as_ref())?];
+    let mut painted = vec![painting(base, bpp, 0, &palette(Some(0), bpp), known.as_ref(), &mut notes)?];
     let declared: HashMap<&str, &Value> = asset.parts("cells").into_iter().collect();
     let mut settings = Table::new();
     settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::from(document.width)), Value::Integer(i64::from(document.height))]));
@@ -342,7 +367,7 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
         let known = if own == bpp { known.as_ref() } else { own_known.as_ref() };
         // Its texels are counted at its own depth from where its halfwords start, which is where it is drawn.
         let start = usize::try_from(layer.x).unwrap_or(0) * texels_per_halfword(own) / texels_per_halfword(bpp);
-        let cell = painting(layer, own, start, &palette(cell_palette, own), known)?;
+        let cell = painting(layer, own, start, &palette(cell_palette, own), known, &mut notes)?;
         let rect = [start, usize::try_from(layer.y).unwrap_or(0), cell.width, cell.height];
         let rect = rect.iter().map(|&v| Value::Integer(i64::try_from(v).unwrap_or(0))).collect();
         let mut fields = Table::new();
@@ -365,7 +390,7 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
         }
     }
     files.push((TEXELS.to_string(), texels.stored()));
-    Ok(pe2_ext::Imported { files, settings })
+    Ok(pe2_ext::Imported { files, settings, notes })
 }
 
 /// A texel layer's values at their places: where its texels start (at its own depth), and which it repainted - those
@@ -382,8 +407,15 @@ struct Painting {
     base: bool,
 }
 
-fn painting(layer: &Layer, own: u8, start: usize, palette: &[u16], known: Option<&Known>) -> Result<Painting> {
-    let (width, height, values) = layer_values(layer, own, palette, known)?;
+fn painting(
+    layer: &Layer,
+    own: u8,
+    start: usize,
+    palette: &[u16],
+    known: Option<&Known>,
+    notes: &mut Vec<String>,
+) -> Result<Painting> {
+    let (width, height, values) = layer_values(layer, own, palette, known, notes)?;
     let repainted = values
         .iter()
         .enumerate()
@@ -574,6 +606,25 @@ mod tests {
         // Blue is the warm palette's fourth color; the second red (index 2) beside it stays.
         expected.get_mut("native.texels").unwrap()[1] = 3;
         assert_eq!(imported(painted), expected);
+    }
+
+    #[test]
+    fn a_color_its_palette_lacks_is_taken_as_the_nearest_and_said() {
+        // Blue a shade off, twice: no palette has it, so the import takes the nearest, blue, and says so.
+        let [r, g, b, a] = codecs::texture::rgba(BLUE);
+        let off = [r, g, b.saturating_sub(3), a];
+        let painted = resaved(&source(), &|layer, pixels, _| {
+            if layer == "texels" {
+                pixels[1] = off;
+                pixels[2] = off;
+            }
+        });
+        let made = imported_with(painted, atlas().fields.clone());
+        let texels = &made.files.iter().find(|(n, _)| n == "native.texels").unwrap().1;
+        assert_eq!(texels[1..3], [3, 3]);
+        assert_eq!(made.notes, ["layer texels: 2 texels of 1 color its palette lacks, taken as the nearest it has"]);
+        // The source as exported: nothing said.
+        assert_eq!(imported_with(source(), atlas().fields.clone()).notes, Vec::<String>::new());
     }
 
     #[test]

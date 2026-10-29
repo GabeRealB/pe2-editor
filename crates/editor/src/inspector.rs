@@ -761,6 +761,9 @@ fn import_ui(
             .iter()
             .filter(|(k, v)| !matches!(k.as_str(), "importer" | "source") && !sheet.custom(k) && !is_table_list(v))
             .collect();
+        // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
+        let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
+        let layer = ws.editable_layer().map(|l| l.name.clone());
         let field_edit = &mut ws.field_edit;
         theme::section(ui, "Import", |ui| {
             egui::Grid::new(("import", &asset.path)).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(
@@ -778,6 +781,21 @@ fn import_ui(
                             }
                         });
                         ui.end_row();
+                        if let (Some((category, home)), Some(uid)) = (&tool, &asset.uid) {
+                            ui.label("");
+                            let text = format!("{}  Edit in {}", icons::PENCIL_SIMPLE, category.label().to_lowercase());
+                            let (enabled, says) = match &layer {
+                                Ok(l) if l == home => (true, format!("Open {source} in the {} set in Settings ▸ Tools; what it saves is imported again", category.label().to_lowercase())),
+                                Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
+                                Err(why) => (false, why.clone()),
+                            };
+                            let response = ui.add_enabled(enabled, egui::Button::new(text)).on_hover_text(&says);
+                            let response = if enabled { response } else { response.on_disabled_hover_text(&says) };
+                            if response.clicked() {
+                                *edit = Some(EditRequest::EditIn(uid.clone()));
+                            }
+                            ui.end_row();
+                        }
                     }
                 },
             );

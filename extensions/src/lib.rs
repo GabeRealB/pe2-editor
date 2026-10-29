@@ -266,9 +266,15 @@ mod tests {
         }
         assert!(component::runs(component::CONTRACT).is_ok());
         let said = |c: &str| component::runs(c).unwrap_err();
-        assert!(said("0.2.9").contains("newer than this editor's 0.2.0: update the editor"), "{}", said("0.2.9"));
-        assert!(said("0.1.0").contains("built for contract 0.1, and this editor runs 0.2: rebuild it"), "{}", said("0.1.0"));
-        assert!(said("0.3.0").contains("built for contract 0.3, newer than this editor's 0.2"), "{}", said("0.3.0"));
+        // Around this editor's line, 0.<minor>: newer within it, the line before, the line after, 1.0.
+        let minor: u64 = component::CONTRACT.split('.').nth(1).unwrap().parse().unwrap();
+        let (ours, before, after) = (format!("0.{minor}"), format!("0.{}", minor - 1), format!("0.{}", minor + 1));
+        let newer = format!("{ours}.99");
+        assert!(said(&newer).contains(&format!("newer than this editor's {}: update the editor", component::CONTRACT)));
+        let rebuild = format!("built for contract {before}, and this editor runs {ours}: rebuild it");
+        assert!(said(&format!("{before}.0")).contains(&rebuild), "{}", said(&format!("{before}.0")));
+        let update = format!("built for contract {after}, newer than this editor's {ours}");
+        assert!(said(&format!("{after}.0")).contains(&update), "{}", said(&format!("{after}.0")));
         assert!(said("1.0.0").contains("built for contract 1, newer"), "{}", said("1.0.0"));
         // A component of another line is refused before it is compiled: a built-in's export renamed in place.
         let (_, bytes) = COMPONENTS[0];
@@ -277,7 +283,7 @@ mod tests {
         let ats: Vec<usize> = bytes.windows(name.len()).enumerate().filter(|(_, w)| *w == name.as_bytes()).map(|(at, _)| at).collect();
         assert!(!ats.is_empty(), "its export's name");
         for at in ats {
-            older[at..at + name.len()].copy_from_slice(b"pe2:extension/guest@0.1.0");
+            older[at..at + name.len()].copy_from_slice(format!("pe2:extension/guest@{before}.0").as_bytes());
         }
         let refused = component::load_bytes("older", &older, project::ext::Origin::Builtin).err().expect("refused");
         assert!(format!("{refused:#}").contains("rebuild it with this editor's SDK"), "{refused:#}");

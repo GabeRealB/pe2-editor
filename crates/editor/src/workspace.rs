@@ -211,6 +211,9 @@ pub enum EditRequest {
     RenameTo(String, String),
     Delete(String),
     Resolve(String, project::edit::Resolution),
+    /// Edit the asset's source in the tool its format is edited in: copied into the active layer first where it is
+    /// below it, and imported again when the tool saves it.
+    EditIn(String),
     /// Write a file of the entry (its `asset.toml`; empty: a plain file itself), labeled for the history; edits of one
     /// merge key made in a row are one step.
     Write {
@@ -721,6 +724,7 @@ impl Workspace {
             | EditRequest::RenameTo(uid, _)
             | EditRequest::Delete(uid)
             | EditRequest::Resolve(uid, _)
+            | EditRequest::EditIn(uid)
             | EditRequest::Write { uid, .. } => uid.clone(),
         };
         // Code goes to a files layer: an override of it in an asset layer is asked of the user first
@@ -744,12 +748,48 @@ impl Workspace {
             EditRequest::Write { uid, file, bytes, label, merge } => {
                 edit::write_file(project, index, &name, uid, file, bytes, label.clone(), merge.clone(), history)?
             }
-            EditRequest::Rename(..) => return Ok(String::new()),
+            EditRequest::Rename(..) | EditRequest::EditIn(_) => return Ok(String::new()),
         };
         self.history.note_selection(self.selected.clone());
         let label = self.history.done().last().map_or_default(|s| s.label.clone());
         self.take_in(&paths);
         Ok(label)
+    }
+
+    /// The tool an asset's source is edited in - by the media type of the format it is recognized as - and the source
+    /// file; none where it has no source, or no tool of the settings takes its format.
+    pub fn source_tool(&self, path: &str) -> Option<(crate::external::Category, &project::index::BundleFile)> {
+        let asset = self.index.assets.get(path)?;
+        let name = asset.fields().get("import")?.get("source")?.as_str()?;
+        let file = asset.files.iter().find(|f| f.name == name && f.made_by.is_none())?;
+        let category = self.extensions.recognize(file).into_iter().find_map(|(format, _)| {
+            crate::external::Category::of_media_type(format.media_type.as_deref()?)
+        })?;
+        Some((category, file))
+    }
+
+    /// Edit an asset's source in the tool its format is edited in: where the asset is below the active layer, it is
+    /// overridden there first (a step of the history), so the tool writes the layer's own copy; the watcher brings
+    /// what the tool saves in, and the import runs again. Returns what was done.
+    ///
+    /// # Errors
+    /// No such asset, no source or tool for it, the active layer cannot take it, or the tool cannot be started.
+    pub fn edit_in(&mut self, uid: &str, tools: &crate::settings::Tools) -> anyhow::Result<String> {
+        let path_of = |ws: &Workspace| ws.index.assets.values().find(|a| a.uid.as_deref() == Some(uid)).map(|a| a.path.clone());
+        let path = path_of(self).with_context(|| format!("{uid}: no such asset"))?;
+        let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
+        let (_, source) = self.source_tool(&path).context("it has no source a tool of the settings edits")?;
+        let mut done = vec![];
+        if source.layer != layer {
+            let label = self.edit(&EditRequest::Override(uid.to_string()))?;
+            done.push(label);
+        }
+        let path = path_of(self).unwrap_or(path);
+        let (category, source) = self.source_tool(&path).context("its source is gone")?;
+        anyhow::ensure!(source.layer == layer, "its source is in {}, not in {layer}", source.layer);
+        let opened = crate::external::open_as(&source.path, &path, category, tools).map_err(anyhow::Error::msg)?;
+        done.push(format!("{opened} in the {}: saved, it is imported again", category.label().to_lowercase()));
+        Ok(done.join("; "))
     }
 
     /// The stack's own layers (not the mounts), bottom to top.

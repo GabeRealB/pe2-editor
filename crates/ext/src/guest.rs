@@ -556,7 +556,7 @@ impl g::Guest for Component {
         let made = import.ok_or("the importer makes nothing")?(&lent.asset()).map_err(|e| format!("{e:#}"))?;
         // A document, as the host parses it: an inline table is not one.
         let settings = toml::to_string(&made.settings).map_err(|e| e.to_string())?;
-        Ok(g::Imported { files: made.files, settings })
+        Ok(g::Imported { files: made.files, settings, notes: made.notes })
     }
 
     #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]

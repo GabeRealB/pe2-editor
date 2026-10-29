@@ -8,8 +8,9 @@
 ///
 /// The contract is versioned by semver, a minor version below 1.0 a line: within a line a version only adds functions to
 /// `host`, so a component runs on a host of its line at least as new as what it was built against; any change to
-/// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`).
-package pe2:extension@0.2.0;
+/// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`). 0.3.0: an import's
+/// notes (`imported.notes`).
+package pe2:extension@0.3.0;
 
 interface types {
     /// Pixels as unmultiplied RGBA, row by row.
@@ -337,6 +338,9 @@ interface guest {
     record imported {
         files: list<tuple<string, list<u8>>>,
         settings: string,
+        /// What the import took otherwise than the source has it (colors matched to the nearest a palette has): said
+        /// to the user, as warnings of the asset.
+        notes: list<string>,
     }
 
     /// An importer's work: what it makes of the source an asset names.

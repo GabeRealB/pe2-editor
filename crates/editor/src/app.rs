@@ -253,6 +253,13 @@ impl Editor {
             return;
         }
         let Some(ws) = &mut self.workspace else { return };
+        if let EditRequest::EditIn(uid) = request {
+            self.message = Some(match ws.edit_in(uid, &self.settings.tools) {
+                Ok(done) => done,
+                Err(e) => format!("{e:#}"),
+            });
+            return;
+        }
         if let EditRequest::Override(uid) = request {
             match ws.override_choice(uid) {
                 Err(why) => {

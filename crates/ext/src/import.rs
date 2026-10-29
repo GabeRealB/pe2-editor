@@ -59,6 +59,9 @@ pub type Made = Vec<(String, Vec<u8>)>;
 pub struct Imported {
     pub files: Made,
     pub settings: crate::Table,
+    /// What it took otherwise than the source has it (colors matched to the nearest a palette has), said to the user
+    /// as warnings of the asset.
+    pub notes: Vec<String>,
 }
 
 /// An import: what it makes of the asset's source (the file its `[import]` section names), by its settings.

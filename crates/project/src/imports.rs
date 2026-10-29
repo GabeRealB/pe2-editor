@@ -72,6 +72,9 @@ struct Manifest {
     files: BTreeMap<String, Made>,
     #[serde(default)]
     settings: Table,
+    /// What the import took otherwise than the source has it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
 }
 
 /// The key of an import: its importer (qualified) and its extension's version as loaded, its source's hash and the
@@ -114,7 +117,7 @@ impl Imports {
             write_atomic(&dir.join(name), bytes)?;
             files.insert(name.clone(), Made { sha1: sha1_hex(bytes), size: bytes.len() as u64 });
         }
-        let manifest = Manifest { files, settings: imported.settings.clone() };
+        let manifest = Manifest { files, settings: imported.settings.clone(), notes: imported.notes.clone() };
         write_atomic(&dir.join(MADE), toml::to_string(&manifest)?.as_bytes())
     }
 
@@ -155,7 +158,9 @@ impl Imports {
                 },
             };
             let derives = extensions.importer(&importer).map_or_default(|i| i.derives.clone());
-            let resolved = Arc::new(resolve(asset.fields(), &manifest.settings, &derives));
+            let mut resolved = resolve(asset.fields(), &manifest.settings, &derives);
+            resolved.notes = manifest.notes;
+            let resolved = Arc::new(resolved);
             let import = Arc::new(Known { files: manifest.files.into_iter().collect(), resolved });
             known.insert(key.clone(), import.clone());
             found.push((asset.path.clone(), importer, key, import));
@@ -187,6 +192,7 @@ impl Imports {
                 setting: setting.clone(),
             }));
             problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
+            problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
             asset.imported = Some(resolved.clone());
         }
         problems.extend(self.missing_parts(index, extensions));
@@ -202,6 +208,7 @@ impl Imports {
                     | Problem::Overridden { .. }
                     | Problem::Orphan { .. }
                     | Problem::MissingPart { .. }
+                    | Problem::Taken { .. }
                     | Problem::Extension { .. }
             )
         });
@@ -296,7 +303,7 @@ pub fn resolve(declared: &Table, made: &Table, paths: &[String]) -> Imported {
     for path in paths {
         place(&mut settings, made, &steps(path), "", &mut overridden, &mut orphans);
     }
-    Imported { settings, text: std::sync::OnceLock::new(), overridden, orphans }
+    Imported { settings, text: std::sync::OnceLock::new(), overridden, orphans, notes: vec![] }
 }
 
 fn place(
@@ -470,7 +477,7 @@ mod attaching {
                 let mut settings = Table::new();
                 settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
                 settings.insert("cells".into(), Value::Table(cells));
-                Ok(Imported { files: vec![("native.bin".into(), source.bytes().rev().collect())], settings })
+                Ok(Imported { files: vec![("native.bin".into(), source.bytes().rev().collect())], settings, notes: vec![] })
             })
             .register();
         Ok(())
