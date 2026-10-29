@@ -199,10 +199,11 @@ impl Store {
         write_atomic(&path, toml::to_string(&kept)?.as_bytes())
     }
 
-    /// Whether a value is kept, as this store reads values.
+    /// Whether a value is kept. (One this store cannot read - written otherwise - is found when it is read, and made
+    /// again.)
     #[must_use]
     pub fn has(&self, hash: &str) -> bool {
-        self.describe(hash).is_some()
+        self.value_path(hash).exists()
     }
 
     /// A kept value's description, without reading its blobs.
@@ -253,11 +254,20 @@ impl Store {
 
     /// Remove the traces of nodes not `live`, and of each live node's output all but the newest (what made it
     /// before) - never those under the keys `used`, which what swept them reads - then the values no trace left
-    /// names, then the blobs no value left names: what was swept, as (traces, values, blobs).
+    /// names, then the blobs no value left names: what was swept, as (traces, values, blobs). It may run beside what
+    /// keeps outputs: what was written since a little before it began is left (a value's blobs are written before it,
+    /// it before its trace).
     #[must_use = "what was swept is the sweep's report"]
     pub fn sweep(&self, live: &HashSet<String>, used: &HashSet<&String>) -> (usize, usize, usize) {
+        self.sweep_older(live, used, std::time::SystemTime::now() - std::time::Duration::from_secs(2))
+    }
+
+    /// Sweep as `sweep` does what was written before `began`.
+    #[must_use = "what was swept is the sweep's report"]
+    pub fn sweep_older(&self, live: &HashSet<String>, used: &HashSet<&String>, began: std::time::SystemTime) -> (usize, usize, usize) {
         let stem = |e: &std::fs::DirEntry| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_string);
-        let entries = |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten();
+        let young = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m >= began);
+        let entries = |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
         let mut swept = (0, 0, 0);
         // Each live output's newest trace, by when it was written.
         let mut newest: HashMap<(String, String), (std::time::SystemTime, String, String)> = HashMap::new();
@@ -314,7 +324,7 @@ impl Store {
             }
         }
         for dir in entries("blobs") {
-            for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten().filter(|e| !young(e)) {
                 let name = entry.file_name();
                 if !name.to_str().is_some_and(|n| blobs.contains(n)) && std::fs::remove_file(entry.path()).is_ok() {
                     swept.2 += 1;

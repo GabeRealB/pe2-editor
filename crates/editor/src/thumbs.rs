@@ -106,7 +106,7 @@ impl Thumbs {
 
 /// A thumbnail: read back from the store, or made by its extension and kept.
 fn make(extensions: &Extensions, engine: &Engine, asset: &Asset) -> Option<egui::ColorImage> {
-    let given = extensions.output(engine, asset, project::graph::THUMBNAIL, true).ok()?;
+    let given = extensions.thumbnail(engine, asset).ok()?;
     let Some(project::graph::Value::Image(image)) = given.value.as_deref() else { return None };
     Some(egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba))
 }

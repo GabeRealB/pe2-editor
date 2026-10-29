@@ -348,7 +348,7 @@ impl Workspace {
         let mut index = Index::open_reporting(&project, &cache, report)?;
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
-        let kept = store.clone();
+        let (kept, sweeping) = (store.clone(), store.clone());
         let old = cache.path("artifacts");
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
@@ -369,6 +369,11 @@ impl Workspace {
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
         let _ = imports.attach_reporting(&mut index, &extensions, report);
+        // What the store keeps that nothing makes any more goes, aside: it reads all the store keeps.
+        let (sweeping, nodes) = (sweeping, project::imports::live_nodes(&index));
+        let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
+            let _ = sweeping.sweep(&nodes, &std::collections::HashSet::new());
+        });
         report("Building the tree", 0, 0);
         let tree = Arc::new(Node::build(&index, &extensions));
         Ok(Opened {

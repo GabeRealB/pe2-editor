@@ -566,7 +566,7 @@ impl Extensions {
             .iter()
             .map(|o| graph::Tail {
                 name: o.name.clone(),
-                given: None,
+                fixed: false,
                 op: o.op.clone(),
                 retain: o.retain,
                 from: None,
@@ -577,9 +577,8 @@ impl Extensions {
             let mut settings = Table::new();
             settings.insert("side".into(), Value::Integer(THUMBNAIL_SIDE));
             let (name, op) = (graph::THUMBNAIL.to_string(), graph::THUMBNAIL.to_string());
-            // Of its first look, where its picture is a family.
-            let given = self.pictured(asset).and_then(|(o, members)| members.into_iter().next().filter(|_| self.family(o))).map(|(key, _)| key);
-            tail.push(graph::Tail { name, given, op, retain: pe2_ext::Retain::Cache, from: Some(pictured), settings });
+            // One picture: of its first look, which `thumbnail` supplies when it is asked for.
+            tail.push(graph::Tail { name, fixed: true, op, retain: pe2_ext::Retain::Cache, from: Some(pictured), settings });
         }
         tail
     }
@@ -677,10 +676,22 @@ impl Extensions {
         }
     }
 
-    /// Whether an asset has a thumbnail: it has a picture.
+    /// Whether an asset may have a thumbnail: its kind shows its nodes by a picture. (Whether this one has one is known
+    /// once it is asked for: `thumbnail`.)
     #[must_use]
     pub fn has_thumbnail(&self, asset: &index::Asset) -> bool {
-        self.has_picture(asset)
+        self.shows_pictures(asset)
+    }
+
+    /// An asset's thumbnail, through `engine`: its picture in its first look, made small, kept.
+    ///
+    /// # Errors
+    /// It has no picture, or it could not be made.
+    pub fn thumbnail(&self, engine: &graph::exec::Engine, asset: &index::Asset) -> Result<graph::exec::Given> {
+        let (output, members) = self.pictured(asset).context("it has no picture")?;
+        let first = members.first().filter(|_| self.family(output)).map(|(key, _)| key.as_str());
+        let (plan, _) = self.plan(asset);
+        engine.output_with(&plan, asset, graph::THUMBNAIL, first, true)
     }
 
     /// The fields an asset's kind and role describe, the role's first.

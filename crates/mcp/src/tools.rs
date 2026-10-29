@@ -513,7 +513,14 @@ fn problems(index: &Index, limit: usize) -> Value {
 fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Result<CallToolResult, String> {
     use project::graph::{Content, Value as Made};
     let asset = asset(index, &args.asset)?;
-    let given = extensions.output(&extensions.engine(), asset, &args.output, true).map_err(|e| format!("{e:#}"))?;
+    let engine = extensions.engine();
+    // The thumbnail is of the first look, which it is given when asked for.
+    let given = if args.output == project::graph::THUMBNAIL {
+        extensions.thumbnail(&engine, asset)
+    } else {
+        extensions.output(&engine, asset, &args.output, true)
+    };
+    let given = given.map_err(|e| format!("{e:#}"))?;
     let value = given.value.ok_or_else(|| format!("{}: {} made nothing", asset.path, args.output))?;
     let text = |v: Value| Ok(CallToolResult::success(vec![ContentBlock::text(v.to_string())]));
     let file = |f: &project::graph::File| {

@@ -195,9 +195,9 @@ pub struct Output {
     pub name: String,
     /// Its parameter, for a family: each output addressed `<name>/<value>`.
     pub parameter: Option<String>,
-    /// The value it gives the parameter what it reaches has, where it is one output of what would be a family (the
-    /// thumbnail: of the first look).
-    pub given: Option<String>,
+    /// One output, though what it reaches has a parameter: its value supplied by whoever asks (the thumbnail, of
+    /// the first look: `Engine::output_with`).
+    pub fixed: bool,
     /// The step whose value it is.
     pub from: usize,
     pub retain: Retain,
@@ -220,8 +220,8 @@ pub struct Plan {
 #[derive(Clone, Debug)]
 pub struct Tail {
     pub name: String,
-    /// The value it gives the parameter of what it reaches, making it one output rather than a family.
-    pub given: Option<String>,
+    /// One output rather than a family, the value of the parameter it reaches supplied by whoever asks.
+    pub fixed: bool,
     pub op: String,
     pub retain: Retain,
     pub from: Option<usize>,
@@ -289,8 +289,8 @@ impl Plan {
             if let Some(step) = step {
                 let mut layer = Table::new();
                 layer.insert("name".into(), output.name.clone().into());
-                if let Some(given) = &output.given {
-                    layer.insert("given".into(), given.clone().into());
+                if output.fixed {
+                    layer.insert("fixed".into(), true.into());
                 }
                 layer.insert("retain".into(), retain_name(output.retain).into());
                 lowering.output(&layer, step, &at);
@@ -462,7 +462,7 @@ impl Lowering<'_> {
 
     /// Each output a family of the parameter the operations it reaches have: one at most - two are a problem.
     fn families(&mut self) {
-        let families: Vec<usize> = (0..self.plan.outputs.len()).filter(|o| self.plan.outputs[*o].given.is_none()).collect();
+        let families: Vec<usize> = (0..self.plan.outputs.len()).filter(|o| !self.plan.outputs[*o].fixed).collect();
         for o in families {
             let reached = self.plan.reached(&[o]);
             let mut parameters: Vec<&String> = (0..self.plan.steps.len())
@@ -515,8 +515,8 @@ impl Lowering<'_> {
             }
         };
         // A family where what it reaches has a parameter: found once it is lowered (`families`).
-        let given = layer.get("given").and_then(Toml::as_str).map(str::to_string);
-        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, given, from, retain, eager, at: at.to_string() });
+        let fixed = layer.get("fixed").and_then(Toml::as_bool).unwrap_or(false);
+        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, fixed, from, retain, eager, at: at.to_string() });
     }
 
     /// A graph layer's operations, after those they take from (the layer above's result as `above`): its result's

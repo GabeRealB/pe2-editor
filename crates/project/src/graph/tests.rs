@@ -94,6 +94,11 @@ fn file(bytes: Vec<u8>) -> Value {
     Value::Typed(Typed::new(pe2_ext::data::BYTES, vec![File::new("made", bytes)]))
 }
 
+/// A moment from now: a sweep then takes what was just written.
+fn later() -> std::time::SystemTime {
+    std::time::SystemTime::now() + std::time::Duration::from_secs(60)
+}
+
 fn ops() -> Ops {
     let mut ops = Ops::default();
     let file_type = || Type::File(Box::new(Type::Any));
@@ -304,7 +309,7 @@ fn a_kept_output_holds_while_what_it_read_does() {
     assert!(!changed.kept);
     assert_eq!(data(&node, changed.value.as_deref().unwrap()), b"abcd");
     // Swept: the trace no longer live, its value and blob go.
-    let swept = engine.store().unwrap().sweep(&HashSet::new(), &HashSet::new());
+    let swept = engine.store().unwrap().sweep_older(&HashSet::new(), &HashSet::new(), later());
     assert_eq!(swept, (1, 2, 2));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -335,7 +340,7 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let node = Bundle::new(stack, &[("a.txt", "abc"), ("b.txt", "unread")]);
-    let tail = [Tail { name: "counted".into(), given: None, op: "t.count".into(), retain: Retain::Cache, from: None, settings: toml::Table::new() }];
+    let tail = [Tail { name: "counted".into(), fixed: false, op: "t.count".into(), retain: Retain::Cache, from: None, settings: toml::Table::new() }];
     let (plan, problems) = Plan::of(&node.fields, &engine.ops, &tail);
     assert!(problems.is_empty(), "{problems:?}");
     // The kept native form is taken as made: `upper` runs once, for it, and not again for what is made of it.
@@ -355,8 +360,8 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     // written out for the count's port asking for a file (`ABCD`), which no value names; a node no longer live, all of
     // it - its two traces, their values, the native form's blob.
     let live: HashSet<String> = ["test/bundle".to_string()].into();
-    assert_eq!(engine.store().unwrap().sweep(&live, &HashSet::new()), (0, 1, 1));
-    assert_eq!(engine.store().unwrap().sweep(&HashSet::new(), &HashSet::new()), (2, 2, 1));
+    assert_eq!(engine.store().unwrap().sweep_older(&live, &HashSet::new(), later()), (0, 1, 1));
+    assert_eq!(engine.store().unwrap().sweep_older(&HashSet::new(), &HashSet::new(), later()), (2, 2, 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

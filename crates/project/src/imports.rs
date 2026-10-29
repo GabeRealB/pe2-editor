@@ -74,6 +74,13 @@ impl Imports {
         Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), parts: Mutex::default() })
     }
 
+    /// Sweep the store of what the project's nodes no longer make, and of what nodes it no longer has made
+    /// (`Store::sweep`): what was swept, as (traces, values, blobs). It reads all the store keeps - a third of a
+    /// second for the game - so it is run aside, not on the way to anything.
+    pub fn sweep(&self, index: &Index) -> (usize, usize, usize) {
+        self.store.sweep(&live_nodes(index), &HashSet::new())
+    }
+
     /// The engine imports are made by: the extensions' operations, keeping in the store.
     #[must_use]
     pub fn engine(&self, extensions: &Extensions) -> Engine {
@@ -160,9 +167,6 @@ impl Imports {
         if only.is_none() {
             let live: HashSet<&String> = found.iter().map(|(_, key, _)| key).collect();
             known.retain(|key, _| live.contains(key));
-            // What the project's nodes no longer make, and what nodes it no longer has made.
-            let nodes: HashSet<String> = index.assets.values().map(|a| graph::exec::id(&**a).to_string()).collect();
-            let _ = self.store.sweep(&nodes, &live);
         }
         drop(known);
         let mut problems: Vec<Problem> =
@@ -259,14 +263,16 @@ impl Imports {
         (importer, plan, output): (String, &Plan, usize),
         key: &str,
     ) -> Result<(bool, Reads, Arc<Known>)> {
-        let (made, trace) = if let Some(trace) = engine.kept(plan, asset, output, None) {
-            (false, trace)
+        // Found kept and readable as this store reads values, else made now.
+        let found = engine.kept(plan, asset, output, None).and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
+        let (made, (kept, trace)) = if let Some(found) = found {
+            (false, found)
         } else {
-            let output = &plan.outputs[output];
-            engine.output(plan, asset, &output.name, false)?;
-            (true, self.store.trace(key).context("its import was not kept")?)
+            engine.output(plan, asset, &plan.outputs[output].name, true)?;
+            let trace = self.store.trace(key).context("its import was not kept")?;
+            (true, (self.store.describe(&trace.value).context("its import was not kept")?, trace))
         };
-        let Some(Kept::Typed { files, settings, notes, .. }) = self.store.describe(&trace.value) else {
+        let Kept::Typed { files, settings, notes, .. } = kept else {
             anyhow::bail!("its import is kept as something else than an extension's type");
         };
         let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
@@ -275,6 +281,12 @@ impl Imports {
         let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
         Ok((made, trace.reads, Arc::new(Known { importer, files, resolved: Arc::new(resolved) })))
     }
+}
+
+/// The project's nodes, as traces name them: what the store keeps for others goes in a sweep.
+#[must_use]
+pub fn live_nodes(index: &Index) -> HashSet<String> {
+    index.assets.values().map(|a| graph::exec::id(&**a).to_string()).collect()
 }
 
 /// What makes an asset's result - the operation its stack ends with - and the output keeping it, where its result is
@@ -578,6 +590,10 @@ mod attaching {
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (1, 0));
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingPart { .. })));
+        // Swept, the old import goes.
+        let store = crate::graph::store::Store::at(root.join(".cache/store")).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let _ = store.sweep_older(&super::live_nodes(&index), &std::collections::HashSet::new(), later);
         let kept = |sub: &str| std::fs::read_dir(root.join(".cache/store").join(sub)).unwrap().count();
         assert_eq!((kept("traces"), kept("values")), (1, 1));
         std::fs::remove_dir_all(&root).unwrap();

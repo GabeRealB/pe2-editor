@@ -503,17 +503,27 @@ impl Engine {
     /// # Errors
     /// The node has no such output, or it could not be made or kept.
     pub fn output(&self, plan: &Plan, node: &dyn Node, address: &str, read: bool) -> Result<Given> {
+        self.output_with(plan, node, address, None, read)
+    }
+
+    /// An output as `output` makes it, the parameter of what it reaches given this value where the address gives none
+    /// (a fixed output: the thumbnail's look).
+    ///
+    /// # Errors
+    /// As `output`.
+    pub fn output_with(&self, plan: &Plan, node: &dyn Node, address: &str, supplied: Option<&str>, read: bool) -> Result<Given> {
         let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
-        let parameter = parameter.as_deref().or(plan.outputs[output].given.as_deref());
+        let parameter = parameter.as_deref().or(supplied);
         let retained = plan.outputs[output].retain != Retain::Transient;
         if retained && let Some(trace) = self.kept(plan, node, output, parameter) {
-            let value = if read {
-                let store = self.store.as_ref().context("no store")?;
-                Some(Arc::new(store.get(&trace.value).with_context(|| format!("{}: kept, and not readable", trace.value))?))
-            } else {
-                None
+            // Read where asked; one kept as this store does not read values is made again.
+            let value = match (read, &self.store) {
+                (true, Some(store)) => store.get(&trace.value).ok().map(Arc::new),
+                _ => None,
             };
-            return Ok(Given { value, hash: trace.value, kept: true, reads: trace.reads });
+            if value.is_some() || !read {
+                return Ok(Given { value, hash: trace.value, kept: true, reads: trace.reads });
+            }
         }
         let known = self.known(plan, node, output);
         let (mut made, reads) = evaluate(plan, &self.ops, node, &[(output, parameter)], &known, self.store.as_ref());
