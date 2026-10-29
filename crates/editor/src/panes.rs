@@ -1303,8 +1303,9 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
     }
     theme::section(ui, "Extensions", |ui| {
         let memory = ws.extensions.memory();
-        for extension in &ws.extensions.loaded {
-            ui.horizontal(|ui| {
+        // A column each - name, version, origin, memory - aligned across the rows.
+        egui::Grid::new("project extensions").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
+            for extension in &ws.extensions.loaded {
                 ui.label(RichText::new(&extension.id).strong());
                 ui.label(RichText::new(&extension.version).color(theme::weak()));
                 match &extension.origin {
@@ -1315,19 +1316,30 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
                         ui.label(RichText::new("linked in").small().color(ui.visuals().warn_fg_color))
                             .on_hover_text("PE2_EXTENSIONS=linked: its crate runs in the editor, not its component");
                     }
-                    project::ext::Origin::Component(path) => {
-                        theme::short(ui, RichText::new(path.display().to_string()).small().color(theme::weak()));
+                    project::ext::Origin::Project { asset, .. } => {
+                        ui.label(RichText::new("project").small().color(theme::weak())).on_hover_text(asset);
+                    }
+                    project::ext::Origin::User(path) | project::ext::Origin::Component(path) => {
+                        let text = path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
+                        ui.label(RichText::new(text).small().color(theme::weak())).on_hover_text(path.display().to_string());
                     }
                 }
-                // What its instances hold: a guest's memory only grows, until an idle instance is dropped.
-                if let Some((_, m)) = memory.iter().find(|(id, _)| *id == extension.id) {
-                    let mib = |bytes: usize| bytes.div_ceil(1 << 20);
-                    let text = format!("{} MiB in {} instance{}", mib(m.bytes), m.instances, if m.instances == 1 { "" } else { "s" });
-                    ui.label(RichText::new(text).small().color(theme::weak()))
-                        .on_hover_text(format!("The most one instance has held: {} MiB", mib(m.peak)));
+                // What its instances hold now: a guest's memory only grows, until its instance is reclaimed.
+                match memory.iter().find(|(id, _)| *id == extension.id).filter(|(_, m)| m.instances > 0) {
+                    Some((_, m)) => {
+                        let mib = |bytes: usize| bytes.div_ceil(1 << 20);
+                        let s = if m.instances == 1 { "" } else { "s" };
+                        ui.label(RichText::new(format!("{} MiB", mib(m.bytes))).small().color(theme::weak())).on_hover_text(
+                            format!("Held by {} instance{s}; the most one has held: {} MiB", m.instances, mib(m.peak)),
+                        );
+                    }
+                    None => {
+                        ui.label("");
+                    }
                 }
-            });
-        }
+                ui.end_row();
+            }
+        });
     });
     theme::section(ui, "Layers", |ui| {
         for layer in &p.layers {

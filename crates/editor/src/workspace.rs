@@ -164,6 +164,10 @@ pub struct Workspace {
     imports: project::imports::Imports,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
+    /// The components found beside the built-ins when the project was opened: another finding reopens it.
+    extensions_found: Vec<extensions::Found>,
+    /// When the user's extensions folder was last looked at, which no watcher follows.
+    extensions_checked: std::time::Instant,
     pub tree: Node,
     /// The tree's paths (an asset's without `.asset`) that can be modified, and the folders holding one: the rest is
     /// drawn dimmed.
@@ -230,8 +234,9 @@ pub enum Update {
     Nothing,
     /// This many assets were added, changed or removed.
     Refreshed(usize),
-    /// `project.toml` changed: its layers may have, so the project is opened again.
-    Reopen,
+    /// The project is opened again, as this changed: `project.toml` (its layers, the extensions it leaves off) or
+    /// the extensions found (one in the project or the user's folder came, went or changed).
+    Reopen(&'static str),
 }
 
 /// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its kind draws it.
@@ -297,7 +302,9 @@ impl Workspace {
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
         // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
-        let extensions = extensions::for_project(&project.disabled_extensions);
+        // Its own (`extension` assets) and the user's before the built-ins.
+        let extensions_found = extensions::found(Some(&index));
+        let extensions = extensions::for_project(&project, Some(&index));
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
         let _ = imports.attach(&mut index, &extensions);
@@ -328,6 +335,8 @@ impl Workspace {
             requests: None,
             window_requests: Vec::new(),
             link_error: None,
+            extensions_found,
+            extensions_checked: std::time::Instant::now(),
             imports,
             tree,
             editable: HashSet::new(),
@@ -421,6 +430,13 @@ impl Workspace {
     /// Bring in what the watcher saw: the index refreshed, the pictures of the assets that changed forgotten, the
     /// tree built again, a selection that is gone dropped.
     pub fn update(&mut self) -> Update {
+        // The user's extensions folder, looked at each second.
+        if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
+            self.extensions_checked = std::time::Instant::now();
+            if extensions::found(Some(&self.index)) != self.extensions_found {
+                return Update::Reopen("an extension changed");
+            }
+        }
         let Some(watch) = &self.watch else { return Update::Nothing };
         let mut paths = Vec::new();
         for change in watch.poll() {
@@ -466,7 +482,11 @@ impl Workspace {
             }
         };
         if refreshed.project_file {
-            return Update::Reopen;
+            return Update::Reopen("project.toml changed");
+        }
+        // An `extension` asset came, went or changed.
+        if extensions::found(Some(&self.index)) != self.extensions_found {
+            return Update::Reopen("an extension changed");
         }
         let _ = self.imports.attach(&mut self.index, &self.extensions);
         self.layers = self.index.layers();

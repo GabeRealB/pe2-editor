@@ -163,7 +163,10 @@ fn main() -> Result<()> {
                 eprintln!("warning: {why}");
             }
             let options = project::extract::Options { releases: release, roms, declarations };
-            let extensions = extensions::for_project(&p.disabled_extensions);
+            // Its own extensions (`extension` assets, in its layers above the game's) and the user's.
+            let index = project::cache::Cache::open(&p, &lock).and_then(|cache| project::index::Index::open(&p, &cache));
+            let extensions = extensions::for_project(&p, index.as_ref().ok());
+            drop(index);
             for problem in &extensions.problems {
                 eprintln!("warning: {problem}");
             }

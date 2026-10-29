@@ -132,8 +132,12 @@ fn tint(tint: Tint) -> Color32 {
     }
 }
 
-/// An asset kind's icon and its tint, as its extension registers it; a kind no extension registers, dashed.
+/// An asset kind's icon and its tint, as its extension registers it; the host's `extension`, a plug; a kind no
+/// extension registers, dashed.
 pub fn for_kind(extensions: &Extensions, kind: Option<&str>) -> (&'static str, Color32) {
+    if kind == Some(project::ext::EXTENSION_KIND) {
+        return (PLUGS_CONNECTED, CODE);
+    }
     match kind.and_then(|k| extensions.icon(k)) {
         Some((icon, family)) => (glyph(icon), tint(family)),
         None => (FILE_DASHED, PLAIN),

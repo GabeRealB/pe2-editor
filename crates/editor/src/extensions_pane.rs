@@ -35,14 +35,18 @@ const GAP: egui::Vec2 = egui::vec2(28.0, 54.0);
 pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, message: &mut Option<String>) {
     let id = egui::Id::unique("extensions pane");
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
-    let present = ws.extensions.present.clone();
+    // One of an id in effect; those whose place it takes are listed, and named in its details.
+    let all = ws.extensions.present.clone();
+    let present: Vec<Present> = all.iter().filter(|p| !matches!(p.status, Status::Replaced(_))).cloned().collect();
     if state.selected.as_ref().is_none_or(|s| !present.iter().any(|p| p.id == *s)) {
         state.selected = present.first().map(|p| p.id.clone());
     }
-    egui::Panel::right("extension details").resizable(true).default_size(320.0).show(ui, |ui| {
+    // At most most of the pane: a long value is cut short in it, never widening it over the graph.
+    let widest = (ui.available_width() * 0.5).max(260.0);
+    egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(260.0..=widest).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(selected) = state.selected.clone() {
-                details_ui(ui, ws, &present, &selected, &mut state, message);
+                details_ui(ui, ws, &all, &present, &selected, &mut state, message);
             }
         });
     });
@@ -50,7 +54,7 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, message: &mut Option
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             graph_ui(ui, &present, &mut state);
             ui.add_space(10.0);
-            list_ui(ui, &present, &mut state);
+            list_ui(ui, &all, &mut state);
         });
     });
     ui.data_mut(|d| d.insert_temp(id, state));
@@ -67,7 +71,7 @@ fn requirement(text: &str) -> (&str, Option<&str>) {
 fn status_color(ui: &egui::Ui, status: Option<&Status>) -> Color32 {
     match status {
         Some(Status::Loaded) => theme::accent(),
-        Some(Status::Disabled) => theme::weak(),
+        Some(Status::Disabled | Status::Replaced(_)) => theme::weak(),
         Some(Status::Refused(_)) => ui.visuals().error_fg_color,
         None => ui.visuals().warn_fg_color,
     }
@@ -78,6 +82,7 @@ fn status_text(status: &Status) -> &'static str {
         Status::Loaded => "loaded",
         Status::Disabled => "left off by the project",
         Status::Refused(_) => "not loaded",
+        Status::Replaced(_) => "replaced",
     }
 }
 
@@ -86,6 +91,8 @@ fn origin_text(origin: &Origin) -> String {
         Origin::Builtin => "built in".into(),
         Origin::Linked => "linked in".into(),
         Origin::Component(path) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        Origin::Project { .. } => "project".into(),
+        Origin::User(_) => "user".into(),
     }
 }
 
@@ -219,30 +226,57 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
             }
         }
         let text = if dim { theme::weak() } else { theme::text() };
-        painter.text(rect.center_top() + egui::vec2(0.0, 13.0), egui::Align2::CENTER_CENTER, id.as_str(), egui::TextStyle::Body.resolve(ui.style()), text);
-        let note = found.map_or_else(|| "not installed".to_string(), |p| format!("{}  ·  {}", p.version, origin_text(&p.origin)));
-        painter.text(rect.center_bottom() - egui::vec2(0.0, 12.0), egui::Align2::CENTER_CENTER, note, font.clone(), theme::weak());
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        fitted(&painter, rect.center_top() + egui::vec2(0.0, 13.0), id, body, text, NODE.x - 12.0);
+        let note = found.map_or_else(
+            || "not installed".to_string(),
+            |p| if p.version.is_empty() { origin_text(&p.origin) } else { format!("{}  ·  {}", p.version, origin_text(&p.origin)) },
+        );
+        fitted(&painter, rect.center_bottom() - egui::vec2(0.0, 12.0), &note, font.clone(), theme::weak(), NODE.x - 12.0);
     }
 }
 
-/// Every extension by name, filtered.
-fn list_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
+/// Text on one line centered at `at`, cut short with an ellipsis where wider than `width`.
+fn fitted(painter: &egui::Painter, at: egui::Pos2, text: &str, font: egui::FontId, color: Color32, width: f32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    let galley = painter.layout_job(job);
+    painter.galley(at - galley.size() / 2.0, galley, color);
+}
+
+/// Every extension by name, filtered: those in effect, then those whose place one takes.
+fn list_ui(ui: &mut egui::Ui, all: &[Present], state: &mut State) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(icons::MAGNIFYING_GLASS).color(theme::weak()));
         ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter extensions").desired_width(220.0));
     });
     let filter = state.filter.to_lowercase();
-    // A column each - name, version, what became of it - so they line up across the rows.
-    egui::Grid::new("extensions list").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
-        for p in present.iter().filter(|p| p.id.to_lowercase().contains(&filter)) {
-            let selected = state.selected.as_deref() == Some(p.id.as_str());
-            if ui.selectable_label(selected, RichText::new(&p.id).strong()).clicked() {
-                state.selected = Some(p.id.clone());
+    let (replaced, effective): (Vec<&Present>, Vec<&Present>) =
+        all.iter().filter(|p| p.id.to_lowercase().contains(&filter)).partition(|p| matches!(p.status, Status::Replaced(_)));
+    // A column each - what became of it (a dot, said on hover), name, version, where from - lined up across the rows.
+    // Scrolled sideways where the pane is narrower than the columns, never cut.
+    egui::ScrollArea::horizontal().id_salt("extensions list").show(ui, |ui| {
+        egui::Grid::new("extensions list").num_columns(4).min_col_width(0.0).spacing([10.0, 4.0]).show(ui, |ui| {
+            for p in effective.into_iter().chain(replaced) {
+                let said = match &p.status {
+                    Status::Refused(why) => format!("not loaded: {why}"),
+                    Status::Replaced(by) => format!("replaced by {by}"),
+                    status => status_text(status).to_string(),
+                };
+                let (dot, response) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, status_color(ui, Some(&p.status)));
+                response.on_hover_text(said);
+                let selected = state.selected.as_deref() == Some(p.id.as_str()) && !matches!(p.status, Status::Replaced(_));
+                let name = RichText::new(&p.id).strong();
+                let name = if matches!(p.status, Status::Replaced(_)) { name.color(theme::weak()) } else { name };
+                if ui.selectable_label(selected, name).clicked() {
+                    state.selected = Some(p.id.clone());
+                }
+                ui.label(RichText::new(&p.version).color(theme::weak()));
+                ui.label(RichText::new(origin_text(&p.origin)).small().color(theme::weak()));
+                ui.end_row();
             }
-            ui.label(RichText::new(&p.version).color(theme::weak()));
-            ui.label(RichText::new(status_text(&p.status)).small().color(status_color(ui, Some(&p.status))));
-            ui.end_row();
-        }
+        });
     });
 }
 
@@ -250,6 +284,7 @@ fn list_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
 fn details_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
+    all: &[Present],
     present: &[Present],
     selected: &str,
     state: &mut State,
@@ -267,25 +302,44 @@ fn details_ui(
         egui::Grid::new("extension about").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
             let mut row = |label: &str, value: String| {
                 ui.label(RichText::new(label).color(theme::weak()));
-                ui.label(value);
+                theme::short(ui, value.as_str()).on_hover_text(value);
                 ui.end_row();
             };
-            row("Version", p.version.clone());
+            // One that cannot be read says nothing of who it is.
+            let read = !p.version.is_empty();
+            if read {
+                row("Version", p.version.clone());
+            }
             row("From", origin_text(&p.origin));
+            match &p.origin {
+                Origin::Project { asset, .. } => row("Asset", asset.clone()),
+                Origin::User(path) | Origin::Component(path) => row("File", path.display().to_string()),
+                Origin::Builtin | Origin::Linked => {}
+            }
+            for q in all.iter().filter(|q| q.id == p.id && matches!(q.status, Status::Replaced(_))) {
+                row("In place of", format!("{} {}", q.version, origin_text(&q.origin)));
+            }
             let contract = match p.origin {
                 Origin::Linked => "linked in: none".to_string(),
                 _ => "pe2:extension@0.1.0".to_string(),
             };
-            row("Contract", contract);
+            if read {
+                row("Contract", contract);
+            }
             if let Some(size) = p.size {
                 row("Size", format!("{} KB", size.div_ceil(1024)));
             }
             if let Some(load) = p.load {
                 row("Loaded in", format!("{:.1} ms", load.as_secs_f64() * 1000.0));
             }
-            if let Some((_, m)) = ws.extensions.memory().into_iter().find(|(id, _)| *id == p.id) {
+            if let Some((_, m)) = ws.extensions.memory().into_iter().find(|(id, _)| *id == p.id).filter(|(_, m)| m.peak > 0) {
                 let mib = |bytes: usize| bytes.div_ceil(1 << 20);
-                row("Memory", format!("{} MiB in {} instance{}, at most {} MiB", mib(m.bytes), m.instances, if m.instances == 1 { "" } else { "s" }, mib(m.peak)));
+                let now = match m.instances {
+                    0 => "none held now".to_string(),
+                    n => format!("{} MiB in {n} instance{}", mib(m.bytes), if n == 1 { "" } else { "s" }),
+                };
+                row("Memory", now);
+                row("Most held", format!("{} MiB", mib(m.peak)));
             }
         });
     });
@@ -336,7 +390,11 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
     let disabled: BTreeSet<String> = ws.project.disabled_extensions.iter().cloned().collect();
     let off = disabled.contains(&p.id);
     if !off && matches!(p.status, Status::Refused(_)) {
-        ui.label(RichText::new("It cannot be turned on until what it needs is.").small().color(theme::weak()));
+        // Refused over what it needs, it waits for that; one that cannot be read at all has no switch.
+        let waits = p.requires.iter().any(|r| present.iter().find(|q| q.id == requirement(r).0).is_none_or(|q| q.status != Status::Loaded));
+        if waits {
+            ui.label(RichText::new("It cannot be turned on until what it needs is.").small().color(theme::weak()));
+        }
         return;
     }
     if let Some((turn_on, asked, with)) = state.asked.clone().filter(|(_, asked, _)| *asked == p.id) {

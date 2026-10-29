@@ -21,13 +21,24 @@ use std::path::PathBuf;
 
 use crate::index;
 
+/// The kind of an asset holding an extension: the host's own, registered by none. Its bundle holds the component
+/// (`extension.wasm`), which says who it is.
+pub const EXTENSION_KIND: &str = "extension";
+
+/// The file an `extension` asset holds its component in.
+pub const EXTENSION_COMPONENT: &str = "extension.wasm";
+
 /// Where an extension runs from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// A component built into the host: a built-in.
     Builtin,
     /// A component, from this file.
     Component(PathBuf),
+    /// A component the project holds: an `extension` asset, by its path, and its file.
+    Project { asset: String, file: PathBuf },
+    /// A component in the user's own extensions folder.
+    User(PathBuf),
     /// Linked into the host, its entry point called directly: a built-in, for debugging.
     Linked,
 }
@@ -114,8 +125,42 @@ pub enum Status {
     /// Left off by the project (`[extensions] disabled`).
     Disabled,
     /// Not loaded, and why: a requirement missing, disabled or too old, a cycle, its registration failing, another of
-    /// its id.
+    /// its id from the same place.
     Refused(String),
+    /// Not loaded: one of its id from a nearer place (the project before the user's folder before the built-ins) takes
+    /// its place, named.
+    Replaced(String),
+}
+
+impl Origin {
+    /// How near a project it is: the project's own first, then the user's, then the built-ins (and a file named).
+    fn nearness(&self) -> u8 {
+        match self {
+            Origin::Project { .. } => 0,
+            Origin::User(_) => 1,
+            Origin::Component(_) => 2,
+            Origin::Builtin | Origin::Linked => 3,
+        }
+    }
+
+    /// It runs with the host: a built-in, as a component or linked.
+    #[must_use]
+    pub fn builtin(&self) -> bool {
+        matches!(self, Origin::Builtin | Origin::Linked)
+    }
+
+    /// Where it is from, said in a few words.
+    #[must_use]
+    pub fn said(&self) -> String {
+        let file = |path: &std::path::Path| path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
+        match self {
+            Origin::Builtin => "built in".into(),
+            Origin::Linked => "linked in".into(),
+            Origin::Project { asset, .. } => format!("the project's {asset}"),
+            Origin::User(path) => format!("your {}", file(path)),
+            Origin::Component(path) => file(path),
+        }
+    }
 }
 
 /// The extensions loaded, and what they registered.
@@ -178,12 +223,25 @@ impl Extensions {
     #[must_use]
     pub fn load_without(extensions: Vec<Loadable>, builtin: bool, disabled: &[String]) -> Extensions {
         let mut out = Extensions::default();
+        // One an id: the nearest (the project's, the user's, a built-in), its place taken from the others; two from
+        // the same place, the first.
+        let mut extensions = extensions;
+        extensions.sort_by_key(|e| e.origin.nearness());
         let mut pending: Vec<Loadable> = vec![];
+        // Those taking a built-in's place, which name kinds and roles bare as it did.
+        let mut standing_in: HashSet<String> = HashSet::new();
         for extension in extensions {
-            if pending.iter().any(|e| e.id == extension.id) {
-                let why = "another extension has this id; the second is not loaded".to_string();
-                out.problems.push(format!("{}: {why}", extension.id));
-                out.present.push(Present::of(&extension, Status::Refused(why)));
+            if let Some(nearer) = pending.iter().find(|e| e.id == extension.id) {
+                if nearer.origin.nearness() == extension.origin.nearness() {
+                    let why = "another of its id from the same place is loaded instead".to_string();
+                    out.problems.push(format!("{} ({}): {why}", extension.id, extension.origin.said()));
+                    out.present.push(Present::of(&extension, Status::Refused(why)));
+                } else {
+                    if extension.origin.builtin() {
+                        standing_in.insert(extension.id.clone());
+                    }
+                    out.present.push(Present::of(&extension, Status::Replaced(nearer.origin.said())));
+                }
             } else {
                 pending.push(extension);
             }
@@ -231,6 +289,7 @@ impl Extensions {
                 }
                 progress = true;
                 let started = std::time::Instant::now();
+                let builtin = builtin && (extension.origin.builtin() || standing_in.contains(&extension.id));
                 match out.register(extension, builtin) {
                     Ok(registers) => {
                         timings.insert(extension.id.clone(), (started.elapsed(), registers));
@@ -814,7 +873,7 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 #[cfg(test)]
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
-    use super::{Extensions, Loadable, satisfies};
+    use super::{Extensions, Loadable, Origin, Status, satisfies};
     use pe2_ext::{Extension, Name, Registry, Result};
 
     fn images(r: &mut Registry) -> Result<()> {
@@ -867,7 +926,7 @@ mod tests {
         assert_eq!(ids, ["test.images", "test.fonts"]);
         let problems = loaded.problems.join("\n");
         for expected in [
-            "test.images: another extension has this id",
+            "test.images (linked in): another of its id from the same place is loaded instead",
             "test.old is disabled: it needs test.images ^0.3, and 0.2.3 is installed",
             "test.missing is disabled: it needs test.nowhere, which is not installed",
             "test.chained is disabled: it needs test.missing, which is disabled",
@@ -885,6 +944,34 @@ mod tests {
         let loaded = Extensions::load(vec![extension("mod.images", "0.1.0", &[], images)], false);
         assert_eq!(loaded.loaded, []);
         assert!(loaded.problems[0].contains("only a built-in extension names a kind or role bare"), "{:?}", loaded.problems);
+    }
+
+    #[test]
+    fn the_nearest_of_an_id_takes_its_place() {
+        let from = |origin: Origin| {
+            let mut images = extension("test.images", "0.1.0", &[], images);
+            images.origin = origin;
+            images
+        };
+        let user = Origin::User("images.wasm".into());
+        let project = Origin::Project { asset: "extensions/images".into(), file: "extension.wasm".into() };
+        // The built-in listed first, the project's last: nearness decides, not order.
+        let loaded = Extensions::load(vec![from(Origin::Linked), from(user.clone()), from(project.clone())], true);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.loaded.len(), 1);
+        assert_eq!(loaded.loaded[0].origin, project);
+        // Standing in for a built-in, it names kinds bare as the built-in did.
+        assert_eq!(loaded.kind_aliases["image"], "test.images@image");
+        let replaced: Vec<&Origin> =
+            loaded.present.iter().filter(|p| matches!(p.status, Status::Replaced(_))).map(|p| &p.origin).collect();
+        assert_eq!(replaced, [&user, &Origin::Linked]);
+        // Two from one place: the second is refused, a problem.
+        let mut other = from(user.clone());
+        other.origin = Origin::User("copy.wasm".into());
+        let loaded = Extensions::load(vec![from(user), other], false);
+        assert!(loaded.problems.iter().any(|p| p.contains("another of its id from the same place")), "{:?}", loaded.problems);
+        // Taking no built-in's place, it may not name kinds bare.
+        assert!(loaded.problems.iter().any(|p| p.contains("only a built-in extension names a kind or role bare")));
     }
 
     #[test]

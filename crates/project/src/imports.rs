@@ -23,7 +23,7 @@ use std::sync::Arc;
 use toml::{Table, Value};
 
 use crate::cache::{Cache, write_atomic};
-use crate::ext::Extensions;
+use crate::ext::{Extensions, Origin, Status};
 use crate::extract::sha1_hex;
 use crate::index::{Asset, BundleFile, Imported, Index, Problem};
 
@@ -190,8 +190,20 @@ impl Imports {
             asset.imported = Some(resolved.clone());
         }
         problems.extend(self.missing_parts(index, extensions));
+        // The project's extensions not loaded, as problems of their assets.
+        problems.extend(extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
+            (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
+            _ => None,
+        }));
         index.problems.retain(|p| {
-            !matches!(p, Problem::Import { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::MissingPart { .. })
+            !matches!(
+                p,
+                Problem::Import { .. }
+                    | Problem::Overridden { .. }
+                    | Problem::Orphan { .. }
+                    | Problem::MissingPart { .. }
+                    | Problem::Extension { .. }
+            )
         });
         index.problems.extend(problems);
         attached

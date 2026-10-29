@@ -202,9 +202,9 @@ impl Editor {
             Update::Refreshed(n) => {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
             }
-            Update::Reopen => {
+            Update::Reopen(why) => {
                 self.reopen();
-                self.message = Some("project.toml changed: the project was opened again".into());
+                self.message = Some(format!("{why}: the project was opened again"));
             }
         }
     }
@@ -228,7 +228,7 @@ impl Editor {
         match ws.step(redo, force) {
             Ok((label, update)) => {
                 self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
-                if matches!(update, Update::Reopen) {
+                if matches!(update, Update::Reopen(_)) {
                     self.reopen();
                 }
                 true

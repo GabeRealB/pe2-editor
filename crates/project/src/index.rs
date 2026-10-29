@@ -257,6 +257,8 @@ pub enum Problem {
     Orphan { asset: String, part: String },
     /// A reference naming a part (`uid://...#variants/night`) its asset does not have.
     MissingPart { asset: String, slot: String, target: String, part: String },
+    /// An `extension` asset whose component is not loaded, and why.
+    Extension { asset: String, error: String },
 }
 
 impl Problem {
@@ -269,6 +271,7 @@ impl Problem {
             | Problem::Overridden { asset: path, .. }
             | Problem::Orphan { asset: path, .. }
             | Problem::MissingPart { asset: path, .. }
+            | Problem::Extension { asset: path, .. }
             | Problem::Conflict { path, .. }
             | Problem::Unlisted { path, .. }
             | Problem::Missing { path, .. }
@@ -295,6 +298,7 @@ impl Problem {
             }
             Problem::Orphan { part, .. } => format!("{part} has settings, but its source has no such part"),
             Problem::MissingPart { slot, target, part, .. } => format!("{slot} names {target}#{part}, which it does not have"),
+            Problem::Extension { error, .. } => format!("the extension is not loaded: {error}"),
         }
     }
 
@@ -312,7 +316,8 @@ impl Problem {
             | Problem::Import { .. }
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
-            | Problem::MissingPart { .. } => vec![],
+            | Problem::MissingPart { .. }
+            | Problem::Extension { .. } => vec![],
         }
     }
 
