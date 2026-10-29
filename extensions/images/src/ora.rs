@@ -20,10 +20,10 @@
 
 use codecs::ora::{self, Document, Group, Layer, Node, Pixels};
 use codecs::texture::{color, entries, gray_ramp, rgba};
-use pe2_ext::{Asset, Result, Table, Typed, Value, anyhow};
+use pe2_ext::{Asset, Result, Table, Value, anyhow};
 use std::collections::HashMap;
 
-use crate::{TEXELS, bpp, cells, colors_file, halfwords, pair, palette_names, texels_per_halfword};
+use crate::{TexelImage, bpp, cells, halfwords, palette_names, texels_per_halfword};
 
 /// Where a source is when the declaration does not say.
 pub const SOURCE: &str = "source.ora";
@@ -122,21 +122,17 @@ fn png_error(e: impl std::fmt::Display) -> pe2_ext::Error {
     anyhow!("PNG: {e}")
 }
 
-/// The source, written from the stored texels and palettes.
+/// The source, written from an image's texels and palettes, with its settings (its cells, its palettes' names).
 ///
 /// # Errors
-/// The asset is not a texture or an atlas with texels, or they cannot be read.
-pub fn export(asset: &Asset) -> Result<Vec<u8>> {
-    let (width, height) = pair(asset.field("size")).ok_or_else(|| anyhow!("no size"))?;
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "image sizes")]
-    let (width, height) = (width as usize, height as usize);
-    let bpp = bpp(asset);
-    let stored = asset.read(TEXELS)?;
-    let values = if bpp == 16 { halfwords(&stored) } else { stored.iter().map(|&b| u16::from(b)).collect() };
+/// They cannot be written as layers.
+pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
+    let (width, height, bpp) = (image.width, image.height, image.bpp);
+    let stored = &image.texels;
+    let values = if bpp == 16 { halfwords(stored) } else { stored.iter().map(|&b| u16::from(b)).collect() };
     let texels = Texels { width, height, bpp, values };
     let names = palette_names(asset);
-    let colors: Vec<Option<Vec<u16>>> =
-        names.iter().map(|p| asset.read(&colors_file(p)).ok().map(|b| halfwords(&b))).collect();
+    let colors = image.colors();
     let palette = |i: Option<usize>| i.and_then(|i| colors.get(i)?.as_deref());
 
     let strips = names
@@ -190,7 +186,7 @@ pub fn export(asset: &Asset) -> Result<Vec<u8>> {
     }
     stack.push(layer(TEXELS_LAYER, 0, 0, true, texels_png));
     let document = Document { width: u32::try_from(width)?, height: u32::try_from(height)?, stack };
-    let merged = crate::picture(asset, 0)?;
+    let merged = crate::draw(asset, image, 0);
     let thumbnail = merged.thumbnail(THUMBNAIL);
     let merged = codecs::texture::rgba_png(merged.width, merged.height, &merged.rgba).map_err(png_error)?;
     let thumbnail = codecs::texture::rgba_png(thumbnail.width, thumbnail.height, &thumbnail.rgba).map_err(png_error)?;
@@ -315,7 +311,7 @@ impl Matcher {
 ///
 /// # Errors
 /// The source cannot be read, lacks its texels, or a layer holds what its depth cannot.
-pub fn import(asset: &Asset, source: &[u8]) -> Result<Typed> {
+pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     let document = ora::read(source).map_err(|e| anyhow!("{SOURCE}: {e}"))?;
     let (width, height) = (document.width as usize, document.height as usize);
     let bpp = bpp(asset);
@@ -325,7 +321,6 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<Typed> {
     let strips: HashMap<&str, &Layer> =
         document.group(PALETTES).map_or_default(|g| g.layers().map(|l| (l.name.as_str(), l)).collect());
     let mut colors: Vec<Option<Vec<u16>>> = Vec::with_capacity(names.len());
-    let mut files = Vec::new();
     let mut notes = Vec::new();
     for name in &names {
         let Some(strip) = strips.get(name.as_str()) else {
@@ -333,9 +328,7 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<Typed> {
             continue;
         };
         let (w, _, values) = layer_values(strip, 16, &[], None, &mut notes)?;
-        let row = values[..w.min(values.len())].to_vec();
-        files.push((colors_file(name), row.iter().flat_map(|v| v.to_le_bytes()).collect()));
-        colors.push(Some(row));
+        colors.push(Some(values[..w.min(values.len())].to_vec()));
     }
     let palette = |i: Option<usize>, bpp: u8| padded(i.and_then(|i| colors.get(i)?.as_deref()), bpp);
 
@@ -388,8 +381,8 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<Typed> {
             layer.apply(&mut texels, edited);
         }
     }
-    files.push((TEXELS.to_string(), texels.stored()));
-    Ok(crate::native(files, settings, notes))
+    let palettes = names.into_iter().zip(colors).collect();
+    Ok(TexelImage { width, height, bpp, texels: texels.stored(), palettes, derived: settings, notes })
 }
 
 /// A texel layer's values at their places: where its texels start (at its own depth), and which it repainted - those
@@ -533,7 +526,9 @@ mod tests {
 
     fn imported_with(source: &[u8], fields: Table) -> Made {
         let lent = Lent { fields, files: HashMap::new() };
-        let typed = import(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas")), source).unwrap();
+        let image = import(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas")), source).unwrap();
+        // As it is stored: its files, as its type encodes them.
+        let pe2_ext::Data::Typed(typed) = <crate::Texels as pe2_ext::ty::ValueType>::encode(image) else { panic!("no files") };
         let files = typed
             .files
             .into_iter()
@@ -577,7 +572,8 @@ mod tests {
 
     fn source() -> Vec<u8> {
         let lent = atlas();
-        export(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas"))).unwrap()
+        let asset = Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas"));
+        export(&asset, &crate::TexelImage::read(&asset).unwrap()).unwrap()
     }
 
     #[test]

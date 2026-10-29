@@ -378,6 +378,13 @@ impl Call<'_> {
         Lent { host: self.host, files: &typed.files, fields: merged(self.host.fields(), &typed.settings) }
     }
 
+    /// Lend the node's settings with others in their places - what was derived with a value decoded - as an asset
+    /// of no files.
+    #[must_use]
+    pub fn lend_settings(&self, derived: &Table) -> Lent<'_> {
+        Lent { host: self.host, files: &[], fields: merged(self.host.fields(), derived) }
+    }
+
     /// Lend files as an asset, with the node's settings.
     #[must_use]
     pub fn lend_files<'b>(&'b self, files: &'b [File]) -> Lent<'b> {
