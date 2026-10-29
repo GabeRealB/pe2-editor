@@ -9,8 +9,9 @@
 //!   the file's (`from.<release>.chunks`).
 //! - The disc layout, `disc/<release>/*.toml`: one asset a file, a disc (`disk<N>`) or a stage (`stage<N>`).
 //!
-//! Every slot names the asset that fills it, `asset = { uid, path = "res://<group>/<name>.asset" }`; loading holds
-//! every such reference to a declaration with that uid. Uids are drawn once, when an asset is first declared (`uid`).
+//! Every slot names the asset that fills it, `asset = { uid, path = "res://<group>/<name>.asset" }` - a part of it
+//! with `part` (`part = "palettes/default"`, its fragment); loading holds every such reference to a declaration with
+//! that uid. Uids are drawn once, when an asset is first declared (`uid`).
 //!
 //! # The layout
 //!

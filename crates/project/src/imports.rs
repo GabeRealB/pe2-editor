@@ -46,7 +46,12 @@ pub struct Imports {
     /// What attaching read of each import, and the settings it resolved to, by key: the key covers the declaration,
     /// so a refresh finds them here rather than on disk.
     known: Mutex<HashMap<String, Arc<Known>>>,
+    /// The parts each referenced asset has, by its path, with the hash of the settings they were listed from.
+    parts: Mutex<HashMap<String, Listed>>,
 }
+
+/// An asset's parts, with the hash of the settings they were listed from.
+type Listed = (String, Arc<HashSet<String>>);
 
 /// An import as attaching uses it.
 struct Known {
@@ -86,7 +91,7 @@ impl Imports {
     pub fn open(cache: &Cache) -> Result<Imports> {
         let dir = cache.path(DIR);
         std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
-        Ok(Imports { dir, known: Mutex::default() })
+        Ok(Imports { dir, known: Mutex::default(), parts: Mutex::default() })
     }
 
     fn get(&self, key: &str) -> Option<Manifest> {
@@ -184,12 +189,45 @@ impl Imports {
             problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
             asset.imported = Some(resolved.clone());
         }
-        problems.extend(missing_parts(index, extensions));
+        problems.extend(self.missing_parts(index, extensions));
         index.problems.retain(|p| {
             !matches!(p, Problem::Import { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::MissingPart { .. })
         });
         index.problems.extend(problems);
         attached
+    }
+
+    /// The references naming a part their asset does not have, of the assets whose kinds list their parts: with the
+    /// settings resolved, as parts an import makes are among them. An asset's parts are listed again only when its
+    /// settings change.
+    fn missing_parts(&self, index: &Index, extensions: &Extensions) -> Vec<Problem> {
+        let mut known = self.parts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut problems = Vec::new();
+        for (target, references) in &index.referenced_by {
+            let named: Vec<_> = references.iter().filter(|r| r.part.is_some()).collect();
+            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.lists_parts(a))
+            else {
+                continue;
+            };
+            let digest = sha1_hex(asset.settings_text().as_bytes());
+            let parts = if let Some((_, parts)) = known.get(target).filter(|(d, _)| *d == digest) {
+                parts.clone()
+            } else {
+                let parts: Arc<HashSet<String>> = Arc::new(extensions.parts(asset).into_iter().map(|p| p.id).collect());
+                known.insert(target.clone(), (digest, parts.clone()));
+                parts
+            };
+            for reference in named {
+                let Some(part) = reference.part.as_ref().filter(|p| !parts.contains(*p)) else { continue };
+                problems.push(Problem::MissingPart {
+                    asset: reference.from.clone(),
+                    slot: reference.slot.clone(),
+                    target: target.clone(),
+                    part: part.clone(),
+                });
+            }
+        }
+        problems
     }
 
     /// Import an asset now and keep what it made.
@@ -212,29 +250,6 @@ impl Imports {
         }
         removed
     }
-}
-
-/// The references naming a part their asset does not have, of the assets whose kinds list their parts: with the
-/// settings resolved, as parts an import makes are among them.
-fn missing_parts(index: &Index, extensions: &Extensions) -> Vec<Problem> {
-    let mut problems = Vec::new();
-    for (target, references) in &index.referenced_by {
-        let named: Vec<_> = references.iter().filter(|r| r.part.is_some()).collect();
-        let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.lists_parts(a)) else {
-            continue;
-        };
-        let parts: HashSet<String> = extensions.parts(asset).into_iter().map(|p| p.id).collect();
-        for reference in named {
-            let Some(part) = reference.part.as_ref().filter(|p| !parts.contains(*p)) else { continue };
-            problems.push(Problem::MissingPart {
-                asset: reference.from.clone(),
-                slot: reference.slot.clone(),
-                target: target.clone(),
-                part: part.clone(),
-            });
-        }
-    }
-    problems
 }
 
 /// An asset's importer and its import's key, where its importer makes files and its source is in its bundle.

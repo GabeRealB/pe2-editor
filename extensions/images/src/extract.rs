@@ -22,7 +22,7 @@
 //! A file's image slot lists its `pages` - an `image`, or a place where the page holds palettes only - each image
 //! filling the pages its width needs; where a file holds an image in two chunks, each entry says which of its pages
 //! that chunk holds (`first`, `count`). A palette slot (or a palette resource of a bundle) lists its `palettes`: an
-//! image's palette by name (`image`, `palette`), or a `name`d run of `entries` colors placed by `slot` and `at`, which
+//! image's palette by reference to its part (`palette = { uid, path, part = "palettes/<name>" }`), or a `name`d run of `entries` colors placed by `slot` and `at`, which
 //! no image owns: an image palette no slot names takes its colors from the run uploaded at its place (the system's
 //! text palettes, which every dialogue atlas is drawn with).
 
@@ -34,10 +34,11 @@ use std::fmt::Write as _;
 
 use crate::texels_per_halfword;
 
-/// A reference as declarations write it: a uid and a bundle's `res://` path.
+/// A reference as declarations write it: a uid and a bundle's `res://` path, and the part of it it names.
 #[derive(Clone, Debug, Deserialize)]
 struct Reference {
     path: String,
+    part: Option<String>,
 }
 
 impl Reference {
@@ -100,10 +101,11 @@ struct PageEntry {
     count: Option<usize>,
 }
 
+/// A palette a slot uploads: an image's, by reference to its part (`palettes/<name>`), or a run of colors placed
+/// by `slot` and `at`, which no image owns.
 #[derive(Clone, Debug, Deserialize)]
 struct PaletteEntry {
-    image: Option<Reference>,
-    palette: Option<String>,
+    palette: Option<Reference>,
     slot: Option<Reference>,
     at: Option<[u32; 2]>,
 }
@@ -232,11 +234,12 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
         let mut note = |slot: &str, resource: Option<usize>, in_pages: bool, entries: &[PaletteEntry]| {
             for e in entries {
                 let source = || PaletteSource { file: path.clone(), slot: slot.to_string(), resource, in_pages };
-                match (&e.image, &e.palette, &e.slot, e.at) {
-                    (Some(image), Some(palette), ..) => {
-                        palettes.entry((image.target().to_string(), palette.clone())).or_insert_with(source);
+                let named = e.palette.as_ref().and_then(|p| Some((p.target(), p.part.as_deref()?.strip_prefix("palettes/")?)));
+                match (named, &e.slot, e.at) {
+                    (Some((image, palette)), ..) => {
+                        palettes.entry((image.to_string(), palette.to_string())).or_insert_with(source);
                     }
-                    (None, _, Some(vram), Some(at)) => {
+                    (None, Some(vram), Some(at)) => {
                         runs.entry((vram.target().to_string(), at)).or_insert_with(source);
                     }
                     _ => {}

@@ -15,8 +15,9 @@
 //! and then makes each asset's native files, reading the chunks it needs from the discs and checking them against the
 //! declaration. The host knows no image format.
 //!
-//! A reference is written as the referenced asset's uid alone (`"uid://..."`), where the declarations hold its path
-//! beside it: the uid decides, and a path written into every referencing asset would go stale when the asset moved.
+//! A reference is written as the referenced asset's uid alone (`"uid://..."`, `"uid://...#palettes/default"` for a part
+//! of it), where the declarations hold its path beside it: the uid decides, and a path written into every referencing
+//! asset would go stale when the asset moved.
 //!
 //! An asset whose importer writes its source (an image's `pe2.images@ora`) is written as that source alone: exported
 //! from the native files read off the disc, and imported again to check that it makes them byte for byte and gives
@@ -285,9 +286,11 @@ fn uids_alone_in(value: &mut toml_edit::Value) {
         toml_edit::Value::InlineTable(table) => {
             let uid = table.get("uid").and_then(toml_edit::Value::as_str).map(str::to_string);
             let path = table.get("path").and_then(toml_edit::Value::as_str).is_some_and(|p| p.starts_with("res://"));
+            // A part of the asset, by its fragment: `uid://...#palettes/default`.
+            let part = table.get("part").and_then(toml_edit::Value::as_str).map_or_default(|p| format!("#{p}"));
             if let (Some(uid), true) = (uid, path) {
                 let decor = value.decor().clone();
-                *value = toml_edit::Value::from(uid);
+                *value = toml_edit::Value::from(format!("{uid}{part}"));
                 *value.decor_mut() = decor;
                 return;
             }

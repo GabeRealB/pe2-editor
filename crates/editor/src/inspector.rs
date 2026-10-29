@@ -559,6 +559,11 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
                 Some(parent) => format!("{parent}/{name}"),
                 None => name.to_string(),
             };
+            // A part, by its fragment after the asset's name.
+            let short = match project::index::part_of(value) {
+                Some(part) => format!("{short}#{part}"),
+                None => short,
+            };
             if chip(ui, icon, &short, tint).on_hover_text(&asset.path).clicked() {
                 *nav = Some(asset.path.clone());
             }
@@ -643,8 +648,8 @@ fn collection_ui(
     }
 }
 
-/// A list's entry on one line: its title, its type, a swatch where it names an image's palette (`{ image, palette }`,
-/// drawn by the image's kind as the part `palettes/<name>`), and its fields the row's way.
+/// A list's entry on one line: its title, its type, and its fields the row's way - a reference to a part with a
+/// picture shown with it (a palette's swatch, a variant's look).
 fn row_ui(
     ui: &mut egui::Ui,
     sheet: &Sheet,
@@ -658,21 +663,10 @@ fn row_ui(
         if let Some(ty) = item.get("type").and_then(toml::Value::as_str) {
             badge(ui, ty);
         }
-        if let (Some(image), Some(palette)) = (item.get("image"), item.get("palette").and_then(toml::Value::as_str))
-            && let Some((uid, path)) = project::index::reference(image)
-            && let Some(image) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default())
-        {
-            let ctx = ui.ctx().clone();
-            if let Some(Ok(strip)) = parts.get(&ctx, sheet.extensions, image, &format!("palettes/{palette}")) {
-                let width = if strip.size.x <= 16.0 { 96.0 } else { 160.0 };
-                egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::new(strip.texture.id(), egui::vec2(width, 10.0))));
-                });
-            }
-        }
         let Some(table) = item.as_table() else { return };
         for (k, v) in table {
             if !matches!(k.as_str(), "name" | "index" | "type") && !is_table_list(v) {
+                part_picture(ui, sheet, parts, v);
                 field_ui(ui, sheet, k, v, nav);
             }
         }
@@ -680,6 +674,25 @@ fn row_ui(
             let n = v.as_array().map_or(0, Vec::len);
             ui.label(RichText::new(count(n, &sheet.label(k).to_lowercase())).small().color(theme::weak()));
         }
+    });
+}
+
+/// The picture of the part a reference names, where its asset's kind draws one: a strip (a palette) as a swatch,
+/// anything else small.
+fn part_picture(ui: &mut egui::Ui, sheet: &Sheet, parts: &mut crate::workspace::Parts, value: &toml::Value) {
+    let (Some(part), Some((uid, path))) = (project::index::part_of(value), project::index::reference(value)) else {
+        return;
+    };
+    let Some(asset) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) else { return };
+    let ctx = ui.ctx().clone();
+    let Some(Ok(picture)) = parts.get(&ctx, sheet.extensions, asset, part) else { return };
+    let size = if picture.size.y <= 1.0 {
+        egui::vec2(if picture.size.x <= 16.0 { 96.0 } else { 160.0 }, 10.0)
+    } else {
+        picture.size * (24.0 / picture.size.y.max(1.0))
+    };
+    egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+        ui.add(egui::Image::new(egui::load::SizedTexture::new(picture.texture.id(), size)));
     });
 }
 

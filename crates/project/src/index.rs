@@ -702,10 +702,14 @@ pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     }
 }
 
-/// The part of an asset a reference names: its fragment (`palettes/default` of `uid://...#palettes/default`).
+/// The part of an asset a reference names: its fragment (`palettes/default` of `uid://...#palettes/default`), or the
+/// `part` of a reference written with its path.
 #[must_use]
 pub fn part_of(value: &toml::Value) -> Option<&str> {
-    let (_, part) = value.as_str()?.strip_prefix("uid://")?.split_once('#')?;
+    let part = match value {
+        toml::Value::Table(t) => t.get("part")?.as_str()?,
+        _ => value.as_str()?.strip_prefix("uid://")?.split_once('#')?.1,
+    };
     (!part.is_empty()).then_some(part)
 }
 
@@ -714,7 +718,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
     match value {
         toml::Value::Table(t) => {
             if let Some((uid, path)) = reference(value) {
-                out.push((field.to_string(), uid, path.unwrap_or_default(), String::new()));
+                out.push((field.to_string(), uid, path.unwrap_or_default(), part_of(value).unwrap_or_default().to_string()));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
