@@ -24,6 +24,7 @@ mod layers;
 mod panes;
 mod settings;
 mod theme;
+mod takein;
 mod thumbs;
 mod upscale;
 mod viewer;

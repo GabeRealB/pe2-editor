@@ -292,11 +292,11 @@ pub fn read(view: &View, uri: &str) -> Result<ReadResourceResult, String> {
 fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
     let name = name.trim();
     if let Some(path) = index.by_uid.get(name) {
-        return index.assets.get(path).ok_or_else(|| format!("{name}: no asset"));
+        return index.assets.get(path).map(|a| &**a).ok_or_else(|| format!("{name}: no asset"));
     }
     let path = name.trim_start_matches("res://").trim_end_matches('/');
     let path = path.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(path);
-    index.assets.get(path).ok_or_else(|| {
+    index.assets.get(path).map(|a| &**a).ok_or_else(|| {
         if name.starts_with("uid://") {
             format!("{name}: no asset has this uid")
         } else {
@@ -351,6 +351,7 @@ fn find_assets(index: &Index, args: &FindArgs) -> Value {
     let matches: Vec<&Asset> = index
         .assets
         .values()
+        .map(|a| &**a)
         .filter(|a| text.as_ref().is_none_or(|t| a.path.to_lowercase().contains(t.as_str())))
         .filter(|a| args.kind.is_none() || a.kind == args.kind)
         .filter(|a| args.role.is_none() || a.role == args.role)
@@ -563,7 +564,7 @@ const NO_EDITOR: &str = "the editor does not have the project open";
 
 fn editor_selection(view: &View) -> Result<Value, String> {
     let editor = view.editor.as_ref().ok_or(NO_EDITOR)?;
-    let asset = editor.selection.as_deref().and_then(|s| view.index.assets.get(s));
+    let asset = editor.selection.as_deref().and_then(|s| view.index.assets.get(s)).map(|a| &**a);
     Ok(json!({ "selected": asset.map(summary), "look": editor.variant }))
 }
 

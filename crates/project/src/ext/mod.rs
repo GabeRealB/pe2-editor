@@ -643,7 +643,7 @@ impl Extensions {
     /// Every asset of a kind, by its qualified name or a built-in's bare one.
     pub fn find<'a>(&'a self, index: &'a index::Index, kind: &str) -> impl Iterator<Item = &'a index::Asset> {
         let wanted = self.kind_named(kind).map(|(k, _)| k.name.as_str());
-        index.assets.values().filter(move |a| {
+        index.assets.values().map(|a| &**a).filter(move |a| {
             wanted.is_some_and(|w| self.kind_of(a).is_some_and(|k| k.name.as_str() == w))
                 || wanted.is_none() && a.kind.as_deref() == Some(kind)
         })

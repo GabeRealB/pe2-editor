@@ -100,6 +100,23 @@ impl Default for Startup {
     }
 }
 
+/// When changes other programs make to the project's files are taken in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeIn {
+    /// When the editor regains focus, as Unity's Auto Refresh and Godot's rescan: a tool saving often imports once.
+    #[default]
+    OnFocus,
+    /// As the watcher sees them.
+    AsTheyHappen,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Changes {
+    pub take_in: TakeIn,
+}
+
 /// What agents connected to the project may do in the editor.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,6 +133,8 @@ pub struct EditorSettings {
     pub tools: Tools,
     pub startup: Startup,
     pub agents: Agents,
+    /// Changes made outside the editor.
+    pub changes: Changes,
     /// Extensions' user settings, by id (`[extensions."<id>"]`): the extensions read them from this file too.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extensions: std::collections::BTreeMap<String, toml::Table>,

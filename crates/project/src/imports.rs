@@ -140,15 +140,19 @@ impl Imports {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
+        // Copied where shared with a snapshot, and only where something goes.
         for asset in index.assets.values_mut().filter(|a| of(&a.path)) {
-            asset.files.retain(|f| f.made_by.is_none());
-            asset.imported = None;
+            if asset.imported.is_some() || asset.files.iter().any(|f| f.made_by.is_some()) {
+                let asset = Arc::make_mut(asset);
+                asset.files.retain(|f| f.made_by.is_none());
+                asset.imported = None;
+            }
         }
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut found: Vec<(String, String, String, Arc<Known>)> = Vec::new();
         let assets: Vec<&Asset> = match only {
-            None => index.assets.values().collect(),
-            Some(only) => only.iter().filter_map(|p| index.assets.get(p)).collect(),
+            None => index.assets.values().map(|a| &**a).collect(),
+            Some(only) => only.iter().filter_map(|p| index.assets.get(p).map(|a| &**a)).collect(),
         };
         for asset in assets {
             let Some((importer, key)) = key_of(asset, extensions) else { continue };
@@ -190,7 +194,7 @@ impl Imports {
         let mut problems: Vec<Problem> =
             attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
         for (path, importer, key, import) in found {
-            let Some(asset) = index.assets.get_mut(&path) else { continue };
+            let Some(asset) = index.assets.get_mut(&path).map(Arc::make_mut) else { continue };
             let layer = source_file(asset).map_or_default(|f| f.layer.clone());
             asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
             for (name, file) in &import.files {
@@ -239,7 +243,7 @@ impl Imports {
         let mut known = self.parts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut problems = Vec::new();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
-        for (target, references) in &index.referenced_by {
+        for (target, references) in index.referenced_by.iter() {
             // Of the assets attached: the references to them, and from them.
             let named: Vec<_> = references.iter().filter(|r| r.part.is_some() && (of(target) || of(&r.from))).collect();
             let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.lists_parts(a))

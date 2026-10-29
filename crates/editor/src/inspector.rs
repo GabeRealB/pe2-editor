@@ -785,7 +785,7 @@ fn import_ui(
                             ui.label("");
                             let text = format!("{}  Edit in {}", icons::PENCIL_SIMPLE, category.label().to_lowercase());
                             let (enabled, says) = match &layer {
-                                Ok(l) if l == home => (true, format!("Open {source} in the {} set in Settings ▸ Tools; what it saves is imported again", category.label().to_lowercase())),
+                                Ok(l) if l == home => (true, format!("Open {source} in the {} set in the settings (External tools); what it saves is imported again", category.label().to_lowercase())),
                                 Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
                                 Err(why) => (false, why.clone()),
                             };

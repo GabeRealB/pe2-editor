@@ -434,7 +434,7 @@ fn read_all(files: &[Pending]) -> Vec<Option<Record>> {
 /// What one layer's directory holds, by its real path relative to the layer (a bundle's with `.asset`): its bundles
 /// (their files by name), folders and plain files. Names starting with a dot are the tools' bookkeeping, never
 /// entries.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Scan {
     bundles: BTreeMap<String, BTreeMap<String, PathBuf>>,
     folders: BTreeSet<String>,
@@ -631,6 +631,7 @@ fn asset_of(path: &str) -> &str {
 }
 
 /// A layer as the index holds it.
+#[derive(Clone)]
 struct LayerState {
     name: String,
     kind: LayerKind,
@@ -644,7 +645,8 @@ struct LayerState {
     /// Its changeset can be written: unlisted entries are listed in it.
     writable: bool,
     mounted: bool,
-    scan: Scan,
+    /// What it holds, shared with the snapshots made of the index until it is scanned again.
+    scan: Arc<Scan>,
 }
 
 impl LayerState {
@@ -667,7 +669,7 @@ impl LayerState {
             tree_ignore,
             read_only: layer.read_only,
             mounted: layer.mounted,
-            scan,
+            scan: Arc::new(scan),
         })
     }
 
@@ -784,33 +786,36 @@ fn subtree<V>(map: &BTreeMap<String, V>, path: &str) -> Vec<String> {
     map.keys().filter(|p| *p == path || p.starts_with(&prefix)).cloned().collect()
 }
 
+#[derive(Clone)]
 pub struct Index {
-    /// The resolved assets, by path.
-    pub assets: BTreeMap<String, Asset>,
-    /// Every resolved entry - assets, folders, plain files - by path.
-    pub entries: BTreeMap<String, Entry>,
+    /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
+    pub assets: BTreeMap<String, Arc<Asset>>,
+    /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
+    /// snapshots made of the index, copied when a take-in changes them.
+    pub entries: Arc<BTreeMap<String, Entry>>,
     /// How many files the last opening or refresh read, rather than took from what it knew.
     pub read: usize,
-    pub by_uid: HashMap<String, String>,
+    pub by_uid: Arc<HashMap<String, String>>,
     /// For each asset, the references naming it.
-    pub referenced_by: HashMap<String, Vec<Reference>>,
+    pub referenced_by: Arc<HashMap<String, Vec<Reference>>>,
     /// References whose uid or path names no asset of the project.
     pub dangling: Vec<Reference>,
     pub problems: Vec<Problem>,
     layers: Vec<LayerState>,
-    records: HashMap<PathBuf, Record>,
-    store: Store,
-    resolved: BTreeMap<String, Node>,
+    /// Each file's record, shared with the snapshots made of the index.
+    records: HashMap<PathBuf, Arc<Record>>,
+    store: Arc<Store>,
+    resolved: Arc<BTreeMap<String, Node>>,
     /// The layers left out of the view (the editor's eyes); problems and statuses are the full stack's.
     hidden: HashSet<usize>,
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
     dependencies: Vec<BTreeMap<usize, (usize, usize)>>,
     /// The content hash of each entry a writable layer holds, as of the last pass: what tells a move made outside
     /// the editor from a deletion and a new entry.
-    hashes: Vec<HashMap<String, String>>,
+    hashes: Arc<Vec<HashMap<String, String>>>,
     /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
     /// of a layer's content touches.
-    winning: HashMap<(usize, String), String>,
+    winning: Arc<HashMap<(usize, String), String>>,
 }
 
 impl Index {
@@ -820,26 +825,26 @@ impl Index {
     /// # Errors
     /// A changeset cannot be read or written, or the cache cannot be written.
     pub fn open(project: &Project, cache: &Cache) -> Result<Index> {
-        let store = Store::open(&cache.path(STORE))?;
+        let store = Arc::new(Store::open(&cache.path(STORE))?);
         let mut known = store.load()?;
         let layers = project.layers.iter().map(LayerState::new).collect::<Result<Vec<_>>>()?;
         let mut index = Index {
             assets: BTreeMap::new(),
-            entries: BTreeMap::new(),
+            entries: Arc::default(),
             read: 0,
-            by_uid: HashMap::new(),
-            referenced_by: HashMap::new(),
+            by_uid: Arc::default(),
+            referenced_by: Arc::default(),
             dangling: vec![],
             problems: vec![],
             layers,
             records: HashMap::new(),
             store,
-            resolved: BTreeMap::new(),
+            resolved: Arc::default(),
             hidden: HashSet::new(),
             ops: vec![],
             dependencies: vec![],
-            hashes: vec![],
-            winning: HashMap::new(),
+            hashes: Arc::default(),
+            winning: Arc::default(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         let read = index.load_records(&files, |path, size, modified| {
@@ -848,7 +853,7 @@ impl Index {
         index.read = read.len();
         // What is left of what the store knew no layer holds any more.
         let gone: Vec<&Path> = known.keys().map(PathBuf::as_path).collect();
-        index.store.write(read.iter().map(|p| (p.as_path(), &index.records[p])), gone)?;
+        index.store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
         index.apply_stack()?;
         let paths: Vec<String> = index.resolved.keys().cloned().collect();
         index.assemble(&paths);
@@ -913,7 +918,7 @@ impl Index {
         for (i, at) in &regions {
             let layer = &mut self.layers[*i];
             let before = layer.scan.under(at);
-            layer.scan.rescan(&layer.place, at);
+            Arc::make_mut(&mut layer.scan).rescan(&layer.place, at);
             let after = layer.scan.under(at);
             paths_same &= before.same_paths(&after);
             let now: HashSet<&PathBuf> = after.all_files().collect();
@@ -932,7 +937,7 @@ impl Index {
         let (read, vanished) = self.reload(&files, &reported);
         gone.extend(vanished);
         self.read = read.len();
-        let records = read.iter().filter_map(|p| Some((p.as_path(), self.records.get(p)?)));
+        let records = read.iter().filter_map(|p| Some((p.as_path(), &**self.records.get(p)?)));
         self.store.write(records, gone.iter().map(PathBuf::as_path))?;
         // Contents alone: every bundle and plain file of the regions is its entry's winning content.
         let contents_only = paths_same
@@ -951,7 +956,7 @@ impl Index {
         let before = std::mem::take(&mut self.resolved);
         self.apply_stack()?;
         // An asset changed when its entry did, or when its content lies in what was rescanned.
-        for (path, node) in &self.resolved {
+        for (path, node) in self.resolved.iter() {
             let content = self.layers[node.content.0].place.disk(&node.content.1);
             let touched = rescanned.iter().any(|r| content.starts_with(r) || r.starts_with(&content));
             if node.kind == Kind::Asset && (before.get(path) != Some(node) || touched) {
@@ -982,7 +987,7 @@ impl Index {
             if self.layers[*i].writable {
                 for (path, kind) in scan.bundles.keys().map(|p| (p, Kind::Asset)).chain(scan.files.keys().map(|p| (p, Kind::File))) {
                     if let Some(hash) = self.content_hash(*i, path, kind) {
-                        self.hashes[*i].insert(path.clone(), hash);
+                        Arc::make_mut(&mut self.hashes)[*i].insert(path.clone(), hash);
                     }
                 }
             }
@@ -1016,7 +1021,7 @@ impl Index {
         for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
             let Some(size) = size else { continue };
             if let Some(record) = known(file, size, modified) {
-                self.records.insert(file.clone(), record);
+                self.records.insert(file.clone(), Arc::new(record));
             } else {
                 let declaration = file.file_name().is_some_and(|n| n == ASSET_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
@@ -1026,7 +1031,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                self.records.insert(file.path.clone(), record);
+                self.records.insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -1054,7 +1059,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                self.records.insert(file.path.clone(), record);
+                self.records.insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -1099,10 +1104,11 @@ impl Index {
         let full = self.resolve_stack(&HashSet::new());
         self.problems = full.problems;
         self.ops = full.ops;
-        self.resolved = if self.hidden.is_empty() { full.resolved } else { self.resolve_stack(&self.hidden).resolved };
+        self.resolved =
+            Arc::new(if self.hidden.is_empty() { full.resolved } else { self.resolve_stack(&self.hidden).resolved });
         self.dependencies = self.dependencies();
         self.remember_hashes();
-        self.winning = self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect();
+        self.winning = Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
         Ok(())
     }
 
@@ -1388,7 +1394,7 @@ impl Index {
             return false;
         }
         self.hidden = hidden;
-        self.resolved = self.resolve_stack(&self.hidden).resolved;
+        self.resolved = Arc::new(self.resolve_stack(&self.hidden).resolved);
         self.assets.clear();
         let paths: Vec<String> = self.resolved.keys().cloned().collect();
         self.assemble(&paths);
@@ -1398,7 +1404,7 @@ impl Index {
 
     /// Keep the content hash of each entry a writable layer holds, for the next pass to tell moves.
     fn remember_hashes(&mut self) {
-        self.hashes = (0..self.layers.len())
+        self.hashes = Arc::new((0..self.layers.len())
             .map(|i| {
                 let layer = &self.layers[i];
                 if !layer.writable {
@@ -1408,7 +1414,7 @@ impl Index {
                 let held = held.chain(layer.scan.files.keys().map(|p| (p, Kind::File)));
                 held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect()
             })
-            .collect();
+            .collect());
     }
 
     /// List what writable layers hold unlisted, and follow what moved outside the editor. A listed entry gone from
@@ -1540,8 +1546,9 @@ impl Index {
 
     /// The entries, from the resolved stack.
     fn assemble_entries(&mut self) {
-        self.entries = self
-            .resolved
+        self.entries = Arc::new(
+            self
+                .resolved
             .iter()
             .map(|(path, node)| {
                 let layer = &self.layers[node.content.0];
@@ -1556,7 +1563,8 @@ impl Index {
                 };
                 (path.clone(), entry)
             })
-            .collect();
+                .collect(),
+        );
     }
 
     /// The assets at these real paths, from the resolved stack and the records; a path that no longer resolves to an
@@ -1603,13 +1611,13 @@ impl Index {
                     made_by: None,
                 });
             }
-            self.assets.insert(asset.path.clone(), asset);
+            self.assets.insert(asset.path.clone(), Arc::new(asset));
         }
     }
 
     /// Resolve the uids and the references, and add what is wrong with the assets' declarations.
     fn link(&mut self) {
-        self.by_uid = self.assets.values().filter_map(|a| Some((a.uid.clone()?, a.path.clone()))).collect();
+        self.by_uid = Arc::new(self.assets.values().filter_map(|a| Some((a.uid.clone()?, a.path.clone()))).collect());
         self.problems.retain(|p| !matches!(p, Problem::Unreadable { .. }));
         for asset in self.assets.values() {
             if let Some(error) = &asset.error {
@@ -1637,7 +1645,7 @@ impl Index {
                 }
             }
         }
-        self.referenced_by = referenced_by;
+        self.referenced_by = Arc::new(referenced_by);
         self.dangling = dangling;
     }
 
@@ -1658,10 +1666,11 @@ impl Index {
         for (from, references) in before.iter().filter(|(a, _)| changed.contains(a.as_str())) {
             let targets: Vec<String> = references.iter().filter_map(|r| resolved(self, r)).collect();
             for target in targets {
-                if let Some(list) = self.referenced_by.get_mut(&target) {
+                let referenced_by = Arc::make_mut(&mut self.referenced_by);
+                if let Some(list) = referenced_by.get_mut(&target) {
                     list.retain(|r| r.from != *from);
                     if list.is_empty() {
-                        self.referenced_by.remove(&target);
+                        referenced_by.remove(&target);
                     }
                 }
             }
@@ -1674,7 +1683,7 @@ impl Index {
             let mut dangling_at = self.dangling.partition_point(|r| r.from < *from);
             for reference in self.references_from(from) {
                 if let Some(target) = resolved(self, &reference) {
-                    let list = self.referenced_by.entry(target.clone()).or_default();
+                    let list = Arc::make_mut(&mut self.referenced_by).entry(target.clone()).or_default();
                     // After the references of the assets before it, then each of its own after the last.
                     let at = placed.entry(target).or_insert_with(|| list.partition_point(|r| r.from < *from));
                     list.insert(*at, reference);
@@ -1712,7 +1721,7 @@ impl Index {
     /// The asset a reference names: by uid, else by path.
     #[must_use]
     pub fn resolve(&self, uid: &str, target: &str) -> Option<&Asset> {
-        self.by_uid.get(uid).and_then(|p| self.assets.get(p)).or_else(|| self.assets.get(target))
+        self.by_uid.get(uid).and_then(|p| self.assets.get(p)).or_else(|| self.assets.get(target)).map(|a| &**a)
     }
 }
 
@@ -1858,7 +1867,7 @@ mod tests {
             let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
             let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.kind, a.role, a.variants, a.layers, a.error, a.text, files);
         }
-        for (path, e) in &index.entries {
+        for (path, e) in index.entries.iter() {
             let _ = writeln!(out, "entry {path} {e:?}");
         }
         let by_uid: std::collections::BTreeMap<_, _> = index.by_uid.iter().collect();

@@ -94,6 +94,7 @@ struct MountFile {
     read_only: bool,
 }
 
+#[derive(Clone)]
 pub struct Game {
     /// The name of the layer extraction fills.
     pub layer: String,
@@ -112,6 +113,7 @@ pub enum LayerKind {
     Files,
 }
 
+#[derive(Clone)]
 pub struct Layer {
     pub name: String,
     pub kind: LayerKind,
@@ -129,6 +131,7 @@ pub struct Layer {
     pub mounted: bool,
 }
 
+#[derive(Clone)]
 pub struct Mount {
     pub at: String,
     pub path: PathBuf,
@@ -150,6 +153,7 @@ impl Layer {
     }
 }
 
+#[derive(Clone)]
 pub struct Project {
     pub root: PathBuf,
     pub game: Option<Game>,

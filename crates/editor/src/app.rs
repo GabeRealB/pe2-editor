@@ -197,7 +197,9 @@ impl Editor {
         let Some(ws) = &mut self.workspace else { return };
         ws.watch(ctx);
         ws.answer_agents();
-        match ws.update() {
+        let focused = ctx.input(|i| i.focused);
+        let live = self.settings.changes.take_in == crate::settings::TakeIn::AsTheyHappen;
+        match ws.update(focused, live) {
             Update::Nothing => {}
             Update::Refreshed(n) => {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
@@ -226,11 +228,9 @@ impl Editor {
         let Some(ws) = &mut self.workspace else { return false };
         let verb = if redo { "Redo" } else { "Undo" };
         match ws.step(redo, force) {
-            Ok((label, update)) => {
+            // Its files taken in by the worker: a `project.toml` changed reopens the project from its snapshot.
+            Ok(label) => {
                 self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
-                if matches!(update, Update::Reopen(_)) {
-                    self.reopen();
-                }
                 true
             }
             Err(StepError::Changed(paths)) => {
@@ -410,6 +410,23 @@ impl Editor {
         } else if cancel {
             self.force = None;
         }
+    }
+
+    /// F5: what other programs changed taken in now.
+    fn refresh_key(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&mut self) {
+        let Some(ws) = &mut self.workspace else { return };
+        let pending = ws.pending();
+        ws.refresh_now();
+        self.message = Some(match pending {
+            0 => "Nothing changed on disk".to_string(),
+            n => format!("Taking in {n} change{} made on disk", if n == 1 { "" } else { "s" }),
+        });
     }
 
     /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo - unless a text field has the keyboard, which undoes its own text.
@@ -603,6 +620,12 @@ impl Editor {
                     }
                 }
                 ui.separator();
+                let refresh = ui.add_enabled(self.workspace.is_some(), egui::Button::new("Refresh").shortcut_text("F5"));
+                if refresh.on_hover_text("Take in what other programs changed in the project's files").clicked() {
+                    self.refresh();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Reset layout").on_hover_text("Close the other windows and the extra instances").clicked()
                 {
                     self.layouts = Layouts::new(panes::default_layout());
@@ -697,6 +720,18 @@ impl Editor {
                 }
                 if let Some(e) = &ws.watch_error {
                     ui.label(RichText::new("not watching").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
+                    ui.separator();
+                }
+                // Taking changes in, off the window's thread; or other programs' changes waiting for it.
+                if ws.taking_in() {
+                    ui.label(RichText::new("taking in changes").small().color(theme::weak()));
+                    ui.add(egui::Spinner::new().size(10.0));
+                    ui.separator();
+                } else if ws.pending() > 0 {
+                    let n = ws.pending();
+                    let text = format!("{n} change{} on disk", if n == 1 { "" } else { "s" });
+                    ui.label(RichText::new(text).small().color(theme::weak()))
+                        .on_hover_text("Made by other programs: taken in when the editor regains focus, or now with F5");
                     ui.separator();
                 }
                 if let Some(why) = ws.unprotected() {
@@ -865,6 +900,7 @@ impl eframe::App for Editor {
             ws.extensions.frame();
         }
         self.history_keys(&ctx);
+        self.refresh_key(&ctx);
         if let Some(ws) = &mut self.workspace {
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {
                 ws.go_back();

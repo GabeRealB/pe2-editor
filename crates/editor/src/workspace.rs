@@ -41,9 +41,9 @@ pub struct Entry {
 impl Node {
     /// The tree of the resolved entries, with an asset's looks as its children where its extension draws several. Only
     /// an asset whose declaration names `variants` is asked (the index lists those without parsing a declaration).
-    fn build(index: &Index, extensions: &Extensions) -> Node {
+    pub(crate) fn build(index: &Index, extensions: &Extensions) -> Node {
         let mut root = Node::default();
-        for (real, entry) in &index.entries {
+        for (real, entry) in index.entries.iter() {
             let path = real.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(real);
             let mut node = &mut root;
             for part in path.split('/') {
@@ -130,7 +130,8 @@ const LAYER_VIEW: &str = "editor/layers.toml";
 
 pub struct Workspace {
     pub project: Project,
-    pub index: Index,
+    /// The project as the last take-in left it: a snapshot of the worker's index, swapped in when another arrives.
+    pub index: Arc<Index>,
     /// The stack as the layer panel shows it, bottom to top.
     pub layers: Vec<LayerInfo>,
     /// What was done this session, to undo and redo.
@@ -160,15 +161,31 @@ pub struct Workspace {
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
     /// Requests using the editor's window, which the app's driver answers across frames.
     pub window_requests: Vec<crate::drive::Request>,
-    /// What importers made of the assets' sources.
-    imports: project::imports::Imports,
+    /// The take-in worker: it owns the index and the imports, and hands snapshots back.
+    takein: crate::takein::TakeIn,
+    /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
+    /// setting), before an agent is answered, or on View > Refresh.
+    pending: BTreeSet<PathBuf>,
+    /// Whether the window had focus at the last frame.
+    focused: bool,
+    /// What the editor wrote lately, each path with its stamp then: the watcher's report of it is the editor's own
+    /// change coming back, not another program's.
+    own: Vec<(PathBuf, Option<Stamp>, std::time::Instant)>,
+    /// The last job of other programs' changes, and the last whose snapshot the app was told of.
+    external: (u64, u64),
+    /// What was selected when an undone or redone step was made, shown once its job is taken in.
+    selection_after: Option<(u64, String)>,
+    /// Agents' requests waiting for the take-in of what was pending when they came, by its ticket.
+    agents_waiting: Vec<(u64, mcp::Request, mpsc::Sender<mcp::Reply>)>,
+    /// What the snapshots taken in since the app last asked did.
+    outcome: Update,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
     /// The components found beside the built-ins when the project was opened: another finding reopens it.
     extensions_found: Vec<extensions::Found>,
     /// When the user's extensions folder was last looked at, which no watcher follows.
     extensions_checked: std::time::Instant,
-    pub tree: Node,
+    pub tree: Arc<Node>,
     /// The tree's paths (an asset's without `.asset`) that can be modified, and the folders holding one: the rest is
     /// drawn dimmed.
     editable: HashSet<String>,
@@ -232,8 +249,19 @@ pub struct FieldEdit {
     pub text: String,
 }
 
-/// What a watcher batch did to the workspace.
+/// A path's size and time of change.
+type Stamp = (u64, std::time::SystemTime);
+
+/// A path's stamp, where it is.
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// What a take-in did to the workspace, as the app is told of it.
+#[derive(Default)]
 pub enum Update {
+    #[default]
     Nothing,
     /// This many assets were added, changed or removed.
     Refreshed(usize),
@@ -318,7 +346,18 @@ impl Workspace {
         let imports = project::imports::Imports::open(&cache)?;
         let _ = imports.attach(&mut index, &extensions);
         let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
-        let tree = Node::build(&index, &extensions);
+        let tree = Arc::new(Node::build(&index, &extensions));
+        let layers = index.layers();
+        // The worker takes the index from here; the UI shows a snapshot of it.
+        let shown = Arc::new(index.clone());
+        let takein = crate::takein::TakeIn::start(
+            project.clone(),
+            index,
+            imports,
+            extensions.clone(),
+            extensions_found.clone(),
+            tree.clone(),
+        );
         let mut workspace = Workspace {
             project,
             history,
@@ -328,9 +367,9 @@ impl Workspace {
             views: HashMap::new(),
             view_choice: HashMap::new(),
             textures: crate::ext_ui::Textures::default(),
-            layers: index.layers(),
+            layers,
             layer_view,
-            index,
+            index: shown,
             lock,
             cache_dir: cache.dir,
             watch: None,
@@ -341,7 +380,14 @@ impl Workspace {
             link_error: None,
             extensions_found,
             extensions_checked: std::time::Instant::now(),
-            imports,
+            takein,
+            pending: BTreeSet::new(),
+            focused: true,
+            own: Vec::new(),
+            external: (0, 0),
+            selection_after: None,
+            agents_waiting: Vec::new(),
+            outcome: Update::Nothing,
             tree,
             editable: HashSet::new(),
             selected: None,
@@ -369,6 +415,7 @@ impl Workspace {
         if self.watch.is_some() || self.watch_error.is_some() {
             return;
         }
+        self.takein.wake(ctx);
         let root = &self.project.root;
         let roots: Vec<PathBuf> = self.project.layers.iter().map(|l| l.path.clone()).collect();
         // Each layer's changeset sits beside its directory; project.toml in the project's own.
@@ -404,36 +451,41 @@ impl Workspace {
         }
     }
 
-    /// Answer the agents' requests that arrived since the last frame, against the index and the selection as shown.
+    /// Answer the agents' requests that arrived since the last frame, against the index and the selection as shown. A
+    /// request first has what other programs changed taken in - an agent reads what it just wrote - and waits for it.
     pub fn answer_agents(&mut self) {
         let Some(requests) = &self.requests else { return };
-        let pending: Vec<_> = requests.try_iter().collect();
-        for (request, reply) in pending {
+        let arrived: Vec<_> = requests.try_iter().collect();
+        for (request, reply) in arrived {
             if request.uses_window() {
                 self.window_requests.push((request, reply));
                 continue;
             }
-            let selection = self.selected.clone();
-            let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
-            let editor = mcp::EditorState { selection, variant, show: None };
-            let mut view = mcp::View {
-                project: &self.project,
-                index: &self.index,
-                extensions: &self.extensions,
-                editor: Some(editor),
-            };
-            let answer = mcp::answer(&mut view, &request);
-            let show = view.editor.and_then(|e| e.show);
-            if let Some(path) = show {
-                self.navigate(path);
+            self.take_in_pending();
+            if self.takein.busy() {
+                self.agents_waiting.push((self.takein.issued(), request, reply));
+            } else {
+                self.answer_agent(&request, &reply);
             }
-            let _ = reply.send(answer);
         }
     }
 
-    /// Bring in what the watcher saw: the index refreshed, the pictures of the assets that changed forgotten, the
-    /// tree built again, a selection that is gone dropped.
-    pub fn update(&mut self) -> Update {
+    fn answer_agent(&mut self, request: &mcp::Request, reply: &mpsc::Sender<mcp::Reply>) {
+        let selection = self.selected.clone();
+        let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
+        let editor = mcp::EditorState { selection, variant, show: None };
+        let mut view = mcp::View { project: &self.project, index: &self.index, extensions: &self.extensions, editor: Some(editor) };
+        let answer = mcp::answer(&mut view, request);
+        let show = view.editor.and_then(|e| e.show);
+        if let Some(path) = show {
+            self.navigate(path);
+        }
+        let _ = reply.send(answer);
+    }
+
+    /// Bring in what changed: other programs' changes collected from the watcher, taken in as they happen (`live`) or
+    /// when the window regains focus; and the snapshots the worker made since, swapped in. Returns what they did.
+    pub fn update(&mut self, focused: bool, live: bool) -> Update {
         // The user's extensions folder, looked at each second.
         if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
             self.extensions_checked = std::time::Instant::now();
@@ -441,15 +493,135 @@ impl Workspace {
                 return Update::Reopen("an extension changed");
             }
         }
-        let Some(watch) = &self.watch else { return Update::Nothing };
-        let mut paths = Vec::new();
-        for change in watch.poll() {
-            match change {
-                Change::Paths(changed) => paths.extend(changed),
-                Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
+        // What the editor wrote (an edit, a step, a setting of the project): taken in at once.
+        self.take_written();
+        self.own.retain(|(_, _, at)| at.elapsed() < Duration::from_secs(30));
+        if let Some(watch) = &self.watch {
+            for change in watch.poll() {
+                match change {
+                    Change::Paths(changed) => {
+                        let theirs: Vec<PathBuf> = changed.into_iter().filter(|p| !self.is_own(p)).collect();
+                        self.pending.extend(theirs);
+                    }
+                    Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
+                }
             }
         }
-        self.take_in(&paths)
+        let regained = focused && !self.focused;
+        self.focused = focused;
+        if live || regained {
+            self.take_in_pending();
+        }
+        let ready = self.takein.poll();
+        self.apply(ready);
+        std::mem::take(&mut self.outcome)
+    }
+
+    /// Take in what the history wrote since this was last asked - the editor's own changes - remembering each path's
+    /// stamp to know the watcher's report of it again; returns the job's ticket.
+    fn take_written(&mut self) -> Option<u64> {
+        let written = self.history.take_written();
+        if written.is_empty() {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        self.own.extend(written.iter().map(|p| (p.clone(), stamp(p), now)));
+        Some(self.takein.paths(written))
+    }
+
+    /// Whether the watcher's report of a path is of what the editor wrote: as it left it.
+    fn is_own(&self, path: &Path) -> bool {
+        self.own.iter().rev().find(|(p, ..)| p == path).is_some_and(|(_, then, _)| *then == stamp(path))
+    }
+
+    /// Take in what other programs changed, now.
+    fn take_in_pending(&mut self) {
+        if !self.pending.is_empty() {
+            let paths = std::mem::take(&mut self.pending).into_iter().collect();
+            self.external.0 = self.takein.paths(paths);
+        }
+    }
+
+    /// View > Refresh: what other programs changed taken in; where the watcher failed, every layer scanned again.
+    pub fn refresh_now(&mut self) {
+        if self.watch_error.is_some() {
+            self.pending.extend(self.project.layers.iter().map(|l| l.path.clone()));
+        }
+        self.take_in_pending();
+    }
+
+    /// Changes other programs made, not taken in yet.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// A take-in is running.
+    pub fn taking_in(&self) -> bool {
+        self.takein.busy()
+    }
+
+    /// Wait for the take-ins asked so far, and swap in what they made: what an edit does before reading the index.
+    fn settle(&mut self) {
+        let ready = self.takein.settle();
+        self.apply(ready);
+    }
+
+    /// Swap in snapshots, oldest first: the index, the tree and the layers; the pictures and views of what changed
+    /// forgotten; a selection shown once its step is taken in; agents waiting on them answered.
+    fn apply(&mut self, snapshots: Vec<crate::takein::Snapshot>) {
+        for snapshot in snapshots {
+            if let Some(error) = snapshot.error {
+                self.watch_error = Some(error);
+            }
+            if let Some(why) = snapshot.reopen {
+                self.outcome = Update::Reopen(why);
+            }
+            self.index = snapshot.index;
+            self.tree = snapshot.tree;
+            self.layers = snapshot.layers;
+            self.refresh_editable();
+            if snapshot.all {
+                self.pictures.clear();
+                self.parts = Parts::default();
+                self.inspector_views.clear();
+                self.panels.clear();
+                self.views.clear();
+                self.thumbs.clear();
+            } else if !snapshot.changed.is_empty() {
+                let changed = &snapshot.changed;
+                self.pictures.retain(|(image, ..), _| !changed.contains(image));
+                self.parts.forget(changed);
+                self.inspector_views.retain(|(asset, ..), _| !changed.contains(asset));
+                self.panels.clear();
+                self.views.retain(|(_, asset, _), _| !changed.contains(asset));
+                self.thumbs.forget(changed);
+            }
+            self.drop_lost_selection();
+            // Other programs' changes taken in: the app says how many assets they changed.
+            let (asked, told) = self.external;
+            if asked > told && snapshot.ticket >= asked {
+                self.external.1 = asked;
+                if !matches!(self.outcome, Update::Reopen(_)) && !snapshot.changed.is_empty() {
+                    let before = if let Update::Refreshed(n) = self.outcome { n } else { 0 };
+                    self.outcome = Update::Refreshed(before + snapshot.changed.len());
+                }
+            }
+        }
+        if let Some((ticket, path)) = self.selection_after.take() {
+            if !self.takein.covers(ticket) {
+                self.selection_after = Some((ticket, path));
+            } else if self.exists(&path) {
+                self.navigate(path);
+            }
+        }
+        let waiting = std::mem::take(&mut self.agents_waiting);
+        for (ticket, request, reply) in waiting {
+            if self.takein.covers(ticket) {
+                self.answer_agent(&request, &reply);
+            } else {
+                self.agents_waiting.push((ticket, request, reply));
+            }
+        }
     }
 
     /// Give up the workspace, keeping its history for the project opened again.
@@ -457,57 +629,19 @@ impl Workspace {
         self.history
     }
 
-    /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. The
-    /// index takes the change in at once, and what was selected when the step was made is shown again. Returns the
-    /// step's label and what the index made of it.
+    /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. Its
+    /// files are taken in, and what was selected when the step was made is shown again once they are. Returns the
+    /// step's label.
     ///
     /// # Errors
     /// Nothing to undo or redo, files changed outside the editor (unless forced), or a file not written.
-    pub fn step(&mut self, redo: bool, force: bool) -> Result<(String, Update), StepError> {
+    pub fn step(&mut self, redo: bool, force: bool) -> Result<String, StepError> {
+        self.settle();
         let step = if redo { self.history.redo(force)? } else { self.history.undo(force)? };
-        let (label, paths, selection) = (step.label.clone(), step.paths(), step.selection.clone());
-        let update = self.take_in(&paths);
-        if let Some(path) = selection.filter(|p| self.exists(p)) {
-            self.navigate(path);
-        }
-        Ok((label, update))
-    }
-
-    /// Bring changed paths into the index, and the tree and pictures after it.
-    fn take_in(&mut self, paths: &[PathBuf]) -> Update {
-        if paths.is_empty() {
-            return Update::Nothing;
-        }
-        let refreshed = match self.index.refresh(&self.project, paths) {
-            Ok(refreshed) => refreshed,
-            Err(e) => {
-                self.watch_error = Some(format!("the index could not follow a change: {e:#}"));
-                return Update::Nothing;
-            }
-        };
-        if refreshed.project_file {
-            return Update::Reopen("project.toml changed");
-        }
-        // An `extension` asset came, went or changed.
-        if extensions::found(Some(&self.index)) != self.extensions_found {
-            return Update::Reopen("an extension changed");
-        }
-        // The assets the refresh assembled again, their imports attached again; the others keep theirs.
-        let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
-        self.layers = self.index.layers();
-        self.tree = Node::build(&self.index, &self.extensions);
-        self.refresh_editable();
-        if refreshed.assets.is_empty() {
-            return Update::Nothing;
-        }
-        self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
-        self.parts.forget(&refreshed.assets);
-        self.inspector_views.retain(|(asset, ..), _| !refreshed.assets.contains(asset));
-        self.panels.clear();
-        self.views.retain(|(_, asset, _), _| !refreshed.assets.contains(asset));
-        self.thumbs.forget(&refreshed.assets);
-        self.drop_lost_selection();
-        Update::Refreshed(refreshed.assets.len())
+        let (label, selection) = (step.label.clone(), step.selection.clone());
+        let ticket = self.take_written();
+        self.selection_after = selection.zip(ticket).map(|(path, ticket)| (ticket, path));
+        Ok(label)
     }
 
     /// Why the project is open without a lock: its file system cannot lock files (a WSL folder opened from Windows).
@@ -591,18 +725,8 @@ impl Workspace {
 
     /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
     fn apply_eyes(&mut self) -> Result<()> {
-        if self.index.set_hidden(&self.layer_view.hidden(&self.layers)) {
-            // Every asset assembled again: their imports attached again.
-            let _ = self.imports.attach(&mut self.index, &self.extensions);
-            self.tree = Node::build(&self.index, &self.extensions);
-            self.pictures.clear();
-            self.parts = Parts::default();
-            self.inspector_views.clear();
-            self.panels.clear();
-            self.views.clear();
-            self.thumbs.clear();
-            self.drop_lost_selection();
-        }
+        // The worker assembles the view again; its snapshot brings the tree and forgets the pictures.
+        self.takein.hidden(self.layer_view.hidden(&self.layers));
         self.refresh_editable();
         self.save_layer_view()
     }
@@ -615,7 +739,7 @@ impl Workspace {
             self.layers.iter().filter(|l| !self.is_locked(l)).map(|l| l.name.as_str()).collect();
         let solo = self.layer_view.solo.as_deref();
         let mut editable = HashSet::new();
-        for (real, entry) in &self.index.entries {
+        for (real, entry) in self.index.entries.iter() {
             let touched = solo.is_some_and(|solo| {
                 entry.home == solo || entry.overrides.iter().any(|l| l == solo) || entry.moved.as_deref() == Some(solo)
             });
@@ -709,6 +833,8 @@ impl Workspace {
     /// The active layer cannot be written, the edit does not apply, or files cannot be written.
     pub fn edit(&mut self, request: &EditRequest) -> anyhow::Result<String> {
         use project::edit;
+        // An edit reads the index (a layer's changeset): what was asked before is taken in first.
+        self.settle();
         let name = match request {
             // A files layer chosen for code: it is to be writable, as the active one is.
             EditRequest::OverrideIn(_, layer) => {
@@ -742,7 +868,7 @@ impl Workspace {
             );
         }
         let (project, index, history) = (&self.project, &self.index, &mut self.history);
-        let paths = match request {
+        match request {
             EditRequest::Override(uid) | EditRequest::OverrideIn(uid, _) => {
                 edit::override_entry(project, index, &name, uid, history)?
             }
@@ -756,7 +882,8 @@ impl Workspace {
         };
         self.history.note_selection(self.selected.clone());
         let label = self.history.done().last().map_or_default(|s| s.label.clone());
-        self.take_in(&paths);
+        // What it wrote, taken in ahead of what other programs changed.
+        self.take_written();
         Ok(label)
     }
 
@@ -787,6 +914,8 @@ impl Workspace {
         if source.layer != layer {
             let label = self.edit(&EditRequest::Override(uid.to_string()))?;
             done.push(label);
+            // The copy taken in, to open it.
+            self.settle();
         }
         let path = path_of(self).unwrap_or(path);
         let (category, source) = self.source_tool(&path).context("its source is gone")?;

@@ -286,7 +286,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         }
         let Some(ws) = self.workspace.as_deref_mut() else {
             ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("No project open - File ▸ Open project").color(theme::weak()))
+                ui.label(RichText::new("No project open - File, Open project").color(theme::weak()))
             });
             return UiResponse::None;
         };
@@ -724,6 +724,7 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
         .index
         .assets
         .values()
+        .map(|a| &**a)
         .filter(|a| a.path.to_lowercase().contains(filter) || a.kind.as_deref() == Some(filter))
         .collect();
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
@@ -1378,6 +1379,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
 enum SettingsPage {
     Appearance,
     Tools,
+    Files,
     Startup,
     Agents,
     ProjectGeneral,
@@ -1391,6 +1393,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Appearance => "Appearance",
             SettingsPage::Tools => "External tools",
+            SettingsPage::Files => "Files",
             SettingsPage::Startup => "Startup",
             SettingsPage::Agents => "Agents",
             SettingsPage::ProjectGeneral => "General",
@@ -1409,14 +1412,14 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
     egui::Panel::left("settings categories").resizable(false).default_size(170.0).show(ui, |ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("EDITOR").small().strong().color(theme::weak()));
-        for p in &PAGES[..4] {
+        for p in &PAGES[..5] {
             if ui.selectable_label(page == *p, p.title()).clicked() {
                 page = *p;
             }
         }
         ui.add_space(10.0);
         ui.label(RichText::new("PROJECT").small().strong().color(theme::weak()));
-        for p in &PAGES[4..] {
+        for p in &PAGES[5..] {
             if ui.add_enabled(ws.is_some(), egui::Button::selectable(page == *p, p.title())).clicked() {
                 page = *p;
             }
@@ -1432,6 +1435,23 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
                 match (page, ws) {
                     (SettingsPage::Appearance, _) => appearance_ui(ui, settings),
                     (SettingsPage::Tools, _) => tools_ui(ui, &mut settings.tools),
+                    (SettingsPage::Files, _) => {
+                        use crate::settings::TakeIn;
+                        theme::section(ui, "Changes other programs make", |ui| {
+                            let take_in = &mut settings.changes.take_in;
+                            ui.radio_value(take_in, TakeIn::OnFocus, "Take them in when the editor regains focus");
+                            ui.radio_value(take_in, TakeIn::AsTheyHappen, "Take them in as they happen");
+                            ui.label(
+                                RichText::new(
+                                    "A tool saving often, or a checkout, is taken in once, when you come back to the \
+                                     editor. Refresh in the View menu (F5) takes them in at any time; an agent's request always \
+                                     does first.",
+                                )
+                                .small()
+                                .color(theme::weak()),
+                            );
+                        });
+                    }
                     (SettingsPage::Startup, _) => {
                         theme::section(ui, "When the editor starts", |ui| {
                             ui.checkbox(&mut settings.startup.reopen_last_project, "Reopen the last project");
@@ -1477,9 +1497,10 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
     });
 }
 
-const PAGES: [SettingsPage; 8] = [
+const PAGES: [SettingsPage; 9] = [
     SettingsPage::Appearance,
     SettingsPage::Tools,
+    SettingsPage::Files,
     SettingsPage::Startup,
     SettingsPage::Agents,
     SettingsPage::ProjectGeneral,

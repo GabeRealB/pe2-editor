@@ -112,6 +112,9 @@ pub struct History {
     done: Vec<Step>,
     undone: Vec<Step>,
     trashed: usize,
+    /// The paths its steps wrote - made, undone, redone - since they were last taken (`take_written`): what the
+    /// editor takes in as its own changes.
+    written: Vec<PathBuf>,
 }
 
 impl History {
@@ -125,7 +128,7 @@ impl History {
         let mut recovered = None;
         if let Ok(text) = std::fs::read_to_string(dir.join(APPLYING)) {
             let (label, applied): (String, Vec<Change>) = serde_json::from_str(&text).unwrap_or_default();
-            let history = History { dir: dir.clone(), done: vec![], undone: vec![], trashed: 0 };
+            let history = History { dir: dir.clone(), done: vec![], undone: vec![], trashed: 0, written: vec![] };
             for change in applied.iter().rev() {
                 // Best effort: what the crash left is put back as it was before.
                 let _ = history.apply(&change.inverse());
@@ -136,7 +139,7 @@ impl History {
             std::fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
         }
         std::fs::create_dir_all(dir.join("blobs")).with_context(|| format!("{}", dir.display()))?;
-        Ok((History { dir, done: vec![], undone: vec![], trashed: 0 }, recovered))
+        Ok((History { dir, done: vec![], undone: vec![], trashed: 0, written: vec![] }, recovered))
     }
 
     /// Begin a transaction, named as the user will see it in the history.
@@ -150,6 +153,11 @@ impl History {
         if let Some(step) = self.done.last_mut() {
             step.selection = selection;
         }
+    }
+
+    /// The paths its steps wrote since this was last asked, made, undone or redone.
+    pub fn take_written(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.written)
     }
 
     /// The steps done, oldest first.
@@ -176,6 +184,7 @@ impl History {
         let result = self.run(&mut step, false, force);
         match result {
             Ok(()) => {
+                self.written.extend(step.paths());
                 self.undone.push(step);
                 self.undone.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step undone is gone")))
             }
@@ -198,6 +207,7 @@ impl History {
         let result = self.run(&mut step, true, force);
         match result {
             Ok(()) => {
+                self.written.extend(step.paths());
                 self.done.push(step);
                 self.done.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step redone is gone")))
             }
@@ -497,6 +507,7 @@ impl Transaction<'_> {
         self.committed = true;
         self.history.settle()?;
         let paths = self.step.paths();
+        self.history.written.extend(paths.iter().cloned());
         if !self.step.changes.is_empty() {
             let step = std::mem::replace(
                 &mut self.step,
