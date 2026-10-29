@@ -42,6 +42,8 @@ pub struct BundleFile {
     pub layer: String,
     /// The hash of its content.
     pub sha1: String,
+    /// The importer that made it of the asset's source, kept in the cache (`imports`); none for a file of the bundle.
+    pub made_by: Option<String>,
 }
 
 /// One asset: its resolved path (`stages/akropolis/rooms/square/folder`), its uid, its `asset.toml` and its files.
@@ -61,6 +63,20 @@ pub struct Asset {
     pub error: Option<String>,
     text: Arc<str>,
     fields: OnceLock<toml::Table>,
+    /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
+    pub imported: Option<Arc<Imported>>,
+}
+
+/// An asset's settings with what its import derived from its source in their places.
+#[derive(Clone, Debug, Default)]
+pub struct Imported {
+    pub settings: toml::Table,
+    /// The settings as TOML, for what reads a declaration's text; written the first time it is asked for.
+    pub text: OnceLock<String>,
+    /// Settings the declaration gives that the import overrides (`size`, `cells.dot.rect`).
+    pub overridden: Vec<String>,
+    /// Parts the declaration has that the source no longer does (`cells.dot`).
+    pub orphans: Vec<String>,
 }
 
 impl Asset {
@@ -73,6 +89,21 @@ impl Asset {
     /// Its `asset.toml`'s fields; empty where it cannot be parsed.
     pub fn fields(&self) -> &toml::Table {
         self.fields.get_or_init(|| toml::from_str(&self.text).unwrap_or_default())
+    }
+
+    /// Its settings as readers see them: its fields, with what its import derived in their places.
+    #[must_use]
+    pub fn settings(&self) -> &toml::Table {
+        self.imported.as_ref().map_or_else(|| self.fields(), |i| &i.settings)
+    }
+
+    /// Its settings as TOML.
+    #[must_use]
+    pub fn settings_text(&self) -> &str {
+        self.imported.as_ref().map_or_else(
+            || self.text(),
+            |i| i.text.get_or_init(|| toml::to_string(&i.settings).unwrap_or_default()).as_str(),
+        )
     }
 }
 
@@ -197,6 +228,8 @@ pub struct Reference {
     pub slot: String,
     pub uid: String,
     pub target: String,
+    /// The part of the asset it names (`variants/night`, from `uid://...#variants/night`); none for the asset.
+    pub part: Option<String>,
 }
 
 /// Something wrong with the project, found by the index.
@@ -216,6 +249,14 @@ pub enum Problem {
     Unbound { layer: String, uid: String },
     /// An override whose base changed since it was made.
     Stale { layer: String, path: String },
+    /// An asset whose import failed: it has no native files.
+    Import { asset: String, error: String },
+    /// A setting the declaration gives that the asset's import derives from its source, which wins.
+    Overridden { asset: String, setting: String },
+    /// A part's settings the declaration has for a part its source no longer has.
+    Orphan { asset: String, part: String },
+    /// A reference naming a part (`uid://...#variants/night`) its asset does not have.
+    MissingPart { asset: String, slot: String, target: String, part: String },
 }
 
 impl Problem {
@@ -224,6 +265,10 @@ impl Problem {
     pub fn paths(&self) -> Vec<&str> {
         match self {
             Problem::Unreadable { asset: path, .. }
+            | Problem::Import { asset: path, .. }
+            | Problem::Overridden { asset: path, .. }
+            | Problem::Orphan { asset: path, .. }
+            | Problem::MissingPart { asset: path, .. }
             | Problem::Conflict { path, .. }
             | Problem::Unlisted { path, .. }
             | Problem::Missing { path, .. }
@@ -244,6 +289,12 @@ impl Problem {
             Problem::Missing { layer, .. } => format!("listed by {layer}, which does not hold it"),
             Problem::Unbound { layer, uid } => format!("{layer} acts on {uid}, which no layer below creates"),
             Problem::Stale { layer, .. } => format!("{layer}'s override was made from another version of it"),
+            Problem::Import { error, .. } => format!("its import failed: {error}"),
+            Problem::Overridden { setting, .. } => {
+                format!("{setting} is set, but its import derives it from the source, which wins")
+            }
+            Problem::Orphan { part, .. } => format!("{part} has settings, but its source has no such part"),
+            Problem::MissingPart { slot, target, part, .. } => format!("{slot} names {target}#{part}, which it does not have"),
         }
     }
 
@@ -256,14 +307,19 @@ impl Problem {
             | Problem::Missing { layer, .. }
             | Problem::Unbound { layer, .. }
             | Problem::Stale { layer, .. } => vec![layer.as_str()],
-            Problem::Unreadable { .. } | Problem::DuplicateUid { .. } => vec![],
+            Problem::Unreadable { .. }
+            | Problem::DuplicateUid { .. }
+            | Problem::Import { .. }
+            | Problem::Overridden { .. }
+            | Problem::Orphan { .. }
+            | Problem::MissingPart { .. } => vec![],
         }
     }
 
     /// Whether the build can go on with it: an override made from an older base still applies.
     #[must_use]
     pub fn is_warning(&self) -> bool {
-        matches!(self, Problem::Stale { .. })
+        matches!(self, Problem::Stale { .. } | Problem::Overridden { .. } | Problem::Orphan { .. })
     }
 }
 
@@ -629,7 +685,8 @@ fn bundle_of(rel: &str) -> Option<String> {
 
 /// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
 /// reference is the asset's uid, `"uid://..."` - with a fragment naming a part of it (`#palettes/default`), which
-/// this leaves out -, or, as written before uids sufficed, a table of the uid and the bundle's `res://` path.
+/// this leaves out (`part_of` gives it) -, or, as written before uids sufficed, a table of the uid and the bundle's
+/// `res://` path.
 #[must_use]
 pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     match value {
@@ -645,12 +702,19 @@ pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     }
 }
 
+/// The part of an asset a reference names: its fragment (`palettes/default` of `uid://...#palettes/default`).
+#[must_use]
+pub fn part_of(value: &toml::Value) -> Option<&str> {
+    let (_, part) = value.as_str()?.strip_prefix("uid://")?.split_once('#')?;
+    (!part.is_empty()).then_some(part)
+}
+
 /// Every reference in a value (`reference`), named by the enclosing slot's `name` or else the field it sits in.
-fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String)>) {
+fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String, String)>) {
     match value {
         toml::Value::Table(t) => {
             if let Some((uid, path)) = reference(value) {
-                out.push((field.to_string(), uid, path.unwrap_or_default()));
+                out.push((field.to_string(), uid, path.unwrap_or_default(), String::new()));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
@@ -661,7 +725,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
         toml::Value::String(_) => {
             if let Some((uid, _)) = reference(value) {
-                out.push((field.to_string(), uid, String::new()));
+                out.push((field.to_string(), uid, String::new(), part_of(value).unwrap_or_default().to_string()));
             }
         }
         _ => {}
@@ -1027,7 +1091,7 @@ impl Index {
             for files in layer.scan.bundles.values() {
                 let declaration =
                     files.get(ASSET_FILE).and_then(|f| self.records.get(f)).and_then(|r| r.declaration.as_ref());
-                for (_, uid, _) in declaration.map_or(&[][..], |d| d.references.as_slice()) {
+                for (_, uid, _, _) in declaration.map_or(&[][..], |d| d.references.as_slice()) {
                     if let Some(&j) = creator.get(uid.as_str()).filter(|&&j| j != i) {
                         out[i].entry(j).or_insert((0, 0)).1 += 1;
                     }
@@ -1342,6 +1406,7 @@ impl Index {
                 error: None,
                 text: Arc::from(""),
                 fields: OnceLock::new(),
+                imported: None,
             };
             for (name, file) in layer.scan.bundles.get(&node.content.1).into_iter().flatten() {
                 let Some(record) = self.records.get(file) else { continue };
@@ -1361,6 +1426,7 @@ impl Index {
                     modified: record.modified,
                     layer: layer.name.clone(),
                     sha1: record.sha1.clone(),
+                    made_by: None,
                 });
             }
             self.assets.insert(asset.path.clone(), asset);
@@ -1383,8 +1449,9 @@ impl Index {
                 .iter()
                 .find(|f| f.name == ASSET_FILE)
                 .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
-            for (slot, uid, target) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned() {
-                let reference = Reference { from: asset.path.clone(), slot, uid, target };
+            for (slot, uid, target, part) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned() {
+                let part = (!part.is_empty()).then_some(part);
+                let reference = Reference { from: asset.path.clone(), slot, uid, target, part };
                 // The uid decides; the path is the fallback.
                 match self
                     .by_uid
@@ -1412,11 +1479,12 @@ impl Index {
         declaration
             .map_or(&[][..], |d| d.references.as_slice())
             .iter()
-            .map(|(slot, uid, target)| Reference {
+            .map(|(slot, uid, target, part)| Reference {
                 from: path.to_string(),
                 slot: slot.clone(),
                 uid: uid.clone(),
                 target: target.clone(),
+                part: (!part.is_empty()).then(|| part.clone()),
             })
             .collect()
     }

@@ -58,7 +58,8 @@ struct ProblemsArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct PreviewArgs {
-    /// The image: its path or its uid.
+    /// The image: its path or its uid; with a fragment, one of its parts (`#variants/night`, `#cells/cursor`,
+    /// `#palettes/default`; `get_asset` lists them).
     asset: String,
     /// The look to show it in, by name (an image's variants; an atlas's `default` and its variants). Its first when
     /// absent.
@@ -181,9 +182,10 @@ fn own() -> Vec<Tool> {
         tool::<AssetArgs>(
             "get_asset",
             "An asset as resolved: path, uid, kind, role, the layers creating and overriding it, its files (size, \
-             sha1, layer), its looks where it has a picture, what its kind's extension tells of it (an image's \
+             sha1, layer, the importer that made it of the source), its looks where it has a picture, what its kind's extension tells of it (an image's \
              palettes and cell count), its importer and the importers that fit its source, and its declaration \
-             (asset.toml) as written.",
+             (asset.toml) as written - with the settings as resolved where its import derives some from its source - \
+             and its parts (what references name by fragment, a virtual one with the parts it is made of).",
         ),
         tool::<AssetArgs>(
             "references",
@@ -198,7 +200,7 @@ fn own() -> Vec<Tool> {
         tool::<PreviewArgs>(
             "preview",
             "An image's picture as PNG - a background, a texture through a palette, an atlas with each cell through \
-             its own - in one of its looks.",
+             its own - in one of its looks; or one of its parts by fragment (asset#variants/night).",
         ),
         tool::<NoArgs>(
             "editor_selection",
@@ -387,7 +389,7 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     let files: Vec<Value> = asset
         .files
         .iter()
-        .map(|f| json!({ "name": f.name, "size": f.size, "sha1": f.sha1, "layer": f.layer }))
+        .map(|f| json!({ "name": f.name, "size": f.size, "sha1": f.sha1, "layer": f.layer, "made_by": f.made_by }))
         .collect();
     let mut out = summary(asset);
     let fields = out.as_object_mut().expect("an object");
@@ -416,10 +418,31 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     if !fits.is_empty() {
         fields.insert("importers".into(), json!(fits));
     }
+    let parts: Vec<Value> = extensions
+        .parts(asset)
+        .into_iter()
+        .map(|p| {
+            let made_of = (!p.made_of.is_empty()).then_some(p.made_of);
+            json!({ "id": p.id, "label": p.label, "made_of": made_of })
+        })
+        .collect();
+    if !parts.is_empty() {
+        fields.insert("parts".into(), json!(parts));
+    }
     if let Some(error) = &asset.error {
         fields.insert("error".into(), json!(error));
     }
     fields.insert("declaration".into(), json!(asset.text()));
+    // What readers see where an import derives some of it from the source: the declaration with those in place.
+    if let Some(imported) = &asset.imported {
+        fields.insert("settings".into(), json!(asset.settings_text()));
+        if !imported.overridden.is_empty() {
+            fields.insert("overridden_by_import".into(), json!(imported.overridden));
+        }
+        if !imported.orphans.is_empty() {
+            fields.insert("orphaned".into(), json!(imported.orphans));
+        }
+    }
     Ok(out)
 }
 
@@ -430,7 +453,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .iter()
         .map(|r| {
             let resolved = index.resolve(&r.uid, &r.target).map(|a| a.path.clone());
-            json!({ "slot": r.slot, "uid": r.uid, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
+            json!({ "slot": r.slot, "uid": r.uid, "part": r.part, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
         })
         .collect();
     let by: Vec<Value> = index
@@ -438,7 +461,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .get(&asset.path)
         .map_or(&[][..], Vec::as_slice)
         .iter()
-        .map(|r| json!({ "from": r.from, "slot": r.slot }))
+        .map(|r| json!({ "from": r.from, "slot": r.slot, "part": r.part }))
         .collect();
     Ok(json!({ "path": asset.path, "references": made, "referenced_by": by }))
 }
@@ -464,6 +487,22 @@ fn problems(index: &Index, limit: usize) -> Value {
 }
 
 fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {
+    // A part, by its fragment: `uid://...#variants/night`, `path#cells/cursor`.
+    if let Some((name, part)) = args.asset.split_once('#') {
+        let asset = asset(index, name)?;
+        let ids: Vec<String> = extensions.parts(asset).into_iter().map(|p| p.id).collect();
+        let image = extensions
+            .part(asset, part)
+            .ok_or_else(|| format!("{}: no part {part} with a picture; its parts: {}", asset.path, ids.join(", ")))?
+            .map_err(|e| format!("{e:#}"))?;
+        let image = upscale(image, args.scale.unwrap_or(1).clamp(1, 8));
+        let png = project::ext::png(&image).map_err(|e| format!("{e:#}"))?;
+        let caption = format!("{}#{part}: {} x {}", asset.path, image.width, image.height);
+        return Ok(CallToolResult::success(vec![
+            ContentBlock::text(caption),
+            ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"),
+        ]));
+    }
     let asset = asset(index, &args.asset)?;
     let looks = extensions.looks(asset);
     let look = match &args.variant {

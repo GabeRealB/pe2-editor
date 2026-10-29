@@ -1150,7 +1150,9 @@ fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&str>, nav: 
             ui.label(RichText::new("Nothing references this asset").color(theme::weak()));
         }
         for r in incoming {
-            let slot = RichText::new(format!("slot {}", r.slot)).color(theme::weak());
+            // The part it names, where it names one.
+            let part = r.part.as_ref().map_or_default(|p| format!("  #{p}"));
+            let slot = RichText::new(format!("slot {}{part}", r.slot)).color(theme::weak());
             if theme::link_row(ui, &r.from, slot).clicked() {
                 *nav = Some(r.from.clone());
             }

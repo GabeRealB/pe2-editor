@@ -13,6 +13,12 @@
 //! A reference is written as the referenced asset's uid alone (`"uid://..."`), where the declarations hold its path
 //! beside it: the uid decides, and a path written into every referencing asset would go stale when the asset moved.
 //!
+//! An asset whose importer writes its source (an image's `pe2.images@ora`) is written as that source alone: exported
+//! from the native files read off the disc, and imported again to check that it makes them byte for byte and gives
+//! back the settings it derives (an image's size, its cells' rectangles), which its `asset.toml` then leaves out -
+//! extraction stops at an asset whose source would not. Its import is kept in the project cache, so the project opens without
+//! importing (`imports`).
+//!
 //! A bundle's `asset.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
 //! layer holds - each asset under its declared uid, each folder and `extraction.toml` under a new one - and marks the
 //! layer read-only, extraction's alone.
@@ -29,6 +35,8 @@ use std::path::{Path, PathBuf};
 
 use crate::changeset::Changeset;
 use crate::declarations::{At, Declarations, Disc};
+use crate::ext::Extensions;
+use crate::imports::Imports;
 use crate::lock::Lock;
 use crate::{DiscImage, Game, Project, uid};
 
@@ -43,6 +51,8 @@ pub struct Report {
     pub layer: PathBuf,
     pub assets: usize,
     pub layouts: usize,
+    /// Assets written as their importer's source, each checked to import back into its native files.
+    pub sources: usize,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -344,8 +354,116 @@ fn open_discs(game: &Game, decl: &Declarations, releases: &[String], roms: &Path
     Ok(discs)
 }
 
-/// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count.
-fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &mut Discs) -> Result<usize> {
+/// What makes an asset's source of its native files: the extensions, and the imports kept of what they checked.
+struct Sourcing<'a> {
+    extensions: &'a Extensions,
+    imports: Imports,
+    sources: usize,
+}
+
+/// An asset as extraction lends it to its importer: its declaration and the files given.
+struct Lent<'a> {
+    path: &'a str,
+    fields: toml::Table,
+    declaration: &'a str,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl pe2_ext::Source for Lent<'_> {
+    fn path(&self) -> &str {
+        self.path
+    }
+
+    fn uid(&self) -> Option<&str> {
+        None
+    }
+
+    fn fields(&self) -> &toml::Table {
+        &self.fields
+    }
+
+    fn declaration(&self) -> &str {
+        self.declaration
+    }
+
+    fn has_file(&self, name: &str) -> bool {
+        self.files.contains_key(name)
+    }
+
+    fn read(&self, name: &str) -> pe2_ext::Result<Vec<u8>> {
+        self.files.get(name).cloned().ok_or_else(|| pe2_ext::anyhow!("{}: no file {name}", self.path))
+    }
+}
+
+impl Sourcing<'_> {
+    /// An asset's `asset.toml` and files as its bundle holds them: its native files where its importer is native,
+    /// else its importer's source alone - exported from them, imported back with the declaration less what the
+    /// import derives, and compared, files and settings both; its import kept.
+    fn bundle(
+        &mut self,
+        path: &str,
+        asset: &crate::declarations::Asset,
+        toml: String,
+        native: Vec<(String, Vec<u8>)>,
+    ) -> Result<(String, pe2_ext::Made)> {
+        let fields: toml::Table = toml.parse()?;
+        let import = fields.get("import");
+        let named = |key: &str| import.and_then(|i| i.get(key)).and_then(toml::Value::as_str).map(str::to_string);
+        let (Some(importer), Some(source)) = (named("importer"), named("source")) else { return Ok((toml, native)) };
+        let def = self.extensions.importer(&importer).with_context(|| format!("{path}: no extension provides {importer}"))?;
+        if def.export.is_none() {
+            return Ok((toml, native));
+        }
+        let (kind, role) = self.extensions.qualify(&asset.kind, asset.role.as_deref());
+        let lent = Lent { path, fields: fields.clone(), declaration: &toml, files: native.iter().cloned().collect() };
+        let bytes = self
+            .extensions
+            .export(&importer, &pe2_ext::Asset::new(&lent, kind, role))
+            .context("no export")?
+            .with_context(|| format!("{path}: {importer} could not write its source"))?;
+        // What the bundle says: the declaration without what the source holds.
+        let written = crate::imports::without_derived(&toml, &def.derives)?;
+        let lent = Lent {
+            path,
+            fields: written.parse()?,
+            declaration: &written,
+            files: BTreeMap::from([(source.clone(), bytes.clone())]),
+        };
+        let made = self
+            .extensions
+            .import(&pe2_ext::Asset::new(&lent, kind, role))
+            .context("no import")?
+            .with_context(|| format!("{path}: {importer} could not import its source"))?;
+        let (made_map, native_map): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            (made.files.iter().cloned().collect(), native.into_iter().collect());
+        if made_map != native_map {
+            let differ: Vec<&String> = native_map
+                .keys()
+                .chain(made_map.keys())
+                .filter(|n| native_map.get(*n) != made_map.get(*n))
+                .collect();
+            bail!("{path}: its {source} does not import back into the disc's files ({differ:?} differ)");
+        }
+        let resolved = crate::imports::resolve(&lent.fields, &made.settings, &def.derives);
+        if resolved.settings != fields || !resolved.orphans.is_empty() {
+            bail!("{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})", resolved.orphans);
+        }
+        let key = crate::imports::key(self.extensions, &importer, &sha1_hex(&bytes), &written);
+        self.imports.put(&key, &made)?;
+        self.sources += 1;
+        Ok((written, vec![(source, bytes)]))
+    }
+}
+
+/// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count,
+/// and how many were written as their sources.
+fn write_assets(
+    layer: &Path,
+    decl: &Declarations,
+    releases: &[String],
+    discs: &mut Discs,
+    mut sourcing: Sourcing,
+) -> Result<(usize, usize)> {
     // Where each file asset is, to find a chunk slot's file.
     let mut files = HashMap::new();
     for (path, asset) in &decl.assets {
@@ -374,6 +492,7 @@ fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
             let toml = asset_toml(&asset.body, None, &originals)?;
+            let (toml, pngs) = sourcing.bundle(path, asset, toml, pngs)?;
             let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
             files.extend(pngs.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
             write_bundle(layer, path, &files)?;
@@ -423,7 +542,7 @@ fn write_assets(layer: &Path, decl: &Declarations, releases: &[String], discs: &
         write_bundle(layer, path, &files)?;
         written += 1;
     }
-    Ok(written)
+    Ok((written, sourcing.sources))
 }
 
 /// The releases' discs and containers as bundles, their slots filled. Returns their count.
@@ -512,7 +631,7 @@ fn write_changeset(project: &Project, layer: &str, decl: &Declarations, releases
 /// # Errors
 /// The project names no game layer or an unknown release, the declarations do not load, a disc is missing or differs
 /// from its layout, an asset's bytes differ from its sha1, or a file cannot be written.
-pub fn extract(project: &Project, options: &Options, _lock: &Lock) -> Result<Report> {
+pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &Extensions) -> Result<Report> {
     let game = project.game.as_ref().context("the project has no [game]")?;
     let releases: Vec<String> =
         if options.releases.is_empty() { game.releases.keys().cloned().collect() } else { options.releases.clone() };
@@ -541,9 +660,11 @@ pub fn extract(project: &Project, options: &Options, _lock: &Lock) -> Result<Rep
         fs::remove_dir_all(&layer)?; // the layer is the extraction's alone
     }
     fs::create_dir_all(&layer)?;
-    let assets = write_assets(&layer, &decl, &releases, &mut discs)?;
+    let cache = crate::cache::Cache::open(project, lock)?;
+    let sourcing = Sourcing { extensions, imports: Imports::open(&cache)?, sources: 0 };
+    let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
     write_record(&layer, &decl_root, &releases, &discs)?;
     write_changeset(project, &game.layer, &decl, &releases)?;
-    Ok(Report { layer, assets, layouts })
+    Ok(Report { layer, assets, layouts, sources })
 }

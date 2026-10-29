@@ -11,3 +11,6 @@ workspace = true
 [dependencies]
 formats.workspace = true
 png.workspace = true
+miniz_oxide.workspace = true
+crc32fast.workspace = true
+quick-xml.workspace = true

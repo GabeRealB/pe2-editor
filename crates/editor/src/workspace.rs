@@ -160,6 +160,8 @@ pub struct Workspace {
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
     /// Requests using the editor's window, which the app's driver answers across frames.
     pub window_requests: Vec<crate::drive::Request>,
+    /// What importers made of the assets' sources.
+    imports: project::imports::Imports,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
     pub tree: Node,
@@ -295,6 +297,9 @@ impl Workspace {
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
         let extensions = extensions::shared();
+        // What the assets' importers made of their sources, seen as their files.
+        let imports = project::imports::Imports::open(&cache)?;
+        let _ = imports.attach(&mut index, &extensions);
         let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
@@ -322,6 +327,7 @@ impl Workspace {
             requests: None,
             window_requests: Vec::new(),
             link_error: None,
+            imports,
             tree,
             editable: HashSet::new(),
             selected: None,
@@ -461,6 +467,7 @@ impl Workspace {
         if refreshed.project_file {
             return Update::Reopen;
         }
+        let _ = self.imports.attach(&mut self.index, &self.extensions);
         self.layers = self.index.layers();
         self.tree = Node::build(&self.index, &self.extensions);
         self.refresh_editable();

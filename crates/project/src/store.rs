@@ -15,7 +15,7 @@ use std::sync::Arc;
 use turso::Value;
 
 /// Raised whenever the tables change shape; a store of another version is emptied.
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 /// Rows a write must touch to be checkpointed at once.
 const CHECKPOINT_AFTER: usize = 1000;
 
@@ -31,8 +31,8 @@ pub struct Declaration {
     pub uid: Option<String>,
     /// Its `variants`' names, in order.
     pub variants: Vec<String>,
-    /// Its references: (slot or field, uid, target path).
-    pub references: Vec<(String, String, String)>,
+    /// Its references: (slot or field, uid, target path, the part of the asset it names - empty for the asset).
+    pub references: Vec<(String, String, String, String)>,
     /// Why it cannot be parsed.
     pub error: Option<String>,
     pub text: Arc<str>,
@@ -99,7 +99,7 @@ impl Store {
                      sha1 TEXT NOT NULL, declaration INTEGER NOT NULL, kind TEXT, role TEXT, uid TEXT, variants TEXT,
                      error TEXT, text TEXT);
                  CREATE TABLE reference (path TEXT NOT NULL, slot TEXT NOT NULL, uid TEXT NOT NULL,
-                     target TEXT NOT NULL);
+                     target TEXT NOT NULL, part TEXT NOT NULL);
                  CREATE INDEX reference_path ON reference (path);",
             ))?;
             let mut set = block_on(store.conn.query(&format!("PRAGMA user_version = {VERSION}"), ()))?;
@@ -120,12 +120,12 @@ impl Store {
     /// # Errors
     /// The database cannot be read.
     pub fn load(&self) -> Result<HashMap<PathBuf, Record>> {
-        let mut references: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
-        let mut rows = block_on(self.conn.query("SELECT path, slot, uid, target FROM reference", ()))?;
+        let mut references: HashMap<String, Vec<(String, String, String, String)>> = HashMap::new();
+        let mut rows = block_on(self.conn.query("SELECT path, slot, uid, target, part FROM reference", ()))?;
         while let Some(row) = block_on(rows.next())? {
-            let v: Vec<Value> = (0..4).map(|i| row.get_value(i)).collect::<turso::Result<_>>()?;
+            let v: Vec<Value> = (0..5).map(|i| row.get_value(i)).collect::<turso::Result<_>>()?;
             let field = |i: usize| text(&v[i]).unwrap_or_default();
-            references.entry(field(0)).or_default().push((field(1), field(2), field(3)));
+            references.entry(field(0)).or_default().push((field(1), field(2), field(3), field(4)));
         }
         let mut out = HashMap::new();
         let mut rows = block_on(self.conn.query(
@@ -198,7 +198,7 @@ impl Store {
                  uid = excluded.uid, variants = excluded.variants, error = excluded.error, text = excluded.text",
         ))?;
         let mut reference =
-            block_on(self.conn.prepare("INSERT INTO reference (path, slot, uid, target) VALUES (?1, ?2, ?3, ?4)"))?;
+            block_on(self.conn.prepare("INSERT INTO reference (path, slot, uid, target, part) VALUES (?1, ?2, ?3, ?4, ?5)"))?;
         for path in gone {
             written += 1;
             let path = path.to_string_lossy();
@@ -226,8 +226,9 @@ impl Store {
                 d.and_then(|d| d.error.clone()),
                 d.map(|d| d.text.to_string()),
             )))?;
-            for (slot, uid, target) in d.map_or(&[][..], |d| d.references.as_slice()) {
-                block_on(reference.execute((path.as_ref(), slot.as_str(), uid.as_str(), target.as_str())))?;
+            for (slot, uid, target, part) in d.map_or(&[][..], |d| d.references.as_slice()) {
+                let row = (path.as_ref(), slot.as_str(), uid.as_str(), target.as_str(), part.as_str());
+                block_on(reference.execute(row))?;
             }
         }
         Ok(written)

@@ -9,6 +9,7 @@ pub mod edit;
 pub mod ext;
 pub mod extract;
 pub mod history;
+pub mod imports;
 pub mod index;
 pub mod lock;
 pub mod stack;

@@ -918,6 +918,15 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
                 toml::from_str(&text).unwrap_or_default()
             });
         }
+        if kind.parts {
+            let shared = shared.clone();
+            builder = builder.parts(move |asset| {
+                let parts = shared
+                    .with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_parts(a, index, lent).await))
+                    .unwrap_or_default();
+                parts.into_iter().map(|p| pe2_ext::Part { id: p.id, label: p.label, made_of: p.made_of }).collect()
+            });
+        }
         for v in kind.views {
             builder = builder.view(&v.name, view(shared, v.handle));
         }
@@ -1027,6 +1036,27 @@ fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared:
                     Ok(g::Support::Partial((reason, offer))) => pe2_ext::Support::Partial { reason, offer },
                     Err(e) => pe2_ext::Support::Partial { reason: format!("{e:#}"), offer: false },
                 }
+            });
+        }
+        if importer.imports {
+            let (shared, handle) = (shared.clone(), importer.handle);
+            builder = builder.import(move |asset| {
+                let made = shared
+                    .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_native(a, handle, lent).await))?;
+                let made = made.map_err(|e| pe2_ext::anyhow!("{e}"))?;
+                let settings = toml::from_str(&made.settings).context("the settings an import derived")?;
+                Ok(pe2_ext::Imported { files: made.files, settings })
+            });
+        }
+        for path in &importer.derives {
+            builder = builder.derives(path);
+        }
+        if importer.exports {
+            let (shared, handle) = (shared.clone(), importer.handle);
+            builder = builder.export(move |asset| {
+                let made = shared
+                    .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_source(a, handle, lent).await))?;
+                made.map_err(|e| pe2_ext::anyhow!("{e}"))
             });
         }
         let _ = builder.register();

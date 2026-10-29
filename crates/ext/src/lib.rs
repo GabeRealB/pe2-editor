@@ -24,10 +24,10 @@ mod ui;
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use image::{Image, Rect, Texture};
-pub use import::{Check, FormatDef, ImporterDef, Recognized, Signature, Sniff, Support};
+pub use import::{Check, Export, FormatDef, Import, Imported, ImporterDef, Made, Recognized, Signature, Sniff, Support};
 pub use project::Project;
 pub use registry::{
-    Extension, Facts, Field, Format, FormatBuilder, Icon, ImporterBuilder, KindBuilder, KindDef, MakePanel, MakeView, Name, PanelDef, Parts, Picture,
+    Extension, Facts, Field, Format, FormatBuilder, Icon, ImporterBuilder, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, PanelDef, Part, Parts, Picture,
     Registry, RoleBuilder, RoleDef, Run, Thumbnail, Tint, ToolDef, ViewDef,
 };
 pub use toml::{Table, Value};

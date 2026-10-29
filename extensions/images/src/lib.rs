@@ -7,11 +7,12 @@
 //! palette tool; and VRAM - its slots (`vram_slot`) and the panel showing what an asset uploads where.
 
 mod inspector;
+mod ora;
 mod tools;
 mod view;
 mod vram;
 
-use pe2_ext::{Asset, Field, Icon, Image, Picture, Rect, Registry, Result, Tint, Value};
+use pe2_ext::{Asset, Field, Icon, Image, Part, Picture, Rect, Registry, Result, Tint, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -40,6 +41,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .view("Picture", |asset| Box::new(view::ImageView::new(asset)))
         .inspector("Palettes, variants and cells", |_| Box::new(inspector::Collections::default()))
         .facts(tools::facts)
+        .parts(parts)
         .register();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
         r.role(&image, role).alias(role).label(label).register();
@@ -50,6 +52,16 @@ fn register(r: &mut Registry) -> Result<()> {
     // Native: what they read is what the image is, its kind settings authored beside it.
     r.importer("texels", &image).label("Stored texels").reads(&texels).native().register();
     r.importer("bs", &image).label("Stored BS picture").reads(&bs).native().register();
+    // A texture or an atlas as layers a painting program opens, made back into its texels and palettes exactly.
+    r.importer("ora", &image)
+        .label("OpenRaster layers")
+        .reads_media(codecs::ora::MIMETYPE)
+        .import(ora::import)
+        .derives("size")
+        .derives("cells.*.rect")
+        .export(ora::export)
+        .priority(10)
+        .register();
     r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
     r.panel("vram", "VRAM", Icon::Grid, || Box::<vram::Vram>::default());
     r.tool("palette", tools::PALETTE, tools::PALETTE_ARGUMENTS, tools::palette);
@@ -65,7 +77,7 @@ const MODES: [(&str, &str); 3] = [
 ];
 
 /// A mode's depth, in bits a texel.
-fn depth_of(mode: &str) -> Option<u8> {
+pub(crate) fn depth_of(mode: &str) -> Option<u8> {
     match mode {
         "indexed_4bpp" => Some(4),
         "indexed_8bpp" => Some(8),
@@ -104,6 +116,41 @@ pub fn looks(asset: &Asset) -> Vec<String> {
     } else {
         named.collect()
     }
+}
+
+/// An image's parts: its texels, its palettes, its cells, and its variants - looks made of the texels through the
+/// palettes they name, files of their own they have none.
+fn parts(asset: &Asset) -> Vec<Part> {
+    if !is_texture(asset) {
+        return vec![];
+    }
+    let part = |id: String, label: &str, made_of: Vec<String>| Part { id, label: label.to_string(), made_of };
+    let mut out = vec![part("texels".into(), "Texels", vec![])];
+    let names = palette_names(asset);
+    out.extend(names.iter().map(|name| part(format!("palettes/{name}"), name, vec![])));
+    out.extend(asset.parts("cells").into_iter().map(|(name, _)| part(format!("cells/{name}"), name, vec![])));
+    let atlas = role(asset) == Some("atlas");
+    for (i, look_name) in looks(asset).iter().enumerate() {
+        if atlas && i == 0 {
+            continue;
+        }
+        let (palette, overrides) = look(asset, i);
+        let mut made_of = vec!["texels".to_string()];
+        let mut used: Vec<usize> = palette.into_iter().collect();
+        if atlas {
+            for cell in cells(asset) {
+                used.extend(overrides.get(&cell.name).copied().or(cell.palette));
+            }
+        }
+        for p in used {
+            let id = format!("palettes/{}", names[p]);
+            if !made_of.contains(&id) {
+                made_of.push(id);
+            }
+        }
+        out.push(part(format!("variants/{look_name}"), look_name, made_of));
+    }
+    out
 }
 
 /// The palette each part of an image takes in one of its looks: a texture's (`None` for its only cell, the image),
@@ -202,11 +249,11 @@ pub fn pages(asset: &Asset) -> ((f32, f32), f32) {
 }
 
 /// A palette's file: its colors, as `project::textures` stores them.
-fn colors_file(palette: &str) -> String {
+pub(crate) fn colors_file(palette: &str) -> String {
     format!("native.{palette}.colors")
 }
 
-fn halfwords(bytes: &[u8]) -> Vec<u16> {
+pub(crate) fn halfwords(bytes: &[u8]) -> Vec<u16> {
     bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect()
 }
 
@@ -229,7 +276,7 @@ pub fn rgba(color: u16) -> [u8; 4] {
 // --- pictures -----------------------------------------------------------------------------------------------------
 
 const BS: &str = "native.bs";
-const TEXELS: &str = "native.texels";
+pub(crate) const TEXELS: &str = "native.texels";
 
 /// What an image is drawn from: a background's `native.bs`, or an image's stored texels and its palettes' colors.
 pub(crate) struct Pictures;
@@ -244,6 +291,15 @@ impl Picture for Pictures {
     }
 
     fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
+        // A variant is the picture in its look; a cell, the picture where it is drawn.
+        if let Some(name) = part.strip_prefix("variants/") {
+            let look = looks(asset).iter().position(|l| l == name)?;
+            return Some(self.draw(asset, look));
+        }
+        if let Some(name) = part.strip_prefix("cells/") {
+            let cell = cells(asset).into_iter().find(|c| c.name == name)?;
+            return Some(self.draw(asset, 0).map(|picture| crop(&picture, cell.rect)));
+        }
         let name = part.strip_prefix("palettes/")?;
         let index = palette_names(asset).iter().position(|n| n == name)?;
         Some(palette_colors(asset, index)?.map(|colors| Image {
@@ -337,6 +393,16 @@ fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], vari
         }
     }
     Image { width: w, height: h, rgba: pixels.concat() }
+}
+
+/// A rectangle of a picture, clipped to it.
+fn crop(picture: &Image, rect: Rect) -> Image {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "pixel coordinates")]
+    let (x, y, w, h) = (rect.x as usize, rect.y as usize, rect.width as usize, rect.height as usize);
+    let (x1, y1) = ((x + w).min(picture.width), (y + h).min(picture.height));
+    let (x, y) = (x.min(x1), y.min(y1));
+    let rgba = (y..y1).flat_map(|row| &picture.rgba[(row * picture.width + x) * 4..(row * picture.width + x1) * 4]).copied().collect();
+    Image { width: x1 - x, height: y1 - y, rgba }
 }
 
 /// A background's picture.

@@ -241,6 +241,21 @@ pub type MakePanel = dyn Fn() -> Box<dyn View> + Send + Sync;
 /// What an asset is, for an agent: facts its kind adds to its description (an image's palettes, its cells).
 pub type Facts = dyn Fn(&Asset) -> Table + Send + Sync;
 
+/// A part of an asset: what a reference names by fragment (`uid://...#palettes/default`), an output of its import or
+/// one its settings define.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part {
+    /// Its id within the asset, its fragment: `palettes/default`, `cells/cursor`, `variants/night`.
+    pub id: String,
+    pub label: String,
+    /// The parts it is made of, where it is virtual - files of its own it has none, its settings link them (an
+    /// image's variant: the texels through a palette); empty for a part of its own.
+    pub made_of: Vec<String>,
+}
+
+/// An asset's parts, in order.
+pub type ListParts = dyn Fn(&Asset) -> Vec<Part> + Send + Sync;
+
 /// A tool's work: its arguments to its answer.
 pub type Run = dyn Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync;
 
@@ -294,6 +309,7 @@ pub struct KindDef {
     /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
     pub inspector: Vec<ViewDef>,
     pub facts: Option<Arc<Facts>>,
+    pub parts: Option<Arc<ListParts>>,
 }
 
 /// A role as registered, on a kind of its extension's or of one it requires.
@@ -344,6 +360,7 @@ impl Registry {
             views: vec![],
             inspector: vec![],
             facts: None,
+            parts: None,
         };
         KindBuilder { registry: self, def }
     }
@@ -391,6 +408,9 @@ impl Registry {
             fields: vec![],
             inspector: vec![],
             check: None,
+            import: None,
+            derives: vec![],
+            export: None,
             priority: 0,
         };
         ImporterBuilder { registry: self, def }
@@ -477,6 +497,13 @@ impl KindBuilder<'_> {
     #[must_use]
     pub fn facts(mut self, facts: impl Fn(&Asset) -> Table + Send + Sync + 'static) -> Self {
         self.def.facts = Some(Arc::new(facts));
+        self
+    }
+
+    /// An asset's parts: what references name by fragment.
+    #[must_use]
+    pub fn parts(mut self, parts: impl Fn(&Asset) -> Vec<Part> + Send + Sync + 'static) -> Self {
+        self.def.parts = Some(Arc::new(parts));
         self
     }
 
@@ -642,6 +669,27 @@ impl ImporterBuilder<'_> {
     #[must_use]
     pub fn check(mut self, check: impl Fn(&Asset) -> Support + Send + Sync + 'static) -> Self {
         self.def.check = Some(Arc::new(check));
+        self
+    }
+
+    /// What it makes of a source: the native files, by name, and the settings it derives.
+    #[must_use]
+    pub fn import(mut self, import: impl Fn(&Asset) -> Result<crate::Imported> + Send + Sync + 'static) -> Self {
+        self.def.import = Some(Arc::new(import));
+        self
+    }
+
+    /// A kind setting it derives from the source (`size`, `cells.*.rect`).
+    #[must_use]
+    pub fn derives(mut self, path: &str) -> Self {
+        self.def.derives.push(path.to_string());
+        self
+    }
+
+    /// How it writes its source from the native form, which importing makes again.
+    #[must_use]
+    pub fn export(mut self, export: impl Fn(&Asset) -> Result<Vec<u8>> + Send + Sync + 'static) -> Self {
+        self.def.export = Some(Arc::new(export));
         self
     }
 

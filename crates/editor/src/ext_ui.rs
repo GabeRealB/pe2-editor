@@ -135,7 +135,7 @@ impl<'a> Host<'a> {
             Some(asset) if fields => self.lens.extensions.fields(asset).into_iter().cloned().collect(),
             _ => vec![],
         };
-        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: None }
+        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: None, derived: None }
     }
 
     fn child(&mut self, kind: Child) -> Box<dyn UiHost + '_> {

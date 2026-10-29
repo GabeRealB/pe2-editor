@@ -16,6 +16,7 @@ workspace = true
 codecs.workspace = true
 project.workspace = true
 mcp.workspace = true
+extensions.workspace = true
 png.workspace = true
 anyhow.workspace = true
 clap.workspace = true

@@ -49,7 +49,8 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     };
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
-        let index = Index::open(&project, &cache)?;
+        let mut index = Index::open(&project, &cache)?;
+        let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions::shared());
         Ok((project, index))
     });
     match opened {

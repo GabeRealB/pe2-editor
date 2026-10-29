@@ -126,6 +126,79 @@ pub fn rgba(c: u16) -> [u8; 4] {
     [e(c), e(c >> 5), e(c >> 10), alpha]
 }
 
+/// A color back from RGBA, inverting `rgba` exactly: alpha 0 is the clear `0x0000`, opaque black is `0x8000` (black
+/// with the semi-transparency bit, which the GPU draws), alpha 128 marks the bit on any other color. Other alphas
+/// round to the nearest of those, as a painting program may leave them.
+#[must_use]
+pub fn color([red, green, blue, alpha]: [u8; 4]) -> u16 {
+    if alpha < 64 {
+        return 0;
+    }
+    let bits = u16::from(red >> 3) | u16::from(green >> 3) << 5 | u16::from(blue >> 3) << 10;
+    match bits {
+        0 => 0x8000,
+        bits if alpha < 192 => bits | 0x8000,
+        bits => bits,
+    }
+}
+
+/// Indices as a PNG anyone can read them back from: indexed, its palette a gray ramp (index `i` of 16 is `17 * i`,
+/// of 256 is `i`), so a program saving it in color keeps them as its grays.
+///
+/// # Errors
+/// The PNG encoder fails.
+pub fn index_png(width: usize, height: usize, bpp: u8, indices: &[u16]) -> Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    let mut encoder = png::Encoder::new(&mut out, to_u32(width), to_u32(height));
+    encoder.set_color(png::ColorType::Indexed);
+    encoder.set_compression(png::Compression::High);
+    encoder.set_filter(png::Filter::NoFilter);
+    let n = entries(bpp);
+    let step = 255 / (n - 1);
+    #[expect(clippy::cast_possible_truncation, reason = "a gray of eight bits")]
+    encoder.set_palette((0..n).flat_map(|i| [(i * step) as u8; 3]).collect::<Vec<u8>>());
+    encoder.set_depth(if bpp == 4 { png::BitDepth::Four } else { png::BitDepth::Eight });
+    #[expect(clippy::cast_possible_truncation, reason = "an index of eight bits or fewer")]
+    let data: Vec<u8> = if bpp == 4 {
+        indices
+            .chunks(width.max(1))
+            .flat_map(|row| row.chunks(2).map(|p| (p[0] as u8) << 4 | p.get(1).map_or(0, |&t| t as u8)))
+            .collect()
+    } else {
+        indices.iter().map(|&t| t as u8).collect()
+    };
+    encoder.write_header()?.write_image_data(&data)?;
+    Ok(out)
+}
+
+/// An index back from its gray in an index PNG saved in color.
+#[must_use]
+pub fn index_of_gray(gray: u8, bpp: u8) -> u16 {
+    let step = 255 / (entries(bpp).max(2) - 1);
+    #[expect(clippy::cast_possible_truncation, reason = "an index of eight bits or fewer")]
+    let index = ((usize::from(gray) + step / 2) / step) as u16;
+    index
+}
+
+/// RGBA pixels as a PNG.
+///
+/// # Errors
+/// The PNG encoder fails.
+pub fn rgba_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, png::EncodingError> {
+    let mut out = Vec::new();
+    let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    let mut encoder = png::Encoder::new(&mut out, to_u32(width.max(1)), to_u32(height.max(1)));
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    if rgba.is_empty() {
+        encoder.write_header()?.write_image_data(&[0; 4])?;
+    } else {
+        encoder.write_header()?.write_image_data(rgba)?;
+    }
+    Ok(out)
+}
+
 /// Palette entries at a depth: 16 at 4 bits, 256 at 8, none at 16.
 #[must_use]
 pub fn entries(bpp: u8) -> usize {
@@ -197,6 +270,8 @@ pub fn png(
     }
     let colors: Vec<[u8; 4]> = palette.iter().map(|&c| rgba(c)).collect();
     encoder.set_color(png::ColorType::Indexed);
+    encoder.set_compression(png::Compression::High);
+    encoder.set_filter(png::Filter::NoFilter);
     encoder.set_depth(if bpp == 4 { png::BitDepth::Four } else { png::BitDepth::Eight });
     encoder.set_palette(colors.iter().flat_map(|c| [c[0], c[1], c[2]]).collect::<Vec<u8>>());
     encoder.set_trns(colors.iter().map(|c| c[3]).collect::<Vec<u8>>());
@@ -243,4 +318,16 @@ pub fn render(page: &Page, bpp: u8, palette: Option<&[u16]>) -> (usize, Vec<u8>)
         }
     }
     (width, out)
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::{color, rgba};
+
+    #[test]
+    fn every_color_survives_rgba() {
+        for c in 0..=u16::MAX {
+            assert_eq!(color(rgba(c)), c, "{c:#06x}");
+        }
+    }
 }

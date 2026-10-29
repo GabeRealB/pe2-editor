@@ -243,6 +243,18 @@ impl Extensions {
         self.kinds.get(self.kind_aliases.get(declared).map_or(declared, String::as_str))
     }
 
+    /// A declared kind and role, qualified as extensions see them (`image`, `atlas` to `pe2.images@image`,
+    /// `pe2.images@atlas`); none for what no extension registers.
+    #[must_use]
+    pub fn qualify(&self, kind: &str, role: Option<&str>) -> (Option<&str>, Option<&str>) {
+        let Some((kind, _)) = self.kind_named(kind) else { return (None, None) };
+        let role = role
+            .and_then(|r| self.roles.get(self.role_aliases.get(r).map_or(r, String::as_str)))
+            .filter(|r| r.kind == kind.name)
+            .map(|r| r.name.as_str());
+        (Some(kind.name.as_str()), role)
+    }
+
     /// An asset's kind, where an extension registers it.
     #[must_use]
     pub fn kind_of(&self, asset: &index::Asset) -> Option<&KindDef> {
@@ -349,6 +361,18 @@ impl Extensions {
         self.kind_of(asset)?.picture.as_ref()?.part(&self.lend(asset), part)
     }
 
+    /// An asset's parts, as its kind lists them.
+    #[must_use]
+    pub fn parts(&self, asset: &index::Asset) -> Vec<pe2_ext::Part> {
+        self.kind_of(asset).and_then(|k| k.parts.as_ref()).map_or_default(|parts| parts(&self.lend(asset)))
+    }
+
+    /// Whether an asset's kind lists its parts.
+    #[must_use]
+    pub fn lists_parts(&self, asset: &index::Asset) -> bool {
+        self.kind_of(asset).is_some_and(|k| k.parts.is_some())
+    }
+
     /// What an agent is told of an asset besides its declaration, as its kind says.
     #[must_use]
     pub fn facts(&self, asset: &index::Asset) -> Table {
@@ -393,6 +417,25 @@ impl Extensions {
     #[must_use]
     pub fn importer(&self, name: &str) -> Option<&ImporterDef> {
         self.importers.get(name)
+    }
+
+    /// The native files an asset's importer makes of its source, by name; none where its importer is unknown or makes
+    /// nothing (a native importer).
+    ///
+    /// # Errors
+    /// The import failed.
+    pub fn import(&self, asset: &Asset) -> Option<Result<pe2_ext::Imported>> {
+        let import = self.importer(asset.importer()?)?.import.as_ref()?;
+        Some(import(asset))
+    }
+
+    /// The source an importer reads, written from an asset's native files; none where the importer writes none.
+    ///
+    /// # Errors
+    /// The export failed.
+    pub fn export(&self, importer: &str, asset: &Asset) -> Option<Result<Vec<u8>>> {
+        let export = self.importer(importer)?.export.as_ref()?;
+        Some(export(asset))
     }
 
     /// The formats a file is, by signatures and sniffs: from its first bytes, read once a content.
@@ -514,11 +557,11 @@ impl Source for index::Asset {
     }
 
     fn fields(&self) -> &toml::Table {
-        index::Asset::fields(self)
+        self.settings()
     }
 
     fn declaration(&self) -> &str {
-        self.text()
+        self.settings_text()
     }
 
     fn has_file(&self, name: &str) -> bool {

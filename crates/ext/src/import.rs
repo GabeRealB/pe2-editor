@@ -50,6 +50,24 @@ pub enum Support {
 /// An importer's check of a source it might import.
 pub type Check = dyn Fn(&Asset) -> Support + Send + Sync;
 
+/// Files an import made, each by its name in the bundle.
+pub type Made = Vec<(String, Vec<u8>)>;
+
+/// What an import made of a source: the native files, and the kind settings it derives from the source (an image's
+/// size, its cells' rectangles) - those its importer `derives`, taking the place of the declaration's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Imported {
+    pub files: Made,
+    pub settings: crate::Table,
+}
+
+/// An import: what it makes of the asset's source (the file its `[import]` section names), by its settings.
+pub type Import = dyn Fn(&Asset) -> crate::Result<Imported> + Send + Sync;
+
+/// An export: the source written from an asset's native files and settings - what extraction does where the disc has
+/// only the native form. Importing it makes those native files again, byte for byte.
+pub type Export = dyn Fn(&Asset) -> crate::Result<Vec<u8>> + Send + Sync;
+
 /// An importer as registered.
 #[derive(Clone)]
 pub struct ImporterDef {
@@ -66,6 +84,14 @@ pub struct ImporterDef {
     /// Views drawn in the properties pane with its settings: what its custom settings hold.
     pub inspector: Vec<ViewDef>,
     pub check: Option<Arc<Check>>,
+    /// What it makes; a native importer makes nothing.
+    pub import: Option<Arc<Import>>,
+    /// The kind settings it derives from the source, as paths: `size`, `cells.*.rect` (`*` any part of a keyed table).
+    /// A declaration's value there is overridden by the import's; a part the declaration has and the source no longer
+    /// does is orphaned.
+    pub derives: Vec<String>,
+    /// The source it reads, written from the native form.
+    pub export: Option<Arc<Export>>,
     /// Which of several fully supporting importers is the default: the highest.
     pub priority: i32,
 }

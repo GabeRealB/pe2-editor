@@ -68,6 +68,9 @@ pollster = "0.4"
 branches = { version = "0.4", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 png = "0.18"
+miniz_oxide = "0.8"
+crc32fast = "1"
+quick-xml = "0.41"
 sha1 = "0.10"
 toml = { version = "0.8", features = ["preserve_order"] }
 # Edits to project.toml that keep its comments and layout; the version `toml` reads with.

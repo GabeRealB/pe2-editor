@@ -441,6 +441,7 @@ impl g::Guest for Component {
                 picture: kind.picture.is_some(),
                 thumbnail: kind.thumbnail.is_some(),
                 facts: kind.facts.is_some(),
+                parts: kind.parts.is_some(),
                 views: views(&kind.views, &mut numbered),
                 inspector: views(&kind.inspector, &mut numbered),
             });
@@ -478,44 +479,7 @@ impl g::Guest for Component {
             });
             numbered.tools.push(tool);
         }
-        for (handle, format) in parts.formats.iter().enumerate() {
-            #[expect(clippy::cast_possible_truncation, reason = "a handful of formats")]
-            let handle = handle as u32;
-            let signatures = format
-                .signatures
-                .iter()
-                .map(|s| match s {
-                    #[expect(clippy::cast_possible_truncation, reason = "an offset in a file's first bytes")]
-                    Signature::Bytes { offset, bytes } => g::Signature::Bytes((*offset as u32, bytes.clone())),
-                    Signature::Name(name) => g::Signature::Name(name.clone()),
-                    Signature::Text => g::Signature::Text,
-                })
-                .collect();
-            out.formats.push(g::FileFormat {
-                handle,
-                name: format.name.local().to_string(),
-                label: format.label.clone(),
-                media_type: format.media_type.clone(),
-                signatures,
-                sniff: format.sniff.is_some(),
-            });
-        }
-        for (handle, importer) in parts.importers.iter().enumerate() {
-            #[expect(clippy::cast_possible_truncation, reason = "a handful of importers")]
-            let handle = handle as u32;
-            out.importers.push(g::Importer {
-                handle,
-                name: importer.name.local().to_string(),
-                label: importer.label.clone(),
-                reads: importer.reads.clone(),
-                makes: importer.makes.to_string(),
-                native: importer.native,
-                fields: importer.fields.iter().map(|f| field(f, &mut numbered)).collect(),
-                inspector: views(&importer.inspector, &mut numbered),
-                check: importer.check.is_some(),
-                priority: importer.priority,
-            });
-        }
+        imports(&parts.formats, &parts.importers, &mut out, &mut numbered);
         numbered.formats = parts.formats;
         numbered.importers = parts.importers;
         numbered.kinds = parts.kinds;
@@ -565,6 +529,15 @@ impl g::Guest for Component {
         facts.map_or_else(String::new, |facts| toml::to_string(&facts(&lent.asset())).unwrap_or_default())
     }
 
+    fn parts(kind: u32, asset: &host::Asset) -> Vec<g::Part> {
+        let lent = Lent::borrowed(asset);
+        let parts = registered().kinds[kind as usize].parts.as_ref();
+        parts.map_or_else(Vec::new, |parts| parts(&lent.asset()))
+            .into_iter()
+            .map(|p| g::Part { id: p.id, label: p.label, made_of: p.made_of })
+            .collect()
+    }
+
     fn sniff(format: u32, name: String, size: u64, head: Vec<u8>) -> Option<String> {
         let sniff = registered().formats.get(format as usize)?.sniff.as_ref()?;
         sniff(&name, size, &head).map(|r| r.version.unwrap_or_default())
@@ -580,11 +553,73 @@ impl g::Guest for Component {
     }
 
     #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn make_native(importer: u32, asset: &host::Asset) -> Result<g::Imported, String> {
+        let lent = Lent::borrowed(asset);
+        let import = registered().importers.get(importer as usize).and_then(|i| i.import.as_ref());
+        let made = import.ok_or("the importer makes nothing")?(&lent.asset()).map_err(|e| format!("{e:#}"))?;
+        // A document, as the host parses it: an inline table is not one.
+        let settings = toml::to_string(&made.settings).map_err(|e| e.to_string())?;
+        Ok(g::Imported { files: made.files, settings })
+    }
+
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn make_source(importer: u32, asset: &host::Asset) -> Result<Vec<u8>, String> {
+        let lent = Lent::borrowed(asset);
+        let export = registered().importers.get(importer as usize).and_then(|i| i.export.as_ref());
+        export.ok_or("the importer writes no source")?(&lent.asset()).map_err(|e| format!("{e:#}"))
+    }
+
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
     async fn run(tool: u32, project: &host::Project, arguments: String) -> Result<String, String> {
         let tool = registered().tools.get(tool as usize).ok_or("no such tool")?;
         let arguments = parse_value(&arguments).unwrap_or_else(|| Value::Table(Table::new()));
         let lens = Lens::new(project);
         (tool.run)(&lens, &arguments).map(|answer| value_text(&answer)).map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// The formats and importers registered, as the contract describes them.
+fn imports(formats: &[FormatDef], importers: &[ImporterDef], out: &mut g::Registration, numbered: &mut Registered) {
+    for (handle, format) in formats.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of formats")]
+        let handle = handle as u32;
+        let signatures = format
+            .signatures
+            .iter()
+            .map(|s| match s {
+                #[expect(clippy::cast_possible_truncation, reason = "an offset in a file's first bytes")]
+                Signature::Bytes { offset, bytes } => g::Signature::Bytes((*offset as u32, bytes.clone())),
+                Signature::Name(name) => g::Signature::Name(name.clone()),
+                Signature::Text => g::Signature::Text,
+            })
+            .collect();
+        out.formats.push(g::FileFormat {
+            handle,
+            name: format.name.local().to_string(),
+            label: format.label.clone(),
+            media_type: format.media_type.clone(),
+            signatures,
+            sniff: format.sniff.is_some(),
+        });
+    }
+    for (handle, importer) in importers.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of importers")]
+        let handle = handle as u32;
+        out.importers.push(g::Importer {
+            handle,
+            name: importer.name.local().to_string(),
+            label: importer.label.clone(),
+            reads: importer.reads.clone(),
+            makes: importer.makes.to_string(),
+            native: importer.native,
+            fields: importer.fields.iter().map(|f| field(f, numbered)).collect(),
+            inspector: views(&importer.inspector, numbered),
+            check: importer.check.is_some(),
+            imports: importer.import.is_some(),
+            derives: importer.derives.clone(),
+            exports: importer.export.is_some(),
+            priority: importer.priority,
+        });
     }
 }
 

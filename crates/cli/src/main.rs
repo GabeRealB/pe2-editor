@@ -163,10 +163,16 @@ fn main() -> Result<()> {
                 eprintln!("warning: {why}");
             }
             let options = project::extract::Options { releases: release, roms, declarations };
-            let report = project::extract::extract(&p, &options, &lock)?;
+            let extensions = extensions::shared();
+            for problem in &extensions.problems {
+                eprintln!("warning: {problem}");
+            }
+            let report = project::extract::extract(&p, &options, &lock, &extensions)?;
             println!(
-                "extracted {} assets and {} layout assets into {}",
+                "extracted {} assets ({} as their sources, each checked to import back exactly) and {} layout assets \
+                 into {}",
                 report.assets,
+                report.sources,
                 report.layouts,
                 report.layer.display()
             );

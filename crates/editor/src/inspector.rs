@@ -26,6 +26,8 @@ pub struct Sheet<'a> {
     pub fields: Vec<pe2_ext::Field>,
     /// The table of the declaration the fields are in: none for the asset's own, `import` for its import settings.
     pub within: Option<&'static str>,
+    /// The fields the asset's import derives from its source, by importer: shown, not edited here.
+    pub derived: Option<(String, Vec<String>)>,
 }
 
 impl Sheet<'_> {
@@ -74,9 +76,13 @@ pub fn inspector_ui(
             extensions: &ws.extensions,
             fields: ws.extensions.fields(&asset).into_iter().cloned().collect(),
             within: None,
+            derived: ws.extensions.importer_of(&asset).filter(|i| !i.derives.is_empty()).map(|i| {
+                (i.label.clone(), i.derives.iter().filter(|p| !p.contains('.')).cloned().collect())
+            }),
         };
+        // The settings as resolved: what the import derives in its place.
         let fields: Vec<(&String, &toml::Value)> = asset
-            .fields()
+            .settings()
             .iter()
             .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && *k != "import" && !sheet.custom(k))
             .collect();
@@ -242,6 +248,15 @@ fn property_sheet(
                     return;
                 }
                 let field = sheet.field(key);
+                if let Some((importer, _)) = sheet.derived.as_ref().filter(|(_, keys)| keys.iter().any(|k| k == *key)) {
+                    value_ui(ui, sheet, key, value, nav);
+                    let overridden = asset.imported.as_ref().is_some_and(|i| i.overridden.iter().any(|o| o == *key));
+                    let note = if overridden { "from the source; the declaration's is overridden" } else { "from the source" };
+                    ui.label(RichText::new(note).small().color(theme::weak())).on_hover_text(format!(
+                        "Derived by {importer} from the source: change it there, and it is imported again"
+                    ));
+                    return;
+                }
                 let editable = editable && !field.is_some_and(|f| f.read_only);
                 if let Some(field) = field.filter(|f| editable && !f.choices.is_empty()) {
                     choice_ui(ui, sheet, asset, key, value, field, edit);
@@ -727,6 +742,7 @@ fn import_ui(
             extensions: &ws.extensions,
             fields: importer.map_or_default(|i| i.fields.clone()),
             within: Some("import"),
+            derived: None,
         };
         let settings: Vec<(&String, &toml::Value)> = import
             .iter()
@@ -874,7 +890,17 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                     ui.label(&f.name);
                 });
                 ui.label(RichText::new(size_text(f.size)).small().color(theme::weak()));
-                ui.label(RichText::new(&f.layer).small().color(theme::weak()));
+                match &f.made_by {
+                    // Made of the source, kept in the cache: not the layer's to edit.
+                    Some(importer) => {
+                        ui.label(RichText::new("imported").small().color(theme::weak())).on_hover_text(format!(
+                            "Made of the source by {importer}, kept in the project cache; edit the source instead"
+                        ));
+                    }
+                    None => {
+                        ui.label(RichText::new(&f.layer).small().color(theme::weak()));
+                    }
+                }
                 let hint = match tool.command(tools).trim() {
                     "" => format!("Open in the system's default application ({})", tool.label().to_lowercase()),
                     command => format!("Open with {command}"),

@@ -161,6 +161,7 @@ interface guest {
         picture: bool,
         thumbnail: bool,
         facts: bool,
+        parts: bool,
         views: list<view>,
         inspector: list<view>,
     }
@@ -222,6 +223,11 @@ interface guest {
         fields: list<field>,
         inspector: list<view>,
         check: bool,
+        /// Whether it makes native files (`make-native`), and writes its source from them (`make-source`).
+        imports: bool,
+        /// The kind settings it derives from the source (`size`, `cells.*.rect`).
+        derives: list<string>,
+        exports: bool,
         priority: s32,
     }
 
@@ -251,12 +257,31 @@ interface guest {
     thumbnail: async func(kind: u32, asset: borrow<asset>, side: u32) -> option<result<image, string>>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
+    /// A part of an asset, by its fragment; a virtual one made of others.
+    record part {
+        id: string,
+        label: string,
+        made-of: list<string>,
+    }
+
+    /// An asset's parts, in order.
+    parts: func(kind: u32, asset: borrow<asset>) -> list<part>;
     /// What an agent is told of an asset of the kind (a TOML table).
     facts: func(kind: u32, asset: borrow<asset>) -> string;
     /// A format's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
     sniff: func(format: u32, name: string, size: u64, head: list<u8>) -> option<string>;
     /// An importer's check of the source an asset names.
     check: func(importer: u32, asset: borrow<asset>) -> support;
+    /// What an import made: native files by name, and the kind settings it derives (a TOML table).
+    record imported {
+        files: list<tuple<string, list<u8>>>,
+        settings: string,
+    }
+
+    /// An importer's work: what it makes of the source an asset names.
+    make-native: async func(importer: u32, asset: borrow<asset>) -> result<imported, string>;
+    /// An importer's source, written from an asset's native files.
+    make-source: async func(importer: u32, asset: borrow<asset>) -> result<list<u8>, string>;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
 
