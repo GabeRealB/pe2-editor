@@ -786,6 +786,9 @@ fn subtree<V>(map: &BTreeMap<String, V>, path: &str) -> Vec<String> {
     map.keys().filter(|p| *p == path || p.starts_with(&prefix)).cloned().collect()
 }
 
+/// How far a long piece of work is: its stage, and how many of how many it has done (both 0 where it cannot say).
+pub type Report<'a> = dyn Fn(&str, usize, usize) + 'a;
+
 #[derive(Clone)]
 pub struct Index {
     /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
@@ -825,9 +828,22 @@ impl Index {
     /// # Errors
     /// A changeset cannot be read or written, or the cache cannot be written.
     pub fn open(project: &Project, cache: &Cache) -> Result<Index> {
+        Index::open_reporting(project, cache, &|_, _, _| {})
+    }
+
+    /// Open the index as `open` does, saying how far it is: a stage, and how many of how many it has done.
+    ///
+    /// # Errors
+    /// As `open`.
+    pub fn open_reporting(project: &Project, cache: &Cache, report: &Report<'_>) -> Result<Index> {
+        report("Reading what the cache knows", 0, 0);
         let store = Arc::new(Store::open(&cache.path(STORE))?);
         let mut known = store.load()?;
-        let layers = project.layers.iter().map(LayerState::new).collect::<Result<Vec<_>>>()?;
+        let mut layers = Vec::new();
+        for (i, layer) in project.layers.iter().enumerate() {
+            report(&format!("Scanning {}", layer.name), i, project.layers.len());
+            layers.push(LayerState::new(layer)?);
+        }
         let mut index = Index {
             assets: BTreeMap::new(),
             entries: Arc::default(),
@@ -847,6 +863,7 @@ impl Index {
             winning: Arc::default(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
+        report("Reading the files that changed", 0, files.len());
         let read = index.load_records(&files, |path, size, modified| {
             known.remove(path).filter(|r| r.size == size && r.modified == modified && modified < r.recorded)
         });
@@ -854,7 +871,9 @@ impl Index {
         // What is left of what the store knew no layer holds any more.
         let gone: Vec<&Path> = known.keys().map(PathBuf::as_path).collect();
         index.store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
+        report("Resolving the layers", 0, 0);
         index.apply_stack()?;
+        report("Assembling the assets", 0, 0);
         let paths: Vec<String> = index.resolved.keys().cloned().collect();
         index.assemble(&paths);
         index.link();

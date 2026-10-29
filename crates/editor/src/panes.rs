@@ -270,6 +270,44 @@ pub struct Panes<'a> {
     pub edit: Option<EditRequest>,
     /// A line for the status bar: what an action did, or why it failed.
     pub message: Option<String>,
+    /// A project being opened, as far as it is.
+    pub opening: Option<OpeningShown>,
+}
+
+/// How far opening a project is, as the panes show it.
+#[derive(Clone)]
+pub struct OpeningShown {
+    pub name: String,
+    pub stage: String,
+    /// Done of what the stage counts, where it counts.
+    pub fraction: Option<f32>,
+}
+
+/// The project being opened, once over the window: its name, the stage, a bar where the stage counts, else a spinner.
+pub fn opening_ui(ctx: &egui::Context, opening: &OpeningShown) {
+    egui::Area::new(egui::Id::unique("opening"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(20, 16)).show(ui, |ui| {
+                ui.set_width(320.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icons::FOLDER_OPEN).size(18.0).color(theme::accent()));
+                    ui.label(RichText::new(format!("Opening {}", opening.name)).strong());
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if opening.fraction.is_none() {
+                        ui.add(egui::Spinner::new().size(12.0));
+                    }
+                    ui.label(RichText::new(&opening.stage).color(theme::weak()));
+                });
+                if let Some(fraction) = opening.fraction {
+                    ui.add_space(6.0);
+                    ui.add(egui::ProgressBar::new(fraction).desired_height(6.0));
+                }
+            });
+        });
 }
 
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
@@ -285,9 +323,12 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             return UiResponse::None;
         }
         let Some(ws) = self.workspace.as_deref_mut() else {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("No project open - File, Open project").color(theme::weak()))
-            });
+            // While a project opens, the panes wait blank under its card.
+            if self.opening.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("No project open - File, Open project").color(theme::weak()))
+                });
+            }
             return UiResponse::None;
         };
         // An instance pinned to an entry shows it; the others show the selection.

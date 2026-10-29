@@ -136,8 +136,6 @@ pub struct Workspace {
     pub layers: Vec<LayerInfo>,
     /// What was done this session, to undo and redo.
     pub history: History,
-    /// The label of an edit a crash left half done, rolled back when the project was opened.
-    pub recovered: Option<String>,
     /// The tree's thumbnails, kept as artifacts in the cache.
     pub thumbs: crate::thumbs::Thumbs,
     /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
@@ -312,13 +310,32 @@ fn show(ctx: &egui::Context, path: &str, chosen: usize, upscale: Upscale, image:
     Shown { texture: ctx.load_texture(format!("{path}#{chosen}#{upscale:?}"), image, options), size }
 }
 
+/// A project opened as far as a workspace starts from it: what `Workspace::prepare` makes off the window's thread.
+pub struct Opened {
+    project: Project,
+    lock: Lock,
+    cache_dir: PathBuf,
+    history: History,
+    /// The label of an edit a crash left half done, rolled back.
+    pub recovered: Option<String>,
+    index: Index,
+    artifacts: project::artifacts::Artifacts,
+    extensions: Arc<Extensions>,
+    extensions_found: Vec<extensions::Found>,
+    imports: project::imports::Imports,
+    layer_view: LayerView,
+    tree: Arc<Node>,
+}
+
 impl Workspace {
-    /// Open the project in `dir`; with a history, again, keeping this session's history: a change to `project.toml` -
-    /// an edit of the stack, or its undoing - opens the project again, and must not end the session's history.
+    /// Open the project in `dir` as far as a workspace starts from it, off the window's thread, saying how far it is;
+    /// with a history, again, keeping this session's history: a change to `project.toml` - an edit of the stack, or
+    /// its undoing - opens the project again, and must not end the session's history.
     ///
     /// # Errors
-    /// Its `project.toml` or its assets cannot be read.
-    pub fn open_keeping(dir: &Path, history: Option<History>) -> Result<Workspace> {
+    /// Its `project.toml` or its assets cannot be read, or another holds it.
+    pub fn prepare(dir: &Path, history: Option<History>, report: &project::index::Report<'_>) -> Result<Opened> {
+        report("Reading project.toml", 0, 0);
         let project = Project::load(dir)?;
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
         let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
@@ -328,12 +345,13 @@ impl Workspace {
             Some(history) => (history, None),
             None => History::open(&cache)?,
         };
-        let mut index = Index::open(&project, &cache)?;
+        let mut index = Index::open_reporting(&project, &cache, report)?;
         // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
         // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
         // Its own (`extension` assets) and the user's before the built-ins.
+        report("Loading the extensions", 0, 0);
         let extensions_found = extensions::found(Some(&index));
         let extensions = extensions::for_project(&project, Some(&index));
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
@@ -344,9 +362,42 @@ impl Workspace {
         index.set_hidden(&layer_view.hidden(&index.layers()));
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
-        let _ = imports.attach(&mut index, &extensions);
-        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
+        let _ = imports.attach_reporting(&mut index, &extensions, report);
+        report("Building the tree", 0, 0);
         let tree = Arc::new(Node::build(&index, &extensions));
+        Ok(Opened {
+            project,
+            lock,
+            cache_dir: cache.dir,
+            history,
+            recovered,
+            index,
+            artifacts,
+            extensions,
+            extensions_found,
+            imports,
+            layer_view,
+            tree,
+        })
+    }
+
+    /// The workspace of a project opened (`prepare`): its worker started, its index shown.
+    pub fn from_opened(opened: Opened) -> Workspace {
+        let Opened {
+            project,
+            lock,
+            cache_dir,
+            history,
+            index,
+            artifacts,
+            extensions,
+            extensions_found,
+            imports,
+            layer_view,
+            tree,
+            ..
+        } = opened;
+        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it.
         let shown = Arc::new(index.clone());
@@ -361,7 +412,6 @@ impl Workspace {
         let mut workspace = Workspace {
             project,
             history,
-            recovered,
             thumbs,
             extensions,
             views: HashMap::new(),
@@ -371,7 +421,7 @@ impl Workspace {
             layer_view,
             index: shown,
             lock,
-            cache_dir: cache.dir,
+            cache_dir,
             watch: None,
             watch_error: None,
             link: None,
@@ -407,7 +457,7 @@ impl Workspace {
             declaration_draft: None,
         };
         workspace.refresh_editable();
-        Ok(workspace)
+        workspace
     }
 
     /// Start watching the layers, once: every change on disk is then brought in by `update`.

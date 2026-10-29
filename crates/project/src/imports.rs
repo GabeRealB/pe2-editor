@@ -25,7 +25,7 @@ use toml::{Table, Value};
 use crate::cache::{Cache, write_atomic};
 use crate::ext::{Extensions, Origin, Status};
 use crate::extract::sha1_hex;
-use crate::index::{Asset, BundleFile, Imported, Index, Problem};
+use crate::index::{Asset, BundleFile, Imported, Index, Problem, Report};
 
 const DIR: &str = "imports";
 const MADE: &str = "made.toml";
@@ -126,17 +126,28 @@ impl Imports {
     /// the declaration's. An import that fails, a declared value it overrides, a part it orphans and a reference
     /// naming a part its asset does not have are problems of the index. Imports no asset made are removed.
     pub fn attach(&self, index: &mut Index, extensions: &Extensions) -> Attached {
-        self.attach_some(index, extensions, None)
+        self.attach_some(index, extensions, None, &|_, _, _| {})
+    }
+
+    /// Attach as `attach` does, saying how many assets of how many it has gone through.
+    pub fn attach_reporting(&self, index: &mut Index, extensions: &Extensions, report: &Report<'_>) -> Attached {
+        self.attach_some(index, extensions, None, report)
     }
 
     /// Attach the imports of these assets alone - those a refresh changed (`Refreshed::assets`) - the others keeping
     /// theirs: their problems made again, and those of the references from or to them naming parts. What it costs is
     /// what changed; imports no asset makes any more are removed by the next full attach.
     pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
-        self.attach_some(index, extensions, Some(changed))
+        self.attach_some(index, extensions, Some(changed), &|_, _, _| {})
     }
 
-    fn attach_some(&self, index: &mut Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Attached {
+    fn attach_some(
+        &self,
+        index: &mut Index,
+        extensions: &Extensions,
+        only: Option<&BTreeSet<String>>,
+        report: &Report<'_>,
+    ) -> Attached {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
@@ -154,7 +165,11 @@ impl Imports {
             None => index.assets.values().map(|a| &**a).collect(),
             Some(only) => only.iter().filter_map(|p| index.assets.get(p).map(|a| &**a)).collect(),
         };
-        for asset in assets {
+        let total = assets.len();
+        for (i, asset) in assets.into_iter().enumerate() {
+            if i % 256 == 0 {
+                report("Attaching what the importers made", i, total);
+            }
             let Some((importer, key)) = key_of(asset, extensions) else { continue };
             if let Some(import) = known.get(&key) {
                 attached.kept += 1;

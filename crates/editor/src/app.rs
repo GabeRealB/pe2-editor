@@ -47,8 +47,21 @@ struct Capture {
     pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
+struct Opening {
+    dir: PathBuf,
+    progress: Arc<std::sync::Mutex<(String, usize, usize)>>,
+    ready: std::sync::mpsc::Receiver<anyhow::Result<crate::workspace::Opened>>,
+    /// Shown once it is open: the selection kept across a reopen, or asked on the command line.
+    select: Option<String>,
+}
+
 pub struct Editor {
     workspace: Option<Workspace>,
+    /// A project being opened, off the window's thread.
+    opening: Option<Opening>,
+    /// The window's context: what a project being opened wakes.
+    ctx: egui::Context,
     /// The main window's layout, the other windows', and each pane instance's state.
     layouts: Layouts,
     /// A window to bring to the front once it is drawn.
@@ -122,6 +135,8 @@ impl Editor {
         let project = start.project.or(last);
         let mut editor = Editor {
             workspace: None,
+            opening: None,
+            ctx: cc.egui_ctx.clone(),
             layouts: Layouts {
                 main: layout,
                 windows,
@@ -155,8 +170,9 @@ impl Editor {
         if let Some(dir) = project {
             editor.open(&dir);
         }
-        if let (Some(ws), Some(asset)) = (&mut editor.workspace, start.select) {
-            ws.navigate(asset);
+        // Shown once the project is open.
+        if let Some(opening) = &mut editor.opening {
+            opening.select = start.select;
         }
         if let Some(kind) =
             start.show.and_then(|name| PaneKind::with_panels().into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
@@ -170,26 +186,66 @@ impl Editor {
         self.open_keeping(dir, None);
     }
 
-    /// Open a project; with a history, the same project again, its session going on.
+    /// Open a project, off the window's thread; with a history, the same project again, its session going on. The
+    /// panes say how far it is, and it is shown once open (`opened`).
     fn open_keeping(&mut self, dir: &Path, history: Option<project::history::History>) {
         // The project open now lets go of its lock first: opening it again must find it free.
         self.workspace = None;
-        match Workspace::open_keeping(dir, history) {
-            Ok(ws) => {
-                self.settings.last_project = std::path::absolute(dir).ok();
-                if let Some(label) = &ws.recovered {
+        let progress: Arc<std::sync::Mutex<(String, usize, usize)>> = Arc::default();
+        let (done, ready) = std::sync::mpsc::channel();
+        let (dir_owned, said, ctx) = (dir.to_path_buf(), progress.clone(), self.ctx.clone());
+        let started = std::thread::Builder::new().name("open".into()).spawn(move || {
+            let report = |stage: &str, done: usize, total: usize| {
+                if let Ok(mut p) = said.lock() {
+                    *p = (stage.to_string(), done, total);
+                }
+                ctx.request_repaint();
+            };
+            let _ = done.send(Workspace::prepare(&dir_owned, history, &report));
+            ctx.request_repaint();
+        });
+        match started {
+            Ok(_) => self.opening = Some(Opening { dir: dir.to_path_buf(), progress, ready, select: None }),
+            Err(e) => self.error = Some(format!("{}: {e}", dir.display())),
+        }
+    }
+
+    /// The project being opened, once it is: shown, its selection kept; or why it could not be.
+    fn opened(&mut self) {
+        let Some(opening) = &self.opening else { return };
+        let Ok(result) = opening.ready.try_recv() else { return };
+        let Some(opening) = self.opening.take() else { return };
+        let dir = opening.dir;
+        match result {
+            Ok(opened) => {
+                self.settings.last_project = std::path::absolute(&dir).ok();
+                if let Some(label) = &opened.recovered {
                     self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
+                }
+                let mut ws = Workspace::from_opened(opened);
+                if let Some(path) = opening.select.filter(|p| ws.exists(p)) {
+                    ws.navigate(path);
                 }
                 self.workspace = Some(ws);
                 self.error = None;
             }
             Err(e) => {
                 if let Some(project::lock::LockError::Held(owner)) = e.downcast_ref() {
-                    self.in_use = Some((dir.to_path_buf(), owner.clone()));
+                    self.in_use = Some((dir.clone(), owner.clone()));
                 }
                 self.error = Some(format!("{}: {e:#}", dir.display()));
             }
         }
+    }
+
+    /// How far the project being opened is, as the panes show it.
+    fn opening_shown(&self) -> Option<panes::OpeningShown> {
+        let opening = self.opening.as_ref()?;
+        let (stage, done, total) = opening.progress.lock().map_or_default(|p| p.clone());
+        let name = opening.dir.file_name().map_or_else(|| opening.dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+        #[expect(clippy::cast_precision_loss, reason = "a fraction shown")]
+        let fraction = (total > 0).then(|| done as f32 / total as f32);
+        Some(panes::OpeningShown { name, stage, fraction })
     }
 
     /// Bring in what changed on disk; open the project again when its `project.toml` changed, keeping the selection.
@@ -216,10 +272,8 @@ impl Editor {
         let Some(ws) = self.workspace.take() else { return };
         let (root, selected) = (ws.project.root.clone(), ws.selected.clone());
         self.open_keeping(&root, Some(ws.into_history()));
-        if let (Some(ws), Some(path)) = (&mut self.workspace, selected)
-            && ws.exists(&path)
-        {
-            ws.navigate(path);
+        if let Some(opening) = &mut self.opening {
+            opening.select = selected;
         }
     }
 
@@ -500,6 +554,7 @@ impl Editor {
     /// dock-back button; closing one docks its panes back.
     fn show_windows(&mut self, ctx: &egui::Context, titles: &[(u64, String)]) -> Outcome {
         let mut outcome = Outcome::default();
+        let opening = self.opening_shown();
         for window in &mut self.layouts.windows {
             let id = window.id;
             ctx.show_viewport_immediate(window.viewport(), window.builder(), |ui, _class| {
@@ -524,6 +579,7 @@ impl Editor {
                         steps: None,
                         edit: None,
                         message: None,
+                        opening: opening.clone(),
                     };
                     window.tree.ui(&mut behavior, ui);
                     outcome.take(behavior, Some(id));
@@ -664,7 +720,8 @@ impl Editor {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let Some(ws) = &mut self.workspace else {
-                ui.label(RichText::new("No project").color(theme::weak()));
+                let text = if self.opening.is_some() { "Opening..." } else { "No project" };
+                ui.label(RichText::new(text).color(theme::weak()));
                 return;
             };
             if ui
@@ -772,7 +829,9 @@ impl Editor {
                     let text = self
                         .workspace
                         .as_ref()
-                        .map_or_else(|| "No project open".to_string(), |ws| ws.project.root.display().to_string());
+                        .map(|ws| ws.project.root.display().to_string())
+                        .or_else(|| self.opening.as_ref().map(|o| format!("Opening {}", o.dir.display())))
+                        .unwrap_or_else(|| "No project open".to_string());
                     ui.add(egui::Label::new(RichText::new(text).small().color(theme::weak())).truncate());
                 }
             });
@@ -843,6 +902,10 @@ impl Editor {
     /// Advance a pending screenshot: request it once settled, close once it is saved. The main window only: eframe
     /// paints the other windows (immediate viewports) without taking screenshots of them.
     fn capture(&mut self, ctx: &egui::Context) {
+        // The window is settled only once its project is open.
+        if self.opening.is_some() {
+            return;
+        }
         let Some(capture) = &mut self.capture else { return };
         if capture.requested && capture.pending.load(Ordering::Acquire) == 0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -890,6 +953,7 @@ impl eframe::App for Editor {
         }
         self.zoom(&ctx);
         self.capture(&ctx);
+        self.opened();
         self.follow_disk(&ctx);
         if let Some(ws) = &mut self.workspace {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
@@ -920,6 +984,7 @@ impl eframe::App for Editor {
         }
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
         let mut outcome = Outcome::default();
+        let opening = self.opening_shown();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut behavior = Panes {
                 workspace: self.workspace.as_mut(),
@@ -934,10 +999,14 @@ impl eframe::App for Editor {
                 steps: None,
                 edit: None,
                 message: None,
+                opening,
             };
             self.layouts.main.ui(&mut behavior, ui);
             outcome.take(behavior, None);
         });
+        if let Some(opening) = self.opening_shown() {
+            panes::opening_ui(&ctx, &opening);
+        }
         let windows = self.show_windows(&ctx, &titles);
         outcome.merge(windows);
         self.apply(outcome);
