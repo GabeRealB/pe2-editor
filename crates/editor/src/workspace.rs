@@ -308,15 +308,16 @@ impl Workspace {
         // Its own (`extension` assets) and the user's before the built-ins.
         let extensions_found = extensions::found(Some(&index));
         let extensions = extensions::for_project(&project, Some(&index));
-        // What the assets' importers made of their sources, seen as their files.
-        let imports = project::imports::Imports::open(&cache)?;
-        let _ = imports.attach(&mut index, &extensions);
-        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
+        // The view first: hiding layers assembles the assets again, so the imports are attached to what it shows.
         index.set_hidden(&layer_view.hidden(&index.layers()));
+        // What the assets' importers made of their sources, seen as their files.
+        let imports = project::imports::Imports::open(&cache)?;
+        let _ = imports.attach(&mut index, &extensions);
+        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let tree = Node::build(&index, &extensions);
         let mut workspace = Workspace {
             project,
@@ -491,7 +492,8 @@ impl Workspace {
         if extensions::found(Some(&self.index)) != self.extensions_found {
             return Update::Reopen("an extension changed");
         }
-        let _ = self.imports.attach(&mut self.index, &self.extensions);
+        // The assets the refresh assembled again, their imports attached again; the others keep theirs.
+        let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
         self.layers = self.index.layers();
         self.tree = Node::build(&self.index, &self.extensions);
         self.refresh_editable();
@@ -590,6 +592,8 @@ impl Workspace {
     /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
     fn apply_eyes(&mut self) -> Result<()> {
         if self.index.set_hidden(&self.layer_view.hidden(&self.layers)) {
+            // Every asset assembled again: their imports attached again.
+            let _ = self.imports.attach(&mut self.index, &self.extensions);
             self.tree = Node::build(&self.index, &self.extensions);
             self.pictures.clear();
             self.parts = Parts::default();

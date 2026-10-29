@@ -342,6 +342,8 @@ impl Problem {
 pub struct Refreshed {
     pub assets: BTreeSet<String>,
     pub project_file: bool,
+    /// The stack was applied again: what changed was more than contents.
+    pub restacked: bool,
 }
 
 fn stamp(time: SystemTime) -> Stamp {
@@ -582,6 +584,33 @@ impl Scan {
     fn all_files(&self) -> impl Iterator<Item = &PathBuf> {
         self.bundles.values().flat_map(BTreeMap::values).chain(self.files.values())
     }
+
+    /// What it holds at the resolved path `rel` and under it (all of it when empty).
+    fn under(&self, rel: &str) -> Scan {
+        let prefix = format!("{rel}/");
+        let below = |p: &String| rel.is_empty() || p == rel || p.starts_with(&prefix);
+        Scan {
+            bundles: self.bundles.iter().filter(|(p, _)| below(p)).map(|(p, f)| (p.clone(), f.clone())).collect(),
+            folders: self.folders.iter().filter(|p| below(p)).cloned().collect(),
+            files: self.files.iter().filter(|(p, _)| below(p)).map(|(p, f)| (p.clone(), f.clone())).collect(),
+        }
+    }
+
+    /// Whether it holds the same paths as `other`: what a change of contents alone leaves.
+    fn same_paths(&self, other: &Scan) -> bool {
+        self.bundles.keys().eq(other.bundles.keys()) && self.folders == other.folders && self.files.keys().eq(other.files.keys())
+    }
+
+    /// Whether it holds this file on disk, of a bundle or plain.
+    fn holds(&self, place: &Place, file: &Path) -> bool {
+        let Some(rel) = place.resolved(file) else { return false };
+        if self.files.get(&rel).is_some_and(|f| f == file) {
+            return true;
+        }
+        bundle_of(&rel).is_some_and(|asset| {
+            self.bundles.get(&format!("{asset}{BUNDLE_SUFFIX}")).is_some_and(|files| files.values().any(|f| f == file))
+        })
+    }
 }
 
 /// A bundle's files by name.
@@ -779,6 +808,9 @@ pub struct Index {
     /// The content hash of each entry a writable layer holds, as of the last pass: what tells a move made outside
     /// the editor from a deletion and a new entry.
     hashes: Vec<HashMap<String, String>>,
+    /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
+    /// of a layer's content touches.
+    winning: HashMap<(usize, String), String>,
 }
 
 impl Index {
@@ -807,6 +839,7 @@ impl Index {
             ops: vec![],
             dependencies: vec![],
             hashes: vec![],
+            winning: HashMap::new(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         let read = index.load_records(&files, |path, size, modified| {
@@ -824,52 +857,97 @@ impl Index {
     }
 
     /// Bring the index up to date with paths a watcher reports changed: what they lie in is scanned again (a file
-    /// reported is read again whatever its stamp), a changeset reported is read again, the stack is applied anew, and
-    /// the assets whose entry changed are rebuilt. `project.toml` is only noticed: a change to the layers themselves
-    /// needs the project opened again.
+    /// reported is read again whatever its stamp), a changeset reported is read again, and the assets whose entry or
+    /// content changed are rebuilt. It costs what changed: where only contents did - the layers hold the same paths,
+    /// no changeset was read again, and each content changed is its entry's winning one - the stack is not applied
+    /// again, and only the changed assets are assembled and linked; otherwise the stack is applied anew.
+    /// `project.toml` is only noticed: a change to the layers themselves needs the project opened again.
     ///
     /// # Errors
     /// A changeset cannot be read or written.
     pub fn refresh(&mut self, project: &Project, changed: &[PathBuf]) -> Result<Refreshed> {
         let mut refreshed = Refreshed::default();
-        let mut rescanned: Vec<PathBuf> = Vec::new();
+        let mut changesets = false;
+        let mut wanted: Vec<(usize, String)> = Vec::new();
         for path in changed {
             if *path == project.root.join(FILE) {
                 refreshed.project_file = true;
                 continue;
             }
-            for layer in &mut self.layers {
+            for (i, layer) in self.layers.iter_mut().enumerate() {
                 if *path == layer.changeset_path {
                     layer.reload_changeset()?;
+                    changesets = true;
                     continue;
                 }
                 let Some(rel) = layer.place.resolved(path) else { continue };
-                // A change inside a bundle rescans the bundle; anything else, what is at the path.
+                // A change inside a bundle rescans the bundle; anything else, what is at the path (the whole layer at
+                // a mount's point).
                 let bundle = if layer.place.assets { bundle_of(&rel) } else { None };
                 let at = bundle.map_or(rel, |asset| format!("{asset}{BUNDLE_SUFFIX}"));
-                layer.scan.rescan(&layer.place, &at);
-                rescanned.push(layer.place.disk(&at));
+                wanted.push((i, if at == layer.place.at { String::new() } else { at }));
             }
         }
-        // Records of files no layer holds any more go; files under what was rescanned are stat'ed again.
-        let held: HashSet<PathBuf> = self.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
-        let gone: Vec<PathBuf> = self.records.keys().filter(|p| !held.contains(*p)).cloned().collect();
-        self.records.retain(|p, _| held.contains(p));
-        let files: Vec<PathBuf> = held.iter().filter(|f| rescanned.iter().any(|r| f.starts_with(r))).cloned().collect();
-        let reported: HashSet<&PathBuf> = changed.iter().collect();
-        let known = std::mem::take(&mut self.records);
-        let read = self.load_records(&files, |path, size, modified| {
-            known
-                .get(path)
-                .filter(|r| !reported.contains(&path.to_path_buf()) && r.size == size && r.modified == modified)
-                .cloned()
-        });
-        self.read = read.len();
-        for (path, record) in known {
-            self.records.entry(path).or_insert(record);
+        // Each region once: one within another of its layer is scanned with it.
+        let within = |a: &str, b: &str| b.is_empty() || a == b || a.starts_with(&format!("{b}/"));
+        wanted.sort();
+        wanted.dedup();
+        let regions: Vec<(usize, String)> = wanted
+            .iter()
+            .filter(|(i, a)| !wanted.iter().any(|(j, b)| j == i && b != a && within(a, b)))
+            .cloned()
+            .collect();
+        // What the entries changed declare now, before their records are read again: what a link takes back.
+        let mut before_references = HashMap::new();
+        for (i, at) in &regions {
+            for path in self.layers[*i].scan.under(at).bundles.keys() {
+                if let Some(resolved) = self.winning.get(&(*i, path.clone())) {
+                    let asset = asset_of(resolved).to_string();
+                    before_references.insert(asset.clone(), self.references_from(&asset));
+                }
+            }
         }
+        let mut gone = Vec::new();
+        let mut files = Vec::new();
+        let mut paths_same = true;
+        for (i, at) in &regions {
+            let layer = &mut self.layers[*i];
+            let before = layer.scan.under(at);
+            layer.scan.rescan(&layer.place, at);
+            let after = layer.scan.under(at);
+            paths_same &= before.same_paths(&after);
+            let now: HashSet<&PathBuf> = after.all_files().collect();
+            for file in before.all_files().filter(|f| !now.contains(f)) {
+                let elsewhere = self.layers.iter().enumerate().any(|(j, l)| j != *i && l.scan.holds(&l.place, file));
+                if !elsewhere {
+                    gone.push(file.clone());
+                }
+            }
+            files.extend(after.all_files().cloned());
+        }
+        for file in &gone {
+            self.records.remove(file);
+        }
+        let reported: HashSet<&PathBuf> = changed.iter().collect();
+        let (read, vanished) = self.reload(&files, &reported);
+        gone.extend(vanished);
+        self.read = read.len();
         let records = read.iter().filter_map(|p| Some((p.as_path(), self.records.get(p)?)));
         self.store.write(records, gone.iter().map(PathBuf::as_path))?;
+        // Contents alone: every bundle and plain file of the regions is its entry's winning content.
+        let contents_only = paths_same
+            && !changesets
+            && self.hidden.is_empty()
+            && regions.iter().all(|(i, at)| {
+                let scan = self.layers[*i].scan.under(at);
+                scan.bundles.keys().chain(scan.files.keys()).all(|p| self.winning.contains_key(&(*i, p.clone())))
+            });
+        if contents_only {
+            self.refresh_contents(&regions, &before_references, &mut refreshed);
+            return Ok(refreshed);
+        }
+        let rescanned: Vec<PathBuf> = regions.iter().map(|(i, at)| self.layers[*i].place.disk(at)).collect();
+        refreshed.restacked = true;
         let before = std::mem::take(&mut self.resolved);
         self.apply_stack()?;
         // An asset changed when its entry did, or when its content lies in what was rescanned.
@@ -887,6 +965,45 @@ impl Index {
         self.assemble(&paths);
         self.link();
         Ok(refreshed)
+    }
+
+    /// A refresh where only contents changed, each its entry's winning one: the entries stand; the changed assets
+    /// are assembled and linked again, the hashes of their writable layers kept, the dependencies counted again only
+    /// where their references changed.
+    fn refresh_contents(
+        &mut self,
+        regions: &[(usize, String)],
+        before: &HashMap<String, Vec<Reference>>,
+        refreshed: &mut Refreshed,
+    ) {
+        let mut paths = Vec::new();
+        for (i, at) in regions {
+            let scan = self.layers[*i].scan.under(at);
+            if self.layers[*i].writable {
+                for (path, kind) in scan.bundles.keys().map(|p| (p, Kind::Asset)).chain(scan.files.keys().map(|p| (p, Kind::File))) {
+                    if let Some(hash) = self.content_hash(*i, path, kind) {
+                        self.hashes[*i].insert(path.clone(), hash);
+                    }
+                }
+            }
+            for path in scan.bundles.keys() {
+                if let Some(resolved) = self.winning.get(&(*i, path.clone())) {
+                    paths.push(resolved.clone());
+                }
+            }
+        }
+        self.assemble_assets(&paths);
+        let assets: Vec<String> = paths.iter().map(|p| asset_of(p).to_string()).collect();
+        let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.part.clone());
+        let references_changed = assets.iter().any(|a| {
+            let now: Vec<_> = self.references_from(a).iter().map(referring).collect();
+            before.get(a).is_none_or(|b| b.iter().map(referring).collect::<Vec<_>>() != now)
+        });
+        self.relink(&assets, before);
+        if references_changed {
+            self.dependencies = self.dependencies();
+        }
+        refreshed.assets.extend(assets);
     }
 
     /// Stat the files; take the records `known` still answers for, read the rest on every core. Returns those read.
@@ -914,6 +1031,34 @@ impl Index {
             }
         }
         read
+    }
+
+    /// Stat the files and read again those whose stamp changed or that were reported; returns those read, and those
+    /// gone since they were scanned.
+    fn reload(&mut self, files: &[PathBuf], reported: &HashSet<&PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let (mut pending, mut vanished) = (Vec::new(), Vec::new());
+        for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
+            let Some(size) = size else {
+                self.records.remove(file);
+                vanished.push(file.clone());
+                continue;
+            };
+            let kept = !reported.contains(file)
+                && self.records.get(file).is_some_and(|r| r.size == size && r.modified == modified);
+            if !kept {
+                let declaration = file.file_name().is_some_and(|n| n == ASSET_FILE)
+                    && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
+                pending.push(Pending { path: file.clone(), size, modified, declaration });
+            }
+        }
+        let mut read = Vec::new();
+        for (file, record) in pending.iter().zip(read_all(&pending)) {
+            if let Some(record) = record {
+                self.records.insert(file.path.clone(), record);
+                read.push(file.path.clone());
+            }
+        }
+        (read, vanished)
     }
 
     /// The hash of an entry's content in a layer: a plain file's own, a bundle's over its files' names and hashes;
@@ -957,6 +1102,7 @@ impl Index {
         self.resolved = if self.hidden.is_empty() { full.resolved } else { self.resolve_stack(&self.hidden).resolved };
         self.dependencies = self.dependencies();
         self.remember_hashes();
+        self.winning = self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect();
         Ok(())
     }
 
@@ -1388,6 +1534,12 @@ impl Index {
     /// bundle, its `asset.toml`. A path that no longer resolves to an asset loses its asset; `entries` follows the
     /// whole stack.
     fn assemble(&mut self, paths: &[String]) {
+        self.assemble_entries();
+        self.assemble_assets(paths);
+    }
+
+    /// The entries, from the resolved stack.
+    fn assemble_entries(&mut self) {
         self.entries = self
             .resolved
             .iter()
@@ -1405,6 +1557,11 @@ impl Index {
                 (path.clone(), entry)
             })
             .collect();
+    }
+
+    /// The assets at these real paths, from the resolved stack and the records; a path that no longer resolves to an
+    /// asset loses its asset.
+    fn assemble_assets(&mut self, paths: &[String]) {
         for path in paths {
             let Some(node) = self.resolved.get(path).filter(|n| n.kind == Kind::Asset) else {
                 self.assets.remove(asset_of(path));
@@ -1482,6 +1639,52 @@ impl Index {
         }
         self.referenced_by = referenced_by;
         self.dangling = dangling;
+    }
+
+    /// Link again what these assets declare, which declared `before` (by asset): their unreadable declarations, and
+    /// their references taken back and made again where a full link puts them (in asset order, then declaration
+    /// order). The uids and the assets stand: other assets' references resolve as they did.
+    fn relink(&mut self, assets: &[String], before: &HashMap<String, Vec<Reference>>) {
+        let changed: HashSet<&str> = assets.iter().map(String::as_str).collect();
+        self.problems.retain(|p| !matches!(p, Problem::Unreadable { asset, .. } if changed.contains(asset.as_str())));
+        for path in assets {
+            if let Some(error) = self.assets.get(path).and_then(|a| a.error.clone()) {
+                self.problems.push(Problem::Unreadable { asset: path.clone(), error });
+            }
+        }
+        let resolved = |index: &Index, r: &Reference| {
+            index.by_uid.get(&r.uid).cloned().or_else(|| index.assets.contains_key(&r.target).then(|| r.target.clone()))
+        };
+        for (from, references) in before.iter().filter(|(a, _)| changed.contains(a.as_str())) {
+            let targets: Vec<String> = references.iter().filter_map(|r| resolved(self, r)).collect();
+            for target in targets {
+                if let Some(list) = self.referenced_by.get_mut(&target) {
+                    list.retain(|r| r.from != *from);
+                    if list.is_empty() {
+                        self.referenced_by.remove(&target);
+                    }
+                }
+            }
+        }
+        self.dangling.retain(|r| !changed.contains(r.from.as_str()));
+        let mut sorted: Vec<&String> = assets.iter().collect();
+        sorted.sort();
+        for from in sorted {
+            let mut placed: HashMap<String, usize> = HashMap::new();
+            let mut dangling_at = self.dangling.partition_point(|r| r.from < *from);
+            for reference in self.references_from(from) {
+                if let Some(target) = resolved(self, &reference) {
+                    let list = self.referenced_by.entry(target.clone()).or_default();
+                    // After the references of the assets before it, then each of its own after the last.
+                    let at = placed.entry(target).or_insert_with(|| list.partition_point(|r| r.from < *from));
+                    list.insert(*at, reference);
+                    *at += 1;
+                } else {
+                    self.dangling.insert(dangling_at, reference);
+                    dangling_at += 1;
+                }
+            }
+        }
     }
 
     /// The references an asset's declaration makes, in its order.
@@ -1643,6 +1846,72 @@ mod tests {
         assert!(!index.assets.contains_key("f"));
         assert!(index.problems.contains(&Problem::Missing { layer: "base".into(), path: "f.asset".into() }));
         assert!(index.refresh(&project, &[root.join("project.toml")]).unwrap().project_file);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What an index shows, in a form to compare: its assets (their declarations and files by name, hash and layer),
+    /// entries, uids, references both ways and problems (in no particular order), stack and statuses.
+    fn shown(index: &Index) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (path, a) in &index.assets {
+            let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
+            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.kind, a.role, a.variants, a.layers, a.error, a.text, files);
+        }
+        for (path, e) in &index.entries {
+            let _ = writeln!(out, "entry {path} {e:?}");
+        }
+        let by_uid: std::collections::BTreeMap<_, _> = index.by_uid.iter().collect();
+        let _ = writeln!(out, "uids {by_uid:?}");
+        let referenced: std::collections::BTreeMap<_, _> = index.referenced_by.iter().collect();
+        let _ = writeln!(out, "referenced {referenced:?}\ndangling {:?}", index.dangling);
+        let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
+        problems.sort();
+        let _ = writeln!(out, "problems {problems:?}\nops {:?}\ndependencies {:?}", index.ops, index.dependencies);
+        let mut winning: Vec<_> = index.winning.iter().collect();
+        winning.sort();
+        let _ = writeln!(out, "winning {winning:?}");
+        out
+    }
+
+    #[test]
+    fn a_refresh_shows_what_opening_afresh_shows() {
+        let root = project("afresh");
+        let (project, mut index) = open(&root);
+        // Each change refreshed, the stack applied again or not as expected, then held to an opening afresh.
+        let check = |index: &mut Index, project: &Project, changed: &[PathBuf], what: &str, restacked: bool| {
+            assert_eq!(index.refresh(project, changed).unwrap().restacked, restacked, "{what}");
+            let (_, fresh) = open(&root);
+            assert_eq!(shown(index), shown(&fresh), "after {what}");
+        };
+        let base = |p: &str| root.join(".layers/base").join(p);
+        // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
+        write(&root, ".layers/base/g/a.asset/native.texels", "repainted");
+        check(&mut index, &project, &[base("g/a.asset/native.texels")], "a file of a bundle", false);
+        write(&root, ".layers/base/b.asset/asset.toml", "kind = \"file\"\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
+        check(&mut index, &project, &[base("b.asset/asset.toml")], "references changed", false);
+        write(&root, ".layers/base/f.asset/asset.toml", "kind = [unclosed\n");
+        check(&mut index, &project, &[base("f.asset/asset.toml")], "an unreadable declaration", false);
+        write(&root, ".layers/base/f.asset/asset.toml", "kind = \"file\"\nold = { uid = \"uid://a\" }\n");
+        check(&mut index, &project, &[base("f.asset/asset.toml")], "readable again", false);
+        // A file added to a bundle: its content changes, its paths stay.
+        write(&root, ".layers/base/g/a.asset/extra.bin", "more");
+        check(&mut index, &project, &[base("g/a.asset/extra.bin")], "a file added to a bundle", false);
+        // Structure: a new bundle, listed in its changeset; one removed.
+        write(&root, ".layers/base/n.asset/asset.toml", "kind = \"file\"\nto = \"uid://a\"\n");
+        check(&mut index, &project, &[base("n.asset/asset.toml")], "a new bundle", true);
+        std::fs::remove_dir_all(base("n.asset")).unwrap();
+        check(&mut index, &project, &[base("n.asset")], "a bundle removed", true);
+        // An override in top, then its base changed below it: stale, though only contents changed.
+        let mut top = Changeset::default();
+        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.asset").unwrap(), to: None });
+        top.save(&root.join(".layers/top.toml")).unwrap();
+        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\n");
+        check(&mut index, &project, &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.asset/asset.toml")], "an override", true);
+        write(&root, ".layers/base/g/a.asset/native.texels", "retouched");
+        check(&mut index, &project, &[base("g/a.asset/native.texels")], "an override's base changed", true);
+        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\nnote = \"uid://a\"\n");
+        check(&mut index, &project, &[root.join(".layers/top/g/a.asset/asset.toml")], "the override's own content", false);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

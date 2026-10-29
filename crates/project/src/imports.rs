@@ -16,7 +16,7 @@
 //! the cost of time only.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -126,15 +126,31 @@ impl Imports {
     /// the declaration's. An import that fails, a declared value it overrides, a part it orphans and a reference
     /// naming a part its asset does not have are problems of the index. Imports no asset made are removed.
     pub fn attach(&self, index: &mut Index, extensions: &Extensions) -> Attached {
+        self.attach_some(index, extensions, None)
+    }
+
+    /// Attach the imports of these assets alone - those a refresh changed (`Refreshed::assets`) - the others keeping
+    /// theirs: their problems made again, and those of the references from or to them naming parts. What it costs is
+    /// what changed; imports no asset makes any more are removed by the next full attach.
+    pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
+        self.attach_some(index, extensions, Some(changed))
+    }
+
+    fn attach_some(&self, index: &mut Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Attached {
         let mut attached = Attached::default();
+        let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
-        for asset in index.assets.values_mut() {
+        for asset in index.assets.values_mut().filter(|a| of(&a.path)) {
             asset.files.retain(|f| f.made_by.is_none());
             asset.imported = None;
         }
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut found: Vec<(String, String, String, Arc<Known>)> = Vec::new();
-        for asset in index.assets.values() {
+        let assets: Vec<&Asset> = match only {
+            None => index.assets.values().collect(),
+            Some(only) => only.iter().filter_map(|p| index.assets.get(p)).collect(),
+        };
+        for asset in assets {
             let Some((importer, key)) = key_of(asset, extensions) else { continue };
             if let Some(import) = known.get(&key) {
                 attached.kept += 1;
@@ -165,9 +181,11 @@ impl Imports {
             known.insert(key.clone(), import.clone());
             found.push((asset.path.clone(), importer, key, import));
         }
-        let live: HashSet<&str> = found.iter().map(|(_, _, key, _)| key.as_str()).collect();
-        known.retain(|key, _| live.contains(key.as_str()));
-        self.sweep(&live);
+        if only.is_none() {
+            let live: HashSet<&str> = found.iter().map(|(_, _, key, _)| key.as_str()).collect();
+            known.retain(|key, _| live.contains(key.as_str()));
+            self.sweep(&live);
+        }
         drop(known);
         let mut problems: Vec<Problem> =
             attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
@@ -195,22 +213,20 @@ impl Imports {
             problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
             asset.imported = Some(resolved.clone());
         }
-        problems.extend(self.missing_parts(index, extensions));
+        problems.extend(self.missing_parts(index, extensions, only));
         // The project's extensions not loaded, as problems of their assets.
         problems.extend(extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
             (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
             _ => None,
         }));
-        index.problems.retain(|p| {
-            !matches!(
-                p,
-                Problem::Import { .. }
-                    | Problem::Overridden { .. }
-                    | Problem::Orphan { .. }
-                    | Problem::MissingPart { .. }
-                    | Problem::Taken { .. }
-                    | Problem::Extension { .. }
-            )
+        index.problems.retain(|p| match p {
+            Problem::Import { asset, .. }
+            | Problem::Overridden { asset, .. }
+            | Problem::Orphan { asset, .. }
+            | Problem::Taken { asset, .. } => !of(asset),
+            Problem::MissingPart { asset, target, .. } => !of(asset) && !of(target),
+            Problem::Extension { .. } => false,
+            _ => true,
         });
         index.problems.extend(problems);
         attached
@@ -219,11 +235,13 @@ impl Imports {
     /// The references naming a part their asset does not have, of the assets whose kinds list their parts: with the
     /// settings resolved, as parts an import makes are among them. An asset's parts are listed again only when its
     /// settings change.
-    fn missing_parts(&self, index: &Index, extensions: &Extensions) -> Vec<Problem> {
+    fn missing_parts(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
         let mut known = self.parts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut problems = Vec::new();
+        let of = |path: &str| only.is_none_or(|o| o.contains(path));
         for (target, references) in &index.referenced_by {
-            let named: Vec<_> = references.iter().filter(|r| r.part.is_some()).collect();
+            // Of the assets attached: the references to them, and from them.
+            let named: Vec<_> = references.iter().filter(|r| r.part.is_some() && (of(target) || of(&r.from))).collect();
             let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.lists_parts(a))
             else {
                 continue;
@@ -539,6 +557,56 @@ mod attaching {
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingPart { .. })));
         let kept = std::fs::read_dir(root.join(".cache/imports")).unwrap().count();
         assert_eq!(kept, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What an index's imports show: each asset's made files and settings, and the problems (in no order).
+    fn shown(index: &Index) -> String {
+        let mut out: Vec<String> = index
+            .assets
+            .values()
+            .map(|a| {
+                let made: Vec<_> = a.files.iter().filter(|f| f.made_by.is_some()).map(|f| (&f.name, &f.sha1)).collect();
+                format!("{} {made:?} {:?}", a.path, a.imported.as_ref().map(|i| &i.settings))
+            })
+            .collect();
+        let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
+        problems.sort();
+        out.extend(problems);
+        out.join("\n")
+    }
+
+    #[test]
+    fn attaching_what_changed_shows_what_attaching_all_shows() {
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        let declared = "kind = \"strip\"\ncells.a = {}\n\n[import]\nimporter = \"test.strips@line\"\nsource = \"source.txt\"\n";
+        write(&root, ".layers/base/s.asset/asset.toml", &format!("uid = \"uid://s\"\n{declared}"));
+        write(&root, ".layers/base/s.asset/source.txt", "a b");
+        write(&root, ".layers/base/t.asset/asset.toml", &format!("uid = \"uid://t\"\n{declared}"));
+        write(&root, ".layers/base/t.asset/source.txt", "a");
+        write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\none = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
+        let extensions =
+            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], register: strips })], true);
+        let project = Project::load(&root).unwrap();
+        let (mut index, _) = open(&root, &extensions);
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        drop(lock);
+        let base = |p: &str| root.join(".layers/base").join(p);
+        // A source repainted (a part gone and one come), a declaration naming another part, both at once.
+        for (path, text) in [
+            ("s.asset/source.txt", "a"),
+            ("t.asset/source.txt", "a b"),
+            ("r.asset/asset.toml", "kind = \"file\"\none = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
+        ] {
+            write(&root, &format!(".layers/base/{path}"), text);
+            let refreshed = index.refresh(&project, &[base(path)]).unwrap();
+            imports.attach_changed(&mut index, &extensions, &refreshed.assets);
+            let (fresh, _) = open(&root, &extensions);
+            assert_eq!(shown(&index), shown(&fresh), "after {path}");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
