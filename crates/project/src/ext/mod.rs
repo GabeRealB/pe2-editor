@@ -42,8 +42,8 @@ pub struct Loadable {
     pub requires: Vec<String>,
     pub origin: Origin,
     register: Option<Register>,
-    /// Its component, where it runs as one: its instances, their memory.
-    component: Option<Arc<component::Shared>>,
+    /// Its component, where it runs as one - set when it registers: its instances, their memory.
+    component: Option<Arc<std::sync::OnceLock<Arc<component::Shared>>>>,
 }
 
 impl From<Extension> for Loadable {
@@ -81,7 +81,7 @@ pub struct Extensions {
     importers: HashMap<String, ImporterDef>,
     extractors: Vec<pe2_ext::ExtractorDef>,
     /// The components of the extensions loaded, by id.
-    components: Vec<(String, Arc<component::Shared>)>,
+    components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
     /// The formats recognized in files, by their content's hash.
     recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
@@ -447,19 +447,19 @@ impl Extensions {
     /// What each extension running as a component holds: its live instances and their memory, by id.
     #[must_use]
     pub fn memory(&self) -> Vec<(&str, component::Memory)> {
-        self.components.iter().map(|(id, c)| (id.as_str(), c.memory())).collect()
+        self.components.iter().filter_map(|(id, c)| Some((id.as_str(), c.get()?.memory()))).collect()
     }
 
     /// A frame ended: each extension's readings' instance unused for long enough is reclaimed.
     pub fn frame(&self) {
-        for (_, component) in &self.components {
+        for component in self.components.iter().filter_map(|(_, c)| c.get()) {
             component.frame();
         }
     }
 
     /// Reclaim every readings' instance now: where there are no frames (the agents' server, between requests).
     pub fn release(&self) {
-        for (_, component) in &self.components {
+        for component in self.components.iter().filter_map(|(_, c)| c.get()) {
             component.release();
         }
     }

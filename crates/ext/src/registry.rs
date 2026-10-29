@@ -42,11 +42,34 @@ macro_rules! extension {
             extension()
         }
 
+        /// Who it is, as its component carries it in the section the host reads without running it
+        /// (`pe2-extension`): its id, version and requirements as TOML.
+        #[cfg(target_family = "wasm")]
+        const __PE2_ABOUT: &str = concat!(
+            "id = \"", $id, "\"\nversion = \"", $version, "\"\nrequires = [", $($("\"", $requires, "\", ",)*)? "]\n"
+        );
+        #[cfg(target_family = "wasm")]
+        #[unsafe(link_section = "pe2-extension")]
+        #[used]
+        static __PE2_ABOUT_SECTION: [u8; __PE2_ABOUT.len()] = $crate::section(__PE2_ABOUT);
+
         #[cfg(target_family = "wasm")]
         use $crate::guest::Component as __Pe2Component;
         #[cfg(target_family = "wasm")]
         $crate::guest::bindings::export_component!(__Pe2Component with_types_in $crate::guest::bindings);
     };
+}
+
+/// A text as a custom section's bytes, for `extension!`.
+#[doc(hidden)]
+#[must_use]
+pub const fn section<const N: usize>(text: &str) -> [u8; N] {
+    let (bytes, mut out, mut i) = (text.as_bytes(), [0; N], 0);
+    while i < N {
+        out[i] = bytes[i];
+        i += 1;
+    }
+    out
 }
 
 /// A name an extension registers, qualified by its id: `pe2.images@image`.

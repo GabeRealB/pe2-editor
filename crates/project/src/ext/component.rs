@@ -1515,12 +1515,69 @@ pub fn load(path: &Path) -> Result<Loadable> {
     load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.to_path_buf()))
 }
 
-/// A component to load (`name` names it until it says who it is): compiled, instantiated, asked who it is and what it
-/// registers.
+/// Who a component is, as `extension!` writes it into the section the host reads without running it
+/// (`pe2-extension`, in its core module): its id, version and requirements.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct About {
+    pub id: String,
+    pub version: String,
+    #[serde(default)]
+    pub requires: Vec<String>,
+}
+
+/// What a component says it is, read from its section; none where it has none (built by an older SDK).
+#[must_use]
+pub fn about(bytes: &[u8]) -> Option<About> {
+    wasmparser::Parser::new(0).parse_all(bytes).find_map(|payload| match payload.ok()? {
+        wasmparser::Payload::CustomSection(section) if section.name() == SECTION => {
+            toml::from_str(std::str::from_utf8(section.data()).ok()?).ok()
+        }
+        _ => None,
+    })
+}
+
+/// The section `extension!` writes.
+const SECTION: &str = "pe2-extension";
+
+/// A component to load (`name` names it until it says who it is). One that says who it is in its section is compiled
+/// and run only when it registers - an extension disabled, or whose requirements are not met, never is - and must then
+/// say the same when asked; one without is compiled, instantiated and asked now.
 ///
 /// # Errors
-/// It cannot be compiled or instantiated, or its registration fails.
+/// One without the section cannot be compiled or instantiated, or its registration fails.
 pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
+    let cell: Arc<OnceLock<Arc<Shared>>> = Arc::default();
+    if let Some(about) = about(bytes) {
+        let (name, bytes, said, kept) = (name.to_string(), bytes.to_vec(), about.clone(), cell.clone());
+        return Ok(Loadable {
+            id: about.id,
+            version: about.version,
+            requires: about.requires,
+            origin,
+            register: Some(Box::new(move |registry| {
+                let (shared, told, registration) = start(&name, &bytes)?;
+                anyhow::ensure!(told == said, "{name}: it says it is {told:?}, its section {said:?}");
+                let shared = kept.get_or_init(|| shared).clone();
+                apply(registry, registration, &shared)
+            })),
+            component: Some(cell),
+        });
+    }
+    let (shared, about, registration) = start(name, bytes)?;
+    let shared = cell.get_or_init(|| shared).clone();
+    Ok(Loadable {
+        id: about.id,
+        version: about.version,
+        requires: about.requires,
+        origin,
+        register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
+        component: Some(cell),
+    })
+}
+
+/// A component compiled in an engine of its own, its first instance asked who it is and what it registers - which
+/// then answers the first readings.
+fn start(name: &str, bytes: &[u8]) -> Result<(Arc<Shared>, About, g::Registration)> {
     let engine = new_engine()?;
     let component = compile(&engine, bytes).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
@@ -1540,24 +1597,15 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
         peak: AtomicUsize::new(0),
     };
     let mut runner = shared.instantiate(MEMORY)?;
-    let about = runner.call(LONG, async |accessor, guest| guest.call_describe(accessor).await)?;
+    let told = runner.call(LONG, async |accessor, guest| guest.call_describe(accessor).await)?;
     let registration = runner
         .call(LONG, async |accessor, guest| guest.call_register(accessor).await)?
         .map_err(|e| anyhow!("{name}: its registration failed: {e}"))?;
-    shared.id.clone_from(&about.id);
-    shared.caps = caps(&about.id, &registration)?;
-    shared.views_cap = views_cap(&about.id, &registration, &shared.caps);
-    runner.store.data_mut().id.clone_from(&about.id);
-    // The first instance, registered already, answers the first readings.
+    shared.id.clone_from(&told.id);
+    shared.caps = caps(&told.id, &registration)?;
+    shared.views_cap = views_cap(&told.id, &registration, &shared.caps);
+    runner.store.data_mut().id.clone_from(&told.id);
     *shared.reading.get_mut().map_err(|_| anyhow!("{name}: its readings are poisoned"))? = Some((runner, READING_FRAMES));
-    let shared = Arc::new(shared);
-    let component = shared.clone();
-    Ok(Loadable {
-        id: about.id,
-        version: about.version,
-        requires: about.requires,
-        origin,
-        register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
-        component: Some(component),
-    })
+    let about = About { id: told.id, version: told.version, requires: told.requires };
+    Ok((Arc::new(shared), about, registration))
 }
