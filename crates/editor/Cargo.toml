@@ -17,7 +17,6 @@ codecs.workspace = true
 project.workspace = true
 extensions.workspace = true
 pe2-ext.workspace = true
-pe2-images.workspace = true
 mcp.workspace = true
 anyhow.workspace = true
 eframe.workspace = true

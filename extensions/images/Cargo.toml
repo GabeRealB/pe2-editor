@@ -5,6 +5,10 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[lib]
+# A library linked into the editor, and a component built for wasm32-wasip3.
+crate-type = ["rlib", "cdylib"]
+
 [lints]
 workspace = true
 

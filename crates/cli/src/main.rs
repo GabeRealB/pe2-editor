@@ -159,6 +159,9 @@ fn main() -> Result<()> {
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
             })?;
+            if let Some(why) = lock.unprotected() {
+                eprintln!("warning: {why}");
+            }
             let options = project::extract::Options { releases: release, roms, declarations };
             let report = project::extract::extract(&p, &options, &lock)?;
             println!(

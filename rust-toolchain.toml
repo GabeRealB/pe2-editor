@@ -1,0 +1,4 @@
+# Nightly: the extensions are WASI 0.3 components, and wasm32-wasip3 is nightly's alone so far.
+[toolchain]
+channel = "nightly"
+targets = ["wasm32-wasip3"]

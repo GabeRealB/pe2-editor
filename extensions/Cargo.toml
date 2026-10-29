@@ -10,4 +10,6 @@ workspace = true
 
 [dependencies]
 pe2-ext.workspace = true
+project.workspace = true
+pe2-game.workspace = true
 pe2-images.workspace = true

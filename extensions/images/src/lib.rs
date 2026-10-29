@@ -1,12 +1,17 @@
 //! pe2.images: the image kind and its roles - a background (a BS picture), a texture (texels through its palettes),
 //! an atlas (texels in cells, each cell through its own palette).
 //!
-//! It registers what the host shows an image by: its picture in each of its looks, its thumbnail, its fields' labels
-//! and readings, and its view (the picture on a canvas, with an atlas's cells or a wide texture's pages over it). What
-//! the host's VRAM view and the agents' server read of images besides - palettes, cells, depths - is this crate's
-//! interface (`palette_names`, `cells`, ...), as a component would export it for its dependents.
+//! It registers what the host shows an image by: its picture in each of its looks and its palettes as parts, its
+//! thumbnail, its fields' labels and readings, its view (the picture on a canvas, with an atlas's cells or a wide
+//! texture's pages over it), its inspector sections (palettes, variants, cells), what agents are told of it and its
+//! palette tool; and VRAM - its slots (`vram_slot`) and the panel showing what an asset uploads where.
 
-use pe2_ext::{Asset, Canvas, Field, Icon, Image, Picture, Rect, Registry, Result, Texture, Tint, Ui, Value, View};
+mod inspector;
+mod tools;
+mod view;
+mod vram;
+
+use pe2_ext::{Asset, Field, Icon, Image, Picture, Rect, Registry, Result, Tint, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -19,15 +24,23 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("Image")
         .icon(Icon::Image, Tint::Picture)
         .field(Field::new("mode").label("Mode").choices(MODES).brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))))
+        .field(Field::new("palettes").custom())
+        .field(Field::new("variants").custom())
+        .field(Field::new("cells").custom())
         .picture(Pictures)
         .thumbnail(|asset, side| {
             Pictures.has(asset).then(|| Pictures.draw(asset, 0).map(|image| image.thumbnail(side)))
         })
-        .view("Picture", |asset| Box::new(ImageView::new(asset)))
+        .view("Picture", |asset| Box::new(view::ImageView::new(asset)))
+        .inspector("Collections", |_| Box::new(inspector::Collections::default()))
+        .facts(tools::facts)
         .register();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
         r.role(&image, role).alias(role).label(label).register();
     }
+    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
+    r.panel("vram", "VRAM", Icon::Grid, || Box::<vram::Vram>::default());
+    r.tool("palette", tools::PALETTE, tools::PALETTE_ARGUMENTS, tools::palette);
     Ok(())
 }
 
@@ -206,7 +219,7 @@ const BS: &str = "native.bs";
 const TEXELS: &str = "native.texels";
 
 /// What an image is drawn from: a background's `native.bs`, or an image's stored texels and its palettes' colors.
-struct Pictures;
+pub(crate) struct Pictures;
 
 impl Picture for Pictures {
     fn has(&self, asset: &Asset) -> bool {
@@ -215,6 +228,16 @@ impl Picture for Pictures {
 
     fn looks(&self, asset: &Asset) -> Vec<String> {
         looks(asset)
+    }
+
+    fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
+        let name = part.strip_prefix("palettes/")?;
+        let index = palette_names(asset).iter().position(|n| n == name)?;
+        Some(palette_colors(asset, index)?.map(|colors| Image {
+            width: colors.len(),
+            height: 1,
+            rgba: colors.iter().flat_map(|&c| rgba(c)).collect(),
+        }))
     }
 
     fn draw(&self, asset: &Asset, look: usize) -> Result<Image> {
@@ -310,81 +333,6 @@ fn decode_bs(bytes: &[u8]) -> Result<Image> {
     Ok(Image { width: picture.width, height: picture.height, rgba })
 }
 
-// --- the view -----------------------------------------------------------------------------------------------------
-
-/// An image on a canvas, in the look the host's picker chose: an atlas with a box over each cell, a texture wider than
-/// a page with a box over each page.
-struct ImageView {
-    size: (f32, f32),
-    boxes: Vec<(String, Rect)>,
-    summary: String,
-    toggle: &'static str,
-    /// Each look's picture, decoded when first shown.
-    pictures: HashMap<usize, Result<Texture, String>>,
-}
-
-impl ImageView {
-    fn new(asset: &Asset) -> ImageView {
-        let (size, page_width) = pages(asset);
-        let mut view = ImageView { size, boxes: vec![], summary: String::new(), toggle: "", pictures: HashMap::new() };
-        match role(asset) {
-            Some("atlas") => {
-                view.boxes = cells(asset).into_iter().map(|c| (c.name, c.rect)).collect();
-                let n = view.boxes.len();
-                view.summary = format!("{n} cell{}", if n == 1 { "" } else { "s" });
-                view.toggle = "Cells";
-            }
-            Some("texture") if size.0 > page_width => {
-                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a page count")]
-                let n = (size.0 / page_width).ceil() as usize;
-                #[expect(clippy::cast_precision_loss, reason = "a page count")]
-                let page = |k: usize| {
-                    let x = k as f32 * page_width;
-                    (format!("page {k}"), Rect { x, y: 0.0, width: (size.0 - x).min(page_width), height: size.1 })
-                };
-                view.boxes = (0..n).map(page).collect();
-                view.summary = format!("{n} pages of {page_width} texels");
-                view.toggle = "Pages";
-            }
-            _ => {}
-        }
-        view
-    }
-}
-
-impl View for ImageView {
-    fn show(&mut self, ui: &mut Ui) {
-        let look = ui.look();
-        let picture = self.pictures.entry(look).or_insert_with(|| {
-            let asset = ui.asset();
-            Pictures
-                .draw(&asset, look)
-                .map(|image| Texture::new(format!("{}#{look}", asset.path()), image))
-                .map_err(|e| format!("{e:#}"))
-        });
-        let texture = match picture {
-            Ok(texture) => texture.clone(),
-            Err(e) => {
-                ui.error(&format!("No preview: {e}"));
-                return;
-            }
-        };
-        let (width, height) = self.size;
-        let image = texture.image();
-        // A background's size is its picture's: it declares none.
-        #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
-        let (width, height) = if width > 0.0 { (width, height) } else { (image.width as f32, image.height as f32) };
-        ui.canvas(&Canvas {
-            width,
-            height,
-            pictures: vec![(texture, Rect { x: 0.0, y: 0.0, width, height })],
-            boxes: self.boxes.clone(),
-            summary: self.summary.clone(),
-            toggle: self.toggle.to_string(),
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Pictures, cells, looks, palette_colors};
@@ -408,6 +356,10 @@ mod tests {
 
         fn fields(&self) -> &Table {
             &self.fields
+        }
+
+        fn declaration(&self) -> &'static str {
+            ""
         }
 
         fn has_file(&self, name: &str) -> bool {

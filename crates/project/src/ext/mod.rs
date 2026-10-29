@@ -5,20 +5,62 @@
 //! version loaded (`pe2.images@^0.1`), registration in dependency order, cycles refused; an extension whose
 //! requirement is missing, too old or itself disabled is disabled, and so are its dependents, each with the reason. What
 //! one registers is checked as well: a role only on its own kinds or its dependencies', an alias only from a built-in,
-//! a name only once. The extensions are linked in for now (`extensions::builtin`), so loading is calling their entry
-//! points; a component's would be instantiated first.
+//! a name only once. An extension is a component the host runs (`component`), or a crate linked into the host whose
+//! entry point it calls - the built-ins' fallback while developing.
+
+pub mod component;
 
 use anyhow::{Context, Result};
-use pe2_ext::{Asset, Extension, Field, Icon, Image, KindDef, Registry, RoleDef, Source, Tint, ViewDef};
+use pe2_ext::{
+    Asset, Extension, Field, Icon, Image, KindDef, PanelDef, Project, Registry, RoleDef, Source, Table, Tint, ToolDef, Value,
+    ViewDef,
+};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::index;
+
+/// Where an extension runs from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A component built into the host: a built-in.
+    Builtin,
+    /// A component, from this file.
+    Component(PathBuf),
+    /// Linked into the host, its entry point called directly: a built-in, for debugging.
+    Linked,
+}
+
+/// How an extension registers: its entry point, or what its component registered.
+type Register = Box<dyn FnOnce(&mut Registry) -> Result<()>>;
+
+/// An extension to load: who it is, what it requires, and how it registers.
+pub struct Loadable {
+    pub id: String,
+    pub version: String,
+    pub requires: Vec<String>,
+    pub origin: Origin,
+    register: Option<Register>,
+}
+
+impl From<Extension> for Loadable {
+    fn from(extension: Extension) -> Loadable {
+        Loadable {
+            id: extension.id.to_string(),
+            version: extension.version.to_string(),
+            requires: extension.requires.iter().map(ToString::to_string).collect(),
+            origin: Origin::Linked,
+            register: Some(Box::new(move |registry| (extension.register)(registry))),
+        }
+    }
+}
 
 /// A loaded extension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
     pub id: String,
     pub version: String,
+    pub origin: Origin,
 }
 
 /// The extensions loaded, and what they registered.
@@ -29,6 +71,8 @@ pub struct Extensions {
     pub problems: Vec<String>,
     kinds: HashMap<String, (KindDef, usize)>,
     roles: HashMap<String, RoleDef>,
+    panels: Vec<PanelDef>,
+    tools: Vec<ToolDef>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     kind_aliases: HashMap<String, String>,
     role_aliases: HashMap<String, String>,
@@ -61,9 +105,9 @@ fn requirement(text: &str) -> (&str, Option<&str>) {
 impl Extensions {
     /// Load `extensions`, built-ins (`builtin`) or a project's own.
     #[must_use]
-    pub fn load(extensions: Vec<Extension>, builtin: bool) -> Extensions {
+    pub fn load(extensions: Vec<Loadable>, builtin: bool) -> Extensions {
         let mut out = Extensions::default();
-        let mut pending: Vec<Extension> = vec![];
+        let mut pending: Vec<Loadable> = vec![];
         for extension in extensions {
             if pending.iter().any(|e| e.id == extension.id) {
                 out.problems.push(format!("{}: another extension has this id; the second is not loaded", extension.id));
@@ -71,16 +115,16 @@ impl Extensions {
                 pending.push(extension);
             }
         }
-        let ids: HashSet<&str> = pending.iter().map(|e| e.id).collect();
-        let mut disabled: HashSet<&'static str> = HashSet::new();
+        let ids: HashSet<String> = pending.iter().map(|e| e.id.clone()).collect();
+        let mut disabled: HashSet<String> = HashSet::new();
         loop {
             let mut progress = false;
-            for extension in &pending {
-                if disabled.contains(extension.id) || out.loaded.iter().any(|l| l.id == extension.id) {
+            for extension in &mut pending {
+                if disabled.contains(&extension.id) || out.loaded.iter().any(|l| l.id == extension.id) {
                     continue;
                 }
                 let mut ready = true;
-                for text in extension.requires {
+                for text in &extension.requires {
                     let (id, version) = requirement(text);
                     let blocked = if !ids.contains(id) {
                         Some(format!("it needs {text}, which is not installed"))
@@ -96,19 +140,19 @@ impl Extensions {
                     };
                     if let Some(why) = blocked {
                         out.problems.push(format!("{} is disabled: {why}", extension.id));
-                        disabled.insert(extension.id);
+                        disabled.insert(extension.id.clone());
                         ready = false;
                         progress = true;
                         break;
                     }
                 }
-                if !ready || disabled.contains(extension.id) {
+                if !ready || disabled.contains(&extension.id) {
                     continue;
                 }
                 progress = true;
                 if let Err(e) = out.register(extension, builtin) {
                     out.problems.push(format!("{} is disabled: {e:#}", extension.id));
-                    disabled.insert(extension.id);
+                    disabled.insert(extension.id.clone());
                 }
             }
             if !progress {
@@ -116,7 +160,7 @@ impl Extensions {
             }
         }
         for extension in &pending {
-            if !disabled.contains(extension.id) && !out.loaded.iter().any(|l| l.id == extension.id) {
+            if !disabled.contains(&extension.id) && !out.loaded.iter().any(|l| l.id == extension.id) {
                 out.problems.push(format!("{} is disabled: its requirements form a cycle", extension.id));
             }
         }
@@ -124,13 +168,17 @@ impl Extensions {
     }
 
     /// Call an extension's entry point and take what it registered, checked.
-    fn register(&mut self, extension: &Extension, builtin: bool) -> Result<()> {
-        let mut registry = Registry::new(extension.id);
-        (extension.register)(&mut registry).context("its registration failed")?;
-        let (kinds, roles) = registry.into_parts();
+    fn register(&mut self, extension: &mut Loadable, builtin: bool) -> Result<()> {
+        let mut registry = Registry::new(&extension.id);
+        let register = extension.register.take().context("it was registered already")?;
+        register(&mut registry).context("its registration failed")?;
+        let parts = registry.into_parts();
+        let (kinds, roles) = (parts.kinds, parts.roles);
         let dependencies: Vec<&str> = extension.requires.iter().map(|r| requirement(r).0).collect();
         let mut seen = HashSet::new();
-        for name in kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name)) {
+        let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
+        let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
+        for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
         }
@@ -145,7 +193,8 @@ impl Extensions {
             anyhow::ensure!(builtin, "only a built-in extension names a kind or role bare ({alias})");
         }
         let index = self.loaded.len();
-        self.loaded.push(Loaded { id: extension.id.to_string(), version: extension.version.to_string() });
+        let (id, version, origin) = (extension.id.clone(), extension.version.clone(), extension.origin.clone());
+        self.loaded.push(Loaded { id, version, origin });
         for kind in kinds {
             if let Some(alias) = &kind.alias {
                 self.kind_aliases.insert(alias.clone(), kind.name.to_string());
@@ -158,6 +207,8 @@ impl Extensions {
             }
             self.roles.insert(role.name.to_string(), role);
         }
+        self.panels.extend(parts.panels);
+        self.tools.extend(parts.tools);
         Ok(())
     }
 
@@ -258,12 +309,91 @@ impl Extensions {
         role.iter().chain(kind).collect()
     }
 
+    /// The inspector views of an asset: its kind's, then its role's.
+    #[must_use]
+    pub fn inspector(&self, asset: &index::Asset) -> Vec<&ViewDef> {
+        let kind = self.kind_of(asset).map_or(&[][..], |k| k.inspector.as_slice());
+        let role = self.role_of(asset).map_or(&[][..], |r| r.inspector.as_slice());
+        kind.iter().chain(role).collect()
+    }
+
+    /// A part of an asset's picture (`palettes/<name>`); none where its kind draws no such part.
+    #[must_use]
+    pub fn part(&self, asset: &index::Asset, part: &str) -> Option<Result<Image>> {
+        self.kind_of(asset)?.picture.as_ref()?.part(&self.lend(asset), part)
+    }
+
+    /// What an agent is told of an asset besides its declaration, as its kind says.
+    #[must_use]
+    pub fn facts(&self, asset: &index::Asset) -> Table {
+        self.kind_of(asset).and_then(|k| k.facts.as_ref()).map_or_default(|facts| facts(&self.lend(asset)))
+    }
+
+    /// The panels the extensions registered.
+    #[must_use]
+    pub fn panels(&self) -> &[PanelDef] {
+        &self.panels
+    }
+
+    /// The panel registered under a name.
+    #[must_use]
+    pub fn panel(&self, name: &str) -> Option<&PanelDef> {
+        self.panels.iter().find(|p| p.name.as_str() == name)
+    }
+
+    /// The tools the extensions registered, for agents.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolDef] {
+        &self.tools
+    }
+
+    /// Every asset of a kind, by its qualified name or a built-in's bare one.
+    pub fn find<'a>(&'a self, index: &'a index::Index, kind: &str) -> impl Iterator<Item = &'a index::Asset> {
+        let wanted = self.kind_named(kind).map(|(k, _)| k.name.as_str());
+        index.assets.values().filter(move |a| {
+            wanted.is_some_and(|w| self.kind_of(a).is_some_and(|k| k.name.as_str() == w))
+                || wanted.is_none() && a.kind.as_deref() == Some(kind)
+        })
+    }
+
     /// The views of an asset: its kind's, then its role's.
     #[must_use]
     pub fn views(&self, asset: &index::Asset) -> Vec<&ViewDef> {
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.views.as_slice());
         let role = self.role_of(asset).map_or(&[][..], |r| r.views.as_slice());
         kind.iter().chain(role).collect()
+    }
+}
+
+/// The project as extensions ask about it: the index, through the registry, with what the user selected and the looks
+/// chosen (the editor's; none for a tool).
+pub struct Lens<'a> {
+    pub index: &'a index::Index,
+    pub extensions: &'a Extensions,
+    pub selection: Option<&'a str>,
+    pub looks: Option<&'a HashMap<String, usize>>,
+}
+
+impl Project for Lens<'_> {
+    fn asset(&self, path: &str) -> Option<Asset<'_>> {
+        self.index.assets.get(path).map(|a| self.extensions.lend(a))
+    }
+
+    fn resolve(&self, reference: &Value) -> Option<Asset<'_>> {
+        let (uid, path) = index::reference(reference)?;
+        self.index.resolve(&uid, path.as_deref().unwrap_or_default()).map(|a| self.extensions.lend(a))
+    }
+
+    fn find(&self, kind: &str) -> Vec<Asset<'_>> {
+        self.extensions.find(self.index, kind).map(|a| self.extensions.lend(a)).collect()
+    }
+
+    fn selection(&self) -> Option<Asset<'_>> {
+        self.asset(self.selection?)
+    }
+
+    fn look(&self, path: &str) -> usize {
+        self.looks.and_then(|l| l.get(path).copied()).unwrap_or(0)
     }
 }
 
@@ -278,6 +408,10 @@ impl Source for index::Asset {
 
     fn fields(&self) -> &toml::Table {
         index::Asset::fields(self)
+    }
+
+    fn declaration(&self) -> &str {
+        self.text()
     }
 
     fn has_file(&self, name: &str) -> bool {
@@ -326,7 +460,7 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 #[cfg(test)]
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
-    use super::{Extensions, satisfies};
+    use super::{Extensions, Loadable, satisfies};
     use pe2_ext::{Extension, Name, Registry, Result};
 
     fn images(r: &mut Registry) -> Result<()> {
@@ -349,8 +483,13 @@ mod tests {
         Ok(())
     }
 
-    fn extension(id: &'static str, version: &'static str, requires: &'static [&'static str], register: fn(&mut Registry) -> Result<()>) -> Extension {
-        Extension { id, version, requires, register }
+    fn extension(
+        id: &'static str,
+        version: &'static str,
+        requires: &'static [&'static str],
+        register: fn(&mut Registry) -> Result<()>,
+    ) -> Loadable {
+        Extension { id, version, requires, register }.into()
     }
 
     #[test]

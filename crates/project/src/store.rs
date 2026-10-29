@@ -77,6 +77,14 @@ impl Store {
     /// The database cannot be opened or its tables made.
     pub fn open(path: &Path) -> Result<Store> {
         let name = path.to_str().with_context(|| format!("{}: not a UTF-8 path", path.display()))?;
+        // The project lock keeps every other process out of the cache, so the database's own lock adds nothing; on
+        // Windows it is a byte-range lock, which a WSL folder's share refuses, so it is turned off there (turso has
+        // only this switch for it).
+        #[cfg(windows)]
+        // SAFETY: setting the environment is safe on Windows, with other threads running too.
+        unsafe {
+            std::env::set_var("LIMBO_DISABLE_FILE_LOCK", "1");
+        }
         let db = block_on(turso::Builder::new_local(name).build()).with_context(|| name.to_string())?;
         let conn = db.connect()?;
         let store = Store { _db: db, conn };

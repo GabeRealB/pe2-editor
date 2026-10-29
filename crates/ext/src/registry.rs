@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::{Asset, Image, Result, Value, View};
+use crate::{Asset, Image, Project, Result, Table, Value, View};
 
 /// An extension: its id, its version, the extensions it needs and its entry point. `extension!` makes it.
 pub struct Extension {
@@ -17,7 +17,7 @@ pub struct Extension {
 }
 
 /// Declares an extension: its id, its version, its entry point and, optionally, what it requires. Defines `ID`, the
-/// id, and `extension()`, which the host loads it by.
+/// id, and `extension()`, which a host linking it in loads it by; built as a component, it exports it.
 ///
 /// ```ignore
 /// pe2_ext::extension!("acme.fonts", "0.1.0", register, requires = ["pe2.images@^0.1"]);
@@ -33,6 +33,18 @@ macro_rules! extension {
         pub fn extension() -> $crate::Extension {
             $crate::Extension { id: $id, version: $version, requires: &[$($($requires),*)?], register: $register }
         }
+
+        /// This extension, for the SDK's component exports.
+        #[cfg(target_family = "wasm")]
+        #[unsafe(no_mangle)]
+        fn __pe2_extension() -> $crate::Extension {
+            extension()
+        }
+
+        #[cfg(target_family = "wasm")]
+        use $crate::guest::Component as __Pe2Component;
+        #[cfg(target_family = "wasm")]
+        $crate::guest::bindings::export_component!(__Pe2Component with_types_in $crate::guest::bindings);
     };
 }
 
@@ -81,6 +93,8 @@ impl fmt::Display for Name {
 /// An icon of the host's set, for a kind in the tree and the inspector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
+    Disc,
+    Stack,
     Image,
     Palette,
     Grid,
@@ -124,12 +138,22 @@ pub struct Field {
     pub choices: Vec<(Value, String)>,
     /// Not edited in place: it describes stored data, which an edit would not change.
     pub read_only: bool,
+    /// Drawn by its kind's inspector view, not by the host's property sheet.
+    pub custom: bool,
 }
 
 impl Field {
     #[must_use]
     pub fn new(key: &str) -> Field {
-        Field { key: key.to_string(), label: None, format: None, brief: None, choices: vec![], read_only: false }
+        Field {
+            key: key.to_string(),
+            label: None,
+            format: None,
+            brief: None,
+            choices: vec![],
+            read_only: false,
+            custom: false,
+        }
     }
 
     #[must_use]
@@ -168,6 +192,13 @@ impl Field {
         self.read_only = true;
         self
     }
+
+    /// Drawn by the kind's inspector view instead of the host's sheet.
+    #[must_use]
+    pub fn custom(mut self) -> Field {
+        self.custom = true;
+        self
+    }
 }
 
 /// What an asset looks like as an image, in each of its looks: what the host shows it by wherever it draws it (the
@@ -183,6 +214,12 @@ pub trait Picture: Send + Sync {
     /// # Errors
     /// Its files cannot be read or decoded.
     fn draw(&self, asset: &Asset, look: usize) -> Result<Image>;
+    /// A part of it as a picture, by the part's path (an image's `palettes/<name>`, as a strip of its colors); none
+    /// where it has no such part.
+    fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
+        let _ = (asset, part);
+        None
+    }
 }
 
 /// An asset's thumbnail, at most `side` pixels on its longer side; none where it has none. The host keeps it as an
@@ -191,6 +228,42 @@ pub type Thumbnail = dyn Fn(&Asset, usize) -> Option<Result<Image>> + Send + Syn
 
 /// Makes a view of an asset.
 pub type MakeView = dyn Fn(&Asset) -> Box<dyn View> + Send + Sync;
+
+/// Makes a panel's view.
+pub type MakePanel = dyn Fn() -> Box<dyn View> + Send + Sync;
+
+/// What an asset is, for an agent: facts its kind adds to its description (an image's palettes, its cells).
+pub type Facts = dyn Fn(&Asset) -> Table + Send + Sync;
+
+/// A tool's work: its arguments to its answer.
+pub type Run = dyn Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync;
+
+/// A pane of the extension's own, not of an asset: shown from the View menu.
+#[derive(Clone)]
+pub struct PanelDef {
+    pub name: Name,
+    pub label: String,
+    pub icon: Option<Icon>,
+    pub make: Arc<MakePanel>,
+}
+
+/// A tool agents call (the agents' server lists it), its arguments described by a JSON schema.
+#[derive(Clone)]
+pub struct ToolDef {
+    pub name: Name,
+    pub description: String,
+    pub schema: String,
+    pub run: Arc<Run>,
+}
+
+/// What an extension registered.
+#[derive(Clone, Default)]
+pub struct Parts {
+    pub kinds: Vec<KindDef>,
+    pub roles: Vec<RoleDef>,
+    pub panels: Vec<PanelDef>,
+    pub tools: Vec<ToolDef>,
+}
 
 #[derive(Clone)]
 pub struct ViewDef {
@@ -210,6 +283,9 @@ pub struct KindDef {
     pub picture: Option<Arc<dyn Picture>>,
     pub thumbnail: Option<Arc<Thumbnail>>,
     pub views: Vec<ViewDef>,
+    /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
+    pub inspector: Vec<ViewDef>,
+    pub facts: Option<Arc<Facts>>,
 }
 
 /// A role as registered, on a kind of its extension's or of one it requires.
@@ -223,21 +299,22 @@ pub struct RoleDef {
     pub fields: Vec<Field>,
     /// Views it adds to its kind's.
     pub views: Vec<ViewDef>,
+    /// Inspector views it adds to its kind's.
+    pub inspector: Vec<ViewDef>,
 }
 
 /// What an extension registers, as its entry point calls it. The host checks the outcome: a role's kind must be its
 /// extension's or a dependency's, an alias a built-in's, a name registered once.
 pub struct Registry {
     id: String,
-    kinds: Vec<KindDef>,
-    roles: Vec<RoleDef>,
+    parts: Parts,
 }
 
 impl Registry {
     /// A registry for the extension `id`, as the host makes it.
     #[must_use]
     pub fn new(id: &str) -> Registry {
-        Registry { id: id.to_string(), kinds: vec![], roles: vec![] }
+        Registry { id: id.to_string(), parts: Parts::default() }
     }
 
     /// The registering extension's id.
@@ -257,6 +334,8 @@ impl Registry {
             picture: None,
             thumbnail: None,
             views: vec![],
+            inspector: vec![],
+            facts: None,
         };
         KindBuilder { registry: self, def }
     }
@@ -270,14 +349,34 @@ impl Registry {
             label: name.to_string(),
             fields: vec![],
             views: vec![],
+            inspector: vec![],
         };
         RoleBuilder { registry: self, def }
     }
 
+    /// A panel, `<id>@<name>`, labeled in the View menu and its tab.
+    pub fn panel(&mut self, name: &str, label: &str, icon: Icon, make: impl Fn() -> Box<dyn View> + Send + Sync + 'static) {
+        let name = Name::of(&self.id, name);
+        self.parts.panels.push(PanelDef { name, label: label.to_string(), icon: Some(icon), make: Arc::new(make) });
+    }
+
+    /// A tool for agents, `<id>@<name>`: what it does, its arguments as a JSON schema, its work.
+    pub fn tool(
+        &mut self,
+        name: &str,
+        description: &str,
+        schema: &str,
+        run: impl Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync + 'static,
+    ) {
+        let name = Name::of(&self.id, name);
+        let (description, schema) = (description.to_string(), schema.to_string());
+        self.parts.tools.push(ToolDef { name, description, schema, run: Arc::new(run) });
+    }
+
     /// What was registered, for the host.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<KindDef>, Vec<RoleDef>) {
-        (self.kinds, self.roles)
+    pub fn into_parts(self) -> Parts {
+        self.parts
     }
 }
 
@@ -331,11 +430,25 @@ impl KindBuilder<'_> {
         self
     }
 
+    /// A view drawn in the inspector, after the property sheet: what the kind's custom fields hold.
+    #[must_use]
+    pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self
+    }
+
+    /// What an agent is told of an asset of the kind besides its declaration.
+    #[must_use]
+    pub fn facts(mut self, facts: impl Fn(&Asset) -> Table + Send + Sync + 'static) -> Self {
+        self.def.facts = Some(Arc::new(facts));
+        self
+    }
+
     /// Register it; its name, which roles name it by.
     #[expect(clippy::must_use_candidate, reason = "a kind without roles needs no name")]
     pub fn register(self) -> Name {
         let name = self.def.name.clone();
-        self.registry.kinds.push(self.def);
+        self.registry.parts.kinds.push(self.def);
         name
     }
 }
@@ -371,11 +484,18 @@ impl RoleBuilder<'_> {
         self
     }
 
+    /// A view drawn in the inspector, after its kind's.
+    #[must_use]
+    pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self
+    }
+
     /// Register it; its name.
     #[expect(clippy::must_use_candidate, reason = "a role's name is seldom needed")]
     pub fn register(self) -> Name {
         let name = self.def.name.clone();
-        self.registry.roles.push(self.def);
+        self.registry.parts.roles.push(self.def);
         name
     }
 }

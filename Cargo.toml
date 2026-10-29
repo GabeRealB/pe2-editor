@@ -11,6 +11,7 @@ members = [
     "crates/cli",
     "crates/editor",
     "extensions",
+    "extensions/game",
     "extensions/images",
 ]
 
@@ -32,8 +33,14 @@ formats = { path = "crates/formats" }
 codecs = { path = "crates/codecs" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }
+# The guest side of the extensions' contract (crates/ext/wit), for extensions built as components.
+wit-bindgen = "0.63"
+# The host of the extensions built as components: wasmtime with what WASI 0.3 components need, no more.
+wasmtime = { version = "50", default-features = false, features = ["anyhow", "runtime", "cranelift", "component-model", "component-model-async", "std", "parallel-compilation", "addr2line", "demangle"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
 # The built-in extensions (`extensions/`) and the list of them the editor ships.
 extensions = { path = "extensions" }
+pe2-game = { path = "extensions/game" }
 pe2-images = { path = "extensions/images" }
 mcp = { path = "crates/mcp" }
 # The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.

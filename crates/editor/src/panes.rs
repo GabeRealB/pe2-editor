@@ -14,9 +14,60 @@ use crate::settings::{EditorSettings, Preview, Theme, Tools, Upscale};
 use crate::workspace::{EditRequest, Entry, Node, Workspace};
 use crate::{icons, theme};
 
-/// What a pane shows.
+/// A panel's name (`pe2.images@vram`), interned: a pane stays small and `Copy`, and a saved layout names its panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PanelName(&'static str);
+
+impl PanelName {
+    pub fn new(name: &str) -> PanelName {
+        static NAMES: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let mut names = NAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(known) = names.get(name) {
+            return PanelName(known);
+        }
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        names.insert(leaked);
+        PanelName(leaked)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl Serialize for PanelName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PanelName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(PanelName::new(&String::deserialize(deserializer)?))
+    }
+}
+
+/// What a pane shows: one of the editor's own panes, or a panel an extension registers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(from = "StoredKind")]
 pub enum PaneKind {
+    Assets,
+    Preview,
+    Inspector,
+    References,
+    Problems,
+    Project,
+    Settings,
+    Layers,
+    Layer,
+    History,
+    Panel(PanelName),
+}
+
+/// A pane kind as layouts saved it: the editor's VRAM pane, before it was an extension's panel, read as that panel.
+#[derive(Deserialize)]
+enum StoredKind {
     Assets,
     Preview,
     Inspector,
@@ -28,13 +79,33 @@ pub enum PaneKind {
     Layers,
     Layer,
     History,
+    Panel(PanelName),
+}
+
+impl From<StoredKind> for PaneKind {
+    fn from(stored: StoredKind) -> PaneKind {
+        match stored {
+            StoredKind::Assets => PaneKind::Assets,
+            StoredKind::Preview => PaneKind::Preview,
+            StoredKind::Inspector => PaneKind::Inspector,
+            StoredKind::References => PaneKind::References,
+            StoredKind::Problems => PaneKind::Problems,
+            StoredKind::Project => PaneKind::Project,
+            StoredKind::Settings => PaneKind::Settings,
+            StoredKind::Vram => PaneKind::Panel(PanelName::new("pe2.images@vram")),
+            StoredKind::Layers => PaneKind::Layers,
+            StoredKind::Layer => PaneKind::Layer,
+            StoredKind::History => PaneKind::History,
+            StoredKind::Panel(name) => PaneKind::Panel(name),
+        }
+    }
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 11] = [
+    /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
+    pub const ALL: [PaneKind; 10] = [
         PaneKind::Assets,
         PaneKind::Preview,
-        PaneKind::Vram,
         PaneKind::Layer,
         PaneKind::Inspector,
         PaneKind::References,
@@ -54,16 +125,24 @@ impl PaneKind {
             PaneKind::Problems => icons::WARNING,
             PaneKind::Project => icons::HARD_DRIVES,
             PaneKind::Settings => icons::GEAR,
-            PaneKind::Vram => icons::SQUARES_FOUR,
             PaneKind::Layers => icons::STACK_SIMPLE,
             PaneKind::Layer => icons::GIT_DIFF,
             PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
+            PaneKind::Panel(name) => {
+                extensions::shared().panel(name.as_str()).and_then(|p| p.icon).map_or(icons::SQUARES_FOUR, icons::glyph)
+            }
         }
+    }
+
+    /// The editor's own panes, then the extensions' panels.
+    pub fn with_panels() -> Vec<PaneKind> {
+        let panels = extensions::shared().panels().iter().map(|p| PaneKind::Panel(PanelName::new(p.name.as_str()))).collect::<Vec<_>>();
+        PaneKind::ALL.into_iter().chain(panels).collect()
     }
 
     /// Whether it may be open several times, each instance with its own state; the others are singletons.
     pub fn several(self) -> bool {
-        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Vram)
+        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Panel(_))
     }
 
     /// Whether it shows one asset or entry: the selection, or the one an instance is pinned to.
@@ -74,10 +153,10 @@ impl PaneKind {
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Assets | PaneKind::Vram | PaneKind::Settings | PaneKind::Preview)
+        matches!(self, PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview)
     }
 
-    pub fn title(self) -> &'static str {
+    pub fn title(self) -> String {
         match self {
             PaneKind::Assets => "Assets",
             PaneKind::Preview => "Preview",
@@ -86,11 +165,14 @@ impl PaneKind {
             PaneKind::Problems => "Problems",
             PaneKind::Project => "Project",
             PaneKind::Settings => "Settings",
-            PaneKind::Vram => "VRAM",
             PaneKind::Layers => "Layers",
             PaneKind::Layer => "Layer",
             PaneKind::History => "History",
+            PaneKind::Panel(name) => {
+                return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
+            }
         }
+        .to_string()
     }
 }
 
@@ -132,14 +214,16 @@ pub enum PaneAction {
     Close,
 }
 
-/// The default layout: assets and project on the left, the preview, the VRAM and the active layer's changeset in the
-/// middle, the inspector over the layers, references and problems on the right.
+/// The default layout: assets and project on the left, the preview, the extensions' panels (VRAM) and the active
+/// layer's changeset in the middle, the inspector over the layers, references and problems on the right.
 pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let mut tiles = Tiles::default();
     let left = [PaneKind::Assets, PaneKind::Project].map(|k| tiles.insert_pane(Pane::first(k)));
     let left = tiles.insert_tab_tile(left.to_vec());
-    let center = [PaneKind::Preview, PaneKind::Vram, PaneKind::Layer].map(|k| tiles.insert_pane(Pane::first(k)));
-    let center = tiles.insert_tab_tile(center.to_vec());
+    let panels = PaneKind::with_panels().into_iter().filter(|k| matches!(k, PaneKind::Panel(_)));
+    let center = std::iter::once(PaneKind::Preview).chain(panels).chain([PaneKind::Layer]);
+    let center = center.map(|k| tiles.insert_pane(Pane::first(k))).collect();
+    let center = tiles.insert_tab_tile(center);
     let inspector = tiles.insert_pane(Pane::first(PaneKind::Inspector));
     let inspector = tiles.insert_tab_tile(vec![inspector]);
     let references = [PaneKind::Layers, PaneKind::History, PaneKind::References, PaneKind::Problems]
@@ -221,7 +305,9 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 match pane.kind {
                     PaneKind::Assets => assets_ui(ui, ws, pick, edit),
                     PaneKind::Preview => preview_ui(ui, ws, egui::Id::unique(pane), subject, nav, &mut settings.preview),
-                    PaneKind::Vram => vram_ui(ui, ws, nav, settings.preview.upscale),
+                    PaneKind::Panel(name) => {
+                        ws.show_panel(ui, egui::Id::unique(pane), name.as_str(), settings.preview, nav);
+                    }
                     PaneKind::Inspector => {
                         crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message, edit);
                     }
@@ -728,7 +814,7 @@ fn views_ui(
             },
             |ui| variant_picker(ui, ws, &path),
         );
-        ws.show_view(ui, pane, &path, *view, count);
+        ws.show_view(ui, pane, &path, *view, count, nav);
         ui.add_space(8.0);
     }
 }
@@ -775,37 +861,57 @@ fn variant_picker(ui: &mut egui::Ui, ws: &mut Workspace, path: &str) {
     }
 }
 
-/// Pictures laid out on a canvas, with named boxes over them and a legend: an atlas's cells, a multi-page image's
-/// pages - an extension's `Canvas`, uploaded.
+/// Pictures laid out on a canvas, with named boxes over them: an atlas's cells, a multi-page image's pages, VRAM's
+/// slots - an extension's `Canvas`, uploaded.
 pub struct Overlay {
     pub id: String,
     pub size: egui::Vec2,
-    pub pictures: Vec<(egui::TextureId, egui::Rect)>,
-    pub boxes: Vec<(String, egui::Rect)>,
+    /// Each picture, where it is drawn, what hovering it says, what clicking it opens.
+    pub pictures: Vec<(egui::TextureId, egui::Rect, Option<String>, Option<String>)>,
+    /// Each box, named, and whether it is drawn stronger.
+    pub boxes: Vec<(String, egui::Rect, bool)>,
     pub summary: String,
+    /// The toggle showing the boxes; without one they are always drawn.
     pub toggle: String,
+    /// Boxes each in a color of its own, named in a corner and in a legend; else plain.
+    pub legend: bool,
+    /// Lines every so many units across and down.
+    pub grid: Option<(f32, f32)>,
 }
 
-/// An overlay drawn: each picture in its chosen variant, a box over each named rectangle with its name where it fits,
-/// and the legend; hovering an entry of either highlights it in both.
-pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) {
+/// An overlay drawn: each picture, a box over each named rectangle, the legend; hovering an entry of either highlights
+/// it in both, hovering the canvas names what is under the pointer. Returns the link of a picture clicked.
+pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) -> Option<String> {
     let (path, boxes, layout_size) = (overlay.id.as_str(), &overlay.boxes, overlay.size);
-    let color = box_color;
+    let color = |i: usize, highlight: bool| {
+        if overlay.legend {
+            box_color(i)
+        } else if highlight {
+            theme::accent()
+        } else {
+            theme::weak().gamma_multiply(0.6)
+        }
+    };
     let shown_id = egui::Id::unique(("overlay boxes", path));
     let hover_id = egui::Id::unique(("overlay hovered", path));
     let mut show_boxes = ui.data(|d| d.get_temp::<bool>(shown_id)).unwrap_or(true);
     let hovered: Option<usize> = ui.data(|d| d.get_temp(hover_id)).flatten();
     let mut now_hovered = None;
-    if !boxes.is_empty() {
+    if overlay.toggle.is_empty() {
+        show_boxes = true;
+        if !overlay.summary.is_empty() {
+            ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
+        }
+    } else if !boxes.is_empty() {
         ui.horizontal(|ui| {
             ui.checkbox(&mut show_boxes, &overlay.toggle);
             ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
         });
     }
     ui.data_mut(|d| d.insert_temp(shown_id, show_boxes));
-    let legend = if show_boxes && !boxes.is_empty() { 0.7 } else { 1.0 };
+    let legend = overlay.legend && show_boxes && !boxes.is_empty();
     #[expect(clippy::cast_precision_loss, reason = "a handful of pictures")]
-    let height = (ui.available_height() * legend - 40.0).max(160.0) / count.max(1) as f32;
+    let height = (ui.available_height() * if legend { 0.7 } else { 1.0 } - 40.0).max(160.0) / count.max(1) as f32;
     let (canvas, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click_and_drag());
     let painter = ui.painter_at(canvas);
@@ -813,19 +919,30 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
     let to_screen =
         |r: egui::Rect| egui::Rect::from_min_max(origin + r.min.to_vec2() * scale, origin + r.max.to_vec2() * scale);
     painter.rect_filled(canvas, 0.0, ui.visuals().extreme_bg_color);
+    let whole = to_screen(egui::Rect::from_min_size(egui::Pos2::ZERO, layout_size));
+    if let Some(grid) = overlay.grid {
+        page_grid(&painter, whole, layout_size, scale, grid);
+    }
     let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-    for (texture, rect) in &overlay.pictures {
-        painter.image(*texture, to_screen(*rect), uv, Color32::WHITE);
+    for (texture, rect, _, _) in &overlay.pictures {
+        let mut screen = to_screen(*rect);
+        // A row of colors stays visible at small scales.
+        screen.max.y = screen.max.y.max(screen.min.y + 2.0);
+        painter.image(*texture, screen, uv, Color32::WHITE);
     }
     if view.grid {
-        grid_ui(&painter, to_screen(egui::Rect::from_min_size(egui::Pos2::ZERO, layout_size)), layout_size, scale);
+        grid_ui(&painter, whole, layout_size, scale);
     }
     if show_boxes {
         let font = egui::TextStyle::Small.resolve(ui.style());
-        for (i, (name, rect)) in boxes.iter().enumerate() {
-            let width = if hovered == Some(i) { 3.0 } else { 1.0 };
+        for (i, (name, rect, highlight)) in boxes.iter().enumerate() {
+            let strong = hovered == Some(i) || *highlight;
+            let width = if strong { if overlay.legend { 3.0 } else { 2.0 } } else { 1.0 };
             let screen = to_screen(*rect);
-            painter.rect_stroke(screen, 0.0, egui::Stroke::new(width, color(i)), egui::StrokeKind::Inside);
+            painter.rect_stroke(screen, 0.0, egui::Stroke::new(width, color(i, *highlight)), egui::StrokeKind::Inside);
+            if !overlay.legend {
+                continue;
+            }
             // The name, on a dark band in the box's corner, where the box is large enough to hold it.
             let galley = painter.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE);
             let band = egui::Rect::from_min_size(screen.min, galley.size() + egui::vec2(6.0, 2.0));
@@ -835,12 +952,21 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
             }
         }
     }
+    let mut clicked = None;
     if let Some(pointer) = response.hover_pos() {
         let at = ((pointer - origin) / scale).to_pos2();
         let under: Vec<usize> = (0..boxes.len()).filter(|&i| boxes[i].1.contains(at)).collect();
         now_hovered = under.first().copied();
+        let pictures: Vec<&(egui::TextureId, egui::Rect, Option<String>, Option<String>)> =
+            overlay.pictures.iter().filter(|(_, rect, _, _)| rect.contains(at)).collect();
         let mut lines = vec![format!("({:.0}, {:.0})", at.x.floor(), at.y.floor())];
-        lines.extend(under.iter().map(|&i| boxes[i].0.clone()));
+        lines.extend(pictures.iter().filter_map(|(_, _, label, _)| label.clone()));
+        if show_boxes {
+            lines.extend(under.iter().map(|&i| boxes[i].0.clone()));
+        }
+        if response.clicked() {
+            clicked = pictures.iter().find_map(|(_, _, _, link)| link.clone());
+        }
         response.clone().on_hover_text_at_pointer(lines.join("\n"));
     }
     ui.label(
@@ -853,28 +979,46 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
         .small()
         .color(theme::weak()),
     );
-    if show_boxes && let Some(i) = legend_ui(ui, path, boxes, hovered) {
+    if legend && let Some(i) = legend_ui(ui, path, boxes, hovered) {
         now_hovered = Some(i);
     }
     ui.data_mut(|d| d.insert_temp(hover_id, now_hovered));
+    clicked
+}
+
+/// Lines every so many units across and down a canvas drawn at `scale`: VRAM's texture pages.
+fn page_grid(painter: &egui::Painter, whole: egui::Rect, size: egui::Vec2, scale: f32, (across, down): (f32, f32)) {
+    let stroke = egui::Stroke::new(1.0, theme::border().gamma_multiply(0.5));
+    let mut x = across;
+    while x < size.x {
+        let at = whole.left() + x * scale;
+        painter.line_segment([egui::pos2(at, whole.top()), egui::pos2(at, whole.bottom())], stroke);
+        x += across;
+    }
+    let mut y = down;
+    while y < size.y {
+        let at = whole.top() + y * scale;
+        painter.line_segment([egui::pos2(whole.left(), at), egui::pos2(whole.right(), at)], stroke);
+        y += down;
+    }
 }
 
 /// An overlay's legend: each box's color and name in columns; hovering an entry highlights its box. Returns the entry
 /// hovered.
-fn legend_ui(ui: &mut egui::Ui, path: &str, boxes: &[(String, egui::Rect)], hovered: Option<usize>) -> Option<usize> {
+fn legend_ui(ui: &mut egui::Ui, path: &str, boxes: &[(String, egui::Rect, bool)], hovered: Option<usize>) -> Option<usize> {
     let color = box_color;
     let mut now_hovered = None;
     ui.add_space(6.0);
     let font = egui::TextStyle::Small.resolve(ui.style());
     let widest = boxes
         .iter()
-        .map(|(name, _)| ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x))
+        .map(|(name, _, _)| ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x))
         .fold(0.0, f32::max);
     let column = widest + 28.0;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a column count")]
     let columns = ((ui.available_width() / column).floor() as usize).max(1);
     egui::Grid::new(("atlas legend", path)).min_col_width(column).spacing([4.0, 2.0]).show(ui, |ui| {
-        for (i, (name, rect)) in boxes.iter().enumerate() {
+        for (i, (name, rect, _)) in boxes.iter().enumerate() {
             let entry = ui
                 .horizontal(|ui| {
                     let (swatch, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -989,83 +1133,6 @@ fn zoom_pan(
     (scale, origin)
 }
 
-// --- VRAM -------------------------------------------------------------------------------------------------------------
-
-const VRAM: egui::Vec2 = egui::vec2(1024.0, 512.0);
-
-/// VRAM, 1024 × 512 halfwords: the texture pages' grid, the slots, and what the selected asset uploads - its pages
-/// at their places (a 4-bit page a quarter of its texels wide, as VRAM holds it) and its palettes' colors. Hovering
-/// names what is there; clicking a texture opens it.
-fn vram_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, upscale: Upscale) {
-    let selected = ws.selected_asset().cloned();
-    let (pages, palettes) = selected.as_ref().map_or_default(|a| ws.uploads_of(a));
-    let slots = ws.vram_slots();
-    ui.horizontal(|ui| {
-        let what = match &selected {
-            Some(a) if !pages.is_empty() || !palettes.is_empty() => {
-                format!("{}: {} pages, {} palettes", a.path, pages.len(), palettes.len())
-            }
-            Some(a) if a.kind.as_deref() == Some("vram_slot") => a.path.clone(),
-            _ => "Select a texture, an atlas or a file to see what it uploads".into(),
-        };
-        ui.label(RichText::new(what).small().color(theme::weak()));
-    });
-    let scale = (ui.available_width() / VRAM.x).min((ui.available_height() - 4.0) / VRAM.y).max(0.2);
-    let (response, painter) = ui.allocate_painter(VRAM * scale, egui::Sense::click());
-    let origin = response.rect.min;
-    let to_screen =
-        |r: egui::Rect| egui::Rect::from_min_max(origin + r.min.to_vec2() * scale, origin + r.max.to_vec2() * scale);
-    painter.rect_filled(response.rect, 0.0, ui.visuals().extreme_bg_color);
-    let grid = egui::Stroke::new(1.0, theme::border().gamma_multiply(0.5));
-    for column in 1..16u8 {
-        let x = origin.x + f32::from(column) * 64.0 * scale;
-        painter.line_segment([egui::pos2(x, response.rect.top()), egui::pos2(x, response.rect.bottom())], grid);
-    }
-    let middle = origin.y + 256.0 * scale;
-    painter.line_segment([egui::pos2(response.rect.left(), middle), egui::pos2(response.rect.right(), middle)], grid);
-    let ctx = ui.ctx().clone();
-    for upload in &pages {
-        if let Some(Ok(shown)) = ws.picture(&ctx, &upload.image, upscale) {
-            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-            painter.image(shown.texture.id(), to_screen(upload.rect), uv, Color32::WHITE);
-        }
-    }
-    for p in &palettes {
-        if let Some(Ok(strip)) = ws.palette(&ctx, &p.image, p.palette) {
-            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-            let mut r = to_screen(p.rect);
-            r.max.y = r.max.y.max(r.min.y + 2.0); // a row of colors stays visible at small scales
-            painter.image(strip.texture.id(), r, uv, Color32::WHITE);
-        }
-    }
-    let selected_path = selected.as_ref().map(|a| a.path.as_str());
-    for (path, rect) in &slots {
-        let highlighted = Some(path.as_str()) == selected_path;
-        let stroke = if highlighted {
-            egui::Stroke::new(2.0, theme::accent())
-        } else {
-            egui::Stroke::new(1.0, theme::weak().gamma_multiply(0.6))
-        };
-        painter.rect_stroke(to_screen(*rect), 0.0, stroke, egui::StrokeKind::Inside);
-    }
-    let Some(hovered) = response.hover_pos() else { return };
-    let at = ((hovered - origin) / scale).to_pos2();
-    let mut lines = vec![format!("({:.0}, {:.0})", at.x.floor(), at.y.floor())];
-    let under: Vec<&String> = pages.iter().filter(|u| u.rect.contains(at)).map(|u| &u.image).collect();
-    lines.extend(under.iter().map(|t| format!("{}  {t}", icons::IMAGE)));
-    lines.extend(palettes.iter().filter(|p| p.rect.contains(at)).map(|p| {
-        let palette = ws.palettes_of(&p.image).get(p.palette).cloned().unwrap_or_default();
-        format!("{}  {} · {palette}", icons::PALETTE, p.image)
-    }));
-    lines.extend(slots.iter().filter(|(_, r)| r.contains(at)).map(|(p, _)| format!("{}  {p}", icons::SQUARES_FOUR)));
-    response.clone().on_hover_text_at_pointer(lines.join("\n"));
-    if response.clicked()
-        && let Some(texture) = under.first()
-    {
-        *nav = Some((*texture).clone());
-    }
-}
-
 // --- inspector --------------------------------------------------------------------------------------------------------
 
 // --- references -------------------------------------------------------------------------------------------------------
@@ -1131,6 +1198,11 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
     if let Some(e) = &ws.watch_error {
         theme::section(ui, "Watching", |ui| {
             ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
+        });
+    }
+    if let Some(why) = ws.unprotected() {
+        theme::section(ui, "Project lock", |ui| {
+            ui.label(RichText::new(why).color(ui.visuals().warn_fg_color));
         });
     }
     if let Some(e) = &ws.link_error {
@@ -1218,6 +1290,26 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
             }
         });
     }
+    theme::section(ui, "Extensions", |ui| {
+        for extension in &ws.extensions.loaded {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&extension.id).strong());
+                ui.label(RichText::new(&extension.version).color(theme::weak()));
+                match &extension.origin {
+                    project::ext::Origin::Builtin => {
+                        ui.label(RichText::new("built in").small().color(theme::weak()));
+                    }
+                    project::ext::Origin::Linked => {
+                        ui.label(RichText::new("linked in").small().color(ui.visuals().warn_fg_color))
+                            .on_hover_text("PE2_EXTENSIONS=linked: its crate runs in the editor, not its component");
+                    }
+                    project::ext::Origin::Component(path) => {
+                        theme::short(ui, RichText::new(path.display().to_string()).small().color(theme::weak()));
+                    }
+                }
+            });
+        }
+    });
     theme::section(ui, "Layers", |ui| {
         for layer in &p.layers {
             ui.horizontal(|ui| {

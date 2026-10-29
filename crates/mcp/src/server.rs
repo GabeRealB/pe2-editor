@@ -3,7 +3,6 @@
 
 use project::Project;
 use project::cache::Cache;
-use project::ext::Extensions;
 use project::index::Index;
 use project::lock::{Lock, LockError};
 use rmcp::model::{
@@ -33,6 +32,11 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
         return reply;
     }
     let lock = match Lock::acquire_within(root, "pe2-cli mcp", PATIENCE) {
+        Ok(lock) if lock.unprotected().is_some() => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!("warning: {}", lock.unprotected().unwrap_or_default()));
+            lock
+        }
         Ok(lock) => lock,
         Err(LockError::Held(owner)) => {
             return Reply::Error(format!("the project is in use by {owner}; ask again once it is done"));
@@ -46,7 +50,7 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     });
     match opened {
         Ok((project, index)) => {
-            let extensions = Extensions::load(extensions::builtin(), true);
+            let extensions = extensions::shared();
             answer(&mut View { project: &project, index: &index, extensions: &extensions, editor: None }, request)
         }
         Err(e) => Reply::Error(format!("the project cannot be opened: {e:#}")),
@@ -135,9 +139,11 @@ impl ServerHandler for Server {
 /// # Errors
 /// The runtime cannot start or the connection fails.
 pub fn serve_stdio(root: PathBuf) -> anyhow::Result<()> {
+    // Made before the runtime: listing the extensions' tools loads them, and a component's call blocks its thread.
+    let server = Server::new(root);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async move {
-        let service = Server::new(root).serve(rmcp::transport::stdio()).await?;
+        let service = server.serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;
         Ok(())
     })

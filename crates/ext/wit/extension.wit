@@ -1,0 +1,217 @@
+/// The contract between the editor and an extension built as a WebAssembly component: what the host lends an
+/// extension (`host`) and what an extension exports (`guest`). The SDK (`pe2-ext`) implements both sides' Rust API
+/// over it, so an extension's code is the same linked in or built as a component.
+///
+/// Callbacks cannot cross: what an extension registers is described by `register`'s result, each callback by a handle
+/// the host calls back with (a kind's index for its picture, thumbnail and facts, a field's for its readings, a view's
+/// or a panel's for its views, a tool's for its work). Values cross as TOML (`4`, `"indexed_4bpp"`, `{ a = 1 }`).
+package pe2:extension@0.1.0;
+
+interface types {
+    /// Pixels as unmultiplied RGBA, row by row.
+    record image {
+        width: u32,
+        height: u32,
+        rgba: list<u8>,
+    }
+
+    record rect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    }
+
+    enum icon { disc, stack, image, palette, grid, film, waveform, speaker, music, %package, terminal, text, binary, file, folder }
+
+    enum tint { structure, picture, motion, sound, code, plain }
+
+    enum style { normal, weak, note, strong, error }
+}
+
+interface host {
+    use types.{image, rect, style};
+
+    /// An asset, lent for a call: one the host passes, or one a query of the project returns.
+    resource asset {
+        path: func() -> string;
+        uid: func() -> option<string>;
+        /// Its kind and role, qualified (`pe2.images@image`), as the host resolved them.
+        kind: func() -> option<string>;
+        role: func() -> option<string>;
+        /// Its declaration, as written (TOML).
+        declaration: func() -> string;
+        has-file: func(name: string) -> bool;
+        read: func(name: string) -> result<list<u8>, string>;
+    }
+
+    /// The project, lent for a call: what an extension asks about other assets. The assets it returns are lent for
+    /// the same call.
+    resource project {
+        asset: func(path: string) -> option<asset>;
+        /// The asset a reference names (TOML: `"uid://..."`, or `{ uid, path }`).
+        resolve: func(reference: string) -> option<asset>;
+        find: func(kind: string) -> list<asset>;
+        selection: func() -> option<asset>;
+        look: func(path: string) -> u32;
+    }
+
+    /// An image a view shows, held by the host: made once, shown by handle every frame.
+    resource texture {
+        constructor(key: string, image: image);
+    }
+
+    record placed {
+        rect: rect,
+        label: option<string>,
+        link: option<string>,
+    }
+
+    record marked {
+        name: string,
+        rect: rect,
+        highlight: bool,
+    }
+
+    /// Images on a canvas the host zooms and pans, with named boxes over them.
+    record canvas {
+        width: f32,
+        height: f32,
+        pictures: list<tuple<borrow<texture>, placed>>,
+        boxes: list<marked>,
+        summary: string,
+        toggle: string,
+        legend: bool,
+        grid: option<tuple<f32, f32>>,
+    }
+
+    /// The host's UI, lent to a view for a frame; a row, a section or a collapsing body of it is drawn on until it is
+    /// dropped.
+    resource ui {
+        label: func(text: string, style: style);
+        button: func(text: string) -> bool;
+        /// A checkbox showing `value`; its value after this frame.
+        checkbox: func(text: string, value: bool) -> bool;
+        badge: func(text: string);
+        chip: func(text: string) -> bool;
+        image: func(texture: borrow<texture>, width: f32, height: f32);
+        /// The host's chip for a reference (TOML), opening its asset.
+        reference: func(reference: string);
+        /// A field, the host's way: its label and its reading (TOML value).
+        field: func(key: string, value: string);
+        tooltip: func(text: string);
+        horizontal: func() -> ui;
+        wrapped: func() -> ui;
+        indented: func() -> ui;
+        section: func(title: string) -> ui;
+        collapsing: func(id: string, title: string, note: string) -> option<ui>;
+        canvas: func(canvas: canvas);
+        navigate: func(path: string);
+    }
+
+    log: func(message: string);
+}
+
+interface guest {
+    use types.{image, rect, icon, tint};
+    use host.{asset, project, ui};
+
+    /// An extension: its id, its version, what it requires (`pe2.images@^0.1`).
+    record about {
+        id: string,
+        version: string,
+        requires: list<string>,
+    }
+
+    /// A field, its readings by handle.
+    record field {
+        handle: u32,
+        key: string,
+        label: option<string>,
+        format: bool,
+        brief: bool,
+        choices: list<tuple<string, string>>,
+        read-only: bool,
+        custom: bool,
+    }
+
+    /// A view or a panel's view, by handle.
+    record view {
+        handle: u32,
+        name: string,
+    }
+
+    /// A kind; its picture, thumbnail and facts called back by its index.
+    record kind {
+        name: string,
+        alias: option<string>,
+        label: string,
+        icon: option<tuple<icon, tint>>,
+        fields: list<field>,
+        picture: bool,
+        thumbnail: bool,
+        facts: bool,
+        views: list<view>,
+        inspector: list<view>,
+    }
+
+    record role {
+        name: string,
+        /// Qualified: a role may be on a dependency's kind.
+        kind: string,
+        alias: option<string>,
+        label: string,
+        fields: list<field>,
+        views: list<view>,
+        inspector: list<view>,
+    }
+
+    record panel {
+        handle: u32,
+        name: string,
+        label: string,
+        icon: option<icon>,
+    }
+
+    record tool {
+        handle: u32,
+        name: string,
+        description: string,
+        /// Its arguments, as a JSON schema.
+        schema: string,
+    }
+
+    record registration {
+        kinds: list<kind>,
+        roles: list<role>,
+        panels: list<panel>,
+        tools: list<tool>,
+    }
+
+    describe: func() -> about;
+    /// Run the extension's entry point.
+    register: func() -> result<registration, string>;
+
+    picture-has: func(kind: u32, asset: borrow<asset>) -> bool;
+    picture-looks: func(kind: u32, asset: borrow<asset>) -> list<string>;
+    picture-draw: async func(kind: u32, asset: borrow<asset>, look: u32) -> result<image, string>;
+    picture-part: func(kind: u32, asset: borrow<asset>, part: string) -> option<result<image, string>>;
+    thumbnail: async func(kind: u32, asset: borrow<asset>, side: u32) -> option<result<image, string>>;
+    /// A field's reading of a value (`brief`: within a list's row).
+    format: func(field: u32, brief: bool, value: string) -> option<string>;
+    /// What an agent is told of an asset of the kind (a TOML table).
+    facts: func(kind: u32, asset: borrow<asset>) -> string;
+    /// A tool's work: its arguments (TOML) to its answer (TOML).
+    run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
+
+    /// A view, kept between frames: of an asset, or a panel's (no asset).
+    resource view-state {
+        constructor(view: u32, asset: option<borrow<asset>>);
+        show: func(ui: borrow<ui>, project: borrow<project>, asset: option<borrow<asset>>, look: u32);
+    }
+}
+
+world extension {
+    import host;
+    export guest;
+}

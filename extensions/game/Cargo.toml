@@ -1,0 +1,16 @@
+[package]
+name = "pe2-game"
+description = "pe2.game, a built-in extension: the kinds of the game's data besides images - discs, stages, folders, files, streams, movies, scene audio, executables"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A library linked into the editor, and a component built for wasm32-wasip3.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true

@@ -68,8 +68,10 @@ const CODE: Color32 = Color32::from_rgb(0xe0, 0x84, 0x84);
 const PLAIN: Color32 = Color32::from_rgb(0x9a, 0xa3, 0xaf);
 
 /// An extension's icon, from the host's set.
-fn glyph(icon: Icon) -> &'static str {
+pub fn glyph(icon: Icon) -> &'static str {
     match icon {
+        Icon::Disc => DISC,
+        Icon::Stack => STACK,
         Icon::Image => IMAGE,
         Icon::Palette => PALETTE,
         Icon::Grid => SQUARES_FOUR,
@@ -97,26 +99,10 @@ fn tint(tint: Tint) -> Color32 {
     }
 }
 
-/// An asset kind's icon and its tint: as its extension registers it, else as the editor knows it.
+/// An asset kind's icon and its tint, as its extension registers it; a kind no extension registers, dashed.
 pub fn for_kind(extensions: &Extensions, kind: Option<&str>) -> (&'static str, Color32) {
-    if let Some((icon, family)) = kind.and_then(|k| extensions.icon(k)) {
-        return (glyph(icon), tint(family));
-    }
-    match kind {
-        Some("disc") => (DISC, STRUCTURE),
-        Some("stage") => (STACK, STRUCTURE),
-        Some("folder") => (FOLDERS, STRUCTURE),
-        Some("file_group") => (SQUARES_FOUR, STRUCTURE),
-        Some("file") => (FILE, STRUCTURE),
-        Some("vram_slot") => (SQUARES_FOUR, PICTURE),
-        Some("movie" | "stream") => (FILM_STRIP, MOTION),
-        Some("scene_audio") => (WAVEFORM, SOUND),
-        Some("sound_bank") => (SPEAKER_HIGH, SOUND),
-        Some("sequence") => (MUSIC_NOTES, SOUND),
-        Some("executable") => (TERMINAL_WINDOW, CODE),
-        Some("package") => (PACKAGE, CODE),
-        Some("text") => (FILE_TEXT, PLAIN),
-        Some("binary") => (BINARY, PLAIN),
-        _ => (FILE_DASHED, PLAIN),
+    match kind.and_then(|k| extensions.icon(k)) {
+        Some((icon, family)) => (glyph(icon), tint(family)),
+        None => (FILE_DASHED, PLAIN),
     }
 }

@@ -5,21 +5,28 @@
 //! registers procedurally, from one entry point (`extension!`): a kind and what it attaches to it - its fields as the
 //! inspector shows them, its picture, its thumbnail, its views - and roles on its own kinds or on its dependencies'.
 //!
-//! The extensions are linked into the editor for now, and the host (`project::ext`) calls what they register
-//! directly. This API is the one a WebAssembly component's bindings will implement: what crosses is what WIT can say -
-//! assets lent for a call, images, a `Ui` handle a view draws through, never the host's own types.
+//! An extension is built as a WebAssembly component (`wasm32-wasip3`): `extension!` then exports it through the
+//! contract in `wit/extension.wit` (`guest`), and the host (`project::ext`) loads it with wasmtime. Built for the host's
+//! own target, the same crate links into the editor instead and the host calls what it registers directly - the
+//! built-ins' fallback while developing. What crosses is what WIT can say: assets lent for a call, images, a `Ui`
+//! handle a view draws through, never the host's own types.
 
 mod asset;
+#[cfg(target_family = "wasm")]
+#[doc(hidden)]
+pub mod guest;
 mod image;
+mod project;
 mod registry;
 mod ui;
 
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use image::{Image, Rect, Texture};
+pub use project::Project;
 pub use registry::{
-    Extension, Field, Format, Icon, KindBuilder, KindDef, MakeView, Name, Picture, Registry, RoleBuilder, RoleDef, Thumbnail,
-    Tint, ViewDef,
+    Extension, Facts, Field, Format, Icon, KindBuilder, KindDef, MakePanel, MakeView, Name, PanelDef, Parts, Picture,
+    Registry, RoleBuilder, RoleDef, Run, Thumbnail, Tint, ToolDef, ViewDef,
 };
 pub use toml::{Table, Value};
-pub use ui::{Canvas, Style, Ui, UiHost, View};
+pub use ui::{Canvas, Marked, Placed, Style, Ui, UiHost, View};

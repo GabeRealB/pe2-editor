@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use pe2_ext::Image;
-use project::ext::Extensions;
+use project::ext::{Extensions, Lens};
 use project::index::{Asset, Index, Kind, Reference};
 use rmcp::model::{CallToolResult, ContentBlock, ReadResourceResult, ResourceContents, Tool, ToolAnnotations};
 use schemars::JsonSchema;
@@ -70,14 +70,6 @@ struct PreviewArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct PaletteArgs {
-    /// The image: its path or its uid.
-    asset: String,
-    /// The palette's name.
-    palette: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct NoArgs {}
 
 fn tool<T: JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
@@ -85,9 +77,23 @@ fn tool<T: JsonSchema + 'static>(name: &'static str, description: &'static str) 
     Tool::new(name, description, Map::new()).with_input_schema::<T>().annotate(annotations)
 }
 
-/// Every tool.
+/// An extension's tool as agents see it: by its name within its extension (`palette`), its arguments as it declares
+/// them.
+fn extension_tool(tool: &pe2_ext::ToolDef) -> Tool {
+    let schema: Map<String, Value> = serde_json::from_str(&tool.schema).unwrap_or_default();
+    let annotations = ToolAnnotations::new().read_only(true);
+    Tool::new(tool.name.local().to_string(), tool.description.clone(), schema).annotate(annotations)
+}
+
+/// Every tool: the server's own, then the extensions'.
 #[must_use]
 pub fn definitions() -> Vec<Tool> {
+    let mut tools = own();
+    tools.extend(extensions::shared().tools().iter().map(extension_tool));
+    tools
+}
+
+fn own() -> Vec<Tool> {
     vec![
         tool::<NoArgs>(
             "project",
@@ -108,7 +114,8 @@ pub fn definitions() -> Vec<Tool> {
         tool::<AssetArgs>(
             "get_asset",
             "An asset as resolved: path, uid, kind, role, the layers creating and overriding it, its files (size, \
-             sha1, layer), an image's palettes, looks and cell count, and its declaration (asset.toml) as written.",
+             sha1, layer), its looks where it has a picture, what its kind's extension tells of it (an image's \
+             palettes and cell count), and its declaration (asset.toml) as written.",
         ),
         tool::<AssetArgs>(
             "references",
@@ -125,7 +132,6 @@ pub fn definitions() -> Vec<Tool> {
             "An image's picture as PNG - a background, a texture through a palette, an atlas with each cell through \
              its own - in one of its looks.",
         ),
-        tool::<PaletteArgs>("palette", "A palette's colors: each as stored (ABGR1555) and as RGBA."),
         tool::<NoArgs>(
             "editor_selection",
             "The asset selected in the editor and the look it is shown in. Only when the editor has the project open.",
@@ -150,10 +156,9 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
         "preview" => {
             return parse(arguments).and_then(|a| preview(view.index, view.extensions, &a)).unwrap_or_else(failure);
         }
-        "palette" => parse(arguments).and_then(|a| palette(view.index, view.extensions, &a)),
         "editor_selection" => editor_selection(view),
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
-        _ => Err(format!("no tool is named {name}")),
+        _ => run_extension_tool(view, name, arguments),
     };
     match result {
         Ok(value) => {
@@ -293,13 +298,12 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     let fields = out.as_object_mut().expect("an object");
     fields.insert("layers".into(), json!(asset.layers));
     fields.insert("files".into(), json!(files));
-    let lent = extensions.lend(asset);
-    let has_picture = extensions.has_picture(asset);
-    if pe2_images::is_texture(&lent) || has_picture {
-        fields.insert("palettes".into(), json!(pe2_images::palette_names(&lent)));
+    if extensions.kind_of(asset).is_some_and(|k| k.picture.is_some()) {
         fields.insert("looks".into(), json!(extensions.looks(asset)));
-        fields.insert("cells".into(), json!(pe2_images::cells(&lent).len()));
-        fields.insert("has_picture".into(), json!(has_picture));
+        fields.insert("has_picture".into(), json!(extensions.has_picture(asset)));
+    }
+    for (key, value) in extensions.facts(asset) {
+        fields.insert(key, serde_json::to_value(value).unwrap_or_default());
     }
     if let Some(error) = &asset.error {
         fields.insert("error".into(), json!(error));
@@ -393,23 +397,16 @@ fn upscale(image: Image, scale: usize) -> Image {
     Image { width, height, rgba }
 }
 
-fn palette(index: &Index, extensions: &Extensions, args: &PaletteArgs) -> Result<Value, String> {
-    let asset = extensions.lend(asset(index, &args.asset)?);
-    let names = pe2_images::palette_names(&asset);
-    let chosen = names.iter().position(|n| *n == args.palette).ok_or_else(|| {
-        format!("{}: no palette is named {}; its palettes: {}", asset.path(), args.palette, names.join(", "))
-    })?;
-    let colors = pe2_images::palette_colors(&asset, chosen)
-        .ok_or_else(|| format!("{}: palette {} has no stored colors", asset.path(), args.palette))?
-        .map_err(|e| format!("{e:#}"))?;
-    let colors: Vec<Value> = colors
-        .iter()
-        .map(|&c| {
-            let [red, green, blue, alpha] = pe2_images::rgba(c);
-            json!({ "abgr1555": format!("{c:#06x}"), "rgba": format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}") })
-        })
-        .collect();
-    Ok(json!({ "path": asset.path(), "palette": args.palette, "colors": colors }))
+/// An extension's tool, by its name within its extension: its arguments as TOML, its answer back as JSON.
+fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -> Result<Value, String> {
+    let extensions = view.extensions;
+    let tool = extensions.tools().iter().find(|t| t.name.local() == name).ok_or_else(|| format!("no tool is named {name}"))?;
+    let arguments: toml::Value =
+        serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
+    let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());
+    let lens = Lens { index: view.index, extensions, selection, looks: None };
+    let answer = (tool.run)(&lens, &arguments).map_err(|e| format!("{e:#}"))?;
+    serde_json::to_value(answer).map_err(|e| e.to_string())
 }
 
 const NO_EDITOR: &str = "the editor does not have the project open";

@@ -3,12 +3,13 @@
 //! editor's do; the textures a view shows are uploaded once each, for the upscaling the preview uses.
 
 use eframe::egui::{self, RichText};
-use pe2_ext::{Canvas, Image, Style, Texture, UiHost};
-use project::ext::Extensions;
+use pe2_ext::{Canvas, Image, Project, Style, Texture, UiHost, Value};
+use project::ext::Lens;
 use project::index::Asset;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use crate::inspector::Sheet;
 use crate::panes::{Overlay, overlay_ui};
 use crate::settings::{Preview, Upscale};
 use crate::theme;
@@ -46,29 +47,108 @@ impl Textures {
     }
 }
 
-/// A view's frame: the pane's `Ui`, the asset shown, its look and the preview's settings.
+/// Where a view draws: the pane's `Ui`; a row, an indent or a collapsing body of it, which advances its parent's
+/// cursor past it when it ends; or a section, whose frame closes when it ends.
+enum Target<'a> {
+    Pane(&'a mut egui::Ui),
+    Child { parent: &'a mut egui::Ui, child: Box<egui::Ui> },
+    Section { parent: &'a mut egui::Ui, prepared: Option<Box<egui::containers::frame::Prepared>> },
+}
+
+impl Target<'_> {
+    fn ui(&mut self) -> &mut egui::Ui {
+        match self {
+            Target::Pane(ui) => ui,
+            Target::Child { child, .. } => child,
+            Target::Section { prepared, parent } => match prepared {
+                Some(prepared) => &mut prepared.content_ui,
+                None => parent,
+            },
+        }
+    }
+}
+
+impl Drop for Target<'_> {
+    fn drop(&mut self) {
+        match self {
+            Target::Pane(_) => {}
+            Target::Child { parent, child } => {
+                parent.advance_cursor_after_rect(child.min_rect());
+            }
+            Target::Section { parent, prepared } => {
+                if let Some(prepared) = prepared.take() {
+                    prepared.end(parent);
+                }
+            }
+        }
+    }
+}
+
+/// What a view's frame shows: the asset (none for a panel), its look, the preview's settings, and how many views
+/// share the pane's height.
+#[derive(Clone, Copy)]
+pub struct Frame<'a> {
+    pub asset: Option<&'a Asset>,
+    pub look: usize,
+    pub preview: Preview,
+    pub count: usize,
+}
+
+/// A view's handle on a frame: where it draws, what it shows, what it can ask of the project.
 pub struct Host<'a> {
-    ui: &'a mut egui::Ui,
-    asset: &'a Asset,
-    extensions: &'a Extensions,
+    target: Target<'a>,
+    lens: &'a Lens<'a>,
     textures: &'a mut Textures,
-    look: usize,
-    preview: Preview,
-    /// How many views share the pane's height.
-    count: usize,
+    nav: &'a mut Option<String>,
+    frame: Frame<'a>,
+    /// The last widget drawn, for a tooltip.
+    last: Option<egui::Response>,
+}
+
+/// How a child frame lays out.
+#[derive(Clone, Copy)]
+enum Child {
+    Row(egui::Layout),
+    Indent,
 }
 
 impl<'a> Host<'a> {
     pub fn new(
         ui: &'a mut egui::Ui,
-        asset: &'a Asset,
-        extensions: &'a Extensions,
+        lens: &'a Lens<'a>,
         textures: &'a mut Textures,
-        look: usize,
-        preview: Preview,
-        count: usize,
+        nav: &'a mut Option<String>,
+        frame: Frame<'a>,
     ) -> Host<'a> {
-        Host { ui, asset, extensions, textures, look, preview, count }
+        Host { target: Target::Pane(ui), lens, textures, nav, frame, last: None }
+    }
+
+    fn sheet(&self, fields: bool) -> Sheet<'a> {
+        let fields = match self.frame.asset {
+            Some(asset) if fields => self.lens.extensions.fields(asset).into_iter().cloned().collect(),
+            _ => vec![],
+        };
+        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields }
+    }
+
+    fn child(&mut self, kind: Child) -> Box<dyn UiHost + '_> {
+        let Host { target, lens, textures, nav, frame, .. } = self;
+        let parent = target.ui();
+        let mut rect = parent.available_rect_before_wrap();
+        let layout = match kind {
+            // A row starts one widget high, as egui's own rows do, and grows with what it holds.
+            Child::Row(layout) => {
+                rect.set_height(parent.spacing().interact_size.y);
+                layout
+            }
+            Child::Indent => {
+                rect.min.x += parent.spacing().indent;
+                egui::Layout::top_down(egui::Align::Min)
+            }
+        };
+        let child = parent.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+        let target = Target::Child { parent, child: Box::new(child) };
+        Box::new(Host { target, lens, textures, nav, frame: *frame, last: None })
     }
 }
 
@@ -78,48 +158,148 @@ impl UiHost for Host<'_> {
         let text = match style {
             Style::Normal => text,
             Style::Weak => text.color(theme::weak()),
+            Style::Note => text.small().color(theme::weak()),
             Style::Strong => text.strong(),
-            Style::Error => text.color(self.ui.visuals().error_fg_color),
+            Style::Error => text.color(self.target.ui().visuals().error_fg_color),
         };
-        self.ui.label(text);
+        self.last = Some(self.target.ui().label(text));
     }
 
     fn button(&mut self, text: &str) -> bool {
-        self.ui.button(text).clicked()
+        let response = self.target.ui().button(text);
+        let clicked = response.clicked();
+        self.last = Some(response);
+        clicked
     }
 
     fn checkbox(&mut self, text: &str, value: &mut bool) -> bool {
-        self.ui.checkbox(value, text).changed()
+        let response = self.target.ui().checkbox(value, text);
+        let changed = response.changed();
+        self.last = Some(response);
+        changed
     }
 
-    fn horizontal(&mut self, body: &mut dyn FnMut(&mut dyn UiHost)) {
-        let Host { ui, asset, extensions, textures, look, preview, count } = self;
-        ui.horizontal(|ui| {
-            let textures = &mut **textures;
-            body(&mut Host { ui, asset, extensions, textures, look: *look, preview: *preview, count: *count });
+    fn badge(&mut self, text: &str) {
+        crate::inspector::badge(self.target.ui(), text);
+        self.last = None;
+    }
+
+    fn chip(&mut self, text: &str) -> bool {
+        let response = crate::inspector::chip(self.target.ui(), crate::icons::SQUARES_FOUR, text, theme::weak());
+        let clicked = response.clicked();
+        self.last = Some(response);
+        clicked
+    }
+
+    fn image(&mut self, texture: &Texture, width: f32, height: f32) {
+        let ui = self.target.ui();
+        let id = self.textures.get(ui.ctx(), texture, Upscale::Nearest);
+        let shown = egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(id, egui::vec2(width, height))))
         });
+        self.last = Some(shown.inner);
+    }
+
+    fn reference(&mut self, reference: &Value) {
+        let sheet = self.sheet(false);
+        crate::inspector::reference_chip(self.target.ui(), &sheet, reference, self.nav);
+        self.last = None;
+    }
+
+    fn field(&mut self, key: &str, value: &Value) {
+        let sheet = self.sheet(true);
+        crate::inspector::field_ui(self.target.ui(), &sheet, key, value, self.nav);
+        self.last = None;
+    }
+
+    fn tooltip(&mut self, text: &str) {
+        if let Some(response) = self.last.take() {
+            response.on_hover_text(text);
+        }
+    }
+
+    fn horizontal(&mut self) -> Box<dyn UiHost + '_> {
+        self.child(Child::Row(egui::Layout::left_to_right(egui::Align::Center)))
+    }
+
+    fn wrapped(&mut self) -> Box<dyn UiHost + '_> {
+        self.child(Child::Row(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true)))
+    }
+
+    fn indented(&mut self) -> Box<dyn UiHost + '_> {
+        self.child(Child::Indent)
+    }
+
+    fn section(&mut self, title: &str) -> Box<dyn UiHost + '_> {
+        let Host { target, lens, textures, nav, frame, .. } = self;
+        let parent = target.ui();
+        parent.add_space(6.0);
+        parent.label(RichText::new(title.to_uppercase()).small().strong().color(theme::weak()));
+        parent.add_space(2.0);
+        let mut prepared = egui::Frame::new()
+            .fill(theme::background())
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(8))
+            .begin(parent);
+        let width = prepared.content_ui.available_width();
+        prepared.content_ui.set_width(width);
+        let target = Target::Section { parent, prepared: Some(Box::new(prepared)) };
+        Box::new(Host { target, lens, textures, nav, frame: *frame, last: None })
+    }
+
+    fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>> {
+        let parent = self.target.ui();
+        let id = parent.make_persistent_id(id);
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(parent.ctx(), id, false);
+        parent.horizontal(|ui| {
+            state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+            ui.label(RichText::new(title).strong());
+            if !note.is_empty() {
+                ui.label(RichText::new(note).small().color(theme::weak()));
+            }
+        });
+        state.store(parent.ctx());
+        state.is_open().then(|| self.child(Child::Indent))
     }
 
     fn canvas(&mut self, canvas: &Canvas) {
-        let ctx = self.ui.ctx().clone();
-        let upscale = self.preview.upscale;
-        let pictures = canvas.pictures.iter().map(|(t, r)| (self.textures.get(&ctx, t, upscale), to_rect(*r))).collect();
+        let ui = self.target.ui();
+        let ctx = ui.ctx().clone();
+        let upscale = self.frame.preview.upscale;
+        let pictures = canvas
+            .pictures
+            .iter()
+            .map(|p| (self.textures.get(&ctx, &p.texture, upscale), to_rect(p.rect), p.label.clone(), p.link.clone()))
+            .collect();
         let overlay = Overlay {
-            id: self.asset.path.clone(),
+            id: self.frame.asset.map_or_else(|| format!("{:?}", ui.scope_id()), |a| a.path.clone()),
             size: egui::vec2(canvas.width, canvas.height),
             pictures,
-            boxes: canvas.boxes.iter().map(|(name, r)| (name.clone(), to_rect(*r))).collect(),
+            boxes: canvas.boxes.iter().map(|b| (b.name.clone(), to_rect(b.rect), b.highlight)).collect(),
             summary: canvas.summary.clone(),
             toggle: canvas.toggle.clone(),
+            legend: canvas.legend,
+            grid: canvas.grid,
         };
-        overlay_ui(self.ui, &overlay, self.preview, self.count);
+        if let Some(link) = overlay_ui(ui, &overlay, self.frame.preview, self.frame.count) {
+            *self.nav = Some(link);
+        }
+        self.last = None;
     }
 
-    fn asset(&self) -> pe2_ext::Asset<'_> {
-        self.extensions.lend(self.asset)
+    fn navigate(&mut self, path: &str) {
+        *self.nav = Some(path.to_string());
+    }
+
+    fn asset(&self) -> Option<pe2_ext::Asset<'_>> {
+        self.frame.asset.map(|asset| self.lens.extensions.lend(asset))
     }
 
     fn look(&self) -> usize {
-        self.look
+        self.frame.look
+    }
+
+    fn project(&self) -> &dyn Project {
+        self.lens
     }
 }

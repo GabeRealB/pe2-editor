@@ -10,6 +10,8 @@ pub trait Source {
     fn uid(&self) -> Option<&str>;
     /// Its declaration's fields.
     fn fields(&self) -> &Table;
+    /// Its declaration, as written.
+    fn declaration(&self) -> &str;
     /// Whether its bundle has a file of this name.
     fn has_file(&self, name: &str) -> bool;
     /// A file of its bundle, whole.
@@ -92,5 +94,11 @@ impl<'a> Asset<'a> {
     /// It has no such file, or it cannot be read.
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
         self.source.read(name)
+    }
+
+    /// What the host lent, for a host passing the asset on (to a component).
+    #[must_use]
+    pub fn source(&self) -> &'a dyn Source {
+        self.source
     }
 }

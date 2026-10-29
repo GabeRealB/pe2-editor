@@ -6,6 +6,11 @@
 //! A process holding the lock passes it to the processes it starts: `PE2_PROJECT_LOCKED` names the project, and a
 //! process finding its project named there works under its parent's lock instead of waiting for it
 //! (`tools/project_lock.py` takes the same lock for the Python tools).
+//!
+//! Some file systems cannot lock a file at all - a WSL folder opened from Windows (`\\wsl.localhost\...`, whose 9P
+//! share has no byte-range locks). There the project opens unprotected rather than not at all: the lock says why
+//! (`unprotected`), for the editor and the tools to warn that nothing keeps a second process out. A Windows process
+//! and a WSL one would not see each other's locks across that share anyway.
 
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions, TryLockError};
@@ -22,6 +27,7 @@ const HELD: &str = "PE2_PROJECT_LOCKED";
 #[derive(Debug)]
 pub struct Lock {
     _file: Option<File>,
+    unprotected: Option<String>,
 }
 
 /// Whether a parent process holds the project in `root` for this one.
@@ -74,23 +80,58 @@ fn owner(root: &Path) -> String {
 fn claim(root: &Path, file: File, who: &str) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {})", std::process::id());
     std::fs::write(paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
-    Ok(Lock { _file: Some(file) })
+    Ok(Lock { _file: Some(file), unprotected: None })
+}
+
+/// Whether a lock failed because the file system cannot lock files: `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`
+/// on Windows (a WSL share), `ENOLCK` or an unsupported operation elsewhere.
+fn unsupported(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    let codes: &[i32] = &[1, 50];
+    #[cfg(target_os = "linux")]
+    let codes: &[i32] = &[37];
+    #[cfg(target_os = "macos")]
+    let codes: &[i32] = &[77];
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let codes: &[i32] = &[];
+    e.kind() == std::io::ErrorKind::Unsupported || e.raw_os_error().is_some_and(|c| codes.contains(&c))
+}
+
+/// The project, held without a lock where its file system cannot lock: who works on it is still recorded.
+fn unprotected(root: &Path, lock: &Path, who: &str, e: &std::io::Error) -> Result<Lock, LockError> {
+    let owner = format!("{who} (process {}, without a lock)", std::process::id());
+    std::fs::write(paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
+    let why = format!(
+        "{} cannot be locked on its file system ({e}): nothing keeps another editor or tool from working on the \
+         project at the same time",
+        lock.display()
+    );
+    Ok(Lock { _file: None, unprotected: Some(why) })
 }
 
 impl Lock {
+    /// Why the project is held without a lock, where its file system cannot lock files.
+    #[must_use]
+    pub fn unprotected(&self) -> Option<&str> {
+        self.unprotected.as_deref()
+    }
+
     /// Lock the project in `root` for `who`, or say who holds it.
     ///
     /// # Errors
     /// Another process holds the project, or the lock file cannot be made.
     pub fn try_acquire(root: &Path, who: &str) -> Result<Lock, LockError> {
         if inherited(root) {
-            return Ok(Lock { _file: None });
+            return Ok(Lock { _file: None, unprotected: None });
         }
         let file = open(root).map_err(LockError::Io)?;
         match file.try_lock() {
             Ok(()) => claim(root, file, who),
             Err(TryLockError::WouldBlock) => Err(LockError::Held(owner(root))),
-            Err(TryLockError::Error(e)) => Err(LockError::Io(e.into())),
+            Err(TryLockError::Error(e)) if unsupported(&e) => unprotected(root, &paths(root).0, who, &e),
+            Err(TryLockError::Error(e)) => {
+                Err(LockError::Io(anyhow::Error::new(e).context(paths(root).0.display().to_string())))
+            }
         }
     }
 
@@ -118,7 +159,7 @@ impl Lock {
             Err(LockError::Held(owner)) => {
                 waiting(&owner);
                 let file = open(root).map_err(LockError::Io)?;
-                file.lock().map_err(|e| LockError::Io(e.into()))?;
+                file.lock().map_err(|e| LockError::Io(anyhow::Error::new(e).context(paths(root).0.display().to_string())))?;
                 claim(root, file, who)
             }
             other => other,
@@ -145,6 +186,20 @@ mod tests {
         drop(held);
         let again = Lock::try_acquire(&root, "the second").unwrap();
         drop(again);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_system_without_locks_holds_unprotected() {
+        let root = std::env::temp_dir().join(format!("pe2-unlockable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        let e = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert!(super::unsupported(&e));
+        assert!(!super::unsupported(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        let held = super::unprotected(&root, &root.join(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
+        assert!(held.unprotected().is_some_and(|why| why.contains("nothing keeps another editor")));
+        drop(held);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

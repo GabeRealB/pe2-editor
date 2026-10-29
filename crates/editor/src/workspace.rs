@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use project::Project;
 use project::cache::Cache;
-use project::ext::Extensions;
+use project::ext::{Extensions, Lens};
 use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
@@ -149,7 +149,7 @@ pub struct Workspace {
     textures: crate::ext_ui::Textures,
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
-    _lock: Lock,
+    lock: Lock,
     cache_dir: PathBuf,
     /// The watcher on the layers, started with the first frame (it wakes the window).
     watch: Option<Watch>,
@@ -172,8 +172,12 @@ pub struct Workspace {
     pub reveal: Option<String>,
     /// Decoded pictures by (image, variant, upscaling).
     pictures: HashMap<(String, usize, Upscale), Picture>,
-    /// Palettes as strips of colors, by (image, palette).
-    strips: HashMap<(String, usize), Picture>,
+    /// Parts of pictures (palettes' strips), as the inspector shows them.
+    pub parts: Parts,
+    /// The kinds' inspector views, by (asset, view).
+    inspector_views: HashMap<(String, usize), Box<dyn pe2_ext::View>>,
+    /// The panels' views, by pane.
+    panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
     /// The variant an image is shown in (an index into `variants_of`); without one, its first.
     pub variant_choice: HashMap<String, usize>,
     /// A field being edited in the inspector.
@@ -224,32 +228,33 @@ pub enum Update {
     Reopen,
 }
 
-/// An image's pages in VRAM, in halfwords: where, and how large (a 4-bit texel is a quarter of a halfword).
-pub struct Upload {
-    pub image: String,
-    pub rect: egui::Rect,
+/// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its kind draws it.
+#[derive(Default)]
+pub struct Parts {
+    shown: HashMap<(String, String), Picture>,
 }
 
-/// A palette's colors in VRAM: a run of halfwords on one row.
-pub struct PaletteUpload {
-    pub image: String,
-    pub palette: usize,
-    pub rect: egui::Rect,
-}
+impl Parts {
+    /// An asset's part, uploaded; none where its kind draws no such part.
+    pub fn get(&mut self, ctx: &egui::Context, extensions: &Extensions, asset: &Asset, part: &str) -> Option<&Picture> {
+        let key = (asset.path.clone(), part.to_string());
+        if !self.shown.contains_key(&key) {
+            let drawn = extensions.part(asset, part)?;
+            let shown = drawn.map_err(|e| format!("{e:#}")).map(|image| {
+                #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
+                let size = egui::vec2(image.width as f32, image.height as f32);
+                let image = crate::ext_ui::color_image(&image);
+                let texture = ctx.load_texture(format!("{}#{part}", asset.path), image, egui::TextureOptions::NEAREST);
+                Shown { texture, size }
+            });
+            self.shown.insert(key.clone(), shown);
+        }
+        self.shown.get(&key)
+    }
 
-use pe2_images::{bpp, is_texture, palette_names, texels_per_halfword};
-
-fn vec2((x, y): (f32, f32)) -> egui::Vec2 {
-    egui::vec2(x, y)
-}
-
-fn pair(value: Option<&toml::Value>) -> Option<egui::Vec2> {
-    pe2_images::pair(value).map(vec2)
-}
-
-/// A `rect = [x, y, w, h]` as a rectangle.
-fn rect(value: &toml::Value) -> Option<egui::Rect> {
-    pe2_images::rect(value).map(crate::ext_ui::to_rect)
+    fn forget(&mut self, assets: &BTreeSet<String>) {
+        self.shown.retain(|(asset, _), _| !assets.contains(asset));
+    }
 }
 
 /// A field's array; empty where it has none.
@@ -285,7 +290,7 @@ impl Workspace {
         // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
-        let extensions = Arc::new(Extensions::load(extensions::builtin(), true));
+        let extensions = extensions::shared();
         let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
@@ -305,7 +310,7 @@ impl Workspace {
             layers: index.layers(),
             layer_view,
             index,
-            _lock: lock,
+            lock,
             cache_dir: cache.dir,
             watch: None,
             watch_error: None,
@@ -320,7 +325,9 @@ impl Workspace {
             filter: String::new(),
             reveal: None,
             pictures: HashMap::new(),
-            strips: HashMap::new(),
+            parts: Parts::default(),
+            inspector_views: HashMap::new(),
+            panels: HashMap::new(),
             variant_choice: HashMap::new(),
             field_edit: None,
             viewer: crate::viewer::Viewer::default(),
@@ -451,15 +458,18 @@ impl Workspace {
             return Update::Nothing;
         }
         self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
-        self.strips.retain(|(image, _), _| !refreshed.assets.contains(image));
+        self.parts.forget(&refreshed.assets);
+        self.inspector_views.retain(|(asset, _), _| !refreshed.assets.contains(asset));
+        self.panels.clear();
         self.views.retain(|(_, asset, _), _| !refreshed.assets.contains(asset));
         self.thumbs.forget(&refreshed.assets);
         self.drop_lost_selection();
         Update::Refreshed(refreshed.assets.len())
     }
 
-    pub fn selected_asset(&self) -> Option<&Asset> {
-        self.index.assets.get(self.selected.as_deref()?)
+    /// Why the project is open without a lock: its file system cannot lock files (a WSL folder opened from Windows).
+    pub fn unprotected(&self) -> Option<&str> {
+        self.lock.unprotected()
     }
 
     /// The entry at a tree path when it is not an asset (a plain file, a folder): its real path and the entry.
@@ -541,7 +551,9 @@ impl Workspace {
         if self.index.set_hidden(&self.layer_view.hidden(&self.layers)) {
             self.tree = Node::build(&self.index, &self.extensions);
             self.pictures.clear();
-            self.strips.clear();
+            self.parts = Parts::default();
+            self.inspector_views.clear();
+            self.panels.clear();
             self.views.clear();
             self.thumbs.clear();
             self.drop_lost_selection();
@@ -833,11 +845,6 @@ impl Workspace {
         self.index.resolve(&uid, path.as_deref().unwrap_or_default())
     }
 
-    /// An image's palettes by name.
-    pub fn palettes_of(&self, path: &str) -> Vec<String> {
-        self.index.assets.get(path).map_or_default(|a| palette_names(&self.extensions.lend(a)))
-    }
-
     /// An asset's looks by name.
     pub fn variants_of(&self, path: &str) -> Vec<String> {
         self.index.assets.get(path).map_or_default(|a| self.extensions.looks(a))
@@ -867,30 +874,6 @@ impl Workspace {
             );
         }
         self.pictures.get(&key)
-    }
-
-    /// A palette's colors, as a strip.
-    pub fn palette(&mut self, ctx: &egui::Context, path: &str, palette: usize) -> Option<&Picture> {
-        let key = (path.to_string(), palette);
-        if !self.strips.contains_key(&key) {
-            let colors = pe2_images::palette_colors(&self.extensions.lend(self.index.assets.get(path)?), palette)?;
-            let strip = colors.map_err(|e| format!("{e:#}")).map(|colors| {
-                let pixels: Vec<egui::Color32> = colors
-                    .into_iter()
-                    .map(|c| {
-                        let [red, green, blue, alpha] = pe2_images::rgba(c);
-                        egui::Color32::from_rgba_unmultiplied(red, green, blue, alpha)
-                    })
-                    .collect();
-                #[expect(clippy::cast_precision_loss, reason = "palette sizes")]
-                let size = egui::vec2(pixels.len() as f32, 1.0);
-                let image = egui::ColorImage::new([pixels.len().max(1), 1], pixels);
-                let options = egui::TextureOptions::NEAREST;
-                Shown { texture: ctx.load_texture(format!("{path}#{palette}#palette"), image, options), size }
-            });
-            self.strips.insert(key.clone(), strip);
-        }
-        self.strips.get(&key)
     }
 
     /// Whether the preview shows an asset by its kind's views: it has one, and a picture where its kind draws one.
@@ -930,7 +913,15 @@ impl Workspace {
 
     /// Show an asset's view in a pane - the one chosen, where its kind and role have several - made when first shown.
     /// `count` views share the pane's height.
-    pub fn show_view(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: &str, preview: Preview, count: usize) {
+    pub fn show_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: egui::Id,
+        path: &str,
+        preview: Preview,
+        count: usize,
+        nav: &mut Option<String>,
+    ) {
         let look = self.variant(path);
         let Some(asset) = self.index.assets.get(path) else { return };
         let views = self.extensions.views(asset);
@@ -948,89 +939,52 @@ impl Workspace {
         }
         let make = &views[chosen].make;
         let view = self.views.entry((pane, path.to_string(), chosen)).or_insert_with(|| make(&self.extensions.lend(asset)));
-        let mut host = crate::ext_ui::Host::new(ui, asset, &self.extensions, &mut self.textures, look, preview, count);
+        let lens = Lens {
+            index: &self.index,
+            extensions: &self.extensions,
+            selection: self.selected.as_deref(),
+            looks: Some(&self.variant_choice),
+        };
+        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count };
+        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
     }
 
-    /// The VRAM slots, by asset path, and their rectangles in halfwords.
-    pub fn vram_slots(&self) -> Vec<(String, egui::Rect)> {
-        self.index
-            .assets
-            .values()
-            .filter(|a| a.kind.as_deref() == Some("vram_slot"))
-            .filter_map(|a| Some((a.path.clone(), rect(a.fields().get("rect")?)?)))
-            .collect()
-    }
-
-    /// A placement's VRAM halfword: its slot's corner plus its `at`.
-    fn place(&self, placement: &toml::Value) -> Option<egui::Pos2> {
-        let slot = rect(self.target(placement.get("slot")?)?.fields().get("rect")?)?;
-        Some(slot.min + pair(placement.get("at"))?)
-    }
-
-    /// What an asset puts in VRAM: an image its pages and its placed palettes, a file what its image, palette and
-    /// bundle slots upload.
-    pub fn uploads_of(&self, asset: &Asset) -> (Vec<Upload>, Vec<PaletteUpload>) {
-        let (mut pages, mut palettes) = (vec![], vec![]);
-        let lent = self.extensions.lend(asset);
-        if is_texture(&lent) {
-            let bpp = bpp(&lent);
-            if let (Some(origin), Some(size)) =
-                (asset.fields().get("page").and_then(|p| self.place(p)), pair(asset.fields().get("size")))
-            {
-                #[expect(clippy::cast_precision_loss, reason = "texels per halfword")]
-                let per = texels_per_halfword(bpp) as f32;
-                let rect = egui::Rect::from_min_size(origin, egui::vec2(size.x / per, size.y));
-                pages.push(Upload { image: asset.path.clone(), rect });
-            }
-            for i in 0..palette_names(&lent).len() {
-                self.palette_upload(asset, i, &mut palettes);
-            }
-            return (pages, palettes);
+    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet - made when first
+    /// shown.
+    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
+        let look = self.variant(path);
+        let Some(asset) = self.index.assets.get(path) else { return };
+        let lens = Lens {
+            index: &self.index,
+            extensions: &self.extensions,
+            selection: self.selected.as_deref(),
+            looks: Some(&self.variant_choice),
+        };
+        for (i, def) in self.extensions.inspector(asset).into_iter().enumerate() {
+            let view = self.inspector_views.entry((path.to_string(), i)).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
+            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1 };
+            let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
+            view.show(&mut pe2_ext::Ui::new(&mut host));
         }
-        for slot in array(asset, "slots") {
-            let list = |key: &str| slot.get(key).and_then(toml::Value::as_array).cloned().unwrap_or_default();
-            for page in list("pages") {
-                if let Some(image) = page.get("image").and_then(|t| self.target(t)) {
-                    pages.extend(self.uploads_of(image).0);
-                }
-            }
-            let resources = list("resources");
-            let entries = list("palettes").into_iter().chain(
-                resources
-                    .iter()
-                    .flat_map(|r| r.get("palettes").and_then(toml::Value::as_array).cloned().unwrap_or_default()),
-            );
-            for entry in entries {
-                if let Some((image, i)) = self.entry_palette(&entry)
-                    && let Some(asset) = self.index.assets.get(&image)
-                {
-                    self.palette_upload(asset, i, &mut palettes);
-                }
-            }
-        }
-        (pages, palettes)
     }
 
-    /// The image and palette a file's palette entry (`{ image, palette }`) names.
-    pub fn entry_palette(&self, entry: &toml::Value) -> Option<(String, usize)> {
-        let image = self.target(entry.get("image")?)?;
-        let name = entry.get("palette")?.as_str()?;
-        Some((image.path.clone(), palette_names(&self.extensions.lend(image)).iter().position(|n| n == name)?))
-    }
-
-    fn palette_upload(&self, asset: &Asset, palette: usize, out: &mut Vec<PaletteUpload>) {
-        let declared = array(asset, "palettes").get(palette);
-        let Some(at) = declared.and_then(|p| self.place(p)) else { return };
-        let lent = self.extensions.lend(asset);
-        let bpp = bpp(&lent);
-        let cells = pe2_images::cells(&lent);
-        let deepest = cells.iter().filter(|c| c.palette == Some(palette)).map(|c| c.bpp).max().unwrap_or(bpp);
-        let n = if deepest == 4 { 16.0 } else { 256.0 };
-        out.push(PaletteUpload {
-            image: asset.path.clone(),
-            palette,
-            rect: egui::Rect::from_min_size(at, egui::vec2(n, 1.0)),
-        });
+    /// Show a panel in a pane, its view made when the pane first shows it.
+    pub fn show_panel(&mut self, ui: &mut egui::Ui, pane: egui::Id, name: &str, preview: Preview, nav: &mut Option<String>) {
+        let Some(panel) = self.extensions.panel(name) else {
+            ui.label(egui::RichText::new(format!("No extension provides {name}")).color(crate::theme::weak()));
+            return;
+        };
+        let view = self.panels.entry(pane).or_insert_with(|| (panel.make)());
+        let lens = Lens {
+            index: &self.index,
+            extensions: &self.extensions,
+            selection: self.selected.as_deref(),
+            looks: Some(&self.variant_choice),
+        };
+        // A panel's canvas is not a picture's: no texel grid over it.
+        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview: Preview { grid: false, ..preview }, count: 1 };
+        let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, frame);
+        view.show(&mut pe2_ext::Ui::new(&mut host));
     }
 }

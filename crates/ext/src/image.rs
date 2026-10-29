@@ -1,5 +1,6 @@
 //! Pictures as extensions make them and the host shows them.
 
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
 /// Pixels as unmultiplied RGBA, row by row.
@@ -59,17 +60,30 @@ pub struct Rect {
 }
 
 /// An image a view shows, by a key the host keeps its upload under: the same key with the same image is uploaded
-/// once, a new image under it replaces the old.
+/// once, a new image under it replaces the old. In a component the host holds the image, made once and shown by
+/// handle.
 #[derive(Clone)]
 pub struct Texture {
     key: String,
+    width: usize,
+    height: usize,
+    #[cfg(not(target_family = "wasm"))]
     image: Arc<Image>,
+    #[cfg(target_family = "wasm")]
+    handle: std::rc::Rc<crate::guest::bindings::pe2::extension::host::Texture>,
 }
 
 impl Texture {
     #[must_use]
     pub fn new(key: impl Into<String>, image: Image) -> Texture {
-        Texture { key: key.into(), image: Arc::new(image) }
+        let (key, width, height) = (key.into(), image.width, image.height);
+        #[cfg(not(target_family = "wasm"))]
+        return Texture { key, width, height, image: Arc::new(image) };
+        #[cfg(target_family = "wasm")]
+        {
+            let handle = crate::guest::texture(&key, image);
+            Texture { key, width, height, handle: std::rc::Rc::new(handle) }
+        }
     }
 
     #[must_use]
@@ -78,7 +92,30 @@ impl Texture {
     }
 
     #[must_use]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// An image the host holds already, under a key: a component's texture.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn shared(key: impl Into<String>, image: Arc<Image>) -> Texture {
+        Texture { key: key.into(), width: image.width, height: image.height, image }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
     pub fn image(&self) -> &Arc<Image> {
         &self.image
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn handle(&self) -> &crate::guest::bindings::pe2::extension::host::Texture {
+        &self.handle
     }
 }

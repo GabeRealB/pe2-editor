@@ -1,0 +1,4 @@
+# Extensions built as components (extensions/build.sh) use wasm's SIMD: deterministic, unlike relaxed SIMD, and
+# about a third faster at decoding the image kinds.
+[target.wasm32-wasip3]
+rustflags = ["-C", "target-feature=+simd128"]

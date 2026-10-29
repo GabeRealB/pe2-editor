@@ -42,7 +42,7 @@ impl Window {
 
     /// Its title: the panes it shows.
     pub fn title(&self) -> String {
-        let names: Vec<&str> = panes_of(&self.tree)
+        let names: Vec<String> = panes_of(&self.tree)
             .into_iter()
             .filter(|(id, _)| self.tree.tiles.is_visible(*id))
             .map(|(_, pane)| pane.kind.title())

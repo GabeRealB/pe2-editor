@@ -149,7 +149,7 @@ impl Editor {
             ws.navigate(asset);
         }
         if let Some(kind) =
-            start.show.and_then(|name| PaneKind::ALL.into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
+            start.show.and_then(|name| PaneKind::with_panels().into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
         {
             editor.show_pane(Pane::first(kind));
         }
@@ -577,7 +577,7 @@ impl Editor {
                 }
             });
             ui.menu_button("View", |ui| {
-                for kind in PaneKind::ALL {
+                for kind in PaneKind::with_panels() {
                     let pane = Pane::first(kind);
                     let mut visible = self.pane_visible(pane);
                     if ui.checkbox(&mut visible, kind.title()).clicked() {
@@ -679,6 +679,10 @@ impl Editor {
                 }
                 if let Some(e) = &ws.watch_error {
                     ui.label(RichText::new("not watching").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
+                    ui.separator();
+                }
+                if let Some(why) = ws.unprotected() {
+                    ui.label(RichText::new("not locked").small().color(ui.visuals().warn_fg_color)).on_hover_text(why);
                     ui.separator();
                 }
                 if let Some(e) = &ws.link_error {

@@ -1,47 +1,97 @@
 //! Views: an extension's own UI, in immediate mode as the editor's is. A view is one instance a pane, keeping its
 //! state between frames; every frame the host calls `show` with a `Ui` it lends for the call, and each call on it
-//! draws a widget and returns what the user did with it this frame.
+//! draws a widget and returns what the user did with it this frame. A view shows an asset (a kind's view, in the
+//! preview or the inspector), or none (a panel).
 
-use crate::{Asset, Rect, Texture};
+use crate::{Asset, Project, Rect, Texture, Value};
 
 /// How a label is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
     Normal,
-    /// Secondary: a note, a count.
+    /// Secondary: a value's unit, a name beside a swatch.
     Weak,
+    /// Small and secondary: a count, a note.
+    Note,
     Strong,
     Error,
 }
 
-/// Images laid out on a canvas the host zooms and pans, with named boxes over them and a legend: an atlas's cells, an
-/// image's pages. Sizes and rectangles are in the canvas's own units (an image's pixels).
+/// A picture on a canvas: where it is drawn, what hovering it says, what clicking it opens.
+#[derive(Clone)]
+pub struct Placed {
+    pub texture: Texture,
+    pub rect: Rect,
+    pub label: Option<String>,
+    /// An asset's path.
+    pub link: Option<String>,
+}
+
+/// A named rectangle over a canvas.
+#[derive(Clone)]
+pub struct Marked {
+    pub name: String,
+    pub rect: Rect,
+    /// Drawn stronger: the selected one.
+    pub highlight: bool,
+}
+
+/// Images laid out on a canvas the host zooms and pans, with named boxes over them: an atlas's cells, an image's
+/// pages, VRAM's slots. Sizes and rectangles are in the canvas's own units (an image's pixels, VRAM's halfwords).
+#[derive(Clone, Default)]
 pub struct Canvas {
     pub width: f32,
     pub height: f32,
-    pub pictures: Vec<(Texture, Rect)>,
-    pub boxes: Vec<(String, Rect)>,
-    /// What the boxes are, beside their toggle: "12 cells".
+    pub pictures: Vec<Placed>,
+    pub boxes: Vec<Marked>,
+    /// What the boxes are, beside their toggle: "12 cells". Without a toggle the boxes are always drawn.
     pub summary: String,
     /// The toggle showing the boxes: "Cells".
     pub toggle: String,
+    /// Boxes each in a color of its own, named in a corner and in a legend; else plain.
+    pub legend: bool,
+    /// Lines every so many units across and down: VRAM's texture pages.
+    pub grid: Option<(f32, f32)>,
 }
 
-/// What the host gives a view to draw with: its widgets. The host implements it over its own UI; a component reaches
-/// the same through the host's `ui` resource.
+/// What the host gives a view to draw with: its widgets, and what it knows. The host implements it over its own UI; a
+/// component reaches the same through the host's `ui` and `project` resources.
 pub trait UiHost {
     fn label(&mut self, text: &str, style: Style);
     /// A button; whether it was clicked.
     fn button(&mut self, text: &str) -> bool;
     /// A checkbox over `value`; whether it was toggled.
     fn checkbox(&mut self, text: &str, value: &mut bool) -> bool;
-    /// What `body` draws, in a row.
-    fn horizontal(&mut self, body: &mut dyn FnMut(&mut dyn UiHost));
+    /// A word in a pill: a type, a flag.
+    fn badge(&mut self, text: &str);
+    /// A small framed name: a cell, an item; whether it was clicked.
+    fn chip(&mut self, text: &str) -> bool;
+    /// An image at a size, framed: a palette's swatch.
+    fn image(&mut self, texture: &Texture, width: f32, height: f32);
+    /// The host's chip for a reference: its asset's icon and name, opening it on a click.
+    fn reference(&mut self, reference: &Value);
+    /// A field within a row, the host's way: its label and its reading (a reference as a chip, a flag as a badge).
+    fn field(&mut self, key: &str, value: &Value);
+    /// What hovering the last widget says.
+    fn tooltip(&mut self, text: &str);
+    /// A row: what is drawn on it is laid out left to right, until it is dropped.
+    fn horizontal(&mut self) -> Box<dyn UiHost + '_>;
+    /// A row that wraps where the pane is narrow.
+    fn wrapped(&mut self) -> Box<dyn UiHost + '_>;
+    /// What is drawn on it indented.
+    fn indented(&mut self) -> Box<dyn UiHost + '_>;
+    /// One of the inspector's sections, titled.
+    fn section(&mut self, title: &str) -> Box<dyn UiHost + '_>;
+    /// A collapsing header, `id` keeping it open or not; its body while open.
+    fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>>;
     fn canvas(&mut self, canvas: &Canvas);
-    /// The asset the view shows, lent for the frame.
-    fn asset(&self) -> Asset<'_>;
+    /// Select the asset at a path, as clicking it in the tree would.
+    fn navigate(&mut self, path: &str);
+    /// The asset the view shows, lent for the frame; none for a panel.
+    fn asset(&self) -> Option<Asset<'_>>;
     /// The look the asset is shown in (an index into its picture's looks), as the host's look picker chose it.
     fn look(&self) -> usize;
+    fn project(&self) -> &dyn Project;
 }
 
 /// A view's handle on the frame being drawn.
@@ -75,18 +125,72 @@ impl<'a> Ui<'a> {
         self.host.checkbox(text, value)
     }
 
+    pub fn badge(&mut self, text: &str) {
+        self.host.badge(text);
+    }
+
+    pub fn chip(&mut self, text: &str) -> bool {
+        self.host.chip(text)
+    }
+
+    pub fn image(&mut self, texture: &Texture, width: f32, height: f32) {
+        self.host.image(texture, width, height);
+    }
+
+    pub fn reference(&mut self, reference: &Value) {
+        self.host.reference(reference);
+    }
+
+    pub fn field(&mut self, key: &str, value: &Value) {
+        self.host.field(key, value);
+    }
+
+    pub fn tooltip(&mut self, text: &str) {
+        self.host.tooltip(text);
+    }
+
     /// What `body` draws, in a row.
-    pub fn horizontal(&mut self, mut body: impl FnMut(&mut Ui)) {
-        self.host.horizontal(&mut |host| body(&mut Ui { host }));
+    pub fn horizontal(&mut self, body: impl FnOnce(&mut Ui)) {
+        let mut row = self.host.horizontal();
+        body(&mut Ui { host: &mut *row });
+    }
+
+    /// What `body` draws, in a row wrapping where the pane is narrow.
+    pub fn wrapped(&mut self, body: impl FnOnce(&mut Ui)) {
+        let mut row = self.host.wrapped();
+        body(&mut Ui { host: &mut *row });
+    }
+
+    /// What `body` draws, indented.
+    pub fn indented(&mut self, body: impl FnOnce(&mut Ui)) {
+        let mut inner = self.host.indented();
+        body(&mut Ui { host: &mut *inner });
+    }
+
+    /// What `body` draws, as one of the inspector's sections.
+    pub fn section(&mut self, title: &str, body: impl FnOnce(&mut Ui)) {
+        let mut section = self.host.section(title);
+        body(&mut Ui { host: &mut *section });
+    }
+
+    /// A collapsing header; `body` draws what it holds while it is open.
+    pub fn collapsing(&mut self, id: &str, title: &str, note: &str, body: impl FnOnce(&mut Ui)) {
+        if let Some(mut inner) = self.host.collapsing(id, title, note) {
+            body(&mut Ui { host: &mut *inner });
+        }
     }
 
     pub fn canvas(&mut self, canvas: &Canvas) {
         self.host.canvas(canvas);
     }
 
-    /// The asset shown.
+    pub fn navigate(&mut self, path: &str) {
+        self.host.navigate(path);
+    }
+
+    /// The asset shown; none for a panel.
     #[must_use]
-    pub fn asset(&self) -> Asset<'_> {
+    pub fn asset(&self) -> Option<Asset<'_>> {
         self.host.asset()
     }
 
@@ -95,10 +199,21 @@ impl<'a> Ui<'a> {
     pub fn look(&self) -> usize {
         self.host.look()
     }
+
+    /// The project, to ask about other assets.
+    #[must_use]
+    pub fn project(&self) -> &dyn Project {
+        self.host.project()
+    }
+
+    /// The host's widgets, for a host passing the frame on (to a component).
+    pub fn host(&mut self) -> &mut dyn UiHost {
+        self.host
+    }
 }
 
-/// A view of an asset: made when a pane first shows the asset, kept while it does, made again when the asset
-/// changes.
+/// A view: of an asset, made when a pane first shows it, kept while it does, made again when it changes; or a panel's,
+/// kept while the panel is open.
 pub trait View {
     fn show(&mut self, ui: &mut Ui);
 }

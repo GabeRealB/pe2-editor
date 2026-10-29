@@ -5,7 +5,8 @@
 //! palette's colors; the bundle's files and the originals' sha1s close it.
 
 use eframe::egui::{self, Color32, RichText};
-use project::index::Asset;
+use project::ext::Extensions;
+use project::index::{Asset, Index};
 
 use crate::external::{self, Category};
 use crate::settings::{Tools, Upscale};
@@ -17,15 +18,15 @@ const HEADER_FIELDS: [&str; 4] = ["uid", "kind", "role", "original"];
 const ROW_HEIGHT: f32 = 22.0;
 const THUMBNAIL: f32 = 64.0;
 
-/// Where in the declaration a value is - the asset's own fields, or an atlas part's (whose variants are that part's) -
-/// and the fields its kind and role describe, as their extensions register them.
-#[derive(Clone)]
-struct Context {
-    piece: Option<String>,
-    fields: Vec<pe2_ext::Field>,
+/// What a value is read with: the index its references resolve in, the registry their kinds' icons come from, and the
+/// fields the asset's kind and role describe, as their extensions register them.
+pub struct Sheet<'a> {
+    pub index: &'a Index,
+    pub extensions: &'a Extensions,
+    pub fields: Vec<pe2_ext::Field>,
 }
 
-impl Context {
+impl Sheet<'_> {
     fn field(&self, key: &str) -> Option<&pe2_ext::Field> {
         self.fields.iter().find(|f| f.key == key)
     }
@@ -33,6 +34,11 @@ impl Context {
     /// A field's label: its extension's, or the name a reader would use.
     fn label(&self, key: &str) -> String {
         self.field(key).and_then(|f| f.label.clone()).unwrap_or_else(|| label_of(key))
+    }
+
+    /// Drawn by its kind's inspector view, not here.
+    fn custom(&self, key: &str) -> bool {
+        self.field(key).is_some_and(|f| f.custom)
     }
 }
 
@@ -54,21 +60,33 @@ pub fn inspector_ui(
         return;
     };
     header_ui(ui, ws, &asset);
-    let fields = ws.extensions.fields(&asset).into_iter().cloned().collect();
-    let piece = pe2_images::is_texture(&ws.extensions.lend(&asset)).then(|| asset.path.clone());
-    let context = Context { piece, fields };
-    let fields: Vec<(&String, &toml::Value)> =
-        asset.fields().iter().filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str())).collect();
-    let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
-    if !properties.is_empty() {
-        theme::section(ui, "Properties", |ui| property_sheet(ui, ws, &asset, &properties, &context, nav, edit));
+    let target = edit_target(ws, &asset);
+    {
+        let sheet = Sheet {
+            index: &ws.index,
+            extensions: &ws.extensions,
+            fields: ws.extensions.fields(&asset).into_iter().cloned().collect(),
+        };
+        let fields: Vec<(&String, &toml::Value)> = asset
+            .fields()
+            .iter()
+            .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && !sheet.custom(k))
+            .collect();
+        let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
+        let (field_edit, parts) = (&mut ws.field_edit, &mut ws.parts);
+        if !properties.is_empty() {
+            theme::section(ui, "Properties", |ui| {
+                property_sheet(ui, &sheet, field_edit, &target, &asset, &properties, nav, edit);
+            });
+        }
+        for (key, value) in lists {
+            let items = value.as_array().map_or(&[][..], Vec::as_slice);
+            theme::section(ui, &format!("{}  ·  {}", sheet.label(key), items.len()), |ui| {
+                collection_ui(ui, &sheet, parts, key, items, nav);
+            });
+        }
     }
-    for (key, value) in lists {
-        let items = value.as_array().map_or(&[][..], Vec::as_slice);
-        theme::section(ui, &format!("{}  ·  {}", context.label(key), items.len()), |ui| {
-            collection_ui(ui, ws, &asset, key, items, &context, nav);
-        });
-    }
+    ws.show_inspector_views(ui, &asset.path, nav);
     files_ui(ui, &asset, tools, message);
     declaration_ui(ui, ws, &asset, edit);
 }
@@ -182,9 +200,6 @@ fn label_of(key: &str) -> String {
         "rect" => "Rectangle",
         "sha1" => "SHA-1",
         "id" => "Id",
-        "executable_palette" => "Palette from",
-        "no_palette" => "No palette",
-        "sector_len" => "Sector length",
         "native" => "Native file",
         _ => "",
     };
@@ -196,36 +211,38 @@ fn label_of(key: &str) -> String {
     chars.next().map_or_default(|c| c.to_uppercase().chain(chars).collect())
 }
 
+#[expect(clippy::too_many_arguments, reason = "a sheet's context")]
 fn property_sheet(
     ui: &mut egui::Ui,
-    ws: &mut Workspace,
+    sheet: &Sheet,
+    field_edit: &mut Option<FieldEdit>,
+    target: &Result<String, String>,
     asset: &Asset,
     fields: &[(&String, &toml::Value)],
-    context: &Context,
     nav: &mut Option<String>,
     edit: &mut Option<EditRequest>,
 ) {
-    let editable = edit_target(ws, asset).is_ok();
+    let editable = target.is_ok();
     egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
         for (key, value) in fields {
-            ui.label(RichText::new(context.label(key)).color(theme::weak()));
+            ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
             ui.horizontal_wrapped(|ui| {
-                let editing = ws.field_edit.as_ref().is_some_and(|f| f.asset == asset.path && f.key == **key);
+                let editing = field_edit.as_ref().is_some_and(|f| f.asset == asset.path && f.key == **key);
                 if editing {
-                    field_editor(ui, ws, asset, key, value, context, edit);
+                    field_editor(ui, field_edit, asset, key, value, sheet, edit);
                     return;
                 }
-                let field = context.field(key);
+                let field = sheet.field(key);
                 let editable = editable && !field.is_some_and(|f| f.read_only);
                 if let Some(field) = field.filter(|f| editable && !f.choices.is_empty()) {
                     choice_ui(ui, asset, key, value, field, edit);
                     return;
                 }
-                value_ui(ui, ws, key, value, context, nav);
+                value_ui(ui, sheet, key, value, nav);
                 if editable && is_scalar(value) {
                     let pencil = ui.add(egui::Button::new(RichText::new(icons::PENCIL_SIMPLE).small()).frame(false));
-                    if pencil.on_hover_text(edit_target(ws, asset).unwrap_or_default()).clicked() {
-                        ws.field_edit =
+                    if pencil.on_hover_text(target.clone().unwrap_or_default()).clicked() {
+                        *field_edit =
                             Some(FieldEdit { asset: asset.path.clone(), key: (*key).clone(), text: raw_text(value) });
                     }
                 }
@@ -236,17 +253,11 @@ fn property_sheet(
 }
 
 /// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
-fn nested_sheet(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    fields: &[(&String, &toml::Value)],
-    context: &Context,
-    nav: &mut Option<String>,
-) {
+fn nested_sheet(ui: &mut egui::Ui, sheet: &Sheet, fields: &[(&String, &toml::Value)], nav: &mut Option<String>) {
     egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
         for (key, value) in fields {
-            ui.label(RichText::new(context.label(key)).color(theme::weak()));
-            ui.horizontal_wrapped(|ui| value_ui(ui, ws, key, value, context, nav));
+            ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
+            ui.horizontal_wrapped(|ui| value_ui(ui, sheet, key, value, nav));
             ui.end_row();
         }
     });
@@ -269,14 +280,14 @@ fn raw_text(value: &toml::Value) -> String {
 /// Enter or when it loses the keyboard; Escape leaves it.
 fn field_editor(
     ui: &mut egui::Ui,
-    ws: &mut Workspace,
+    field_edit: &mut Option<FieldEdit>,
     asset: &Asset,
     key: &str,
     value: &toml::Value,
-    context: &Context,
+    sheet: &Sheet,
     edit: &mut Option<EditRequest>,
 ) {
-    let Some(field) = ws.field_edit.as_mut() else { return };
+    let Some(field) = field_edit.as_mut() else { return };
     let parsed: Result<toml_edit::Value, String> = match value {
         toml::Value::String(_) => Ok(field.text.as_str().into()),
         toml::Value::Integer(_) => {
@@ -299,12 +310,12 @@ fn field_editor(
         ui.label(RichText::new(why).small().color(ui.visuals().error_fg_color));
     }
     if escape {
-        ws.field_edit = None;
+        *field_edit = None;
     } else if (enter || response.lost_focus())
         && let Ok(new) = parsed
     {
-        ws.field_edit = None;
-        if let Some(request) = set_field(asset, key, new, &context.label(key)) {
+        *field_edit = None;
+        if let Some(request) = set_field(asset, key, new, &sheet.label(key)) {
             *edit = Some(request);
         }
     }
@@ -367,26 +378,15 @@ fn ints(value: &toml::Value) -> Option<Vec<i64>> {
 }
 
 /// A value by its field's meaning: a depth, a size, an offset, a rectangle, a placement, a reference, a list.
-fn value_ui(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    key: &str,
-    value: &toml::Value,
-    context: &Context,
-    nav: &mut Option<String>,
-) {
-    let field = context.field(key);
+pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value, nav: &mut Option<String>) {
+    let field = sheet.field(key);
     let formatted = field.and_then(|f| f.format.as_ref()).and_then(|format| format(value));
     if let Some(text) = formatted.or_else(|| field.and_then(|f| f.choice(value)).map(str::to_string)) {
         ui.label(text);
         return;
     }
     if let Some(n) = int(value) {
-        let text = match key {
-            "sector_len" | "header_bits" | "sound_bank_mask" => format!("0x{n:X}"),
-            _ => n.to_string(),
-        };
-        ui.label(text);
+        ui.label(n.to_string());
         return;
     }
     if let Some(v) = ints(value) {
@@ -411,15 +411,15 @@ fn value_ui(
         }
         toml::Value::Array(items) => {
             for item in items {
-                value_ui(ui, ws, key, item, context, nav);
+                value_ui(ui, sheet, key, item, nav);
             }
         }
         toml::Value::Table(t) => {
             if is_reference(value) {
-                reference_chip(ui, ws, value, nav);
+                reference_chip(ui, sheet, value, nav);
             } else if let (Some(slot), Some(at)) = (t.get("slot"), t.get("at")) {
                 // A placement: the VRAM slot and the offset in it.
-                reference_chip(ui, ws, slot, nav);
+                reference_chip(ui, sheet, slot, nav);
                 if let Some([x, y]) = ints(at).as_deref() {
                     ui.label(RichText::new(format!("+ ({x}, {y})")).monospace().color(theme::weak()));
                 }
@@ -429,7 +429,7 @@ fn value_ui(
             } else {
                 ui.vertical(|ui| {
                     let fields: Vec<(&String, &toml::Value)> = t.iter().collect();
-                    nested_sheet(ui, ws, &fields, context, nav);
+                    nested_sheet(ui, sheet, &fields, nav);
                 });
             }
         }
@@ -452,12 +452,12 @@ fn is_reference(value: &toml::Value) -> bool {
 }
 
 /// A reference as a chip: its asset's icon and short name, opening it on a click; red where it names nothing.
-fn reference_chip(ui: &mut egui::Ui, ws: &Workspace, value: &toml::Value, nav: &mut Option<String>) {
+pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav: &mut Option<String>) {
     let (uid, path) = project::index::reference(value).unwrap_or_default();
-    let target = path.unwrap_or(uid);
-    match ws.target(value) {
+    let target = path.clone().unwrap_or_else(|| uid.clone());
+    match sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) {
         Some(asset) => {
-            let (icon, tint) = icons::for_kind(&ws.extensions, asset.kind.as_deref());
+            let (icon, tint) = icons::for_kind(sheet.extensions, asset.kind.as_deref());
             let mut parts = asset.path.rsplit('/');
             let name = parts.next().unwrap_or_default();
             let short = match parts.next() {
@@ -475,7 +475,7 @@ fn reference_chip(ui: &mut egui::Ui, ws: &Workspace, value: &toml::Value, nav: &
 }
 
 /// A reference or a cell as a chip: one widget, so that a row of them wraps where the pane is narrow.
-fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::Response {
+pub fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     let font = egui::TextStyle::Body.resolve(ui.style());
     job.append(icon, 0.0, egui::text::TextFormat::simple(font.clone(), tint));
@@ -516,65 +516,46 @@ fn title_of(item: &toml::Value, i: usize) -> String {
 /// (a file's slots with their pages and palettes, an atlas's parts) as cards that open; the rest as rows.
 fn collection_ui(
     ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    asset: &Asset,
+    sheet: &Sheet,
+    parts: &mut crate::workspace::Parts,
     key: &str,
     items: &[toml::Value],
-    context: &Context,
     nav: &mut Option<String>,
 ) {
-    if key == "cells" {
-        cells_ui(ui, items);
-        return;
-    }
-    if key == "variants" && context.piece.is_some() {
-        variants_ui(ui, ws, asset, items);
-        return;
-    }
     for (i, item) in items.iter().enumerate() {
         let title = title_of(item, i);
         let nested = item.as_table().is_some_and(|t| t.values().any(is_table_list));
-        let item_context = if key == "parts" {
-            Context { piece: Some(format!("{}#{title}", asset.path)), ..context.clone() }
-        } else {
-            context.clone()
-        };
         if nested {
             let id = ui.make_persistent_id((key, i));
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-                .show_header(ui, |ui| row_ui(ui, ws, key, i, &title, item, &item_context, nav))
+                .show_header(ui, |ui| row_ui(ui, sheet, parts, &title, item, nav))
                 .body(|ui| {
                     let table = item.as_table().cloned().unwrap_or_default();
                     for (k, v) in table.iter().filter(|(_, v)| is_table_list(v)) {
                         let list = v.as_array().map_or(&[][..], Vec::as_slice);
                         ui.label(
-                            RichText::new(format!("{}  ·  {}", item_context.label(k), list.len()))
-                                .small()
-                                .color(theme::weak()),
+                            RichText::new(format!("{}  ·  {}", sheet.label(k), list.len())).small().color(theme::weak()),
                         );
-                        ui.indent((key, i, k.as_str()), |ui| collection_ui(ui, ws, asset, k, list, &item_context, nav));
+                        ui.indent((key, i, k.as_str()), |ui| collection_ui(ui, sheet, parts, k, list, nav));
                     }
                 });
         } else {
             ui.horizontal(|ui| {
                 ui.add_space(18.0);
-                row_ui(ui, ws, key, i, &title, item, &item_context, nav);
+                row_ui(ui, sheet, parts, &title, item, nav);
             });
         }
     }
 }
 
-/// One item's summary line: its title, then its plain fields as small label-value pairs, references as chips; a
-/// variant's or a palette entry's colors as a swatch.
-#[expect(clippy::too_many_arguments, reason = "one row's context")]
+/// A list's entry on one line: its title, its type, a swatch where it names an image's palette (`{ image, palette }`,
+/// drawn by the image's kind as the part `palettes/<name>`), and its fields the row's way.
 fn row_ui(
     ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    key: &str,
-    index: usize,
+    sheet: &Sheet,
+    parts: &mut crate::workspace::Parts,
     title: &str,
     item: &toml::Value,
-    context: &Context,
     nav: &mut Option<String>,
 ) {
     ui.horizontal_wrapped(|ui| {
@@ -582,116 +563,54 @@ fn row_ui(
         if let Some(ty) = item.get("type").and_then(toml::Value::as_str) {
             badge(ui, ty);
         }
-        if key == "palettes" {
-            // An image's own palette by its place in the list; a file's palette entry by the image it names.
-            if item.get("image").is_some() {
-                if let Some((image, palette)) = ws.entry_palette(item) {
-                    swatch_ui(ui, ws, &image, palette);
-                }
-            } else if let Some(piece) = &context.piece {
-                swatch_ui(ui, ws, piece, index);
+        if let (Some(image), Some(palette)) = (item.get("image"), item.get("palette").and_then(toml::Value::as_str))
+            && let Some((uid, path)) = project::index::reference(image)
+            && let Some(image) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default())
+        {
+            let ctx = ui.ctx().clone();
+            if let Some(Ok(strip)) = parts.get(&ctx, sheet.extensions, image, &format!("palettes/{palette}")) {
+                let width = if strip.size.x <= 16.0 { 96.0 } else { 160.0 };
+                egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(strip.texture.id(), egui::vec2(width, 10.0))));
+                });
             }
         }
         let Some(table) = item.as_table() else { return };
         for (k, v) in table {
-            if matches!(k.as_str(), "name" | "index" | "type") || is_table_list(v) {
-                continue;
-            }
-            if is_reference(v) {
-                reference_chip(ui, ws, v, nav);
-                continue;
-            }
-            if let Some(brief) = context.field(k).and_then(|f| f.brief.as_ref()).and_then(|brief| brief(v)) {
-                ui.label(RichText::new(brief).color(theme::weak()));
-                continue;
-            }
-            match v {
-                toml::Value::Boolean(false) => {}
-                toml::Value::Boolean(true) => badge(ui, &context.label(k).to_lowercase()),
-                _ => {
-                    ui.label(RichText::new(context.label(k).to_lowercase()).small().color(theme::weak()));
-                    value_ui(ui, ws, k, v, context, nav);
-                }
+            if !matches!(k.as_str(), "name" | "index" | "type") && !is_table_list(v) {
+                field_ui(ui, sheet, k, v, nav);
             }
         }
         for (k, v) in table.iter().filter(|(_, v)| is_table_list(v)) {
             let n = v.as_array().map_or(0, Vec::len);
-            ui.label(RichText::new(count(n, &context.label(k).to_lowercase())).small().color(theme::weak()));
+            ui.label(RichText::new(count(n, &sheet.label(k).to_lowercase())).small().color(theme::weak()));
         }
     });
+}
+
+/// A field within a row: a reference as a chip, a flag as a badge, anything else its label and its reading.
+pub fn field_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value, nav: &mut Option<String>) {
+    if is_reference(value) {
+        reference_chip(ui, sheet, value, nav);
+        return;
+    }
+    if let Some(brief) = sheet.field(key).and_then(|f| f.brief.as_ref()).and_then(|brief| brief(value)) {
+        ui.label(RichText::new(brief).color(theme::weak()));
+        return;
+    }
+    match value {
+        toml::Value::Boolean(false) => {}
+        toml::Value::Boolean(true) => badge(ui, &sheet.label(key).to_lowercase()),
+        _ => {
+            ui.label(RichText::new(sheet.label(key).to_lowercase()).small().color(theme::weak()));
+            value_ui(ui, sheet, key, value, nav);
+        }
+    }
 }
 
 /// `n` of a plural noun: "1 variant", "8 cells".
 fn count(n: usize, plural: &str) -> String {
     if n == 1 { format!("1 {}", plural.strip_suffix('s').unwrap_or(plural)) } else { format!("{n} {plural}") }
-}
-
-/// A palette's colors as a strip.
-fn swatch_ui(ui: &mut egui::Ui, ws: &mut Workspace, piece: &str, variant: usize) {
-    let ctx = ui.ctx().clone();
-    if let Some(Ok(strip)) = ws.palette(&ctx, piece, variant) {
-        let width = if strip.size.x <= 16.0 { 96.0 } else { 160.0 };
-        egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(strip.texture.id(), egui::vec2(width, 10.0))));
-        });
-    }
-}
-
-/// An image's variants as a tree: a texture's each one palette; an atlas's each the cells it recolors, every one with
-/// the palette it takes - a swatch beside each palette.
-fn variants_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, items: &[toml::Value]) {
-    let palettes = ws.palettes_of(&asset.path);
-    let index = |name: &str| palettes.iter().position(|p| p == name);
-    for (i, item) in items.iter().enumerate() {
-        let title = title_of(item, i);
-        if let Some(palette) = item.get("palette").and_then(toml::Value::as_str) {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                ui.label(RichText::new(&title).strong());
-                if let Some(p) = index(palette) {
-                    swatch_ui(ui, ws, &asset.path, p);
-                }
-                ui.label(RichText::new(palette).small().color(theme::weak()));
-            });
-            continue;
-        }
-        let cells = item.get("palettes").and_then(toml::Value::as_table).cloned().unwrap_or_default();
-        let id = ui.make_persistent_id(("variant", i));
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
-                ui.label(RichText::new(&title).strong());
-                ui.label(RichText::new(count(cells.len(), "cells")).small().color(theme::weak()));
-            })
-            .body(|ui| {
-                for (cell, palette) in &cells {
-                    let palette = palette.as_str().unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(icons::SQUARES_FOUR).color(theme::weak()));
-                        ui.label(cell);
-                        ui.label(RichText::new("→").color(theme::weak()));
-                        if let Some(p) = index(palette) {
-                            swatch_ui(ui, ws, &asset.path, p);
-                        }
-                        ui.label(RichText::new(palette).small().color(theme::weak()));
-                    });
-                }
-            });
-    }
-}
-
-fn cells_ui(ui: &mut egui::Ui, items: &[toml::Value]) {
-    ui.horizontal_wrapped(|ui| {
-        for (i, item) in items.iter().enumerate() {
-            let rect = item.get("rect").and_then(ints).unwrap_or_default();
-            let palette =
-                item.get("palette").and_then(toml::Value::as_str).map_or(String::new(), |p| format!(", palette {p}"));
-            let hint = match rect.as_slice() {
-                [x, y, w, h] => format!("{w} × {h} at ({x}, {y}){palette}"),
-                _ => String::new(),
-            };
-            chip(ui, icons::SQUARES_FOUR, &title_of(item, i), theme::weak()).on_hover_text(hint);
-        }
-    });
 }
 
 // --- files ------------------------------------------------------------------------------------------------------------
