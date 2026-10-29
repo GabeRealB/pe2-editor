@@ -58,6 +58,15 @@ interface host {
         find: func(kind: string) -> list<asset>;
         selection: func() -> option<asset>;
         look: func(path: string) -> u32;
+        /// What the host understands of any asset, answered by the extension its kind is: its picture in a look, a
+        /// part's picture, its parts (id, label, what it is made of), its facts (TOML).
+        picture: func(path: string, look: u32) -> option<result<image, string>>;
+        part: func(path: string, part: string) -> option<result<image, string>>;
+        parts: func(path: string) -> list<tuple<string, string, list<string>>>;
+        facts: func(path: string) -> string;
+        /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
+        /// the services of the extensions this one requires, or its own.
+        call: func(service: string, arguments: string) -> result<string, string>;
     }
 
     /// An image a view shows, held by the host: made once, shown by handle every frame.
@@ -267,6 +276,8 @@ interface guest {
         roles: list<role>,
         panels: list<panel>,
         tools: list<tool>,
+        /// Services, for other extensions: described as tools are.
+        services: list<tool>,
         formats: list<file-format>,
         importers: list<importer>,
         extractors: list<extractor>,
@@ -314,6 +325,8 @@ interface guest {
     /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the
     /// last closes), which keeps it when it says no - it holds what it cannot rebuild cheaply.
     reclaimable: func() -> bool;
+    /// A service's work, called by another extension through the host: its arguments (TOML) to its answer (TOML).
+    serve: async func(service: u32, project: borrow<project>, arguments: string) -> result<string, string>;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
 

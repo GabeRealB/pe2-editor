@@ -65,6 +65,8 @@ pub struct Loaded {
     pub id: String,
     pub version: String,
     pub origin: Origin,
+    /// What it requires (`pe2.images@^0.1`): whose services it may call.
+    pub requires: Vec<String>,
 }
 
 /// The extensions loaded, and what they registered.
@@ -77,6 +79,7 @@ pub struct Extensions {
     roles: HashMap<String, RoleDef>,
     panels: Vec<PanelDef>,
     tools: Vec<ToolDef>,
+    services: HashMap<String, ToolDef>,
     formats: Vec<FormatDef>,
     importers: HashMap<String, ImporterDef>,
     extractors: Vec<pe2_ext::ExtractorDef>,
@@ -190,7 +193,7 @@ impl Extensions {
         let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
         let names = names.chain(parts.formats.iter().map(|f| &f.name)).chain(parts.importers.iter().map(|i| &i.name));
-        let names = names.chain(parts.extractors.iter().map(|e| &e.name));
+        let names = names.chain(parts.extractors.iter().map(|e| &e.name)).chain(parts.services.iter().map(|s| &s.name));
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
@@ -242,7 +245,8 @@ impl Extensions {
             self.components.push((extension.id.clone(), component.clone()));
         }
         let (id, version, origin) = (extension.id.clone(), extension.version.clone(), extension.origin.clone());
-        self.loaded.push(Loaded { id, version, origin });
+        let requires = extension.requires.clone();
+        self.loaded.push(Loaded { id, version, origin, requires });
         for kind in kinds {
             if let Some(alias) = &kind.alias {
                 self.kind_aliases.insert(alias.clone(), kind.name.to_string());
@@ -257,6 +261,7 @@ impl Extensions {
         }
         self.panels.extend(parts.panels);
         self.tools.extend(parts.tools);
+        self.services.extend(parts.services.into_iter().map(|s| (s.name.to_string(), s)));
         self.formats.extend(parts.formats);
         self.importers.extend(parts.importers.into_iter().map(|i| (i.name.to_string(), i)));
         self.extractors.extend(parts.extractors);
@@ -414,6 +419,20 @@ impl Extensions {
     #[must_use]
     pub fn panel(&self, name: &str) -> Option<&PanelDef> {
         self.panels.iter().find(|p| p.name.as_str() == name)
+    }
+
+    /// A service an extension offers, by its qualified name.
+    #[must_use]
+    pub fn service(&self, name: &str) -> Option<&ToolDef> {
+        self.services.get(name)
+    }
+
+    /// Whether the extension `caller` may call a service: its own, or one of an extension it requires.
+    #[must_use]
+    pub fn may_call(&self, caller: &str, service: &str) -> bool {
+        let Some(owner) = self.services.get(service).map(|s| s.name.extension()) else { return false };
+        owner == caller
+            || self.loaded.iter().find(|l| l.id == caller).is_some_and(|l| l.requires.iter().any(|r| requirement(r).0 == owner))
     }
 
     /// The tools the extensions registered, for agents.
@@ -597,6 +616,31 @@ impl Project for Lens<'_> {
     fn look(&self, path: &str) -> usize {
         self.looks.and_then(|l| l.get(path).copied()).unwrap_or(0)
     }
+
+    fn picture(&self, path: &str, look: usize) -> Option<Result<Image>> {
+        self.extensions.picture(self.index.assets.get(path)?, look)
+    }
+
+    fn part(&self, path: &str, part: &str) -> Option<Result<Image>> {
+        self.extensions.part(self.index.assets.get(path)?, part)
+    }
+
+    fn parts(&self, path: &str) -> Vec<pe2_ext::Part> {
+        self.index.assets.get(path).map_or_default(|a| self.extensions.parts(a))
+    }
+
+    fn facts(&self, path: &str) -> toml::Table {
+        self.index.assets.get(path).map_or_default(|a| self.extensions.facts(a))
+    }
+
+    fn call(&self, service: &str, arguments: &Value) -> Result<Value> {
+        let def = self.extensions.service(service).with_context(|| format!("no service {service}"))?;
+        (def.run)(self, arguments).with_context(|| service.to_string())
+    }
+
+    fn may_call(&self, caller: &str, service: &str) -> bool {
+        self.extensions.may_call(caller, service)
+    }
 }
 
 impl Source for index::Asset {
@@ -757,5 +801,89 @@ mod tests {
         assert!(!satisfies("0.2.0", "^0.1"));
         assert!(satisfies("1.4.0", "^1.2"));
         assert!(!satisfies("2.0.0", "^1.2"));
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
+mod calling {
+    use super::{Extensions, Lens, Loadable};
+    use crate::Project as Opened;
+    use crate::cache::Cache;
+    use crate::index::Index;
+    use crate::lock::Lock;
+    use pe2_ext::{Asset, Extension, Image, Picture, Project, Registry, Result, Table, Value, anyhow};
+
+    /// A picture of one red pixel.
+    struct Red;
+
+    impl Picture for Red {
+        fn has(&self, _: &Asset) -> bool {
+            true
+        }
+
+        fn looks(&self, _: &Asset) -> Vec<String> {
+            vec![]
+        }
+
+        fn draw(&self, _: &Asset, _: usize) -> Result<Image> {
+            Ok(Image { width: 1, height: 1, rgba: vec![255, 0, 0, 255] })
+        }
+    }
+
+    fn paint(r: &mut Registry) -> Result<()> {
+        r.kind("canvas").alias("canvas").picture(Red).register();
+        r.service("red", "The color red", "{}", |_, _| Ok(Value::String("red".into())));
+        Ok(())
+    }
+
+    /// Asks the painter, which it requires, for its service and a picture.
+    fn scene(r: &mut Registry) -> Result<()> {
+        r.service("frame", "A frame", "{}", |project: &dyn Project, _| {
+            let color = project.call("test.paint@red", &Value::Table(Table::new()))?;
+            let picture = project.picture("a", 0).ok_or_else(|| anyhow!("no picture"))??;
+            Ok(Value::String(format!("{} {}x{}", color.as_str().unwrap_or_default(), picture.width, picture.height)))
+        });
+        Ok(())
+    }
+
+    fn stray(_: &mut Registry) -> Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn extensions_reach_one_another_through_the_host() {
+        let root = std::env::temp_dir().join(format!("pe2-calling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.asset/asset.toml", "kind = \"canvas\"\n")] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let extension = |id: &'static str, requires: &'static [&'static str], register: fn(&mut Registry) -> Result<()>| {
+            Loadable::from(Extension { id, version: "0.1.0", requires, register })
+        };
+        let extensions = Extensions::load(
+            vec![
+                extension("test.paint", &[], paint),
+                extension("test.scene", &["test.paint@^0.1"], scene),
+                extension("test.stray", &[], stray),
+            ],
+            true,
+        );
+        assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        let project = Opened::load(&root).unwrap();
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let lens = Lens { index: &index, extensions: &extensions, selection: None, looks: None };
+        let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();
+        assert_eq!(answer.as_str(), Some("red 1x1"));
+        assert!(lens.call("test.nowhere@service", &Value::Table(Table::new())).is_err());
+        // A component may call its own services and those of what it requires, no other's.
+        assert!(lens.may_call("test.scene", "test.paint@red"));
+        assert!(lens.may_call("test.paint", "test.paint@red"));
+        assert!(!lens.may_call("test.stray", "test.paint@red"));
+        assert!(!lens.may_call("test.scene", "test.paint@nothing"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

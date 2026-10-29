@@ -41,6 +41,7 @@ struct Registered {
     fields: Vec<Field>,
     views: Vec<Maker>,
     tools: Vec<ToolDef>,
+    services: Vec<ToolDef>,
     formats: Vec<FormatDef>,
     importers: Vec<ImporterDef>,
     extractors: Vec<crate::ExtractorDef>,
@@ -234,6 +235,32 @@ impl Project for Lens<'_> {
     fn look(&self, path: &str) -> usize {
         self.project.look(path) as usize
     }
+
+    fn picture(&self, path: &str, look: usize) -> Option<crate::Result<Image>> {
+        let look = u32::try_from(look).unwrap_or(u32::MAX);
+        self.project.picture(path, look).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    }
+
+    fn part(&self, path: &str, part: &str) -> Option<crate::Result<Image>> {
+        self.project.part(path, part).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    }
+
+    fn parts(&self, path: &str) -> Vec<crate::Part> {
+        self.project.parts(path).into_iter().map(|(id, label, made_of)| crate::Part { id, label, made_of }).collect()
+    }
+
+    fn facts(&self, path: &str) -> Table {
+        toml::from_str(&self.project.facts(path)).unwrap_or_default()
+    }
+
+    fn call(&self, service: &str, arguments: &Value) -> crate::Result<Value> {
+        let answer = self.project.call(service, &value_text(arguments)).map_err(crate::Error::msg)?;
+        parse_value(&answer).ok_or_else(|| crate::anyhow!("{service}: its answer is not TOML"))
+    }
+}
+
+fn from_image(image: types::Image) -> Image {
+    Image { width: image.width as usize, height: image.height as usize, rgba: image.rgba }
 }
 
 /// A frame's `ui`: the one lent, or a row, a section or a body of it.
@@ -529,6 +556,14 @@ impl g::Guest for Component {
     }
 
     #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn serve(service: u32, project: &host::Project, arguments: String) -> Result<String, String> {
+        let service = registered().services.get(service as usize).ok_or("no such service")?;
+        let arguments = parse_value(&arguments).unwrap_or_else(|| Value::Table(Table::new()));
+        let lens = Lens::new(project);
+        (service.run)(&lens, &arguments).map(|answer| value_text(&answer)).map_err(|e| format!("{e:#}"))
+    }
+
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
     async fn run(tool: u32, project: &host::Project, arguments: String) -> Result<String, String> {
         let tool = registered().tools.get(tool as usize).ok_or("no such tool")?;
         let arguments = parse_value(&arguments).unwrap_or_else(|| Value::Table(Table::new()));
@@ -557,6 +592,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         fields: vec![],
         views: vec![],
         tools: vec![],
+        services: vec![],
         formats: vec![],
         importers: vec![],
         extractors: vec![],
@@ -570,6 +606,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         roles: vec![],
         panels: vec![],
         tools: vec![],
+        services: vec![],
         formats: vec![],
         importers: vec![],
         extractors: vec![],
@@ -612,17 +649,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         });
         numbered.views.push(Maker::Panel(panel));
     }
-    for tool in parts.tools {
-        #[expect(clippy::cast_possible_truncation, reason = "a handful of tools")]
-        let handle = numbered.tools.len() as u32;
-        out.tools.push(g::Tool {
-            handle,
-            name: tool.name.local().to_string(),
-            description: tool.description.clone(),
-            schema: tool.schema.clone(),
-        });
-        numbered.tools.push(tool);
-    }
+    numbered.tools = calls(parts.tools, &mut out.tools);
+    numbered.services = calls(parts.services, &mut out.services);
     imports(&parts.formats, &parts.importers, &mut out, &mut numbered);
     for (handle, extractor) in parts.extractors.iter().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
@@ -650,6 +678,7 @@ fn number(parts: crate::registry::Parts) -> Registered {
         fields: vec![],
         views: vec![],
         tools: vec![],
+        services: vec![],
         formats: vec![],
         importers: vec![],
         extractors: vec![],
@@ -669,12 +698,28 @@ fn number(parts: crate::registry::Parts) -> Registered {
         numbered.views.extend(importer.inspector.iter().cloned().map(Maker::Asset));
     }
     numbered.tools = parts.tools;
+    numbered.services = parts.services;
     numbered.formats = parts.formats;
     numbered.importers = parts.importers;
     numbered.extractors = parts.extractors;
     numbered.kinds = parts.kinds;
     numbered.reclaimable = parts.reclaimable;
     numbered
+}
+
+/// Tools or services, as the contract describes them, numbered in their order.
+fn calls(defs: Vec<ToolDef>, out: &mut Vec<g::Tool>) -> Vec<ToolDef> {
+    for (handle, def) in defs.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of tools")]
+        let handle = handle as u32;
+        out.push(g::Tool {
+            handle,
+            name: def.name.local().to_string(),
+            description: def.description.clone(),
+            schema: def.schema.clone(),
+        });
+    }
+    defs
 }
 
 /// The formats and importers registered, as the contract describes them.

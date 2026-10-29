@@ -307,6 +307,8 @@ pub struct Parts {
     pub roles: Vec<RoleDef>,
     pub panels: Vec<PanelDef>,
     pub tools: Vec<ToolDef>,
+    /// Services: like tools, but for other extensions to call.
+    pub services: Vec<ToolDef>,
     pub formats: Vec<FormatDef>,
     pub importers: Vec<ImporterDef>,
     pub extractors: Vec<crate::ExtractorDef>,
@@ -490,6 +492,21 @@ impl Registry {
         let name = Name::of(&self.id, name);
         let (description, schema) = (description.to_string(), schema.to_string());
         self.parts.tools.push(ToolDef { name, description, schema, run: Arc::new(run) });
+    }
+
+    /// A service, `<id>@<name>`, other extensions call through the host (`Project::call`) - those requiring this one:
+    /// what it does, its arguments as a JSON schema, its work. It runs in an instance of this extension's own.
+    pub fn service(
+        &mut self,
+        name: &str,
+        description: &str,
+        schema: &str,
+        run: impl Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Name {
+        let name = Name::of(&self.id, name);
+        let (description, schema) = (description.to_string(), schema.to_string());
+        self.parts.services.push(ToolDef { name: name.clone(), description, schema, run: Arc::new(run) });
+        name
     }
 
     /// What was registered, for the host.

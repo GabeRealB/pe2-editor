@@ -453,6 +453,53 @@ impl host::HostProject for State {
         Ok(u32::try_from(project.look(&path)).unwrap_or(0))
     }
 
+    fn picture(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        look: u32,
+    ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| p.picture(&path, look as usize).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+    }
+
+    fn part(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        part: String,
+    ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| p.part(&path, &part).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+    }
+
+    fn parts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<Vec<(String, String, Vec<String>)>> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| p.parts(&path).into_iter().map(|part| (part.id, part.label, part.made_of)).collect()))
+    }
+
+    fn facts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<String> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| toml::to_string(&p.facts(&path)).unwrap_or_default()))
+    }
+
+    fn call(
+        &mut self,
+        project: Resource<LentProject>,
+        service: String,
+        arguments: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let project = self.project(&project)?;
+        // SAFETY: as `asset`.
+        if !unsafe { &*project }.may_call(&self.id, &service) {
+            return Ok(Err(format!("{service}: not a service of {} or of an extension it requires", self.id)));
+        }
+        let Some(arguments) = parse_value(&arguments) else { return Ok(Err("its arguments are not TOML".into())) };
+        Ok(elsewhere(project, move |p| {
+            p.call(&service, &arguments).map(|answer| answer.to_string()).map_err(|e| format!("{e:#}"))
+        }))
+    }
+
     fn drop(&mut self, project: Resource<LentProject>) -> wasmtime::Result<()> {
         self.table.delete(project)?;
         Ok(())
@@ -493,6 +540,45 @@ impl host::HostDiscs for State {
         let _ = discs;
         Ok(())
     }
+}
+
+/// Run a component's future to its end on this thread. Within another component's call - one extension asking another
+/// through the host - that call's runtime is driving this thread, and tokio refuses to block on another inside it: the
+/// future is polled here instead, which suffices for a guest that does not sleep (one that does is stopped by its
+/// deadline). Otherwise on the instance's own runtime.
+fn drive<F: std::future::Future>(runtime: &Runtime, future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() { pollster::block_on(future) } else { runtime.block_on(future) }
+}
+
+/// An instance's runtime, shut down without blocking when it goes: an instance a nested call made is dropped within
+/// the calling component's runtime, where tokio refuses to block.
+struct Runtime(std::mem::ManuallyDrop<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for Runtime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &tokio::runtime::Runtime {
+        &self.0
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here, and never used again.
+        unsafe { std::mem::ManuallyDrop::take(&mut self.0) }.shutdown_background();
+    }
+}
+
+/// Ask the lent project: what it asks may run another extension's component, inline (`Runner::call`).
+fn elsewhere<R>(project: *const (dyn Project + 'static), ask: impl FnOnce(&dyn Project) -> R) -> R {
+    // SAFETY: lent for the call running now, which this is part of.
+    ask(unsafe { &*project })
+}
+
+/// An image as the contract carries it.
+fn to_wit(image: Image) -> types::Image {
+    let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    types::Image { width: to_u32(image.width), height: to_u32(image.height), rgba: image.rgba }
 }
 
 fn parse_value(text: &str) -> Option<Value> {
@@ -701,7 +787,7 @@ impl host::HostUi for State {
 struct Runner {
     store: Store<State>,
     instance: bindings::Extension,
-    runtime: tokio::runtime::Runtime,
+    runtime: Runtime,
     meter: Arc<Meter>,
     /// What the guest writes to standard error: a panic's message.
     stderr: MemoryOutputPipe,
@@ -724,7 +810,7 @@ impl Runner {
         self.store.set_epoch_deadline(ticks);
         let Runner { store, instance, runtime, .. } = self;
         let guest = instance.pe2_extension_guest();
-        let out = runtime.block_on(store.run_concurrent(async |accessor| call(accessor, guest).await));
+        let out = drive(runtime, store.run_concurrent(async |accessor| call(accessor, guest).await));
         // What the project's queries lent goes with the call.
         let data = self.store.data_mut();
         for rep in std::mem::take(&mut data.found) {
@@ -854,8 +940,8 @@ impl Shared {
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(LONG);
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let instance = runtime.block_on(self.pre.instantiate_async(&mut store))?;
+        let runtime = Runtime(std::mem::ManuallyDrop::new(tokio::runtime::Builder::new_current_thread().enable_all().build()?));
+        let instance = drive(&runtime, self.pre.instantiate_async(&mut store))?;
         Ok(Runner { store, instance, runtime, meter, stderr })
     }
 
@@ -1102,7 +1188,7 @@ impl Drop for ComponentView {
         if let (Some(runner), Some(state)) = (self.runner.take(), self.state.take()) {
             if let Ok(mut r) = runner.lock() {
                 let Runner { store, runtime, .. } = &mut *r;
-                let _ = runtime.block_on(state.resource_drop_async(&mut *store));
+                let _ = drive(runtime, state.resource_drop_async(&mut *store));
                 self.shared.peak.fetch_max(r.bytes(), Ordering::Relaxed);
             }
             drop(runner);
@@ -1150,7 +1236,7 @@ impl Extraction for ComponentExtraction {
 impl Drop for ComponentExtraction {
     fn drop(&mut self) {
         let Runner { store, runtime, .. } = &mut self.runner;
-        let _ = runtime.block_on(self.state.resource_drop_async(&mut *store));
+        let _ = drive(runtime, self.state.resource_drop_async(&mut *store));
     }
 }
 
@@ -1170,6 +1256,33 @@ fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shar
         });
     }
     Ok(())
+}
+
+/// A tool's or a service's work, as a job of its component with the project lent: its arguments to its answer.
+fn called(
+    shared: &Arc<Shared>,
+    handle: u32,
+    name: &str,
+    service: bool,
+) -> impl Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync + 'static {
+    let (shared, name) = (shared.clone(), name.to_string());
+    let cap = shared.cap(&name);
+    move |project, arguments| {
+        let arguments = arguments.to_string();
+        let answer = shared.job(cap, |r| {
+            let lent = r.lend_project(project)?;
+            let borrowed = Resource::new_borrow(lent.rep());
+            let out = if service {
+                r.call(LONG, async |a, g| g.call_serve(a, handle, borrowed, arguments).await)
+            } else {
+                r.call(LONG, async |a, g| g.call_run(a, handle, borrowed, arguments).await)
+            };
+            r.unlend_project(lent);
+            out
+        })?;
+        let answer = answer.map_err(|e| anyhow!(e))?;
+        parse_value(&answer).with_context(|| format!("{name}: its answer is not TOML"))
+    }
 }
 
 /// What an extension declared its jobs may take, by qualified name: only of what it registers, at most `MOST_MEMORY`.
@@ -1336,21 +1449,13 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     apply_formats(registry, registration.formats, shared);
     apply_importers(registry, registration.importers, shared)?;
     apply_extractors(registry, registration.extractors, shared)?;
+    for service in registration.services {
+        let run = called(shared, service.handle, &service.name, true);
+        let _ = registry.service(&service.name, &service.description, &service.schema, run);
+    }
     for tool in registration.tools {
-        let (shared, handle, name) = (shared.clone(), tool.handle, tool.name.clone());
-        let cap = shared.cap(&tool.name);
-        registry.tool(&tool.name, &tool.description, &tool.schema, move |project, arguments| {
-            let arguments = arguments.to_string();
-            let answer = shared.job(cap, |r| {
-                let lent = r.lend_project(project)?;
-                let borrowed = Resource::new_borrow(lent.rep());
-                let out = r.call(LONG, async |a, g| g.call_run(a, handle, borrowed, arguments).await);
-                r.unlend_project(lent);
-                out
-            })?;
-            let answer = answer.map_err(|e| anyhow!(e))?;
-            parse_value(&answer).with_context(|| format!("{name}: its answer is not TOML"))
-        });
+        let run = called(shared, tool.handle, &tool.name, false);
+        registry.tool(&tool.name, &tool.description, &tool.schema, run);
     }
     Ok(())
 }

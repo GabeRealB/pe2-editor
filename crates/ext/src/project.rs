@@ -1,7 +1,12 @@
 //! The project as an extension asks about it: assets by path, by reference, by kind; what the user selected; the look
 //! an asset is shown in. The assets are lent, like any: for the frame or call that asked.
+//!
+//! It is also how extensions use one another, through the host: what the host understands of any asset - its picture,
+//! its parts, its facts - is answered by the extension its kind is, whichever that is; and anything else by a service
+//! an extension offers (`Registry::service`), called by name. Each runs in the other extension's own instance, its
+//! memory and failures its own.
 
-use crate::{Asset, Value};
+use crate::{Asset, Image, Part, Result, Table, Value};
 
 /// What the host answers about the project.
 pub trait Project {
@@ -15,4 +20,24 @@ pub trait Project {
     fn selection(&self) -> Option<Asset<'_>>;
     /// The look an asset is shown in, as the host's look picker chose it (an index into its picture's looks).
     fn look(&self, path: &str) -> usize;
+    /// An asset's picture in one of its looks, drawn by the extension its kind is; none where it has none.
+    fn picture(&self, path: &str, look: usize) -> Option<Result<Image>>;
+    /// A part's picture (`palettes/default`); none where it has none.
+    fn part(&self, path: &str, part: &str) -> Option<Result<Image>>;
+    /// An asset's parts, as its kind lists them.
+    fn parts(&self, path: &str) -> Vec<Part>;
+    /// What an asset's kind tells of it.
+    fn facts(&self, path: &str) -> Table;
+    /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only
+    /// the services of the extensions it requires (or its own).
+    ///
+    /// # Errors
+    /// No such service, it is not the caller's to call, or it failed.
+    fn call(&self, service: &str, arguments: &Value) -> Result<Value>;
+    /// Whether the extension `caller` may call `service`: its own, or one of an extension it requires. The host's
+    /// check of a component's call; an extension asks nothing of it.
+    fn may_call(&self, caller: &str, service: &str) -> bool {
+        let _ = (caller, service);
+        true
+    }
 }
