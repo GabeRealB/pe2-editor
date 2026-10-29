@@ -287,6 +287,10 @@ pub struct Parts {
     pub formats: Vec<FormatDef>,
     pub importers: Vec<ImporterDef>,
     pub extractors: Vec<crate::ExtractorDef>,
+    /// Whether its instance may be reclaimed now; without, always.
+    pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The memory a job of something it registered may take, where more than the host's default, by its name.
+    pub memory: Vec<(Name, u64)>,
 }
 
 #[derive(Clone)]
@@ -416,6 +420,21 @@ impl Registry {
         let name = def.name.clone();
         self.parts.extractors.push(def);
         name
+    }
+
+    /// Whether an instance of it may be reclaimed now: the host asks before it drops a long-running instance (its
+    /// views' when the last closes), and keeps one that says no - a scene its next view shows, which cannot be rebuilt
+    /// cheaply. An extension that keeps nothing between calls needs none.
+    pub fn reclaimable(&mut self, reclaimable: impl Fn() -> bool + Send + Sync + 'static) {
+        self.parts.reclaimable = Some(Arc::new(reclaimable));
+    }
+
+    /// How much memory a job of `of` may take - a kind's pictures, thumbnails, parts and views, an importer's
+    /// imports and exports, an extractor's sessions, a tool's runs, a panel - where its default is too little (a
+    /// renderer's scene, a movie's frames). The host enforces it for each instance by the job it runs (up to 4 GiB, a
+    /// 32-bit memory's most).
+    pub fn memory(&mut self, of: &Name, bytes: u64) {
+        self.parts.memory.push((of.clone(), bytes));
     }
 
     /// An importer, `<id>@<name>`, making assets of `kind`: registered by `register` on what this returns.

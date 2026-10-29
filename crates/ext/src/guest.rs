@@ -44,12 +44,15 @@ struct Registered {
     formats: Vec<FormatDef>,
     importers: Vec<ImporterDef>,
     extractors: Vec<crate::ExtractorDef>,
+    reclaimable: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 static REGISTERED: OnceLock<Registered> = OnceLock::new();
 
+/// What the extension registered: made with the first call needing it, so a new instance runs its entry point only
+/// once it is asked something - the host asks for the registration once, of the first instance.
 fn registered() -> &'static Registered {
-    REGISTERED.get().expect("the host asks for the registration first")
+    REGISTERED.get_or_init(|| register(false).expect("the host had this registration before").0)
 }
 
 /// An image held by the host, for a `Texture`.
@@ -178,6 +181,15 @@ impl Source for Lent<'_> {
 
     fn read(&self, name: &str) -> crate::Result<Vec<u8>> {
         self.resource().read(name).map_err(crate::Error::msg)
+    }
+
+    fn size(&self, name: &str) -> Option<u64> {
+        self.resource().size(name)
+    }
+
+    fn read_range(&self, name: &str, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        self.resource().read_range(name, offset, len).map_err(crate::Error::msg)
     }
 }
 
@@ -425,92 +437,8 @@ impl g::Guest for Component {
     }
 
     fn register() -> Result<g::Registration, String> {
-        let extension = __pe2_extension();
-        let mut registry = Registry::new(extension.id);
-        (extension.register)(&mut registry).map_err(|e| format!("{e:#}"))?;
-        let parts = registry.into_parts();
-        let mut numbered = Registered {
-            kinds: vec![],
-            fields: vec![],
-            views: vec![],
-            tools: vec![],
-            formats: vec![],
-            importers: vec![],
-            extractors: vec![],
-        };
-        let mut out = g::Registration {
-            kinds: vec![],
-            roles: vec![],
-            panels: vec![],
-            tools: vec![],
-            formats: vec![],
-            importers: vec![],
-            extractors: vec![],
-        };
-        for kind in &parts.kinds {
-            out.kinds.push(g::Kind {
-                name: kind.name.local().to_string(),
-                alias: kind.alias.clone(),
-                label: kind.label.clone(),
-                icon: kind.icon.map(|(i, t)| (icon(i), tint(t))),
-                fields: kind.fields.iter().map(|f| field(f, &mut numbered)).collect(),
-                picture: kind.picture.is_some(),
-                thumbnail: kind.thumbnail.is_some(),
-                facts: kind.facts.is_some(),
-                parts: kind.parts.is_some(),
-                views: views(&kind.views, &mut numbered),
-                inspector: views(&kind.inspector, &mut numbered),
-            });
-        }
-        for role in &parts.roles {
-            out.roles.push(g::Role {
-                name: role.name.local().to_string(),
-                kind: role.kind.to_string(),
-                alias: role.alias.clone(),
-                label: role.label.clone(),
-                fields: role.fields.iter().map(|f| field(f, &mut numbered)).collect(),
-                views: views(&role.views, &mut numbered),
-                inspector: views(&role.inspector, &mut numbered),
-            });
-        }
-        for panel in parts.panels {
-            #[expect(clippy::cast_possible_truncation, reason = "a handful of views")]
-            let handle = numbered.views.len() as u32;
-            out.panels.push(g::Panel {
-                handle,
-                name: panel.name.local().to_string(),
-                label: panel.label.clone(),
-                icon: panel.icon.map(icon),
-            });
-            numbered.views.push(Maker::Panel(panel));
-        }
-        for tool in parts.tools {
-            #[expect(clippy::cast_possible_truncation, reason = "a handful of tools")]
-            let handle = numbered.tools.len() as u32;
-            out.tools.push(g::Tool {
-                handle,
-                name: tool.name.local().to_string(),
-                description: tool.description.clone(),
-                schema: tool.schema.clone(),
-            });
-            numbered.tools.push(tool);
-        }
-        imports(&parts.formats, &parts.importers, &mut out, &mut numbered);
-        for (handle, extractor) in parts.extractors.iter().enumerate() {
-            #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
-            let handle = handle as u32;
-            out.extractors.push(g::Extractor {
-                handle,
-                name: extractor.name.local().to_string(),
-                kind: extractor.kind.to_string(),
-                roles: extractor.roles.iter().map(ToString::to_string).collect(),
-            });
-        }
-        numbered.formats = parts.formats;
-        numbered.importers = parts.importers;
-        numbered.extractors = parts.extractors;
-        numbered.kinds = parts.kinds;
-        REGISTERED.set(numbered).map_err(|_| "registered twice".to_string())?;
+        let (numbered, out) = registration()?;
+        let _ = REGISTERED.set(numbered);
         Ok(out)
     }
 
@@ -596,6 +524,10 @@ impl g::Guest for Component {
         export.ok_or("the importer writes no source")?(&lent.asset()).map_err(|e| format!("{e:#}"))
     }
 
+    fn reclaimable() -> bool {
+        registered().reclaimable.as_ref().is_none_or(|reclaimable| reclaimable())
+    }
+
     #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
     async fn run(tool: u32, project: &host::Project, arguments: String) -> Result<String, String> {
         let tool = registered().tools.get(tool as usize).ok_or("no such tool")?;
@@ -603,6 +535,146 @@ impl g::Guest for Component {
         let lens = Lens::new(project);
         (tool.run)(&lens, &arguments).map(|answer| value_text(&answer)).map_err(|e| format!("{e:#}"))
     }
+}
+
+/// The extension's registration: its entry point run, what it registered numbered, and the contract's description of
+/// it.
+fn registration() -> Result<(Registered, g::Registration), String> {
+    let (numbered, out) = register(true)?;
+    Ok((numbered, out.unwrap_or_else(|| unreachable!("described"))))
+}
+
+/// Run the extension's entry point and number what it registered, the callbacks the host calls back by; `describe`:
+/// also describe it as the contract does, which only the host's first instance is asked for - an instance made for a
+/// job numbers alone.
+fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), String> {
+    let extension = __pe2_extension();
+    let mut registry = Registry::new(extension.id);
+    (extension.register)(&mut registry).map_err(|e| format!("{e:#}"))?;
+    let parts = registry.into_parts();
+    let mut numbered = Registered {
+        kinds: vec![],
+        fields: vec![],
+        views: vec![],
+        tools: vec![],
+        formats: vec![],
+        importers: vec![],
+        extractors: vec![],
+        reclaimable: None,
+    };
+    if !describe {
+        return Ok((number(parts), None));
+    }
+    let mut out = g::Registration {
+        kinds: vec![],
+        roles: vec![],
+        panels: vec![],
+        tools: vec![],
+        formats: vec![],
+        importers: vec![],
+        extractors: vec![],
+        memory: parts.memory.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect(),
+    };
+    for kind in &parts.kinds {
+        out.kinds.push(g::Kind {
+            name: kind.name.local().to_string(),
+            alias: kind.alias.clone(),
+            label: kind.label.clone(),
+            icon: kind.icon.map(|(i, t)| (icon(i), tint(t))),
+            fields: kind.fields.iter().map(|f| field(f, &mut numbered)).collect(),
+            picture: kind.picture.is_some(),
+            thumbnail: kind.thumbnail.is_some(),
+            facts: kind.facts.is_some(),
+            parts: kind.parts.is_some(),
+            views: views(&kind.views, &mut numbered),
+            inspector: views(&kind.inspector, &mut numbered),
+        });
+    }
+    for role in &parts.roles {
+        out.roles.push(g::Role {
+            name: role.name.local().to_string(),
+            kind: role.kind.to_string(),
+            alias: role.alias.clone(),
+            label: role.label.clone(),
+            fields: role.fields.iter().map(|f| field(f, &mut numbered)).collect(),
+            views: views(&role.views, &mut numbered),
+            inspector: views(&role.inspector, &mut numbered),
+        });
+    }
+    for panel in parts.panels {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of views")]
+        let handle = numbered.views.len() as u32;
+        out.panels.push(g::Panel {
+            handle,
+            name: panel.name.local().to_string(),
+            label: panel.label.clone(),
+            icon: panel.icon.map(icon),
+        });
+        numbered.views.push(Maker::Panel(panel));
+    }
+    for tool in parts.tools {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of tools")]
+        let handle = numbered.tools.len() as u32;
+        out.tools.push(g::Tool {
+            handle,
+            name: tool.name.local().to_string(),
+            description: tool.description.clone(),
+            schema: tool.schema.clone(),
+        });
+        numbered.tools.push(tool);
+    }
+    imports(&parts.formats, &parts.importers, &mut out, &mut numbered);
+    for (handle, extractor) in parts.extractors.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
+        let handle = handle as u32;
+        out.extractors.push(g::Extractor {
+            handle,
+            name: extractor.name.local().to_string(),
+            kind: extractor.kind.to_string(),
+            roles: extractor.roles.iter().map(ToString::to_string).collect(),
+        });
+    }
+    numbered.formats = parts.formats;
+    numbered.importers = parts.importers;
+    numbered.extractors = parts.extractors;
+    numbered.kinds = parts.kinds;
+    numbered.reclaimable = parts.reclaimable;
+    Ok((numbered, Some(out)))
+}
+
+/// What an extension registered, numbered as describing it numbers it - kinds' fields and views, roles', panels,
+/// importers' fields and views - without the description.
+fn number(parts: crate::registry::Parts) -> Registered {
+    let mut numbered = Registered {
+        kinds: vec![],
+        fields: vec![],
+        views: vec![],
+        tools: vec![],
+        formats: vec![],
+        importers: vec![],
+        extractors: vec![],
+        reclaimable: None,
+    };
+    for kind in &parts.kinds {
+        numbered.fields.extend(kind.fields.iter().cloned());
+        numbered.views.extend(kind.views.iter().chain(&kind.inspector).cloned().map(Maker::Asset));
+    }
+    for role in &parts.roles {
+        numbered.fields.extend(role.fields.iter().cloned());
+        numbered.views.extend(role.views.iter().chain(&role.inspector).cloned().map(Maker::Asset));
+    }
+    numbered.views.extend(parts.panels.into_iter().map(Maker::Panel));
+    for importer in &parts.importers {
+        numbered.fields.extend(importer.fields.iter().cloned());
+        numbered.views.extend(importer.inspector.iter().cloned().map(Maker::Asset));
+    }
+    numbered.tools = parts.tools;
+    numbered.formats = parts.formats;
+    numbered.importers = parts.importers;
+    numbered.extractors = parts.extractors;
+    numbered.kinds = parts.kinds;
+    numbered.reclaimable = parts.reclaimable;
+    numbered
 }
 
 /// The formats and importers registered, as the contract describes them.

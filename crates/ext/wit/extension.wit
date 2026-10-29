@@ -43,6 +43,10 @@ interface host {
         declaration: func() -> string;
         has-file: func(name: string) -> bool;
         read: func(name: string) -> result<list<u8>, string>;
+        /// A file's size in bytes, without reading it.
+        size: func(name: string) -> option<u64>;
+        /// Up to `len` bytes of a file from `offset`, read alone: fewer at its end.
+        read-range: func(name: string, offset: u64, len: u32) -> result<list<u8>, string>;
     }
 
     /// The project, lent for a call: what an extension asks about other assets. The assets it returns are lent for
@@ -266,6 +270,9 @@ interface guest {
         formats: list<file-format>,
         importers: list<importer>,
         extractors: list<extractor>,
+        /// The memory a job of something it registered may take, where more than the host's default: by its name
+        /// (qualified), in bytes.
+        memory: list<tuple<string, u64>>,
     }
 
     describe: func() -> about;
@@ -304,6 +311,9 @@ interface guest {
     make-native: async func(importer: u32, asset: borrow<asset>) -> result<imported, string>;
     /// An importer's source, written from an asset's native files.
     make-source: async func(importer: u32, asset: borrow<asset>) -> result<list<u8>, string>;
+    /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the
+    /// last closes), which keeps it when it says no - it holds what it cannot rebuild cheaply.
+    reclaimable: func() -> bool;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
 

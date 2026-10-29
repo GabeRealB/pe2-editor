@@ -1,12 +1,18 @@
 //! Extensions built as WebAssembly components, run by wasmtime: the host side of the contract in
 //! `crates/ext/wit/extension.wit`.
 //!
-//! Loading compiles a component, instantiates it once and asks who it is (`describe`) and what it registers
-//! (`register`); what it registers becomes the same kinds, roles, fields, pictures, thumbnails and views a linked
-//! extension's would, each callback a call into the component by its handle. A call runs on an instance taken from the
-//! extension's pool (another is instantiated when all are busy, so the thumbnails' thread and the frames do not wait on
-//! each other); the views share one instance of their own, as a view lives in the instance that made it. An instance
-//! that traps is dropped, not reused.
+//! Loading compiles a component, in an engine of its own, instantiates it once and asks who it is (`describe`) and
+//! what it registers (`register`); what it registers becomes the same kinds, roles, fields, pictures, thumbnails and
+//! views a linked extension's would, each callback a call into the component by its handle.
+//!
+//! A guest's memory only grows, so an instance holds the most it ever held until it is dropped: instances live by the
+//! lifetime of their job, never a timer. A job - a picture, a thumbnail, an import, an export, a tool's run - gets an
+//! instance made for it and dropped when it returns. Readings - whether an asset has a picture, its looks, a field's
+//! reading, facts, parts, a sniff, a check - share one instance, reused while it is used and reclaimed after
+//! `READING_FRAMES` frames unused (the host counts frames: `frame`). Long-running jobs keep theirs: the views live in
+//! one instance, which goes when its last view closes and it answers that it may be reclaimed; an extraction session in
+//! one of its own, which goes with the session. Each engine pools its instances' slots, so making one is cheap and
+//! dropping one returns its memory. An instance that traps is dropped, not reused.
 //!
 //! What a call lends - an asset, a frame's UI - the host keeps by pointer in the instance's resource table for the
 //! call alone, and takes back before the call returns; a row a view opens is closed before its frame is drawn on again.
@@ -27,7 +33,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use wasmtime::component::{Accessor, Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use std::sync::Weak;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{HostMonotonicClock, HostWallClock, WasiCtx, WasiCtxView, WasiView};
 
@@ -63,30 +71,64 @@ const FRAME: u64 = 200;
 const LONG: u64 = 1000;
 /// An extraction session's beginning (reading every declaration it needs) or one asset's extraction.
 const EXTRACTION: u64 = 6000;
-/// An instance's memory, at most.
-const MEMORY: usize = 512 << 20;
+/// An instance's memory, at most, unless its extension declares more for its job (`Registry::memory`).
+const MEMORY: u64 = 256 << 20;
+/// The most any job may be given: a 32-bit memory's whole range, which a pooled slot reserves anyway.
+const MOST_MEMORY: u64 = 4 << 30;
+/// A reading instance grown past this after a call is dropped, not kept: its memory goes back, as a guest's never
+/// shrinks.
+const RESIDENT: usize = 64 << 20;
+/// How many frames a reading instance stays unused before it is reclaimed.
+const READING_FRAMES: u32 = 60;
+/// How many instances of an extension live at once, at most: its readings', its jobs', its views'.
+const SLOTS: u32 = 16;
+/// What a slot keeps of its memory when its instance goes, to be reset rather than faulted in again by the next.
+const KEEP_RESIDENT: usize = 4 << 20;
 
-/// The engine every component runs in, deterministic: NaNs canonical, relaxed SIMD deterministic, and an epoch for
-/// deadlines.
-fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = Config::new();
-        config.wasm_component_model_async(true);
-        config.epoch_interruption(true);
-        config.cranelift_nan_canonicalization(true);
-        config.relaxed_simd_deterministic(true);
-        let engine = Engine::new(&config).expect("the engine's configuration is valid");
-        let ticking = engine.weak();
+/// An extension's engine, deterministic - NaNs canonical, relaxed SIMD deterministic, an epoch for deadlines - with a
+/// pooling allocator of its own: its slots reserved up front (address space, not memory), at most `SLOTS` instances
+/// of it at once, an instance's memory decommitted to the component's image when it goes and its slot kept warm, so
+/// making one is cheap and dropping one gives its memory back.
+fn new_engine() -> Result<Engine> {
+    let mut pooling = wasmtime::PoolingAllocationConfig::default();
+    pooling
+        .total_component_instances(SLOTS)
+        .total_core_instances(SLOTS * 8)
+        .total_memories(SLOTS * 2)
+        .total_tables(SLOTS * 8)
+        .total_stacks(SLOTS)
+        .max_memory_size(usize::try_from(MOST_MEMORY).unwrap_or(usize::MAX))
+        .linear_memory_keep_resident(KEEP_RESIDENT)
+        .max_unused_warm_slots(4);
+    let mut config = Config::new();
+    config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling));
+    config.wasm_component_model_async(true);
+    config.epoch_interruption(true);
+    config.cranelift_nan_canonicalization(true);
+    config.relaxed_simd_deterministic(true);
+    let engine = Engine::new(&config).map_err(anyhow::Error::from)?;
+    tick(&engine);
+    Ok(engine)
+}
+
+/// Tick an engine's epoch with every other's, on one thread, while it lives.
+fn tick(engine: &Engine) {
+    static TICKED: OnceLock<Mutex<Vec<wasmtime::EngineWeak>>> = OnceLock::new();
+    let started = TICKED.get().is_some();
+    let engines = TICKED.get_or_init(Mutex::default);
+    if let Ok(mut engines) = engines.lock() {
+        engines.push(engine.weak());
+    }
+    if !started {
         std::thread::spawn(move || {
-            while let Some(engine) = ticking.upgrade() {
-                engine.increment_epoch();
-                drop(engine);
+            loop {
+                if let Ok(mut engines) = engines.lock() {
+                    engines.retain(|weak| weak.upgrade().inspect(Engine::increment_epoch).is_some());
+                }
                 std::thread::sleep(TICK);
             }
         });
-        engine
-    })
+    }
 }
 
 /// A clock that never moves: an extension's output may not depend on time.
@@ -220,12 +262,48 @@ pub struct HostTexture {
     image: Arc<Image>,
 }
 
+/// An instance's memory as it grows: linear memory never shrinks, so this is what it holds until it is dropped.
+#[derive(Default)]
+struct Meter {
+    bytes: AtomicUsize,
+}
+
+/// An instance's limits: the cap on each memory, its job's, and its growth counted on its meter.
+struct Limits {
+    meter: Arc<Meter>,
+    cap: u64,
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+        if desired as u64 > self.cap {
+            return Ok(false);
+        }
+        self.meter.bytes.fetch_add(desired.saturating_sub(current), Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn table_growing(&mut self, _current: usize, _desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// What an extension's instances hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// Its live instances, and the memory they hold.
+    pub instances: usize,
+    pub bytes: usize,
+    /// The most an instance of it has held.
+    pub peak: usize,
+}
+
 /// An instance's state: its resources, WASI with nothing behind it, its limits.
 struct State {
     id: String,
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: Limits,
     /// The frames open, the lent one first and its innermost row last: only the last is drawn on.
     frames: Vec<u32>,
     /// The assets the project's queries lent during the call, taken back when it returns.
@@ -316,6 +394,20 @@ impl host::HostAsset for State {
 
     fn read(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
         Ok(self.lent(&asset)?.read(&name).map_err(|e| format!("{e:#}")))
+    }
+
+    fn size(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Option<u64>> {
+        Ok(self.lent(&asset)?.size(&name))
+    }
+
+    fn read_range(
+        &mut self,
+        asset: Resource<LentAsset>,
+        name: String,
+        offset: u64,
+        len: u32,
+    ) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        Ok(self.lent(&asset)?.read_range(&name, offset, len as usize).map_err(|e| format!("{e:#}")))
     }
 
     fn drop(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<()> {
@@ -610,6 +702,16 @@ struct Runner {
     store: Store<State>,
     instance: bindings::Extension,
     runtime: tokio::runtime::Runtime,
+    meter: Arc<Meter>,
+    /// What the guest writes to standard error: a panic's message.
+    stderr: MemoryOutputPipe,
+}
+
+impl Runner {
+    /// The memory it holds.
+    fn bytes(&self) -> usize {
+        self.meter.bytes.load(Ordering::Relaxed)
+    }
 }
 
 impl Runner {
@@ -620,7 +722,7 @@ impl Runner {
         call: impl AsyncFnOnce(&Accessor<State>, &g::Guest) -> wasmtime::Result<R>,
     ) -> Result<R> {
         self.store.set_epoch_deadline(ticks);
-        let Runner { store, instance, runtime } = self;
+        let Runner { store, instance, runtime, .. } = self;
         let guest = instance.pe2_extension_guest();
         let out = runtime.block_on(store.run_concurrent(async |accessor| call(accessor, guest).await));
         // What the project's queries lent goes with the call.
@@ -628,7 +730,13 @@ impl Runner {
         for rep in std::mem::take(&mut data.found) {
             let _ = data.table.delete(Resource::<LentAsset>::new_own(rep));
         }
-        Ok(out??)
+        // A call that traps says what the guest wrote first: a panic's message.
+        let out = match out {
+            Ok(Ok(out)) => return Ok(out),
+            Ok(Err(e)) | Err(e) => e,
+        };
+        let said = String::from_utf8_lossy(&self.stderr.contents()).trim().to_string();
+        Err(if said.is_empty() { anyhow!("{out:#}") } else { anyhow!("{out:#}: {said}") })
     }
 
     /// Lend the project for a call; `unlend_project` takes it back.
@@ -668,59 +776,160 @@ impl Runner {
         out
     }
 
-    /// What standard error the instance wrote: a panic's message.
-    fn stderr(&self, pipe: &MemoryOutputPipe) -> String {
-        let _ = self;
-        String::from_utf8_lossy(&pipe.contents()).trim().to_string()
-    }
 }
 
-/// A component: compiled once, instantiated as often as calls need.
+/// A component, compiled once in an engine of its own, and its instances by the lifetime of their job: a job's (a
+/// picture, an import, a tool's run) made for its call and dropped after it; the readings' (has a picture, a field's
+/// reading, facts), reused while used, reclaimed after `READING_FRAMES` frames unused; the long-running views',
+/// which goes when its last view closes and it says it may. A guest's memory only grows, so dropping its instance is
+/// what gives it back.
 pub struct Shared {
     id: String,
+    engine: Engine,
     pre: bindings::ExtensionPre<State>,
-    pool: Mutex<Vec<Runner>>,
-    /// The instance the views live in, made with the first view.
+    /// The readings' instance, and how many more frames unused it stays.
+    reading: Mutex<Option<(Runner, u32)>>,
+    /// The instance the views live in, made with the first view and dropped with the last.
     views: Mutex<Option<Arc<Mutex<Runner>>>>,
+    /// The views alive in it.
+    open_views: AtomicUsize,
+    /// What its extension declared a job of something it registered may take, by its qualified name; and the most of
+    /// those its views may take, as they share one instance.
+    caps: std::collections::HashMap<String, u64>,
+    views_cap: u64,
+    /// Every instance's meter, while it lives.
+    meters: Mutex<Vec<Weak<Meter>>>,
+    peak: AtomicUsize,
 }
 
 impl Shared {
-    /// A new instance, its registration run (each instance keeps what its extension registered).
-    fn instantiate(&self, register: bool) -> Result<Runner> {
+    /// What a job of something its extension registered may take, by its name within the extension.
+    fn cap(&self, local: &str) -> u64 {
+        self.caps.get(&format!("{}@{local}", self.id)).copied().unwrap_or(MEMORY)
+    }
+
+    /// A new instance for a job that may take `cap` bytes; its extension registers when a call first needs it. Where
+    /// its engine's slots are all taken, room is made - the readings' instance reclaimed, a long-running one asked - and
+    /// it is tried once more.
+    fn instantiate(&self, cap: u64) -> Result<Runner> {
+        match self.instance(cap) {
+            Ok(runner) => Ok(runner),
+            Err(_) if self.make_room() => self.instance(cap),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Room for an instance: the readings' instance reclaimed whatever its frames, and the views' asked whether it may
+    /// go where no view lives in it. Whether any went.
+    fn make_room(&self) -> bool {
+        let mut made = false;
+        if let Ok(mut reading) = self.reading.try_lock() {
+            made |= reading.take().is_some();
+        }
+        if self.open_views.load(Ordering::Relaxed) == 0
+            && let Ok(mut views) = self.views.try_lock()
+            && let Some(runner) = views.as_ref()
+        {
+            let reclaimable = runner.try_lock().ok().is_none_or(|mut r| {
+                r.call(QUICK, async |a, g| g.call_reclaimable(a).await).unwrap_or(true)
+            });
+            if reclaimable {
+                *views = None;
+                made = true;
+            }
+        }
+        made
+    }
+
+    fn instance(&self, cap: u64) -> Result<Runner> {
         let stderr = MemoryOutputPipe::new(64 << 10);
         let wasi = WasiCtx::builder().stderr(stderr.clone()).wall_clock(Still).monotonic_clock(Still).build();
-        let limits = StoreLimitsBuilder::new().memory_size(MEMORY).build();
-        let table = ResourceTable::new();
-        let state = State { id: self.id.clone(), wasi, table, limits, frames: vec![], found: vec![] };
-        let mut store = Store::new(engine(), state);
+        let meter = Arc::new(Meter::default());
+        if let Ok(mut meters) = self.meters.lock() {
+            meters.retain(|m| m.strong_count() > 0);
+            meters.push(Arc::downgrade(&meter));
+        }
+        let limits = Limits { meter: meter.clone(), cap: cap.min(MOST_MEMORY) };
+        let state = State { id: self.id.clone(), wasi, table: ResourceTable::new(), limits, frames: vec![], found: vec![] };
+        let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(LONG);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let instance = runtime.block_on(self.pre.instantiate_async(&mut store))?;
-        let mut runner = Runner { store, instance, runtime };
-        if register {
-            runner
-                .call(LONG, async |accessor, guest| guest.call_register(accessor).await)
-                .map_err(|e| anyhow!("{e:#}: {}", runner.stderr(&stderr)))?
-                .map_err(|e| anyhow!(e))?;
-        }
-        Ok(runner)
+        Ok(Runner { store, instance, runtime, meter, stderr })
     }
 
-    /// Run `call` on an idle instance of the pool, or a new one; an instance that fails is dropped.
-    fn with<R>(&self, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
-        let idle = self.pool.lock().map_err(|_| anyhow!("{}: its pool is poisoned", self.id))?.pop();
-        let mut runner = match idle {
-            Some(runner) => runner,
-            None => self.instantiate(true)?,
+    /// A job that may take `cap` bytes: run on an instance made for it, dropped when it returns.
+    fn job<R>(&self, cap: u64, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
+        let mut runner = self.instantiate(cap).with_context(|| self.id.clone())?;
+        let out = call(&mut runner).with_context(|| self.id.clone());
+        self.peak.fetch_max(runner.bytes(), Ordering::Relaxed);
+        out
+    }
+
+    /// A reading: run on the readings' instance, made if there is none, its frames reset; a reading while it is busy
+    /// on another thread is a job. One that failed, or grew past the budget, goes.
+    fn read<R>(&self, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
+        let Ok(mut reading) = self.reading.try_lock() else { return self.job(MEMORY, call) };
+        let mut runner = match reading.take() {
+            Some((runner, _)) => runner,
+            None => self.instantiate(MEMORY).with_context(|| self.id.clone())?,
         };
         let out = call(&mut runner).with_context(|| self.id.clone());
-        if out.is_ok()
-            && let Ok(mut pool) = self.pool.lock()
-        {
-            pool.push(runner);
+        self.peak.fetch_max(runner.bytes(), Ordering::Relaxed);
+        if out.is_ok() && runner.bytes() <= RESIDENT {
+            *reading = Some((runner, READING_FRAMES));
         }
         out
+    }
+
+    /// A frame ended: the readings' instance, unused for `READING_FRAMES` frames, is reclaimed.
+    pub fn frame(&self) {
+        if let Ok(mut reading) = self.reading.try_lock() {
+            match reading.as_mut() {
+                Some((_, 0)) => *reading = None,
+                Some((_, left)) => *left -= 1,
+                None => {}
+            }
+        }
+    }
+
+    /// Reclaim the readings' instance now: where there are no frames (the agents' server, between its requests).
+    pub fn release(&self) {
+        if let Ok(mut reading) = self.reading.lock() {
+            *reading = None;
+        }
+    }
+
+    /// What its instances hold now, and the most one has held.
+    pub fn memory(&self) -> Memory {
+        let meters: Vec<Arc<Meter>> =
+            self.meters.lock().map_or_default(|m| m.iter().filter_map(Weak::upgrade).collect());
+        let bytes: usize = meters.iter().map(|m| m.bytes.load(Ordering::Relaxed)).sum();
+        let largest = meters.iter().map(|m| m.bytes.load(Ordering::Relaxed)).max().unwrap_or(0);
+        Memory { instances: meters.len(), bytes, peak: self.peak.load(Ordering::Relaxed).max(largest) }
+    }
+
+    /// A view opened in the views' instance.
+    fn view_opened(&self) {
+        self.open_views.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A view closed: with the last, the views' instance goes - if it says it may (it may hold what it cannot
+    /// rebuild cheaply: a scene its next view shows).
+    fn view_closed(&self) {
+        if self.open_views.fetch_sub(1, Ordering::Relaxed) != 1 {
+            return;
+        }
+        let Ok(mut views) = self.views.lock() else { return };
+        let reclaimable = views.as_ref().is_none_or(|runner| {
+            runner.lock().ok().is_none_or(|mut r| {
+                r.call(QUICK, async |a, g| g.call_reclaimable(a).await).unwrap_or(true)
+            })
+        });
+        if reclaimable {
+            *views = None;
+        }
     }
 
     /// The views' instance.
@@ -729,7 +938,7 @@ impl Shared {
         if let Some(runner) = views.as_ref() {
             return Ok(runner.clone());
         }
-        let runner = Arc::new(Mutex::new(self.instantiate(true)?));
+        let runner = Arc::new(Mutex::new(self.instantiate(self.views_cap)?));
         *views = Some(runner.clone());
         Ok(runner)
     }
@@ -743,7 +952,7 @@ impl Shared {
 
     fn format(&self, field: u32, brief: bool, value: &Value) -> Option<String> {
         let text = value.to_string();
-        self.with(|runner| runner.call(QUICK, async |accessor, guest| guest.call_format(accessor, field, brief, text).await))
+        self.read(|runner| runner.call(QUICK, async |accessor, guest| guest.call_format(accessor, field, brief, text).await))
             .ok()
             .flatten()
     }
@@ -753,6 +962,8 @@ impl Shared {
 struct ComponentPicture {
     shared: Arc<Shared>,
     kind: u32,
+    /// What drawing one may take.
+    cap: u64,
 }
 
 fn image(image: types::Image) -> Image {
@@ -763,21 +974,21 @@ impl Picture for ComponentPicture {
     fn has(&self, asset: &Asset) -> bool {
         let kind = self.kind;
         self.shared
-            .with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_has(a, kind, lent).await))
+            .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_has(a, kind, lent).await))
             .unwrap_or(false)
     }
 
     fn looks(&self, asset: &Asset) -> Vec<String> {
         let kind = self.kind;
         self.shared
-            .with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_looks(a, kind, lent).await))
+            .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_looks(a, kind, lent).await))
             .unwrap_or_default()
     }
 
     fn draw(&self, asset: &Asset, look: usize) -> Result<Image> {
         let (kind, look) = (self.kind, u32::try_from(look)?);
         self.shared
-            .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_draw(a, kind, lent, look).await))?
+            .job(self.cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_draw(a, kind, lent, look).await))?
             .map(image)
             .map_err(|e| anyhow!(e))
     }
@@ -786,7 +997,7 @@ impl Picture for ComponentPicture {
         let (kind, part) = (self.kind, part.to_string());
         let made = self
             .shared
-            .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_part(a, kind, lent, part).await));
+            .job(self.cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_part(a, kind, lent, part).await));
         match made {
             Ok(made) => made.map(|m| m.map(image).map_err(|e| anyhow!(e))),
             Err(e) => Some(Err(e)),
@@ -821,6 +1032,7 @@ impl ComponentView {
             Ok((runner, state)) => {
                 out.runner = Some(runner);
                 out.state = Some(state);
+                out.shared.view_opened();
             }
             Err(e) => {
                 out.shared.views_failed();
@@ -887,11 +1099,14 @@ impl View for ComponentView {
 
 impl Drop for ComponentView {
     fn drop(&mut self) {
-        if let (Some(runner), Some(state)) = (&self.runner, self.state.take())
-            && let Ok(mut r) = runner.lock()
-        {
-            let Runner { store, runtime, .. } = &mut *r;
-            let _ = runtime.block_on(state.resource_drop_async(&mut *store));
+        if let (Some(runner), Some(state)) = (self.runner.take(), self.state.take()) {
+            if let Ok(mut r) = runner.lock() {
+                let Runner { store, runtime, .. } = &mut *r;
+                let _ = runtime.block_on(state.resource_drop_async(&mut *store));
+                self.shared.peak.fetch_max(r.bytes(), Ordering::Relaxed);
+            }
+            drop(runner);
+            self.shared.view_closed();
         }
     }
 }
@@ -904,8 +1119,8 @@ struct ComponentExtraction {
 }
 
 impl ComponentExtraction {
-    fn begin(shared: &Shared, extractor: u32, declared: &dyn Declared) -> Result<ComponentExtraction> {
-        let mut runner = shared.instantiate(true)?;
+    fn begin(shared: &Shared, extractor: u32, cap: u64, declared: &dyn Declared) -> Result<ComponentExtraction> {
+        let mut runner = shared.instantiate(cap)?;
         // SAFETY: the pointer is used only during this call, and taken back before it returns.
         let declared = unsafe { erase_declared(declared) };
         let lent = runner.store.data_mut().table.push(LentDeclarations { declared })?;
@@ -949,11 +1164,35 @@ fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shar
             .map(|r| Name::parse(r).with_context(|| format!("{r}: not a qualified role")))
             .collect::<Result<Vec<_>>>()?;
         let (shared, handle) = (shared.clone(), extractor.handle);
+        let cap = shared.cap(&extractor.name);
         let _ = registry.extractor(&extractor.name, &kind, &roles, move |declared| {
-            Ok(Box::new(ComponentExtraction::begin(&shared, handle, declared)?) as Box<dyn Extraction>)
+            Ok(Box::new(ComponentExtraction::begin(&shared, handle, cap, declared)?) as Box<dyn Extraction>)
         });
     }
     Ok(())
+}
+
+/// What an extension declared its jobs may take, by qualified name: only of what it registers, at most `MOST_MEMORY`.
+fn caps(id: &str, registration: &g::Registration) -> Result<std::collections::HashMap<String, u64>> {
+    let mut out = std::collections::HashMap::new();
+    for (name, bytes) in &registration.memory {
+        let qualified = Name::parse(name).with_context(|| format!("memory for {name}: not a qualified name"))?;
+        anyhow::ensure!(qualified.extension() == id, "memory for {name}: not something {id} registers");
+        out.insert(name.clone(), (*bytes).min(MOST_MEMORY));
+    }
+    Ok(out)
+}
+
+/// What the views' instance may take: the most any kind, role or panel with views was given, as they share it.
+fn views_cap(id: &str, registration: &g::Registration, caps: &std::collections::HashMap<String, u64>) -> u64 {
+    let with_views = registration
+        .kinds
+        .iter()
+        .filter(|k| !k.views.is_empty() || !k.inspector.is_empty())
+        .map(|k| k.name.as_str())
+        .chain(registration.roles.iter().filter(|r| !r.views.is_empty() || !r.inspector.is_empty()).map(|r| r.name.as_str()))
+        .chain(registration.panels.iter().map(|p| p.name.as_str()));
+    with_views.filter_map(|local| caps.get(&format!("{id}@{local}")).copied()).fold(MEMORY, u64::max)
 }
 
 /// A field as its component describes it, its readings called back.
@@ -1029,14 +1268,15 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         for f in kind.fields {
             builder = builder.field(field(shared, f));
         }
+        let cap = shared.cap(&kind.name);
         if kind.picture {
-            builder = builder.picture(ComponentPicture { shared: shared.clone(), kind: index });
+            builder = builder.picture(ComponentPicture { shared: shared.clone(), kind: index, cap });
         }
         if kind.thumbnail {
             let shared = shared.clone();
             builder = builder.thumbnail(move |asset, side| {
                 let side = u32::try_from(side).ok()?;
-                let made = shared.with(|r| {
+                let made = shared.job(cap, |r| {
                     r.with_asset(asset, LONG, async |a, g, lent| g.call_thumbnail(a, index, lent, side).await)
                 });
                 match made {
@@ -1049,7 +1289,7 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
             let shared = shared.clone();
             builder = builder.facts(move |asset| {
                 let text = shared
-                    .with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_facts(a, index, lent).await))
+                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_facts(a, index, lent).await))
                     .unwrap_or_default();
                 toml::from_str(&text).unwrap_or_default()
             });
@@ -1058,7 +1298,7 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
             let shared = shared.clone();
             builder = builder.parts(move |asset| {
                 let parts = shared
-                    .with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_parts(a, index, lent).await))
+                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_parts(a, index, lent).await))
                     .unwrap_or_default();
                 parts.into_iter().map(|p| pe2_ext::Part { id: p.id, label: p.label, made_of: p.made_of }).collect()
             });
@@ -1098,9 +1338,10 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     apply_extractors(registry, registration.extractors, shared)?;
     for tool in registration.tools {
         let (shared, handle, name) = (shared.clone(), tool.handle, tool.name.clone());
+        let cap = shared.cap(&tool.name);
         registry.tool(&tool.name, &tool.description, &tool.schema, move |project, arguments| {
             let arguments = arguments.to_string();
-            let answer = shared.with(|r| {
+            let answer = shared.job(cap, |r| {
                 let lent = r.lend_project(project)?;
                 let borrowed = Resource::new_borrow(lent.rep());
                 let out = r.call(LONG, async |a, g| g.call_run(a, handle, borrowed, arguments).await);
@@ -1133,7 +1374,7 @@ fn apply_formats(registry: &mut Registry, formats: Vec<g::FileFormat>, shared: &
             builder = builder.sniff(move |name, size, head| {
                 let (name, head) = (name.to_string(), head.to_vec());
                 let version = shared
-                    .with(|r| r.call(QUICK, async |a, g| g.call_sniff(a, handle, name, size, head).await))
+                    .read(|r| r.call(QUICK, async |a, g| g.call_sniff(a, handle, name, size, head).await))
                     .ok()
                     .flatten()?;
                 Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
@@ -1167,7 +1408,7 @@ fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared:
             let (shared, handle) = (shared.clone(), importer.handle);
             builder = builder.check(move |asset| {
                 let support =
-                    shared.with(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_check(a, handle, lent).await));
+                    shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_check(a, handle, lent).await));
                 match support {
                     Ok(g::Support::Full) => pe2_ext::Support::Full,
                     Ok(g::Support::Partial((reason, offer))) => pe2_ext::Support::Partial { reason, offer },
@@ -1175,11 +1416,12 @@ fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared:
                 }
             });
         }
+        let cap = shared.cap(&importer.name);
         if importer.imports {
             let (shared, handle) = (shared.clone(), importer.handle);
             builder = builder.import(move |asset| {
                 let made = shared
-                    .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_native(a, handle, lent).await))?;
+                    .job(cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_native(a, handle, lent).await))?;
                 let made = made.map_err(|e| pe2_ext::anyhow!("{e}"))?;
                 let settings = toml::from_str(&made.settings).context("the settings an import derived")?;
                 Ok(pe2_ext::Imported { files: made.files, settings })
@@ -1192,7 +1434,7 @@ fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared:
             let (shared, handle) = (shared.clone(), importer.handle);
             builder = builder.export(move |asset| {
                 let made = shared
-                    .with(|r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_source(a, handle, lent).await))?;
+                    .job(cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_source(a, handle, lent).await))?;
                 made.map_err(|e| pe2_ext::anyhow!("{e}"))
             });
         }
@@ -1232,11 +1474,11 @@ fn sweep(dir: &Path) {
 
 /// A component compiled: read back from the cache, or compiled and kept. A kept file starts with the SHA-1 of the
 /// rest, checked before wasmtime is trusted with it.
-fn compile(bytes: &[u8]) -> Result<Component> {
+fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
     use sha1::{Digest, Sha1};
     use std::hash::{Hash, Hasher};
     let mut settings = std::hash::DefaultHasher::new();
-    engine().precompile_compatibility_hash().hash(&mut settings);
+    engine.precompile_compatibility_hash().hash(&mut settings);
     let key = format!("{}-{:016x}", crate::extract::sha1_hex(bytes), settings.finish());
     let file = compiled_dir().map(|dir| dir.join(format!("{key}.cwasm")));
     if let Some(kept) = file.as_ref().and_then(|f| std::fs::read(f).ok())
@@ -1245,11 +1487,11 @@ fn compile(bytes: &[u8]) -> Result<Component> {
     {
         // SAFETY: what `serialize` wrote for this engine's settings (the key) and these bytes, unchanged since (the
         // digest).
-        if let Ok(component) = unsafe { Component::deserialize(engine(), code) } {
+        if let Ok(component) = unsafe { Component::deserialize(engine, code) } {
             return Ok(component);
         }
     }
-    let component = Component::new(engine(), bytes).map_err(anyhow::Error::from)?;
+    let component = Component::new(engine, bytes).map_err(anyhow::Error::from)?;
     if let Some(file) = file
         && let Ok(code) = component.serialize()
     {
@@ -1279,26 +1521,43 @@ pub fn load(path: &Path) -> Result<Loadable> {
 /// # Errors
 /// It cannot be compiled or instantiated, or its registration fails.
 pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
-    let component = compile(bytes).with_context(|| name.to_string())?;
-    let mut linker = Linker::<State>::new(engine());
+    let engine = new_engine()?;
+    let component = compile(&engine, bytes).with_context(|| name.to_string())?;
+    let mut linker = Linker::<State>::new(&engine);
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     bindings::Extension::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
     let pre = bindings::ExtensionPre::new(linker.instantiate_pre(&component)?)?;
-    let mut shared = Shared { id: name.to_string(), pre, pool: Mutex::new(vec![]), views: Mutex::new(None) };
-    let mut runner = shared.instantiate(false)?;
+    let mut shared = Shared {
+        id: name.to_string(),
+        engine,
+        pre,
+        reading: Mutex::new(None),
+        views: Mutex::new(None),
+        open_views: AtomicUsize::new(0),
+        caps: std::collections::HashMap::new(),
+        views_cap: MEMORY,
+        meters: Mutex::new(vec![]),
+        peak: AtomicUsize::new(0),
+    };
+    let mut runner = shared.instantiate(MEMORY)?;
     let about = runner.call(LONG, async |accessor, guest| guest.call_describe(accessor).await)?;
     let registration = runner
         .call(LONG, async |accessor, guest| guest.call_register(accessor).await)?
         .map_err(|e| anyhow!("{name}: its registration failed: {e}"))?;
     shared.id.clone_from(&about.id);
+    shared.caps = caps(&about.id, &registration)?;
+    shared.views_cap = views_cap(&about.id, &registration, &shared.caps);
     runner.store.data_mut().id.clone_from(&about.id);
-    shared.pool.get_mut().map_err(|_| anyhow!("{name}: its pool is poisoned"))?.push(runner);
+    // The first instance, registered already, answers the first readings.
+    *shared.reading.get_mut().map_err(|_| anyhow!("{name}: its readings are poisoned"))? = Some((runner, READING_FRAMES));
     let shared = Arc::new(shared);
+    let component = shared.clone();
     Ok(Loadable {
         id: about.id,
         version: about.version,
         requires: about.requires,
         origin,
         register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
+        component: Some(component),
     })
 }

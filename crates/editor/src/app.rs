@@ -853,6 +853,10 @@ impl eframe::App for Editor {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
         }
         self.drive.update(&ctx, self.agents_drive || self.settings.agents.drive);
+        // A frame of the extensions' readings: one unused for long enough gives its memory back.
+        if let Some(ws) = &self.workspace {
+            ws.extensions.frame();
+        }
         self.history_keys(&ctx);
         if let Some(ws) = &mut self.workspace {
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {

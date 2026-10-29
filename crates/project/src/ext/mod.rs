@@ -16,7 +16,7 @@ use pe2_ext::{
     Signature, Source, Support, Table, Tint, ToolDef, Value, ViewDef,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 use crate::index;
@@ -42,6 +42,8 @@ pub struct Loadable {
     pub requires: Vec<String>,
     pub origin: Origin,
     register: Option<Register>,
+    /// Its component, where it runs as one: its instances, their memory.
+    component: Option<Arc<component::Shared>>,
 }
 
 impl From<Extension> for Loadable {
@@ -52,6 +54,7 @@ impl From<Extension> for Loadable {
             requires: extension.requires.iter().map(ToString::to_string).collect(),
             origin: Origin::Linked,
             register: Some(Box::new(move |registry| (extension.register)(registry))),
+            component: None,
         }
     }
 }
@@ -77,6 +80,8 @@ pub struct Extensions {
     formats: Vec<FormatDef>,
     importers: HashMap<String, ImporterDef>,
     extractors: Vec<pe2_ext::ExtractorDef>,
+    /// The components of the extensions loaded, by id.
+    components: Vec<(String, Arc<component::Shared>)>,
     /// The formats recognized in files, by their content's hash.
     recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
@@ -233,6 +238,9 @@ impl Extensions {
             anyhow::ensure!(builtin, "only a built-in extension names a kind or role bare ({alias})");
         }
         let index = self.loaded.len();
+        if let Some(component) = &extension.component {
+            self.components.push((extension.id.clone(), component.clone()));
+        }
         let (id, version, origin) = (extension.id.clone(), extension.version.clone(), extension.origin.clone());
         self.loaded.push(Loaded { id, version, origin });
         for kind in kinds {
@@ -436,6 +444,26 @@ impl Extensions {
         self.importers.get(name)
     }
 
+    /// What each extension running as a component holds: its live instances and their memory, by id.
+    #[must_use]
+    pub fn memory(&self) -> Vec<(&str, component::Memory)> {
+        self.components.iter().map(|(id, c)| (id.as_str(), c.memory())).collect()
+    }
+
+    /// A frame ended: each extension's readings' instance unused for long enough is reclaimed.
+    pub fn frame(&self) {
+        for (_, component) in &self.components {
+            component.frame();
+        }
+    }
+
+    /// Reclaim every readings' instance now: where there are no frames (the agents' server, between requests).
+    pub fn release(&self) {
+        for (_, component) in &self.components {
+            component.release();
+        }
+    }
+
     /// The extractor of assets of a declared kind and role (`image`, `atlas`), where an extension registers one.
     #[must_use]
     pub fn extractor_for(&self, kind: &str, role: Option<&str>) -> Option<&pe2_ext::ExtractorDef> {
@@ -595,6 +623,20 @@ impl Source for index::Asset {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let file = self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
         std::fs::read(&file.path).with_context(|| file.path.display().to_string())
+    }
+
+    fn size(&self, name: &str) -> Option<u64> {
+        Some(self.files.iter().find(|f| f.name == name)?.size)
+    }
+
+    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let file = self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
+        let mut opened = std::fs::File::open(&file.path).with_context(|| file.path.display().to_string())?;
+        opened.seek(SeekFrom::Start(offset))?;
+        let mut out = Vec::with_capacity(len.min(usize::try_from(file.size.saturating_sub(offset)).unwrap_or(len)));
+        opened.take(len as u64).read_to_end(&mut out)?;
+        Ok(out)
     }
 }
 

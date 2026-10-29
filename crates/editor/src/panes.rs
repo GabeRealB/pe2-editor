@@ -1295,6 +1295,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         });
     }
     theme::section(ui, "Extensions", |ui| {
+        let memory = ws.extensions.memory();
         for extension in &ws.extensions.loaded {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&extension.id).strong());
@@ -1310,6 +1311,13 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
                     project::ext::Origin::Component(path) => {
                         theme::short(ui, RichText::new(path.display().to_string()).small().color(theme::weak()));
                     }
+                }
+                // What its instances hold: a guest's memory only grows, until an idle instance is dropped.
+                if let Some((_, m)) = memory.iter().find(|(id, _)| *id == extension.id) {
+                    let mib = |bytes: usize| bytes.div_ceil(1 << 20);
+                    let text = format!("{} MiB in {} instance{}", mib(m.bytes), m.instances, if m.instances == 1 { "" } else { "s" });
+                    ui.label(RichText::new(text).small().color(theme::weak()))
+                        .on_hover_text(format!("The most one instance has held: {} MiB", mib(m.peak)));
                 }
             });
         }
