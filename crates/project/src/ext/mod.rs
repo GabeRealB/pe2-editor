@@ -44,6 +44,8 @@ pub struct Loadable {
     register: Option<Register>,
     /// Its component, where it runs as one - set when it registers: its instances, their memory.
     component: Option<Arc<std::sync::OnceLock<Arc<component::Shared>>>>,
+    /// Its component's size in bytes, where it is one.
+    pub size: Option<usize>,
 }
 
 impl From<Extension> for Loadable {
@@ -55,6 +57,7 @@ impl From<Extension> for Loadable {
             origin: Origin::Linked,
             register: Some(Box::new(move |registry| (extension.register)(registry))),
             component: None,
+            size: None,
         }
     }
 }
@@ -69,10 +72,58 @@ pub struct Loaded {
     pub requires: Vec<String>,
 }
 
+/// An extension present, loaded or not: who it is, what became of it, what it registered.
+#[derive(Clone, Debug)]
+pub struct Present {
+    pub id: String,
+    pub version: String,
+    pub origin: Origin,
+    pub requires: Vec<String>,
+    pub status: Status,
+    /// Its component's size in bytes, where it is one.
+    pub size: Option<usize>,
+    /// How long registering it took (compiling and instantiating a component), where it was registered.
+    pub load: Option<std::time::Duration>,
+    /// What it registered, by what it is - kinds, roles, formats, importers, extractors, panels, tools, services -
+    /// each name qualified.
+    pub registers: Registers,
+}
+
+/// What an extension registered, by what it is (`kinds`, `services`, ...), each name qualified.
+pub type Registers = Vec<(&'static str, Vec<String>)>;
+
+impl Present {
+    fn of(extension: &Loadable, status: Status) -> Present {
+        Present {
+            id: extension.id.clone(),
+            version: extension.version.clone(),
+            origin: extension.origin.clone(),
+            requires: extension.requires.clone(),
+            status,
+            size: extension.size,
+            load: None,
+            registers: vec![],
+        }
+    }
+}
+
+/// What became of an extension present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    Loaded,
+    /// Left off by the project (`[extensions] disabled`).
+    Disabled,
+    /// Not loaded, and why: a requirement missing, disabled or too old, a cycle, its registration failing, another of
+    /// its id.
+    Refused(String),
+}
+
 /// The extensions loaded, and what they registered.
 #[derive(Default)]
 pub struct Extensions {
     pub loaded: Vec<Loaded>,
+    /// Every extension present, in the order found, loaded or not.
+    pub present: Vec<Present>,
     /// What was refused or disabled, and why.
     pub problems: Vec<String>,
     kinds: HashMap<String, (KindDef, usize)>,
@@ -120,21 +171,35 @@ impl Extensions {
     /// Load `extensions`, built-ins (`builtin`) or a project's own.
     #[must_use]
     pub fn load(extensions: Vec<Loadable>, builtin: bool) -> Extensions {
+        Extensions::load_without(extensions, builtin, &[])
+    }
+
+    /// Load `extensions` but those a project leaves off (`disabled`, by id) - and those requiring them.
+    #[must_use]
+    pub fn load_without(extensions: Vec<Loadable>, builtin: bool, disabled: &[String]) -> Extensions {
         let mut out = Extensions::default();
         let mut pending: Vec<Loadable> = vec![];
         for extension in extensions {
             if pending.iter().any(|e| e.id == extension.id) {
-                out.problems.push(format!("{}: another extension has this id; the second is not loaded", extension.id));
+                let why = "another extension has this id; the second is not loaded".to_string();
+                out.problems.push(format!("{}: {why}", extension.id));
+                out.present.push(Present::of(&extension, Status::Refused(why)));
             } else {
                 pending.push(extension);
             }
         }
         let ids: HashSet<String> = pending.iter().map(|e| e.id.clone()).collect();
-        let mut disabled: HashSet<String> = HashSet::new();
+        let mut off: HashSet<String> = HashSet::new();
+        let mut status: HashMap<String, Status> = HashMap::new();
+        for extension in pending.iter().filter(|e| disabled.contains(&e.id)) {
+            off.insert(extension.id.clone());
+            status.insert(extension.id.clone(), Status::Disabled);
+        }
+        let mut timings: HashMap<String, (std::time::Duration, Registers)> = HashMap::new();
         loop {
             let mut progress = false;
             for extension in &mut pending {
-                if disabled.contains(&extension.id) || out.loaded.iter().any(|l| l.id == extension.id) {
+                if off.contains(&extension.id) || out.loaded.iter().any(|l| l.id == extension.id) {
                     continue;
                 }
                 let mut ready = true;
@@ -142,7 +207,7 @@ impl Extensions {
                     let (id, version) = requirement(text);
                     let blocked = if !ids.contains(id) {
                         Some(format!("it needs {text}, which is not installed"))
-                    } else if disabled.contains(id) {
+                    } else if off.contains(id) {
                         Some(format!("it needs {id}, which is disabled"))
                     } else if let Some(loaded) = out.loaded.iter().find(|l| l.id == id) {
                         version.filter(|v| !satisfies(&loaded.version, v)).map(|v| {
@@ -154,19 +219,28 @@ impl Extensions {
                     };
                     if let Some(why) = blocked {
                         out.problems.push(format!("{} is disabled: {why}", extension.id));
-                        disabled.insert(extension.id.clone());
+                        status.insert(extension.id.clone(), Status::Refused(why));
+                        off.insert(extension.id.clone());
                         ready = false;
                         progress = true;
                         break;
                     }
                 }
-                if !ready || disabled.contains(&extension.id) {
+                if !ready || off.contains(&extension.id) {
                     continue;
                 }
                 progress = true;
-                if let Err(e) = out.register(extension, builtin) {
-                    out.problems.push(format!("{} is disabled: {e:#}", extension.id));
-                    disabled.insert(extension.id.clone());
+                let started = std::time::Instant::now();
+                match out.register(extension, builtin) {
+                    Ok(registers) => {
+                        timings.insert(extension.id.clone(), (started.elapsed(), registers));
+                        status.insert(extension.id.clone(), Status::Loaded);
+                    }
+                    Err(e) => {
+                        out.problems.push(format!("{} is disabled: {e:#}", extension.id));
+                        status.insert(extension.id.clone(), Status::Refused(format!("{e:#}")));
+                        off.insert(extension.id.clone());
+                    }
                 }
             }
             if !progress {
@@ -174,19 +248,39 @@ impl Extensions {
             }
         }
         for extension in &pending {
-            if !disabled.contains(&extension.id) && !out.loaded.iter().any(|l| l.id == extension.id) {
-                out.problems.push(format!("{} is disabled: its requirements form a cycle", extension.id));
+            let status = status.remove(&extension.id).unwrap_or_else(|| {
+                let why = "its requirements form a cycle".to_string();
+                out.problems.push(format!("{} is disabled: {why}", extension.id));
+                Status::Refused(why)
+            });
+            let mut present = Present::of(extension, status);
+            if let Some((load, registers)) = timings.remove(&extension.id) {
+                present.load = Some(load);
+                present.registers = registers;
             }
+            out.present.push(present);
         }
         out
     }
 
-    /// Call an extension's entry point and take what it registered, checked.
-    fn register(&mut self, extension: &mut Loadable, builtin: bool) -> Result<()> {
+
+    /// Call an extension's entry point and take what it registered, checked: what it registered, by what it is.
+    fn register(&mut self, extension: &mut Loadable, builtin: bool) -> Result<Registers> {
         let mut registry = Registry::new(&extension.id);
         let register = extension.register.take().context("it was registered already")?;
         register(&mut registry).context("its registration failed")?;
         let parts = registry.into_parts();
+        let listed = |names: Vec<&pe2_ext::Name>| names.into_iter().map(ToString::to_string).collect::<Vec<_>>();
+        let registers = vec![
+            ("kinds", listed(parts.kinds.iter().map(|k| &k.name).collect())),
+            ("roles", listed(parts.roles.iter().map(|r| &r.name).collect())),
+            ("formats", listed(parts.formats.iter().map(|f| &f.name).collect())),
+            ("importers", listed(parts.importers.iter().map(|i| &i.name).collect())),
+            ("extractors", listed(parts.extractors.iter().map(|e| &e.name).collect())),
+            ("panels", listed(parts.panels.iter().map(|p| &p.name).collect())),
+            ("tools", listed(parts.tools.iter().map(|t| &t.name).collect())),
+            ("services", listed(parts.services.iter().map(|s| &s.name).collect())),
+        ];
         let (kinds, roles) = (parts.kinds, parts.roles);
         let dependencies: Vec<&str> = extension.requires.iter().map(|r| requirement(r).0).collect();
         let mut seen = HashSet::new();
@@ -265,7 +359,7 @@ impl Extensions {
         self.formats.extend(parts.formats);
         self.importers.extend(parts.importers.into_iter().map(|i| (i.name.to_string(), i)));
         self.extractors.extend(parts.extractors);
-        Ok(())
+        Ok(registers)
     }
 
     /// The kind a declaration names, qualified or by a built-in's bare alias.
@@ -885,5 +979,26 @@ mod calling {
         assert!(!lens.may_call("test.stray", "test.paint@red"));
         assert!(!lens.may_call("test.scene", "test.paint@nothing"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_project_leaves_extensions_off_with_those_requiring_them() {
+        let extension = |id: &'static str, requires: &'static [&'static str], register: fn(&mut Registry) -> Result<()>| {
+            Loadable::from(Extension { id, version: "0.1.0", requires, register })
+        };
+        let loaded = Extensions::load_without(
+            vec![extension("test.paint", &[], paint), extension("test.scene", &["test.paint@^0.1"], scene), extension("test.stray", &[], stray)],
+            true,
+            &["test.paint".to_string()],
+        );
+        let status = |id: &str| loaded.present.iter().find(|p| p.id == id).map(|p| p.status.clone());
+        assert_eq!(status("test.paint"), Some(super::Status::Disabled));
+        assert!(matches!(status("test.scene"), Some(super::Status::Refused(why)) if why.contains("disabled")));
+        assert_eq!(status("test.stray"), Some(super::Status::Loaded));
+        assert_eq!(loaded.loaded.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["test.stray"]);
+        let all = Extensions::load(vec![extension("test.paint", &[], paint)], true);
+        let painter = &all.present[0];
+        assert!(painter.load.is_some());
+        assert_eq!(painter.registers.iter().find(|(what, _)| *what == "services").map(|(_, n)| n.clone()), Some(vec!["test.paint@red".to_string()]));
     }
 }

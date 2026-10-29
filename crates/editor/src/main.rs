@@ -16,6 +16,7 @@
 mod app;
 mod drive;
 mod ext_ui;
+mod extensions_pane;
 mod external;
 mod icons;
 mod inspector;

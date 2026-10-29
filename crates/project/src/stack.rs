@@ -14,13 +14,13 @@ use crate::history::History;
 use crate::index::LayerInfo;
 use crate::{FILE, LAYERS, LayerKind, Project};
 
-fn read(root: &Path) -> Result<DocumentMut> {
+pub(crate) fn read(root: &Path) -> Result<DocumentMut> {
     let path = root.join(FILE);
     let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
     text.parse().with_context(|| format!("{}", path.display()))
 }
 
-fn write(root: &Path, document: &DocumentMut, history: &mut History, label: String) -> Result<()> {
+pub(crate) fn write(root: &Path, document: &DocumentMut, history: &mut History, label: String) -> Result<()> {
     let mut tx = history.begin(label);
     tx.write(&root.join(FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)

@@ -50,12 +50,13 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
         let mut index = Index::open(&project, &cache)?;
-        let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions::shared());
-        Ok((project, index))
+        // The extensions as the project has them: without those it leaves off.
+        let extensions = extensions::for_project(&project.disabled_extensions);
+        let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
+        Ok((project, index, extensions))
     });
     match opened {
-        Ok((project, index)) => {
-            let extensions = extensions::shared();
+        Ok((project, index, extensions)) => {
             let reply = answer(&mut View { project: &project, index: &index, extensions: &extensions, editor: None }, request);
             // The server has no frames, and waits for the next request: its extensions' readings give their memory back.
             extensions.release();

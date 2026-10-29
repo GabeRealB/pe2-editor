@@ -6,7 +6,8 @@
 //! step through one in a debugger or compare the two.
 
 use project::ext::{Extensions, Loadable, Origin, component};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 include!(concat!(env!("OUT_DIR"), "/components.rs"));
 
@@ -25,8 +26,14 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
 #[must_use]
 pub fn load() -> Extensions {
+    load_without(&[])
+}
+
+/// Load the built-ins but those a project leaves off (`disabled`, by id), and those requiring them.
+#[must_use]
+pub fn load_without(disabled: &[String]) -> Extensions {
     if std::env::var_os("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
-        return Extensions::load(linked().into_iter().map(Into::into).collect(), true);
+        return Extensions::load_without(linked().into_iter().map(Into::into).collect(), true, disabled);
     }
     let mut loadable: Vec<Loadable> = vec![];
     let mut failed = vec![];
@@ -36,15 +43,27 @@ pub fn load() -> Extensions {
             Err(e) => failed.push(format!("{package}: {e:#}")),
         }
     }
-    let mut extensions = Extensions::load(loadable, true);
+    let mut extensions = Extensions::load_without(loadable, true, disabled);
     extensions.problems.extend(failed);
     extensions
 }
 
 /// The built-ins, loaded once a process.
+#[must_use]
 pub fn shared() -> Arc<Extensions> {
-    static SHARED: OnceLock<Arc<Extensions>> = OnceLock::new();
-    SHARED.get_or_init(|| Arc::new(load())).clone()
+    for_project(&[])
+}
+
+/// The built-ins as a project has them - but those it leaves off - loaded once a process for each such set.
+#[must_use]
+pub fn for_project(disabled: &[String]) -> Arc<Extensions> {
+    static LOADED: OnceLock<Mutex<HashMap<Vec<String>, Arc<Extensions>>>> = OnceLock::new();
+    let mut key = disabled.to_vec();
+    key.sort_unstable();
+    key.dedup();
+    let loaded = LOADED.get_or_init(Mutex::default);
+    let mut loaded = loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loaded.entry(key.clone()).or_insert_with(|| Arc::new(load_without(&key))).clone()
 }
 
 #[cfg(test)]

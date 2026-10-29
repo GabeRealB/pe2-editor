@@ -1651,6 +1651,7 @@ const SECTION: &str = "pe2-extension";
 /// # Errors
 /// One without the section cannot be compiled or instantiated, or its registration fails.
 pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
+    let size = bytes.len();
     let cell: Arc<OnceLock<Arc<Shared>>> = Arc::default();
     if let Some(about) = about(bytes) {
         let (name, bytes, said, kept) = (name.to_string(), bytes.to_vec(), about.clone(), cell.clone());
@@ -1666,6 +1667,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
                 apply(registry, registration, &shared)
             })),
             component: Some(cell),
+            size: Some(size),
         });
     }
     let (shared, about, registration) = start(name, bytes)?;
@@ -1677,6 +1679,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
         origin,
         register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
         component: Some(cell),
+        size: Some(size),
     })
 }
 

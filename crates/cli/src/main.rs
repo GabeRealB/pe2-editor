@@ -163,7 +163,7 @@ fn main() -> Result<()> {
                 eprintln!("warning: {why}");
             }
             let options = project::extract::Options { releases: release, roms, declarations };
-            let extensions = extensions::shared();
+            let extensions = extensions::for_project(&p.disabled_extensions);
             for problem in &extensions.problems {
                 eprintln!("warning: {problem}");
             }

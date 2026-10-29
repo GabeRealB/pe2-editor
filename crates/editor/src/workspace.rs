@@ -296,7 +296,8 @@ impl Workspace {
         // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
-        let extensions = extensions::shared();
+        // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
+        let extensions = extensions::for_project(&project.disabled_extensions);
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
         let _ = imports.attach(&mut index, &extensions);

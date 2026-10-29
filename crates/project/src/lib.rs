@@ -14,6 +14,7 @@ pub mod index;
 pub mod lock;
 pub mod stack;
 pub mod store;
+pub mod switches;
 pub mod uid;
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,15 @@ struct ProjectFile {
     layer: Vec<LayerFile>,
     #[serde(default)]
     mount: Vec<MountFile>,
+    #[serde(default)]
+    extensions: ExtensionsFile,
+}
+
+/// `[extensions]`: the extensions the project leaves off.
+#[derive(Default, Deserialize)]
+struct ExtensionsFile {
+    #[serde(default)]
+    disabled: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +152,8 @@ pub struct Project {
     pub game: Option<Game>,
     pub layers: Vec<Layer>,
     pub mounts: Vec<Mount>,
+    /// The extensions it leaves off, by id (`[extensions] disabled`): everyone on it reads its assets the same way.
+    pub disabled_extensions: Vec<String>,
 }
 
 fn resolve_path(directory: &Path, value: &str) -> PathBuf {
@@ -215,7 +227,7 @@ impl Project {
                 mounted: false,
             });
         }
-        Ok(Project { root, game, layers, mounts })
+        Ok(Project { root, game, layers, mounts, disabled_extensions: file.extensions.disabled })
     }
 
     /// A `res://` path's place on disk, through the mounts (the longest mount point first).

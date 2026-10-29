@@ -62,6 +62,7 @@ pub enum PaneKind {
     Layers,
     Layer,
     History,
+    Extensions,
     Panel(PanelName),
 }
 
@@ -79,6 +80,7 @@ enum StoredKind {
     Layers,
     Layer,
     History,
+    Extensions,
     Panel(PanelName),
 }
 
@@ -96,6 +98,7 @@ impl From<StoredKind> for PaneKind {
             StoredKind::Layers => PaneKind::Layers,
             StoredKind::Layer => PaneKind::Layer,
             StoredKind::History => PaneKind::History,
+            StoredKind::Extensions => PaneKind::Extensions,
             StoredKind::Panel(name) => PaneKind::Panel(name),
         }
     }
@@ -103,7 +106,7 @@ impl From<StoredKind> for PaneKind {
 
 impl PaneKind {
     /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
-    pub const ALL: [PaneKind; 10] = [
+    pub const ALL: [PaneKind; 11] = [
         PaneKind::Assets,
         PaneKind::Preview,
         PaneKind::Layer,
@@ -113,6 +116,7 @@ impl PaneKind {
         PaneKind::Layers,
         PaneKind::History,
         PaneKind::Project,
+        PaneKind::Extensions,
         PaneKind::Settings,
     ];
 
@@ -128,6 +132,7 @@ impl PaneKind {
             PaneKind::Layers => icons::STACK_SIMPLE,
             PaneKind::Layer => icons::GIT_DIFF,
             PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
+            PaneKind::Extensions => icons::PLUGS_CONNECTED,
             PaneKind::Panel(name) => {
                 extensions::shared().panel(name.as_str()).and_then(|p| p.icon).map_or(icons::SQUARES_FOUR, icons::glyph)
             }
@@ -153,7 +158,7 @@ impl PaneKind {
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview)
+        matches!(self, PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview | PaneKind::Extensions)
     }
 
     pub fn title(self) -> String {
@@ -168,6 +173,7 @@ impl PaneKind {
             PaneKind::Layers => "Layers",
             PaneKind::Layer => "Layer",
             PaneKind::History => "History",
+            PaneKind::Extensions => "Extensions",
             PaneKind::Panel(name) => {
                 return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
             }
@@ -319,6 +325,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
+                    PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, message),
                     PaneKind::Settings => {}
                 }
             });
