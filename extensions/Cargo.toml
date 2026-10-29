@@ -1,0 +1,13 @@
+[package]
+name = "extensions"
+description = "The extensions the editor ships, loaded for every project"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true
+pe2-images.workspace = true

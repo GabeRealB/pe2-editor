@@ -963,10 +963,12 @@ dependencies = [
  "eframe",
  "egui_extras",
  "egui_tiles",
+ "extensions",
  "mcp",
  "notify",
+ "pe2-ext",
+ "pe2-images",
  "png",
- "preview",
  "project",
  "serde",
  "serde_json",
@@ -1248,6 +1250,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "extensions"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+ "pe2-images",
 ]
 
 [[package]]
@@ -2368,8 +2378,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "extensions",
  "interprocess",
- "preview",
+ "pe2-ext",
+ "pe2-images",
  "project",
  "rmcp",
  "schemars",
@@ -3074,6 +3086,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pe2-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "toml",
+]
+
+[[package]]
+name = "pe2-images"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "pe2-ext",
+ "toml",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3259,17 +3288,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "preview"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "codecs",
- "png",
- "project",
- "toml",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3302,6 +3320,8 @@ dependencies = [
  "codecs",
  "formats",
  "getrandom 0.3.4",
+ "pe2-ext",
+ "png",
  "pollster 0.4.0",
  "serde",
  "serde_json",

@@ -6,6 +6,7 @@ pub mod cache;
 pub mod changeset;
 pub mod declarations;
 pub mod edit;
+pub mod ext;
 pub mod extract;
 pub mod history;
 pub mod index;

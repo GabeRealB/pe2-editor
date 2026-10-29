@@ -53,6 +53,8 @@ pub struct EditorState {
 pub struct View<'a> {
     pub project: &'a project::Project,
     pub index: &'a project::index::Index,
+    /// What the extensions say of the assets: their pictures, their looks.
+    pub extensions: &'a project::ext::Extensions,
     /// Present where the editor answers.
     pub editor: Option<EditorState>,
 }

@@ -4,13 +4,14 @@
 
 use eframe::egui::{self, Color32, RichText};
 use egui_tiles::{Tile, TileId, Tiles, UiResponse};
+use project::ext::Extensions;
 use project::index::Asset;
 use serde::{Deserialize, Serialize};
 
 use crate::external::{self, Category};
 use crate::inspector::{badge, size_text};
 use crate::settings::{EditorSettings, Preview, Theme, Tools, Upscale};
-use crate::workspace::{EditRequest, Entry, Node, Workspace, cells_of};
+use crate::workspace::{EditRequest, Entry, Node, Workspace};
 use crate::{icons, theme};
 
 /// What a pane shows.
@@ -219,7 +220,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 let subject = subject.as_deref();
                 match pane.kind {
                     PaneKind::Assets => assets_ui(ui, ws, pick, edit),
-                    PaneKind::Preview => preview_ui(ui, ws, subject, nav, &mut settings.preview),
+                    PaneKind::Preview => preview_ui(ui, ws, egui::Id::unique(pane), subject, nav, &mut settings.preview),
                     PaneKind::Vram => vram_ui(ui, ws, nav, settings.preview.upscale),
                     PaneKind::Inspector => {
                         crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message, edit);
@@ -491,8 +492,9 @@ impl TreeView<'_> {
         let kind = found.and_then(|a| a.kind.as_deref());
         let dim = !self.ws.is_editable(asset);
         let selected = self.ws.selected.as_deref() == Some(asset);
-        // An image with a picture shows its thumbnail in place of its kind's icon, once it is made.
-        let thumbnail = found.filter(|a| preview::has_picture(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), a));
+        // An asset whose kind makes thumbnails shows its own in place of its kind's icon, once it is made.
+        let thumbnail =
+            found.filter(|a| self.ws.extensions.has_thumbnail(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
         let button = match thumbnail {
             Some(texture) => {
                 let side = ui.text_style_height(&egui::TextStyle::Body);
@@ -503,7 +505,7 @@ impl TreeView<'_> {
                 let name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, color);
                 egui::Button::selectable(selected, (image, name))
             }
-            None => egui::Button::selectable(selected, labelled(ui.style(), kind, name, dim)),
+            None => egui::Button::selectable(selected, labelled(&self.ws.extensions, ui.style(), kind, name, dim)),
         };
         let response = ui.add(button.truncate());
         if self.reveal == Some(asset) {
@@ -591,8 +593,14 @@ fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &str) -> Option<EditReque
 }
 
 /// A name after its kind's icon, the icon in the kind's tint; dimmed where it cannot be modified.
-fn labelled(style: &egui::Style, kind: Option<&str>, name: &str, dim: bool) -> egui::text::LayoutJob {
-    let (icon, tint) = icons::for_kind(kind);
+fn labelled(
+    extensions: &Extensions,
+    style: &egui::Style,
+    kind: Option<&str>,
+    name: &str,
+    dim: bool,
+) -> egui::text::LayoutJob {
+    let (icon, tint) = icons::for_kind(extensions, kind);
     icon_and_name(style, icon, tint, theme::text(), name, dim)
 }
 
@@ -626,7 +634,7 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
     for asset in matches.iter().take(SHOWN) {
         let selected = ws.selected.as_deref() == Some(asset.path.as_str());
-        let job = labelled(ui.style(), asset.kind.as_deref(), &asset.path, !ws.is_editable(&asset.path));
+        let job = labelled(&ws.extensions, ui.style(), asset.kind.as_deref(), &asset.path, !ws.is_editable(&asset.path));
         if ui.add(egui::Button::selectable(selected, job).truncate()).clicked() {
             *pick = Some(asset.path.clone());
         }
@@ -641,6 +649,7 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
 fn preview_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
+    pane: egui::Id,
     subject: Option<&str>,
     nav: &mut Option<String>,
     view: &mut Preview,
@@ -657,12 +666,12 @@ fn preview_ui(
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
     };
-    let shown = ws.pictures_of(asset);
+    let shown = ws.previews_of(asset);
     if shown.is_empty() {
         files_view_ui(ui, ws, &asset.clone());
         return;
     }
-    scroll(ui, "preview", |ui| pictures_ui(ui, ws, nav, view, shown));
+    scroll(ui, "preview", |ui| views_ui(ui, ws, pane, nav, view, shown));
 }
 
 /// An asset without a picture: one of its files at a time, as text or bytes - its native form first, by default.
@@ -689,10 +698,12 @@ fn files_view_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
     }
 }
 
-/// An asset's pictures: its own, or those its slots hold.
-fn pictures_ui(
+/// An asset's views, by its kind's extension: its own, or those of the assets its slots hold, each under its look
+/// picker.
+fn views_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
+    pane: egui::Id,
     nav: &mut Option<String>,
     view: &mut Preview,
     shown: Vec<(Option<String>, String)>,
@@ -702,11 +713,9 @@ fn pictures_ui(
         upscale_picker(ui, &mut view.upscale);
         ui.checkbox(&mut view.grid, "Grid").on_hover_text("A texel grid, its spacing following the zoom");
     });
-    let (view, upscale) = (*view, &view.upscale);
-    let ctx = ui.ctx().clone();
     let count = shown.len();
     for (slot, path) in shown {
-        // The slot and the image's path on the left, cut short where the pane is narrow; its look on the right.
+        // The slot and the asset's path on the left, cut short where the pane is narrow; its look on the right.
         egui::containers::Sides::new().shrink_left().truncate().show(
             ui,
             |ui| {
@@ -719,36 +728,7 @@ fn pictures_ui(
             },
             |ui| variant_picker(ui, ws, &path),
         );
-        let role = ws.index.assets.get(&path).and_then(crate::workspace::role).map(str::to_string);
-        let paged = ws.index.assets.get(&path).is_some_and(|a| {
-            let (size, page_width) = image_pages(a);
-            role.as_deref() == Some("texture") && size.x > page_width
-        });
-        let size = match ws.picture(&ctx, &path, *upscale) {
-            Some(Err(e)) => {
-                ui.colored_label(ui.visuals().error_fg_color, format!("No preview: {e}"));
-                None
-            }
-            Some(Ok(shown)) => Some(shown.size),
-            None => None,
-        };
-        if let Some(size) = size {
-            if role.as_deref() == Some("atlas") {
-                atlas_ui(ui, ws, &path, view, count);
-            } else if paged {
-                pages_ui(ui, ws, &path, view, count);
-            } else {
-                let overlay = Overlay {
-                    id: path.clone(),
-                    size,
-                    pictures: vec![(path.clone(), egui::Rect::from_min_size(egui::Pos2::ZERO, size))],
-                    boxes: vec![],
-                    summary: String::new(),
-                    toggle: "",
-                };
-                overlay_ui(ui, ws, &overlay, view, count);
-            }
-        }
+        ws.show_view(ui, pane, &path, *view, count);
         ui.add_space(8.0);
     }
 }
@@ -795,78 +775,20 @@ fn variant_picker(ui: &mut egui::Ui, ws: &mut Workspace, path: &str) {
     }
 }
 
-/// An atlas with a box over each cell: drawn, each cell through its own palette.
-fn atlas_ui(ui: &mut egui::Ui, ws: &mut Workspace, path: &str, view: Preview, count: usize) {
-    let Some(asset) = ws.index.assets.get(path) else { return };
-    let (size, _) = image_pages(asset);
-    let cells = cells_of(asset);
-    let overlay = Overlay {
-        id: path.to_string(),
-        size,
-        pictures: vec![(path.to_string(), egui::Rect::from_min_size(egui::Pos2::ZERO, size))],
-        summary: format!("{} cell{}", cells.len(), if cells.len() == 1 { "" } else { "s" }),
-        toggle: "Cells",
-        boxes: cells.into_iter().map(|c| (c.name, c.rect)).collect(),
-    };
-    overlay_ui(ui, ws, &overlay, view, count);
-}
-
-/// A multi-page image with a box over each page: page 1 is what a model's faces name as the image's second page.
-fn pages_ui(ui: &mut egui::Ui, ws: &mut Workspace, path: &str, view: Preview, count: usize) {
-    let Some(asset) = ws.index.assets.get(path) else { return };
-    let (size, page_width) = image_pages(asset);
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a page count")]
-    let pages = (size.x / page_width).ceil() as usize;
-    #[expect(clippy::cast_precision_loss, reason = "a page count")]
-    let boxes = (0..pages)
-        .map(|k| {
-            let x = k as f32 * page_width;
-            (
-                format!("page {k}"),
-                egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2((size.x - x).min(page_width), size.y)),
-            )
-        })
-        .collect();
-    let overlay = Overlay {
-        id: path.to_string(),
-        size,
-        pictures: vec![(path.to_string(), egui::Rect::from_min_size(egui::Pos2::ZERO, size))],
-        summary: format!("{pages} pages of {page_width} texels"),
-        toggle: "Pages",
-        boxes,
-    };
-    overlay_ui(ui, ws, &overlay, view, count);
-}
-
-/// An image's size in texels and its pages' width (64 halfwords at its depth).
-pub fn image_pages(asset: &project::index::Asset) -> (egui::Vec2, f32) {
-    let get = |k: &str| asset.fields().get(k);
-    let size = get("size").and_then(toml::Value::as_array).cloned().unwrap_or_default();
-    #[expect(clippy::cast_precision_loss, reason = "image sizes")]
-    let dim = |i: usize| size.get(i).and_then(toml::Value::as_integer).unwrap_or(0) as f32;
-    let per = match get("bpp").and_then(toml::Value::as_integer) {
-        Some(4) => 4.0,
-        Some(8) => 2.0,
-        _ => 1.0,
-    };
-    (egui::vec2(dim(0), dim(1)), 64.0 * per)
-}
-
-/// Pictures laid out on a canvas, with named boxes over them and a legend: an atlas's parts and cells, a multi-page
-/// image's pages.
-struct Overlay {
-    id: String,
-    size: egui::Vec2,
-    pictures: Vec<(String, egui::Rect)>,
-    boxes: Vec<(String, egui::Rect)>,
-    summary: String,
-    toggle: &'static str,
+/// Pictures laid out on a canvas, with named boxes over them and a legend: an atlas's cells, a multi-page image's
+/// pages - an extension's `Canvas`, uploaded.
+pub struct Overlay {
+    pub id: String,
+    pub size: egui::Vec2,
+    pub pictures: Vec<(egui::TextureId, egui::Rect)>,
+    pub boxes: Vec<(String, egui::Rect)>,
+    pub summary: String,
+    pub toggle: String,
 }
 
 /// An overlay drawn: each picture in its chosen variant, a box over each named rectangle with its name where it fits,
 /// and the legend; hovering an entry of either highlights it in both.
-fn overlay_ui(ui: &mut egui::Ui, ws: &mut Workspace, overlay: &Overlay, view: Preview, count: usize) {
-    let upscale = view.upscale;
+pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) {
     let (path, boxes, layout_size) = (overlay.id.as_str(), &overlay.boxes, overlay.size);
     let color = box_color;
     let shown_id = egui::Id::unique(("overlay boxes", path));
@@ -876,7 +798,7 @@ fn overlay_ui(ui: &mut egui::Ui, ws: &mut Workspace, overlay: &Overlay, view: Pr
     let mut now_hovered = None;
     if !boxes.is_empty() {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut show_boxes, overlay.toggle);
+            ui.checkbox(&mut show_boxes, &overlay.toggle);
             ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
         });
     }
@@ -884,7 +806,6 @@ fn overlay_ui(ui: &mut egui::Ui, ws: &mut Workspace, overlay: &Overlay, view: Pr
     let legend = if show_boxes && !boxes.is_empty() { 0.7 } else { 1.0 };
     #[expect(clippy::cast_precision_loss, reason = "a handful of pictures")]
     let height = (ui.available_height() * legend - 40.0).max(160.0) / count.max(1) as f32;
-    let ctx = ui.ctx().clone();
     let (canvas, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click_and_drag());
     let painter = ui.painter_at(canvas);
@@ -893,10 +814,8 @@ fn overlay_ui(ui: &mut egui::Ui, ws: &mut Workspace, overlay: &Overlay, view: Pr
         |r: egui::Rect| egui::Rect::from_min_max(origin + r.min.to_vec2() * scale, origin + r.max.to_vec2() * scale);
     painter.rect_filled(canvas, 0.0, ui.visuals().extreme_bg_color);
     let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-    for (piece, rect) in &overlay.pictures {
-        if let Some(Ok(shown)) = ws.picture(&ctx, piece, upscale) {
-            painter.image(shown.texture.id(), to_screen(*rect), uv, Color32::WHITE);
-        }
+    for (texture, rect) in &overlay.pictures {
+        painter.image(*texture, to_screen(*rect), uv, Color32::WHITE);
     }
     if view.grid {
         grid_ui(&painter, to_screen(egui::Rect::from_min_size(egui::Pos2::ZERO, layout_size)), layout_size, scale);
@@ -1217,6 +1136,13 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
     if let Some(e) = &ws.link_error {
         theme::section(ui, "Agents", |ui| {
             ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
+        });
+    }
+    if !ws.extensions.problems.is_empty() {
+        theme::section(ui, "Extensions", |ui| {
+            for problem in &ws.extensions.problems {
+                ui.label(RichText::new(problem).color(ui.visuals().error_fg_color));
+            }
         });
     }
     let problems = &ws.index.problems;

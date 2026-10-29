@@ -104,11 +104,11 @@ pub fn extract(
     let mut reader = Reader { decl, index, release, read };
     let tex: Texture = asset.view()?;
     let [w, h] = tex.size.map(|n| n as usize);
-    let page_width = 64 * texels_per_halfword(tex.bpp);
+    let page_width = 64 * texels_per_halfword(tex.mode.bpp());
     let count = w.div_ceil(page_width).max(1);
     let mut columns = Vec::new();
     for page in image_pages(&mut reader, path, at, pages, first, count)? {
-        columns.push((codecs::texture::texels(&page, tex.bpp, (0, 0, page_width, h)), page.rows));
+        columns.push((codecs::texture::texels(&page, tex.mode.bpp(), (0, 0, page_width, h)), page.rows));
     }
     let mut texels = Vec::with_capacity(w * h);
     for y in 0..h {
@@ -118,8 +118,8 @@ pub fn extract(
     }
     let stored = h.min(columns[0].1);
     let want = loc.sha1.as_ref().context("no texels sha1")?;
-    check(&codecs::texture::texel_bytes(&texels[..w * stored], tex.bpp), want, "texels")?;
-    let mut out = vec![("native.texels".to_string(), codecs::texture::texel_bytes(&texels, tex.bpp))];
+    check(&codecs::texture::texel_bytes(&texels[..w * stored], tex.mode.bpp()), want, "texels")?;
+    let mut out = vec![("native.texels".to_string(), codecs::texture::texel_bytes(&texels, tex.mode.bpp()))];
     for palette in &tex.palettes {
         let (Some(slot), Some(place)) = (&palette.slot, palette.at) else { continue }; // an executable's
         // A slot naming the image's palette uploads it; else a named run at its place (a palette the system uploads
@@ -199,7 +199,7 @@ fn entry_pages(decl: &Declarations, entry: &crate::declarations::PageEntry) -> u
         .view::<Texture>()
         .ok()
         .filter(|_| image.role.as_deref() == Some("texture"))
-        .map_or(1, |t| (t.size[0] as usize).div_ceil(64 * texels_per_halfword(t.bpp)).max(1));
+        .map_or(1, |t| (t.size[0] as usize).div_ceil(64 * texels_per_halfword(t.mode.bpp())).max(1));
     let from = entry.first.unwrap_or(0);
     entry.count.unwrap_or(total - from)
 }

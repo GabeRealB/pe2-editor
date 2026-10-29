@@ -2,7 +2,17 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/formats", "crates/codecs", "crates/project", "crates/preview", "crates/mcp", "crates/cli", "crates/editor"]
+members = [
+    "crates/formats",
+    "crates/codecs",
+    "crates/ext",
+    "crates/project",
+    "crates/mcp",
+    "crates/cli",
+    "crates/editor",
+    "extensions",
+    "extensions/images",
+]
 
 [workspace.package]
 edition = "2024"
@@ -21,7 +31,10 @@ pedantic = { level = "warn", priority = -1 }
 formats = { path = "crates/formats" }
 codecs = { path = "crates/codecs" }
 project = { path = "crates/project" }
-preview = { path = "crates/preview" }
+pe2-ext = { path = "crates/ext" }
+# The built-in extensions (`extensions/`) and the list of them the editor ships.
+extensions = { path = "extensions" }
+pe2-images = { path = "extensions/images" }
 mcp = { path = "crates/mcp" }
 # The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }

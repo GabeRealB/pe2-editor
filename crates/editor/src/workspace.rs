@@ -6,15 +6,16 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use project::Project;
 use project::cache::Cache;
+use project::ext::Extensions;
 use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use crate::settings::Upscale;
+use crate::settings::{Preview, Upscale};
 use crate::watch::{Change, Watch};
 
 /// A node of the tree of the resolved project: its children and, where an entry has this path, that entry (its real
@@ -38,7 +39,9 @@ pub struct Entry {
 }
 
 impl Node {
-    fn build(index: &Index) -> Node {
+    /// The tree of the resolved entries, with an asset's looks as its children where its extension draws several. Only
+    /// an asset whose declaration names `variants` is asked (the index lists those without parsing a declaration).
+    fn build(index: &Index, extensions: &Extensions) -> Node {
         let mut root = Node::default();
         for (real, entry) in &index.entries {
             let path = real.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(real);
@@ -53,7 +56,7 @@ impl Node {
                 Kind::Asset => {
                     let Some(asset) = index.assets.get(path) else { continue };
                     node.asset = Some(path.to_string());
-                    let names = variant_names(asset);
+                    let names = if asset.variants.is_empty() { vec![] } else { extensions.looks(asset) };
                     if names.len() > 1 {
                         for (i, name) in names.into_iter().enumerate() {
                             let entry = Some(Entry { image: path.to_string(), variant: i });
@@ -136,6 +139,14 @@ pub struct Workspace {
     pub recovered: Option<String>,
     /// The tree's thumbnails, kept as artifacts in the cache.
     pub thumbs: crate::thumbs::Thumbs,
+    /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
+    pub extensions: Arc<Extensions>,
+    /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
+    views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
+    /// The view an asset is shown in, where its kind and role have several.
+    pub view_choice: HashMap<String, usize>,
+    /// What the views show, uploaded.
+    textures: crate::ext_ui::Textures,
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     _lock: Lock,
@@ -226,51 +237,31 @@ pub struct PaletteUpload {
     pub rect: egui::Rect,
 }
 
-pub use preview::role;
-use preview::{array, bpp, is_texture, palette_names, texels_per_halfword, variant_names};
+use pe2_images::{bpp, is_texture, palette_names, texels_per_halfword};
 
 fn vec2((x, y): (f32, f32)) -> egui::Vec2 {
     egui::vec2(x, y)
 }
 
 fn pair(value: Option<&toml::Value>) -> Option<egui::Vec2> {
-    preview::pair(value).map(vec2)
-}
-
-fn to_rect(r: preview::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.width, r.height))
+    pe2_images::pair(value).map(vec2)
 }
 
 /// A `rect = [x, y, w, h]` as a rectangle.
 fn rect(value: &toml::Value) -> Option<egui::Rect> {
-    preview::rect(value).map(to_rect)
+    pe2_images::rect(value).map(crate::ext_ui::to_rect)
 }
 
-/// A cell as drawn in its image (`preview::Cell`), in the editor's rectangles.
-pub struct Cell {
-    pub name: String,
-    pub rect: egui::Rect,
-    pub bpp: u8,
-    pub palette: Option<usize>,
-}
-
-/// An atlas's cells.
-pub fn cells_of(asset: &Asset) -> Vec<Cell> {
-    preview::cells_of(asset)
-        .into_iter()
-        .map(|c| Cell { name: c.name, rect: to_rect(c.rect), bpp: c.bpp, palette: c.palette })
-        .collect()
-}
-
-fn color_image(image: &preview::Image) -> egui::ColorImage {
-    egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba)
+/// A field's array; empty where it has none.
+fn array<'a>(asset: &'a Asset, key: &str) -> &'a [toml::Value] {
+    asset.fields().get(key).and_then(toml::Value::as_array).map_or(&[][..], Vec::as_slice)
 }
 
 /// A decoded picture uploaded, scaled by the upscaling method.
-fn show(ctx: &egui::Context, path: &str, chosen: usize, upscale: Upscale, image: &preview::Image) -> Shown {
+fn show(ctx: &egui::Context, path: &str, chosen: usize, upscale: Upscale, image: &pe2_ext::Image) -> Shown {
     #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
     let size = egui::vec2(image.width as f32, image.height as f32);
-    let (image, options) = crate::upscale::apply(color_image(image), upscale);
+    let (image, options) = crate::upscale::apply(crate::ext_ui::color_image(image), upscale);
     Shown { texture: ctx.load_texture(format!("{path}#{chosen}#{upscale:?}"), image, options), size }
 }
 
@@ -294,18 +285,23 @@ impl Workspace {
         // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
         let artifacts = project::artifacts::Artifacts::open(&cache)?;
         let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
-        let thumbs = crate::thumbs::Thumbs::start(artifacts);
+        let extensions = Arc::new(Extensions::load(extensions::builtin(), true));
+        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
         index.set_hidden(&layer_view.hidden(&index.layers()));
-        let tree = Node::build(&index);
+        let tree = Node::build(&index, &extensions);
         let mut workspace = Workspace {
             project,
             history,
             recovered,
             thumbs,
+            extensions,
+            views: HashMap::new(),
+            view_choice: HashMap::new(),
+            textures: crate::ext_ui::Textures::default(),
             layers: index.layers(),
             layer_view,
             index,
@@ -383,7 +379,12 @@ impl Workspace {
             let selection = self.selected.clone();
             let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
             let editor = mcp::EditorState { selection, variant, show: None };
-            let mut view = mcp::View { project: &self.project, index: &self.index, editor: Some(editor) };
+            let mut view = mcp::View {
+                project: &self.project,
+                index: &self.index,
+                extensions: &self.extensions,
+                editor: Some(editor),
+            };
             let answer = mcp::answer(&mut view, &request);
             let show = view.editor.and_then(|e| e.show);
             if let Some(path) = show {
@@ -444,13 +445,14 @@ impl Workspace {
             return Update::Reopen;
         }
         self.layers = self.index.layers();
-        self.tree = Node::build(&self.index);
+        self.tree = Node::build(&self.index, &self.extensions);
         self.refresh_editable();
         if refreshed.assets.is_empty() {
             return Update::Nothing;
         }
         self.pictures.retain(|(image, ..), _| !refreshed.assets.contains(image));
         self.strips.retain(|(image, _), _| !refreshed.assets.contains(image));
+        self.views.retain(|(_, asset, _), _| !refreshed.assets.contains(asset));
         self.thumbs.forget(&refreshed.assets);
         self.drop_lost_selection();
         Update::Refreshed(refreshed.assets.len())
@@ -537,9 +539,10 @@ impl Workspace {
     /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
     fn apply_eyes(&mut self) -> Result<()> {
         if self.index.set_hidden(&self.layer_view.hidden(&self.layers)) {
-            self.tree = Node::build(&self.index);
+            self.tree = Node::build(&self.index, &self.extensions);
             self.pictures.clear();
             self.strips.clear();
+            self.views.clear();
             self.thumbs.clear();
             self.drop_lost_selection();
         }
@@ -832,12 +835,12 @@ impl Workspace {
 
     /// An image's palettes by name.
     pub fn palettes_of(&self, path: &str) -> Vec<String> {
-        self.index.assets.get(path).map_or_default(palette_names)
+        self.index.assets.get(path).map_or_default(|a| palette_names(&self.extensions.lend(a)))
     }
 
-    /// An image's looks by name.
+    /// An asset's looks by name.
     pub fn variants_of(&self, path: &str) -> Vec<String> {
-        self.index.assets.get(path).map_or_default(variant_names)
+        self.index.assets.get(path).map_or_default(|a| self.extensions.looks(a))
     }
 
     /// The variant an image is shown in.
@@ -846,18 +849,18 @@ impl Workspace {
         self.variant_choice.get(path).copied().filter(|&v| v < n).unwrap_or(0)
     }
 
-    /// Whether an image has a picture: a background, a texture, an atlas.
+    /// Whether an asset has a picture.
     pub fn has_picture(&self, path: &str) -> bool {
-        self.index.assets.get(path).is_some_and(preview::has_picture)
+        self.index.assets.get(path).is_some_and(|a| self.extensions.has_picture(a))
     }
 
-    /// The picture of an image - a background, a texture or an atlas, in its chosen variant - decoded once per variant
-    /// and upscaling method.
+    /// The picture of an asset, in its chosen look, as its extension draws it - decoded once per look and upscaling
+    /// method.
     pub fn picture(&mut self, ctx: &egui::Context, path: &str, upscale: Upscale) -> Option<&Picture> {
         let chosen = self.variant(path);
         let key = (path.to_string(), chosen, upscale);
         if !self.pictures.contains_key(&key) {
-            let decoded = preview::picture(self.index.assets.get(path)?, chosen)?;
+            let decoded = self.extensions.picture(self.index.assets.get(path)?, chosen)?;
             self.pictures.insert(
                 key.clone(),
                 decoded.map_err(|e| format!("{e:#}")).map(|image| show(ctx, path, chosen, upscale, &image)),
@@ -870,12 +873,12 @@ impl Workspace {
     pub fn palette(&mut self, ctx: &egui::Context, path: &str, palette: usize) -> Option<&Picture> {
         let key = (path.to_string(), palette);
         if !self.strips.contains_key(&key) {
-            let colors = preview::palette_colors(self.index.assets.get(path)?, palette)?;
+            let colors = pe2_images::palette_colors(&self.extensions.lend(self.index.assets.get(path)?), palette)?;
             let strip = colors.map_err(|e| format!("{e:#}")).map(|colors| {
                 let pixels: Vec<egui::Color32> = colors
                     .into_iter()
                     .map(|c| {
-                        let [red, green, blue, alpha] = preview::rgba(c);
+                        let [red, green, blue, alpha] = pe2_images::rgba(c);
                         egui::Color32::from_rgba_unmultiplied(red, green, blue, alpha)
                     })
                     .collect();
@@ -890,15 +893,23 @@ impl Workspace {
         self.strips.get(&key)
     }
 
-    /// The pictures to show for an asset, as (label, image): its own; or what a container's slots hold - the assets
-    /// filling them, the images its image slots upload.
-    pub fn pictures_of(&self, asset: &Asset) -> Vec<(Option<String>, String)> {
-        if self.has_picture(&asset.path) {
+    /// Whether the preview shows an asset by its kind's views: it has one, and a picture where its kind draws one.
+    pub fn has_view(&self, path: &str) -> bool {
+        self.index.assets.get(path).is_some_and(|a| {
+            !self.extensions.views(a).is_empty()
+                && (self.extensions.kind_of(a).is_none_or(|k| k.picture.is_none()) || self.extensions.has_picture(a))
+        })
+    }
+
+    /// The assets the preview shows for an asset, as (label, asset): itself, where it has a view; or what a container's
+    /// slots hold - the assets filling them, the images its image slots upload.
+    pub fn previews_of(&self, asset: &Asset) -> Vec<(Option<String>, String)> {
+        if self.has_view(&asset.path) {
             return vec![(None, asset.path.clone())];
         }
         let mut out: Vec<(Option<String>, String)> = Vec::new();
         let mut push = |label: String, a: &Asset| {
-            if self.has_picture(&a.path) && !out.iter().any(|(_, p)| *p == a.path) {
+            if self.has_view(&a.path) && !out.iter().any(|(_, p)| *p == a.path) {
                 out.push((Some(label), a.path.clone()));
             }
         };
@@ -915,6 +926,30 @@ impl Workspace {
             }
         }
         out
+    }
+
+    /// Show an asset's view in a pane - the one chosen, where its kind and role have several - made when first shown.
+    /// `count` views share the pane's height.
+    pub fn show_view(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: &str, preview: Preview, count: usize) {
+        let look = self.variant(path);
+        let Some(asset) = self.index.assets.get(path) else { return };
+        let views = self.extensions.views(asset);
+        if views.is_empty() {
+            return;
+        }
+        let mut chosen = self.view_choice.get(path).copied().filter(|&v| v < views.len()).unwrap_or(0);
+        if views.len() > 1 {
+            ui.horizontal(|ui| {
+                for (i, view) in views.iter().enumerate() {
+                    ui.selectable_value(&mut chosen, i, &view.name);
+                }
+            });
+            self.view_choice.insert(path.to_string(), chosen);
+        }
+        let make = &views[chosen].make;
+        let view = self.views.entry((pane, path.to_string(), chosen)).or_insert_with(|| make(&self.extensions.lend(asset)));
+        let mut host = crate::ext_ui::Host::new(ui, asset, &self.extensions, &mut self.textures, look, preview, count);
+        view.show(&mut pe2_ext::Ui::new(&mut host));
     }
 
     /// The VRAM slots, by asset path, and their rectangles in halfwords.
@@ -937,8 +972,9 @@ impl Workspace {
     /// bundle slots upload.
     pub fn uploads_of(&self, asset: &Asset) -> (Vec<Upload>, Vec<PaletteUpload>) {
         let (mut pages, mut palettes) = (vec![], vec![]);
-        if is_texture(asset) {
-            let bpp = bpp(asset);
+        let lent = self.extensions.lend(asset);
+        if is_texture(&lent) {
+            let bpp = bpp(&lent);
             if let (Some(origin), Some(size)) =
                 (asset.fields().get("page").and_then(|p| self.place(p)), pair(asset.fields().get("size")))
             {
@@ -947,7 +983,7 @@ impl Workspace {
                 let rect = egui::Rect::from_min_size(origin, egui::vec2(size.x / per, size.y));
                 pages.push(Upload { image: asset.path.clone(), rect });
             }
-            for i in 0..palette_names(asset).len() {
+            for i in 0..palette_names(&lent).len() {
                 self.palette_upload(asset, i, &mut palettes);
             }
             return (pages, palettes);
@@ -980,14 +1016,16 @@ impl Workspace {
     pub fn entry_palette(&self, entry: &toml::Value) -> Option<(String, usize)> {
         let image = self.target(entry.get("image")?)?;
         let name = entry.get("palette")?.as_str()?;
-        Some((image.path.clone(), palette_names(image).iter().position(|n| n == name)?))
+        Some((image.path.clone(), palette_names(&self.extensions.lend(image)).iter().position(|n| n == name)?))
     }
 
     fn palette_upload(&self, asset: &Asset, palette: usize, out: &mut Vec<PaletteUpload>) {
         let declared = array(asset, "palettes").get(palette);
         let Some(at) = declared.and_then(|p| self.place(p)) else { return };
-        let bpp = bpp(asset);
-        let deepest = cells_of(asset).iter().filter(|c| c.palette == Some(palette)).map(|c| c.bpp).max().unwrap_or(bpp);
+        let lent = self.extensions.lend(asset);
+        let bpp = bpp(&lent);
+        let cells = pe2_images::cells(&lent);
+        let deepest = cells.iter().filter(|c| c.palette == Some(palette)).map(|c| c.bpp).max().unwrap_or(bpp);
         let n = if deepest == 4 { 16.0 } else { 256.0 };
         out.push(PaletteUpload {
             image: asset.path.clone(),

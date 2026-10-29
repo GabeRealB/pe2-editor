@@ -1,6 +1,8 @@
 //! The tools: their definitions (names, descriptions, input schemas from the argument types) and their answers.
 
 use base64::Engine;
+use pe2_ext::Image;
+use project::ext::Extensions;
 use project::index::{Asset, Index, Kind, Reference};
 use rmcp::model::{CallToolResult, ContentBlock, ReadResourceResult, ResourceContents, Tool, ToolAnnotations};
 use schemars::JsonSchema;
@@ -142,11 +144,13 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
         "project" => Ok(project(view)),
         "find_assets" => parse(arguments).map(|a| find_assets(view.index, &a)),
         "list_folder" => parse(arguments).map(|a: FolderArgs| list_folder(view.index, a.path.as_deref())),
-        "get_asset" => parse(arguments).and_then(|a: AssetArgs| get_asset(view.index, &a.asset)),
+        "get_asset" => parse(arguments).and_then(|a: AssetArgs| get_asset(view.index, view.extensions, &a.asset)),
         "references" => parse(arguments).and_then(|a: AssetArgs| references(view.index, &a.asset)),
         "problems" => parse(arguments).map(|a: ProblemsArgs| problems(view.index, a.limit.unwrap_or(100))),
-        "preview" => return parse(arguments).and_then(|a| preview(view.index, &a)).unwrap_or_else(failure),
-        "palette" => parse(arguments).and_then(|a| palette(view.index, &a)),
+        "preview" => {
+            return parse(arguments).and_then(|a| preview(view.index, view.extensions, &a)).unwrap_or_else(failure);
+        }
+        "palette" => parse(arguments).and_then(|a| palette(view.index, view.extensions, &a)),
         "editor_selection" => editor_selection(view),
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
         _ => Err(format!("no tool is named {name}")),
@@ -278,7 +282,7 @@ fn list_folder(index: &Index, path: Option<&str>) -> Value {
     json!({ "path": path, "folders": folders, "assets": assets, "files": files })
 }
 
-fn get_asset(index: &Index, name: &str) -> Result<Value, String> {
+fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value, String> {
     let asset = asset(index, name)?;
     let files: Vec<Value> = asset
         .files
@@ -289,11 +293,13 @@ fn get_asset(index: &Index, name: &str) -> Result<Value, String> {
     let fields = out.as_object_mut().expect("an object");
     fields.insert("layers".into(), json!(asset.layers));
     fields.insert("files".into(), json!(files));
-    if preview::is_texture(asset) || preview::has_picture(asset) {
-        fields.insert("palettes".into(), json!(preview::palette_names(asset)));
-        fields.insert("looks".into(), json!(preview::variant_names(asset)));
-        fields.insert("cells".into(), json!(preview::cells_of(asset).len()));
-        fields.insert("has_picture".into(), json!(preview::has_picture(asset)));
+    let lent = extensions.lend(asset);
+    let has_picture = extensions.has_picture(asset);
+    if pe2_images::is_texture(&lent) || has_picture {
+        fields.insert("palettes".into(), json!(pe2_images::palette_names(&lent)));
+        fields.insert("looks".into(), json!(extensions.looks(asset)));
+        fields.insert("cells".into(), json!(pe2_images::cells(&lent).len()));
+        fields.insert("has_picture".into(), json!(has_picture));
     }
     if let Some(error) = &asset.error {
         fields.insert("error".into(), json!(error));
@@ -342,9 +348,9 @@ fn problems(index: &Index, limit: usize) -> Value {
     })
 }
 
-fn preview(index: &Index, args: &PreviewArgs) -> Result<CallToolResult, String> {
+fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {
     let asset = asset(index, &args.asset)?;
-    let looks = preview::variant_names(asset);
+    let looks = extensions.looks(asset);
     let look = match &args.variant {
         Some(name) => looks
             .iter()
@@ -352,11 +358,12 @@ fn preview(index: &Index, args: &PreviewArgs) -> Result<CallToolResult, String> 
             .ok_or_else(|| format!("{}: no look is named {name}; its looks: {}", asset.path, looks.join(", ")))?,
         None => 0,
     };
-    let image = preview::picture(asset, look)
+    let image = extensions
+        .picture(asset, look)
         .ok_or_else(|| format!("{}: not an image with a picture (a background, a texture, an atlas)", asset.path))?
         .map_err(|e| format!("{e:#}"))?;
     let image = upscale(image, args.scale.unwrap_or(1).clamp(1, 8));
-    let png = image.png().map_err(|e| format!("{e:#}"))?;
+    let png = project::ext::png(&image).map_err(|e| format!("{e:#}"))?;
     let caption = format!(
         "{}: {} x {}{}",
         asset.path,
@@ -371,7 +378,7 @@ fn preview(index: &Index, args: &PreviewArgs) -> Result<CallToolResult, String> 
 }
 
 /// Each pixel repeated `scale` times both ways.
-fn upscale(image: preview::Image, scale: usize) -> preview::Image {
+fn upscale(image: Image, scale: usize) -> Image {
     if scale == 1 {
         return image;
     }
@@ -383,26 +390,26 @@ fn upscale(image: preview::Image, scale: usize) -> preview::Image {
             rgba.extend_from_slice(&wide);
         }
     }
-    preview::Image { width, height, rgba }
+    Image { width, height, rgba }
 }
 
-fn palette(index: &Index, args: &PaletteArgs) -> Result<Value, String> {
-    let asset = asset(index, &args.asset)?;
-    let names = preview::palette_names(asset);
+fn palette(index: &Index, extensions: &Extensions, args: &PaletteArgs) -> Result<Value, String> {
+    let asset = extensions.lend(asset(index, &args.asset)?);
+    let names = pe2_images::palette_names(&asset);
     let chosen = names.iter().position(|n| *n == args.palette).ok_or_else(|| {
-        format!("{}: no palette is named {}; its palettes: {}", asset.path, args.palette, names.join(", "))
+        format!("{}: no palette is named {}; its palettes: {}", asset.path(), args.palette, names.join(", "))
     })?;
-    let colors = preview::palette_colors(asset, chosen)
-        .ok_or_else(|| format!("{}: palette {} has no stored colors", asset.path, args.palette))?
+    let colors = pe2_images::palette_colors(&asset, chosen)
+        .ok_or_else(|| format!("{}: palette {} has no stored colors", asset.path(), args.palette))?
         .map_err(|e| format!("{e:#}"))?;
     let colors: Vec<Value> = colors
         .iter()
         .map(|&c| {
-            let [red, green, blue, alpha] = preview::rgba(c);
+            let [red, green, blue, alpha] = pe2_images::rgba(c);
             json!({ "abgr1555": format!("{c:#06x}"), "rgba": format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}") })
         })
         .collect();
-    Ok(json!({ "path": asset.path, "palette": args.palette, "colors": colors }))
+    Ok(json!({ "path": asset.path(), "palette": args.palette, "colors": colors }))
 }
 
 const NO_EDITOR: &str = "the editor does not have the project open";

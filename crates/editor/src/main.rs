@@ -13,6 +13,7 @@
 //! inside the main one instead (and so in its screenshots).
 
 mod app;
+mod ext_ui;
 mod external;
 mod icons;
 mod inspector;

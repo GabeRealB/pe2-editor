@@ -2,6 +2,8 @@
 //! of both font families, so an icon is a character that sits in any label. Codepoints from the font's own table.
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily};
+use pe2_ext::{Icon, Tint};
+use project::ext::Extensions;
 use std::sync::Arc;
 
 pub const FOLDER: &str = "\u{E24A}";
@@ -58,23 +60,55 @@ pub fn install(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// An asset kind's icon and its tint.
-pub fn for_kind(kind: Option<&str>) -> (&'static str, Color32) {
-    const STRUCTURE: Color32 = Color32::from_rgb(0x8f, 0xa8, 0xc8);
-    const PICTURE: Color32 = Color32::from_rgb(0x6f, 0xc8, 0xb0);
-    const MOTION: Color32 = Color32::from_rgb(0xb0, 0x93, 0xe0);
-    const SOUND: Color32 = Color32::from_rgb(0xe6, 0xa8, 0x5c);
-    const CODE: Color32 = Color32::from_rgb(0xe0, 0x84, 0x84);
-    const PLAIN: Color32 = Color32::from_rgb(0x9a, 0xa3, 0xaf);
+const STRUCTURE: Color32 = Color32::from_rgb(0x8f, 0xa8, 0xc8);
+const PICTURE: Color32 = Color32::from_rgb(0x6f, 0xc8, 0xb0);
+const MOTION: Color32 = Color32::from_rgb(0xb0, 0x93, 0xe0);
+const SOUND: Color32 = Color32::from_rgb(0xe6, 0xa8, 0x5c);
+const CODE: Color32 = Color32::from_rgb(0xe0, 0x84, 0x84);
+const PLAIN: Color32 = Color32::from_rgb(0x9a, 0xa3, 0xaf);
+
+/// An extension's icon, from the host's set.
+fn glyph(icon: Icon) -> &'static str {
+    match icon {
+        Icon::Image => IMAGE,
+        Icon::Palette => PALETTE,
+        Icon::Grid => SQUARES_FOUR,
+        Icon::Film => FILM_STRIP,
+        Icon::Waveform => WAVEFORM,
+        Icon::Speaker => SPEAKER_HIGH,
+        Icon::Music => MUSIC_NOTES,
+        Icon::Package => PACKAGE,
+        Icon::Terminal => TERMINAL_WINDOW,
+        Icon::Text => FILE_TEXT,
+        Icon::Binary => BINARY,
+        Icon::File => FILE,
+        Icon::Folder => FOLDERS,
+    }
+}
+
+fn tint(tint: Tint) -> Color32 {
+    match tint {
+        Tint::Structure => STRUCTURE,
+        Tint::Picture => PICTURE,
+        Tint::Motion => MOTION,
+        Tint::Sound => SOUND,
+        Tint::Code => CODE,
+        Tint::Plain => PLAIN,
+    }
+}
+
+/// An asset kind's icon and its tint: as its extension registers it, else as the editor knows it.
+pub fn for_kind(extensions: &Extensions, kind: Option<&str>) -> (&'static str, Color32) {
+    if let Some((icon, family)) = kind.and_then(|k| extensions.icon(k)) {
+        return (glyph(icon), tint(family));
+    }
     match kind {
         Some("disc") => (DISC, STRUCTURE),
         Some("stage") => (STACK, STRUCTURE),
         Some("folder") => (FOLDERS, STRUCTURE),
         Some("file_group") => (SQUARES_FOUR, STRUCTURE),
         Some("file") => (FILE, STRUCTURE),
-        Some("image") => (IMAGE, PICTURE),
         Some("vram_slot") => (SQUARES_FOUR, PICTURE),
-        Some("palette") => (PALETTE, PICTURE),
         Some("movie" | "stream") => (FILM_STRIP, MOTION),
         Some("scene_audio") => (WAVEFORM, SOUND),
         Some("sound_bank") => (SPEAKER_HIGH, SOUND),

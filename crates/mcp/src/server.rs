@@ -3,6 +3,7 @@
 
 use project::Project;
 use project::cache::Cache;
+use project::ext::Extensions;
 use project::index::Index;
 use project::lock::{Lock, LockError};
 use rmcp::model::{
@@ -44,7 +45,10 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
         Ok((project, index))
     });
     match opened {
-        Ok((project, index)) => answer(&mut View { project: &project, index: &index, editor: None }, request),
+        Ok((project, index)) => {
+            let extensions = Extensions::load(extensions::builtin(), true);
+            answer(&mut View { project: &project, index: &index, extensions: &extensions, editor: None }, request)
+        }
         Err(e) => Reply::Error(format!("the project cannot be opened: {e:#}")),
     }
 }

@@ -45,7 +45,8 @@
 //! menu's previews over the room's sprite pages). Any other overlap is two uses of the same VRAM at different times.
 //!
 //! Textures and atlases are images (`kind = "image"`) by `role`, as backgrounds are: a slot that takes an image takes
-//! any of them. A texture is pixels at a depth (`bpp` 4, 8 or 16) and a `size` in texels, uploaded to a `page` - the
+//! any of them. A texture is pixels in a `mode` - `indexed_4bpp`, `indexed_8bpp` or `direct_16bpp` - and a `size` in
+//! texels, uploaded to a `page` - the
 //! VRAM slot and the halfword `at` in it - filling as many 64-halfword VRAM pages, side by side, as its width needs;
 //! and its `palettes`, each named, placed where its colors are uploaded (`slot`, `at`), or uploaded by an executable
 //! (`executable`), or none known (`no_palette`). A texture is drawn whole, with its palette. Its location lists where
@@ -55,7 +56,7 @@
 //!
 //! An atlas is a texture whose regions are drawn separately - a sprite, a polygon, a glyph sampling a rectangle of it
 //! with a palette of its own - with `cells`, each a named `rect` in texels and the `palette` it is drawn with; a cell
-//! of another depth than the image's states its `bpp`, its rectangle in texels of that depth (the UI sheet's 8-bit
+//! of another depth than the image's states its `mode`, its rectangle in texels of that depth (the UI sheet's 8-bit
 //! portrait among 4-bit icons). A palette holds the colors of the deepest cell drawn with it. The cells are those its
 //! users name: a room's view sprites (`view<N>_sprite_<i>`), the code's own tables (a clock's digits, the HUD's
 //! icons), a model's faces. A multi-page image whose pages are drawn with palettes of their own, where nothing names
@@ -212,11 +213,34 @@ pub struct Resource {
     pub palettes: Vec<PaletteEntry>,
 }
 
-/// A texture or an atlas: pixels at a depth, its page, the palettes it is drawn
+/// What a texel is: an index into a palette of 16 or 256 colors, or a color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum Mode {
+    #[serde(rename = "indexed_4bpp")]
+    Indexed4,
+    #[serde(rename = "indexed_8bpp")]
+    Indexed8,
+    #[serde(rename = "direct_16bpp")]
+    Direct16,
+}
+
+impl Mode {
+    /// Its depth: bits a texel.
+    #[must_use]
+    pub fn bpp(self) -> u8 {
+        match self {
+            Mode::Indexed4 => 4,
+            Mode::Indexed8 => 8,
+            Mode::Direct16 => 16,
+        }
+    }
+}
+
+/// A texture or an atlas: pixels in a mode, its page, the palettes it is drawn
 /// with, and an atlas's cells.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Texture {
-    pub bpp: u8,
+    pub mode: Mode,
     pub size: [u32; 2],
     pub page: Option<Placement>,
     #[serde(default)]
@@ -232,8 +256,8 @@ impl Texture {
     #[must_use]
     pub fn entries(&self, palette: &str) -> usize {
         let depths =
-            self.cells.iter().filter(|c| c.palette.as_deref() == Some(palette)).map(|c| c.bpp.unwrap_or(self.bpp));
-        depths.map(entries_at).max().unwrap_or(entries_at(self.bpp))
+            self.cells.iter().filter(|c| c.palette.as_deref() == Some(palette)).map(|c| c.mode.unwrap_or(self.mode));
+        depths.map(|m| entries_at(m.bpp())).max().unwrap_or(entries_at(self.mode.bpp()))
     }
 }
 
@@ -254,14 +278,14 @@ pub struct Palette {
     pub executable: Option<String>,
 }
 
-/// A region of an atlas drawn on its own: a rectangle in texels (of its own depth, where it states one) and its
+/// A region of an atlas drawn on its own: a rectangle in texels (of its own mode, where it states one) and its
 /// palette.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Cell {
     pub name: String,
     pub rect: [u32; 4],
     pub palette: Option<String>,
-    pub bpp: Option<u8>,
+    pub mode: Option<Mode>,
 }
 
 /// A rectangle of VRAM uploads are placed in.
