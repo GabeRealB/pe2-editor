@@ -3,15 +3,15 @@
 /// over it, so an extension's code is the same linked in or built as a component.
 ///
 /// Callbacks cannot cross: what an extension registers is described by `register`'s result, each callback by a handle
-/// the host calls back with (a kind's index for its picture, thumbnail and facts, a field's for its readings, a view's
-/// or a panel's for its views, a tool's for its work). Values cross as TOML (`4`, `"indexed_4bpp"`, `{ a = 1 }`).
+/// the host calls back with (an operation's for its run, a kind's index for its outputs' members and its parts, a
+/// field's for its readings, a view's or a panel's for its views, a tool's for its work). Settings cross as TOML (`4`,
+/// `"indexed_4bpp"`, `{ a = 1 }`); the work graph's values as `value`.
 ///
 /// The contract is versioned by semver, a minor version below 1.0 a line: within a line a version only adds functions to
 /// `host`, so a component runs on a host of its line at least as new as what it was built against; any change to
-/// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`). 0.3.0: an import's
-/// notes (`imported.notes`). 0.3.1: the host's pictures (`ui.picture`). 0.3.2: discs read by range (`discs.size`,
-/// `discs.read-range`). 0.3.3: tables (`ui.table`).
-package pe2:extension@0.3.3;
+/// `guest` or to a type is a new line. Until the editor's first release it has no outside consumers and stays at
+/// 0.1.0, changing freely.
+package pe2:extension@0.1.0;
 
 interface types {
     /// Pixels as unmultiplied RGBA, row by row.
@@ -33,6 +33,53 @@ interface types {
     enum tint { structure, picture, motion, sound, code, plain }
 
     enum style { normal, weak, note, strong, error }
+
+    /// A file's content: its bytes, or a blob the host keeps, by its hash and size - read through the node an
+    /// operation is lent, as its file named by the hash.
+    variant content {
+        inline(list<u8>),
+        stored(tuple<string, u64>),
+    }
+
+    /// A file of a value's encoding: its name, its content.
+    record file {
+        name: string,
+        content: content,
+    }
+
+    /// Audio: interleaved 16-bit samples.
+    record pcm {
+        rate: u32,
+        channels: u16,
+        samples: list<s16>,
+    }
+
+    /// A value of a type as files (an extension's, or `bytes`): its type (qualified), the other names it answers to,
+    /// its files, the settings derived with it (TOML), notes.
+    record typed {
+        ty: string,
+        also: list<string>,
+        files: list<file>,
+        settings: string,
+        notes: list<string>,
+    }
+
+    /// A value that is no list (a table as TOML).
+    variant item {
+        image(image),
+        table(string),
+        pcm(pcm),
+        typed(typed),
+    }
+
+    /// A value: an item, or a list of items.
+    variant value {
+        image(image),
+        table(string),
+        pcm(pcm),
+        typed(typed),
+        items(list<item>),
+    }
 }
 
 interface host {
@@ -65,11 +112,10 @@ interface host {
         selection: func() -> option<asset>;
         look: func(path: string) -> u32;
         /// What the host understands of any asset, answered by the extension its kind is: its picture in a look, a
-        /// part's picture, its parts (id, label, what it is made of), its facts (TOML).
+        /// part's picture, its parts (id, label, what it is made of).
         picture: func(path: string, look: u32) -> option<result<image, string>>;
         part: func(path: string, part: string) -> option<result<image, string>>;
         parts: func(path: string) -> list<tuple<string, string, list<string>>>;
-        facts: func(path: string) -> string;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
         /// the services of the extensions this one requires, or its own.
         call: func(service: string, arguments: string) -> result<string, string>;
@@ -178,7 +224,7 @@ interface host {
 }
 
 interface guest {
-    use types.{image, rect, icon, tint};
+    use types.{image, rect, icon, tint, value};
     use host.{asset, project, ui, declarations, discs};
 
     /// An extension: its id, its version, what it requires (`pe2.images@^0.1`).
@@ -206,19 +252,31 @@ interface guest {
         name: string,
     }
 
-    /// A kind; its picture, thumbnail and facts called back by its index.
+    /// How an output is kept: in the project's store, in its build directory, or not at all.
+    enum retain { cache, build, transient }
+
+    /// An output a kind declares on every node of it: made by an operation (qualified) from the node's stack's result
+    /// - a family where the operation has a parameter, its members called back by the kind's index and the output's.
+    record output {
+        name: string,
+        op: string,
+        retain: retain,
+        members: bool,
+    }
+
+    /// A kind; its outputs' members and its parts called back by its index.
     record kind {
         name: string,
         alias: option<string>,
         label: string,
         icon: option<tuple<icon, tint>>,
         fields: list<field>,
-        picture: bool,
-        thumbnail: bool,
-        facts: bool,
         parts: bool,
         views: list<view>,
         inspector: list<view>,
+        outputs: list<output>,
+        /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
+        stack: option<string>,
     }
 
     record role {
@@ -247,49 +305,49 @@ interface guest {
         schema: string,
     }
 
-    /// How the host recognizes a format without calling back: bytes at an offset, a file name (exact, or `*` and a
-    /// suffix), or text.
+    /// How the host recognizes a type in a file without calling back: bytes at an offset, a file name (exact, or `*`
+    /// and a suffix), or text.
     variant signature {
         bytes(tuple<u32, list<u8>>),
         name(string),
         text,
     }
 
-    /// A format; its sniff, where it has one, called back by its handle.
-    record file-format {
+
+    /// A port of an operation: what it takes (a type as written: `pe2.formats@ora`, `a | b`, `file<T>`, `image`, `T`,
+    /// `any`), and whether any number of values.
+    record port {
+        name: string,
+        ty: string,
+        many: bool,
+    }
+
+    /// An operation; its run called back by its handle.
+    record op {
+        handle: u32,
+        name: string,
+        label: string,
+        inputs: list<port>,
+        output: string,
+        fields: list<field>,
+        /// The settings of its node it derives (`size`, `cells.*.rect`).
+        derives: list<string>,
+        /// The operation undoing it, qualified.
+        inverse: option<string>,
+        /// Its parameter: its name, and the kind of value it takes (`name`, `number`).
+        parameter: option<tuple<string, string>>,
+        priority: s32,
+    }
+
+    /// A type of the extension's own: with a recognizer - signatures, a sniff called back by its handle, a media type
+    /// it answers to - a stored file is recognized as it.
+    record value-type {
         handle: u32,
         name: string,
         label: string,
         media-type: option<string>,
         signatures: list<signature>,
         sniff: bool,
-    }
-
-    /// An importer; its check, where it has one, called back by its handle.
-    record importer {
-        handle: u32,
-        name: string,
-        label: string,
-        /// Formats (qualified) or media types.
-        reads: list<string>,
-        /// The kind it makes, qualified.
-        makes: string,
-        native: bool,
-        fields: list<field>,
-        inspector: list<view>,
-        check: bool,
-        /// Whether it makes native files (`make-native`), and writes its source from them (`make-source`).
-        imports: bool,
-        /// The kind settings it derives from the source (`size`, `cells.*.rect`).
-        derives: list<string>,
-        exports: bool,
-        priority: s32,
-    }
-
-    /// How far an importer takes a source: fully, or partly with a reason and whether it is offered anyway.
-    variant support {
-        full,
-        partial(tuple<string, bool>),
     }
 
     /// An extractor: the native files of a kind's assets (of some of its roles, qualified; all where none) from the
@@ -321,8 +379,8 @@ interface guest {
         tools: list<tool>,
         /// Services, for other extensions: described as tools are.
         services: list<tool>,
-        formats: list<file-format>,
-        importers: list<importer>,
+        ops: list<op>,
+        types: list<value-type>,
         extractors: list<extractor>,
         /// The memory a job of something it registered may take, where more than the host's default: by its name
         /// (qualified), in bytes.
@@ -334,11 +392,12 @@ interface guest {
     /// Run the extension's entry point.
     register: func() -> result<registration, string>;
 
-    picture-has: func(kind: u32, asset: borrow<asset>) -> bool;
-    picture-looks: func(kind: u32, asset: borrow<asset>) -> list<string>;
-    picture-draw: async func(kind: u32, asset: borrow<asset>, look: u32) -> result<image, string>;
-    picture-part: func(kind: u32, asset: borrow<asset>, part: string) -> option<result<image, string>>;
-    thumbnail: async func(kind: u32, asset: borrow<asset>, side: u32) -> option<result<image, string>>;
+    /// An operation's run: lent its node as an asset - its path, kind, role and declared settings, its files the
+    /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
+    /// parameter.
+    run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
+    /// A family's members, of an asset: each by its parameter's value, with a label.
+    members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
     /// A part of an asset, by its fragment; a virtual one made of others.
@@ -350,25 +409,8 @@ interface guest {
 
     /// An asset's parts, in order.
     parts: func(kind: u32, asset: borrow<asset>) -> list<part>;
-    /// What an agent is told of an asset of the kind (a TOML table).
-    facts: func(kind: u32, asset: borrow<asset>) -> string;
-    /// A format's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
-    sniff: func(format: u32, name: string, size: u64, head: list<u8>) -> option<string>;
-    /// An importer's check of the source an asset names.
-    check: func(importer: u32, asset: borrow<asset>) -> support;
-    /// What an import made: native files by name, and the kind settings it derives (a TOML table).
-    record imported {
-        files: list<tuple<string, list<u8>>>,
-        settings: string,
-        /// What the import took otherwise than the source has it (colors matched to the nearest a palette has): said
-        /// to the user, as warnings of the asset.
-        notes: list<string>,
-    }
-
-    /// An importer's work: what it makes of the source an asset names.
-    make-native: async func(importer: u32, asset: borrow<asset>) -> result<imported, string>;
-    /// An importer's source, written from an asset's native files.
-    make-source: async func(importer: u32, asset: borrow<asset>) -> result<list<u8>, string>;
+    /// A type's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
+    sniff: func(ty: u32, name: string, size: u64, head: list<u8>) -> option<string>;
     /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the
     /// last closes), which keeps it when it says no - it holds what it cannot rebuild cheaply.
     reclaimable: func() -> bool;

@@ -1,12 +1,14 @@
-//! Pictures drawn off the window's thread: an asset's picture in a look, drawn once on a few threads of their own (each
-//! a job of its extension) from the project as the last take-in left it, and shared by all that show it - the
-//! inspector's header, the preview's views, the panels. Until one is drawn it is not there yet, and the window is
-//! woken when it is; a take-in that changed an asset forgets its pictures.
+//! Pictures drawn off the window's thread: an asset's picture in a look - its kind's `picture/<look>` output, made
+//! through the work graph and not kept - drawn once on a few threads of their own (each a job of its extension) from
+//! the project as the last take-in left it, and shared by all that show it - the inspector's header, the preview's
+//! views, the panels. Until one is drawn it is not there yet, and the window is woken when it is. Each is kept with
+//! what it read: a take-in forgets those whose reads no longer hold.
 
 use pe2_ext::Image;
 use project::ext::Extensions;
+use project::graph::exec::Reads;
 use project::index::Index;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -24,13 +26,17 @@ pub type Drawn = Result<Arc<Image>, String>;
 
 enum Slot {
     Drawing(u64),
-    Drawn(Drawn),
+    /// Drawn, with what it read; failed, with nothing.
+    Drawn(Drawn, Option<Reads>),
 }
+
+/// A picture as a thread answers: its asset and look, the asking it answers, the picture and what it read.
+type Answer = (String, usize, u64, Drawn, Option<Reads>);
 
 pub struct Pictures {
     slots: HashMap<(String, usize), Slot>,
     requests: Option<Sender<Request>>,
-    results: Receiver<(String, usize, u64, Drawn)>,
+    results: Receiver<Answer>,
     index: Arc<Index>,
     extensions: Arc<Extensions>,
     asked: u64,
@@ -48,20 +54,26 @@ impl Pictures {
         for i in 0..threads {
             let (queued, drawn, extensions, wake) = (queued.clone(), drawn.clone(), extensions.clone(), ctx.clone());
             let _ = std::thread::Builder::new().name(format!("pictures {i}")).spawn(move || {
+                let engine = extensions.engine();
                 loop {
                     let request = match queued.lock() {
                         Ok(queue) => queue.recv(),
                         Err(_) => return,
                     };
                     let Ok(request) = request else { return };
-                    let picture = request
-                        .index
-                        .assets
-                        .get(&request.path)
-                        .and_then(|asset| extensions.picture(asset, request.look))
-                        .unwrap_or_else(|| Err(pe2_ext::anyhow!("it has no picture")));
-                    let picture = picture.map(Arc::new).map_err(|e| format!("{e:#}"));
-                    if drawn.send((request.path, request.look, request.asked, picture)).is_err() {
+                    let made = request.index.assets.get(&request.path).and_then(|asset| {
+                        let address = extensions.picture_address(asset, request.look)?;
+                        Some(extensions.output(&engine, asset, &address, true))
+                    });
+                    let (picture, reads) = match made {
+                        Some(Ok(given)) => match given.value.as_deref() {
+                            Some(project::graph::Value::Image(image)) => (Ok(Arc::new(image.clone())), Some(given.reads)),
+                            _ => (Err("it drew no picture".to_string()), None),
+                        },
+                        Some(Err(e)) => (Err(format!("{e:#}")), None),
+                        None => (Err("it has no picture".to_string()), None),
+                    };
+                    if drawn.send((request.path, request.look, request.asked, picture, reads)).is_err() {
                         return;
                     }
                     if let Some(ctx) = wake.get() {
@@ -78,23 +90,30 @@ impl Pictures {
         let _ = self.ctx.set(ctx.clone());
     }
 
-    /// The project to draw from: the last take-in's.
+    /// The project to draw from: the last take-in's. A picture whose reads no longer hold in it is forgotten, to be
+    /// drawn again when asked; one that failed is asked again.
     pub fn set_index(&mut self, index: Arc<Index>) {
+        self.slots.retain(|(path, _), slot| match slot {
+            Slot::Drawing(_) => true,
+            Slot::Drawn(_, reads) => {
+                reads.as_ref().is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset)))
+            }
+        });
         self.index = index;
     }
 
     /// An asset's picture in a look: drawn; or, while it is being drawn (asked now if it was not), none.
     pub fn get(&mut self, path: &str, look: usize) -> Option<Drawn> {
-        for (path, look, asked, picture) in self.results.try_iter() {
+        for (path, look, asked, picture, reads) in self.results.try_iter() {
             if let Some(slot) = self.slots.get_mut(&(path, look))
                 && matches!(slot, Slot::Drawing(a) if *a == asked)
             {
-                *slot = Slot::Drawn(picture);
+                *slot = Slot::Drawn(picture, reads);
             }
         }
         let key = (path.to_string(), look);
         match self.slots.get(&key) {
-            Some(Slot::Drawn(picture)) => return Some(picture.clone()),
+            Some(Slot::Drawn(picture, _)) => return Some(picture.clone()),
             Some(Slot::Drawing(_)) => return None,
             None => {}
         }
@@ -107,11 +126,6 @@ impl Pictures {
             self.slots.insert(key, Slot::Drawing(self.asked));
         }
         None
-    }
-
-    /// Forget the pictures of these assets: they changed.
-    pub fn forget(&mut self, assets: &BTreeSet<String>) {
-        self.slots.retain(|(path, _), _| !assets.contains(path));
     }
 
     /// Forget every picture.

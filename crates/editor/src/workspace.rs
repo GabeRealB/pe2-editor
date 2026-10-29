@@ -136,7 +136,7 @@ pub struct Workspace {
     pub layers: Vec<LayerInfo>,
     /// What was done this session, to undo and redo.
     pub history: History,
-    /// The tree's thumbnails, kept as artifacts in the cache.
+    /// The tree's thumbnails, kept in the project's store.
     pub thumbs: crate::thumbs::Thumbs,
     /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
@@ -198,7 +198,7 @@ pub struct Workspace {
     /// Parts of pictures (palettes' strips), as the inspector shows them.
     pub parts: Parts,
     /// The inspector views - the kinds' and roles', or the importers' - by (asset, the importer's, view).
-    inspector_views: HashMap<(String, bool, usize), Box<dyn pe2_ext::View>>,
+    inspector_views: HashMap<(String, usize), Box<dyn pe2_ext::View>>,
     /// The panels' views, by pane.
     panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
     /// What a view set of the asset it shows this frame, for the app to make after drawing.
@@ -319,7 +319,7 @@ pub struct Opened {
     /// The label of an edit a crash left half done, rolled back.
     pub recovered: Option<String>,
     index: Index,
-    artifacts: project::artifacts::Artifacts,
+    store: project::graph::store::Store,
     extensions: Arc<Extensions>,
     extensions_found: Vec<extensions::Found>,
     imports: project::imports::Imports,
@@ -346,14 +346,20 @@ impl Workspace {
             None => History::open(&cache)?,
         };
         let mut index = Index::open_reporting(&project, &cache, report)?;
-        // The artifacts of assets the project no longer has go; the whole stack's entries are what it has.
-        let artifacts = project::artifacts::Artifacts::open(&cache)?;
-        let _ = artifacts.sweep(&index.entries.values().map(|e| e.uid.as_str()).collect());
+        // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
+        let store = project::graph::store::Store::open(&cache)?;
+        let kept = store.clone();
+        let old = cache.path("artifacts");
+        if old.exists() {
+            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
+        }
         // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
         // Its own (`extension` assets) and the user's before the built-ins.
         report("Loading the extensions", 0, 0);
         let extensions_found = extensions::found(Some(&index));
         let extensions = extensions::for_project(&project, Some(&index));
+        // What they are asked in passing reads and keeps what the project's store holds.
+        extensions.keep_in(kept);
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
@@ -372,7 +378,7 @@ impl Workspace {
             history,
             recovered,
             index,
-            artifacts,
+            store,
             extensions,
             extensions_found,
             imports,
@@ -389,7 +395,7 @@ impl Workspace {
             cache_dir,
             history,
             index,
-            artifacts,
+            store,
             extensions,
             extensions_found,
             imports,
@@ -397,7 +403,7 @@ impl Workspace {
             tree,
             ..
         } = opened;
-        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), artifacts);
+        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), store);
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it.
         let shown = Arc::new(index.clone());
@@ -632,12 +638,10 @@ impl Workspace {
             }
             self.index = snapshot.index;
             if let Some(pictures) = &mut self.textures.pictures {
-                pictures.set_index(self.index.clone());
                 if snapshot.all {
                     pictures.clear();
-                } else {
-                    pictures.forget(&snapshot.changed);
                 }
+                pictures.set_index(self.index.clone());
             }
             self.tree = snapshot.tree;
             self.layers = snapshot.layers;
@@ -1151,7 +1155,7 @@ impl Workspace {
     pub fn has_view(&self, path: &str) -> bool {
         self.index.assets.get(path).is_some_and(|a| {
             !self.extensions.views(a).is_empty()
-                && (self.extensions.kind_of(a).is_none_or(|k| k.picture.is_none()) || self.extensions.has_picture(a))
+                && (!self.extensions.shows_pictures(a) || self.extensions.has_picture(a))
         })
     }
 
@@ -1228,9 +1232,9 @@ impl Workspace {
         }
     }
 
-    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet, or (`import`) its
-    /// importer of its import settings - made when first shown.
-    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>, import: bool) {
+    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet - made when first
+    /// shown.
+    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
         let look = self.variant(path);
         // As the inspector's own fields: an asset from below is overridden into the active layer.
         let editable = self.editable_layer().is_ok();
@@ -1241,13 +1245,8 @@ impl Workspace {
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
         };
-        let defs = if import {
-            self.extensions.importer_of(asset).map_or_default(|i| i.inspector.iter().collect())
-        } else {
-            self.extensions.inspector(asset)
-        };
-        for (i, def) in defs.into_iter().enumerate() {
-            let key = (path.to_string(), import, i);
+        for (i, def) in self.extensions.inspector(asset).into_iter().enumerate() {
+            let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
             let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable };
             let mut sets = vec![];

@@ -1,17 +1,8 @@
-//! What agents are told of an image besides its declaration, and the palette tool.
+//! The palette tool: a palette's colors, for agents.
 
-use pe2_ext::{Asset, Project, Result, Table, Value, anyhow};
+use pe2_ext::{Project, Result, Table, Value, anyhow};
 
-use crate::{cells, palette_colors, palette_names, rgba};
-
-/// An image's palettes by name and its cells' count.
-pub(crate) fn facts(asset: &Asset) -> Table {
-    let mut facts = Table::new();
-    let palettes = palette_names(asset).into_iter().map(Value::String).collect();
-    facts.insert("palettes".into(), Value::Array(palettes));
-    facts.insert("cells".into(), Value::Integer(i64::try_from(cells(asset).len()).unwrap_or(i64::MAX)));
-    facts
-}
+use crate::{palette_colors, palette_names, rgba};
 
 pub(crate) const PALETTE: &str = "A palette's colors: each as stored (ABGR1555) and as RGBA.";
 

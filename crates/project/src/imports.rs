@@ -28,8 +28,6 @@ use crate::graph::store::{Blob, Kept, Store};
 use crate::graph::{self, Plan};
 use crate::index::{Asset, BundleFile, Imported, Index, Problem, Report};
 
-/// The output an asset's import is.
-pub const NATIVE: &str = "native";
 /// Where imports were kept before the store, removed on opening.
 const OLD: &str = "imports";
 
@@ -133,21 +131,20 @@ impl Imports {
             if i % 256 == 0 {
                 report("Attaching what the importers made", i, total);
             }
-            if asset.fields().contains_key("stack") {
-                let (_, wrong) = Plan::of(asset.fields(), &engine.ops);
-                stacks.extend(wrong.into_iter().map(|p| Problem::Import {
-                    asset: asset.path.clone(),
-                    error: format!("{}: {}", p.at, p.what),
-                }));
-            }
-            let Some((importer, plan, output)) = import_plan(asset, extensions, &engine) else { continue };
-            let key = engine.key(&plan, asset, output, None);
+            let (plan, wrong) = extensions.plan(asset);
+            stacks.extend(wrong.into_iter().map(|p| Problem::Import {
+                asset: asset.path.clone(),
+                error: format!("{}: {}", p.at, p.what),
+            }));
+            let Some((importer, output)) = import_output(&plan) else { continue };
+            let plan = &plan;
+            let key = engine.key(plan, asset, output, None);
             if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset)) {
                 attached.kept += 1;
                 found.push((asset.path.clone(), key, import.clone()));
                 continue;
             }
-            match self.import(asset, extensions, &engine, (importer, &plan, output), &key) {
+            match self.import(asset, extensions, &engine, (importer, plan, output), &key) {
                 Ok((made, reads, import)) => {
                     if made {
                         attached.made += 1;
@@ -161,9 +158,11 @@ impl Imports {
             }
         }
         if only.is_none() {
-            let live: HashSet<String> = found.iter().map(|(_, key, _)| key.clone()).collect();
+            let live: HashSet<&String> = found.iter().map(|(_, key, _)| key).collect();
             known.retain(|key, _| live.contains(key));
-            let _ = self.store.sweep(&live);
+            // What the project's nodes no longer make, and what nodes it no longer has made.
+            let nodes: HashSet<String> = index.assets.values().map(|a| graph::exec::id(&**a).to_string()).collect();
+            let _ = self.store.sweep(&nodes, &live);
         }
         drop(known);
         let mut problems: Vec<Problem> =
@@ -263,31 +262,27 @@ impl Imports {
         let (made, trace) = if let Some(trace) = engine.kept(plan, asset, output, None) {
             (false, trace)
         } else {
-            engine.output(plan, asset, NATIVE, false)?;
+            let output = &plan.outputs[output];
+            engine.output(plan, asset, &output.name, false)?;
             (true, self.store.trace(key).context("its import was not kept")?)
         };
-        let Some(Kept::Native { files, order, settings, notes }) = self.store.describe(&trace.value) else {
-            anyhow::bail!("its import is kept as something else");
+        let Some(Kept::Typed { files, settings, notes, .. }) = self.store.describe(&trace.value) else {
+            anyhow::bail!("its import is kept as something else than an extension's type");
         };
-        let derives = extensions.importer(&importer).map_or_default(|i| i.derives.clone());
+        let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
         let mut resolved = resolve(asset.fields(), &settings, &derives);
         resolved.notes = notes;
-        let mut files: Vec<(String, Blob)> = files.into_iter().collect();
-        files.sort_by_key(|(name, _)| order.iter().position(|o| o == name).unwrap_or(usize::MAX));
+        let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
         Ok((made, trace.reads, Arc::new(Known { importer, files, resolved: Arc::new(resolved) })))
     }
 }
 
-/// An asset's importer, its plan and the index of its `native` output, where its stack imports a source its bundle has
-/// with an importer that makes files.
-fn import_plan(asset: &Asset, extensions: &Extensions, engine: &Engine) -> Option<(String, Plan, usize)> {
-    let import = graph::import_of(asset.fields())?;
-    extensions.importer(import.op)?.import.as_ref()?;
-    source_file(asset)?;
-    let importer = import.op.to_string();
-    let (plan, _) = Plan::of(asset.fields(), &engine.ops);
-    let (output, _) = plan.output(NATIVE).filter(|(_, p)| p.is_none())?;
-    Some((importer, plan, output))
+/// What makes an asset's result - the operation its stack ends with - and the output keeping it, where its result is
+/// made: its files are then attached in its bundle's, and its derived settings resolved over its declaration's. (A
+/// result that is a stored file is seen as it is.)
+fn import_output(plan: &Plan) -> Option<(String, usize)> {
+    let result = plan.result.filter(|_| !plan.result_stored())?;
+    Some((plan.steps[result].op.clone(), plan.result_output()?))
 }
 
 /// The file an asset's stack takes as its import's source, from its bundle.
@@ -461,7 +456,32 @@ mod attaching {
     use crate::ext::{Extensions, Loadable};
     use crate::index::{Index, Problem};
     use crate::lock::Lock;
-    use pe2_ext::{Extension, Imported, Part, Registry, Result, Table, Value};
+    use pe2_ext::ty::{Files, Registered};
+    use pe2_ext::{Extension, File, Part, Registry, Result, Signature, Table, Typed, Value};
+
+    /// A strip's source: a line of cell names, recognized by its name.
+    struct Line;
+
+    impl Registered for Line {
+        const NAME: &str = "test.strips@text_line";
+        const LABEL: &str = "A line of names";
+
+        fn signatures() -> Vec<Signature> {
+            vec![Signature::Name("source.txt".into())]
+        }
+    }
+
+    impl Files for Line {}
+
+    /// A strip's native form.
+    struct Strip;
+
+    impl Registered for Strip {
+        const NAME: &str = "test.strips@line_native";
+        const LABEL: &str = "A strip's native form";
+    }
+
+    impl Files for Strip {}
     use std::path::{Path, PathBuf};
 
     /// A kind whose source is a line of cell names: each a cell one texel wide, its native file the source reversed.
@@ -474,13 +494,18 @@ mod attaching {
                 asset.parts("cells").into_iter().map(|(name, _)| Part { id: format!("cells/{name}"), label: name.into(), made_of: vec![] }).collect()
             })
             .register();
-        let text = r.format("text_line").named("source.txt").register();
-        r.importer("line", &strip)
-            .reads(&text)
+        let _ = strip;
+        let _ = r.value_type::<Line>();
+        let _ = r.value_type::<Strip>();
+        let _ = r
+            .op("line")
+            .input::<Line>("source")
+            .output::<Strip>()
             .derives("size")
             .derives("cells.*.rect")
-            .import(|asset| {
-                let source = String::from_utf8(asset.read("source.txt")?)?;
+            .run(|call| {
+                let source = call.take::<Line>(0)?;
+                let source = String::from_utf8(call.read(source.file()?)?)?;
                 let names: Vec<&str> = source.split_whitespace().collect();
                 let mut cells = Table::new();
                 for (i, name) in names.iter().enumerate() {
@@ -490,9 +515,9 @@ mod attaching {
                 let mut settings = Table::new();
                 settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
                 settings.insert("cells".into(), Value::Table(cells));
-                Ok(Imported { files: vec![("native.bin".into(), source.bytes().rev().collect())], settings, notes: vec![] })
-            })
-            .register();
+                let files = vec![File::new("native.bin", source.bytes().rev().collect())];
+                Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
+            });
         Ok(())
     }
 

@@ -357,29 +357,30 @@ fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) 
 }
 
 /// A bundle's `asset.toml` with its declaration's `[import]` written out as its stack, before the originals: its source
-/// stored on top, the importer taking it (with the import's other settings), the native form it makes as the `native`
-/// output - kept in the store, made as soon as the source changes, where the importer makes files; where it is native,
-/// its source as it is, made when asked for.
+/// stored on top, the importer taking it where it names one (with the import's other settings), the native form as the
+/// `native` output - kept in the store, made as soon as the source changes, where the importer makes it; where none
+/// does (`native`), the stored file as it is, made when asked for.
 fn stacked(toml: &str, native: bool) -> Result<String> {
     use std::fmt::Write as _;
     let mut doc: toml_edit::DocumentMut = toml.parse()?;
     let Some(import) = doc.remove("import") else { return Ok(toml.to_string()) };
     let import = import.as_table_like().context("its `import` is not a table")?;
-    let text = |key: &str| import.get(key).and_then(toml_edit::Item::as_str).with_context(|| format!("its import has no {key}"));
-    let mut stack = format!("[[stack]]\nop = \"file\"\nfile = {}\n\n[[stack]]\nop = {}\n", quote(text("source")?), quote(text("importer")?));
-    for (key, item) in import.iter().filter(|(k, _)| !matches!(*k, "importer" | "source")) {
-        let value = item.as_value().with_context(|| format!("its import's {key} is not a value"))?;
-        let _ = writeln!(stack, "{key} = {}", value.to_string().trim());
+    let text = |key: &str| import.get(key).and_then(toml_edit::Item::as_str);
+    let source = text("source").context("its import has no source")?;
+    let mut stack = format!("[[stack]]\nop = \"file\"\nfile = {}\n", quote(source));
+    // Its importer, where it names one; none, and the stored file is the native form as it is.
+    if let Some(importer) = text("importer") {
+        let _ = write!(stack, "\n[[stack]]\nop = {}\n", quote(importer));
+        for (key, item) in import.iter().filter(|(k, _)| !matches!(*k, "importer" | "source")) {
+            let value = item.as_value().with_context(|| format!("its import's {key} is not a value"))?;
+            let _ = writeln!(stack, "{key} = {}", value.to_string().trim());
+        }
     }
     stack.push_str("\n[[stack]]\nop = \"output\"\nname = \"native\"\n");
     if !native {
         stack.push_str("retain = \"cache\"\nwhen = \"eager\"\n");
     }
-    let text = doc.to_string();
-    let body = text.find("\n[original.").map_or(text.len(), |i| i + 1);
-    let (body, originals) = text.split_at(body);
-    let separator = if originals.is_empty() { "" } else { "\n" };
-    Ok(format!("{}\n\n{stack}{separator}{originals}", body.trim_end()))
+    Ok(with_stack(&doc.to_string(), &stack))
 }
 
 /// A layout asset's `asset.toml`: its declaration without what only extraction reads (`at`).
@@ -546,49 +547,66 @@ impl crate::graph::exec::Node for Lent<'_> {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
     }
+
+    fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
+        let found = self.files.values().find(|bytes| sha1_hex(bytes) == sha1);
+        found.cloned().with_context(|| format!("{}: no content {sha1}", self.path))
+    }
 }
 
 impl Sourcing<'_> {
-    /// A bundle's `asset.toml` with the import its declaration names written out as its stack (`stacked`).
-    fn stack(&self, path: &str, toml: String) -> Result<String> {
+    /// A bundle's `asset.toml` with its stack written out: the import its declaration names (`stacked`), or where it
+    /// names none, the stack of its kind (`KindBuilder::stack`), where that has one.
+    fn stack(&self, path: &str, kind: &str, toml: String) -> Result<String> {
         let declared: toml::Table = toml.parse()?;
-        let Some(importer) = declared.get("import").and_then(|i| i.get("importer")).and_then(toml::Value::as_str) else {
+        if declared.contains_key("stack") {
             return Ok(toml);
+        }
+        let Some(import) = declared.get("import") else {
+            return Ok(match self.extensions.kind_stack(kind) {
+                Some(stack) => with_stack(&toml, stack),
+                None => toml,
+            });
         };
-        let def = self.extensions.importer(importer).with_context(|| format!("{path}: no extension provides {importer}"))?;
-        stacked(&toml, def.import.is_none()).with_context(|| path.to_string())
+        // An import undone by another makes its native form from a source: kept. A stored file named without an
+        // importer, or one undone by none, is the native form as it is.
+        let native = match import.get("importer").and_then(toml::Value::as_str) {
+            Some(op) => self.extensions.op(op).with_context(|| format!("{path}: no extension provides {op}"))?.inverse.is_none(),
+            None => true,
+        };
+        stacked(&toml, native).with_context(|| path.to_string())
     }
 
-    /// An asset's `asset.toml` and files as its bundle holds them: its native files where its importer is native,
-    /// else its importer's source alone - exported from them, imported back with the declaration less what the
-    /// import derives, and compared, files and settings both; its import kept.
-    fn bundle(
-        &mut self,
-        path: &str,
-        asset: &crate::declarations::Asset,
-        toml: String,
-        native: Vec<(String, Vec<u8>)>,
-    ) -> Result<(String, pe2_ext::Made)> {
+    /// A content, whole: inline, or kept in the store.
+    fn read(&self, content: &crate::graph::Content) -> Result<Vec<u8>> {
+        match content {
+            crate::graph::Content::Inline(bytes) => Ok(bytes.clone()),
+            crate::graph::Content::Stored { sha1, .. } => {
+                let path = self.engine.store().context("no store")?.blob_path(sha1);
+                std::fs::read(&path).with_context(|| path.display().to_string())
+            }
+        }
+    }
+
+    /// An asset's `asset.toml` and files as its bundle holds them: its native files where its import is undone by
+    /// none, else its import's source alone - written by the operation undoing it from the native files, imported back
+    /// by its stack with the declaration less what the import derives, and compared, files and settings both; its
+    /// import kept.
+    fn bundle(&mut self, path: &str, asset: &crate::declarations::Asset, toml: String, native: pe2_ext::Made) -> Result<(String, pe2_ext::Made)> {
         let fields: toml::Table = toml.parse()?;
         let Some(import) = crate::graph::import_of(&fields) else { return Ok((toml, native)) };
-        let (importer, source) = (import.op.to_string(), import.source.to_string());
-        let def = self.extensions.importer(&importer).with_context(|| format!("{path}: no extension provides {importer}"))?;
-        if def.export.is_none() {
-            return Ok((toml, native));
-        }
-        let (kind, role) = self.extensions.qualify(&asset.kind, asset.role.as_deref());
-        let lent = Lent {
-            path,
-            uid: Some(&asset.uid),
-            fields: crate::graph::with_import(&fields, &import),
-            declaration: &toml,
-            files: native.iter().cloned().collect(),
+        let (op, source) = (import.op.to_string(), import.source.to_string());
+        let def = self.extensions.op(&op).with_context(|| format!("{path}: no extension provides {op}"))?;
+        let Some(inverse) = def.inverse.clone() else { return Ok((toml, native)) };
+        let pe2_ext::Type::Named(ty) = &def.output else { bail!("{path}: {op} makes {}, no extension's type", def.output) };
+        let lent = Lent { path, uid: Some(&asset.uid), fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
+        let files = native.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.clone())).collect();
+        let native_form = crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, ..pe2_ext::Typed::default() });
+        let written = self.engine.run(&inverse, vec![vec![native_form]], &toml::Table::new(), &lent);
+        let bytes = match written.with_context(|| format!("{path}: {inverse} could not write its source"))? {
+            crate::graph::Value::Typed(written) => self.read(&written.file()?.content)?,
+            other => bail!("{path}: {inverse} wrote {}, not a file", other.ty()),
         };
-        let bytes = self
-            .extensions
-            .export(&importer, &pe2_ext::Asset::new(&lent, kind, role))
-            .context("no export")?
-            .with_context(|| format!("{path}: {importer} could not write its source"))?;
         // What the bundle says: the declaration without what the source holds. Imported back by its stack, as the
         // project will - which keeps the import.
         let written = crate::imports::without_derived(&toml, &def.derives)?;
@@ -599,19 +617,21 @@ impl Sourcing<'_> {
             declaration: &written,
             files: BTreeMap::from([(source.clone(), bytes.clone())]),
         };
-        let (plan, wrong) = crate::graph::Plan::of(&lent.fields, &self.engine.ops);
+        let (plan, wrong) = crate::graph::Plan::of(&lent.fields, &self.engine.ops, &[]);
         if let Some(wrong) = wrong.first() {
             bail!("{path}: {}: {}", wrong.at, wrong.what);
         }
+        let result = plan.result_output().map(|o| plan.outputs[o].name.clone()).with_context(|| format!("{path}: its stack keeps no result"))?;
         let given = self
             .engine
-            .output(&plan, &lent, crate::imports::NATIVE, true)
-            .with_context(|| format!("{path}: {importer} could not import its source"))?;
-        let Some(crate::graph::Value::Native(made)) = given.value.as_deref() else {
+            .output(&plan, &lent, &result, true)
+            .with_context(|| format!("{path}: {op} could not import its source"))?;
+        let Some(crate::graph::Value::Typed(made)) = given.value.as_deref() else {
             bail!("{path}: its import made no native form");
         };
-        let (made_map, native_map): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            (made.files.iter().cloned().collect(), native.into_iter().collect());
+        let made_map: BTreeMap<String, Vec<u8>> =
+            made.files.iter().map(|f| Ok((f.name.clone(), self.read(&f.content)?))).collect::<Result<_>>()?;
+        let native_map: BTreeMap<String, Vec<u8>> = native.into_iter().collect();
         if made_map != native_map {
             let differ: Vec<&String> = native_map
                 .keys()
@@ -627,6 +647,14 @@ impl Sourcing<'_> {
         self.sources += 1;
         Ok((written, vec![(source, bytes)]))
     }
+}
+
+/// A bundle's `asset.toml` with a stack added, before the originals.
+fn with_stack(toml: &str, stack: &str) -> String {
+    let body = toml.find("\n[original.").map_or(toml.len(), |i| i + 1);
+    let (body, originals) = toml.split_at(body);
+    let separator = if originals.is_empty() { "" } else { "\n" };
+    format!("{}\n\n{}\n{separator}{originals}", body.trim_end(), stack.trim())
 }
 
 /// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count,
@@ -672,7 +700,7 @@ fn write_assets(
                 }
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
-            let toml = sourcing.stack(path, asset_toml(&asset.body, None, &originals)?)?;
+            let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, None, &originals)?)?;
             let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
             let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
             files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
@@ -727,7 +755,7 @@ fn write_assets(
             }
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
-        let toml = sourcing.stack(path, asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?)?;
+        let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?)?;
         let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
         if let Some(native) = &native {
             files.push((&name, native));

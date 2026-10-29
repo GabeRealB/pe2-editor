@@ -4,9 +4,9 @@
 //! runs: a source on top - a file of its bundle, a constant, another node's output - then layers each taking the
 //! result above and passing their own down: an operation with its settings, or a graph layer, an operation graph whose
 //! input is the result above and whose result goes on down. Output layers are taps: each exposes the value at its level
-//! as one of the node's outputs, under a name, and passes it on unchanged. A family of outputs is one output with a
-//! parameter (`picture(look)`), each of its outputs addressed by the parameter's value (`picture/0`). A node's outputs
-//! are its output layers, known without evaluating anything.
+//! as one of the node's outputs, under a name, and passes it on unchanged. An output reaching an operation with a
+//! parameter is a family of it, each of its outputs addressed by a value of the parameter (`picture/night`). A node's
+//! outputs are its output layers and its kind's, known without evaluating anything.
 //!
 //! A stack is lowered to a plan - its operations in an order each comes after those it takes from - checked as it is:
 //! an operation no extension provides, a source below the top, a value of one type given to a port of another, a cycle
@@ -26,109 +26,52 @@ use std::sync::Arc;
 
 use toml::{Table, Value as Toml};
 
-pub use pe2_ext::{Image, Imported};
+pub use pe2_ext::{Content, Data as Value, File, Image, Pcm, Port, Retain, Type, Typed};
 
-/// What a port takes or an operation makes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Type {
-    /// A file: its name and its bytes.
-    File,
-    /// An asset's native form: its files, and the settings derived with them.
-    Native,
-    Image,
-    Table,
-    /// Whatever it is given.
-    Any,
-}
-
-impl Type {
-    /// Whether a value of this type may be given to a port taking `port`.
-    #[must_use]
-    pub fn fits(self, port: Type) -> bool {
-        self == port || self == Type::Any || port == Type::Any
-    }
-
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Type::File => "file",
-            Type::Native => "native",
-            Type::Image => "image",
-            Type::Table => "table",
-            Type::Any => "any",
-        }
-    }
-}
-
-/// A value passed between operations, or given out as an output.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    File(File),
-    Native(Imported),
-    Image(Image),
-    Table(Table),
-}
-
-impl Value {
-    #[must_use]
-    pub fn ty(&self) -> Type {
-        match self {
-            Value::File(_) => Type::File,
-            Value::Native(_) => Type::Native,
-            Value::Image(_) => Type::Image,
-            Value::Table(_) => Type::Table,
-        }
-    }
-
-    /// Its hash: of its type and its contents, a native form's files by their names and hashes.
-    #[must_use]
-    pub fn hash(&self) -> String {
-        let sha1 = crate::extract::sha1_hex;
-        let text = match self {
-            Value::File(file) => format!("file {}\n{}", file.name, sha1(&file.bytes)),
-            Value::Native(native) => {
-                let mut text = String::from("native\n");
-                for (name, bytes) in &native.files {
-                    let _ = writeln!(text, "{name} {}", sha1(bytes));
-                }
-                let _ = writeln!(text, "{}", toml::to_string(&native.settings).unwrap_or_default());
-                for note in &native.notes {
-                    let _ = writeln!(text, "note {note}");
-                }
-                text
+/// A value's hash: of its type and its contents - a file's by its content's hash, inline or stored alike.
+#[must_use]
+pub fn hash(value: &Value) -> String {
+    let sha1 = crate::extract::sha1_hex;
+    let content = |c: &Content| match c {
+        Content::Inline(bytes) => sha1(bytes),
+        Content::Stored { sha1, .. } => sha1.clone(),
+    };
+    let text = match value {
+        Value::Typed(typed) => {
+            let mut text = format!("{} {:?}\n", typed.ty, typed.also);
+            for file in &typed.files {
+                let _ = writeln!(text, "{} {}", file.name, content(&file.content));
             }
-            Value::Image(image) => format!("image {}x{}\n{}", image.width, image.height, sha1(&image.rgba)),
-            Value::Table(table) => format!("table\n{}", toml::to_string(table).unwrap_or_default()),
-        };
-        sha1(text.as_bytes())
-    }
+            let _ = writeln!(text, "{}", toml::to_string(&typed.settings).unwrap_or_default());
+            for note in &typed.notes {
+                let _ = writeln!(text, "note {note}");
+            }
+            text
+        }
+        Value::Image(image) => format!("image {}x{}\n{}", image.width, image.height, sha1(&image.rgba)),
+        Value::Table(table) => format!("table\n{}", toml::to_string(table).unwrap_or_default()),
+        Value::Pcm(pcm) => {
+            let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+            format!("pcm {} {}\n{}", pcm.rate, pcm.channels, sha1(&bytes))
+        }
+        Value::List(items) => items.iter().fold(String::from("list\n"), |mut text, item| {
+            let _ = writeln!(text, "{}", hash(item));
+            text
+        }),
+    };
+    sha1(text.as_bytes())
 }
 
-/// A file as a value: what a bundle names it, and its bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct File {
-    pub name: String,
-    pub bytes: Vec<u8>,
+/// A port taking one value of a type.
+#[must_use]
+pub fn port(name: &str, ty: Type) -> Port {
+    Port { name: name.to_string(), ty, many: false }
 }
 
-/// A port of an operation: what it takes, and whether it takes any number of values (a list joined in order).
-#[derive(Clone, Debug)]
-pub struct Port {
-    pub name: String,
-    pub ty: Type,
-    pub many: bool,
-}
-
-impl Port {
-    #[must_use]
-    pub fn one(name: &str, ty: Type) -> Port {
-        Port { name: name.to_string(), ty, many: false }
-    }
-
-    #[must_use]
-    pub fn many(name: &str, ty: Type) -> Port {
-        Port { name: name.to_string(), ty, many: true }
-    }
+/// A port taking any number of values of a type, in order.
+#[must_use]
+pub fn ports(name: &str, ty: Type) -> Port {
+    Port { name: name.to_string(), ty, many: true }
 }
 
 /// What an operation does when it runs.
@@ -143,13 +86,23 @@ pub struct OpDef {
     pub version: String,
     pub inputs: Vec<Port>,
     pub output: Option<Type>,
+    /// Its parameter's name: what reaches it is a family of it.
+    pub parameter: Option<String>,
     pub run: Option<Arc<Run>>,
 }
 
 impl OpDef {
     #[must_use]
     pub fn new(name: &str, label: &str, version: &str) -> OpDef {
-        OpDef { name: name.to_string(), label: label.to_string(), version: version.to_string(), inputs: Vec::new(), output: None, run: None }
+        let (name, label, version) = (name.to_string(), label.to_string(), version.to_string());
+        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None }
+    }
+
+    /// With a parameter: what reaches it is a family of it.
+    #[must_use]
+    pub fn parameter(mut self, name: &str) -> OpDef {
+        self.parameter = Some(name.to_string());
+        self
     }
 
     #[must_use]
@@ -177,6 +130,10 @@ pub const FILE: &str = "file";
 pub const CONSTANT: &str = "constant";
 pub const OUTPUT: &str = "output";
 pub const GRAPH: &str = "graph";
+/// The host's thumbnail: a picture made small (`side`, its longer side's pixels).
+pub const THUMBNAIL: &str = "thumbnail";
+/// The host's output keeping a node's result, where nothing in its stack keeps it and it is not a stored file.
+pub const RESULT: &str = "result";
 /// What a graph layer's operations name the result above it by.
 pub const ABOVE: &str = "above";
 
@@ -189,16 +146,22 @@ pub struct Ops {
 impl Default for Ops {
     fn default() -> Ops {
         let mut ops = Ops { defs: HashMap::new() };
-        ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File, |call| {
+        ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             let name = call.setting_str("file")?.to_string();
-            let bytes = call.file(&name)?;
-            Ok(Value::File(File { name, bytes }))
+            call.stored(&name, Vec::new()).map(Value::Typed)
         }));
         ops.add(OpDef::new(CONSTANT, "Constant", "1").makes(Type::Table, |call| {
             let value = call.settings().get("value").and_then(Toml::as_table).cloned();
             value.map(Value::Table).ok_or_else(|| anyhow::anyhow!("its `value` is not a table"))
         }));
-        ops.add(OpDef::new(OUTPUT, "Output", "1").input(Port::one("value", Type::Any)));
+        ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)));
+        ops.add(OpDef::new(THUMBNAIL, "Thumbnail", "1").input(port("picture", Type::Image)).makes(Type::Image, |call| {
+            let side = call.settings().get("side").and_then(Toml::as_integer).and_then(|s| usize::try_from(s).ok()).unwrap_or(32);
+            match call.take(0)?.take() {
+                Value::Image(image) => Ok(Value::Image(image.thumbnail(side))),
+                other => anyhow::bail!("given {}, not an image", other.ty()),
+            }
+        }));
         ops
     }
 }
@@ -214,23 +177,14 @@ impl Ops {
     }
 }
 
-/// How an output is kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Retain {
-    /// In the project's store, by content.
-    Cache,
-    /// In the project's build directory.
-    Build,
-    /// Not at all: handed to whoever asked, its trace kept.
-    Transient,
-}
-
 /// An operation of a plan: its type, its settings, and the steps each of its ports takes from.
 #[derive(Clone, Debug)]
 pub struct Step {
     pub op: String,
     pub settings: Table,
     pub inputs: Vec<Vec<usize>>,
+    /// What it makes, its operation's variables bound by what it takes.
+    pub ty: Type,
     /// Where its node's declaration has it: `stack[1]`, `stack[2].ops.join`.
     pub at: String,
 }
@@ -239,8 +193,11 @@ pub struct Step {
 #[derive(Clone, Debug)]
 pub struct Output {
     pub name: String,
-    /// Its parameter, for a family (`picture(look)`): each output addressed `<name>/<value>`.
+    /// Its parameter, for a family: each output addressed `<name>/<value>`.
     pub parameter: Option<String>,
+    /// The value it gives the parameter what it reaches has, where it is one output of what would be a family (the
+    /// thumbnail: of the first look).
+    pub given: Option<String>,
     /// The step whose value it is.
     pub from: usize,
     pub retain: Retain,
@@ -249,11 +206,36 @@ pub struct Output {
     pub at: String,
 }
 
-/// A stack lowered: its operations, each after those it takes from, and its outputs.
+/// A stack lowered: its operations, each after those it takes from, its outputs, and its result - the step its stack
+/// ends with, which its kind's outputs take, and which is the node as its readers see it.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub steps: Vec<Step>,
     pub outputs: Vec<Output>,
+    pub result: Option<usize>,
+}
+
+/// An output a node's kind adds after its stack: made by an operation from the stack's result - or from what another
+/// of the kind's outputs is made of (`from`, its index among them) - with settings of its own.
+#[derive(Clone, Debug)]
+pub struct Tail {
+    pub name: String,
+    /// The value it gives the parameter of what it reaches, making it one output rather than a family.
+    pub given: Option<String>,
+    pub op: String,
+    pub retain: Retain,
+    pub from: Option<usize>,
+    pub settings: Table,
+}
+
+/// How a retention is written.
+#[must_use]
+pub fn retain_name(retain: Retain) -> &'static str {
+    match retain {
+        Retain::Cache => "cache",
+        Retain::Build => "build",
+        Retain::Transient => "transient",
+    }
 }
 
 /// What is wrong with a stack, where.
@@ -267,17 +249,72 @@ impl Plan {
     /// A declaration's stack lowered and checked: the plan, and what is wrong with it. A plan with problems still has
     /// the steps and outputs that are sound, so a node keeps what it can make.
     #[must_use]
-    pub fn of(declaration: &Table, ops: &Ops) -> (Plan, Vec<Problem>) {
+    pub fn of(declaration: &Table, ops: &Ops, tail: &[Tail]) -> (Plan, Vec<Problem>) {
         let mut lowering = Lowering { ops, plan: Plan::default(), problems: Vec::new() };
-        match declaration.get("stack") {
-            None => {}
+        let result = match declaration.get("stack") {
+            None => None,
             Some(Toml::Array(layers)) => lowering.stack(layers),
-            Some(_) => lowering.problem("stack", "is not a list of layers"),
+            Some(_) => {
+                lowering.problem("stack", "is not a list of layers");
+                None
+            }
+        };
+        lowering.plan.result = result;
+        // The node as its readers see it is its result: kept - by the stack where an output keeps it, else by the
+        // host - unless it is a stored file, which its readers see as it is, or a family (one asset is no family).
+        if let Some(result) = result
+            && lowering.plan.steps[result].op != FILE
+            && lowering.plan.result_output().is_none()
+            && !lowering.reaches_parameter(result)
+        {
+            let mut layer = Table::new();
+            layer.insert("name".into(), RESULT.into());
+            layer.insert("retain".into(), retain_name(Retain::Cache).into());
+            layer.insert("when".into(), "eager".into());
+            lowering.output(&layer, result, "stack");
         }
+        // The kind's outputs, after the stack: a node without a result has none of them.
+        let mut made: Vec<Option<usize>> = Vec::with_capacity(tail.len());
+        for (i, output) in tail.iter().enumerate() {
+            let at = format!("kind.outputs[{i}]");
+            let from = output.from.map_or(result, |f| made.get(f).copied().flatten());
+            let step = match (from, ops.get(&output.op).cloned()) {
+                (Some(from), Some(def)) => Some(lowering.step(&def, &output.op, output.settings.clone(), vec![vec![from]], &at)),
+                (Some(_), None) => {
+                    lowering.problem(&at, &format!("`{}`: no extension provides it", output.op));
+                    None
+                }
+                (None, _) => None,
+            };
+            if let Some(step) = step {
+                let mut layer = Table::new();
+                layer.insert("name".into(), output.name.clone().into());
+                if let Some(given) = &output.given {
+                    layer.insert("given".into(), given.clone().into());
+                }
+                layer.insert("retain".into(), retain_name(output.retain).into());
+                lowering.output(&layer, step, &at);
+            }
+            made.push(step);
+        }
+        lowering.families();
         (lowering.plan, lowering.problems)
     }
 
-    /// An output by its address: `native`, `picture/0` - with its parameter's value.
+    /// The output keeping its result in the store: one of its stack's, or the host's (`RESULT`).
+    #[must_use]
+    pub fn result_output(&self) -> Option<usize> {
+        let result = self.result?;
+        self.outputs.iter().position(|o| o.from == result && o.parameter.is_none() && o.retain == Retain::Cache)
+    }
+
+    /// Whether its result is a stored file of its node, which readers see as it is.
+    #[must_use]
+    pub fn result_stored(&self) -> bool {
+        self.result.is_some_and(|r| self.steps[r].op == FILE)
+    }
+
+    /// An output by its address: `native`, `picture/night` - with its parameter's value.
     #[must_use]
     pub fn output(&self, address: &str) -> Option<(usize, Option<String>)> {
         if let Some(i) = self.outputs.iter().position(|o| o.parameter.is_none() && o.name == address) {
@@ -291,10 +328,16 @@ impl Plan {
     /// The steps an output reaches, in order.
     #[must_use]
     pub fn reached(&self, outputs: &[usize]) -> Vec<bool> {
+        self.reached_until(outputs, &std::collections::HashSet::new())
+    }
+
+    /// The steps an output reaches, not going past those `known` (made already).
+    #[must_use]
+    pub fn reached_until(&self, outputs: &[usize], known: &std::collections::HashSet<usize>) -> Vec<bool> {
         let mut needed = vec![false; self.steps.len()];
         let mut todo: Vec<usize> = outputs.iter().map(|&o| self.outputs[o].from).collect();
         while let Some(s) = todo.pop() {
-            if !std::mem::replace(&mut needed[s], true) {
+            if !std::mem::replace(&mut needed[s], true) && !known.contains(&s) {
                 todo.extend(self.steps[s].inputs.iter().flatten());
             }
         }
@@ -334,7 +377,25 @@ impl Lowering<'_> {
         self.problems.push(Problem { at: at.to_string(), what: what.to_string() });
     }
 
-    fn stack(&mut self, layers: &[Toml]) {
+    /// A step of an operation taking from `inputs` (by port): its types checked, its variables bound by what it is
+    /// given; its index.
+    fn step(&mut self, def: &OpDef, op: &str, settings: Table, inputs: Vec<Vec<usize>>, at: &str) -> usize {
+        let mut bound = Vec::new();
+        for (port, from) in def.inputs.iter().zip(&inputs) {
+            for &from in from {
+                let made = self.plan.steps[from].ty.clone();
+                if !port.ty.unify(&made, &mut bound) {
+                    self.problem(at, &format!("its `{}` takes {}, and is given {made}", port.name, port.ty));
+                }
+            }
+        }
+        let ty = def.output.as_ref().map_or(Type::Any, |t| t.bind(&bound));
+        self.plan.steps.push(Step { op: op.to_string(), settings, inputs, ty, at: at.to_string() });
+        self.plan.steps.len() - 1
+    }
+
+    /// A stack's layers: the step of its result, where it has one.
+    fn stack(&mut self, layers: &[Toml]) -> Option<usize> {
         let mut above: Option<usize> = None;
         for (i, layer) in layers.iter().enumerate() {
             let at = format!("stack[{i}]");
@@ -371,24 +432,55 @@ impl Lowering<'_> {
                         above = None;
                         continue;
                     } else if let Some(from) = above {
-                        self.check_type(from, &def.inputs[0], &at);
                         vec![vec![from]]
                     } else {
                         self.problem(&at, &format!("`{op}` takes a value, and nothing is above it"));
                         continue;
                     };
-                    self.plan.steps.push(Step { op: op.to_string(), settings: settings_of(layer, &["op"]), inputs, at });
-                    above = Some(self.plan.steps.len() - 1);
+                    above = Some(self.step(&def, op, settings_of(layer, &["op"]), inputs, &at));
                 }
             }
         }
+        above
     }
 
-    /// Whether the value of step `from` fits a port; a problem where it does not.
-    fn check_type(&mut self, from: usize, port: &Port, at: &str) {
-        let made = self.ops.get(&self.plan.steps[from].op).and_then(|d| d.output).unwrap_or(Type::Any);
-        if !made.fits(port.ty) {
-            self.problem(at, &format!("its `{}` takes {}, and is given {}", port.name, port.ty.name(), made.name()));
+    /// Whether a step reaches an operation with a parameter: what it makes is a family.
+    fn reaches_parameter(&self, step: usize) -> bool {
+        let mut todo = vec![step];
+        let mut seen = vec![false; self.plan.steps.len()];
+        while let Some(s) = todo.pop() {
+            if std::mem::replace(&mut seen[s], true) {
+                continue;
+            }
+            if self.ops.get(&self.plan.steps[s].op).is_some_and(|d| d.parameter.is_some()) {
+                return true;
+            }
+            todo.extend(self.plan.steps[s].inputs.iter().flatten());
+        }
+        false
+    }
+
+    /// Each output a family of the parameter the operations it reaches have: one at most - two are a problem.
+    fn families(&mut self) {
+        let families: Vec<usize> = (0..self.plan.outputs.len()).filter(|o| self.plan.outputs[*o].given.is_none()).collect();
+        for o in families {
+            let reached = self.plan.reached(&[o]);
+            let mut parameters: Vec<&String> = (0..self.plan.steps.len())
+                .filter(|s| reached[*s])
+                .filter_map(|s| self.ops.get(&self.plan.steps[s].op)?.parameter.as_ref())
+                .collect();
+            parameters.sort_unstable();
+            parameters.dedup();
+            let output = &self.plan.outputs[o];
+            match parameters.as_slice() {
+                [] => {}
+                [parameter] => self.plan.outputs[o].parameter = Some((*parameter).clone()),
+                many => {
+                    let (at, name) = (output.at.clone(), output.name.clone());
+                    let named: Vec<String> = many.iter().map(|p| format!("`{p}`")).collect();
+                    self.problem(&at, &format!("`{name}` reaches operations of {}: an output is one family", named.join(" and ")));
+                }
+            }
         }
     }
 
@@ -397,17 +489,7 @@ impl Lowering<'_> {
             self.problem(at, "is an output without a name");
             return;
         };
-        let (name, parameter) = match name.split_once('(') {
-            Some((name, rest)) => {
-                let Some(parameter) = rest.strip_suffix(')').filter(|p| !p.is_empty() && !p.contains(['(', ')', '/'])) else {
-                    self.problem(at, &format!("`{name}`: a family's name is `name(parameter)`"));
-                    return;
-                };
-                (name, Some(parameter.to_string()))
-            }
-            None => (name, None),
-        };
-        if name.is_empty() || name.contains('/') {
+        if name.is_empty() || name.contains(['/', '(', ')']) {
             self.problem(at, &format!("`{name}` is not an output's name"));
             return;
         }
@@ -432,7 +514,9 @@ impl Lowering<'_> {
                 false
             }
         };
-        self.plan.outputs.push(Output { name: name.to_string(), parameter, from, retain, eager, at: at.to_string() });
+        // A family where what it reaches has a parameter: found once it is lowered (`families`).
+        let given = layer.get("given").and_then(Toml::as_str).map(str::to_string);
+        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, given, from, retain, eager, at: at.to_string() });
     }
 
     /// A graph layer's operations, after those they take from (the layer above's result as `above`): its result's
@@ -528,7 +612,6 @@ impl Lowering<'_> {
                     self.problem(at, &format!("its `{}` takes from `{id}`, which makes nothing", port.name));
                     return None;
                 };
-                self.check_type(step, port, at);
                 steps.push(step);
             }
             inputs.push(steps);
@@ -537,8 +620,7 @@ impl Lowering<'_> {
             self.output(op, inputs[0][0], at);
             return None;
         }
-        self.plan.steps.push(Step { op: name.to_string(), settings: settings_of(op, &["op", "from"]), inputs, at: at.to_string() });
-        Some(self.plan.steps.len() - 1)
+        Some(self.step(&def, name, settings_of(op, &["op", "from"]), inputs, at))
     }
 }
 

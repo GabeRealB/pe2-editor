@@ -5,7 +5,7 @@
 //! of the cache, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
 //! a trace never names what is not there.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -13,18 +13,23 @@ use serde::{Deserialize, Serialize};
 use toml::Table;
 
 use super::exec::Reads;
-use super::{File, Image, Imported, Value};
+use super::{Content, File, Image, Pcm, Typed, Value};
 use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 
 const DIR: &str = "store";
 
-/// An output's trace: its value's hash, and what it read.
+/// An output's trace: its value's hash, what it read, and whose output it is (its node, as traces name it, and its
+/// address).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trace {
     pub value: String,
     #[serde(default)]
     pub reads: Reads,
+    #[serde(default)]
+    pub node: String,
+    #[serde(default)]
+    pub output: String,
 }
 
 /// A blob as a value names it.
@@ -34,16 +39,22 @@ pub struct Blob {
     pub size: u64,
 }
 
-/// A kept value as its `values/<hash>.toml` describes it.
+/// A kept file: its name, its content's blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptFile {
+    pub name: String,
+    pub blob: Blob,
+}
+
+/// A kept value as its `values/<hash>.toml` describes it: contents as blobs, read back by reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Kept {
-    File { name: String, blob: Blob },
-    Native {
-        files: BTreeMap<String, Blob>,
-        /// The files' order as made.
-        #[serde(default)]
-        order: Vec<String>,
+    Typed {
+        ty: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        also: Vec<String>,
+        files: Vec<KeptFile>,
         #[serde(default)]
         settings: Table,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -51,6 +62,20 @@ pub enum Kept {
     },
     Image { width: usize, height: usize, blob: Blob },
     Table { table: Table },
+    Pcm { rate: u32, channels: u16, blob: Blob },
+    /// Its items, each kept by its own hash.
+    List { items: Vec<String> },
+}
+
+impl Kept {
+    /// The blobs it names.
+    fn blobs(&self) -> Vec<&Blob> {
+        match self {
+            Kept::Typed { files, .. } => files.iter().map(|f| &f.blob).collect(),
+            Kept::Image { blob, .. } | Kept::Pcm { blob, .. } => vec![blob],
+            Kept::Table { .. } | Kept::List { .. } => vec![],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +122,14 @@ impl Store {
         Ok(Blob { sha1, size: bytes.len() as u64 })
     }
 
+    /// Keep bytes as a blob, where a program can read them (`blob_path`).
+    ///
+    /// # Errors
+    /// They cannot be written.
+    pub fn keep(&self, bytes: &[u8]) -> Result<Blob> {
+        self.put_blob(bytes)
+    }
+
     fn read_blob(&self, blob: &Blob) -> Result<Vec<u8>> {
         let path = self.blob_path(&blob.sha1);
         std::fs::read(&path).with_context(|| path.display().to_string())
@@ -106,61 +139,97 @@ impl Store {
         self.dir.join("values").join(format!("{hash}.toml"))
     }
 
-    /// Keep a value under its hash: its blobs, then its description.
+    /// Keep a content as a blob: inline, written; stored elsewhere (`locate` reads it, by its hash), copied.
+    fn put_content(&self, content: &Content, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Blob> {
+        match content {
+            Content::Inline(bytes) => self.put_blob(bytes),
+            Content::Stored { sha1, size } => {
+                let path = self.blob_path(sha1);
+                if !path.exists() {
+                    let bytes = locate(sha1).with_context(|| format!("no content {sha1} to keep"))?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+                    }
+                    write_atomic(&path, &bytes)?;
+                }
+                Ok(Blob { sha1: sha1.clone(), size: *size })
+            }
+        }
+    }
+
+    fn put_file(&self, file: &File, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<KeptFile> {
+        Ok(KeptFile { name: file.name.clone(), blob: self.put_content(&file.content, locate)? })
+    }
+
+    /// Keep a value under its hash: its contents as blobs (what is stored elsewhere read by `locate`), then its
+    /// description.
     ///
     /// # Errors
-    /// It cannot be written.
-    pub fn put(&self, hash: &str, value: &Value) -> Result<()> {
-        let path = self.value_path(hash);
-        if path.exists() {
+    /// It cannot be written, or a content of it found.
+    pub fn put(&self, hash: &str, value: &Value, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<()> {
+        // Kept already, as this store reads values (one written otherwise is written again).
+        if self.describe(hash).is_some() {
             return Ok(());
         }
+        let path = self.value_path(hash);
         let kept = match value {
-            Value::File(file) => Kept::File { name: file.name.clone(), blob: self.put_blob(&file.bytes)? },
-            Value::Native(native) => {
-                let mut files = BTreeMap::new();
-                for (name, bytes) in &native.files {
-                    files.insert(name.clone(), self.put_blob(bytes)?);
-                }
-                let order = native.files.iter().map(|(name, _)| name.clone()).collect();
-                Kept::Native { files, order, settings: native.settings.clone(), notes: native.notes.clone() }
-            }
+            Value::Typed(typed) => Kept::Typed {
+                ty: typed.ty.clone(),
+                also: typed.also.clone(),
+                files: typed.files.iter().map(|f| self.put_file(f, locate)).collect::<Result<_>>()?,
+                settings: typed.settings.clone(),
+                notes: typed.notes.clone(),
+            },
             Value::Image(image) => Kept::Image { width: image.width, height: image.height, blob: self.put_blob(&image.rgba)? },
             Value::Table(table) => Kept::Table { table: table.clone() },
+            Value::Pcm(pcm) => {
+                let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                Kept::Pcm { rate: pcm.rate, channels: pcm.channels, blob: self.put_blob(&bytes)? }
+            }
+            Value::List(items) => {
+                let mut hashes = Vec::with_capacity(items.len());
+                for item in items {
+                    let hash = super::hash(item);
+                    self.put(&hash, item, locate)?;
+                    hashes.push(hash);
+                }
+                Kept::List { items: hashes }
+            }
         };
         write_atomic(&path, toml::to_string(&kept)?.as_bytes())
     }
 
-    /// Whether a value is kept.
+    /// Whether a value is kept, as this store reads values.
     #[must_use]
     pub fn has(&self, hash: &str) -> bool {
-        self.value_path(hash).exists()
+        self.describe(hash).is_some()
     }
 
-    /// A kept value's description, without reading its blobs: a native form's files are then read where they are kept
-    /// (`blob_path`).
+    /// A kept value's description, without reading its blobs.
     #[must_use]
     pub fn describe(&self, hash: &str) -> Option<Kept> {
         toml::from_str(&std::fs::read_to_string(self.value_path(hash)).ok()?).ok()
     }
 
-    /// A kept value, read whole.
+    /// A kept value: its files' contents by reference (read through `blob_path`), what is not a file's read now.
     ///
     /// # Errors
     /// It is not kept, or a blob of it cannot be read.
     pub fn get(&self, hash: &str) -> Result<Value> {
         let kept = self.describe(hash).with_context(|| format!("{hash}: not kept"))?;
+        let file = |f: KeptFile| File { name: f.name, content: Content::Stored { sha1: f.blob.sha1, size: f.blob.size } };
         Ok(match kept {
-            Kept::File { name, blob } => Value::File(File { name, bytes: self.read_blob(&blob)? }),
-            Kept::Native { files, order, settings, notes } => {
-                let mut made = Vec::with_capacity(files.len());
-                for name in order.iter().filter(|n| files.contains_key(*n)).chain(files.keys().filter(|n| !order.contains(n))) {
-                    made.push((name.clone(), self.read_blob(&files[name])?));
-                }
-                Value::Native(Imported { files: made, settings, notes })
+            Kept::Typed { ty, also, files, settings, notes } => {
+                Value::Typed(Typed { ty, also, files: files.into_iter().map(file).collect(), settings, notes })
             }
             Kept::Image { width, height, blob } => Value::Image(Image { width, height, rgba: self.read_blob(&blob)? }),
             Kept::Table { table } => Value::Table(table),
+            Kept::Pcm { rate, channels, blob } => {
+                let bytes = self.read_blob(&blob)?;
+                let samples = bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();
+                Value::Pcm(Pcm { rate, channels, samples })
+            }
+            Kept::List { items } => Value::List(items.iter().map(|h| self.get(h)).collect::<Result<_>>()?),
         })
     }
 
@@ -182,33 +251,64 @@ impl Store {
         write_atomic(&self.trace_path(key), toml::to_string(trace)?.as_bytes())
     }
 
-    /// Remove the traces not under the keys `live`, then the values no trace left names, then the blobs no value left
-    /// names: what was swept, as (traces, values, blobs).
+    /// Remove the traces of nodes not `live`, and of each live node's output all but the newest (what made it
+    /// before) - never those under the keys `used`, which what swept them reads - then the values no trace left
+    /// names, then the blobs no value left names: what was swept, as (traces, values, blobs).
     #[must_use = "what was swept is the sweep's report"]
-    pub fn sweep(&self, live: &HashSet<String>) -> (usize, usize, usize) {
+    pub fn sweep(&self, live: &HashSet<String>, used: &HashSet<&String>) -> (usize, usize, usize) {
         let stem = |e: &std::fs::DirEntry| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_string);
         let entries = |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten();
         let mut swept = (0, 0, 0);
-        let mut values = HashSet::new();
+        // Each live output's newest trace, by when it was written.
+        let mut newest: HashMap<(String, String), (std::time::SystemTime, String, String)> = HashMap::new();
+        let mut gone = Vec::new();
         for entry in entries("traces") {
-            let Some(key) = stem(&entry) else { continue };
-            if live.contains(&key) && let Some(trace) = self.trace(&key) {
-                values.insert(trace.value);
-            } else if std::fs::remove_file(entry.path()).is_ok() {
+            let (Some(key), Some(trace)) = (stem(&entry), stem(&entry).and_then(|k| self.trace(&k))) else {
+                gone.push(entry.path());
+                continue;
+            };
+            // A trace in use is the newest there is.
+            let written = if used.contains(&key) {
+                std::time::SystemTime::now() + std::time::Duration::from_secs(1)
+            } else {
+                entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
+            };
+            if !live.contains(&trace.node) && !used.contains(&key) {
+                gone.push(entry.path());
+                continue;
+            }
+            match newest.entry((trace.node, trace.output)) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    if held.get().0 < written {
+                        let (_, older, _) = held.insert((written, key, trace.value));
+                        gone.push(self.trace_path(&older));
+                    } else {
+                        gone.push(entry.path());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((written, key, trace.value));
+                }
+            }
+        }
+        for path in gone {
+            if std::fs::remove_file(path).is_ok() {
                 swept.0 += 1;
+            }
+        }
+        let mut values: HashSet<String> = newest.into_values().map(|(_, _, value)| value).collect();
+        // A kept list keeps its items.
+        let mut lists: Vec<String> = values.iter().cloned().collect();
+        while let Some(hash) = lists.pop() {
+            if let Some(Kept::List { items }) = self.describe(&hash) {
+                lists.extend(items.iter().filter(|i| values.insert((*i).clone())).cloned());
             }
         }
         let mut blobs = HashSet::new();
         for entry in entries("values") {
             let Some(hash) = stem(&entry) else { continue };
             if values.contains(&hash) && let Some(kept) = self.describe(&hash) {
-                match kept {
-                    Kept::File { blob, .. } | Kept::Image { blob, .. } => {
-                        blobs.insert(blob.sha1);
-                    }
-                    Kept::Native { files, .. } => blobs.extend(files.into_values().map(|b| b.sha1)),
-                    Kept::Table { .. } => {}
-                }
+                blobs.extend(kept.blobs().into_iter().map(|b| b.sha1.clone()));
             } else if std::fs::remove_file(entry.path()).is_ok() {
                 swept.1 += 1;
             }

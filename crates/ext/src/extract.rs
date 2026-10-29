@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::{Made, Name, Result, Table};
+use crate::{Name, Result, Table};
+
+/// Files made, each by its name in the bundle.
+pub type Made = Vec<(String, Vec<u8>)>;
 
 /// The declarations, as extraction holds them: each the table its group file declares it by (with `from`, where
 /// extraction finds it per release).

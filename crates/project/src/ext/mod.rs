@@ -12,8 +12,8 @@ pub mod component;
 
 use anyhow::{Context, Result};
 use pe2_ext::{
-    Asset, Extension, Field, FormatDef, Icon, Image, ImporterDef, KindDef, PanelDef, Project, Recognized, Registry, RoleDef,
-    Signature, Source, Support, Table, Tint, ToolDef, Value, ViewDef,
+    Asset, Extension, Field, TypeDef, Icon, Image, KindDef, PanelDef, Project, Recognized, Registry, RoleDef, Signature,
+    Source, Table, Tint, ToolDef, Value, ViewDef,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -57,8 +57,11 @@ pub struct Loadable {
     component: Option<Arc<std::sync::OnceLock<Arc<component::Shared>>>>,
     /// Its component's size in bytes, where it is one.
     pub size: Option<usize>,
-    /// The contract its component was built against (`0.2.0`); none linked in.
+    /// The contract its component was built against (`0.1.0`); none linked in.
     pub contract: Option<String>,
+    /// Its component's hash, which what it makes is kept by: a rebuilt extension makes it again, its version the
+    /// same. None linked in.
+    pub build: Option<String>,
     /// The settings kept for it, by scope (`{ project = { ... }, user = { ... } }`), which it reads as it registers.
     pub settings: toml::Table,
 }
@@ -74,6 +77,7 @@ impl From<Extension> for Loadable {
             component: None,
             size: None,
             contract: None,
+            build: None,
             settings: toml::Table::new(),
         }
     }
@@ -84,6 +88,8 @@ impl From<Extension> for Loadable {
 pub struct Loaded {
     pub id: String,
     pub version: String,
+    /// Its component's hash; none linked in.
+    pub build: Option<String>,
     pub origin: Origin,
     /// What it requires (`pe2.images@^0.1`): whose services it may call.
     pub requires: Vec<String>,
@@ -187,8 +193,14 @@ pub struct Extensions {
     panels: Vec<PanelDef>,
     tools: Vec<ToolDef>,
     services: HashMap<String, ToolDef>,
-    formats: Vec<FormatDef>,
-    importers: HashMap<String, ImporterDef>,
+    /// The types a stored file may be recognized as: those registered with a recognizer.
+    recognizers: Vec<TypeDef>,
+    ops: HashMap<String, pe2_ext::OpDef>,
+    types: HashMap<String, pe2_ext::TypeDef>,
+    /// The operations as the work graph runs them, made once loaded.
+    graph_ops: std::sync::OnceLock<graph::Ops>,
+    /// The store outputs asked for in passing read and keep, once the project is open.
+    store: std::sync::OnceLock<graph::store::Store>,
     extractors: Vec<pe2_ext::ExtractorDef>,
     /// The components of the extensions loaded, by id.
     components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
@@ -345,8 +357,8 @@ impl Extensions {
         let registers = vec![
             ("kinds", listed(parts.kinds.iter().map(|k| &k.name).collect())),
             ("roles", listed(parts.roles.iter().map(|r| &r.name).collect())),
-            ("formats", listed(parts.formats.iter().map(|f| &f.name).collect())),
-            ("importers", listed(parts.importers.iter().map(|i| &i.name).collect())),
+            ("operations", listed(parts.ops.iter().map(|o| &o.name).collect())),
+            ("types", listed(parts.types.iter().map(|t| &t.name).collect())),
             ("extractors", listed(parts.extractors.iter().map(|e| &e.name).collect())),
             ("panels", listed(parts.panels.iter().map(|p| &p.name).collect())),
             ("tools", listed(parts.tools.iter().map(|t| &t.name).collect())),
@@ -357,7 +369,8 @@ impl Extensions {
         let mut seen = HashSet::new();
         let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
-        let names = names.chain(parts.formats.iter().map(|f| &f.name)).chain(parts.importers.iter().map(|i| &i.name));
+        let names = names.chain(parts.ops.iter().map(|o| &o.name));
+        let names = names.chain(parts.types.iter().map(|t| &t.name));
         let names = names.chain(parts.extractors.iter().map(|e| &e.name)).chain(parts.services.iter().map(|s| &s.name));
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
@@ -370,23 +383,7 @@ impl Extensions {
             anyhow::ensure!(reachable, "{} is on {}, which neither it nor what it requires registers", role.name, role.kind);
         }
         let reachable = |owner: &str, known: bool| owner == extension.id && known || dependencies.contains(&owner);
-        for importer in &parts.importers {
-            let own = kinds.iter().any(|k| k.name == importer.makes);
-            anyhow::ensure!(
-                reachable(importer.makes.extension(), own) && (own || self.kinds.contains_key(importer.makes.as_str())),
-                "{} makes {}, which neither it nor what it requires registers",
-                importer.name,
-                importer.makes
-            );
-            for read in importer.reads.iter().filter_map(|r| pe2_ext::Name::parse(r)) {
-                let own = parts.formats.iter().any(|f| f.name == read);
-                anyhow::ensure!(
-                    reachable(read.extension(), own) && (own || self.formats.iter().any(|f| f.name == read)),
-                    "{} reads {read}, which neither it nor what it requires registers",
-                    importer.name
-                );
-            }
-        }
+        self.check_graph(&extension.id, &dependencies, (&parts.ops, &parts.types, &parts.problems), &kinds)?;
         for extractor in &parts.extractors {
             let own = kinds.iter().any(|k| k.name == extractor.kind);
             anyhow::ensure!(
@@ -411,7 +408,7 @@ impl Extensions {
         }
         let (id, version, origin) = (extension.id.clone(), extension.version.clone(), extension.origin.clone());
         let requires = extension.requires.clone();
-        self.loaded.push(Loaded { id, version, origin, requires });
+        self.loaded.push(Loaded { id, version, build: extension.build.clone(), origin, requires });
         for kind in kinds {
             if let Some(alias) = &kind.alias {
                 self.kind_aliases.insert(alias.clone(), kind.name.to_string());
@@ -427,10 +424,53 @@ impl Extensions {
         self.panels.extend(parts.panels);
         self.tools.extend(parts.tools);
         self.services.extend(parts.services.into_iter().map(|s| (s.name.to_string(), s)));
-        self.formats.extend(parts.formats);
-        self.importers.extend(parts.importers.into_iter().map(|i| (i.name.to_string(), i)));
+        self.recognizers.extend(parts.types.iter().filter(|t| t.recognizable()).cloned());
+        self.ops.extend(parts.ops.into_iter().map(|o| (o.name.to_string(), o)));
+        self.types.extend(parts.types.into_iter().map(|t| (t.name.to_string(), t)));
         self.extractors.extend(parts.extractors);
         Ok(registers)
+    }
+
+    /// What an extension registers for the work graph, checked: its registration's own problems; that what its
+    /// operations take and make, and what its kinds' outputs are made by, is its own or what it requires registers.
+    fn check_graph(
+        &self,
+        id: &str,
+        dependencies: &[&str],
+        (ops, types, problems): (&[pe2_ext::OpDef], &[pe2_ext::TypeDef], &[String]),
+        kinds: &[KindDef],
+    ) -> Result<()> {
+        let reachable = |owner: &str, known: bool| owner == id && known || dependencies.contains(&owner);
+        anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
+        // What its operations take and make, and what its kinds' outputs are made by: its own, or what it requires.
+        for op in ops {
+            let mut named = Vec::new();
+            for ty in op.inputs.iter().map(|p| &p.ty).chain([&op.output]) {
+                named_types(ty, &mut named);
+            }
+            // A media type is no extension's: any may claim a file answers to it.
+            for ty in named.into_iter().filter(|t| !t.contains('/')) {
+                let owner = ty.split_once('@').map_or("", |(owner, _)| owner);
+                let own = types.iter().any(|t| t.name.to_string() == ty);
+                anyhow::ensure!(
+                    reachable(owner, own) && (own || self.types.contains_key(&ty)),
+                    "{} takes or makes {ty}, which neither it nor what it requires registers",
+                    op.name
+                );
+            }
+        }
+        for (kind, output) in kinds.iter().flat_map(|k| k.outputs.iter().map(move |o| (k, o))) {
+            let owner = output.op.split_once('@').map_or("", |(owner, _)| owner);
+            let own = ops.iter().any(|o| o.name.to_string() == output.op);
+            anyhow::ensure!(
+                reachable(owner, own) && (own || self.ops.contains_key(&output.op)),
+                "{}'s output {} is made by {}, which neither it nor what it requires registers",
+                kind.name,
+                output.name,
+                output.op
+            );
+        }
+        Ok(())
     }
 
     /// An extension's settings as it declared them, with the values they took; what is kept for it that it could not
@@ -451,8 +491,9 @@ impl Extensions {
         self.settings.insert(extension.id.clone(), declared.to_vec());
     }
 
-    /// An extension's version as what it makes is kept by: its version, and the project's settings it took where any
-    /// is not its default - another value of one makes other assets, so other keys.
+    /// An extension's version as what it makes is kept by: its version and its build (its component's hash), and the
+    /// project's settings it took where any is not its default - another value of one makes other assets, so other
+    /// keys.
     #[must_use]
     pub fn version_of(&self, id: &str) -> String {
         let Some(loaded) = self.loaded.iter().find(|l| l.id == id) else { return String::new() };
@@ -464,7 +505,9 @@ impl Extensions {
             .filter(|(s, value)| s.scope == pe2_ext::Scope::Project && *value != s.default)
             .map(|(s, value)| format!("{}={value}", s.key))
             .collect();
-        if changed.is_empty() { loaded.version.clone() } else { format!("{} {}", loaded.version, changed.join(" ")) }
+        // Its build: a component rebuilt is another extension to what it made, its version the same.
+        let version = loaded.build.as_ref().map_or_else(|| loaded.version.clone(), |b| format!("{} {b}", loaded.version));
+        if changed.is_empty() { version } else { format!("{version} {}", changed.join(" ")) }
     }
 
     /// The kind a declaration names, qualified or by a built-in's bare alias.
@@ -513,59 +556,131 @@ impl Extensions {
         self.kind_named(declared)?.0.icon
     }
 
+    /// The outputs an asset's kind adds after its stack, as its plan lowers them - then the host's thumbnail (the
+    /// first that is a picture, made small, kept).
+    #[must_use]
+    pub fn tail(&self, asset: &index::Asset) -> Vec<graph::Tail> {
+        let Some(kind) = self.kind_of(asset) else { return Vec::new() };
+        let mut tail: Vec<graph::Tail> = kind
+            .outputs
+            .iter()
+            .map(|o| graph::Tail {
+                name: o.name.clone(),
+                given: None,
+                op: o.op.clone(),
+                retain: o.retain,
+                from: None,
+                settings: Table::new(),
+            })
+            .collect();
+        if let Some(pictured) = kind.outputs.iter().position(|o| self.makes_pictures(o)) {
+            let mut settings = Table::new();
+            settings.insert("side".into(), Value::Integer(THUMBNAIL_SIDE));
+            let (name, op) = (graph::THUMBNAIL.to_string(), graph::THUMBNAIL.to_string());
+            // Of its first look, where its picture is a family.
+            let given = self.pictured(asset).and_then(|(o, members)| members.into_iter().next().filter(|_| self.family(o))).map(|(key, _)| key);
+            tail.push(graph::Tail { name, given, op, retain: pe2_ext::Retain::Cache, from: Some(pictured), settings });
+        }
+        tail
+    }
+
+    /// Whether a kind's output is a picture: its operation makes an image.
+    fn makes_pictures(&self, output: &pe2_ext::OutputDef) -> bool {
+        self.ops.get(&output.op).is_some_and(|op| op.output == pe2_ext::Type::Image)
+    }
+
+    /// An asset's plan: its stack, then its kind's outputs; and what is wrong with it.
+    #[must_use]
+    pub fn plan(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
+        graph::Plan::of(asset.fields(), &self.operations(), &self.tail(asset))
+    }
+
+    /// An output of an asset, by its address (`native`, `picture/night`), through `engine`.
+    ///
+    /// # Errors
+    /// It has no such output, or it could not be made.
+    pub fn output(&self, engine: &graph::exec::Engine, asset: &index::Asset, address: &str, read: bool) -> Result<graph::exec::Given> {
+        let (plan, _) = self.plan(asset);
+        engine.output(&plan, asset, address, read)
+    }
+
+    /// An engine for what is asked now, in passing: the extensions' operations, reading what the project's store
+    /// keeps (`keep_in`), keeping what it is asked to.
+    #[must_use]
+    pub fn engine(&self) -> graph::exec::Engine {
+        graph::exec::Engine::new(self.operations(), self.store.get().cloned())
+    }
+
+    /// The store outputs are kept in, for what is asked in passing: the project's, once it is open.
+    pub fn keep_in(&self, store: graph::store::Store) {
+        let _ = self.store.set(store);
+    }
+
+    /// Whether a kind's output is a family: its operation has a parameter.
+    fn family(&self, output: &pe2_ext::OutputDef) -> bool {
+        self.ops.get(&output.op).is_some_and(|op| op.parameter.is_some())
+    }
+
+    /// The output of an asset's kind it is shown by - the first that is a picture - with its members (one, unnamed,
+    /// where it is no family).
+    fn pictured(&self, asset: &index::Asset) -> Option<(&pe2_ext::OutputDef, Vec<(String, String)>)> {
+        let output = self.kind_of(asset)?.outputs.iter().find(|o| self.makes_pictures(o))?;
+        let members = match &output.members {
+            Some(members) => members(&self.lend(asset)),
+            None if !self.family(output) => vec![(String::new(), output.name.clone())],
+            None => Vec::new(),
+        };
+        Some((output, members))
+    }
+
+    /// Whether an asset's kind shows its nodes by a picture: it outputs one.
+    #[must_use]
+    pub fn shows_pictures(&self, asset: &index::Asset) -> bool {
+        self.kind_of(asset).is_some_and(|k| k.outputs.iter().any(|o| self.makes_pictures(o)))
+    }
+
     /// Whether an asset has a picture.
     #[must_use]
     pub fn has_picture(&self, asset: &index::Asset) -> bool {
-        self.kind_of(asset).and_then(|k| k.picture.as_ref()).is_some_and(|p| p.has(&self.lend(asset)))
+        self.pictured(asset).is_some_and(|(_, members)| !members.is_empty())
     }
 
-    /// An asset's looks, by name.
+    /// An asset's looks - the members of the picture it is shown by - by name.
     #[must_use]
     pub fn looks(&self, asset: &index::Asset) -> Vec<String> {
-        self.kind_of(asset).and_then(|k| k.picture.as_ref()).map_or_default(|p| p.looks(&self.lend(asset)))
+        self.pictured(asset).map_or_default(|(_, members)| members.into_iter().map(|(_, label)| label).collect())
     }
 
-    /// An asset's picture in one of its looks; none when it has none.
+    /// The address of an asset's picture in one of its looks (its first, past them).
+    #[must_use]
+    pub fn picture_address(&self, asset: &index::Asset, look: usize) -> Option<String> {
+        let (output, members) = self.pictured(asset)?;
+        let (key, _) = members.get(look).or_else(|| members.first())?;
+        Some(if self.family(output) { format!("{}/{key}", output.name) } else { output.name.clone() })
+    }
+
+    /// An asset's picture in one of its looks, made now; none when it has none.
     ///
     /// # Errors
-    /// Its extension could not draw it.
+    /// It could not be made.
     pub fn picture(&self, asset: &index::Asset, look: usize) -> Option<Result<Image>> {
-        let picture = self.kind_of(asset)?.picture.as_ref()?;
-        let lent = self.lend(asset);
-        picture.has(&lent).then(|| picture.draw(&lent, look))
+        let address = self.picture_address(asset, look)?;
+        Some(self.image(asset, &address))
     }
 
-    /// Whether an asset's kind makes thumbnails.
+    /// An output that is an image, made now.
+    fn image(&self, asset: &index::Asset, address: &str) -> Result<Image> {
+        let given = self.output(&self.engine(), asset, address, true)?;
+        match given.value.as_deref() {
+            Some(graph::Value::Image(image)) => Ok(image.clone()),
+            _ => anyhow::bail!("{address} is no picture"),
+        }
+    }
+
+    /// Whether an asset has a thumbnail: it has a picture.
     #[must_use]
     pub fn has_thumbnail(&self, asset: &index::Asset) -> bool {
-        self.kind_of(asset).is_some_and(|k| k.thumbnail.is_some())
-    }
-
-    /// An asset's thumbnail, at most `side` pixels on its longer side; none when its kind makes none, or it has none.
-    #[must_use]
-    pub fn thumbnail(&self, asset: &index::Asset, side: usize) -> Option<Result<Image>> {
-        (self.kind_of(asset)?.thumbnail.as_ref()?)(&self.lend(asset), side)
-    }
-
-    /// An artifact's generator: its extension's id and version, and its name.
-    fn generator(&self, index: usize, name: &str) -> String {
-        let loaded = &self.loaded[index];
-        format!("{}@{name} {}", loaded.id, self.version_of(&loaded.id))
-    }
-
-    /// The artifact name an asset's thumbnail is kept under, before it is made: its extension's.
-    #[must_use]
-    pub fn thumbnail_name(&self, asset: &index::Asset) -> Option<String> {
-        let (_, index) = self.kind_named(asset.kind.as_deref()?)?;
-        Some(format!("{}@thumbnail.png", self.loaded[*index].id))
-    }
-
-    /// The generator an asset's thumbnail is kept under as an artifact: `pe2.images@thumbnail 0.1.0`, so that a new
-    /// version of its extension makes it again.
-    #[must_use]
-    pub fn thumbnail_generator(&self, asset: &index::Asset) -> Option<String> {
-        let (_, index) = self.kind_named(asset.kind.as_deref()?)?;
-        Some(self.generator(*index, "thumbnail"))
+        self.has_picture(asset)
     }
 
     /// The fields an asset's kind and role describe, the role's first.
@@ -584,10 +699,15 @@ impl Extensions {
         kind.iter().chain(role).collect()
     }
 
-    /// A part of an asset's picture (`palettes/<name>`); none where its kind draws no such part.
+    /// A part of an asset as a picture (`palettes/<name>`): the member of a family of its kind's pictures keyed by it;
+    /// none where none is.
     #[must_use]
     pub fn part(&self, asset: &index::Asset, part: &str) -> Option<Result<Image>> {
-        self.kind_of(asset)?.picture.as_ref()?.part(&self.lend(asset), part)
+        let lent = self.lend(asset);
+        let output = self.kind_of(asset)?.outputs.iter().find(|o| {
+            self.makes_pictures(o) && o.members.as_ref().is_some_and(|m| m(&lent).iter().any(|(key, _)| key == part))
+        })?;
+        Some(self.image(asset, &format!("{}/{part}", output.name)))
     }
 
     /// An asset's parts, as its kind lists them.
@@ -600,12 +720,6 @@ impl Extensions {
     #[must_use]
     pub fn lists_parts(&self, asset: &index::Asset) -> bool {
         self.kind_of(asset).is_some_and(|k| k.parts.is_some())
-    }
-
-    /// What an agent is told of an asset besides its declaration, as its kind says.
-    #[must_use]
-    pub fn facts(&self, asset: &index::Asset) -> Table {
-        self.kind_of(asset).and_then(|k| k.facts.as_ref()).map_or_default(|facts| facts(&self.lend(asset)))
     }
 
     /// The panels the extensions registered.
@@ -649,61 +763,63 @@ impl Extensions {
         })
     }
 
-    /// An asset's importer: the operation its stack takes its source through.
+    /// The stack a kind's nodes have where their bundles state none (`[[stack]]` tables), by the name a declaration
+    /// writes it by.
     #[must_use]
-    pub fn importer_of(&self, asset: &index::Asset) -> Option<&ImporterDef> {
-        self.importers.get(graph::import_of(asset.fields())?.op)
+    pub fn kind_stack(&self, declared: &str) -> Option<&str> {
+        self.kind_named(declared)?.0.stack.as_deref()
     }
 
-    /// An importer, by its qualified name.
+    /// An asset's import: the operation its stack takes its source through.
     #[must_use]
-    pub fn importer(&self, name: &str) -> Option<&ImporterDef> {
-        self.importers.get(name)
+    pub fn import_op(&self, asset: &index::Asset) -> Option<&pe2_ext::OpDef> {
+        self.ops.get(graph::import_of(asset.fields())?.op)
     }
 
-    /// The operations stacks are made of: the built-ins, and each importer as one taking its source and making its
-    /// asset's native form - a native importer's being its source as it is. An importer reads its asset as it always
-    /// has, its source and settings given as `[import]` (`graph::with_import`); it is versioned by its extension.
+    /// An operation, by its qualified name.
+    #[must_use]
+    pub fn op(&self, name: &str) -> Option<&pe2_ext::OpDef> {
+        self.ops.get(name)
+    }
+
+    /// The operations stacks are made of: the host's (a stored file - typed by the formats it is recognized as -
+    /// constants, outputs, the thumbnail) and the extensions', each lent its node as it runs.
     #[must_use]
     pub fn operations(&self) -> graph::Ops {
+        self.graph_ops.get_or_init(|| self.make_operations()).clone()
+    }
+
+    fn make_operations(&self) -> graph::Ops {
         let mut ops = graph::Ops::default();
-        for def in self.importers.values() {
-            let name = def.name.to_string();
+        let recognizers = Arc::new(self.recognizers.clone());
+        let any_file = pe2_ext::Type::File(Box::new(pe2_ext::Type::Any));
+        let stored = graph::OpDef::new(graph::FILE, "Stored file", "1").makes(any_file, move |call| {
+            let name = call.setting_str("file")?.to_string();
+            let node = call.recorder().node();
+            let head = node.read_head(&name, HEAD);
+            let size = node.file_size(&name).unwrap_or_default();
+            let known = recognize_head(&recognizers, &name, size, &head);
+            call.stored(&name, type_names(known.iter().map(|(i, _)| &recognizers[*i]))).map(graph::Value::Typed)
+        });
+        ops.add(stored);
+        // Declared kinds and roles to the qualified names an operation is told.
+        let mut qualified: HashMap<String, String> = self.kinds.keys().map(|k| (k.clone(), k.clone())).collect();
+        qualified.extend(self.kind_aliases.iter().map(|(a, q)| (a.clone(), q.clone())));
+        qualified.extend(self.roles.keys().map(|r| (r.clone(), r.clone())));
+        qualified.extend(self.role_aliases.iter().map(|(a, q)| (a.clone(), q.clone())));
+        let qualified = Arc::new(qualified);
+        for def in self.ops.values() {
             let version = self.version_of(def.name.extension());
-            let op = graph::OpDef::new(&name, &def.label, &version).input(graph::Port::one("source", graph::Type::File));
-            let op = match def.import.clone() {
-                None => op.makes(graph::Type::Native, |call| {
-                    let graph::Value::File(file) = call.take(0)?.take() else { anyhow::bail!("its source is not a file") };
-                    Ok(graph::Value::Native(pe2_ext::Imported { files: vec![(file.name, file.bytes)], ..Default::default() }))
-                }),
-                Some(import) => {
-                    let kind = def.makes.to_string();
-                    // The roles of its kind by every name a declaration may give them.
-                    let mut roles: HashMap<String, String> = self
-                        .roles
-                        .iter()
-                        .filter(|(_, r)| r.kind == def.makes)
-                        .map(|(q, _)| (q.clone(), q.clone()))
-                        .collect();
-                    let aliases: Vec<(String, String)> =
-                        self.role_aliases.iter().filter(|(_, q)| roles.contains_key(*q)).map(|(a, q)| (a.clone(), q.clone())).collect();
-                    roles.extend(aliases);
-                    op.makes(graph::Type::Native, move |call| {
-                        let graph::Value::File(source) = call.take(0)?.take() else { anyhow::bail!("its source is not a file") };
-                        let recorder = call.recorder();
-                        recorder.declaration();
-                        let node = recorder.node();
-                        let fields = graph::with_import(
-                            node.fields(),
-                            &graph::Import { source: &source.name, op: &name, settings: call.settings().clone() },
-                        );
-                        let role = node.fields().get("role").and_then(toml::Value::as_str).and_then(|r| roles.get(r));
-                        let staged = Staged { recorder, fields, source };
-                        import(&Asset::new(&staged, Some(&kind), role.map(String::as_str))).map(graph::Value::Native)
-                    })
-                }
-            };
-            ops.add(op);
+            let mut op = graph::OpDef::new(&def.name.to_string(), &def.label, &version);
+            op.inputs.clone_from(&def.inputs);
+            op.parameter = def.parameter.as_ref().map(|(name, _)| name.clone());
+            let (run, qualified) = (def.run.clone(), qualified.clone());
+            ops.add(op.makes(def.output.clone(), move |call| {
+                let inputs = call.take_inputs();
+                let hosted = Hosted::new(call, &qualified);
+                let mut lent = pe2_ext::Call { inputs, settings: call.settings(), parameter_text: call.parameter(), host: &hosted };
+                run(&mut lent)
+            }));
         }
         ops
     }
@@ -735,18 +851,9 @@ impl Extensions {
         self.extractors.iter().find(|e| e.takes(kind, role))
     }
 
-    /// The source an importer reads, written from an asset's native files; none where the importer writes none.
-    ///
-    /// # Errors
-    /// The export failed.
-    pub fn export(&self, importer: &str, asset: &Asset) -> Option<Result<Vec<u8>>> {
-        let export = self.importer(importer)?.export.as_ref()?;
-        Some(export(asset))
-    }
-
     /// The formats a file is, by signatures and sniffs: from its first bytes, read once a content.
     #[must_use]
-    pub fn recognize(&self, file: &index::BundleFile) -> Vec<(&FormatDef, Recognized)> {
+    pub fn recognize(&self, file: &index::BundleFile) -> Vec<(&TypeDef, Recognized)> {
         let known = self.recognized.lock().ok().and_then(|r| r.get(&file.sha1).cloned());
         let found = known.unwrap_or_else(|| {
             let found = self.recognize_now(file);
@@ -755,58 +862,98 @@ impl Extensions {
             }
             found
         });
-        found.into_iter().map(|(i, r)| (&self.formats[i], r)).collect()
+        found.into_iter().map(|(i, r)| (&self.recognizers[i], r)).collect()
     }
 
     fn recognize_now(&self, file: &index::BundleFile) -> Vec<(usize, Recognized)> {
         use std::io::Read;
-        const HEAD: u64 = 4096;
         let mut head = Vec::new();
         if let Ok(f) = std::fs::File::open(&file.path) {
-            let _ = f.take(HEAD).read_to_end(&mut head);
+            let _ = f.take(HEAD as u64).read_to_end(&mut head);
         }
-        let text = match std::str::from_utf8(&head) {
-            Ok(t) => !t.contains('\0'),
-            // A cut through a character at the end of what was read: what is before it decides.
-            Err(e) => e.error_len().is_none() && !head[..e.valid_up_to()].contains(&0),
-        };
-        let named = |pattern: &str| match pattern.strip_prefix('*') {
-            Some(suffix) => file.name.ends_with(suffix),
-            None => file.name == pattern,
-        };
-        let mut out = vec![];
-        for (i, format) in self.formats.iter().enumerate() {
-            let signed = format.signatures.iter().any(|signature| match signature {
-                Signature::Bytes { offset, bytes } => head.get(*offset..offset + bytes.len()) == Some(bytes.as_slice()),
-                Signature::Name(pattern) => named(pattern),
-                Signature::Text => text,
-            });
-            let recognized = if signed {
-                Some(Recognized::default())
-            } else {
-                format.sniff.as_ref().and_then(|sniff| sniff(&file.name, file.size, &head))
-            };
-            out.extend(recognized.map(|r| (i, r)));
-        }
-        out
+        recognize_head(&self.recognizers, &file.name, file.size, &head)
     }
+}
 
-    /// The importers that fit an asset's source - the stored file its stack takes - with how far each takes it, the
-    /// highest priority first. An importer not reading any of the source's formats is not listed.
+/// The types a type names, within unions, lists and files.
+fn named_types(ty: &pe2_ext::Type, out: &mut Vec<String>) {
+    match ty {
+        pe2_ext::Type::Named(name) => out.push(name.clone()),
+        pe2_ext::Type::Union(any) => any.iter().for_each(|t| named_types(t, out)),
+        pe2_ext::Type::List(of) | pe2_ext::Type::File(of) => named_types(of, out),
+        _ => {}
+    }
+}
+
+/// Whether a port's type names types: not anything, nor bytes, nor a variable.
+fn specific(ty: &pe2_ext::Type) -> bool {
+    match ty {
+        pe2_ext::Type::Named(_) => true,
+        pe2_ext::Type::Union(any) => any.iter().any(specific),
+        pe2_ext::Type::File(of) => specific(of),
+        _ => false,
+    }
+}
+
+/// How much of a file its types are recognized by: its first bytes.
+const HEAD: usize = 4096;
+
+/// The thumbnail's longer side, in pixels: twice the tree's row, for scaled displays.
+pub const THUMBNAIL_SIDE: i64 = 32;
+
+/// The names a file recognized as these types answers to: each type's, then its media type.
+fn type_names<'a>(types: impl Iterator<Item = &'a TypeDef>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for ty in types {
+        for name in std::iter::once(ty.name.to_string()).chain(ty.media_type.clone()) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// The types a file of a name and size is recognized as, by its first bytes: each by its index among `types`.
+fn recognize_head(types: &[TypeDef], name: &str, size: u64, head: &[u8]) -> Vec<(usize, Recognized)> {
+    let text = match std::str::from_utf8(head) {
+        Ok(t) => !t.contains('\0'),
+        // A cut through a character at the end of what was read: what is before it decides.
+        Err(e) => e.error_len().is_none() && !head[..e.valid_up_to()].contains(&0),
+    };
+    let named = |pattern: &str| match pattern.strip_prefix('*') {
+        Some(suffix) => name.ends_with(suffix),
+        None => name == pattern,
+    };
+    let mut out = vec![];
+    for (i, format) in types.iter().enumerate() {
+        let signed = format.signatures.iter().any(|signature| match signature {
+            Signature::Bytes { offset, bytes } => head.get(*offset..offset + bytes.len()) == Some(bytes.as_slice()),
+            Signature::Name(pattern) => named(pattern),
+            Signature::Text => text,
+        });
+        let recognized = if signed { Some(Recognized::default()) } else { format.sniff.as_ref().and_then(|sniff| sniff(name, size, head)) };
+        out.extend(recognized.map(|r| (i, r)));
+    }
+    out
+}
+
+impl Extensions {
+    /// The operations that take an asset's source - the stored file its stack takes - by the types it is recognized
+    /// as: those whose first port names one of them (not those taking anything), the highest priority first.
     #[must_use]
-    pub fn importers_for(&self, asset: &index::Asset) -> Vec<(&ImporterDef, Support)> {
+    pub fn ops_for(&self, asset: &index::Asset) -> Vec<&pe2_ext::OpDef> {
+        use pe2_ext::Type;
         let Some(source) = graph::import_of(asset.fields()).map(|i| i.source) else { return vec![] };
-        let Some(file) = asset.files.iter().find(|f| f.name == source) else { return vec![] };
-        let formats = self.recognize(file);
-        let read = |r: &str| formats.iter().any(|(f, _)| f.name.as_str() == r || f.media_type.as_deref() == Some(r));
-        let lent = self.lend(asset);
-        let mut out: Vec<(&ImporterDef, Support)> = self
-            .importers
+        let Some(file) = asset.files.iter().find(|f| f.name == source && f.made_by.is_none()) else { return vec![] };
+        let names = type_names(self.recognize(file).into_iter().map(|(t, _)| t));
+        let given = Type::Union(names.into_iter().map(Type::Named).collect());
+        let mut out: Vec<&pe2_ext::OpDef> = self
+            .ops
             .values()
-            .filter(|i| i.reads.iter().any(|r| read(r)))
-            .map(|i| (i, i.check.as_ref().map_or(Support::Full, |check| check(&lent))))
+            .filter(|op| op.inputs.first().is_some_and(|p| specific(&p.ty) && p.ty.unify(&given, &mut Vec::new())))
             .collect();
-        out.sort_by(|(a, _), (b, _)| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
+        out.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
         out
     }
 
@@ -862,10 +1009,6 @@ impl Project for Lens<'_> {
         self.index.assets.get(path).map_or_default(|a| self.extensions.parts(a))
     }
 
-    fn facts(&self, path: &str) -> toml::Table {
-        self.index.assets.get(path).map_or_default(|a| self.extensions.facts(a))
-    }
-
     fn call(&self, service: &str, arguments: &Value) -> Result<Value> {
         let def = self.extensions.service(service).with_context(|| format!("no service {service}"))?;
         (def.run)(self, arguments).with_context(|| service.to_string())
@@ -876,41 +1019,47 @@ impl Project for Lens<'_> {
     }
 }
 
-/// A node as an operation lends it to an importer: its fields with `[import]`, its source as the operation was given
-/// it, and its other stored files, each recorded as read.
-struct Staged<'a> {
-    recorder: graph::exec::Recorder<'a>,
-    fields: toml::Table,
-    source: graph::File,
+/// What an extension's operation is lent of its node: its path, kind and role, its declared settings (recorded as
+/// read when it is lent), and contents read by their hashes.
+struct Hosted<'a> {
+    call: &'a graph::exec::Call<'a>,
+    kind: Option<&'a str>,
+    role: Option<&'a str>,
 }
 
-impl Source for Staged<'_> {
+impl<'a> Hosted<'a> {
+    fn new(call: &'a graph::exec::Call<'a>, qualified: &'a HashMap<String, String>) -> Hosted<'a> {
+        let recorder = call.recorder();
+        recorder.declaration();
+        let fields = recorder.node().fields();
+        let named = |key: &str| fields.get(key).and_then(Value::as_str).and_then(|n| qualified.get(n)).map(String::as_str);
+        Hosted { call, kind: named("kind"), role: named("role") }
+    }
+}
+
+impl pe2_ext::CallHost for Hosted<'_> {
     fn path(&self) -> &str {
-        self.recorder.node().path()
+        self.call.recorder().node().path()
     }
 
-    fn uid(&self) -> Option<&str> {
-        self.recorder.node().uid()
+    fn kind(&self) -> Option<&str> {
+        self.kind
     }
 
-    fn fields(&self) -> &toml::Table {
-        &self.fields
+    fn role(&self) -> Option<&str> {
+        self.role
     }
 
-    fn declaration(&self) -> &str {
-        self.recorder.node().declaration()
+    fn fields(&self) -> &Table {
+        self.call.recorder().node().fields()
     }
 
-    fn has_file(&self, name: &str) -> bool {
-        name == self.source.name || self.recorder.node().file_sha1(name).is_some()
+    fn read(&self, content: &pe2_ext::Content) -> Result<Vec<u8>> {
+        self.call.read(content)
     }
 
-    fn read(&self, name: &str) -> Result<Vec<u8>> {
-        if name == self.source.name {
-            return Ok(self.source.bytes.clone());
-        }
-        self.recorder.file(name);
-        self.recorder.node().read(name)
+    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.call.read_range(content, offset, len)
     }
 }
 
@@ -1150,27 +1299,16 @@ mod calling {
     use crate::cache::Cache;
     use crate::index::Index;
     use crate::lock::Lock;
-    use pe2_ext::{Asset, Extension, Image, Picture, Project, Registry, Result, Table, Value, anyhow};
-
-    /// A picture of one red pixel.
-    struct Red;
-
-    impl Picture for Red {
-        fn has(&self, _: &Asset) -> bool {
-            true
-        }
-
-        fn looks(&self, _: &Asset) -> Vec<String> {
-            vec![]
-        }
-
-        fn draw(&self, _: &Asset, _: usize) -> Result<Image> {
-            Ok(Image { width: 1, height: 1, rgba: vec![255, 0, 0, 255] })
-        }
-    }
+    use pe2_ext::{Extension, Image, Project, Registry, Result, Retain, Table, Value, anyhow, ty};
 
     fn paint(r: &mut Registry) -> Result<()> {
-        r.kind("canvas").alias("canvas").picture(Red).register();
+        // A picture of one red pixel, whatever the canvas is.
+        let draw = r
+            .op("draw")
+            .input::<ty::Any>("canvas")
+            .output::<ty::Image>()
+            .run(|_| Ok(Image { width: 1, height: 1, rgba: vec![255, 0, 0, 255] }));
+        r.kind("canvas").alias("canvas").output("picture", &draw, Retain::Transient).register();
         r.service("red", "The color red", "{}", |_, _| Ok(Value::String("red".into())));
         Ok(())
     }
@@ -1193,7 +1331,8 @@ mod calling {
     fn extensions_reach_one_another_through_the_host() {
         let root = std::env::temp_dir().join(format!("pe2-calling-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.asset/asset.toml", "kind = \"canvas\"\n")] {
+        let canvas = "kind = \"canvas\"\n\n[[stack]]\nop = \"constant\"\nvalue = {}\n";
+        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.asset/asset.toml", canvas)] {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();

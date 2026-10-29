@@ -1,21 +1,82 @@
-//! pe2.formats: the common file formats, recognized for every extension that reads them - by their own bytes, never
-//! by a file's name, which proves nothing. An importer reads one of these by its name (`pe2.formats@png`) or, not to
-//! depend on who recognizes it, by its media type (`image/png`).
+//! pe2.formats: the common file types, recognized for every extension that takes them - by their own bytes, never by a
+//! file's name, which proves nothing. An operation takes one of these by its marker (`pe2_formats::Png`) or, not to
+//! depend on who recognizes it, by a marker of its media type (`image/png`).
 
-use pe2_ext::{Registry, Result};
+use pe2_ext::ty::{Files, Registered};
+use pe2_ext::{Registry, Result, Signature};
 
 pe2_ext::extension!("pe2.formats", "0.1.0", register);
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    r.format("png").label("PNG image").media_type("image/png").bytes(0, b"\x89PNG\r\n\x1a\n").register();
-    // An OpenRaster file is a zip whose first entry, stored, is `mimetype`: its name at 30, its content after it.
-    r.format("ora")
-        .label("OpenRaster image")
-        .media_type("image/openraster")
-        .bytes(30, b"mimetypeimage/openraster")
-        .register();
-    r.format("zip").label("Zip archive").media_type("application/zip").bytes(0, b"PK\x03\x04").register();
-    r.format("text").label("Text").media_type("text/plain").text().register();
+    let _ = r.value_type::<Png>();
+    let _ = r.value_type::<Ora>();
+    let _ = r.value_type::<Zip>();
+    let _ = r.value_type::<Text>();
     Ok(())
 }
+
+/// These bytes at the start of a file.
+fn at(offset: usize, bytes: &[u8]) -> Signature {
+    Signature::Bytes { offset, bytes: bytes.to_vec() }
+}
+
+/// A PNG image.
+pub struct Png;
+
+impl Registered for Png {
+    const NAME: &str = "pe2.formats@png";
+    const LABEL: &str = "PNG image";
+    const MEDIA_TYPE: Option<&str> = Some("image/png");
+
+    fn signatures() -> Vec<Signature> {
+        vec![at(0, b"\x89PNG\r\n\x1a\n")]
+    }
+}
+
+impl Files for Png {}
+
+/// An `OpenRaster` image: a zip whose first entry, stored, is `mimetype` - its name at 30, its content after it.
+pub struct Ora;
+
+impl Registered for Ora {
+    const NAME: &str = "pe2.formats@ora";
+    const LABEL: &str = "OpenRaster image";
+    const MEDIA_TYPE: Option<&str> = Some("image/openraster");
+
+    fn signatures() -> Vec<Signature> {
+        vec![at(30, b"mimetypeimage/openraster")]
+    }
+}
+
+impl Files for Ora {}
+
+/// A zip archive.
+pub struct Zip;
+
+impl Registered for Zip {
+    const NAME: &str = "pe2.formats@zip";
+    const LABEL: &str = "Zip archive";
+    const MEDIA_TYPE: Option<&str> = Some("application/zip");
+
+    fn signatures() -> Vec<Signature> {
+        vec![at(0, b"PK\x03\x04")]
+    }
+}
+
+impl Files for Zip {}
+
+/// Text: UTF-8 without a NUL byte.
+pub struct Text;
+
+impl Registered for Text {
+    const NAME: &str = "pe2.formats@text";
+    const LABEL: &str = "Text";
+    const MEDIA_TYPE: Option<&str> = Some("text/plain");
+
+    fn signatures() -> Vec<Signature> {
+        vec![Signature::Text]
+    }
+}
+
+impl Files for Text {}

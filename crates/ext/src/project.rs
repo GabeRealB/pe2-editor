@@ -6,7 +6,7 @@
 //! an extension offers (`Registry::service`), called by name. Each runs in the other extension's own instance, its
 //! memory and failures its own.
 
-use crate::{Asset, Image, Part, Result, Table, Value};
+use crate::{Asset, Image, Part, Result, Value};
 
 /// What the host answers about the project.
 pub trait Project {
@@ -26,8 +26,6 @@ pub trait Project {
     fn part(&self, path: &str, part: &str) -> Option<Result<Image>>;
     /// An asset's parts, as its kind lists them.
     fn parts(&self, path: &str) -> Vec<Part>;
-    /// What an asset's kind tells of it.
-    fn facts(&self, path: &str) -> Table;
     /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only
     /// the services of the extensions it requires (or its own).
     ///

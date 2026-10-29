@@ -2,10 +2,10 @@
 //! an image its pages at their places (a 4-bit page a quarter of its texels wide, as VRAM holds it) and its palettes'
 //! colors, a file what its image and palette slots name. Hovering names what is there; clicking an image opens it.
 
-use pe2_ext::{Asset, Canvas, Marked, Picture, Placed, Project, Rect, Style, Texture, Ui, Value, View};
+use pe2_ext::{Asset, Canvas, Marked, Placed, Project, Rect, Style, Texture, Ui, Value, View};
 use std::collections::HashMap;
 
-use crate::{Pictures, bpp, cells, is_texture, pair, palette_names, rect, texels_per_halfword};
+use crate::{bpp, cells, is_texture, pair, palette_names, rect, texels_per_halfword};
 
 /// VRAM's size, in halfwords.
 const VRAM: (f32, f32) = (1024.0, 512.0);
@@ -129,7 +129,7 @@ impl View for Vram {
                 let key = (upload.image.clone(), upload.palette.clone());
                 let strip = self.strips.entry(key).or_insert_with(|| {
                     let asset = project.asset(&upload.image)?;
-                    let strip = Pictures.part(&asset, &format!("palettes/{}", upload.palette))?.ok()?;
+                    let strip = crate::part_picture(&asset, &format!("palettes/{}", upload.palette))?.ok()?;
                     Some(Texture::new(format!("{}#palettes/{}#vram", upload.image, upload.palette), strip))
                 });
                 if let Some(texture) = strip {

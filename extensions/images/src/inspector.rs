@@ -1,10 +1,10 @@
 //! The image's parts in the properties pane, each keyed by name: its palettes, each with a swatch of its colors and
 //! where it is uploaded; its variants (a texture's each a palette, an atlas's each the cells it recolors); its cells.
 
-use pe2_ext::{Asset, Icon, Picture, Style, Table, Texture, Ui, Value, View};
+use pe2_ext::{Asset, Icon, Style, Table, Texture, Ui, Value, View};
 use std::collections::HashMap;
 
-use crate::{Pictures, palette_names, rect, role};
+use crate::{palette_names, rect, role};
 
 /// `n` of a plural noun: "1 cell", "8 cells".
 fn count_of(n: usize, plural: &str) -> String {
@@ -143,7 +143,7 @@ impl Shown {
 impl Collections {
     fn swatch_of(&mut self, asset: &Asset, palette: &str) {
         self.swatches.entry(palette.to_string()).or_insert_with(|| {
-            let strip = Pictures.part(asset, &format!("palettes/{palette}"))?.ok()?;
+            let strip = crate::part_picture(asset, &format!("palettes/{palette}"))?.ok()?;
             Some(Texture::new(format!("{}#palettes/{palette}#swatch", asset.path()), strip))
         });
     }

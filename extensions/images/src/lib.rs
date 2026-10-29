@@ -13,13 +13,58 @@ mod tools;
 mod view;
 mod vram;
 
-use pe2_ext::{Asset, Field, Icon, Image, Part, Picture, Rect, Registry, Result, Setting, Tint, Value};
+use pe2_ext::ty::{self, Files, Registered};
+use pe2_ext::{Asset, Field, File, Icon, Image, Part, Rect, Registry, Result, Retain, Setting, Signature, Table, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
+    // An image's native form, as stored: a background's BS picture, or a texture's or atlas's texels and palettes.
+    let _ = r.value_type::<BsPicture>();
+    let _ = r.value_type::<Indexed>();
+    // A texture or an atlas as layers a painting program opens, made back into its texels and palettes exactly.
+    let ora_source = r
+        .op("ora_source")
+        .label("OpenRaster layers, written")
+        .input::<Indexed>("native")
+        .output::<ty::File<OpenRaster>>()
+        .run(|call| {
+            let native = call.take::<Indexed>(0)?;
+            let bytes = ora::export(&call.lend(&native).asset())?;
+            Ok(Typed::new(codecs::ora::MIMETYPE, vec![File::new(ora::SOURCE, bytes)]))
+        });
+    let _ = r
+        .op("ora")
+        .label("OpenRaster layers")
+        .input::<OpenRaster>("source")
+        .output::<Indexed>()
+        .derives("size")
+        .derives("cells.*.rect")
+        .inverse(&ora_source)
+        .priority(10)
+        .run(|call| {
+            let source = call.take::<OpenRaster>(0)?;
+            let bytes = call.read(source.file()?)?;
+            ora::import(&call.lend_files(&[]).asset(), &bytes)
+        });
+    // An image in one of its looks, by name: `default`, or a variant's.
+    let draw = r.op("draw").label("Picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("look").run(|call| {
+        let look: String = call.parameter()?;
+        let native = call.take::<NativeForm>(0)?.into_inner();
+        let lent = call.lend(&native);
+        let asset = lent.asset();
+        let names = look_names(&asset);
+        let index = names.iter().position(|n| *n == look).ok_or_else(|| pe2_ext::anyhow!("it has no look {look}; its looks: {}", names.join(", ")))?;
+        picture(&asset, index)
+    });
+    let part = r.op("part").label("A part's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("id").run(|call| {
+        let part: String = call.parameter()?;
+        let native = call.take::<NativeForm>(0)?.into_inner();
+        let lent = call.lend(&native);
+        part_picture(&lent.asset(), &part).ok_or_else(|| pe2_ext::anyhow!("it has no part {part}"))?
+    });
     let image = r
         .kind("image")
         .alias("image")
@@ -35,14 +80,14 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("palettes").custom())
         .field(Field::new("cells").custom())
         .field(Field::new("variants").custom())
-        .picture(Pictures)
-        .thumbnail(|asset, side| {
-            Pictures.has(asset).then(|| Pictures.draw(asset, 0).map(|image| image.thumbnail(side)))
-        })
         .view("Picture", |asset| Box::new(view::ImageView::new(asset)))
         .inspector("Palettes, variants and cells", |_| Box::new(inspector::Collections::default()))
-        .facts(tools::facts)
         .parts(parts)
+        // Its picture in each look; its palettes, variants and cells drawn.
+        .output("picture", &draw, Retain::Transient)
+        .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] })
+        .output("part", &part, Retain::Transient)
+        .members(|asset| parts(asset).into_iter().map(|p| (p.id, p.label)).collect())
         .register();
     let mut roles = HashMap::new();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
@@ -50,22 +95,6 @@ fn register(r: &mut Registry) -> Result<()> {
     }
     // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
     let _ = r.extractor("textures", &image, &[roles["texture"].clone(), roles["atlas"].clone()], extract::begin);
-    // The stored forms, recognized by name: stored texels have no header to tell them by.
-    let texels = r.format("raw_texels").label("Stored texels").named("native.texels").register();
-    let bs = r.format("bs_picture").label("BS picture").named("native.bs").named("*.bs").register();
-    // Native: what they read is what the image is, its kind settings authored beside it.
-    r.importer("texels", &image).label("Stored texels").reads(&texels).native().register();
-    r.importer("bs", &image).label("Stored BS picture").reads(&bs).native().register();
-    // A texture or an atlas as layers a painting program opens, made back into its texels and palettes exactly.
-    r.importer("ora", &image)
-        .label("OpenRaster layers")
-        .reads_media(codecs::ora::MIMETYPE)
-        .import(ora::import)
-        .derives("size")
-        .derives("cells.*.rect")
-        .export(ora::export)
-        .priority(10)
-        .register();
     r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)
@@ -289,49 +318,87 @@ pub fn rgba(color: u16) -> [u8; 4] {
 const BS: &str = "native.bs";
 pub(crate) const TEXELS: &str = "native.texels";
 
-/// What an image is drawn from: a background's `native.bs`, or an image's stored texels and its palettes' colors.
-pub(crate) struct Pictures;
+/// An image's looks by name, as its picture's members are named: its looks, or - where it has none - `default`.
+fn look_names(asset: &Asset) -> Vec<String> {
+    let looks = looks(asset);
+    if looks.is_empty() { vec!["default".to_string()] } else { looks }
+}
 
-impl Picture for Pictures {
-    fn has(&self, asset: &Asset) -> bool {
-        asset.has_file(BS) || is_texture(asset) && asset.has_file(TEXELS)
-    }
+/// A background's native form: its BS picture, recognized by its name (it has no header to tell it by).
+pub struct BsPicture;
 
-    fn looks(&self, asset: &Asset) -> Vec<String> {
-        looks(asset)
-    }
+impl Registered for BsPicture {
+    const NAME: &str = "pe2.images@bs_picture";
+    const LABEL: &str = "BS picture";
 
-    fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
-        // A variant is the picture in its look; a cell, the picture where it is drawn.
-        if let Some(name) = part.strip_prefix("variants/") {
-            let look = looks(asset).iter().position(|l| l == name)?;
-            return Some(self.draw(asset, look));
-        }
-        if let Some(name) = part.strip_prefix("cells/") {
-            let cell = cells(asset).into_iter().find(|c| c.name == name)?;
-            return Some(self.draw(asset, 0).map(|picture| crop(&picture, cell.rect)));
-        }
-        let name = part.strip_prefix("palettes/")?;
-        let index = palette_names(asset).iter().position(|n| n == name)?;
-        Some(palette_colors(asset, index)?.map(|colors| Image {
-            width: colors.len(),
-            height: 1,
-            rgba: colors.iter().flat_map(|&c| rgba(c)).collect(),
-        }))
+    fn signatures() -> Vec<Signature> {
+        vec![Signature::Name(BS.into()), Signature::Name("*.bs".into())]
     }
+}
 
-    fn draw(&self, asset: &Asset, look: usize) -> Result<Image> {
-        if asset.has_file(BS) {
-            return decode_bs(&asset.read(BS)?);
-        }
-        let look = if look < looks(asset).len() { look } else { 0 };
-        let texels = asset.read(TEXELS)?;
-        let colors: Vec<Option<Vec<u16>>> = palette_names(asset)
-            .iter()
-            .map(|p| asset.read(&colors_file(p)).ok().map(|b| halfwords(&b)))
-            .collect();
-        Ok(decode_texels(asset, &texels, &colors, look))
+impl Files for BsPicture {}
+
+/// A texture's or atlas's native form: its texels and its palettes' colors, as stored.
+pub struct Indexed;
+
+impl Registered for Indexed {
+    const NAME: &str = "pe2.images@indexed";
+    const LABEL: &str = "Texels and palettes";
+}
+
+impl Files for Indexed {}
+
+pe2_ext::media_type!(
+    /// An `OpenRaster` image, by its media type: whoever recognizes it.
+    pub OpenRaster = "image/openraster"
+);
+
+/// What an image's native form is, either way.
+type NativeForm = ty::OneOf<(BsPicture, Indexed)>;
+
+/// An image's native form made now: its files inline, with the settings derived and notes taken.
+pub(crate) fn native(files: Vec<(String, Vec<u8>)>, settings: Table, notes: Vec<String>) -> Typed {
+    let files = files.into_iter().map(|(name, bytes)| File::new(&name, bytes)).collect();
+    Typed { ty: Indexed::NAME.into(), files, settings, notes, ..Typed::default() }
+}
+
+/// Whether an image has a picture: a background's `native.bs`, or a texture's or atlas's stored texels.
+pub(crate) fn has_picture(asset: &Asset) -> bool {
+    asset.has_file(BS) || is_texture(asset) && asset.has_file(TEXELS)
+}
+
+/// A part as a picture: a palette as a strip of its colors, a variant in its look, a cell where it is drawn.
+pub(crate) fn part_picture(asset: &Asset, part: &str) -> Option<Result<Image>> {
+    // A variant is the picture in its look; a cell, the picture where it is drawn.
+    if let Some(name) = part.strip_prefix("variants/") {
+        let look = looks(asset).iter().position(|l| l == name)?;
+        return Some(picture(asset, look));
     }
+    if let Some(name) = part.strip_prefix("cells/") {
+        let cell = cells(asset).into_iter().find(|c| c.name == name)?;
+        return Some(picture(asset, 0).map(|picture| crop(&picture, cell.rect)));
+    }
+    let name = part.strip_prefix("palettes/")?;
+    let index = palette_names(asset).iter().position(|n| n == name)?;
+    Some(palette_colors(asset, index)?.map(|colors| Image {
+        width: colors.len(),
+        height: 1,
+        rgba: colors.iter().flat_map(|&c| rgba(c)).collect(),
+    }))
+}
+
+/// An image's picture in a look (an index into its looks; one past them, its first).
+pub(crate) fn picture(asset: &Asset, look: usize) -> Result<Image> {
+    if asset.has_file(BS) {
+        return decode_bs(&asset.read(BS)?);
+    }
+    let look = if look < looks(asset).len() { look } else { 0 };
+    let texels = asset.read(TEXELS)?;
+    let colors: Vec<Option<Vec<u16>>> = palette_names(asset)
+        .iter()
+        .map(|p| asset.read(&colors_file(p)).ok().map(|b| halfwords(&b)))
+        .collect();
+    Ok(decode_texels(asset, &texels, &colors, look))
 }
 
 /// An image's pixels in one of its looks: a texture through its variant's palette; an atlas faintly through its first
@@ -425,8 +492,8 @@ fn decode_bs(bytes: &[u8]) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pictures, cells, looks, palette_colors};
-    use pe2_ext::{Asset, Picture, Result, Source, Table, anyhow};
+    use super::{cells, has_picture, looks, palette_colors, picture};
+    use pe2_ext::{Asset, Result, Source, Table, anyhow};
     use std::collections::HashMap;
 
     /// An asset as a host would lend it: a declaration and its files.
@@ -500,12 +567,12 @@ mod tests {
         assert_eq!(looks(&asset), ["default", "night"]);
         assert_eq!(cells(&asset)[0].palette, Some(0));
         assert_eq!(palette_colors(&asset, 1).unwrap().unwrap(), [blue, blue]);
-        assert!(Pictures.has(&asset));
-        let default = Pictures.draw(&asset, 0).unwrap();
+        assert!(has_picture(&asset));
+        let default = picture(&asset, 0).unwrap();
         // Outside the cell: the first palette, faintly; the cell: its palette's second color, opaque green.
         assert_eq!(default.rgba[..4], [255, 0, 0, 63]);
         assert_eq!(default.rgba[4..], [0, 255, 0, 255]);
-        let night = Pictures.draw(&asset, 1).unwrap();
+        let night = picture(&asset, 1).unwrap();
         assert_eq!(night.rgba[4..], [0, 0, 255, 255]);
     }
 }

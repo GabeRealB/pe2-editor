@@ -1,20 +1,17 @@
-//! Thumbnails of the asset tree's assets, made by their kinds' extensions on a thread of their own and kept as artifacts
-//! in the project cache (`project::artifacts`), named in the extension's namespace (`pe2.images@thumbnail.png`): an
-//! asset shown in the tree is asked for once, read back from the cache when it was made in an earlier session, made
-//! and kept otherwise. The key of an artifact follows its asset's files and its extension's version, so an edit or a
-//! new version makes a new one; a refreshed asset's thumbnail is forgotten and asked for again.
+//! Thumbnails of the asset tree's assets: each its kind's `thumbnail/<side>` output, made on a thread of their own
+//! through the work graph and kept in the project's store - an asset shown in the tree is asked for once, read back
+//! from the store where what it read still holds (an earlier session's), made and kept otherwise. A refreshed asset's
+//! thumbnail is forgotten and asked for again.
 
 use eframe::egui;
-use project::artifacts::{self, Artifacts};
 use project::ext::Extensions;
+use project::graph::exec::Engine;
+use project::graph::store::Store;
 use project::index::Asset;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
-
-/// The longer side of a thumbnail, in pixels: twice the tree's row, for scaled displays.
-pub const SIDE: usize = 32;
 
 enum Thumb {
     Pending,
@@ -25,10 +22,6 @@ enum Thumb {
 
 struct Job {
     path: String,
-    uid: String,
-    /// The artifact it is kept as, and the key it is made under.
-    name: String,
-    key: String,
     asset: Asset,
 }
 
@@ -46,15 +39,16 @@ pub struct Thumbs {
 }
 
 impl Thumbs {
-    /// Start the thread making thumbnails by the `extensions`, keeping them in `artifacts`.
-    pub fn start(extensions: Arc<Extensions>, artifacts: Artifacts) -> Thumbs {
+    /// Start the thread making thumbnails by the `extensions`, keeping them in `store`.
+    pub fn start(extensions: Arc<Extensions>, store: Store) -> Thumbs {
         let (jobs, queue) = mpsc::channel::<Job>();
         let (finished, done) = mpsc::channel();
         let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
         let wake = ctx.clone();
         std::thread::spawn(move || {
+            let engine = Engine::new(extensions.operations(), Some(store));
             for job in queue {
-                let image = make(&extensions, &artifacts, &job);
+                let image = make(&extensions, &engine, &job.asset);
                 if finished.send(Done { path: job.path, image }).is_err() {
                     break;
                 }
@@ -84,10 +78,10 @@ impl Thumbs {
             Some(Thumb::Ready(texture)) => Some(texture.id()),
             Some(Thumb::Pending | Thumb::None) => None,
             None => {
-                let uid = asset.uid.clone()?;
-                let name = extensions.thumbnail_name(asset)?;
-                let key = artifacts::key(asset, &extensions.thumbnail_generator(asset)?, &SIDE.to_string());
-                let job = Job { path: asset.path.clone(), uid, name, key, asset: asset.clone() };
+                if !extensions.has_thumbnail(asset) {
+                    return None;
+                }
+                let job = Job { path: asset.path.clone(), asset: asset.clone() };
                 if self.jobs.send(job).is_ok() {
                     shown.insert(asset.path.clone(), Thumb::Pending);
                 }
@@ -110,17 +104,9 @@ impl Thumbs {
     }
 }
 
-/// A thumbnail: read back from the cache, or made by its extension and kept.
-fn make(extensions: &Extensions, artifacts: &Artifacts, job: &Job) -> Option<egui::ColorImage> {
-    let kept = artifacts.get(&job.uid, &job.name, &job.key).and_then(|png| project::ext::from_png(&png).ok());
-    let image = if let Some(image) = kept {
-        image
-    } else {
-        let image = extensions.thumbnail(&job.asset, SIDE)?.ok()?;
-        if let Ok(png) = project::ext::png(&image) {
-            let _ = artifacts.put(&job.uid, &job.name, &job.key, &png);
-        }
-        image
-    };
+/// A thumbnail: read back from the store, or made by its extension and kept.
+fn make(extensions: &Extensions, engine: &Engine, asset: &Asset) -> Option<egui::ColorImage> {
+    let given = extensions.output(engine, asset, project::graph::THUMBNAIL, true).ok()?;
+    let Some(project::graph::Value::Image(image)) = given.value.as_deref() else { return None };
     Some(egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba))
 }

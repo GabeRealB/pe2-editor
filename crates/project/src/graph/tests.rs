@@ -4,9 +4,9 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
-use super::exec::{Engine, Node, evaluate};
+use super::exec::{Call, Engine, Node, evaluate};
 use super::store::Store;
-use super::{File, OpDef, Ops, Plan, Port, Retain, Type, Value};
+use super::{Content, File, OpDef, Ops, Plan, Retain, Tail, Type, Typed, Value, port, ports};
 
 struct Bundle {
     path: &'static str,
@@ -47,6 +47,20 @@ impl Node for Bundle {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         self.files.lock().unwrap().get(name).cloned().context("no such file")
     }
+
+    fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
+        let files = self.files.lock().unwrap();
+        files.values().find(|b| crate::extract::sha1_hex(b) == sha1).cloned().context("no such content")
+    }
+}
+
+/// A file value's bytes, as a node holds them where they are stored.
+fn data(node: &Bundle, value: &Value) -> Vec<u8> {
+    let Value::Typed(typed) = value else { panic!("not a file") };
+    match &typed.file().unwrap().content {
+        Content::Inline(bytes) => bytes.clone(),
+        Content::Stored { sha1, .. } => node.read_content(sha1).unwrap(),
+    }
 }
 
 thread_local! {
@@ -68,51 +82,60 @@ fn shared() -> usize {
     SHARED.with(Cell::get)
 }
 
-fn bytes(value: &Value) -> &[u8] {
+/// A file value's bytes, as an operation reads them.
+fn bytes(call: &Call<'_>, value: &Value) -> Result<Vec<u8>> {
     match value {
-        Value::File(f) => &f.bytes,
-        _ => panic!("not a file"),
+        Value::Typed(typed) => call.read(&typed.file()?.content),
+        _ => anyhow::bail!("not a file"),
     }
 }
 
 fn file(bytes: Vec<u8>) -> Value {
-    Value::File(File { name: "made".into(), bytes })
+    Value::Typed(Typed::new(pe2_ext::data::BYTES, vec![File::new("made", bytes)]))
 }
 
 fn ops() -> Ops {
     let mut ops = Ops::default();
-    ops.add(OpDef::new("t.upper", "Upper", "1").input(Port::one("in", Type::File)).makes(Type::File, |call| {
+    let file_type = || Type::File(Box::new(Type::Any));
+    ops.add(OpDef::new("t.upper", "Upper", "1").input(port("in", file_type())).makes(file_type(), |call| {
         ran(0);
         let input = call.take(0)?;
         if input.is_shared() {
             SHARED.with(|c| c.set(c.get() + 1));
         }
-        let Value::File(mut f) = input.take() else { anyhow::bail!("not a file") };
-        f.bytes.make_ascii_uppercase();
-        Ok(Value::File(f))
+        let Value::Typed(mut typed) = input.take() else { anyhow::bail!("not a file") };
+        let mut bytes = call.read(&typed.file()?.content)?;
+        bytes.make_ascii_uppercase();
+        typed.files[0].content = Content::Inline(bytes);
+        Ok(Value::Typed(typed))
     }));
-    ops.add(OpDef::new("t.count", "Count", "1").input(Port::one("in", Type::File)).makes(Type::Table, |call| {
+    ops.add(OpDef::new("t.count", "Count", "1").input(port("in", file_type())).makes(Type::Table, |call| {
         ran(1);
-        let len = bytes(call.take(0)?.value()).len();
+        let input = call.take(0)?;
+        let len = bytes(call, input.value())?.len();
         let mut table = toml::Table::new();
         table.insert("len".into(), i64::try_from(len)?.into());
         Ok(Value::Table(table))
     }));
-    ops.add(OpDef::new("t.join", "Join", "1").input(Port::many("parts", Type::File)).makes(Type::File, |call| {
+    ops.add(OpDef::new("t.join", "Join", "1").input(ports("parts", file_type())).makes(file_type(), |call| {
         ran(2);
-        let parts: Vec<u8> = call.take_all(0).iter().flat_map(|i| bytes(i.value()).to_vec()).collect();
+        let mut parts = Vec::new();
+        for input in call.take_all(0) {
+            parts.extend(bytes(call, input.value())?);
+        }
         Ok(file(parts))
     }));
-    ops.add(OpDef::new("t.repeat", "Repeat", "1").input(Port::one("in", Type::File)).makes(Type::File, |call| {
+    ops.add(OpDef::new("t.repeat", "Repeat", "1").input(port("in", file_type())).parameter("times").makes(file_type(), |call| {
         ran(3);
         let n: usize = call.parameter().unwrap_or("1").parse()?;
-        Ok(file(bytes(call.take(0)?.value()).repeat(n)))
+        let input = call.take(0)?;
+        Ok(file(bytes(call, input.value())?.repeat(n)))
     }));
     ops
 }
 
 fn problems(declaration: &str) -> Vec<String> {
-    let (_, problems) = Plan::of(&toml::from_str(declaration).unwrap(), &ops());
+    let (_, problems) = Plan::of(&toml::from_str(declaration).unwrap(), &ops(), &[]);
     problems.into_iter().map(|p| format!("{}: {}", p.at, p.what)).collect()
 }
 
@@ -144,12 +167,15 @@ when = "eager"
 
 #[test]
 fn a_stack_lowers_to_a_chain_with_taps() {
-    let (plan, problems) = Plan::of(&toml::from_str(STACK).unwrap(), &ops());
+    let (plan, problems) = Plan::of(&toml::from_str(STACK).unwrap(), &ops(), &[]);
     assert!(problems.is_empty(), "{problems:?}");
     let steps: Vec<_> = plan.steps.iter().map(|s| (s.op.as_str(), s.inputs.clone())).collect();
     assert_eq!(steps, [("file", vec![]), ("t.upper", vec![vec![0]]), ("t.count", vec![vec![1]])]);
     let outputs: Vec<_> = plan.outputs.iter().map(|o| (o.name.as_str(), o.from, o.retain, o.eager)).collect();
-    assert_eq!(outputs, [("source", 0, Retain::Cache, false), ("upper", 1, Retain::Transient, false), ("count", 2, Retain::Transient, true)]);
+    // Its result (the count) kept by no output of its own: the host keeps it.
+    let kept = [("count", 2, Retain::Transient, true), (super::RESULT, 2, Retain::Cache, true)];
+    assert_eq!(outputs[..2], [("source", 0, Retain::Cache, false), ("upper", 1, Retain::Transient, false)]);
+    assert_eq!(outputs[2..], kept);
 }
 
 #[test]
@@ -194,19 +220,19 @@ op = "t.repeat"
 
 [[stack]]
 op = "output"
-name = "repeated(times)"
+name = "repeated"
 "#;
 
 #[test]
 fn a_graph_layer_runs_what_its_outputs_reach() {
     let ops = ops();
-    let (plan, problems) = Plan::of(&toml::from_str(GRAPH).unwrap(), &ops);
+    let (plan, problems) = Plan::of(&toml::from_str(GRAPH).unwrap(), &ops, &[]);
     assert!(problems.is_empty(), "{problems:?}");
     let node = Bundle::new(GRAPH, &[("a.txt", "a"), ("b.txt", "b")]);
     let before = runs();
     let (joined, _) = plan.output("joined").unwrap();
-    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, None)]);
-    assert_eq!(bytes(made[0].as_ref().unwrap()), b"aBa");
+    let (made, reads) = evaluate(&plan, &ops, &node, &[(joined, None)], &Vec::new(), None);
+    assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBa");
     // `unused` is pruned; `t.repeat` is below the output asked for.
     let ran = runs();
     assert_eq!([ran[0] - before[0], ran[2] - before[2], ran[3] - before[3]], [1, 1, 0]);
@@ -214,9 +240,9 @@ fn a_graph_layer_runs_what_its_outputs_reach() {
     // A family's output, by its parameter's value; the tap inside the graph.
     let (repeated, times) = plan.output("repeated/3").unwrap();
     let (b, _) = plan.output("b").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(repeated, times.as_deref()), (b, None)]);
-    assert_eq!(bytes(made[0].as_ref().unwrap()), b"aBaaBaaBa");
-    assert_eq!(bytes(made[1].as_ref().unwrap()), b"B");
+    let (made, _) = evaluate(&plan, &ops, &node, &[(repeated, times.as_deref()), (b, None)], &Vec::new(), None);
+    assert_eq!(data(&node, made[0].as_ref().unwrap()), b"aBaaBaaBa");
+    assert_eq!(data(&node, made[1].as_ref().unwrap()), b"B");
 }
 
 #[test]
@@ -232,30 +258,30 @@ fn a_cycle_in_a_graph_layer() {
 #[test]
 fn a_value_taken_once_is_moved() {
     let ops = ops();
-    let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops);
+    let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops, &[]);
     let node = Bundle::new(STACK, &[("a.txt", "abc")]);
     let before = shared();
     // `upper` alone: the file's bytes are taken by it alone, and moved.
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)]);
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), None);
     assert_eq!(made[0].as_ref().unwrap().as_ref(), &Value::Table(toml::from_str("len = 3").unwrap()));
     assert_eq!(shared(), before);
     // Asked for with `source`, the bytes are shared: upper copies them, the source is unchanged.
     let (source, _) = plan.output("source").unwrap();
     let (upper, _) = plan.output("upper").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)]);
-    assert_eq!((bytes(made[0].as_ref().unwrap()), bytes(made[1].as_ref().unwrap())), (&b"abc"[..], &b"ABC"[..]));
+    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)], &Vec::new(), None);
+    assert_eq!((data(&node, made[0].as_ref().unwrap()), data(&node, made[1].as_ref().unwrap())), (b"abc".to_vec(), b"ABC".to_vec()));
     assert!(shared() > before);
 }
 
 #[test]
 fn a_failure_reaches_what_takes_from_it() {
     let ops = ops();
-    let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops);
+    let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops, &[]);
     let node = Bundle::new(STACK, &[]);
     let (count, _) = plan.output("count").unwrap();
-    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)]);
-    assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: no such file");
+    let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), None);
+    assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: test/bundle: no file a.txt");
 }
 
 #[test]
@@ -264,21 +290,21 @@ fn a_kept_output_holds_while_what_it_read_does() {
     let _ = std::fs::remove_dir_all(&dir);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let node = Bundle::new(STACK, &[("a.txt", "abc")]);
-    let (plan, _) = Plan::of(&node.fields, &engine.ops);
+    let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
     let first = engine.output(&plan, &node, "source", false).unwrap();
     assert!(!first.kept);
     let again = engine.output(&plan, &node, "source", true).unwrap();
     assert!(again.kept);
-    assert_eq!(bytes(again.value.as_deref().unwrap()), b"abc");
+    assert_eq!(data(&node, again.value.as_deref().unwrap()), b"abc");
     // A transient output is never kept.
     assert!(!engine.output(&plan, &node, "upper", false).unwrap().kept);
     // The file changed: made again.
     node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
     let changed = engine.output(&plan, &node, "source", true).unwrap();
     assert!(!changed.kept);
-    assert_eq!(bytes(changed.value.as_deref().unwrap()), b"abcd");
+    assert_eq!(data(&node, changed.value.as_deref().unwrap()), b"abcd");
     // Swept: the trace no longer live, its value and blob go.
-    let swept = engine.store().unwrap().sweep(&HashSet::new());
+    let swept = engine.store().unwrap().sweep(&HashSet::new(), &HashSet::new());
     assert_eq!(swept, (1, 2, 2));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -290,7 +316,7 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let one = Bundle::new(STACK, &[("a.txt", "abc")]);
     let two = Bundle { path: "test/other", ..Bundle::new(STACK, &[("a.txt", "abc")]) };
-    let (plan, _) = Plan::of(&one.fields, &engine.ops);
+    let (plan, _) = Plan::of(&one.fields, &engine.ops, &[]);
     assert!(!engine.output(&plan, &one, "source", false).unwrap().kept);
     assert!(!engine.output(&plan, &two, "source", false).unwrap().kept);
     // Each found kept by its own trace; the other's file changing leaves it.
@@ -299,4 +325,66 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     let count = |sub: &str| std::fs::read_dir(dir.join(sub)).unwrap().count();
     assert_eq!((count("traces"), count("values")), (2, 1));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-tail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
+    let node = Bundle::new(stack, &[("a.txt", "abc"), ("b.txt", "unread")]);
+    let tail = [Tail { name: "counted".into(), given: None, op: "t.count".into(), retain: Retain::Cache, from: None, settings: toml::Table::new() }];
+    let (plan, problems) = Plan::of(&node.fields, &engine.ops, &tail);
+    assert!(problems.is_empty(), "{problems:?}");
+    // The kept native form is taken as made: `upper` runs once, for it, and not again for what is made of it.
+    let before = runs();
+    assert!(!engine.output(&plan, &node, "native", false).unwrap().kept);
+    let counted = engine.output(&plan, &node, "counted", true).unwrap();
+    assert_eq!((counted.kept, runs()[0] - before[0]), (false, 1));
+    assert_eq!(counted.value.as_deref(), Some(&Value::Table(toml::from_str("len = 3").unwrap())));
+    // It read what the native form read: what neither read changing leaves both; what they read, makes them again.
+    assert_eq!(counted.reads.files.keys().collect::<Vec<_>>(), ["a.txt"]);
+    node.files.lock().unwrap().insert("b.txt".into(), b"changed".to_vec());
+    assert!(engine.output(&plan, &node, "counted", false).unwrap().kept);
+    node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
+    let again = engine.output(&plan, &node, "counted", true).unwrap();
+    assert_eq!((again.kept, again.value.as_deref()), (false, Some(&Value::Table(toml::from_str("len = 4").unwrap()))));
+    // An output's trace is under one key: its older value goes with the sweep (the count of three), and what was
+    // written out for the count's port asking for a file (`ABCD`), which no value names; a node no longer live, all of
+    // it - its two traces, their values, the native form's blob.
+    let live: HashSet<String> = ["test/bundle".to_string()].into();
+    assert_eq!(engine.store().unwrap().sweep(&live, &HashSet::new()), (0, 1, 1));
+    assert_eq!(engine.store().unwrap().sweep(&HashSet::new(), &HashSet::new()), (2, 2, 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_nodes_result_is_kept_by_its_stack_or_the_host() {
+    let names = |plan: &Plan| plan.outputs.iter().map(|o| (o.name.clone(), o.retain)).collect::<Vec<_>>();
+    // A stored file is seen as it is: nothing keeps it.
+    let (stored, _) = Plan::of(&toml::from_str("[[stack]]\nop = \"file\"\nfile = \"a.txt\"").unwrap(), &ops(), &[]);
+    assert!(stored.result_stored() && stored.result_output().is_none() && stored.outputs.is_empty());
+    // Made, and kept by nothing in the stack: the host keeps it.
+    let made = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n[[stack]]\nop = \"t.upper\"";
+    let (plan, _) = Plan::of(&toml::from_str(made).unwrap(), &ops(), &[]);
+    assert_eq!(names(&plan), [(super::RESULT.to_string(), Retain::Cache)]);
+    assert_eq!(plan.result_output(), Some(0));
+    // Kept by its stack, under any name: the host adds nothing.
+    let (plan, _) = Plan::of(&toml::from_str(&format!("{made}\n[[stack]]\nop = \"output\"\nname = \"upper\"\nretain = \"cache\"")).unwrap(), &ops(), &[]);
+    assert_eq!(names(&plan), [("upper".to_string(), Retain::Cache)]);
+}
+
+#[test]
+fn an_output_is_a_family_of_the_parameter_it_reaches() {
+    let mut ops = ops();
+    ops.add(OpDef::new("t.pick", "Pick", "1").input(port("in", Type::File(Box::new(Type::Any)))).parameter("which").makes(Type::Any, |call| Ok(call.take(0)?.take())));
+    let stack = |below: &str| format!("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"t.repeat\"\n{below}[[stack]]\nop = \"output\"\nname = \"made\"");
+    let (plan, problems) = Plan::of(&toml::from_str(&stack("")).unwrap(), &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(plan.outputs[0].parameter.as_deref(), Some("times"));
+    assert_eq!(plan.output("made/3").map(|(o, p)| (o, p.unwrap())), Some((0, "3".to_string())));
+    let (_, problems) = Plan::of(&toml::from_str(&stack("[[stack]]\nop = \"t.pick\"\n")).unwrap(), &ops, &[]);
+    assert_eq!(problems.iter().map(|p| p.what.as_str()).collect::<Vec<_>>(), ["`made` reaches operations of `times` and `which`: an output is one family"]);
 }

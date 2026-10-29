@@ -2,13 +2,13 @@
 //! `crates/ext/wit/extension.wit`.
 //!
 //! Loading compiles a component, in an engine of its own, instantiates it once and asks who it is (`describe`) and
-//! what it registers (`register`); what it registers becomes the same kinds, roles, fields, pictures, thumbnails and
+//! what it registers (`register`); what it registers becomes the same kinds, roles, fields, operations, types and
 //! views a linked extension's would, each callback a call into the component by its handle.
 //!
 //! A guest's memory only grows, so an instance holds the most it ever held until it is dropped: instances live by the
-//! lifetime of their job, never a timer. A job - a picture, a thumbnail, an import, an export, a tool's run - gets an
-//! instance made for it and dropped when it returns. Readings - whether an asset has a picture, its looks, a field's
-//! reading, facts, parts, a sniff, a check - share one instance, reused while it is used and reclaimed after
+//! lifetime of their job, never a timer. A job - an operation's run, a tool's run - gets an instance made for it and
+//! dropped when it returns. Readings - a family's members, a field's reading, parts, a sniff - share one instance,
+//! reused while it is used and reclaimed after
 //! `READING_FRAMES` frames unused (the host counts frames: `frame`). Long-running jobs keep theirs: the views live in
 //! one instance, which goes when its last view closes and it answers that it may be reclaimed; an extraction session in
 //! one of its own, which goes with the session. Each engine pools its instances' slots, so making one is cheap and
@@ -27,7 +27,7 @@
 //! settings, so only the first process to load a component compiles it.
 
 use anyhow::{Context, Result, anyhow};
-use pe2_ext::{Asset, Declared, Discs, Extraction, Field, Image, Name, Picture, Project, Registry, Source, Table, UiHost};
+use pe2_ext::{Asset, Declared, Discs, Extraction, Field, Image, Name, Project, Registry, Source, Table, UiHost};
 use pe2_ext::{Value, View};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -482,11 +482,6 @@ impl host::HostProject for State {
     fn parts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<Vec<(String, String, Vec<String>)>> {
         let project = self.project(&project)?;
         Ok(elsewhere(project, move |p| p.parts(&path).into_iter().map(|part| (part.id, part.label, part.made_of)).collect()))
-    }
-
-    fn facts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<String> {
-        let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| toml::to_string(&p.facts(&path)).unwrap_or_default()))
     }
 
     fn call(
@@ -1126,53 +1121,6 @@ impl Shared {
     }
 }
 
-/// A kind's picture, drawn by its component.
-struct ComponentPicture {
-    shared: Arc<Shared>,
-    kind: u32,
-    /// What drawing one may take.
-    cap: u64,
-}
-
-fn image(image: types::Image) -> Image {
-    Image { width: image.width as usize, height: image.height as usize, rgba: image.rgba }
-}
-
-impl Picture for ComponentPicture {
-    fn has(&self, asset: &Asset) -> bool {
-        let kind = self.kind;
-        self.shared
-            .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_has(a, kind, lent).await))
-            .unwrap_or(false)
-    }
-
-    fn looks(&self, asset: &Asset) -> Vec<String> {
-        let kind = self.kind;
-        self.shared
-            .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_picture_looks(a, kind, lent).await))
-            .unwrap_or_default()
-    }
-
-    fn draw(&self, asset: &Asset, look: usize) -> Result<Image> {
-        let (kind, look) = (self.kind, u32::try_from(look)?);
-        self.shared
-            .job(self.cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_draw(a, kind, lent, look).await))?
-            .map(image)
-            .map_err(|e| anyhow!(e))
-    }
-
-    fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
-        let (kind, part) = (self.kind, part.to_string());
-        let made = self
-            .shared
-            .job(self.cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_picture_part(a, kind, lent, part).await));
-        match made {
-            Ok(made) => made.map(|m| m.map(image).map_err(|e| anyhow!(e))),
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
 /// A view living in its component's views' instance: of an asset, or a panel's.
 struct ComponentView {
     shared: Arc<Shared>,
@@ -1482,31 +1430,25 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         for f in kind.fields {
             builder = builder.field(field(shared, f));
         }
-        let cap = shared.cap(&kind.name);
-        if kind.picture {
-            builder = builder.picture(ComponentPicture { shared: shared.clone(), kind: index, cap });
-        }
-        if kind.thumbnail {
-            let shared = shared.clone();
-            builder = builder.thumbnail(move |asset, side| {
-                let side = u32::try_from(side).ok()?;
-                let made = shared.job(cap, |r| {
-                    r.with_asset(asset, LONG, async |a, g, lent| g.call_thumbnail(a, index, lent, side).await)
+        for (o, output) in kind.outputs.into_iter().enumerate() {
+            let o = u32::try_from(o)?;
+            let retain = match output.retain {
+                g::Retain::Cache => pe2_ext::Retain::Cache,
+                g::Retain::Build => pe2_ext::Retain::Build,
+                g::Retain::Transient => pe2_ext::Retain::Transient,
+            };
+            builder = builder.output_described(&output.name, &output.op, retain);
+            if output.members {
+                let shared = shared.clone();
+                builder = builder.members_described(move |asset| {
+                    shared
+                        .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, index, o, lent).await))
+                        .unwrap_or_default()
                 });
-                match made {
-                    Ok(made) => made.map(|m| m.map(image).map_err(|e| anyhow!(e))),
-                    Err(e) => Some(Err(e)),
-                }
-            });
+            }
         }
-        if kind.facts {
-            let shared = shared.clone();
-            builder = builder.facts(move |asset| {
-                let text = shared
-                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_facts(a, index, lent).await))
-                    .unwrap_or_default();
-                toml::from_str(&text).unwrap_or_default()
-            });
+        if let Some(stack) = &kind.stack {
+            builder = builder.stack(stack);
         }
         if kind.parts {
             let shared = shared.clone();
@@ -1547,8 +1489,8 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
         registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
     }
-    apply_formats(registry, registration.formats, shared);
-    apply_importers(registry, registration.importers, shared)?;
+    apply_types(registry, registration.types, shared);
+    apply_ops(registry, registration.ops, shared);
     apply_extractors(registry, registration.extractors, shared)?;
     for service in registration.services {
         let run = called(shared, service.handle, &service.name, true);
@@ -1561,10 +1503,10 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     Ok(())
 }
 
-/// Register what a component's formats are, their sniffs calls into it.
-fn apply_formats(registry: &mut Registry, formats: Vec<g::FileFormat>, shared: &Arc<Shared>) {
-    for format in formats {
-        let mut builder = registry.format(&format.name).label(&format.label);
+/// Register a component's types, with what recognizes them in files; their sniffs call into it.
+fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<Shared>) {
+    for format in types {
+        let mut builder = registry.type_described(&format.name).label(&format.label);
         if let Some(media_type) = &format.media_type {
             builder = builder.media_type(media_type);
         }
@@ -1590,63 +1532,163 @@ fn apply_formats(registry: &mut Registry, formats: Vec<g::FileFormat>, shared: &
     }
 }
 
-/// Register a component's importers, their checks calls into it.
-fn apply_importers(registry: &mut Registry, importers: Vec<g::Importer>, shared: &Arc<Shared>) -> Result<()> {
-    for importer in importers {
-        let makes = Name::parse(&importer.makes).with_context(|| format!("{}: not a qualified kind", importer.makes))?;
-        let mut builder = registry.importer(&importer.name, &makes).label(&importer.label).priority(importer.priority);
-        for read in &importer.reads {
-            builder = match Name::parse(read) {
-                Some(format) => builder.reads(&format),
-                None => builder.reads_media(read),
-            };
+/// Register a component's types and operations, their runs calls into it: each lent its node as an asset whose files
+/// are its values' contents, named by their hashes.
+fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
+    for op in ops {
+        let mut builder = registry.op(&op.name).label(&op.label).priority(op.priority);
+        for port in &op.inputs {
+            builder = builder.port(&port.name, &port.ty, port.many);
         }
-        if importer.native {
-            builder = builder.native();
-        }
-        for f in importer.fields {
+        builder = builder.output_described(&op.output);
+        for f in op.fields {
             builder = builder.field(field(shared, f));
         }
-        for v in importer.inspector {
-            builder = builder.inspector(&v.name, view(shared, v.handle));
-        }
-        if importer.check {
-            let (shared, handle) = (shared.clone(), importer.handle);
-            builder = builder.check(move |asset| {
-                let support =
-                    shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_check(a, handle, lent).await));
-                match support {
-                    Ok(g::Support::Full) => pe2_ext::Support::Full,
-                    Ok(g::Support::Partial((reason, offer))) => pe2_ext::Support::Partial { reason, offer },
-                    Err(e) => pe2_ext::Support::Partial { reason: format!("{e:#}"), offer: false },
-                }
-            });
-        }
-        let cap = shared.cap(&importer.name);
-        if importer.imports {
-            let (shared, handle) = (shared.clone(), importer.handle);
-            builder = builder.import(move |asset| {
-                let made = shared
-                    .job(cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_native(a, handle, lent).await))?;
-                let made = made.map_err(|e| pe2_ext::anyhow!("{e}"))?;
-                let settings = toml::from_str(&made.settings).context("the settings an import derived")?;
-                Ok(pe2_ext::Imported { files: made.files, settings, notes: made.notes })
-            });
-        }
-        for path in &importer.derives {
+        for path in &op.derives {
             builder = builder.derives(path);
         }
-        if importer.exports {
-            let (shared, handle) = (shared.clone(), importer.handle);
-            builder = builder.export(move |asset| {
-                let made = shared
-                    .job(cap, |r| r.with_asset(asset, LONG, async |a, g, lent| g.call_make_source(a, handle, lent).await))?;
-                made.map_err(|e| pe2_ext::anyhow!("{e}"))
-            });
+        if let Some(inverse) = &op.inverse {
+            builder = builder.inverse_described(inverse);
         }
-        let _ = builder.register();
+        if let Some((name, kind)) = &op.parameter {
+            builder = builder.parameter_described(name, kind);
+        }
+        let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
+        let _ = builder.run(move |call| {
+            let inputs: Vec<Vec<types::Value>> =
+                std::mem::take(&mut call.inputs).into_iter().map(|port| port.into_iter().map(value_to_wit).collect()).collect();
+            let settings = toml::to_string(call.settings).unwrap_or_default();
+            let parameter = call.parameter_text.map(str::to_string);
+            let node = Node::new(call.host);
+            let asset = Asset::new(&node, call.host.kind(), call.host.role());
+            let made = shared.job(cap, |r| {
+                r.with_asset(&asset, LONG, async |a, g, lent| g.call_run_op(a, handle, lent, inputs, settings, parameter).await)
+            })?;
+            made.map(value_from_wit).map_err(|e| anyhow!(e))
+        });
     }
-    Ok(())
+}
+
+/// A node as an operation's run lends it to a component: its path, kind, role and declared settings; its files the
+/// contents its values hold, named by their hashes.
+struct Node<'a> {
+    host: &'a dyn pe2_ext::CallHost,
+    declaration: String,
+}
+
+impl<'a> Node<'a> {
+    fn new(host: &'a dyn pe2_ext::CallHost) -> Node<'a> {
+        Node { host, declaration: toml::to_string(host.fields()).unwrap_or_default() }
+    }
+
+    fn content(name: &str) -> pe2_ext::Content {
+        pe2_ext::Content::Stored { sha1: name.to_string(), size: 0 }
+    }
+}
+
+impl Source for Node<'_> {
+    fn path(&self) -> &str {
+        self.host.path()
+    }
+
+    fn uid(&self) -> Option<&str> {
+        None
+    }
+
+    fn fields(&self) -> &Table {
+        self.host.fields()
+    }
+
+    fn declaration(&self) -> &str {
+        &self.declaration
+    }
+
+    fn has_file(&self, _: &str) -> bool {
+        true
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        self.host.read(&Node::content(name))
+    }
+
+    fn size(&self, _: &str) -> Option<u64> {
+        None
+    }
+
+    fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.host.read_range(&Node::content(name), offset, len)
+    }
+}
+
+/// A value as the contract carries it: a list's items that are lists themselves are dropped (it carries one level).
+fn value_to_wit(value: pe2_ext::Data) -> types::Value {
+    use pe2_ext::Data;
+    match value {
+        Data::List(items) => types::Value::Items(items.into_iter().filter_map(item_to_wit).collect()),
+        Data::Image(image) => types::Value::Image(to_wit(image)),
+        Data::Table(table) => types::Value::Table(toml::to_string(&table).unwrap_or_default()),
+        Data::Pcm(pcm) => types::Value::Pcm(types::Pcm { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples }),
+        Data::Typed(t) => types::Value::Typed(types::Typed {
+            ty: t.ty,
+            also: t.also,
+            files: t.files.into_iter().map(file_to_wit).collect(),
+            settings: toml::to_string(&t.settings).unwrap_or_default(),
+            notes: t.notes,
+        }),
+    }
+}
+
+fn item_to_wit(value: pe2_ext::Data) -> Option<types::Item> {
+    Some(match value_to_wit(value) {
+        types::Value::Image(i) => types::Item::Image(i),
+        types::Value::Table(t) => types::Item::Table(t),
+        types::Value::Pcm(p) => types::Item::Pcm(p),
+        types::Value::Typed(t) => types::Item::Typed(t),
+        types::Value::Items(_) => return None,
+    })
+}
+
+fn file_to_wit(f: pe2_ext::File) -> types::File {
+    let content = match f.content {
+        pe2_ext::Content::Inline(bytes) => types::Content::Inline(bytes),
+        pe2_ext::Content::Stored { sha1, size } => types::Content::Stored((sha1, size)),
+    };
+    types::File { name: f.name, content }
+}
+
+/// A value as the contract carried it.
+fn value_from_wit(value: types::Value) -> pe2_ext::Data {
+    match value {
+        types::Value::Image(i) => item_from_wit(types::Item::Image(i)),
+        types::Value::Table(t) => item_from_wit(types::Item::Table(t)),
+        types::Value::Pcm(p) => item_from_wit(types::Item::Pcm(p)),
+        types::Value::Typed(t) => item_from_wit(types::Item::Typed(t)),
+        types::Value::Items(items) => pe2_ext::Data::List(items.into_iter().map(item_from_wit).collect()),
+    }
+}
+
+fn item_from_wit(item: types::Item) -> pe2_ext::Data {
+    use pe2_ext::Data;
+    match item {
+        types::Item::Image(i) => Data::Image(Image { width: i.width as usize, height: i.height as usize, rgba: i.rgba }),
+        types::Item::Table(t) => Data::Table(toml::from_str(&t).unwrap_or_default()),
+        types::Item::Pcm(p) => Data::Pcm(pe2_ext::Pcm { rate: p.rate, channels: p.channels, samples: p.samples }),
+        types::Item::Typed(t) => Data::Typed(pe2_ext::Typed {
+            ty: t.ty,
+            also: t.also,
+            files: t.files.into_iter().map(file_from_wit).collect(),
+            settings: toml::from_str(&t.settings).unwrap_or_default(),
+            notes: t.notes,
+        }),
+    }
+}
+
+fn file_from_wit(f: types::File) -> pe2_ext::File {
+    let content = match f.content {
+        types::Content::Inline(bytes) => pe2_ext::Content::Inline(bytes),
+        types::Content::Stored((sha1, size)) => pe2_ext::Content::Stored { sha1, size },
+    };
+    pe2_ext::File { name: f.name, content }
 }
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.
@@ -1745,9 +1787,9 @@ pub fn about(bytes: &[u8]) -> Option<About> {
 /// The section `extension!` writes.
 const SECTION: &str = "pe2-extension";
 
-/// The contract this host runs: the version of the WIT package (`pe2:extension@0.2.0`), the line it is of (`0.2`)
+/// The contract this host runs: the version of the WIT package (`pe2:extension@0.1.0`), the line it is of (`0.1`)
 /// running every component built against a version of the line no newer than it.
-pub const CONTRACT: &str = "0.3.3";
+pub const CONTRACT: &str = "0.1.0";
 
 /// What a component's guest interface is exported as, before its version.
 const GUEST: &str = "pe2:extension/guest@";
@@ -1793,7 +1835,7 @@ pub fn runs(contract: &str) -> std::result::Result<(), String> {
 /// # Errors
 /// One without the section cannot be compiled or instantiated, or its registration fails.
 pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
-    let size = bytes.len();
+    let (size, build) = (bytes.len(), Some(crate::extract::sha1_hex(bytes)));
     // Its contract first, before anything of it is compiled.
     let contract = contract(bytes).context("it exports no pe2:extension/guest: it is no extension")?;
     runs(&contract).map_err(|why| anyhow!(why))?;
@@ -1816,6 +1858,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
             component: Some(cell),
             size: Some(size),
             contract: contract.clone(),
+            build: build.clone(),
             settings: toml::Table::new(),
         });
     }
@@ -1831,6 +1874,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
         component: Some(cell),
         size: Some(size),
         contract,
+        build,
         settings: toml::Table::new(),
     })
 }

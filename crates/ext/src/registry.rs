@@ -3,8 +3,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::import::{FormatDef, ImporterDef, Recognized, Signature, Support};
-use crate::{Asset, Image, Project, Result, Table, Value, View};
+use std::marker::PhantomData;
+
+use crate::data::{Call, OpDef, OutputDef, Port, Retain, Type};
+use crate::ty::ValueType;
+use crate::import::{Recognized, Signature, TypeDef};
+use crate::{Asset, Project, Result, Table, Value, View};
 
 /// An extension: its id, its version, the extensions it needs and its entry point. `extension!` makes it.
 pub struct Extension {
@@ -230,39 +234,11 @@ impl Field {
     }
 }
 
-/// What an asset looks like as an image, in each of its looks: what the host shows it by wherever it draws it (the
-/// inspector's header, VRAM, a container's preview, an agent's request).
-pub trait Picture: Send + Sync {
-    /// Whether the asset has a picture.
-    fn has(&self, asset: &Asset) -> bool;
-    /// Its looks, by name; empty or one where it has a single look. The looks are its declaration's `variants`: the
-    /// host's tree asks only an asset declaring some, as it knows which do without parsing their declarations.
-    fn looks(&self, asset: &Asset) -> Vec<String>;
-    /// Its picture in a look (an index into `looks`; a look past them is its first).
-    ///
-    /// # Errors
-    /// Its files cannot be read or decoded.
-    fn draw(&self, asset: &Asset, look: usize) -> Result<Image>;
-    /// A part of it as a picture, by the part's path (an image's `palettes/<name>`, as a strip of its colors); none
-    /// where it has no such part.
-    fn part(&self, asset: &Asset, part: &str) -> Option<Result<Image>> {
-        let _ = (asset, part);
-        None
-    }
-}
-
-/// An asset's thumbnail, at most `side` pixels on its longer side; none where it has none. The host keeps it as an
-/// artifact, under a key of the extension's version and the asset's files.
-pub type Thumbnail = dyn Fn(&Asset, usize) -> Option<Result<Image>> + Send + Sync;
-
 /// Makes a view of an asset.
 pub type MakeView = dyn Fn(&Asset) -> Box<dyn View> + Send + Sync;
 
 /// Makes a panel's view.
 pub type MakePanel = dyn Fn() -> Box<dyn View> + Send + Sync;
-
-/// What an asset is, for an agent: facts its kind adds to its description (an image's palettes, its cells).
-pub type Facts = dyn Fn(&Asset) -> Table + Send + Sync;
 
 /// A part of an asset: what a reference names by fragment (`uid://...#palettes/default`), an output of its import or
 /// one its settings define.
@@ -309,8 +285,8 @@ pub struct Parts {
     pub tools: Vec<ToolDef>,
     /// Services: like tools, but for other extensions to call.
     pub services: Vec<ToolDef>,
-    pub formats: Vec<FormatDef>,
-    pub importers: Vec<ImporterDef>,
+    pub ops: Vec<OpDef>,
+    pub types: Vec<TypeDef>,
     pub extractors: Vec<crate::ExtractorDef>,
     /// Whether its instance may be reclaimed now; without, always.
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -318,6 +294,8 @@ pub struct Parts {
     pub memory: Vec<(Name, u64)>,
     /// Its settings, as declared, each with the value it took.
     pub settings: Vec<(Setting, Value)>,
+    /// What it registered wrongly (a type not written as one): the host's problems of it.
+    pub problems: Vec<String>,
 }
 
 /// Where a setting is kept, and so whom it is the same for.
@@ -412,13 +390,14 @@ pub struct KindDef {
     pub label: String,
     pub icon: Option<(Icon, Tint)>,
     pub fields: Vec<Field>,
-    pub picture: Option<Arc<dyn Picture>>,
-    pub thumbnail: Option<Arc<Thumbnail>>,
     pub views: Vec<ViewDef>,
     /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
     pub inspector: Vec<ViewDef>,
-    pub facts: Option<Arc<Facts>>,
     pub parts: Option<Arc<ListParts>>,
+    /// The outputs every node of it has, made from its stack's result (`picture(look)`, `facts`).
+    pub outputs: Vec<OutputDef>,
+    /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
+    pub stack: Option<String>,
 }
 
 /// A role as registered, on a kind of its extension's or of one it requires.
@@ -496,12 +475,11 @@ impl Registry {
             label: name.to_string(),
             icon: None,
             fields: vec![],
-            picture: None,
-            thumbnail: None,
             views: vec![],
             inspector: vec![],
-            facts: None,
             parts: None,
+            outputs: vec![],
+            stack: None,
         };
         KindBuilder { registry: self, def }
     }
@@ -526,16 +504,35 @@ impl Registry {
         self.parts.panels.push(PanelDef { name, label: label.to_string(), icon: Some(icon), make: Arc::new(make) });
     }
 
-    /// A format, `<id>@<name>`: registered by `register` on what this returns.
-    pub fn format(&mut self, name: &str) -> FormatBuilder<'_> {
-        let def = FormatDef {
+    /// A type of the extension's, by its marker: its name and label, and what recognizes it in a stored file. Its
+    /// name must be in the extension's namespace.
+    pub fn value_type<T: crate::ty::Registered>(&mut self) -> Name {
+        let Some(name) = Name::parse(T::NAME).filter(|n| n.extension() == self.id) else {
+            self.parts.problems.push(format!("{}: not a type of {}", T::NAME, self.id));
+            return Name::of(&self.id, T::NAME);
+        };
+        let mut builder = self.type_described(name.local()).label(T::LABEL);
+        if let Some(media_type) = T::MEDIA_TYPE {
+            builder = builder.media_type(media_type);
+        }
+        builder.def.signatures = T::signatures();
+        if let Some(sniff) = T::SNIFF {
+            builder = builder.sniff(sniff);
+        }
+        builder.register()
+    }
+
+    /// A type as described where types cross as text (a component's registration), `<id>@<name>`: registered by
+    /// `register` on what this returns.
+    pub fn type_described(&mut self, name: &str) -> TypeBuilder<'_> {
+        let def = TypeDef {
             name: Name::of(&self.id, name),
             label: name.to_string(),
             media_type: None,
             signatures: vec![],
             sniff: None,
         };
-        FormatBuilder { registry: self, def }
+        TypeBuilder { registry: self, def }
     }
 
     /// An extractor, `<id>@<name>`, making the native files of assets of `kind` (of `roles`, qualified; of every role
@@ -573,24 +570,24 @@ impl Registry {
         self.parts.memory.push((of.clone(), bytes));
     }
 
-    /// An importer, `<id>@<name>`, making assets of `kind`: registered by `register` on what this returns.
-    pub fn importer(&mut self, name: &str, kind: &Name) -> ImporterBuilder<'_> {
-        let def = ImporterDef {
+    /// An operation, `<id>@<name>`: registered by `run` on what this returns. It makes `ty::Any` until it says
+    /// otherwise.
+    pub fn op(&mut self, name: &str) -> OpBuilder<'_> {
+        let def = OpDef {
             name: Name::of(&self.id, name),
             label: name.to_string(),
-            reads: vec![],
-            makes: kind.clone(),
-            native: false,
+            inputs: vec![],
+            output: Type::Any,
             fields: vec![],
-            inspector: vec![],
-            check: None,
-            import: None,
             derives: vec![],
-            export: None,
+            inverse: None,
+            parameter: None,
             priority: 0,
+            run: Arc::new(|_| Err(crate::anyhow!("it does nothing"))),
         };
-        ImporterBuilder { registry: self, def }
+        OpBuilder { registry: self, def, same: Vec::new(), list_of: None, out: PhantomData }
     }
+
 
     /// A tool for agents, `<id>@<name>`: what it does, its arguments as a JSON schema, its work.
     pub fn tool(
@@ -660,18 +657,6 @@ impl KindBuilder<'_> {
     }
 
     #[must_use]
-    pub fn picture(mut self, picture: impl Picture + 'static) -> Self {
-        self.def.picture = Some(Arc::new(picture));
-        self
-    }
-
-    #[must_use]
-    pub fn thumbnail(mut self, thumbnail: impl Fn(&Asset, usize) -> Option<Result<Image>> + Send + Sync + 'static) -> Self {
-        self.def.thumbnail = Some(Arc::new(thumbnail));
-        self
-    }
-
-    #[must_use]
     pub fn view(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
         self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
         self
@@ -684,10 +669,40 @@ impl KindBuilder<'_> {
         self
     }
 
-    /// What an agent is told of an asset of the kind besides its declaration.
+    /// An output every node of the kind has: `name` (`stream`, `picture`) made by the operation `op` (as its
+    /// registration named it) from the node's stack's result, kept as `retain` says - a family where the operation
+    /// has a parameter, each member addressed by a value of it (`picture/night`).
     #[must_use]
-    pub fn facts(mut self, facts: impl Fn(&Asset) -> Table + Send + Sync + 'static) -> Self {
-        self.def.facts = Some(Arc::new(facts));
+    pub fn output(self, name: &str, op: &Name, retain: Retain) -> Self {
+        self.output_described(name, &op.to_string(), retain)
+    }
+
+    /// An output as described where names cross as text (its operation qualified).
+    #[must_use]
+    pub fn output_described(mut self, name: &str, op: &str, retain: Retain) -> Self {
+        self.def.outputs.push(OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None });
+        self
+    }
+
+    /// The members of the family the last output is: each by a value of its operation's parameter, with a label.
+    #[must_use]
+    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) -> Self {
+        self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect())
+    }
+
+    /// The members of a family as described where values cross as text.
+    #[must_use]
+    pub fn members_described(mut self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) -> Self {
+        if let Some(output) = self.def.outputs.last_mut() {
+            output.members = Some(Arc::new(members));
+        }
+        self
+    }
+
+    /// The stack a node of the kind has where its bundle states none, as `[[stack]]` tables: extraction writes it.
+    #[must_use]
+    pub fn stack(mut self, toml: &str) -> Self {
+        self.def.stack = Some(toml.to_string());
         self
     }
 
@@ -754,12 +769,12 @@ impl RoleBuilder<'_> {
     }
 }
 
-pub struct FormatBuilder<'a> {
+pub struct TypeBuilder<'a> {
     registry: &'a mut Registry,
-    def: FormatDef,
+    def: TypeDef,
 }
 
-impl FormatBuilder<'_> {
+impl TypeBuilder<'_> {
     #[must_use]
     pub fn label(mut self, label: &str) -> Self {
         self.def.label = label.to_string();
@@ -800,46 +815,132 @@ impl FormatBuilder<'_> {
         self
     }
 
-    /// Register it; its name, which importers read it by.
-    #[expect(clippy::must_use_candidate, reason = "a format no importer of its extension reads needs no name")]
+    /// Register it; its name, which ports take it by.
+    #[expect(clippy::must_use_candidate, reason = "a type no operation of its extension names needs no name")]
     pub fn register(self) -> Name {
         let name = self.def.name.clone();
-        self.registry.parts.formats.push(self.def);
+        self.registry.parts.types.push(self.def);
         name
     }
 }
 
-pub struct ImporterBuilder<'a> {
+/// An operation being registered: `Out` the type it makes (`ty::Any` until `output` says).
+pub struct OpBuilder<'a, Out = crate::ty::Any> {
     registry: &'a mut Registry,
-    def: ImporterDef,
+    def: OpDef,
+    /// Ports and its output (`None`) that are one type, whatever it is: the constraints.
+    same: Vec<Vec<Option<String>>>,
+    /// Its output is a list of what this port takes.
+    list_of: Option<String>,
+    out: PhantomData<Out>,
 }
 
-impl ImporterBuilder<'_> {
+impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     #[must_use]
     pub fn label(mut self, label: &str) -> Self {
         self.def.label = label.to_string();
         self
     }
 
-    /// It reads this format.
+    /// A port taking one value of a type (`.input::<Indexed>("native")`).
     #[must_use]
-    pub fn reads(mut self, format: &Name) -> Self {
-        self.def.reads.push(format.to_string());
+    pub fn input<T: ValueType>(mut self, name: &str) -> Self {
+        self.def.inputs.push(Port { name: name.to_string(), ty: T::ty(), many: false });
         self
     }
 
-    /// It reads any format of this media type.
+    /// A port taking any number of values of a type, in order.
     #[must_use]
-    pub fn reads_media(mut self, media_type: &str) -> Self {
-        self.def.reads.push(media_type.to_string());
+    pub fn inputs<T: ValueType>(mut self, name: &str) -> Self {
+        self.def.inputs.push(Port { name: name.to_string(), ty: T::ty(), many: true });
         self
     }
 
-    /// It makes nothing: its outputs are its inputs, its settings how to read them.
+    /// A port as described where types cross as text (a component's registration): its type, parsed.
     #[must_use]
-    pub fn native(mut self) -> Self {
-        self.def.native = true;
+    pub fn port(mut self, name: &str, ty: &str, many: bool) -> Self {
+        let ty = self.parse(ty);
+        self.def.inputs.push(Port { name: name.to_string(), ty, many });
         self
+    }
+
+    /// What it makes, as described where types cross as text.
+    #[must_use]
+    pub fn output_described(mut self, ty: &str) -> Self {
+        self.def.output = self.parse(ty);
+        self
+    }
+
+    fn parse(&mut self, ty: &str) -> Type {
+        Type::parse(ty, &self.registry.id).unwrap_or_else(|e| {
+            self.registry.parts.problems.push(format!("{}: {e}", self.def.name));
+            Type::Any
+        })
+    }
+
+    /// What it makes (`.output::<ty::Image>()`): what `run` returns a value of.
+    #[must_use]
+    pub fn output<T: ValueType>(self) -> OpBuilder<'a, T> {
+        let OpBuilder { registry, mut def, same, list_of, .. } = self;
+        def.output = T::ty();
+        OpBuilder { registry, def, same, list_of, out: PhantomData }
+    }
+
+    /// Two ports taking `Any` take one type, whatever it is: given a texture first, the other takes a texture.
+    #[must_use]
+    pub fn same(self, a: &str, b: &str) -> Self {
+        self.join(Some(a), Some(b))
+    }
+
+    /// What it makes is of the type a port taking `Any` is given.
+    #[must_use]
+    pub fn output_same_as(self, port: &str) -> Self {
+        self.join(None, Some(port))
+    }
+
+    /// What it makes is a list of what a port taking `Any` is given.
+    #[must_use]
+    pub fn output_list_of(mut self, port: &str) -> Self {
+        self.list_of = Some(port.to_string());
+        self.join(Some(port), Some(port))
+    }
+
+    fn join(mut self, a: Option<&str>, b: Option<&str>) -> Self {
+        let (a, b) = (a.map(str::to_string), b.map(str::to_string));
+        let find = |same: &Vec<Vec<Option<String>>>, s: &Option<String>| same.iter().position(|g| g.contains(s));
+        match (find(&self.same, &a), find(&self.same, &b)) {
+            (Some(i), Some(j)) if i != j => {
+                let moved = self.same.remove(j.max(i));
+                self.same[j.min(i)].extend(moved);
+            }
+            (Some(_), Some(_)) => {}
+            (Some(i), None) => self.same[i].push(b),
+            (None, Some(j)) => self.same[j].push(a),
+            (None, None) => self.same.push(if a == b { vec![a] } else { vec![a, b] }),
+        }
+        self
+    }
+
+    /// The constraints as the host checks them: each group one variable, its ports and output taking it.
+    fn constrain(&mut self) {
+        let name = self.def.name.clone();
+        for (i, group) in self.same.iter().enumerate() {
+            let var = Type::Var(char::from(b'A' + u8::try_from(i % 26).unwrap_or(0)).to_string());
+            for slot in group {
+                let ty = match slot {
+                    Some(port) => self.def.inputs.iter_mut().find(|p| p.name == *port).map(|p| &mut p.ty),
+                    None => Some(&mut self.def.output),
+                };
+                match ty {
+                    Some(ty) if *ty == Type::Any => *ty = var.clone(),
+                    Some(_) => self.registry.parts.problems.push(format!("{name}: a constraint relates a port of a type")),
+                    None => self.registry.parts.problems.push(format!("{name}: a constraint names no port {slot:?}")),
+                }
+            }
+            if self.list_of.as_ref().is_some_and(|p| group.contains(&Some(p.clone()))) {
+                self.def.output = Type::List(Box::new(var.clone()));
+            }
+        }
     }
 
     /// A setting.
@@ -849,52 +950,57 @@ impl ImporterBuilder<'_> {
         self
     }
 
-    /// A view drawn with its settings in the properties pane: what its custom settings hold.
-    #[must_use]
-    pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
-        self
-    }
-
-    /// How far it takes a source of its formats; without a check, fully.
-    #[must_use]
-    pub fn check(mut self, check: impl Fn(&Asset) -> Support + Send + Sync + 'static) -> Self {
-        self.def.check = Some(Arc::new(check));
-        self
-    }
-
-    /// What it makes of a source: the native files, by name, and the settings it derives.
-    #[must_use]
-    pub fn import(mut self, import: impl Fn(&Asset) -> Result<crate::Imported> + Send + Sync + 'static) -> Self {
-        self.def.import = Some(Arc::new(import));
-        self
-    }
-
-    /// A kind setting it derives from the source (`size`, `cells.*.rect`).
+    /// A setting of its node it derives (`size`, `cells.*.rect`): what it makes says it, in the declaration's place.
     #[must_use]
     pub fn derives(mut self, path: &str) -> Self {
         self.def.derives.push(path.to_string());
         self
     }
 
-    /// How it writes its source from the native form, which importing makes again.
+    /// The operation undoing it: what writes its input from what it makes, as extraction writes a source from the
+    /// disc's native form.
     #[must_use]
-    pub fn export(mut self, export: impl Fn(&Asset) -> Result<Vec<u8>> + Send + Sync + 'static) -> Self {
-        self.def.export = Some(Arc::new(export));
+    pub fn inverse(mut self, op: &Name) -> Self {
+        self.def.inverse = Some(op.to_string());
         self
     }
 
+    /// The operation undoing it, as described where names cross as text (qualified).
+    #[must_use]
+    pub fn inverse_described(mut self, op: &str) -> Self {
+        self.def.inverse = Some(op.to_string());
+        self
+    }
+
+    /// Which of several operations taking a source is offered first: the highest.
     #[must_use]
     pub fn priority(mut self, priority: i32) -> Self {
         self.def.priority = priority;
         self
     }
 
-    #[expect(clippy::must_use_candidate, reason = "an importer's name is seldom needed")]
-    pub fn register(self) -> Name {
+    /// Its parameter, of a type (`.parameter::<String>("look")`): what reaches it is a family, each member addressed
+    /// by a value of it, which `Call::parameter` reads.
+    #[must_use]
+    pub fn parameter<P: crate::ty::Parameter>(mut self, name: &str) -> Self {
+        self.def.parameter = Some((name.to_string(), P::KIND.to_string()));
+        self
+    }
+
+    /// Its parameter as described where it crosses as text: its name and the kind of value it takes.
+    #[must_use]
+    pub fn parameter_described(mut self, name: &str, kind: &str) -> Self {
+        self.def.parameter = Some((name.to_string(), kind.to_string()));
+        self
+    }
+
+    /// What it does - given its call, a value of what it makes - registered with it; its name, which a kind's
+    /// outputs and an inverse name it by.
+    pub fn run(mut self, run: impl Fn(&mut Call<'_>) -> Result<Out::Value> + Send + Sync + 'static) -> Name {
+        self.constrain();
+        self.def.run = Arc::new(move |call| run(call).map(Out::encode));
         let name = self.def.name.clone();
-        self.registry.parts.importers.push(self.def);
+        self.registry.parts.ops.push(self.def);
         name
     }
 }
-

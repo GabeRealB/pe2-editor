@@ -21,6 +21,14 @@ struct AssetArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct OutputArgs {
+    /// The asset: its path or its uid.
+    asset: String,
+    /// The output, by its address: `stream`, `native`, a family's member by its parameter's value (`picture/night`).
+    output: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct FindArgs {
     /// Text the asset's path contains (case-insensitive).
     #[serde(default)]
@@ -182,10 +190,11 @@ fn own() -> Vec<Tool> {
         tool::<AssetArgs>(
             "get_asset",
             "An asset as resolved: path, uid, kind, role, the layers creating and overriding it, its files (size, \
-             sha1, layer, the importer that made it of the source), its looks where it has a picture, what its kind's extension tells of it (an image's \
-             palettes and cell count), its importer and the importers that fit its source, and its declaration \
-             (asset.toml) as written - with the settings as resolved where its import derives some from its source - \
-             and its parts (what references name by fragment, a virtual one with the parts it is made of).",
+             sha1, layer, the operation that made it), its looks where it has a picture, its outputs (what its stack \
+             and its kind make of it, each read with get_output), its import and the imports that fit its source, \
+             and its declaration (asset.toml) as written - with the settings as resolved where its import derives \
+             some from its source - and its parts (what references name by fragment, a virtual one with the parts it \
+             is made of).",
         ),
         tool::<AssetArgs>(
             "references",
@@ -196,6 +205,12 @@ fn own() -> Vec<Tool> {
             "problems",
             "What is wrong with the project: unreadable declarations, duplicate uids, conflicting or unlisted \
              entries, stale overrides; and references naming no asset.",
+        ),
+        tool::<OutputArgs>(
+            "get_output",
+            "One of an asset's outputs (get_asset lists them), made now or found kept: a table (a movie's stream) as \
+             JSON; a picture as PNG; a value of an extension's type as its files (name, size, sha1) and the settings \
+             made with it. A family's member by its parameter's value: `picture/default`, `part/palettes/default`.",
         ),
         tool::<PreviewArgs>(
             "preview",
@@ -251,6 +266,9 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
         "problems" => parse(arguments).map(|a: ProblemsArgs| problems(view.index, a.limit.unwrap_or(100))),
         "preview" => {
             return parse(arguments).and_then(|a| preview(view.index, view.extensions, &a)).unwrap_or_else(failure);
+        }
+        "get_output" => {
+            return parse(arguments).and_then(|a| get_output(view.index, view.extensions, &a)).unwrap_or_else(failure);
         }
         "editor_selection" => editor_selection(view),
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
@@ -396,28 +414,33 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     let fields = out.as_object_mut().expect("an object");
     fields.insert("layers".into(), json!(asset.layers));
     fields.insert("files".into(), json!(files));
-    if extensions.kind_of(asset).is_some_and(|k| k.picture.is_some()) {
+    if extensions.has_picture(asset) {
         fields.insert("looks".into(), json!(extensions.looks(asset)));
-        fields.insert("has_picture".into(), json!(extensions.has_picture(asset)));
+        fields.insert("has_picture".into(), json!(true));
     }
-    for (key, value) in extensions.facts(asset) {
-        fields.insert(key, serde_json::to_value(value).unwrap_or_default());
-    }
-    if let Some(importer) = extensions.importer_of(asset) {
-        fields.insert("importer".into(), json!({ "name": importer.name.to_string(), "label": importer.label }));
-    }
-    let fits: Vec<Value> = extensions
-        .importers_for(asset)
-        .into_iter()
-        .map(|(i, support)| match support {
-            pe2_ext::Support::Full => json!({ "name": i.name.to_string(), "label": i.label, "support": "full" }),
-            pe2_ext::Support::Partial { reason, offer } => {
-                json!({ "name": i.name.to_string(), "label": i.label, "support": "partial", "reason": reason, "offered": offer })
-            }
+    // What it makes: its stack's outputs and its kind's, each with how it is kept.
+    let (plan, wrong) = extensions.plan(asset);
+    let outputs: Vec<Value> = plan
+        .outputs
+        .iter()
+        .map(|o| {
+            let name = o.parameter.as_ref().map_or_else(|| o.name.clone(), |p| format!("{}({p})", o.name));
+            json!({ "name": name, "retain": project::graph::retain_name(o.retain), "eager": o.eager })
         })
         .collect();
+    if !outputs.is_empty() {
+        fields.insert("outputs".into(), json!(outputs));
+    }
+    if !wrong.is_empty() {
+        fields.insert("stack_problems".into(), json!(wrong.iter().map(|p| format!("{}: {}", p.at, p.what)).collect::<Vec<_>>()));
+    }
+    if let Some(op) = extensions.import_op(asset) {
+        fields.insert("import".into(), json!({ "name": op.name.to_string(), "label": op.label }));
+    }
+    let fits: Vec<Value> =
+        extensions.ops_for(asset).into_iter().map(|op| json!({ "name": op.name.to_string(), "label": op.label })).collect();
     if !fits.is_empty() {
-        fields.insert("importers".into(), json!(fits));
+        fields.insert("imports".into(), json!(fits));
     }
     let parts: Vec<Value> = extensions
         .parts(asset)
@@ -485,6 +508,40 @@ fn problems(index: &Index, limit: usize) -> Value {
         "dangling_references": dangling,
         "dangling_total": index.dangling.len(),
     })
+}
+
+fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Result<CallToolResult, String> {
+    use project::graph::{Content, Value as Made};
+    let asset = asset(index, &args.asset)?;
+    let given = extensions.output(&extensions.engine(), asset, &args.output, true).map_err(|e| format!("{e:#}"))?;
+    let value = given.value.ok_or_else(|| format!("{}: {} made nothing", asset.path, args.output))?;
+    let text = |v: Value| Ok(CallToolResult::success(vec![ContentBlock::text(v.to_string())]));
+    let file = |f: &project::graph::File| {
+        let (size, sha1) = match &f.content {
+            Content::Inline(bytes) => (bytes.len() as u64, project::extract::sha1_hex(bytes)),
+            Content::Stored { sha1, size } => (*size, sha1.clone()),
+        };
+        json!({ "name": f.name, "size": size, "sha1": sha1 })
+    };
+    match value.as_ref() {
+        Made::Image(image) => {
+            let png = project::ext::png(image).map_err(|e| format!("{e:#}"))?;
+            Ok(CallToolResult::success(vec![
+                ContentBlock::text(format!("{} {}: {} x {}", asset.path, args.output, image.width, image.height)),
+                ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"),
+            ]))
+        }
+        Made::Table(table) => text(serde_json::to_value(table).unwrap_or_default()),
+        Made::Typed(typed) => text(json!({
+            "type": typed.ty,
+            "also": typed.also,
+            "files": typed.files.iter().map(file).collect::<Vec<_>>(),
+            "settings": serde_json::to_value(&typed.settings).unwrap_or_default(),
+            "notes": typed.notes,
+        })),
+        Made::Pcm(pcm) => text(json!({ "rate": pcm.rate, "channels": pcm.channels, "samples": pcm.samples.len() })),
+        Made::List(items) => text(json!({ "items": items.len(), "type": value.ty().to_string() })),
+    }
 }
 
 fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {

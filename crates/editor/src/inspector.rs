@@ -77,8 +77,8 @@ pub fn inspector_ui(
             extensions: &ws.extensions,
             fields: ws.extensions.fields(&asset).into_iter().cloned().collect(),
             within: None,
-            derived: ws.extensions.importer_of(&asset).filter(|i| !i.derives.is_empty()).map(|i| {
-                (i.label.clone(), i.derives.iter().filter(|p| !p.contains('.')).cloned().collect())
+            derived: ws.extensions.import_op(&asset).filter(|op| !op.derives.is_empty()).map(|op| {
+                (op.label.clone(), op.derives.iter().filter(|p| !p.contains('.')).cloned().collect())
             }),
         };
         // The settings as resolved: what the import derives in its place.
@@ -101,7 +101,7 @@ pub fn inspector_ui(
             });
         }
     }
-    ws.show_inspector_views(ui, &asset.path, nav, false);
+    ws.show_inspector_views(ui, &asset.path, nav);
     stack_ui(ui, ws, &asset, &target, nav, edit);
     files_ui(ui, &asset, tools, message);
     declaration_ui(ui, ws, &asset, edit);
@@ -754,18 +754,16 @@ fn stack_ui(
     let import = project::graph::import_of(asset.fields());
     let name = import.as_ref().map_or("", |i| i.op);
     let source = import.as_ref().map(|i| i.source);
-    let importer = ws.extensions.importer(name);
-    let fits: Vec<(String, String, Option<pe2_ext::Support>)> = ws
-        .extensions
-        .importers_for(asset)
-        .into_iter()
-        .map(|(i, support)| (i.name.to_string(), i.label.clone(), Some(support)))
-        .collect();
-    let formats: Vec<String> = asset
-        .files
+    let importer = ws.extensions.op(name);
+    let fits: Vec<(String, String)> = ws.extensions.ops_for(asset).into_iter().map(|op| (op.name.to_string(), op.label.clone())).collect();
+    // What each stored file is recognized as, by its layer.
+    let recognized: Vec<Vec<String>> = layers
         .iter()
-        .filter(|f| Some(f.name.as_str()) == source && f.made_by.is_none())
-        .flat_map(|f| ws.extensions.recognize(f).into_iter().map(|(format, _)| format.label.clone()))
+        .map(|layer| {
+            let name = layer.get("file").and_then(toml::Value::as_str).filter(|_| layer.get("op").and_then(toml::Value::as_str) == Some(project::graph::FILE));
+            let file = name.and_then(|n| asset.files.iter().find(|f| f.name == n && f.made_by.is_none()));
+            file.map_or_default(|f| ws.extensions.recognize(f).into_iter().map(|(ty, _)| ty.label.clone()).collect())
+        })
         .collect();
     // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
     let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
@@ -798,8 +796,8 @@ fn stack_ui(
                         let source_layer = Some(i) == importing.map(|j| j - 1);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(text("file").unwrap_or_default()).monospace());
-                            for format in formats.iter().filter(|_| source_layer) {
-                                badge(ui, format);
+                            for ty in &recognized[i] {
+                                badge(ui, ty);
                             }
                         });
                         // Edited in its tool: a row of its own, under the file.
@@ -841,7 +839,6 @@ fn stack_ui(
         }
         fits_ui(ui, &fits, name);
     });
-    ws.show_inspector_views(ui, &asset.path, nav, true);
 }
 
 /// The button editing a source in the tool its format is edited in: in the active layer, copied there first where the
@@ -871,25 +868,19 @@ fn edit_in_button(
     }
 }
 
-/// The importers that fit an asset's source, where there is a choice: the one in use, and why one takes it only in part.
-fn fits_ui(ui: &mut egui::Ui, fits: &[(String, String, Option<pe2_ext::Support>)], name: &str) {
-    if fits.len() <= 1 && fits.iter().all(|(n, ..)| n == name) {
+/// The operations taking an asset's source, where there is a choice: the one in use marked.
+fn fits_ui(ui: &mut egui::Ui, fits: &[(String, String)], name: &str) {
+    if fits.len() <= 1 && fits.iter().all(|(n, _)| n == name) {
         return;
     }
     ui.add_space(4.0);
-    ui.label(RichText::new("Importers for this source").small().color(theme::weak()));
-    for (fit, label, support) in fits {
+    ui.label(RichText::new("Imports for this source").small().color(theme::weak()));
+    for (fit, label) in fits {
         ui.horizontal_wrapped(|ui| {
             let text = RichText::new(label);
             ui.label(if fit == name { text.strong() } else { text });
-            match support {
-                Some(pe2_ext::Support::Partial { reason, .. }) => {
-                    ui.label(RichText::new(reason).small().color(ui.visuals().warn_fg_color));
-                }
-                _ if fit == name => {
-                    ui.label(RichText::new("in use").small().color(theme::weak()));
-                }
-                _ => {}
+            if fit == name {
+                ui.label(RichText::new("in use").small().color(theme::weak()));
             }
         });
     }
@@ -903,20 +894,17 @@ fn importer_row(
     asset: &Asset,
     at: usize,
     name: &str,
-    importer: Option<&pe2_ext::ImporterDef>,
-    fits: &[(String, String, Option<pe2_ext::Support>)],
+    importer: Option<&pe2_ext::OpDef>,
+    offered: &[(String, String)],
     editable: bool,
     edit: &mut Option<EditRequest>,
 ) {
-    // Offered: fully supporting, or partly and offered anyway.
-    let offered: Vec<&(String, String, Option<pe2_ext::Support>)> =
-        fits.iter().filter(|(_, _, s)| !matches!(s, Some(pe2_ext::Support::Partial { offer: false, .. }))).collect();
     ui.horizontal_wrapped(|ui| {
         if editable && offered.len() > 1 {
             let shown = importer.map_or(name, |i| i.label.as_str());
             let mut chosen = None;
             egui::ComboBox::from_id_salt(("importer", &asset.path)).selected_text(shown).show_ui(ui, |ui| {
-                for (fit, label, _) in &offered {
+                for (fit, label) in offered {
                     if ui.selectable_label(fit == name, label).clicked() && fit != name {
                         chosen = Some(fit.clone());
                     }
@@ -930,9 +918,6 @@ fn importer_row(
         } else if let Some(importer) = importer {
             ui.label(&importer.label);
             ui.label(RichText::new(name).small().color(theme::weak()));
-            if importer.native {
-                badge(ui, "native");
-            }
         } else {
             let unknown = format!("{name}: no extension provides it");
             ui.label(RichText::new(unknown).color(ui.visuals().error_fg_color));

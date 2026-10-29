@@ -20,10 +20,10 @@
 
 use codecs::ora::{self, Document, Group, Layer, Node, Pixels};
 use codecs::texture::{color, entries, gray_ramp, rgba};
-use pe2_ext::{Asset, Picture, Result, Table, Value, anyhow};
+use pe2_ext::{Asset, Result, Table, Typed, Value, anyhow};
 use std::collections::HashMap;
 
-use crate::{Pictures, TEXELS, bpp, cells, colors_file, halfwords, pair, palette_names, texels_per_halfword};
+use crate::{TEXELS, bpp, cells, colors_file, halfwords, pair, palette_names, texels_per_halfword};
 
 /// Where a source is when the declaration does not say.
 pub const SOURCE: &str = "source.ora";
@@ -190,7 +190,7 @@ pub fn export(asset: &Asset) -> Result<Vec<u8>> {
     }
     stack.push(layer(TEXELS_LAYER, 0, 0, true, texels_png));
     let document = Document { width: u32::try_from(width)?, height: u32::try_from(height)?, stack };
-    let merged = Pictures.draw(asset, 0)?;
+    let merged = crate::picture(asset, 0)?;
     let thumbnail = merged.thumbnail(THUMBNAIL);
     let merged = codecs::texture::rgba_png(merged.width, merged.height, &merged.rgba).map_err(png_error)?;
     let thumbnail = codecs::texture::rgba_png(thumbnail.width, thumbnail.height, &thumbnail.rgba).map_err(png_error)?;
@@ -315,9 +315,8 @@ impl Matcher {
 ///
 /// # Errors
 /// The source cannot be read, lacks its texels, or a layer holds what its depth cannot.
-pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
-    let source = asset.source_file().unwrap_or(SOURCE);
-    let document = ora::read(&asset.read(source)?).map_err(|e| anyhow!("{source}: {e}"))?;
+pub fn import(asset: &Asset, source: &[u8]) -> Result<Typed> {
+    let document = ora::read(source).map_err(|e| anyhow!("{SOURCE}: {e}"))?;
     let (width, height) = (document.width as usize, document.height as usize);
     let bpp = bpp(asset);
     let names = palette_names(asset);
@@ -341,7 +340,7 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
     let palette = |i: Option<usize>, bpp: u8| padded(i.and_then(|i| colors.get(i)?.as_deref()), bpp);
 
     // Each texel layer, bottom first: the texels, then the cells as the stack shows them.
-    let base = document.layer(TEXELS_LAYER).ok_or_else(|| anyhow!("{source}: no layer {TEXELS_LAYER}"))?;
+    let base = document.layer(TEXELS_LAYER).ok_or_else(|| anyhow!("{SOURCE}: no layer {TEXELS_LAYER}"))?;
     let indices = document.group(INDICES);
     let known = indices.and_then(|g| g.layers().find(|l| l.name == TEXELS_LAYER)).map(|l| Known::read(l, bpp)).transpose()?;
     let mut painted = vec![painting(base, bpp, 0, &palette(Some(0), bpp), known.as_ref(), &mut notes)?];
@@ -390,7 +389,7 @@ pub fn import(asset: &Asset) -> Result<pe2_ext::Imported> {
         }
     }
     files.push((TEXELS.to_string(), texels.stored()));
-    Ok(pe2_ext::Imported { files, settings, notes })
+    Ok(crate::native(files, settings, notes))
 }
 
 /// A texel layer's values at their places: where its texels start (at its own depth), and which it repainted - those
@@ -459,6 +458,13 @@ mod tests {
     use pe2_ext::{Asset, Result, Source, Table, anyhow};
     use std::collections::{BTreeMap, HashMap};
 
+    /// What an import made, as the tests compare it.
+    struct Made {
+        files: Vec<(String, Vec<u8>)>,
+        settings: Table,
+        notes: Vec<String>,
+    }
+
     struct Lent {
         fields: Table,
         files: HashMap<String, Vec<u8>>,
@@ -521,13 +527,22 @@ mod tests {
     }
 
     /// The atlas made from a source instead of its stored files.
-    fn imported(source: Vec<u8>) -> BTreeMap<String, Vec<u8>> {
+    fn imported(source: &[u8]) -> BTreeMap<String, Vec<u8>> {
         imported_with(source, atlas().fields).files.into_iter().collect()
     }
 
-    fn imported_with(source: Vec<u8>, fields: Table) -> pe2_ext::Imported {
-        let lent = Lent { fields, files: HashMap::from([("source.ora".to_string(), source)]) };
-        import(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas"))).unwrap()
+    fn imported_with(source: &[u8], fields: Table) -> Made {
+        let lent = Lent { fields, files: HashMap::new() };
+        let typed = import(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas")), source).unwrap();
+        let files = typed
+            .files
+            .into_iter()
+            .map(|f| match f.content {
+                pe2_ext::Content::Inline(bytes) => (f.name, bytes),
+                pe2_ext::Content::Stored { .. } => panic!("made stored"),
+            })
+            .collect();
+        Made { files, settings: typed.settings, notes: typed.notes }
     }
 
     /// Every layer of a source as a painting program saves it, in color; `paint` changes one.
@@ -567,9 +582,9 @@ mod tests {
 
     #[test]
     fn a_source_makes_the_stored_files_again() {
-        assert_eq!(imported(source()), native());
+        assert_eq!(imported(&source()), native());
         // Saved in color by a painting program: the repeated reds keep their indices.
-        assert_eq!(imported(resaved(&source(), &|_, _, _| {})), native());
+        assert_eq!(imported(&resaved(&source(), &|_, _, _| {})), native());
     }
 
     #[test]
@@ -585,7 +600,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let made = imported_with(source(), fields);
+        let made = imported_with(&source(), fields);
         assert_eq!(made.files.into_iter().collect::<BTreeMap<_, _>>(), native());
         let expected: Table = toml::from_str(
             "size = [8, 2]\ncells.wide = { rect = [4, 0, 4, 2] }\ncells.small = { rect = [0, 1, 4, 1] }",
@@ -605,7 +620,7 @@ mod tests {
         let mut expected = native();
         // Blue is the warm palette's fourth color; the second red (index 2) beside it stays.
         expected.get_mut("native.texels").unwrap()[1] = 3;
-        assert_eq!(imported(painted), expected);
+        assert_eq!(imported(&painted), expected);
     }
 
     #[test]
@@ -619,12 +634,12 @@ mod tests {
                 pixels[2] = off;
             }
         });
-        let made = imported_with(painted, atlas().fields.clone());
+        let made = imported_with(&painted, atlas().fields.clone());
         let texels = &made.files.iter().find(|(n, _)| n == "native.texels").unwrap().1;
         assert_eq!(texels[1..3], [3, 3]);
         assert_eq!(made.notes, ["layer texels: 2 texels of 1 color its palette lacks, taken as the nearest it has"]);
         // The source as exported: nothing said.
-        assert_eq!(imported_with(source(), atlas().fields.clone()).notes, Vec::<String>::new());
+        assert_eq!(imported_with(&source(), atlas().fields.clone()).notes, Vec::<String>::new());
     }
 
     #[test]
@@ -638,7 +653,7 @@ mod tests {
         });
         let mut expected = native();
         expected.get_mut("native.texels").unwrap()[4] = 3;
-        assert_eq!(imported(painted), expected);
+        assert_eq!(imported(&painted), expected);
     }
 
     #[test]
@@ -658,6 +673,6 @@ mod tests {
         // The wide cell's row 1, column 0 is texel 12: red is the cold palette's fourth color.
         texels[12] = 3;
         texels[8] = 0x23;
-        assert_eq!(imported(painted), expected);
+        assert_eq!(imported(&painted), expected);
     }
 }
