@@ -1500,6 +1500,7 @@ dependencies = [
  "pe2-game",
  "pe2-images",
  "project",
+ "toml",
 ]
 
 [[package]]

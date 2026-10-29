@@ -57,6 +57,8 @@ pub struct Loadable {
     component: Option<Arc<std::sync::OnceLock<Arc<component::Shared>>>>,
     /// Its component's size in bytes, where it is one.
     pub size: Option<usize>,
+    /// The settings kept for it, by scope (`{ project = { ... }, user = { ... } }`), which it reads as it registers.
+    pub settings: toml::Table,
 }
 
 impl From<Extension> for Loadable {
@@ -69,6 +71,7 @@ impl From<Extension> for Loadable {
             register: Some(Box::new(move |registry| (extension.register)(registry))),
             component: None,
             size: None,
+            settings: toml::Table::new(),
         }
     }
 }
@@ -171,6 +174,8 @@ pub struct Extensions {
     pub present: Vec<Present>,
     /// What was refused or disabled, and why.
     pub problems: Vec<String>,
+    /// Each loaded extension's settings, by its id: as declared, with the values they took.
+    pub settings: HashMap<String, Vec<(pe2_ext::Setting, toml::Value)>>,
     kinds: HashMap<String, (KindDef, usize)>,
     roles: HashMap<String, RoleDef>,
     panels: Vec<PanelDef>,
@@ -325,10 +330,11 @@ impl Extensions {
 
     /// Call an extension's entry point and take what it registered, checked: what it registered, by what it is.
     fn register(&mut self, extension: &mut Loadable, builtin: bool) -> Result<Registers> {
-        let mut registry = Registry::new(&extension.id);
+        let mut registry = Registry::with_settings(&extension.id, extension.settings.clone());
         let register = extension.register.take().context("it was registered already")?;
         register(&mut registry).context("its registration failed")?;
         let parts = registry.into_parts();
+        self.take_settings(extension, &parts.settings);
         let listed = |names: Vec<&pe2_ext::Name>| names.into_iter().map(ToString::to_string).collect::<Vec<_>>();
         let registers = vec![
             ("kinds", listed(parts.kinds.iter().map(|k| &k.name).collect())),
@@ -421,6 +427,40 @@ impl Extensions {
         Ok(registers)
     }
 
+    /// An extension's settings as it declared them, with the values they took; what is kept for it that it could not
+    /// take is a problem.
+    fn take_settings(&mut self, extension: &Loadable, declared: &[(pe2_ext::Setting, toml::Value)]) {
+        for (scope, kept) in extension.settings.iter().filter_map(|(scope, t)| Some((scope, t.as_table()?))) {
+            for (key, value) in kept {
+                let id = &extension.id;
+                match declared.iter().find(|(s, _)| s.key == *key && s.scope.name() == scope) {
+                    None => self.problems.push(format!("{id}: the {scope} setting {key} is none it has")),
+                    Some((s, _)) if !s.accepts(value) => {
+                        self.problems.push(format!("{id}: the {scope} setting {key} cannot be {value}; it is {}", s.default));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        self.settings.insert(extension.id.clone(), declared.to_vec());
+    }
+
+    /// An extension's version as what it makes is kept by: its version, and the project's settings it took where any
+    /// is not its default - another value of one makes other assets, so other keys.
+    #[must_use]
+    pub fn version_of(&self, id: &str) -> String {
+        let Some(loaded) = self.loaded.iter().find(|l| l.id == id) else { return String::new() };
+        let changed: Vec<String> = self
+            .settings
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(s, value)| s.scope == pe2_ext::Scope::Project && *value != s.default)
+            .map(|(s, value)| format!("{}={value}", s.key))
+            .collect();
+        if changed.is_empty() { loaded.version.clone() } else { format!("{} {}", loaded.version, changed.join(" ")) }
+    }
+
     /// The kind a declaration names, qualified or by a built-in's bare alias.
     fn kind_named(&self, declared: &str) -> Option<&(KindDef, usize)> {
         self.kinds.get(self.kind_aliases.get(declared).map_or(declared, String::as_str))
@@ -504,7 +544,7 @@ impl Extensions {
     /// An artifact's generator: its extension's id and version, and its name.
     fn generator(&self, index: usize, name: &str) -> String {
         let loaded = &self.loaded[index];
-        format!("{}@{name} {}", loaded.id, loaded.version)
+        format!("{}@{name} {}", loaded.id, self.version_of(&loaded.id))
     }
 
     /// The artifact name an asset's thumbnail is kept under, before it is made: its extension's.
@@ -874,7 +914,7 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
     use super::{Extensions, Loadable, Origin, Status, satisfies};
-    use pe2_ext::{Extension, Name, Registry, Result};
+    use pe2_ext::{Extension, Name, Registry, Result, Setting};
 
     fn images(r: &mut Registry) -> Result<()> {
         let image = r.kind("image").alias("image").register();
@@ -972,6 +1012,45 @@ mod tests {
         assert!(loaded.problems.iter().any(|p| p.contains("another of its id from the same place")), "{:?}", loaded.problems);
         // Taking no built-in's place, it may not name kinds bare.
         assert!(loaded.problems.iter().any(|p| p.contains("only a built-in extension names a kind or role bare")));
+    }
+
+    #[test]
+    fn settings_are_read_as_kept_and_what_is_not_taken_is_said() {
+        fn tuned(r: &mut Registry) -> Result<()> {
+            let _ = r.setting(Setting::new("depth", 4).choices([(4, "4-bit"), (8, "8-bit")]));
+            let _ = r.setting(Setting::new("scale", 1.0));
+            let _ = r.setting(Setting::new("note", "").label("A note"));
+            let _ = r.setting(Setting::new("grid", true).user());
+            Ok(())
+        }
+        let mut tuned_ext = extension("test.tuned", "0.1.0", &[], tuned);
+        tuned_ext.settings = toml::from_str(
+            r#"
+            project = { depth = 8, scale = 2, note = 3, bogus = 1 }
+            user = { grid = "no" }
+            "#,
+        )
+        .unwrap();
+        let loaded = Extensions::load(vec![tuned_ext], false);
+        let value = |key: &str| loaded.settings["test.tuned"].iter().find(|(s, _)| s.key == key).map(|(_, v)| v.clone());
+        assert_eq!(value("depth"), Some(toml::Value::Integer(8)));
+        // An integer where a float is wanted reads as one.
+        assert_eq!(value("scale"), Some(toml::Value::Float(2.0)));
+        // A value of another type is not taken: the default stands, and it is said.
+        assert_eq!(value("note"), Some(toml::Value::String(String::new())));
+        assert_eq!(value("grid"), Some(toml::Value::Boolean(true)));
+        let problems = loaded.problems.join("\n");
+        for expected in [
+            "test.tuned: the project setting bogus is none it has",
+            "test.tuned: the project setting note cannot be 3",
+            "test.tuned: the user setting grid cannot be \"no\"",
+        ] {
+            assert!(problems.contains(expected), "{expected}\n---\n{problems}");
+        }
+        // What it makes is kept by its project settings too, the user's never.
+        assert_eq!(loaded.version_of("test.tuned"), "0.1.0 depth=8 scale=2.0");
+        let plain = Extensions::load(vec![extension("test.tuned", "0.1.0", &[], tuned)], false);
+        assert_eq!(plain.version_of("test.tuned"), "0.1.0");
     }
 
     #[test]

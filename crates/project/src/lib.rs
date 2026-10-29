@@ -42,6 +42,9 @@ struct ProjectFile {
 struct ExtensionsFile {
     #[serde(default)]
     disabled: Vec<String>,
+    /// `[extensions."<id>"]`: an extension's project settings (what is not a table is no extension's).
+    #[serde(flatten)]
+    settings: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -154,6 +157,8 @@ pub struct Project {
     pub mounts: Vec<Mount>,
     /// The extensions it leaves off, by id (`[extensions] disabled`): everyone on it reads its assets the same way.
     pub disabled_extensions: Vec<String>,
+    /// Its extensions' settings, by id (`[extensions."<id>"]`): the same for everyone on it.
+    pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
 }
 
 fn resolve_path(directory: &Path, value: &str) -> PathBuf {
@@ -227,7 +232,17 @@ impl Project {
                 mounted: false,
             });
         }
-        Ok(Project { root, game, layers, mounts, disabled_extensions: file.extensions.disabled })
+        let disabled_extensions = file.extensions.disabled;
+        let extension_settings = file
+            .extensions
+            .settings
+            .into_iter()
+            .filter_map(|(id, value)| match value {
+                toml::Value::Table(table) => Some((id, table)),
+                _ => None,
+            })
+            .collect();
+        Ok(Project { root, game, layers, mounts, disabled_extensions, extension_settings })
     }
 
     /// A `res://` path's place on disk, through the mounts (the longest mount point first).

@@ -13,8 +13,9 @@
 //! with it. The editor then opens the project again with its extensions as they now are.
 
 use eframe::egui::{self, Color32, RichText};
+use pe2_ext::{Scope, Setting};
 use project::ext::{Origin, Present, Status};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::workspace::Workspace;
 use crate::{icons, theme};
@@ -32,7 +33,7 @@ const NODE: egui::Vec2 = egui::vec2(170.0, 46.0);
 const GAP: egui::Vec2 = egui::vec2(28.0, 54.0);
 
 /// The pane.
-pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, message: &mut Option<String>) {
+pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, user: &mut UserSettings, message: &mut Option<String>) {
     let id = egui::Id::unique("extensions pane");
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     // One of an id in effect; those whose place it takes are listed, and named in its details.
@@ -46,7 +47,7 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, message: &mut Option
     egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(260.0..=widest).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(selected) = state.selected.clone() {
-                details_ui(ui, ws, &all, &present, &selected, &mut state, message);
+                details_ui(ui, ws, &all, &selected, &mut state, user, message);
             }
         });
     });
@@ -285,11 +286,14 @@ fn details_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     all: &[Present],
-    present: &[Present],
     selected: &str,
     state: &mut State,
+    user: &mut UserSettings,
     message: &mut Option<String>,
 ) {
+    // Those in effect: one of each id.
+    let present: Vec<Present> = all.iter().filter(|p| !matches!(p.status, Status::Replaced(_))).cloned().collect();
+    let present = present.as_slice();
     let Some(p) = present.iter().find(|p| p.id == selected) else { return };
     ui.label(RichText::new(&p.id).heading());
     ui.label(RichText::new(status_text(&p.status)).color(status_color(ui, Some(&p.status))));
@@ -343,6 +347,7 @@ fn details_ui(
             }
         });
     });
+    settings_ui(ui, ws, p, user, message);
     theme::section(ui, "Requires", |ui| {
         if p.requires.is_empty() {
             ui.label(RichText::new("Nothing").color(theme::weak()));
@@ -383,6 +388,127 @@ fn details_ui(
             });
         }
     });
+}
+
+/// Extensions' user settings, by id: the editor's own settings keep them.
+pub type UserSettings = BTreeMap<String, toml::Table>;
+
+/// Its settings, each edited the way its default's type is, where it is kept said: the project's written to
+/// `project.toml` as a step of the history, the user's to the editor's settings. Either way it is loaded again.
+fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut UserSettings, message: &mut Option<String>) {
+    let declared = ws.extensions.settings.get(&p.id).cloned().unwrap_or_default();
+    if declared.is_empty() {
+        return;
+    }
+    theme::section(ui, "Settings", |ui| {
+        egui::Grid::new(("extension settings", &p.id)).num_columns(3).min_col_width(0.0).spacing([12.0, 6.0]).show(ui, |ui| {
+            for (setting, value) in &declared {
+                let label = setting.label.clone().unwrap_or_else(|| setting.key.clone());
+                let response = ui.label(&label);
+                if let Some(help) = &setting.help {
+                    response.on_hover_text(help);
+                }
+                let mut chosen = value.clone();
+                setting_input(ui, (&p.id, &setting.key), &label, setting, &mut chosen);
+                let kept = match setting.scope {
+                    Scope::Project => ws.project.extension_settings.get(&p.id).and_then(|t| t.get(&setting.key)).cloned(),
+                    Scope::User => user.get(&p.id).and_then(|t| t.get(&setting.key)).cloned(),
+                };
+                let mut next = (chosen != *value).then_some(Some(chosen));
+                ui.horizontal(|ui| {
+                    let (scope, says) = match setting.scope {
+                        Scope::Project => ("project", "Kept in project.toml: the same for everyone on the project"),
+                        Scope::User => ("yours", "Kept in your editor settings: the same in every project"),
+                    };
+                    ui.label(RichText::new(scope).small().color(theme::weak())).on_hover_text(says);
+                    if kept.is_some() {
+                        let back = format!("Back to {}", setting.default);
+                        let response = ui.small_button(icons::ARROW_COUNTER_CLOCKWISE);
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &back));
+                        if response.on_hover_text(&back).clicked() {
+                            next = Some(None);
+                        }
+                    }
+                });
+                ui.end_row();
+                // A value its default's is not kept: going back to it removes the setting.
+                let Some(next) = next.map(|n| n.filter(|v| *v != setting.default)) else { continue };
+                let said = next.as_ref().map_or_else(|| "its default".to_string(), ToString::to_string);
+                match setting.scope {
+                    Scope::Project => {
+                        let written = project::switches::set_setting(
+                            &ws.project,
+                            &p.id,
+                            &setting.key,
+                            next.as_ref(),
+                            &mut ws.history,
+                            format!("Set {label} to {said}"),
+                        );
+                        if let Err(e) = written {
+                            *message = Some(format!("project.toml: {e:#}"));
+                        }
+                    }
+                    Scope::User => {
+                        let table = user.entry(p.id.clone()).or_default();
+                        match next {
+                            Some(v) => {
+                                table.insert(setting.key.clone(), v);
+                            }
+                            None => {
+                                table.remove(&setting.key);
+                            }
+                        }
+                        if table.is_empty() {
+                            user.remove(&p.id);
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// A setting's input, by its default's type: a checkbox, a number, a text, or a list of its choices.
+fn setting_input(ui: &mut egui::Ui, id: (&str, &str), label: &str, setting: &Setting, value: &mut toml::Value) {
+    use toml::Value;
+    if !setting.choices.is_empty() {
+        let shown = setting.choices.iter().find(|(v, _)| v == value).map_or_else(|| value.to_string(), |(_, l)| l.clone());
+        egui::ComboBox::from_id_salt(("setting", id)).selected_text(shown).show_ui(ui, |ui| {
+            for (v, l) in &setting.choices {
+                ui.selectable_value(value, v.clone(), l);
+            }
+        });
+        return;
+    }
+    match value {
+        Value::Boolean(b) => {
+            // Its label is the row's: the checkbox is named by it for the window tools.
+            let response = ui.checkbox(b, "");
+            let on = *b;
+            response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, label));
+        }
+        Value::Integer(i) => {
+            ui.add(egui::DragValue::new(i));
+        }
+        Value::Float(f) => {
+            ui.add(egui::DragValue::new(f).speed(0.1));
+        }
+        Value::String(text) => {
+            // Taken when the edit is done, not at each key.
+            let key = ui.scope_id().with(("setting text", id));
+            let mut draft = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| text.clone());
+            let response = ui.add(egui::TextEdit::singleline(&mut draft).desired_width(160.0));
+            if response.lost_focus() {
+                *text = draft;
+                ui.data_mut(|d| d.remove::<String>(key));
+            } else if response.has_focus() {
+                ui.data_mut(|d| d.insert_temp(key, draft));
+            }
+        }
+        other => {
+            ui.label(RichText::new(other.to_string()).monospace().color(theme::weak()));
+        }
+    }
 }
 
 /// The switch: on or off for the project, saying first what goes with it.

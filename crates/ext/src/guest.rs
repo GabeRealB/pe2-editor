@@ -435,6 +435,21 @@ fn field(f: &Field, numbered: &mut Registered) -> g::Field {
     }
 }
 
+/// A setting as the host is told of it.
+fn setting(s: &crate::Setting) -> g::Setting {
+    g::Setting {
+        key: s.key.clone(),
+        label: s.label.clone(),
+        help: s.help.clone(),
+        default: value_text(&s.default),
+        scope: match s.scope {
+            crate::Scope::Project => g::Scope::Project,
+            crate::Scope::User => g::Scope::User,
+        },
+        choices: s.choices.iter().map(|(v, label)| (value_text(v), label.clone())).collect(),
+    }
+}
+
 /// Views as the host is told of them, numbered.
 fn views(list: &[ViewDef], numbered: &mut Registered) -> Vec<g::View> {
     list.iter()
@@ -584,7 +599,8 @@ fn registration() -> Result<(Registered, g::Registration), String> {
 /// job numbers alone.
 fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), String> {
     let extension = __pe2_extension();
-    let mut registry = Registry::new(extension.id);
+    let stored = parse_value(&host::settings()).and_then(|v| v.as_table().cloned()).unwrap_or_default();
+    let mut registry = Registry::with_settings(extension.id, stored);
     (extension.register)(&mut registry).map_err(|e| format!("{e:#}"))?;
     let parts = registry.into_parts();
     let mut numbered = Registered {
@@ -611,6 +627,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         importers: vec![],
         extractors: vec![],
         memory: parts.memory.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect(),
+        settings: parts.settings.iter().map(|(s, _)| setting(s)).collect(),
     };
     for kind in &parts.kinds {
         out.kinds.push(g::Kind {

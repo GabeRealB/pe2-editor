@@ -325,7 +325,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
-                    PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, message),
+                    PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
                     PaneKind::Settings => {}
                 }
             });

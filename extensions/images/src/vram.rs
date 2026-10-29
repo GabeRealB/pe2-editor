@@ -100,8 +100,17 @@ impl Uploads {
 /// The panel, keeping the pictures and swatches it uploaded.
 #[derive(Default)]
 pub(crate) struct Vram {
+    /// Whether the pages' grid is drawn: the user's setting.
+    pub(crate) grid: bool,
     pictures: HashMap<(String, usize), Option<Texture>>,
     strips: HashMap<(String, String), Option<Texture>>,
+}
+
+impl Vram {
+    /// The panel, its pages' grid drawn or not.
+    pub(crate) fn new(grid: bool) -> Vram {
+        Vram { grid, ..Vram::default() }
+    }
 }
 
 impl View for Vram {
@@ -161,7 +170,7 @@ impl View for Vram {
                 pictures,
                 boxes,
                 legend: false,
-                grid: Some(PAGE),
+                grid: self.grid.then_some(PAGE),
                 ..Canvas::default()
             };
             (summary, canvas)

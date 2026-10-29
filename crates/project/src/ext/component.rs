@@ -308,6 +308,8 @@ struct State {
     frames: Vec<u32>,
     /// The assets the project's queries lent during the call, taken back when it returns.
     found: Vec<u32>,
+    /// The settings kept for its extension, by scope (TOML), as `settings` gives them.
+    settings: Arc<str>,
 }
 
 impl WasiView for State {
@@ -364,6 +366,10 @@ impl host::Host for State {
     fn log(&mut self, message: String) -> wasmtime::Result<()> {
         eprintln!("{}: {message}", self.id);
         Ok(())
+    }
+
+    fn settings(&mut self) -> wasmtime::Result<String> {
+        Ok(self.settings.to_string())
     }
 }
 
@@ -886,6 +892,8 @@ pub struct Shared {
     /// Every instance's meter, while it lives.
     meters: Mutex<Vec<Weak<Meter>>>,
     peak: AtomicUsize,
+    /// The settings kept for its extension, by scope (TOML): every instance's, read as it registers.
+    settings: Arc<str>,
 }
 
 impl Shared {
@@ -936,7 +944,15 @@ impl Shared {
             meters.push(Arc::downgrade(&meter));
         }
         let limits = Limits { meter: meter.clone(), cap: cap.min(MOST_MEMORY) };
-        let state = State { id: self.id.clone(), wasi, table: ResourceTable::new(), limits, frames: vec![], found: vec![] };
+        let state = State {
+            id: self.id.clone(),
+            wasi,
+            table: ResourceTable::new(),
+            limits,
+            frames: vec![],
+            found: vec![],
+            settings: self.settings.clone(),
+        };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(LONG);
@@ -1368,7 +1384,26 @@ fn view(shared: &Arc<Shared>, handle: u32) -> impl Fn(&Asset) -> Box<dyn View> +
     move |asset: &Asset| -> Box<dyn View> { Box::new(ComponentView::new(shared.clone(), handle, Some(asset))) }
 }
 
+/// A setting as the guest described it.
+fn setting(s: g::Setting) -> Result<pe2_ext::Setting> {
+    let parse = |text: &str| parse_value(text).with_context(|| format!("setting {}: not a TOML value: {text}", s.key));
+    let mut setting = pe2_ext::Setting::new(&s.key, parse(&s.default)?);
+    setting.label = s.label;
+    setting.help = s.help;
+    if matches!(s.scope, g::Scope::User) {
+        setting = setting.user();
+    }
+    for (value, label) in s.choices {
+        setting.choices.push((parse(&value)?, label));
+    }
+    Ok(setting)
+}
+
 fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Shared>) -> Result<()> {
+    // Its settings, taken by the host as the guest took them: from the same values kept.
+    for s in registration.settings {
+        let _ = registry.setting(setting(s)?);
+    }
     for (index, kind) in registration.kinds.into_iter().enumerate() {
         let index = u32::try_from(index)?;
         let mut builder = registry.kind(&kind.name).label(&kind.label);
@@ -1661,16 +1696,19 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
             requires: about.requires,
             origin,
             register: Some(Box::new(move |registry| {
-                let (shared, told, registration) = start(&name, &bytes)?;
+                let settings = Value::Table(registry.stored().clone()).to_string();
+                let (shared, told, registration) = start(&name, &bytes, &settings)?;
                 anyhow::ensure!(told == said, "{name}: it says it is {told:?}, its section {said:?}");
                 let shared = kept.get_or_init(|| shared).clone();
                 apply(registry, registration, &shared)
             })),
             component: Some(cell),
             size: Some(size),
+            settings: toml::Table::new(),
         });
     }
-    let (shared, about, registration) = start(name, bytes)?;
+    // Without its section it is asked who it is now, before the host knows its settings: it registers with none kept.
+    let (shared, about, registration) = start(name, bytes, "{}")?;
     let shared = cell.get_or_init(|| shared).clone();
     Ok(Loadable {
         id: about.id,
@@ -1680,12 +1718,13 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
         register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
         component: Some(cell),
         size: Some(size),
+        settings: toml::Table::new(),
     })
 }
 
 /// A component compiled in an engine of its own, its first instance asked who it is and what it registers - which
 /// then answers the first readings.
-fn start(name: &str, bytes: &[u8]) -> Result<(Arc<Shared>, About, g::Registration)> {
+fn start(name: &str, bytes: &[u8], settings: &str) -> Result<(Arc<Shared>, About, g::Registration)> {
     let engine = new_engine()?;
     let component = compile(&engine, bytes).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
@@ -1703,6 +1742,7 @@ fn start(name: &str, bytes: &[u8]) -> Result<(Arc<Shared>, About, g::Registratio
         views_cap: MEMORY,
         meters: Mutex::new(vec![]),
         peak: AtomicUsize::new(0),
+        settings: settings.into(),
     };
     let mut runner = shared.instantiate(MEMORY)?;
     let told = runner.call(LONG, async |accessor, guest| guest.call_describe(accessor).await)?;

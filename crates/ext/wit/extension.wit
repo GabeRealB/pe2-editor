@@ -145,6 +145,9 @@ interface host {
     }
 
     log: func(message: string);
+    /// The settings kept for this extension, by scope, as TOML: `{ project = { ... }, user = { ... } }`. Read as it
+    /// registers; a change loads it again.
+    settings: func() -> string;
 }
 
 interface guest {
@@ -271,6 +274,19 @@ interface guest {
         roles: list<string>,
     }
 
+    /// Where a setting is kept: the project's (the same for everyone on it) or the user's (a preference).
+    enum scope { project, user }
+
+    /// A setting, as declared, and the value it took (TOML).
+    record setting {
+        key: string,
+        label: option<string>,
+        help: option<string>,
+        default: string,
+        scope: scope,
+        choices: list<tuple<string, string>>,
+    }
+
     record registration {
         kinds: list<kind>,
         roles: list<role>,
@@ -284,6 +300,7 @@ interface guest {
         /// The memory a job of something it registered may take, where more than the host's default: by its name
         /// (qualified), in bytes.
         memory: list<tuple<string, u64>>,
+        settings: list<setting>,
     }
 
     describe: func() -> about;

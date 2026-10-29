@@ -116,6 +116,9 @@ pub struct EditorSettings {
     pub tools: Tools,
     pub startup: Startup,
     pub agents: Agents,
+    /// Extensions' user settings, by id (`[extensions."<id>"]`): the extensions read them from this file too.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extensions: std::collections::BTreeMap<String, toml::Table>,
     /// The project opened last (state, not a preference).
     pub last_project: Option<PathBuf>,
 }

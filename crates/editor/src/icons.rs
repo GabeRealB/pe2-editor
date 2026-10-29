@@ -16,6 +16,7 @@ macro_rules! icons {
 
 icons! {
     FOLDER = "\u{E24A}",
+    ARROW_COUNTER_CLOCKWISE = "\u{E014}",
     FOLDER_OPEN = "\u{E256}",
     FOLDERS = "\u{E260}",
     SQUARES_FOUR = "\u{E464}",

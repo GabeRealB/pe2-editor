@@ -30,7 +30,7 @@ pub use import::{Check, Export, FormatDef, Import, Imported, ImporterDef, Made, 
 pub use project::Project;
 pub use registry::{
     Extension, Facts, Field, Format, FormatBuilder, Icon, ImporterBuilder, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, PanelDef, Part, Parts, Picture,
-    Registry, RoleBuilder, RoleDef, Run, Thumbnail, Tint, ToolDef, ViewDef, section,
+    Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Thumbnail, Tint, ToolDef, ViewDef, section,
 };
 pub use toml::{Table, Value};
 pub use ui::{Canvas, Marked, Placed, Style, Ui, UiHost, View};

@@ -79,7 +79,7 @@ struct Manifest {
 #[must_use]
 pub fn key(extensions: &Extensions, importer: &str, source_sha1: &str, declaration: &str) -> String {
     let id = importer.split_once('@').map_or(importer, |(id, _)| id);
-    let version = extensions.loaded.iter().find(|l| l.id == id).map_or("", |l| l.version.as_str());
+    let version = extensions.version_of(id);
     sha1_hex(format!("{importer}\n{version}\n{source_sha1}\n{declaration}").as_bytes())
 }
 

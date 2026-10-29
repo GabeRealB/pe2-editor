@@ -13,7 +13,7 @@ mod tools;
 mod view;
 mod vram;
 
-use pe2_ext::{Asset, Field, Icon, Image, Part, Picture, Rect, Registry, Result, Tint, Value};
+use pe2_ext::{Asset, Field, Icon, Image, Part, Picture, Rect, Registry, Result, Setting, Tint, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -67,7 +67,14 @@ fn register(r: &mut Registry) -> Result<()> {
         .priority(10)
         .register();
     r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
-    r.panel("vram", "VRAM", Icon::Grid, || Box::<vram::Vram>::default());
+    let grid = r.setting(
+        Setting::new("vram_page_grid", true)
+            .label("VRAM page grid")
+            .help("Draw the texture pages' grid over VRAM, 64 by 256 halfwords a page.")
+            .user(),
+    );
+    let grid = grid.as_bool().unwrap_or(true);
+    r.panel("vram", "VRAM", Icon::Grid, move || Box::new(vram::Vram::new(grid)));
     r.tool("palette", tools::PALETTE, tools::PALETTE_ARGUMENTS, tools::palette);
     Ok(())
 }

@@ -910,7 +910,13 @@ impl eframe::App for Editor {
             if let Err(e) = self.settings.save() {
                 self.error = Some(format!("settings: {e}"));
             }
+            // Extensions read their user settings as they load: they are loaded again with the project.
+            let reload = self.settings.extensions != self.saved.extensions;
             self.saved = self.settings.clone();
+            if reload {
+                self.reopen();
+                self.message = Some("an extension's setting changed: the project was opened again".into());
+            }
         }
     }
 

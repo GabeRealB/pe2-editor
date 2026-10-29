@@ -8,7 +8,9 @@
 use project::Project;
 use project::ext::{EXTENSION_COMPONENT, EXTENSION_KIND, Extensions, Loadable, Origin, Present, Status, component};
 use project::index::Index;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use toml::{Table, Value};
 use std::sync::{Arc, Mutex, OnceLock};
 
 include!(concat!(env!("OUT_DIR"), "/components.rs"));
@@ -28,8 +30,11 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
 #[must_use]
 pub fn load() -> Extensions {
-    load_without(&[], &[])
+    load_without(&[], &[], &Kept::new())
 }
+
+/// The settings kept for extensions, by id: each a table by scope (`{ project = { ... }, user = { ... } }`).
+pub type Kept = BTreeMap<String, Table>;
 
 /// A component found beside the built-ins: in the project (an `extension` asset) or the user's folder.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,9 +48,15 @@ pub struct Found {
 /// Load the components found - the project's first, then the user's: one of an id takes the place of those after it -
 /// and the built-ins, but those a project leaves off (`disabled`, by id) and those requiring them.
 #[must_use]
-pub fn load_without(found: &[Found], disabled: &[String]) -> Extensions {
+pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extensions {
+    let with_settings = |mut loadable: Vec<Loadable>| {
+        for l in &mut loadable {
+            l.settings = kept.get(&l.id).cloned().unwrap_or_default();
+        }
+        loadable
+    };
     if std::env::var_os("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
-        return Extensions::load_without(linked().into_iter().map(Into::into).collect(), true, disabled);
+        return Extensions::load_without(with_settings(linked().into_iter().map(Into::into).collect()), true, disabled);
     }
     let mut loadable: Vec<Loadable> = vec![];
     let mut failed = vec![];
@@ -92,7 +103,7 @@ pub fn load_without(found: &[Found], disabled: &[String]) -> Extensions {
             Err(e) => failed.push(format!("{package}: {e:#}")),
         }
     }
-    let mut extensions = Extensions::load_without(loadable, true, disabled);
+    let mut extensions = Extensions::load_without(with_settings(loadable), true, disabled);
     extensions.problems.extend(failed);
     extensions.present.extend(unloadable);
     extensions
@@ -101,14 +112,45 @@ pub fn load_without(found: &[Found], disabled: &[String]) -> Extensions {
 /// The built-ins, loaded once a process.
 #[must_use]
 pub fn shared() -> Arc<Extensions> {
-    loaded(&[], &[])
+    loaded(&[], &[], &Kept::new())
 }
 
 /// The extensions as a project has them: its own (`extension` assets, where the index is given), the user's, the
 /// built-ins, but those it leaves off - loaded once a process for each such set, so a changed component loads again.
 #[must_use]
 pub fn for_project(project: &Project, index: Option<&Index>) -> Arc<Extensions> {
-    loaded(&found(index), &project.disabled_extensions)
+    loaded(&found(index), &project.disabled_extensions, &kept(project))
+}
+
+/// The settings kept for a project's extensions: its own (`[extensions."<id>"]` in `project.toml`) and the user's (the
+/// same in the editor's `settings.toml`).
+#[must_use]
+pub fn kept(project: &Project) -> Kept {
+    let mut kept = Kept::new();
+    let scopes = [("project", project.extension_settings.clone()), ("user", user_settings())];
+    for (scope, by_id) in scopes {
+        for (id, table) in by_id {
+            let by_scope = kept.entry(id).or_default();
+            by_scope.insert(scope.to_string(), Value::Table(table));
+        }
+    }
+    kept
+}
+
+/// The user's settings of extensions: `[extensions."<id>"]` in the editor's `settings.toml`, beside its other ones.
+#[must_use]
+pub fn user_settings() -> BTreeMap<String, Table> {
+    let Some(file) = data_folder().map(|d| d.join("settings.toml")) else { return BTreeMap::new() };
+    let Ok(text) = std::fs::read_to_string(file) else { return BTreeMap::new() };
+    let Ok(mut settings) = toml::from_str::<Table>(&text) else { return BTreeMap::new() };
+    let Some(Value::Table(extensions)) = settings.remove("extensions") else { return BTreeMap::new() };
+    extensions
+        .into_iter()
+        .filter_map(|(id, value)| match value {
+            Value::Table(table) => Some((id, table)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The components found beside the built-ins: the project's (where the index is given), then the user's. Two
@@ -120,8 +162,8 @@ pub fn found(index: Option<&Index>) -> Vec<Found> {
     found
 }
 
-/// What a set of extensions is loaded for: the components found and the ids left off.
-type Key = (Vec<Found>, Vec<String>);
+/// What a set of extensions is loaded for: the components found, the ids left off and the settings kept (as TOML).
+type Key = (Vec<Found>, Vec<String>, String);
 
 /// The sets loaded, by what for.
 type Sets = Vec<(Key, Arc<Extensions>)>;
@@ -129,17 +171,17 @@ type Sets = Vec<(Key, Arc<Extensions>)>;
 /// The sets loaded lately, newest last: one a component replaces is dropped in time, its engines with it.
 const KEPT: usize = 4;
 
-fn loaded(found: &[Found], disabled: &[String]) -> Arc<Extensions> {
+fn loaded(found: &[Found], disabled: &[String], kept: &Kept) -> Arc<Extensions> {
     static LOADED: OnceLock<Mutex<Sets>> = OnceLock::new();
     let mut disabled = disabled.to_vec();
     disabled.sort_unstable();
     disabled.dedup();
-    let key = (found.to_vec(), disabled);
+    let key = (found.to_vec(), disabled, toml::to_string(kept).unwrap_or_default());
     let loaded = LOADED.get_or_init(Mutex::default);
     let mut loaded = loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let extensions = match loaded.iter().position(|(k, _)| *k == key) {
         Some(at) => loaded.remove(at).1,
-        None => Arc::new(load_without(&key.0, &key.1)),
+        None => Arc::new(load_without(&key.0, &key.1, kept)),
     };
     loaded.push((key, extensions.clone()));
     if loaded.len() > KEPT {
@@ -163,11 +205,17 @@ pub fn project_components(index: &Index) -> Vec<Found> {
         .collect()
 }
 
-/// The user's own extensions folder: `extensions` in the editor's data folder (as eframe places it: the XDG data folder
-/// on Linux, Application Support on macOS, the roaming application data on Windows).
+/// The user's own extensions folder: `extensions` in the editor's data folder.
 #[must_use]
 pub fn user_folder() -> Option<PathBuf> {
-    let data = if cfg!(windows) {
+    Some(data_folder()?.join("extensions"))
+}
+
+/// The editor's data folder, as eframe places it: the XDG data folder on Linux, Application Support on macOS, the
+/// roaming application data on Windows.
+#[must_use]
+pub fn data_folder() -> Option<PathBuf> {
+    if cfg!(windows) {
         std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("pe2-editor").join("data"))
     } else if cfg!(target_os = "macos") {
         std::env::home_dir().map(|p| p.join("Library/Application Support/pe2-editor"))
@@ -177,8 +225,7 @@ pub fn user_folder() -> Option<PathBuf> {
             .filter(|p| p.is_absolute())
             .or_else(|| std::env::home_dir().map(|p| p.join(".local/share")))
             .map(|p| p.join("pe2-editor"))
-    };
-    Some(data?.join("extensions"))
+    }
 }
 
 /// The components in the user's folder (`*.wasm`), in name order.

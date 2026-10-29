@@ -316,6 +316,85 @@ pub struct Parts {
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// The memory a job of something it registered may take, where more than the host's default, by its name.
     pub memory: Vec<(Name, u64)>,
+    /// Its settings, as declared, each with the value it took.
+    pub settings: Vec<(Setting, Value)>,
+}
+
+/// Where a setting is kept, and so whom it is the same for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// In the project (`project.toml`): the same for everyone on it. What changes how assets read or are made.
+    Project,
+    /// The user's (the editor's settings): a preference, the same in every project. Never what assets are made of.
+    User,
+}
+
+impl Scope {
+    /// Its name in the stored settings the host gives (`project`, `user`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Project => "project",
+            Scope::User => "user",
+        }
+    }
+}
+
+/// A setting of an extension: its key, how it reads, its default - whose type its values must have - where it is
+/// kept, and the values it takes where they are few.
+#[derive(Clone, Debug)]
+pub struct Setting {
+    pub key: String,
+    pub label: Option<String>,
+    /// What it does, said where it is edited.
+    pub help: Option<String>,
+    pub default: Value,
+    pub scope: Scope,
+    pub choices: Vec<(Value, String)>,
+}
+
+impl Setting {
+    /// A project's setting, `key`, its default `default`.
+    #[must_use]
+    pub fn new(key: &str, default: impl Into<Value>) -> Setting {
+        let default = default.into();
+        Setting { key: key.to_string(), label: None, help: None, default, scope: Scope::Project, choices: vec![] }
+    }
+
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Setting {
+        self.label = Some(label.to_string());
+        self
+    }
+
+    #[must_use]
+    pub fn help(mut self, help: &str) -> Setting {
+        self.help = Some(help.to_string());
+        self
+    }
+
+    /// The user's, not the project's: a preference.
+    #[must_use]
+    pub fn user(mut self) -> Setting {
+        self.scope = Scope::User;
+        self
+    }
+
+    /// The values it takes, labeled.
+    #[must_use]
+    pub fn choices<V: Into<Value>>(mut self, choices: impl IntoIterator<Item = (V, &'static str)>) -> Setting {
+        self.choices = choices.into_iter().map(|(value, label)| (value.into(), label.to_string())).collect();
+        self
+    }
+
+    /// Whether `value` is one it may take: of its default's type, and among its choices where it has them.
+    #[must_use]
+    pub fn accepts(&self, value: &Value) -> bool {
+        let same = std::mem::discriminant(value) == std::mem::discriminant(&self.default)
+            // An integer where a float is wanted reads as one: `2` for `2.0`.
+            || matches!((value, &self.default), (Value::Integer(_), Value::Float(_)));
+        same && (self.choices.is_empty() || self.choices.iter().any(|(v, _)| v == value))
+    }
 }
 
 #[derive(Clone)]
@@ -362,13 +441,45 @@ pub struct RoleDef {
 pub struct Registry {
     id: String,
     parts: Parts,
+    /// The settings kept for it, by scope (`project`, `user`), as the host gives them.
+    stored: Table,
 }
 
 impl Registry {
     /// A registry for the extension `id`, as the host makes it.
     #[must_use]
     pub fn new(id: &str) -> Registry {
-        Registry { id: id.to_string(), parts: Parts::default() }
+        Registry::with_settings(id, Table::new())
+    }
+
+    /// A registry for the extension `id`, with the settings kept for it: by scope, each a table of values by key
+    /// (`{ project = { ... }, user = { ... } }`).
+    #[must_use]
+    pub fn with_settings(id: &str, stored: Table) -> Registry {
+        Registry { id: id.to_string(), parts: Parts::default(), stored }
+    }
+
+    /// The settings kept for it, by scope, as the host gave them.
+    #[must_use]
+    pub fn stored(&self) -> &Table {
+        &self.stored
+    }
+
+    /// A setting: declared, and its value now - as kept in its scope, else its default (a value of another type, or
+    /// none of its choices, is not taken; the host says so). An extension reads its settings as it registers; a
+    /// change loads it again.
+    pub fn setting(&mut self, setting: Setting) -> Value {
+        let kept = self.stored.get(setting.scope.name()).and_then(Value::as_table).and_then(|t| t.get(&setting.key));
+        let value = match kept {
+            Some(Value::Integer(i)) if matches!(setting.default, Value::Float(_)) && setting.accepts(&Value::Integer(*i)) => {
+                #[expect(clippy::cast_precision_loss, reason = "a setting's number")]
+                Value::Float(*i as f64)
+            }
+            Some(value) if setting.accepts(value) => value.clone(),
+            _ => setting.default.clone(),
+        };
+        self.parts.settings.push((setting, value.clone()));
+        value
     }
 
     /// The registering extension's id.
