@@ -1,0 +1,19 @@
+[package]
+name = "pe2-movies"
+description = "pe2.movies, a built-in extension: the game's movies - STR clips of MDEC video and XA audio - their extraction, facts and preview"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A library linked into the editor, and a component built for wasm32-wasip3.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+codecs.workspace = true
+formats.workspace = true
+pe2-ext.workspace = true
+sha1.workspace = true

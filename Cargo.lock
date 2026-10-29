@@ -1499,6 +1499,7 @@ dependencies = [
  "pe2-formats",
  "pe2-game",
  "pe2-images",
+ "pe2-movies",
  "project",
  "toml",
 ]
@@ -3466,6 +3467,16 @@ dependencies = [
  "serde",
  "sha1",
  "toml",
+]
+
+[[package]]
+name = "pe2-movies"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "formats",
+ "pe2-ext",
+ "sha1",
 ]
 
 [[package]]

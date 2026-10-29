@@ -9,8 +9,9 @@
 /// The contract is versioned by semver, a minor version below 1.0 a line: within a line a version only adds functions to
 /// `host`, so a component runs on a host of its line at least as new as what it was built against; any change to
 /// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`). 0.3.0: an import's
-/// notes (`imported.notes`). 0.3.1: the host's pictures (`ui.picture`).
-package pe2:extension@0.3.1;
+/// notes (`imported.notes`). 0.3.1: the host's pictures (`ui.picture`). 0.3.2: discs read by range (`discs.size`,
+/// `discs.read-range`). 0.3.3: tables (`ui.table`).
+package pe2:extension@0.3.3;
 
 interface types {
     /// Pixels as unmultiplied RGBA, row by row.
@@ -79,6 +80,15 @@ interface host {
         constructor(key: string, image: image);
     }
 
+    /// A table's cell: nothing (keeping its column), text, the host's chip for a reference (TOML), an icon button
+    /// with what it does said on hovering it.
+    variant cell {
+        empty,
+        text(tuple<string, style>),
+        reference(string),
+        button(tuple<icon, string>),
+    }
+
     record placed {
         rect: rect,
         label: option<string>,
@@ -134,6 +144,9 @@ interface host {
         section: func(title: string) -> ui;
         collapsing: func(id: string, title: string, note: string) -> option<ui>;
         canvas: func(canvas: canvas);
+        /// Rows of cells in aligned columns, `id` keeping its widths: the cell of a button clicked this frame (its
+        /// row, its column).
+        table: func(id: string, rows: list<list<cell>>) -> option<tuple<u32, u32>>;
         /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show
         /// it - with its width and height: none while it is being drawn (the view is drawn again when it is).
         picture: func(path: string, look: u32) -> option<result<tuple<texture, u32, u32>, string>>;
@@ -148,8 +161,14 @@ interface host {
 
     /// A release's discs, lent for one asset's extraction.
     resource discs {
-        /// A chunk's payload, by a location as a declaration gives it (TOML: `{ stage, folder, file, slot }`).
+        /// A chunk's payload, by a location as a declaration gives it (TOML: `{ stage, folder, file, slot }`), or a
+        /// disc slot's bytes (`{ disc, slot }`).
         read: func(at: string) -> result<list<u8>, string>;
+        /// The size of what `read` gives at a location, without reading it.
+        size: func(at: string) -> result<u64, string>;
+        /// Up to `len` bytes of what `read` gives at a location, from `offset`, read alone: a disc slot of hundreds of
+        /// megabytes (a movie file) is never read whole.
+        read-range: func(at: string, offset: u64, len: u32) -> result<list<u8>, string>;
     }
 
     log: func(message: string);

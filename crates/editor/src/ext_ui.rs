@@ -225,6 +225,51 @@ impl UiHost for Host<'_> {
         self.last = Some(shown.inner);
     }
 
+    fn table(&mut self, id: &str, rows: &[Vec<pe2_ext::Cell>]) -> Option<(usize, usize)> {
+        use pe2_ext::Cell;
+        let sheet = self.sheet(false);
+        let (editable, nav) = (self.frame.editable, &mut *self.nav);
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut clicked = None;
+        let ui = self.target.ui();
+        egui::Grid::new(("table", id)).num_columns(columns).min_col_width(0.0).spacing([10.0, 4.0]).show(ui, |ui| {
+            for (r, row) in rows.iter().enumerate() {
+                for (c, cell) in row.iter().enumerate() {
+                    match cell {
+                        Cell::Empty => {
+                            ui.label("");
+                        }
+                        Cell::Text(text, style) => {
+                            let text = RichText::new(text);
+                            ui.label(match style {
+                                Style::Normal => text,
+                                Style::Weak => text.color(theme::weak()),
+                                Style::Note => text.small().color(theme::weak()),
+                                Style::Strong => text.strong(),
+                                Style::Error => text.color(ui.visuals().error_fg_color),
+                            });
+                        }
+                        Cell::Reference(value) => {
+                            crate::inspector::reference_chip(ui, &sheet, value, nav);
+                        }
+                        Cell::Button(icon, hint) => {
+                            let button = egui::Button::new(crate::icons::glyph(*icon)).frame(false);
+                            let response = ui.add_enabled(editable, button).on_hover_text(hint);
+                            let enabled = response.enabled();
+                            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, hint));
+                            if response.clicked() {
+                                clicked = Some((r, c));
+                            }
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        self.last = None;
+        clicked
+    }
+
     fn reference(&mut self, reference: &Value) {
         let sheet = self.sheet(false);
         crate::inspector::reference_chip(self.target.ui(), &sheet, reference, self.nav);

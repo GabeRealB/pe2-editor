@@ -542,6 +542,32 @@ impl host::HostDiscs for State {
         Ok(discs.read(&at).map_err(|e| format!("{e:#}")))
     }
 
+    fn size(&mut self, discs: Resource<LentDiscs>, at: String) -> wasmtime::Result<Result<u64, String>> {
+        // SAFETY: as `read`.
+        let discs = unsafe { &mut *self.table.get(&discs)?.discs };
+        let at: Table = match toml::from_str(&at) {
+            Ok(at) => at,
+            Err(e) => return Ok(Err(format!("not a location: {e}"))),
+        };
+        Ok(discs.size(&at).map_err(|e| format!("{e:#}")))
+    }
+
+    fn read_range(
+        &mut self,
+        discs: Resource<LentDiscs>,
+        at: String,
+        offset: u64,
+        len: u32,
+    ) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        // SAFETY: as `read`.
+        let discs = unsafe { &mut *self.table.get(&discs)?.discs };
+        let at: Table = match toml::from_str(&at) {
+            Ok(at) => at,
+            Err(e) => return Ok(Err(format!("not a location: {e}"))),
+        };
+        Ok(discs.read_range(&at, offset, len as usize).map_err(|e| format!("{e:#}")))
+    }
+
     fn drop(&mut self, discs: Resource<LentDiscs>) -> wasmtime::Result<()> {
         let _ = discs;
         Ok(())
@@ -607,17 +633,40 @@ fn rect(r: types::Rect) -> pe2_ext::Rect {
     pe2_ext::Rect { x: r.x, y: r.y, width: r.width, height: r.height }
 }
 
+fn style(style: types::Style) -> pe2_ext::Style {
+    match style {
+        types::Style::Normal => pe2_ext::Style::Normal,
+        types::Style::Weak => pe2_ext::Style::Weak,
+        types::Style::Note => pe2_ext::Style::Note,
+        types::Style::Strong => pe2_ext::Style::Strong,
+        types::Style::Error => pe2_ext::Style::Error,
+    }
+}
+
 impl host::HostUi for State {
     fn label(&mut self, ui: Resource<Frame>, text: String, style: types::Style) -> wasmtime::Result<()> {
-        let style = match style {
-            types::Style::Normal => pe2_ext::Style::Normal,
-            types::Style::Weak => pe2_ext::Style::Weak,
-            types::Style::Note => pe2_ext::Style::Note,
-            types::Style::Strong => pe2_ext::Style::Strong,
-            types::Style::Error => pe2_ext::Style::Error,
-        };
-        self.frame(&ui)?.label(&text, style);
+        self.frame(&ui)?.label(&text, self::style(style));
         Ok(())
+    }
+
+    fn table(&mut self, ui: Resource<Frame>, id: String, rows: Vec<Vec<host::Cell>>) -> wasmtime::Result<Option<(u32, u32)>> {
+        let rows: Vec<Vec<pe2_ext::Cell>> = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| match cell {
+                        host::Cell::Empty => pe2_ext::Cell::Empty,
+                        host::Cell::Text((text, s)) => pe2_ext::Cell::Text(text, style(s)),
+                        host::Cell::Reference(text) => {
+                            pe2_ext::Cell::Reference(parse_value(&text).unwrap_or(Value::String(text)))
+                        }
+                        host::Cell::Button((i, hint)) => pe2_ext::Cell::Button(icon(i), hint),
+                    })
+                    .collect()
+            })
+            .collect();
+        let clicked = self.frame(&ui)?.table(&id, &rows);
+        Ok(clicked.map(|(r, c)| (u32::try_from(r).unwrap_or(u32::MAX), u32::try_from(c).unwrap_or(u32::MAX))))
     }
 
     fn button(&mut self, ui: Resource<Frame>, text: String) -> wasmtime::Result<bool> {
@@ -1698,7 +1747,7 @@ const SECTION: &str = "pe2-extension";
 
 /// The contract this host runs: the version of the WIT package (`pe2:extension@0.2.0`), the line it is of (`0.2`)
 /// running every component built against a version of the line no newer than it.
-pub const CONTRACT: &str = "0.3.1";
+pub const CONTRACT: &str = "0.3.3";
 
 /// What a component's guest interface is exported as, before its version.
 const GUEST: &str = "pe2:extension/guest@";

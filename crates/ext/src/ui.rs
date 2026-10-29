@@ -5,6 +5,18 @@
 
 use crate::{Asset, Icon, Project, Rect, Texture, Value};
 
+/// A table's cell (`Ui::table`).
+#[derive(Clone, Debug)]
+pub enum Cell {
+    /// Nothing, its column kept.
+    Empty,
+    Text(String, Style),
+    /// The host's chip for a reference: its asset's icon and name, opening it on a click.
+    Reference(Value),
+    /// An icon button, what it does said on hovering it.
+    Button(Icon, String),
+}
+
 /// How a label is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
@@ -97,6 +109,8 @@ pub trait UiHost {
     /// A collapsing header, `id` keeping it open or not; its body while open.
     fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>>;
     fn canvas(&mut self, canvas: &Canvas);
+    /// Rows of cells in aligned columns, `id` keeping its widths: the cell of a button clicked this frame (row, column).
+    fn table(&mut self, id: &str, rows: &[Vec<Cell>]) -> Option<(usize, usize)>;
     /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show it:
     /// none while it is being drawn (the view is drawn again when it is), or why it cannot be.
     fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>>;
@@ -222,6 +236,12 @@ impl<'a> Ui<'a> {
 
     pub fn canvas(&mut self, canvas: &Canvas) {
         self.host.canvas(canvas);
+    }
+
+    /// Rows of cells in aligned columns - a list's entries, a table's records - `id` keeping its widths: the cell of a
+    /// button clicked this frame (row, column).
+    pub fn table(&mut self, id: &str, rows: &[Vec<Cell>]) -> Option<(usize, usize)> {
+        self.host.table(id, rows)
     }
 
     /// An asset's picture in a look as the host draws it: none while it is being drawn, or why it cannot be.

@@ -21,6 +21,25 @@ pub trait Discs {
     /// # Errors
     /// No such chunk, or it cannot be read.
     fn read(&mut self, at: &Table) -> Result<Vec<u8>>;
+
+    /// The size of what `read` gives at a location, without reading it (where the discs can; else read).
+    ///
+    /// # Errors
+    /// As `read`.
+    fn size(&mut self, at: &Table) -> Result<u64> {
+        Ok(self.read(at)?.len() as u64)
+    }
+
+    /// Up to `len` bytes of what `read` gives at a location, from `offset`: fewer at its end. A disc slot of hundreds of
+    /// megabytes - a movie file - is read by range, never whole (where the discs can; else read and cut).
+    ///
+    /// # Errors
+    /// As `read`.
+    fn read_range(&mut self, at: &Table, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let all = self.read(at)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(all.len());
+        Ok(all[start..all.len().min(start.saturating_add(len))].to_vec())
+    }
 }
 
 /// An extraction session: the assets of the kind, one after another.

@@ -289,16 +289,19 @@ impl Frame<'_> {
     }
 }
 
+fn style(style: Style) -> types::Style {
+    match style {
+        Style::Normal => types::Style::Normal,
+        Style::Weak => types::Style::Weak,
+        Style::Note => types::Style::Note,
+        Style::Strong => types::Style::Strong,
+        Style::Error => types::Style::Error,
+    }
+}
+
 impl UiHost for Frame<'_> {
     fn label(&mut self, text: &str, style: Style) {
-        let style = match style {
-            Style::Normal => types::Style::Normal,
-            Style::Weak => types::Style::Weak,
-            Style::Note => types::Style::Note,
-            Style::Strong => types::Style::Strong,
-            Style::Error => types::Style::Error,
-        };
-        self.ui().label(text, style);
+        self.ui().label(text, self::style(style));
     }
 
     fn button(&mut self, text: &str) -> bool {
@@ -381,6 +384,24 @@ impl UiHost for Frame<'_> {
     fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>> {
         let body = self.ui().collapsing(id, title, note)?;
         Some(self.child(body))
+    }
+
+    fn table(&mut self, id: &str, rows: &[Vec<crate::Cell>]) -> Option<(usize, usize)> {
+        let rows: Vec<Vec<host::Cell>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| match cell {
+                        crate::Cell::Empty => host::Cell::Empty,
+                        crate::Cell::Text(text, style) => host::Cell::Text((text.clone(), self::style(*style))),
+                        crate::Cell::Reference(value) => host::Cell::Reference(value_text(value)),
+                        crate::Cell::Button(i, hint) => host::Cell::Button((icon(*i), hint.clone())),
+                    })
+                    .collect()
+            })
+            .collect();
+        let (row, column) = self.ui().table(id, &rows)?;
+        Some((row as usize, column as usize))
     }
 
     fn canvas(&mut self, canvas: &Canvas) {
@@ -833,6 +854,17 @@ impl crate::Discs for Discs<'_> {
     fn read(&mut self, at: &Table) -> crate::Result<Vec<u8>> {
         let at = toml::to_string(at)?;
         self.0.read(&at).map_err(|e| crate::anyhow!(e))
+    }
+
+    fn size(&mut self, at: &Table) -> crate::Result<u64> {
+        let at = toml::to_string(at)?;
+        self.0.size(&at).map_err(|e| crate::anyhow!(e))
+    }
+
+    fn read_range(&mut self, at: &Table, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+        let at = toml::to_string(at)?;
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        self.0.read_range(&at, offset, len).map_err(|e| crate::anyhow!(e))
     }
 }
 

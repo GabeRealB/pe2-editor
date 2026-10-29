@@ -153,6 +153,40 @@ impl OpenDisc {
             other => bail!("slot {name}: no reading for type {other}"),
         }
     }
+
+    /// The size of a slot's bytes, as `slot` gives them.
+    fn slot_size(&mut self, name: &str) -> Result<u64> {
+        let slot = self.layout.slots.iter().find(|s| s.name == name).with_context(|| format!("no slot {name}"))?;
+        Ok(match slot.ty.as_str() {
+            "data" => u64::from(self.files[name].size),
+            "mixed" => u64::from(self.files[name].sectors()) * iso::MODE2 as u64,
+            _ => self.slot(name)?.len() as u64,
+        })
+    }
+
+    /// Up to `len` of a slot's bytes from `offset`, as `slot` gives them, reading the sectors they lie in alone.
+    fn slot_range(&mut self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let size = self.slot_size(name)?;
+        let end = size.min(offset.saturating_add(len as u64));
+        if offset >= end {
+            return Ok(vec![]);
+        }
+        let ty = self.layout.slots.iter().find(|s| s.name == name).map_or_default(|s| s.ty.clone());
+        let sector = match ty.as_str() {
+            "data" => cdf::SECTOR,
+            "mixed" => iso::MODE2 as u64,
+            _ => {
+                let all = self.slot(name)?;
+                return Ok(all[usize::try_from(offset)?..usize::try_from(end)?].to_vec());
+            }
+        };
+        let e = &self.files[name];
+        let first = u32::try_from(offset / sector)?;
+        let count = u32::try_from(end.div_ceil(sector))? - first;
+        let bytes = if ty == "data" { self.image.data(e.lba + first, count)? } else { self.image.mode2(e.lba + first, count)? };
+        let skip = usize::try_from(offset % sector)?;
+        Ok(bytes[skip..skip + usize::try_from(end - offset)?].to_vec())
+    }
 }
 
 /// An ISO file of an open disc, read sector by sector.
@@ -380,10 +414,42 @@ struct Reader<'a> {
     release: &'a str,
 }
 
+impl Reader<'_> {
+    /// The disc a location's slot is on, where it names one.
+    fn disc_slot(&mut self, at: &toml::Table) -> pe2_ext::Result<Option<(&mut OpenDisc, String)>> {
+        let at: At = at.clone().try_into().context("not a location")?;
+        let (Some(disc), Some(slot)) = (at.disc, at.slot) else { return Ok(None) };
+        let open = self
+            .discs
+            .get_mut(&(self.release.to_string(), disc.clone()))
+            .with_context(|| format!("{} has no disc {disc}", self.release))?;
+        Ok(Some((open, slot)))
+    }
+}
+
 impl pe2_ext::Discs for Reader<'_> {
     fn read(&mut self, at: &toml::Table) -> pe2_ext::Result<Vec<u8>> {
+        if let Some((disc, slot)) = self.disc_slot(at)? {
+            return disc.slot(&slot);
+        }
         let at: At = at.clone().try_into().context("not a location")?;
         chunk_payload(self.decl, self.discs, self.containers, self.files, self.release, &at)
+    }
+
+    fn size(&mut self, at: &toml::Table) -> pe2_ext::Result<u64> {
+        if let Some((disc, slot)) = self.disc_slot(at)? {
+            return disc.slot_size(&slot);
+        }
+        Ok(self.read(at)?.len() as u64)
+    }
+
+    fn read_range(&mut self, at: &toml::Table, offset: u64, len: usize) -> pe2_ext::Result<Vec<u8>> {
+        if let Some((disc, slot)) = self.disc_slot(at)? {
+            return disc.slot_range(&slot, offset, len);
+        }
+        let all = self.read(at)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(all.len());
+        Ok(all[start..all.len().min(start.saturating_add(len))].to_vec())
     }
 }
 
@@ -539,6 +605,18 @@ fn write_assets(
             written += 1;
             continue;
         }
+        // A container assembled from its movies (a disc's movie file) has no bytes of its own: `check_assembled` holds
+        // its entries' movies, in order, to the disc's.
+        if asset.table.contains_key("entries") && asset.kind == "stream" {
+            let originals: Vec<(String, String)> = releases
+                .iter()
+                .filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?)))
+                .collect();
+            let toml = asset_toml(&asset.body, None, &originals)?;
+            write_bundle(layer, path, &[("asset.toml", toml.as_bytes())])?;
+            written += 1;
+            continue;
+        }
         let mut native: Option<Vec<u8>> = None;
         let mut originals = vec![];
         for release in releases {
@@ -583,6 +661,34 @@ fn write_assets(
         written += 1;
     }
     Ok((written, sourcing.sources))
+}
+
+/// Hold each container assembled from its movies (a disc's movie file: its `entries`, each naming a movie, in order) to
+/// the disc's bytes: its movies' native files, written into the layer, joined in order have the file's sha1.
+fn check_assembled(layer: &Path, decl: &Declarations, releases: &[String]) -> Result<()> {
+    for (path, asset) in &decl.assets {
+        if asset.kind != "stream" {
+            continue;
+        }
+        let Some(entries) = asset.table.get("entries").and_then(toml::Value::as_table) else { continue };
+        let mut hasher = Sha1::new();
+        for (id, entry) in entries {
+            let movie = entry.get("movie").with_context(|| format!("{path}: its entry {id} names no movie"))?;
+            let reference: crate::declarations::Reference =
+                movie.clone().try_into().with_context(|| format!("{path}: its entry {id}'s movie is no reference"))?;
+            let native = layer.join(format!("{}{}", reference.target(), crate::index::BUNDLE_SUFFIX)).join("native.str");
+            let mut file = fs::File::open(&native).with_context(|| format!("{path}: {}", native.display()))?;
+            std::io::copy(&mut file, &mut hasher)?;
+        }
+        let got = hex(&hasher.finalize());
+        for release in releases {
+            let Some(want) = asset.from.get(release).and_then(|l| l.sha1.as_deref()) else { continue };
+            if got != want {
+                bail!("{path}: its movies, assembled in order, have sha1 {got}; the disc's file {want}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The releases' discs and containers as bundles, their slots filled. Returns their count.
@@ -704,6 +810,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
     let sourcing = Sourcing { extensions, imports: Imports::open(&cache)?, sources: 0 };
     let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
+    check_assembled(&layer, &decl, &releases)?;
     write_record(&layer, &decl_root, &releases, &discs)?;
     write_changeset(project, &game.layer, &decl, &releases)?;
     Ok(Report { layer, assets, layouts, sources })

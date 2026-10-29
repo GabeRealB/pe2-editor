@@ -26,7 +26,13 @@
 //! folder   <room>/folder             a stage folder: its stream slots and its file slots, by id
 //! file     .../files/<name>          a file's slots in order, typed - package, image, palette, bundle, bs,
 //!                                    sound_bank, text; a `sequence` (a whole-file hMPK music image); a `trailer`
-//! stream   .../streams/<name>        a `movie` or `scene_audio`: its `StreamSlot` fields by their C names
+//! stream   .../streams/<name>        a `movie_slot` or `scene_audio`: its `StreamSlot` fields by their C names; a
+//!                                    movie slot names the entry of a disc's movie file it plays (`movie`,
+//!                                    `uid://...#entries/<id>`), whose place gives its offset
+//! movie    .../movies/<name>         a clip of the discs' movie files, beside the room that first plays it; it
+//!                                    declares its sha1, and where it is follows from the entries listing it
+//! movies   movies/inter_<n>          a disc's movie file (`stream`): `entries.<id> = { movie }`, in order - movies
+//!                                    added, removed and reordered there; no bytes of its own
 //! ```
 //!
 //! A slot's id is the slot's - a folder's or file's place - never part of the asset, which another slot may also hold

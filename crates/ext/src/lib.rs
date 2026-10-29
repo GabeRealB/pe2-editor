@@ -33,4 +33,4 @@ pub use registry::{
     Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Thumbnail, Tint, ToolDef, ViewDef, section,
 };
 pub use toml::{Table, Value};
-pub use ui::{Canvas, Marked, Placed, Style, Ui, UiHost, View};
+pub use ui::{Canvas, Cell, Marked, Placed, Style, Ui, UiHost, View};
