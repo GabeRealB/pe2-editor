@@ -77,3 +77,26 @@ toml = { version = "0.8", features = ["preserve_order"] }
 # Edits to project.toml that keep its comments and layout; the version `toml` reads with.
 toml_edit = "0.22"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+
+# Debug builds: full debug info for the workspace's crates, line tables (file:line in backtraces) for dependencies,
+# which are most of the code - wasmtime, Turso, wgpu, egui; kept in the object files rather than the binary. The
+# dependencies are lightly optimized: the editor runs about three times faster (opening a project 3.5 s, not 10.5),
+# for about 70 s more on a clean build.
+[profile.dev]
+debug = "full"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
+opt-level = 1
+
+# Release builds carry no symbols.
+[profile.release]
+strip = true
+
+# What we ship: release, optimized across crates as one (`cargo build --profile dist`). Slower to build than release,
+# which stays the everyday optimized build.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
