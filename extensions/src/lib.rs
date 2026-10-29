@@ -91,6 +91,7 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
                     requires: vec![],
                     status: Status::Refused(e),
                     size: std::fs::metadata(&found.file).ok().and_then(|m| usize::try_from(m.len()).ok()),
+                    contract: None,
                     load: None,
                     registers: vec![],
                 });
@@ -255,6 +256,32 @@ pub fn user_components() -> Vec<Found> {
 mod tests {
     use super::{COMPONENTS, linked};
     use project::ext::component;
+
+    #[test]
+    fn components_are_held_to_the_contract_this_editor_runs() {
+        let wit = include_str!("../../crates/ext/wit/extension.wit");
+        assert!(wit.contains(&format!("package pe2:extension@{};", component::CONTRACT)), "the WIT package is the contract");
+        for (package, bytes) in COMPONENTS {
+            assert_eq!(component::contract(bytes).as_deref(), Some(component::CONTRACT), "{package}");
+        }
+        assert!(component::runs(component::CONTRACT).is_ok());
+        let said = |c: &str| component::runs(c).unwrap_err();
+        assert!(said("0.2.9").contains("newer than this editor's 0.2.0: update the editor"), "{}", said("0.2.9"));
+        assert!(said("0.1.0").contains("built for contract 0.1, and this editor runs 0.2: rebuild it"), "{}", said("0.1.0"));
+        assert!(said("0.3.0").contains("built for contract 0.3, newer than this editor's 0.2"), "{}", said("0.3.0"));
+        assert!(said("1.0.0").contains("built for contract 1, newer"), "{}", said("1.0.0"));
+        // A component of another line is refused before it is compiled: a built-in's export renamed in place.
+        let (_, bytes) = COMPONENTS[0];
+        let name = format!("pe2:extension/guest@{}", component::CONTRACT);
+        let mut older = bytes.to_vec();
+        let ats: Vec<usize> = bytes.windows(name.len()).enumerate().filter(|(_, w)| *w == name.as_bytes()).map(|(at, _)| at).collect();
+        assert!(!ats.is_empty(), "its export's name");
+        for at in ats {
+            older[at..at + name.len()].copy_from_slice(b"pe2:extension/guest@0.1.0");
+        }
+        let refused = component::load_bytes("older", &older, project::ext::Origin::Builtin).err().expect("refused");
+        assert!(format!("{refused:#}").contains("rebuild it with this editor's SDK"), "{refused:#}");
+    }
 
     #[test]
     fn each_component_says_who_it_is_without_running() {

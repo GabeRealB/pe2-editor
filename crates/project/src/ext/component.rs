@@ -1679,6 +1679,47 @@ pub fn about(bytes: &[u8]) -> Option<About> {
 /// The section `extension!` writes.
 const SECTION: &str = "pe2-extension";
 
+/// The contract this host runs: the version of the WIT package (`pe2:extension@0.2.0`), the line it is of (`0.2`)
+/// running every component built against a version of the line no newer than it.
+pub const CONTRACT: &str = "0.2.0";
+
+/// What a component's guest interface is exported as, before its version.
+const GUEST: &str = "pe2:extension/guest@";
+
+/// The contract a component was built against: the version it exports its guest interface at; none where it exports
+/// none - no extension.
+#[must_use]
+pub fn contract(bytes: &[u8]) -> Option<String> {
+    wasmparser::Parser::new(0).parse_all(bytes).find_map(|payload| match payload.ok()? {
+        wasmparser::Payload::ComponentExportSection(exports) => exports
+            .into_iter()
+            .find_map(|e| Some(e.ok()?.name.name.strip_prefix(GUEST)?.to_string())),
+        _ => None,
+    })
+}
+
+/// Whether this host runs a component built against `contract`; why not, said for whoever is to act on it.
+///
+/// # Errors
+/// Another line (older: the component is to be rebuilt; newer: the editor updated), or newer within this one.
+pub fn runs(contract: &str) -> std::result::Result<(), String> {
+    if super::satisfies(CONTRACT, &format!("^{contract}")) {
+        return Ok(());
+    }
+    let (Some(theirs), Some(ours)) = (super::semver(contract), super::semver(CONTRACT)) else {
+        return Err(format!("its contract, {contract}, is no version"));
+    };
+    let line = |v: (u64, u64, u64)| if v.0 == 0 { format!("0.{}", v.1) } else { v.0.to_string() };
+    let (their_line, our_line) = (line(theirs), line(ours));
+    Err(if their_line == our_line {
+        format!("it needs contract {contract}, newer than this editor's {CONTRACT}: update the editor")
+    } else if theirs > ours {
+        format!("it is built for contract {their_line}, newer than this editor's {our_line}: update the editor")
+    } else {
+        format!("it is built for contract {their_line}, and this editor runs {our_line}: rebuild it with this editor's SDK")
+    })
+}
+
 /// A component to load (`name` names it until it says who it is). One that says who it is in its section is compiled
 /// and run only when it registers - an extension disabled, or whose requirements are not met, never is - and must then
 /// say the same when asked; one without is compiled, instantiated and asked now.
@@ -1687,6 +1728,10 @@ const SECTION: &str = "pe2-extension";
 /// One without the section cannot be compiled or instantiated, or its registration fails.
 pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
     let size = bytes.len();
+    // Its contract first, before anything of it is compiled.
+    let contract = contract(bytes).context("it exports no pe2:extension/guest: it is no extension")?;
+    runs(&contract).map_err(|why| anyhow!(why))?;
+    let contract = Some(contract);
     let cell: Arc<OnceLock<Arc<Shared>>> = Arc::default();
     if let Some(about) = about(bytes) {
         let (name, bytes, said, kept) = (name.to_string(), bytes.to_vec(), about.clone(), cell.clone());
@@ -1704,6 +1749,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
             })),
             component: Some(cell),
             size: Some(size),
+            contract: contract.clone(),
             settings: toml::Table::new(),
         });
     }
@@ -1718,6 +1764,7 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
         register: Some(Box::new(move |registry| apply(registry, registration, &shared))),
         component: Some(cell),
         size: Some(size),
+        contract,
         settings: toml::Table::new(),
     })
 }

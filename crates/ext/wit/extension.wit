@@ -5,7 +5,11 @@
 /// Callbacks cannot cross: what an extension registers is described by `register`'s result, each callback by a handle
 /// the host calls back with (a kind's index for its picture, thumbnail and facts, a field's for its readings, a view's
 /// or a panel's for its views, a tool's for its work). Values cross as TOML (`4`, `"indexed_4bpp"`, `{ a = 1 }`).
-package pe2:extension@0.1.0;
+///
+/// The contract is versioned by semver, a minor version below 1.0 a line: within a line a version only adds functions to
+/// `host`, so a component runs on a host of its line at least as new as what it was built against; any change to
+/// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`).
+package pe2:extension@0.2.0;
 
 interface types {
     /// Pixels as unmultiplied RGBA, row by row.

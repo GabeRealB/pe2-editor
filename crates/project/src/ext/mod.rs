@@ -57,6 +57,8 @@ pub struct Loadable {
     component: Option<Arc<std::sync::OnceLock<Arc<component::Shared>>>>,
     /// Its component's size in bytes, where it is one.
     pub size: Option<usize>,
+    /// The contract its component was built against (`0.2.0`); none linked in.
+    pub contract: Option<String>,
     /// The settings kept for it, by scope (`{ project = { ... }, user = { ... } }`), which it reads as it registers.
     pub settings: toml::Table,
 }
@@ -71,6 +73,7 @@ impl From<Extension> for Loadable {
             register: Some(Box::new(move |registry| (extension.register)(registry))),
             component: None,
             size: None,
+            contract: None,
             settings: toml::Table::new(),
         }
     }
@@ -96,6 +99,8 @@ pub struct Present {
     pub status: Status,
     /// Its component's size in bytes, where it is one.
     pub size: Option<usize>,
+    /// The contract its component was built against; none linked in, or unreadable.
+    pub contract: Option<String>,
     /// How long registering it took (compiling and instantiating a component), where it was registered.
     pub load: Option<std::time::Duration>,
     /// What it registered, by what it is - kinds, roles, formats, importers, extractors, panels, tools, services -
@@ -115,6 +120,7 @@ impl Present {
             requires: extension.requires.clone(),
             status,
             size: extension.size,
+            contract: extension.contract.clone(),
             load: None,
             registers: vec![],
         }
@@ -194,14 +200,14 @@ pub struct Extensions {
 }
 
 /// A version's major, minor and patch numbers.
-fn semver(text: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn semver(text: &str) -> Option<(u64, u64, u64)> {
     let mut parts = text.split('.').map(|p| p.parse::<u64>().ok());
     Some((parts.next()??, parts.next().unwrap_or(Some(0))?, parts.next().unwrap_or(Some(0))?))
 }
 
 /// Whether `version` meets a caret requirement (`^0.1`, `0.1.2`): at least it, and the same major (the same minor
 /// below 1.0).
-fn satisfies(version: &str, requirement: &str) -> bool {
+pub(crate) fn satisfies(version: &str, requirement: &str) -> bool {
     let (Some(have), Some(want)) = (semver(version), semver(requirement.trim_start_matches('^'))) else {
         return false;
     };

@@ -323,11 +323,15 @@ fn details_ui(
             for q in all.iter().filter(|q| q.id == p.id && matches!(q.status, Status::Replaced(_))) {
                 row("In place of", format!("{} {}", q.version, origin_text(&q.origin)));
             }
-            let contract = match p.origin {
-                Origin::Linked => "linked in: none".to_string(),
-                _ => "pe2:extension@0.1.0".to_string(),
+            // What it was built against; this editor's, where that differs (a version of the same line).
+            let ours = project::ext::component::CONTRACT;
+            let contract = match (&p.origin, &p.contract) {
+                (Origin::Linked, _) => "none: linked in".to_string(),
+                (_, Some(c)) if c == ours => format!("pe2:extension@{c}"),
+                (_, Some(c)) => format!("pe2:extension@{c}, run by {ours}"),
+                (_, None) => String::new(),
             };
-            if read {
+            if !contract.is_empty() {
                 row("Contract", contract);
             }
             if let Some(size) = p.size {
