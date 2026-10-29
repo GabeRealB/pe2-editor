@@ -165,14 +165,14 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
 
 fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
     ui.horizontal(|ui| {
-        if ws.has_picture(&asset.path) {
-            let ctx = ui.ctx().clone();
-            if let Some(Ok(shown)) = ws.picture(&ctx, &asset.path, Upscale::Nearest) {
-                let scale = (THUMBNAIL / shown.size.y).min(THUMBNAIL * 2.0 / shown.size.x);
-                egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
-                    ui.add(egui::Image::new(egui::load::SizedTexture::new(shown.texture.id(), shown.size * scale)));
-                });
-            }
+        // Its picture, drawn off the window's thread; its kind's icon until it is, or where it has none.
+        let ctx = ui.ctx().clone();
+        let shown = ws.has_picture(&asset.path).then(|| ws.picture(&ctx, &asset.path, Upscale::Nearest)).flatten();
+        if let Some(Ok(shown)) = shown {
+            let scale = (THUMBNAIL / shown.size.y).min(THUMBNAIL * 2.0 / shown.size.x);
+            egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(shown.texture.id(), shown.size * scale)));
+            });
         } else {
             let (icon, tint) = icons::for_kind(&ws.extensions, asset.kind.as_deref());
             ui.label(RichText::new(icon).size(28.0).color(tint));

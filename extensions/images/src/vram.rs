@@ -97,12 +97,11 @@ impl Uploads {
     }
 }
 
-/// The panel, keeping the pictures and swatches it uploaded.
+/// The panel, keeping the swatches it uploaded; the pages' pictures are the host's.
 #[derive(Default)]
 pub(crate) struct Vram {
     /// Whether the pages' grid is drawn: the user's setting.
     pub(crate) grid: bool,
-    pictures: HashMap<(String, usize), Option<Texture>>,
     strips: HashMap<(String, String), Option<Texture>>,
 }
 
@@ -115,26 +114,17 @@ impl Vram {
 
 impl View for Vram {
     fn show(&mut self, ui: &mut Ui) {
-        let (summary, canvas) = {
+        let (summary, mut canvas, pages) = {
             let project = ui.project();
             let selected = project.selection();
             let mut uploads = Uploads::default();
             if let Some(asset) = &selected {
                 uploads.of(project, asset);
             }
+            // The pages' pictures are asked of the host below, once the project is let go of.
+            let pages: Vec<(String, usize, Rect)> =
+                uploads.pages.iter().map(|u| (u.image.clone(), project.look(&u.image), u.rect)).collect();
             let mut pictures = vec![];
-            for upload in &uploads.pages {
-                let look = project.look(&upload.image);
-                let picture = self.pictures.entry((upload.image.clone(), look)).or_insert_with(|| {
-                    let asset = project.asset(&upload.image)?;
-                    let image = Pictures.has(&asset).then(|| Pictures.draw(&asset, look))?.ok()?;
-                    Some(Texture::new(format!("{}#{look}#vram", upload.image), image))
-                });
-                if let Some(texture) = picture {
-                    let (label, link) = (Some(upload.image.clone()), Some(upload.image.clone()));
-                    pictures.push(Placed { texture: texture.clone(), rect: upload.rect, label, link });
-                }
-            }
             for upload in &uploads.palettes {
                 let key = (upload.image.clone(), upload.palette.clone());
                 let strip = self.strips.entry(key).or_insert_with(|| {
@@ -173,8 +163,21 @@ impl View for Vram {
                 grid: self.grid.then_some(PAGE),
                 ..Canvas::default()
             };
-            (summary, canvas)
+            (summary, canvas, pages)
         };
+        // Each page's picture as the host drew it, under the palettes' strips; one being drawn is there when it is.
+        let mut placed = Vec::with_capacity(pages.len() + canvas.pictures.len());
+        let mut drawing = 0;
+        for (image, look, rect) in pages {
+            match ui.picture(&image, look) {
+                Some(Ok(texture)) => placed.push(Placed { texture, rect, label: Some(image.clone()), link: Some(image) }),
+                None => drawing += 1,
+                Some(Err(_)) => {}
+            }
+        }
+        placed.append(&mut canvas.pictures);
+        canvas.pictures = placed;
+        let summary = if drawing > 0 { format!("{summary} (drawing {drawing})") } else { summary };
         ui.styled(&summary, Style::Note);
         ui.canvas(&canvas);
     }

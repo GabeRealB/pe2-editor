@@ -774,6 +774,23 @@ impl host::HostUi for State {
         Ok(())
     }
 
+    fn picture(
+        &mut self,
+        ui: Resource<Frame>,
+        path: String,
+        look: u32,
+    ) -> wasmtime::Result<Option<Result<(Resource<HostTexture>, u32, u32), String>>> {
+        let Some(shown) = self.frame(&ui)?.picture(&path, look as usize) else { return Ok(None) };
+        Ok(Some(match shown {
+            Ok(texture) => {
+                let (width, height) = (u32::try_from(texture.width())?, u32::try_from(texture.height())?);
+                let held = self.table.push(HostTexture { key: texture.key().to_string(), image: texture.image().clone() })?;
+                Ok((held, width, height))
+            }
+            Err(e) => Err(e),
+        }))
+    }
+
     fn navigate(&mut self, ui: Resource<Frame>, path: String) -> wasmtime::Result<()> {
         self.frame(&ui)?.navigate(&path);
         Ok(())
@@ -1681,7 +1698,7 @@ const SECTION: &str = "pe2-extension";
 
 /// The contract this host runs: the version of the WIT package (`pe2:extension@0.2.0`), the line it is of (`0.2`)
 /// running every component built against a version of the line no newer than it.
-pub const CONTRACT: &str = "0.3.0";
+pub const CONTRACT: &str = "0.3.1";
 
 /// What a component's guest interface is exported as, before its version.
 const GUEST: &str = "pe2:extension/guest@";

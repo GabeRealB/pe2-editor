@@ -114,6 +114,17 @@ impl Texture {
         &self.image
     }
 
+    /// A texture the host made and holds: one of its pictures.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn from_host(
+        key: String,
+        width: usize,
+        height: usize,
+        handle: crate::guest::bindings::pe2::extension::host::Texture,
+    ) -> Texture {
+        Texture { key, width, height, handle: std::rc::Rc::new(handle) }
+    }
+
     #[cfg(target_family = "wasm")]
     pub(crate) fn handle(&self) -> &crate::guest::bindings::pe2::extension::host::Texture {
         &self.handle

@@ -9,8 +9,8 @@
 /// The contract is versioned by semver, a minor version below 1.0 a line: within a line a version only adds functions to
 /// `host`, so a component runs on a host of its line at least as new as what it was built against; any change to
 /// `guest` or to a type is a new line. 0.2.0: settings (`host.settings`, `registration.settings`). 0.3.0: an import's
-/// notes (`imported.notes`).
-package pe2:extension@0.3.0;
+/// notes (`imported.notes`). 0.3.1: the host's pictures (`ui.picture`).
+package pe2:extension@0.3.1;
 
 interface types {
     /// Pixels as unmultiplied RGBA, row by row.
@@ -134,6 +134,9 @@ interface host {
         section: func(title: string) -> ui;
         collapsing: func(id: string, title: string, note: string) -> option<ui>;
         canvas: func(canvas: canvas);
+        /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show
+        /// it - with its width and height: none while it is being drawn (the view is drawn again when it is).
+        picture: func(path: string, look: u32) -> option<result<tuple<texture, u32, u32>, string>>;
         navigate: func(path: string);
     }
 

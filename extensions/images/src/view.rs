@@ -1,9 +1,8 @@
 //! The image's view: its picture on a canvas, in the look the host's picker chose.
 
-use pe2_ext::{Asset, Canvas, Marked, Picture, Placed, Rect, Texture, Ui, View};
-use std::collections::HashMap;
+use pe2_ext::{Asset, Canvas, Marked, Placed, Rect, Style, Ui, View};
 
-use crate::{Pictures, cells, pages, role};
+use crate::{cells, pages, role};
 
 /// An image on a canvas: an atlas with a box over each cell, a texture wider than a page with a box over each page.
 pub(crate) struct ImageView {
@@ -11,8 +10,6 @@ pub(crate) struct ImageView {
     boxes: Vec<Marked>,
     summary: String,
     toggle: &'static str,
-    /// Each look's picture, decoded when first shown.
-    pictures: HashMap<usize, Result<Texture, String>>,
 }
 
 fn marked(name: String, rect: Rect) -> Marked {
@@ -22,7 +19,7 @@ fn marked(name: String, rect: Rect) -> Marked {
 impl ImageView {
     pub(crate) fn new(asset: &Asset) -> ImageView {
         let (size, page_width) = pages(asset);
-        let mut view = ImageView { size, boxes: vec![], summary: String::new(), toggle: "", pictures: HashMap::new() };
+        let mut view = ImageView { size, boxes: vec![], summary: String::new(), toggle: "" };
         match role(asset) {
             Some("atlas") => {
                 view.boxes = cells(asset).into_iter().map(|c| marked(c.name, c.rect)).collect();
@@ -51,17 +48,16 @@ impl ImageView {
 impl View for ImageView {
     fn show(&mut self, ui: &mut Ui) {
         let look = ui.look();
-        let picture = self.pictures.entry(look).or_insert_with(|| {
-            let asset = ui.asset().ok_or("no asset")?;
-            Pictures
-                .draw(&asset, look)
-                .map(|image| Texture::new(format!("{}#{look}", asset.path()), image))
-                .map_err(|e| format!("{e:#}"))
-        });
-        let texture = match picture {
-            Ok(texture) => texture.clone(),
-            Err(e) => {
+        let Some(path) = ui.asset().map(|a| a.path().to_string()) else { return };
+        // The host's drawing of it, made off the window's thread and shared: shown when it is drawn.
+        let texture = match ui.picture(&path, look) {
+            Some(Ok(texture)) => texture,
+            Some(Err(e)) => {
                 ui.error(&format!("No preview: {e}"));
+                return;
+            }
+            None => {
+                ui.styled("Drawing the picture...", Style::Note);
                 return;
             }
         };

@@ -401,6 +401,14 @@ impl UiHost for Frame<'_> {
         });
     }
 
+    fn picture(&mut self, path: &str, look: usize) -> Option<Result<crate::Texture, String>> {
+        let look = u32::try_from(look).unwrap_or(u32::MAX);
+        let shown = self.ui().picture(path, look)?;
+        Some(shown.map(|(handle, width, height)| {
+            crate::Texture::from_host(format!("{path}#{look}#picture"), width as usize, height as usize, handle)
+        }))
+    }
+
     fn navigate(&mut self, path: &str) {
         self.ui().navigate(path);
     }

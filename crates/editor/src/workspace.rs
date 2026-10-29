@@ -401,6 +401,7 @@ impl Workspace {
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it.
         let shown = Arc::new(index.clone());
+        let pictures = crate::pictures::Pictures::start(shown.clone(), extensions.clone());
         let takein = crate::takein::TakeIn::start(
             project.clone(),
             index,
@@ -416,7 +417,7 @@ impl Workspace {
             extensions,
             views: HashMap::new(),
             view_choice: HashMap::new(),
-            textures: crate::ext_ui::Textures::default(),
+            textures: crate::ext_ui::Textures::with_pictures(pictures),
             layers,
             layer_view,
             index: shown,
@@ -466,6 +467,9 @@ impl Workspace {
             return;
         }
         self.takein.wake(ctx);
+        if let Some(pictures) = &self.textures.pictures {
+            pictures.wake(ctx);
+        }
         let root = &self.project.root;
         let roots: Vec<PathBuf> = self.project.layers.iter().map(|l| l.path.clone()).collect();
         // Each layer's changeset sits beside its directory; project.toml in the project's own.
@@ -627,6 +631,14 @@ impl Workspace {
                 self.outcome = Update::Reopen(why);
             }
             self.index = snapshot.index;
+            if let Some(pictures) = &mut self.textures.pictures {
+                pictures.set_index(self.index.clone());
+                if snapshot.all {
+                    pictures.clear();
+                } else {
+                    pictures.forget(&snapshot.changed);
+                }
+            }
             self.tree = snapshot.tree;
             self.layers = snapshot.layers;
             self.refresh_editable();
@@ -1124,15 +1136,13 @@ impl Workspace {
 
     /// The picture of an asset, in its chosen look, as its extension draws it - decoded once per look and upscaling
     /// method.
+    /// An asset's picture in its look, uploaded: drawn off the window's thread, none until it is.
     pub fn picture(&mut self, ctx: &egui::Context, path: &str, upscale: Upscale) -> Option<&Picture> {
         let chosen = self.variant(path);
         let key = (path.to_string(), chosen, upscale);
         if !self.pictures.contains_key(&key) {
-            let decoded = self.extensions.picture(self.index.assets.get(path)?, chosen)?;
-            self.pictures.insert(
-                key.clone(),
-                decoded.map_err(|e| format!("{e:#}")).map(|image| show(ctx, path, chosen, upscale, &image)),
-            );
+            let drawn = self.textures.pictures.as_mut()?.get(path, chosen)?;
+            self.pictures.insert(key.clone(), drawn.map(|image| show(ctx, path, chosen, upscale, &image)));
         }
         self.pictures.get(&key)
     }

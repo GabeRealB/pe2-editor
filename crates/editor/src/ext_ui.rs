@@ -28,9 +28,16 @@ pub fn color_image(image: &Image) -> egui::ColorImage {
 #[derive(Default)]
 pub struct Textures {
     uploaded: HashMap<(String, Upscale), (Weak<Image>, egui::TextureHandle)>,
+    /// The pictures drawn off the window's thread, which views ask for (`UiHost::picture`).
+    pub pictures: Option<crate::pictures::Pictures>,
 }
 
 impl Textures {
+    /// The textures of views, with the pictures drawn for them.
+    pub fn with_pictures(pictures: crate::pictures::Pictures) -> Textures {
+        Textures { uploaded: HashMap::new(), pictures: Some(pictures) }
+    }
+
     fn get(&mut self, ctx: &egui::Context, texture: &Texture, upscale: Upscale) -> egui::TextureId {
         let key = (texture.key().to_string(), upscale);
         if let Some((image, handle)) = self.uploaded.get(&key)
@@ -337,6 +344,11 @@ impl UiHost for Host<'_> {
             *self.nav = Some(link);
         }
         self.last = None;
+    }
+
+    fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>> {
+        let drawn = self.textures.pictures.as_mut()?.get(path, look)?;
+        Some(drawn.map(|image| Texture::shared(format!("{path}#{look}#picture"), image)))
     }
 
     fn navigate(&mut self, path: &str) {

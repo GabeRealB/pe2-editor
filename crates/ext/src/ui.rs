@@ -97,6 +97,9 @@ pub trait UiHost {
     /// A collapsing header, `id` keeping it open or not; its body while open.
     fn collapsing(&mut self, id: &str, title: &str, note: &str) -> Option<Box<dyn UiHost + '_>>;
     fn canvas(&mut self, canvas: &Canvas);
+    /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show it:
+    /// none while it is being drawn (the view is drawn again when it is), or why it cannot be.
+    fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>>;
     /// Select the asset at a path, as clicking it in the tree would.
     fn navigate(&mut self, path: &str);
     /// The asset the view shows, lent for the frame; none for a panel.
@@ -219,6 +222,11 @@ impl<'a> Ui<'a> {
 
     pub fn canvas(&mut self, canvas: &Canvas) {
         self.host.canvas(canvas);
+    }
+
+    /// An asset's picture in a look as the host draws it: none while it is being drawn, or why it cannot be.
+    pub fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>> {
+        self.host.picture(path, look)
     }
 
     pub fn navigate(&mut self, path: &str) {
