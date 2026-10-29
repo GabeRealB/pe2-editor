@@ -479,9 +479,12 @@ mod tests {
             cells.dot = { rect = [1, 0, 1, 1], palette = "warm" }
             variants.night = { palettes = { dot = "cold" } }
 
-            [import]
-            importer = "pe2.images@texels"
-            source = "native.texels"
+            [[stack]]
+            op = "file"
+            file = "native.texels"
+
+            [[stack]]
+            op = "pe2.images@texels"
             "#,
         )
         .unwrap();

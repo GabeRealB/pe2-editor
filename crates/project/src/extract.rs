@@ -356,6 +356,32 @@ fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) 
     Ok(lines.join("\n") + "\n")
 }
 
+/// A bundle's `asset.toml` with its declaration's `[import]` written out as its stack, before the originals: its source
+/// stored on top, the importer taking it (with the import's other settings), the native form it makes as the `native`
+/// output - kept in the store, made as soon as the source changes, where the importer makes files; where it is native,
+/// its source as it is, made when asked for.
+fn stacked(toml: &str, native: bool) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut doc: toml_edit::DocumentMut = toml.parse()?;
+    let Some(import) = doc.remove("import") else { return Ok(toml.to_string()) };
+    let import = import.as_table_like().context("its `import` is not a table")?;
+    let text = |key: &str| import.get(key).and_then(toml_edit::Item::as_str).with_context(|| format!("its import has no {key}"));
+    let mut stack = format!("[[stack]]\nop = \"file\"\nfile = {}\n\n[[stack]]\nop = {}\n", quote(text("source")?), quote(text("importer")?));
+    for (key, item) in import.iter().filter(|(k, _)| !matches!(*k, "importer" | "source")) {
+        let value = item.as_value().with_context(|| format!("its import's {key} is not a value"))?;
+        let _ = writeln!(stack, "{key} = {}", value.to_string().trim());
+    }
+    stack.push_str("\n[[stack]]\nop = \"output\"\nname = \"native\"\n");
+    if !native {
+        stack.push_str("retain = \"cache\"\nwhen = \"eager\"\n");
+    }
+    let text = doc.to_string();
+    let body = text.find("\n[original.").map_or(text.len(), |i| i + 1);
+    let (body, originals) = text.split_at(body);
+    let separator = if originals.is_empty() { "" } else { "\n" };
+    Ok(format!("{}\n\n{stack}{separator}{originals}", body.trim_end()))
+}
+
 /// A layout asset's `asset.toml`: its declaration without what only extraction reads (`at`).
 fn layout_toml(text: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
@@ -453,16 +479,18 @@ impl pe2_ext::Discs for Reader<'_> {
     }
 }
 
-/// What makes an asset's source of its native files: the extensions, and the imports kept of what they checked.
+/// What makes an asset's source of its native files: the extensions, and the engine importing them back - which keeps
+/// the imports it checked.
 struct Sourcing<'a> {
     extensions: &'a Extensions,
-    imports: Imports,
+    engine: crate::graph::exec::Engine,
     sources: usize,
 }
 
 /// An asset as extraction lends it to its importer: its declaration and the files given.
 struct Lent<'a> {
     path: &'a str,
+    uid: Option<&'a str>,
     fields: toml::Table,
     declaration: &'a str,
     files: BTreeMap<String, Vec<u8>>,
@@ -494,7 +522,43 @@ impl pe2_ext::Source for Lent<'_> {
     }
 }
 
+impl crate::graph::exec::Node for Lent<'_> {
+    fn path(&self) -> &str {
+        self.path
+    }
+
+    fn uid(&self) -> Option<&str> {
+        self.uid
+    }
+
+    fn declaration(&self) -> &str {
+        self.declaration
+    }
+
+    fn fields(&self) -> &toml::Table {
+        &self.fields
+    }
+
+    fn file_sha1(&self, name: &str) -> Option<String> {
+        self.files.get(name).map(|bytes| sha1_hex(bytes))
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
+    }
+}
+
 impl Sourcing<'_> {
+    /// A bundle's `asset.toml` with the import its declaration names written out as its stack (`stacked`).
+    fn stack(&self, path: &str, toml: String) -> Result<String> {
+        let declared: toml::Table = toml.parse()?;
+        let Some(importer) = declared.get("import").and_then(|i| i.get("importer")).and_then(toml::Value::as_str) else {
+            return Ok(toml);
+        };
+        let def = self.extensions.importer(importer).with_context(|| format!("{path}: no extension provides {importer}"))?;
+        stacked(&toml, def.import.is_none()).with_context(|| path.to_string())
+    }
+
     /// An asset's `asset.toml` and files as its bundle holds them: its native files where its importer is native,
     /// else its importer's source alone - exported from them, imported back with the declaration less what the
     /// import derives, and compared, files and settings both; its import kept.
@@ -506,33 +570,46 @@ impl Sourcing<'_> {
         native: Vec<(String, Vec<u8>)>,
     ) -> Result<(String, pe2_ext::Made)> {
         let fields: toml::Table = toml.parse()?;
-        let import = fields.get("import");
-        let named = |key: &str| import.and_then(|i| i.get(key)).and_then(toml::Value::as_str).map(str::to_string);
-        let (Some(importer), Some(source)) = (named("importer"), named("source")) else { return Ok((toml, native)) };
+        let Some(import) = crate::graph::import_of(&fields) else { return Ok((toml, native)) };
+        let (importer, source) = (import.op.to_string(), import.source.to_string());
         let def = self.extensions.importer(&importer).with_context(|| format!("{path}: no extension provides {importer}"))?;
         if def.export.is_none() {
             return Ok((toml, native));
         }
         let (kind, role) = self.extensions.qualify(&asset.kind, asset.role.as_deref());
-        let lent = Lent { path, fields: fields.clone(), declaration: &toml, files: native.iter().cloned().collect() };
+        let lent = Lent {
+            path,
+            uid: Some(&asset.uid),
+            fields: crate::graph::with_import(&fields, &import),
+            declaration: &toml,
+            files: native.iter().cloned().collect(),
+        };
         let bytes = self
             .extensions
             .export(&importer, &pe2_ext::Asset::new(&lent, kind, role))
             .context("no export")?
             .with_context(|| format!("{path}: {importer} could not write its source"))?;
-        // What the bundle says: the declaration without what the source holds.
+        // What the bundle says: the declaration without what the source holds. Imported back by its stack, as the
+        // project will - which keeps the import.
         let written = crate::imports::without_derived(&toml, &def.derives)?;
         let lent = Lent {
             path,
+            uid: Some(&asset.uid),
             fields: written.parse()?,
             declaration: &written,
             files: BTreeMap::from([(source.clone(), bytes.clone())]),
         };
-        let made = self
-            .extensions
-            .import(&pe2_ext::Asset::new(&lent, kind, role))
-            .context("no import")?
+        let (plan, wrong) = crate::graph::Plan::of(&lent.fields, &self.engine.ops);
+        if let Some(wrong) = wrong.first() {
+            bail!("{path}: {}: {}", wrong.at, wrong.what);
+        }
+        let given = self
+            .engine
+            .output(&plan, &lent, crate::imports::NATIVE, true)
             .with_context(|| format!("{path}: {importer} could not import its source"))?;
+        let Some(crate::graph::Value::Native(made)) = given.value.as_deref() else {
+            bail!("{path}: its import made no native form");
+        };
         let (made_map, native_map): (BTreeMap<_, _>, BTreeMap<_, _>) =
             (made.files.iter().cloned().collect(), native.into_iter().collect());
         if made_map != native_map {
@@ -547,8 +624,6 @@ impl Sourcing<'_> {
         if resolved.settings != fields || !resolved.orphans.is_empty() {
             bail!("{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})", resolved.orphans);
         }
-        let key = crate::imports::key(self.extensions, &importer, &sha1_hex(&bytes), &written);
-        self.imports.put(&key, &made)?;
         self.sources += 1;
         Ok((written, vec![(source, bytes)]))
     }
@@ -597,7 +672,7 @@ fn write_assets(
                 }
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
-            let toml = asset_toml(&asset.body, None, &originals)?;
+            let toml = sourcing.stack(path, asset_toml(&asset.body, None, &originals)?)?;
             let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
             let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
             files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
@@ -652,7 +727,7 @@ fn write_assets(
             }
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
-        let toml = asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?;
+        let toml = sourcing.stack(path, asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?)?;
         let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
         if let Some(native) = &native {
             files.push((&name, native));
@@ -807,7 +882,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
     }
     fs::create_dir_all(&layer)?;
     let cache = crate::cache::Cache::open(project, lock)?;
-    let sourcing = Sourcing { extensions, imports: Imports::open(&cache)?, sources: 0 };
+    let sourcing = Sourcing { extensions, engine: Imports::open(&cache)?.engine(extensions), sources: 0 };
     let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs)?;
     check_assembled(&layer, &decl, &releases)?;

@@ -24,16 +24,17 @@ pub struct Sheet<'a> {
     pub index: &'a Index,
     pub extensions: &'a Extensions,
     pub fields: Vec<pe2_ext::Field>,
-    /// The table of the declaration the fields are in: none for the asset's own, `import` for its import settings.
-    pub within: Option<&'static str>,
+    /// The table of the declaration the fields are in: none for the asset's own, `stack.1` for a layer of its stack
+    /// (a list's tables by their places).
+    pub within: Option<String>,
     /// The fields the asset's import derives from its source, by importer: shown, not edited here.
     pub derived: Option<(String, Vec<String>)>,
 }
 
 impl Sheet<'_> {
-    /// A field's place in the declaration: `mode`, or `import.mode`.
+    /// A field's place in the declaration: `mode`, or `stack.1.mode`.
     fn path(&self, key: &str) -> String {
-        self.within.map_or_else(|| key.to_string(), |within| format!("{within}.{key}"))
+        self.within.as_ref().map_or_else(|| key.to_string(), |within| format!("{within}.{key}"))
     }
 
     fn field(&self, key: &str) -> Option<&pe2_ext::Field> {
@@ -84,7 +85,7 @@ pub fn inspector_ui(
         let fields: Vec<(&String, &toml::Value)> = asset
             .settings()
             .iter()
-            .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && *k != "import" && !sheet.custom(k))
+            .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && *k != "stack" && !sheet.custom(k))
             .collect();
         let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
         let (field_edit, parts) = (&mut ws.field_edit, &mut ws.parts);
@@ -101,7 +102,7 @@ pub fn inspector_ui(
         }
     }
     ws.show_inspector_views(ui, &asset.path, nav, false);
-    import_ui(ui, ws, &asset, &target, nav, edit);
+    stack_ui(ui, ws, &asset, &target, nav, edit);
     files_ui(ui, &asset, tools, message);
     declaration_ui(ui, ws, &asset, edit);
 }
@@ -339,7 +340,7 @@ fn field_editor(
         && let Ok(new) = parsed
     {
         *field_edit = None;
-        if let Some(request) = set_field(asset, sheet.within, key, new, &sheet.label(key)) {
+        if let Some(request) = set_field(asset, sheet.within.as_deref(), key, new, &sheet.label(key)) {
             *edit = Some(request);
         }
     }
@@ -356,7 +357,7 @@ fn set_field(
 ) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
     match within {
-        Some(table) => document.get_mut(table)?.as_table_like_mut()?.insert(key, toml_edit::Item::Value(new)),
+        Some(path) => table_at(&mut document, path)?.insert(key, toml_edit::Item::Value(new)),
         None => document.insert(key, toml_edit::Item::Value(new)),
     };
     if document.to_string() == asset.text() {
@@ -370,6 +371,20 @@ fn set_field(
         label: format!("Set {} of {name}", label.to_lowercase()),
         merge: Some(format!("{}#{}{key}", asset.path, within.map_or_else(String::new, |w| format!("{w}.")))),
     })
+}
+
+/// The table at a path of a declaration: keys, and a list's tables by their places (`stack.1`).
+fn table_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &str) -> Option<&'a mut dyn toml_edit::TableLike> {
+    let mut steps = path.split('.').peekable();
+    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    while let Some(step) = steps.next() {
+        let item = table.get_mut(step)?;
+        table = match steps.next_if(|s| s.parse::<usize>().is_ok()) {
+            Some(i) => item.as_array_of_tables_mut()?.get_mut(i.parse().ok()?)?,
+            None => item.as_table_like_mut()?,
+        };
+    }
+    Some(table)
 }
 
 /// A value as `toml_edit` writes it: inline, tables as inline tables.
@@ -459,7 +474,7 @@ fn choice_ui(
         _ => None,
     });
     let label = field.label.as_deref().unwrap_or(key);
-    if let Some(request) = new.and_then(|new| set_field(asset, sheet.within, key, new, label)) {
+    if let Some(request) = new.and_then(|new| set_field(asset, sheet.within.as_deref(), key, new, label)) {
         *edit = Some(request);
     }
 }
@@ -723,9 +738,11 @@ fn count(n: usize, plural: &str) -> String {
 
 // --- import ---
 
-/// An asset's import settings, apart from its own: its importer, its source and the formats that is, the settings as
-/// the importer describes them, its views, and the other importers that fit the source.
-fn import_ui(
+/// An asset's stack, top to bottom in the order it runs: each layer's operation and what sets it - a stored file with
+/// the formats it is and the tool it is edited in, an importer with a choice of those fitting its source and its
+/// settings as it describes them, an output with how it is kept - then the importer's views, and the other importers
+/// that fit the source.
+fn stack_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
     asset: &Asset,
@@ -733,9 +750,10 @@ fn import_ui(
     nav: &mut Option<String>,
     edit: &mut Option<EditRequest>,
 ) {
-    let Some(import) = asset.fields().get("import").and_then(toml::Value::as_table) else { return };
-    let name = import.get("importer").and_then(toml::Value::as_str).unwrap_or_default();
-    let source = import.get("source").and_then(toml::Value::as_str);
+    let Some(layers) = asset.fields().get("stack").and_then(toml::Value::as_array) else { return };
+    let import = project::graph::import_of(asset.fields());
+    let name = import.as_ref().map_or("", |i| i.op);
+    let source = import.as_ref().map(|i| i.source);
     let importer = ws.extensions.importer(name);
     let fits: Vec<(String, String, Option<pe2_ext::Support>)> = ws
         .extensions
@@ -746,92 +764,144 @@ fn import_ui(
     let formats: Vec<String> = asset
         .files
         .iter()
-        .filter(|f| Some(f.name.as_str()) == source)
+        .filter(|f| Some(f.name.as_str()) == source && f.made_by.is_none())
         .flat_map(|f| ws.extensions.recognize(f).into_iter().map(|(format, _)| format.label.clone()))
         .collect();
-    {
-        let sheet = Sheet {
-            index: &ws.index,
-            extensions: &ws.extensions,
-            fields: importer.map_or_default(|i| i.fields.clone()),
-            within: Some("import"),
-            derived: None,
-        };
-        let settings: Vec<(&String, &toml::Value)> = import
-            .iter()
-            .filter(|(k, v)| !matches!(k.as_str(), "importer" | "source") && !sheet.custom(k) && !is_table_list(v))
-            .collect();
-        // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
-        let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
-        let layer = ws.editable_layer().map(|l| l.name.clone());
-        let field_edit = &mut ws.field_edit;
-        theme::section(ui, "Import", |ui| {
-            egui::Grid::new(("import", &asset.path)).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(
-                ui,
-                |ui| {
-                    ui.label(RichText::new("Importer").color(theme::weak()));
-                    importer_row(ui, asset, name, importer, &fits, target.is_ok(), edit);
-                    ui.end_row();
-                    if let Some(source) = source {
-                        ui.label(RichText::new("Source").color(theme::weak()));
+    // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
+    let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
+    let active = ws.editable_layer().map(|l| l.name.clone());
+    // The importer's settings, as it describes them, in its layer.
+    let importing = layers.iter().position(|l| l.get("op").and_then(toml::Value::as_str) == Some(name)).filter(|_| import.is_some());
+    let sheet = Sheet {
+        index: &ws.index,
+        extensions: &ws.extensions,
+        fields: importer.map_or_default(|i| i.fields.clone()),
+        within: importing.map(|i| format!("stack.{i}")),
+        derived: None,
+    };
+    let settings: Vec<(&String, &toml::Value)> = importing
+        .and_then(|i| layers[i].as_table())
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| k.as_str() != "op" && !sheet.custom(k) && !is_table_list(v))
+        .collect();
+    let field_edit = &mut ws.field_edit;
+    theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
+        egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
+            for (i, layer) in layers.iter().enumerate() {
+                let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
+                let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
+                ui.label(RichText::new(format!("{i}")).color(theme::weak()));
+                match op {
+                    project::graph::FILE => {
+                        ui.label(RichText::new("Stored file").color(theme::weak()));
+                        let source_layer = Some(i) == importing.map(|j| j - 1);
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(source).monospace());
-                            for format in &formats {
+                            ui.label(RichText::new(text("file").unwrap_or_default()).monospace());
+                            for format in formats.iter().filter(|_| source_layer) {
                                 badge(ui, format);
                             }
                         });
-                        ui.end_row();
-                        if let (Some((category, home)), Some(uid)) = (&tool, &asset.uid) {
-                            ui.label("");
-                            let text = format!("{}  Edit in {}", icons::PENCIL_SIMPLE, category.label().to_lowercase());
-                            let (enabled, says) = match &layer {
-                                Ok(l) if l == home => (true, format!("Open {source} in the {} set in the settings (External tools); what it saves is imported again", category.label().to_lowercase())),
-                                Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
-                                Err(why) => (false, why.clone()),
-                            };
-                            let response = ui.add_enabled(enabled, egui::Button::new(text)).on_hover_text(&says);
-                            let response = if enabled { response } else { response.on_disabled_hover_text(&says) };
-                            if response.clicked() {
-                                *edit = Some(EditRequest::EditIn(uid.clone()));
-                            }
+                        // Edited in its tool: a row of its own, under the file.
+                        if let (true, Some((category, home)), Some(uid), Some(source)) = (source_layer, &tool, &asset.uid, source) {
                             ui.end_row();
+                            ui.label("");
+                            ui.label("");
+                            edit_in_button(ui, *category, home, &active, source, uid, edit);
                         }
                     }
-                },
-            );
-            if !settings.is_empty() {
-                ui.add_space(4.0);
-                property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
-            }
-            if fits.len() > 1 || fits.iter().any(|(n, ..)| n != name) {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Importers for this source").small().color(theme::weak()));
-                for (fit, label, support) in &fits {
-                    ui.horizontal_wrapped(|ui| {
-                        let text = RichText::new(label);
-                        ui.label(if fit == name { text.strong() } else { text });
-                        match support {
-                            Some(pe2_ext::Support::Partial { reason, .. }) => {
-                                ui.label(RichText::new(reason).small().color(ui.visuals().warn_fg_color));
-                            }
-                            _ if fit == name => {
-                                ui.label(RichText::new("in use").small().color(theme::weak()));
-                            }
-                            _ => {}
-                        }
-                    });
+                    project::graph::OUTPUT => {
+                        ui.label(RichText::new("Output").color(theme::weak()));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(text("name").unwrap_or_default()).monospace());
+                            badge(ui, text("retain").unwrap_or("transient"));
+                            badge(ui, text("when").unwrap_or("lazy"));
+                        });
+                    }
+                    project::graph::GRAPH => {
+                        ui.label(RichText::new("Graph").color(theme::weak()));
+                        let count = layer.get("ops").and_then(toml::Value::as_table).map_or(0, toml::Table::len);
+                        ui.label(format!("{count} operation{}", if count == 1 { "" } else { "s" }));
+                    }
+                    _ if Some(i) == importing => {
+                        ui.label(RichText::new("Importer").color(theme::weak()));
+                        importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
+                    }
+                    _ => {
+                        ui.label(RichText::new("Operation").color(theme::weak()));
+                        ui.label(RichText::new(op).monospace());
+                    }
                 }
+                ui.end_row();
+            }
+        });
+        if !settings.is_empty() {
+            ui.add_space(4.0);
+            property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
+        }
+        fits_ui(ui, &fits, name);
+    });
+    ws.show_inspector_views(ui, &asset.path, nav, true);
+}
+
+/// The button editing a source in the tool its format is edited in: in the active layer, copied there first where the
+/// source is below it (`home`, the layer holding it).
+fn edit_in_button(
+    ui: &mut egui::Ui,
+    category: crate::external::Category,
+    home: &str,
+    active: &Result<String, String>,
+    source: &str,
+    uid: &str,
+    edit: &mut Option<EditRequest>,
+) {
+    let tool = category.label().to_lowercase();
+    let label = format!("{}  Edit in {tool}", icons::PENCIL_SIMPLE);
+    let (enabled, says) = match active {
+        Ok(l) if l == home => {
+            (true, format!("Open {source} in the {tool} set in the settings (External tools); what it saves is imported again"))
+        }
+        Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
+        Err(why) => (false, why.clone()),
+    };
+    let response = ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(&says);
+    let response = if enabled { response } else { response.on_disabled_hover_text(&says) };
+    if response.clicked() {
+        *edit = Some(EditRequest::EditIn(uid.to_string()));
+    }
+}
+
+/// The importers that fit an asset's source, where there is a choice: the one in use, and why one takes it only in part.
+fn fits_ui(ui: &mut egui::Ui, fits: &[(String, String, Option<pe2_ext::Support>)], name: &str) {
+    if fits.len() <= 1 && fits.iter().all(|(n, ..)| n == name) {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Importers for this source").small().color(theme::weak()));
+    for (fit, label, support) in fits {
+        ui.horizontal_wrapped(|ui| {
+            let text = RichText::new(label);
+            ui.label(if fit == name { text.strong() } else { text });
+            match support {
+                Some(pe2_ext::Support::Partial { reason, .. }) => {
+                    ui.label(RichText::new(reason).small().color(ui.visuals().warn_fg_color));
+                }
+                _ if fit == name => {
+                    ui.label(RichText::new("in use").small().color(theme::weak()));
+                }
+                _ => {}
             }
         });
     }
-    ws.show_inspector_views(ui, &asset.path, nav, true);
 }
 
 /// The importer: its label and name, or - where the asset can be edited and several importers are offered for its
 /// source - a choice of them, switching as an undoable step.
+#[allow(clippy::too_many_arguments)]
 fn importer_row(
     ui: &mut egui::Ui,
     asset: &Asset,
+    at: usize,
     name: &str,
     importer: Option<&pe2_ext::ImporterDef>,
     fits: &[(String, String, Option<pe2_ext::Support>)],
@@ -852,7 +922,8 @@ fn importer_row(
                     }
                 }
             });
-            let switched = chosen.and_then(|fit| set_field(asset, Some("import"), "importer", fit.as_str().into(), "importer"));
+            let within = format!("stack.{at}");
+            let switched = chosen.and_then(|fit| set_field(asset, Some(&within), "op", fit.as_str().into(), "importer"));
             if let Some(switched) = switched {
                 *edit = Some(switched);
             }
@@ -979,8 +1050,9 @@ variants.day = { palette = "warm" }
 variants.night = { palette = "cold" }
 size = [2, 1]
 
-[import]
-importer = "pe2.images@texels"
+[[stack]]
+op = "file"
+file = "native.texels"
 "#
         .parse()
         .unwrap();
@@ -998,7 +1070,7 @@ variants.dusk = { palette = "warm" }"#,
             "{written}"
         );
         assert!(!written.contains("day"), "{written}");
-        assert!(written.contains("[import]\nimporter = \"pe2.images@texels\""), "{written}");
+        assert!(written.contains("[[stack]]\nop = \"file\"\nfile = \"native.texels\""), "{written}");
         let parsed: toml::Table = toml::from_str(&written).unwrap();
         assert_eq!(parsed["variants"].as_table().unwrap().keys().collect::<Vec<_>>(), ["night", "dusk"]);
     }

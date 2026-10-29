@@ -953,7 +953,7 @@ impl Workspace {
     /// file; none where it has no source, or no tool of the settings takes its format.
     pub fn source_tool(&self, path: &str) -> Option<(crate::external::Category, &project::index::BundleFile)> {
         let asset = self.index.assets.get(path)?;
-        let name = asset.fields().get("import")?.get("source")?.as_str()?;
+        let name = project::graph::import_of(asset.fields())?.source;
         let file = asset.files.iter().find(|f| f.name == name && f.made_by.is_none())?;
         let category = self.extensions.recognize(file).into_iter().find_map(|(format, _)| {
             crate::external::Category::of_media_type(format.media_type.as_deref()?)

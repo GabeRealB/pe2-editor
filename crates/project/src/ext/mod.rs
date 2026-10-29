@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
-use crate::index;
+use crate::{graph, index};
 
 /// The kind of an asset holding an extension: the host's own, registered by none. Its bundle holds the component
 /// (`extension.wasm`), which says who it is.
@@ -649,17 +649,63 @@ impl Extensions {
         })
     }
 
-    /// An asset's importer, as its import settings name it.
+    /// An asset's importer: the operation its stack takes its source through.
     #[must_use]
     pub fn importer_of(&self, asset: &index::Asset) -> Option<&ImporterDef> {
-        let name = asset.fields().get("import")?.get("importer")?.as_str()?;
-        self.importers.get(name)
+        self.importers.get(graph::import_of(asset.fields())?.op)
     }
 
     /// An importer, by its qualified name.
     #[must_use]
     pub fn importer(&self, name: &str) -> Option<&ImporterDef> {
         self.importers.get(name)
+    }
+
+    /// The operations stacks are made of: the built-ins, and each importer as one taking its source and making its
+    /// asset's native form - a native importer's being its source as it is. An importer reads its asset as it always
+    /// has, its source and settings given as `[import]` (`graph::with_import`); it is versioned by its extension.
+    #[must_use]
+    pub fn operations(&self) -> graph::Ops {
+        let mut ops = graph::Ops::default();
+        for def in self.importers.values() {
+            let name = def.name.to_string();
+            let version = self.version_of(def.name.extension());
+            let op = graph::OpDef::new(&name, &def.label, &version).input(graph::Port::one("source", graph::Type::File));
+            let op = match def.import.clone() {
+                None => op.makes(graph::Type::Native, |call| {
+                    let graph::Value::File(file) = call.take(0)?.take() else { anyhow::bail!("its source is not a file") };
+                    Ok(graph::Value::Native(pe2_ext::Imported { files: vec![(file.name, file.bytes)], ..Default::default() }))
+                }),
+                Some(import) => {
+                    let kind = def.makes.to_string();
+                    // The roles of its kind by every name a declaration may give them.
+                    let mut roles: HashMap<String, String> = self
+                        .roles
+                        .iter()
+                        .filter(|(_, r)| r.kind == def.makes)
+                        .map(|(q, _)| (q.clone(), q.clone()))
+                        .collect();
+                    let aliases: Vec<(String, String)> =
+                        self.role_aliases.iter().filter(|(_, q)| roles.contains_key(*q)).map(|(a, q)| (a.clone(), q.clone())).collect();
+                    roles.extend(aliases);
+                    op.makes(graph::Type::Native, move |call| {
+                        let graph::Value::File(source) = call.take(0)?.take() else { anyhow::bail!("its source is not a file") };
+                        let recorder = call.recorder();
+                        recorder.declaration();
+                        let node = recorder.node();
+                        let fields = graph::with_import(
+                            node.fields(),
+                            &graph::Import { source: &source.name, op: &name, settings: call.settings().clone() },
+                        );
+                        let role = node.fields().get("role").and_then(toml::Value::as_str).and_then(|r| roles.get(r));
+                        let staged = Staged { recorder, fields, source };
+                        import(&Asset::new(&staged, Some(&kind), role.map(String::as_str))).map(graph::Value::Native)
+                    })
+                }
+            };
+            ops.add(op);
+        }
+        ops
     }
 
     /// What each extension running as a component holds: its live instances and their memory, by id.
@@ -687,16 +733,6 @@ impl Extensions {
     pub fn extractor_for(&self, kind: &str, role: Option<&str>) -> Option<&pe2_ext::ExtractorDef> {
         let (Some(kind), role) = self.qualify(kind, role) else { return None };
         self.extractors.iter().find(|e| e.takes(kind, role))
-    }
-
-    /// The native files an asset's importer makes of its source, by name; none where its importer is unknown or makes
-    /// nothing (a native importer).
-    ///
-    /// # Errors
-    /// The import failed.
-    pub fn import(&self, asset: &Asset) -> Option<Result<pe2_ext::Imported>> {
-        let import = self.importer(asset.importer()?)?.import.as_ref()?;
-        Some(import(asset))
     }
 
     /// The source an importer reads, written from an asset's native files; none where the importer writes none.
@@ -755,13 +791,11 @@ impl Extensions {
         out
     }
 
-    /// The importers that fit an asset's source - the file its import settings name - with how far each takes it, the
+    /// The importers that fit an asset's source - the stored file its stack takes - with how far each takes it, the
     /// highest priority first. An importer not reading any of the source's formats is not listed.
     #[must_use]
     pub fn importers_for(&self, asset: &index::Asset) -> Vec<(&ImporterDef, Support)> {
-        let Some(source) = asset.fields().get("import").and_then(|i| i.get("source")).and_then(Value::as_str) else {
-            return vec![];
-        };
+        let Some(source) = graph::import_of(asset.fields()).map(|i| i.source) else { return vec![] };
         let Some(file) = asset.files.iter().find(|f| f.name == source) else { return vec![] };
         let formats = self.recognize(file);
         let read = |r: &str| formats.iter().any(|(f, _)| f.name.as_str() == r || f.media_type.as_deref() == Some(r));
@@ -839,6 +873,44 @@ impl Project for Lens<'_> {
 
     fn may_call(&self, caller: &str, service: &str) -> bool {
         self.extensions.may_call(caller, service)
+    }
+}
+
+/// A node as an operation lends it to an importer: its fields with `[import]`, its source as the operation was given
+/// it, and its other stored files, each recorded as read.
+struct Staged<'a> {
+    recorder: graph::exec::Recorder<'a>,
+    fields: toml::Table,
+    source: graph::File,
+}
+
+impl Source for Staged<'_> {
+    fn path(&self) -> &str {
+        self.recorder.node().path()
+    }
+
+    fn uid(&self) -> Option<&str> {
+        self.recorder.node().uid()
+    }
+
+    fn fields(&self) -> &toml::Table {
+        &self.fields
+    }
+
+    fn declaration(&self) -> &str {
+        self.recorder.node().declaration()
+    }
+
+    fn has_file(&self, name: &str) -> bool {
+        name == self.source.name || self.recorder.node().file_sha1(name).is_some()
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        if name == self.source.name {
+            return Ok(self.source.bytes.clone());
+        }
+        self.recorder.file(name);
+        self.recorder.node().read(name)
     }
 }
 

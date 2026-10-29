@@ -8,6 +8,7 @@ pub mod declarations;
 pub mod edit;
 pub mod ext;
 pub mod extract;
+pub mod graph;
 pub mod history;
 pub mod imports;
 pub mod index;

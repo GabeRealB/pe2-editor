@@ -8,27 +8,30 @@
 //! has and the declaration not is there with what the import derives of it. What readers see is the resolved settings
 //! (`index::Asset::settings`); the declaration stays as written.
 //!
-//! An import is kept by content: its key hashes the importer and its extension's version, the source's hash and the
-//! asset's declaration (its settings), so a changed source, a changed setting or a new importer makes it again, and
-//! anything else finds it made. Beside the files, `made.toml` lists them with their hashes and holds the derived
-//! settings, written last: a folder without it is an import that did not finish, made again. Extraction seeds the
-//! imports it checked, so a project opens without importing. Like the rest of the cache, any of it may be deleted at
-//! the cost of time only.
+//! An import is an output of the work graph (`graph`): the asset's stack takes its source - the stored file on top -
+//! through its importer to the `native` output, kept in the project's store by content with its trace, which records
+//! what the import read (its source's hash, the declaration's). A changed source, a changed setting or a new importer
+//! makes it again, and anything else finds it made. Extraction makes the imports it checks through the same engine,
+//! so a project opens without importing. Like the rest of the cache, any of it may be deleted at the cost of time only.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
-use std::path::PathBuf;
 use std::sync::Arc;
 use toml::{Table, Value};
 
-use crate::cache::{Cache, write_atomic};
+use crate::cache::Cache;
 use crate::ext::{Extensions, Origin, Status};
 use crate::extract::sha1_hex;
+use crate::graph::exec::{Engine, Reads};
+use crate::graph::store::{Blob, Kept, Store};
+use crate::graph::{self, Plan};
 use crate::index::{Asset, BundleFile, Imported, Index, Problem, Report};
 
-const DIR: &str = "imports";
-const MADE: &str = "made.toml";
+/// The output an asset's import is.
+pub const NATIVE: &str = "native";
+/// Where imports were kept before the store, removed on opening.
+const OLD: &str = "imports";
 
 /// What attaching found.
 #[derive(Debug, Default)]
@@ -42,10 +45,10 @@ pub struct Attached {
 
 /// The project's imports.
 pub struct Imports {
-    dir: PathBuf,
-    /// What attaching read of each import, and the settings it resolved to, by key: the key covers the declaration,
-    /// so a refresh finds them here rather than on disk.
-    known: Mutex<HashMap<String, Arc<Known>>>,
+    store: Store,
+    /// What attaching read of each import, and the settings it resolved to, by its output's key, with what it read:
+    /// a refresh finds them here rather than on disk while that holds.
+    known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The parts each referenced asset has, by its path, with the hash of the settings they were listed from.
     parts: Mutex<HashMap<String, Listed>>,
 }
@@ -55,70 +58,28 @@ type Listed = (String, Arc<HashSet<String>>);
 
 /// An import as attaching uses it.
 struct Known {
-    files: Vec<(String, Made)>,
+    importer: String,
+    files: Vec<(String, Blob)>,
     resolved: Arc<Imported>,
-}
-
-/// A file an import made, as `made.toml` lists it.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Made {
-    sha1: String,
-    size: u64,
-}
-
-/// `made.toml`: the files, and the settings derived.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Manifest {
-    files: BTreeMap<String, Made>,
-    #[serde(default)]
-    settings: Table,
-    /// What the import took otherwise than the source has it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    notes: Vec<String>,
-}
-
-/// The key of an import: its importer (qualified) and its extension's version as loaded, its source's hash and the
-/// asset's declaration.
-#[must_use]
-pub fn key(extensions: &Extensions, importer: &str, source_sha1: &str, declaration: &str) -> String {
-    let id = importer.split_once('@').map_or(importer, |(id, _)| id);
-    let version = extensions.version_of(id);
-    sha1_hex(format!("{importer}\n{version}\n{source_sha1}\n{declaration}").as_bytes())
 }
 
 impl Imports {
     /// The project's imports.
     ///
     /// # Errors
-    /// Their folder cannot be made.
+    /// The store cannot be opened.
     pub fn open(cache: &Cache) -> Result<Imports> {
-        let dir = cache.path(DIR);
-        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
-        Ok(Imports { dir, known: Mutex::default(), parts: Mutex::default() })
-    }
-
-    fn get(&self, key: &str) -> Option<Manifest> {
-        let text = std::fs::read_to_string(self.dir.join(key).join(MADE)).ok()?;
-        toml::from_str(&text).ok()
-    }
-
-    /// Keep what an import made under its key.
-    ///
-    /// # Errors
-    /// It cannot be written.
-    pub fn put(&self, key: &str, imported: &pe2_ext::Imported) -> Result<()> {
-        let dir = self.dir.join(key);
-        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
-        let mut files = BTreeMap::new();
-        for (name, bytes) in &imported.files {
-            if name.contains(['/', '\\']) || name == MADE || name.starts_with('.') {
-                anyhow::bail!("{name}: not a name an import may make");
-            }
-            write_atomic(&dir.join(name), bytes)?;
-            files.insert(name.clone(), Made { sha1: sha1_hex(bytes), size: bytes.len() as u64 });
+        let old = cache.path(OLD);
+        if old.exists() {
+            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        let manifest = Manifest { files, settings: imported.settings.clone(), notes: imported.notes.clone() };
-        write_atomic(&dir.join(MADE), toml::to_string(&manifest)?.as_bytes())
+        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), parts: Mutex::default() })
+    }
+
+    /// The engine imports are made by: the extensions' operations, keeping in the store.
+    #[must_use]
+    pub fn engine(&self, extensions: &Extensions) -> Engine {
+        Engine::new(extensions.operations(), Some(self.store.clone()))
     }
 
     /// Give every asset whose importer makes files what its import made, made now where it is not yet: the files take
@@ -159,8 +120,10 @@ impl Imports {
                 asset.imported = None;
             }
         }
+        let engine = self.engine(extensions);
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut found: Vec<(String, String, String, Arc<Known>)> = Vec::new();
+        let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
+        let mut stacks: Vec<Problem> = Vec::new();
         let assets: Vec<&Asset> = match only {
             None => index.assets.values().map(|a| &**a).collect(),
             Some(only) => only.iter().filter_map(|p| index.assets.get(p).map(|a| &**a)).collect(),
@@ -170,57 +133,55 @@ impl Imports {
             if i % 256 == 0 {
                 report("Attaching what the importers made", i, total);
             }
-            let Some((importer, key)) = key_of(asset, extensions) else { continue };
-            if let Some(import) = known.get(&key) {
+            if asset.fields().contains_key("stack") {
+                let (_, wrong) = Plan::of(asset.fields(), &engine.ops);
+                stacks.extend(wrong.into_iter().map(|p| Problem::Import {
+                    asset: asset.path.clone(),
+                    error: format!("{}: {}", p.at, p.what),
+                }));
+            }
+            let Some((importer, plan, output)) = import_plan(asset, extensions, &engine) else { continue };
+            let key = engine.key(&plan, asset, output, None);
+            if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset)) {
                 attached.kept += 1;
-                found.push((asset.path.clone(), importer, key, import.clone()));
+                found.push((asset.path.clone(), key, import.clone()));
                 continue;
             }
-            let manifest = match self.get(&key) {
-                Some(manifest) => {
-                    attached.kept += 1;
-                    manifest
-                }
-                None => match self.make(asset, extensions, &key) {
-                    Ok(manifest) => {
+            match self.import(asset, extensions, &engine, (importer, &plan, output), &key) {
+                Ok((made, reads, import)) => {
+                    if made {
                         attached.made += 1;
-                        manifest
+                    } else {
+                        attached.kept += 1;
                     }
-                    Err(e) => {
-                        attached.failed.push((asset.path.clone(), format!("{e:#}")));
-                        continue;
-                    }
-                },
-            };
-            let derives = extensions.importer(&importer).map_or_default(|i| i.derives.clone());
-            let mut resolved = resolve(asset.fields(), &manifest.settings, &derives);
-            resolved.notes = manifest.notes;
-            let resolved = Arc::new(resolved);
-            let import = Arc::new(Known { files: manifest.files.into_iter().collect(), resolved });
-            known.insert(key.clone(), import.clone());
-            found.push((asset.path.clone(), importer, key, import));
+                    known.insert(key.clone(), (reads, import.clone()));
+                    found.push((asset.path.clone(), key, import));
+                }
+                Err(e) => attached.failed.push((asset.path.clone(), format!("{e:#}"))),
+            }
         }
         if only.is_none() {
-            let live: HashSet<&str> = found.iter().map(|(_, _, key, _)| key.as_str()).collect();
-            known.retain(|key, _| live.contains(key.as_str()));
-            self.sweep(&live);
+            let live: HashSet<String> = found.iter().map(|(_, key, _)| key.clone()).collect();
+            known.retain(|key, _| live.contains(key));
+            let _ = self.store.sweep(&live);
         }
         drop(known);
         let mut problems: Vec<Problem> =
             attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
-        for (path, importer, key, import) in found {
+        problems.extend(stacks);
+        for (path, _, import) in found {
             let Some(asset) = index.assets.get_mut(&path).map(Arc::make_mut) else { continue };
             let layer = source_file(asset).map_or_default(|f| f.layer.clone());
             asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
-            for (name, file) in &import.files {
+            for (name, blob) in &import.files {
                 asset.files.push(BundleFile {
-                    path: self.dir.join(&key).join(name),
+                    path: self.store.blob_path(&blob.sha1),
                     name: name.clone(),
-                    size: file.size,
+                    size: blob.size,
                     modified: (0, 0),
                     layer: layer.clone(),
-                    sha1: file.sha1.clone(),
-                    made_by: Some(importer.clone()),
+                    sha1: blob.sha1.clone(),
+                    made_by: Some(import.importer.clone()),
                 });
             }
             let resolved = &import.resolved;
@@ -286,41 +247,52 @@ impl Imports {
         problems
     }
 
-    /// Import an asset now and keep what it made.
-    fn make(&self, asset: &Asset, extensions: &Extensions, key: &str) -> Result<Manifest> {
-        let imported = extensions.import(&extensions.lend(asset)).context("its importer makes nothing")??;
-        self.put(key, &imported)?;
-        self.get(key).context("the import could not be kept")
-    }
+}
 
-    /// Remove the imports not in `live`, and those that did not finish.
-    fn sweep(&self, live: &HashSet<&str>) -> usize {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return 0 };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !live.contains(name) && std::fs::remove_dir_all(entry.path()).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
+impl Imports {
+    /// An asset's import: found kept where its trace holds, else made now - whether it was made, what it read, and
+    /// what attaching uses of it.
+    fn import(
+        &self,
+        asset: &Asset,
+        extensions: &Extensions,
+        engine: &Engine,
+        (importer, plan, output): (String, &Plan, usize),
+        key: &str,
+    ) -> Result<(bool, Reads, Arc<Known>)> {
+        let (made, trace) = if let Some(trace) = engine.kept(plan, asset, output, None) {
+            (false, trace)
+        } else {
+            engine.output(plan, asset, NATIVE, false)?;
+            (true, self.store.trace(key).context("its import was not kept")?)
+        };
+        let Some(Kept::Native { files, order, settings, notes }) = self.store.describe(&trace.value) else {
+            anyhow::bail!("its import is kept as something else");
+        };
+        let derives = extensions.importer(&importer).map_or_default(|i| i.derives.clone());
+        let mut resolved = resolve(asset.fields(), &settings, &derives);
+        resolved.notes = notes;
+        let mut files: Vec<(String, Blob)> = files.into_iter().collect();
+        files.sort_by_key(|(name, _)| order.iter().position(|o| o == name).unwrap_or(usize::MAX));
+        Ok((made, trace.reads, Arc::new(Known { importer, files, resolved: Arc::new(resolved) })))
     }
 }
 
-/// An asset's importer and its import's key, where its importer makes files and its source is in its bundle.
-fn key_of(asset: &Asset, extensions: &Extensions) -> Option<(String, String)> {
-    let importer = extensions.importer_of(asset)?;
-    importer.import.as_ref()?;
-    let source = source_file(asset)?;
-    let name = importer.name.to_string();
-    let key = key(extensions, &name, &source.sha1, asset.text());
-    Some((name, key))
+/// An asset's importer, its plan and the index of its `native` output, where its stack imports a source its bundle has
+/// with an importer that makes files.
+fn import_plan(asset: &Asset, extensions: &Extensions, engine: &Engine) -> Option<(String, Plan, usize)> {
+    let import = graph::import_of(asset.fields())?;
+    extensions.importer(import.op)?.import.as_ref()?;
+    source_file(asset)?;
+    let importer = import.op.to_string();
+    let (plan, _) = Plan::of(asset.fields(), &engine.ops);
+    let (output, _) = plan.output(NATIVE).filter(|(_, p)| p.is_none())?;
+    Some((importer, plan, output))
 }
 
-/// The file an asset's import settings name as its source, from its bundle.
+/// The file an asset's stack takes as its import's source, from its bundle.
 fn source_file(asset: &Asset) -> Option<&BundleFile> {
-    let name = asset.fields().get("import")?.get("source")?.as_str()?;
+    let name = graph::import_of(asset.fields())?.source;
     asset.files.iter().find(|f| f.name == name && f.made_by.is_none())
 }
 
@@ -443,8 +415,12 @@ size = [8, 2]
 cells.wide = { rect = [4, 0, 4, 2], palette = "cold" }
 cells.gone = { rect = [0, 0, 1, 1], palette = "warm" }
 
-[import]
-importer = "pe2.images@ora"
+[[stack]]
+op = "file"
+file = "source.ora"
+
+[[stack]]
+op = "pe2.images@ora"
 "#;
 
     #[test]
@@ -463,7 +439,7 @@ importer = "pe2.images@ora"
         assert_eq!(resolved.overridden, ["size"]);
         assert_eq!(resolved.orphans, ["cells.gone"]);
         let asset_text = toml::to_string(&resolved.settings).unwrap();
-        assert!(asset_text.contains("[import]"));
+        assert!(asset_text.contains("[[stack]]"));
     }
 
     #[test]
@@ -535,6 +511,10 @@ mod attaching {
         (index, attached)
     }
 
+    /// A strip's stack: its source through the importer, kept as its native form.
+    const STACK: &str = "\n[[stack]]\nop = \"file\"\nfile = \"source.txt\"\n\n[[stack]]\nop = \"test.strips@line\"\n\n\
+                         [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n";
+
     #[test]
     fn imports_resolve_settings_and_parts() {
         let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-{}", std::process::id()));
@@ -543,8 +523,7 @@ mod attaching {
         write(
             &root,
             ".layers/base/s.asset/asset.toml",
-            "uid = \"uid://s\"\nkind = \"strip\"\nsize = [9, 9]\ncells.a = { palette = \"warm\" }\ncells.gone = {}\n\n\
-             [import]\nimporter = \"test.strips@line\"\nsource = \"source.txt\"\n",
+            &format!("uid = \"uid://s\"\nkind = \"strip\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"),
         );
         write(&root, ".layers/base/s.asset/source.txt", "a b");
         write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\nfine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
@@ -574,8 +553,8 @@ mod attaching {
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (1, 0));
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingPart { .. })));
-        let kept = std::fs::read_dir(root.join(".cache/imports")).unwrap().count();
-        assert_eq!(kept, 1);
+        let kept = |sub: &str| std::fs::read_dir(root.join(".cache/store").join(sub)).unwrap().count();
+        assert_eq!((kept("traces"), kept("values")), (1, 1));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -600,7 +579,7 @@ mod attaching {
         let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-changed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
-        let declared = "kind = \"strip\"\ncells.a = {}\n\n[import]\nimporter = \"test.strips@line\"\nsource = \"source.txt\"\n";
+        let declared = format!("kind = \"strip\"\ncells.a = {{}}\n{STACK}");
         write(&root, ".layers/base/s.asset/asset.toml", &format!("uid = \"uid://s\"\n{declared}"));
         write(&root, ".layers/base/s.asset/source.txt", "a b");
         write(&root, ".layers/base/t.asset/asset.toml", &format!("uid = \"uid://t\"\n{declared}"));
