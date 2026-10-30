@@ -456,3 +456,21 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     assert!(format!("{cycle:#}").contains("reads, through others, itself"), "{cycle:#}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn marks_are_kept_as_they_are() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-marks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::at(dir.clone()).unwrap();
+    let rect = pe2_ext::Rect { x: 1.0, y: 2.0, width: 3.0, height: 4.0 };
+    let marks = Value::Marks(pe2_ext::Marks {
+        boxes: vec![pe2_ext::Mark { name: "a".into(), rect }],
+        summary: "1 cell".into(),
+        toggle: "Cells".into(),
+        legend: true,
+    });
+    let hash = super::hash(&marks);
+    store.put(&hash, &marks, &|_| None).unwrap();
+    assert_eq!(store.get(&hash).unwrap(), marks);
+    let _ = std::fs::remove_dir_all(&dir);
+}

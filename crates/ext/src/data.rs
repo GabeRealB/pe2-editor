@@ -46,6 +46,8 @@ pub enum Type {
     Video,
     /// A stretch of sound, in a buffer the host holds (`media::AudioData`).
     Audio,
+    /// What is marked on a node's pictures (`Marks`).
+    Marks,
 }
 
 impl Type {
@@ -84,6 +86,7 @@ impl Type {
             "pcm" => Type::Pcm,
             "video" => Type::Video,
             "audio" => Type::Audio,
+            "marks" => Type::Marks,
             "bytes" => Type::Bytes,
             "file" => Type::File(Box::new(Type::Any)),
             _ if inner("file<").is_some() => Type::File(Box::new(Type::parse(inner("file<").unwrap_or_default(), id)?)),
@@ -124,7 +127,7 @@ impl Type {
             (port, Type::Union(given)) => given.iter().any(|g| port.unify(g, bound)),
             (Type::File(port), Type::File(given)) => port.unify(given, bound),
             // What the host holds in memory alone is no file.
-            (Type::File(_), Type::Image | Type::Table | Type::Pcm | Type::Video | Type::Audio | Type::List(_)) => false,
+            (Type::File(_), Type::Image | Type::Table | Type::Pcm | Type::Video | Type::Audio | Type::Marks | Type::List(_)) => false,
             (Type::File(port), given) => port.unify(given, bound),
             (port, Type::File(given)) => port.unify(given.as_ref(), bound),
             (Type::List(a), Type::List(b)) | (Type::Stream(a), Type::Stream(b)) => a.unify(b, bound),
@@ -175,6 +178,7 @@ impl fmt::Display for Type {
             Type::Pcm => f.write_str("pcm"),
             Type::Video => f.write_str("video"),
             Type::Audio => f.write_str("audio"),
+            Type::Marks => f.write_str("marks"),
             Type::Bytes => f.write_str("bytes"),
             Type::List(item) => write!(f, "list<{item}>"),
             Type::Stream(item) => write!(f, "stream<{item}>"),
@@ -271,6 +275,7 @@ pub enum Value {
     Typed(Typed),
     Video(crate::media::VideoFrame),
     Audio(crate::media::AudioData),
+    Marks(crate::Marks),
 }
 
 impl Value {
@@ -282,6 +287,7 @@ impl Value {
             Value::Pcm(_) => Type::Pcm,
             Value::Video(_) => Type::Video,
             Value::Audio(_) => Type::Audio,
+            Value::Marks(_) => Type::Marks,
             Value::List(items) => Type::List(Box::new(items.first().map_or(Type::Any, Value::ty))),
             Value::Typed(typed) => {
                 let named = |name: &str| if name == BYTES { Type::Bytes } else { Type::Named(name.to_string()) };

@@ -356,6 +356,37 @@ mod tests {
     }
 
     #[test]
+    fn an_atlas_is_marked_by_its_cells_and_a_wide_texture_by_its_pages() {
+        use project::graph::{File, Typed, Value};
+        let extensions = super::load();
+        let engine = project::graph::exec::Engine::new(extensions.operations(), None);
+        let marks = |declaration: &str| {
+            let node = Texture { fields: declaration.parse().unwrap(), declaration: declaration.to_string() };
+            let native = Value::Typed(Typed {
+                ty: "pe2.images@texels".into(),
+                files: vec![File::new("native.texels", vec![0; 4])],
+                ..Typed::default()
+            });
+            match engine.run("pe2.images@marks", vec![vec![native]], &toml::Table::new(), &node).unwrap() {
+                Value::Marks(marks) => marks,
+                other => panic!("made {}", other.ty()),
+            }
+        };
+        let atlas = marks(
+            "kind = \"image\"\nrole = \"atlas\"\nmode = \"indexed_8bpp\"\nsize = [16, 16]\n\
+             cells.a = { rect = [0, 0, 8, 16] }\ncells.b = { rect = [8, 0, 8, 16] }\n",
+        );
+        assert_eq!(atlas.boxes.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!((atlas.summary.as_str(), atlas.toggle.as_str(), atlas.legend), ("2 cells", "Cells", true));
+        let wide = marks("kind = \"image\"\nrole = \"texture\"\nmode = \"indexed_8bpp\"\nsize = [300, 8]\n");
+        assert_eq!(wide.boxes.len(), 3);
+        assert_eq!((wide.boxes[2].rect.x, wide.boxes[2].rect.width), (256.0, 44.0));
+        assert_eq!(wide.toggle, "Pages");
+        let plain = marks("kind = \"image\"\nrole = \"texture\"\nmode = \"indexed_8bpp\"\nsize = [64, 8]\n");
+        assert_eq!(plain, pe2_ext::Marks::default());
+    }
+
+    #[test]
     fn each_component_says_who_it_is_without_running() {
         assert_eq!(COMPONENTS.len(), linked().len());
         for (package, bytes) in COMPONENTS {

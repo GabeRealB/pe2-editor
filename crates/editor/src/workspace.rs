@@ -1210,11 +1210,10 @@ impl Workspace {
         self.pictures.get(&key)
     }
 
-    /// Whether the preview shows an asset by its kind's views: it has one, and a picture where its kind draws one.
+    /// Whether the preview shows an asset: by its picture, or - its kind drawing none - by its kind's views.
     pub fn has_view(&self, path: &str) -> bool {
         self.index.assets.get(path).is_some_and(|a| {
-            !self.extensions.views(a).is_empty()
-                && (!self.extensions.shows_pictures(a) || self.extensions.has_picture(a))
+            self.extensions.has_picture(a) || (!self.extensions.shows_pictures(a) && !self.extensions.views(a).is_empty())
         })
     }
 
@@ -1256,6 +1255,10 @@ impl Workspace {
         count: usize,
         nav: &mut Option<String>,
     ) {
+        if self.index.assets.get(path).is_some_and(|a| self.extensions.has_picture(a)) {
+            self.show_picture(ui, path, preview, count, nav);
+            return;
+        }
         let look = self.variant(path);
         // As the inspector's own fields: an asset from below is overridden into the active layer.
         let editable = self.editable_layer().is_ok();
@@ -1288,6 +1291,41 @@ impl Workspace {
         drop(host);
         if !sets.is_empty() {
             self.view_edit = crate::inspector::set_fields(asset, &sets);
+        }
+    }
+
+    /// Show an asset's picture in its look on the host's canvas, with what its kind marks on it over it.
+    fn show_picture(&mut self, ui: &mut egui::Ui, path: &str, preview: Preview, count: usize, nav: &mut Option<String>) {
+        let look = self.variant(path);
+        let Some(pictures) = self.textures.pictures.as_mut() else { return };
+        let image = match pictures.get(path, look) {
+            Some(Ok(image)) => image,
+            Some(Err(e)) => {
+                ui.colored_label(ui.visuals().error_fg_color, format!("No preview: {e}"));
+                return;
+            }
+            None => {
+                ui.label(egui::RichText::new("Drawing the picture...").small().color(crate::theme::weak()));
+                return;
+            }
+        };
+        let marks = pictures.marks(path, look).unwrap_or_default();
+        let texture = pe2_ext::Texture::shared(format!("{path}#{look}#picture"), image.clone());
+        let id = self.textures.get(ui.ctx(), &texture, preview.upscale);
+        #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
+        let size = egui::vec2(image.width as f32, image.height as f32);
+        let overlay = crate::panes::Overlay {
+            id: path.to_string(),
+            size,
+            pictures: vec![(id, egui::Rect::from_min_size(egui::Pos2::ZERO, size), None, None)],
+            boxes: marks.boxes.iter().map(|m| (m.name.clone(), crate::ext_ui::to_rect(m.rect), false)).collect(),
+            summary: marks.summary.clone(),
+            toggle: marks.toggle.clone(),
+            legend: marks.legend,
+            grid: None,
+        };
+        if let Some(link) = crate::panes::overlay_ui(ui, &overlay, preview, count) {
+            *nav = Some(link);
         }
     }
 

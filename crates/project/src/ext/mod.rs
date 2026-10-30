@@ -709,6 +709,14 @@ impl Extensions {
         Some(stream.name.clone())
     }
 
+    /// The output of an asset's kind saying what is marked on its pictures, by name.
+    #[must_use]
+    pub fn marks_output(&self, asset: &index::Asset) -> Option<String> {
+        let kind = self.kind_of(asset)?;
+        let marks = kind.outputs.iter().find(|o| self.ops.get(&o.op).is_some_and(|op| op.output == pe2_ext::Type::Marks))?;
+        Some(marks.name.clone())
+    }
+
     /// Whether an asset's kind shows its nodes by a picture: it outputs one.
     #[must_use]
     pub fn shows_pictures(&self, asset: &index::Asset) -> bool {

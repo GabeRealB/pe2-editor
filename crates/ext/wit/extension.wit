@@ -99,6 +99,21 @@ interface types {
         samples: list<s16>,
     }
 
+    /// A named rectangle over a picture.
+    record mark {
+        name: string,
+        rect: rect,
+    }
+
+    /// What is marked on a node's pictures, in their pixels and the same in each look: its boxes, what they are
+    /// ("12 cells"), the toggle showing them ("Cells"), each in a color of its own and named in a legend or plain.
+    record marks {
+        boxes: list<mark>,
+        summary: string,
+        toggle: string,
+        legend: bool,
+    }
+
     /// A value of a type as files (an extension's, or `bytes`): its type (qualified), the other names it answers to,
     /// its files, the settings derived with it (TOML), notes.
     record typed {
@@ -117,6 +132,7 @@ interface types {
         typed(typed),
         video(video-frame),
         audio(audio-data),
+        marks(marks),
     }
 
     /// A value: an item, or a list of items.
@@ -127,6 +143,7 @@ interface types {
         typed(typed),
         video(video-frame),
         audio(audio-data),
+        marks(marks),
         items(list<item>),
     }
 }

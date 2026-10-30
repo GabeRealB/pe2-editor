@@ -38,7 +38,7 @@ impl Textures {
         Textures { uploaded: HashMap::new(), pictures: Some(pictures) }
     }
 
-    fn get(&mut self, ctx: &egui::Context, texture: &Texture, upscale: Upscale) -> egui::TextureId {
+    pub fn get(&mut self, ctx: &egui::Context, texture: &Texture, upscale: Upscale) -> egui::TextureId {
         let key = (texture.key().to_string(), upscale);
         if let Some((image, handle)) = self.uploaded.get(&key)
             && image.upgrade().is_some_and(|i| Arc::ptr_eq(&i, texture.image()))

@@ -11,7 +11,7 @@
 use std::marker::PhantomData;
 
 use crate::data::{Call, Pcm as PcmValue, Type, Typed, Value as Data};
-use crate::{Image as Pixels, Recognized, Result, Signature, Table as TableValue, anyhow, bail};
+use crate::{Image as Pixels, Marks as MarksValue, Recognized, Result, Signature, Table as TableValue, anyhow, bail};
 
 /// A type as an extension's code names it: the type the host checks, and how a value of it is stored.
 pub trait ValueType: 'static {
@@ -223,6 +223,28 @@ impl ValueType for Pcm {
 
     fn encode(value: PcmValue) -> Data {
         Data::Pcm(value)
+    }
+}
+
+/// What is marked on a node's pictures.
+pub struct Marks;
+
+impl ValueType for Marks {
+    type Value = MarksValue;
+
+    fn ty() -> Type {
+        Type::Marks
+    }
+
+    fn decode(data: Data, _: &Call<'_>) -> Result<MarksValue> {
+        match data {
+            Data::Marks(marks) => Ok(marks),
+            other => bail!("given {}, not marks", other.ty()),
+        }
+    }
+
+    fn encode(value: MarksValue) -> Data {
+        Data::Marks(value)
     }
 }
 

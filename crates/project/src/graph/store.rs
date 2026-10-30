@@ -65,8 +65,28 @@ pub enum Kept {
     Pcm { rate: u32, channels: u16, blob: Blob },
     Video { format: String, width: u32, height: u32, timestamp: u64, blob: Blob },
     Audio { format: String, sample_rate: u32, channels: u32, timestamp: u64, blob: Blob },
+    Marks { boxes: Vec<KeptMark>, summary: String, toggle: String, legend: bool },
     /// Its items, each kept by its own hash.
     List { items: Vec<String> },
+}
+
+/// A mark as kept.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeptMark {
+    name: String,
+    rect: [f32; 4],
+}
+
+impl KeptMark {
+    fn of(mark: &pe2_ext::Mark) -> KeptMark {
+        let r = mark.rect;
+        KeptMark { name: mark.name.clone(), rect: [r.x, r.y, r.width, r.height] }
+    }
+
+    fn into_mark(self) -> pe2_ext::Mark {
+        let [x, y, width, height] = self.rect;
+        pe2_ext::Mark { name: self.name, rect: pe2_ext::Rect { x, y, width, height } }
+    }
 }
 
 impl Kept {
@@ -77,7 +97,7 @@ impl Kept {
             Kept::Image { blob, .. } | Kept::Pcm { blob, .. } | Kept::Video { blob, .. } | Kept::Audio { blob, .. } => {
                 vec![blob]
             }
-            Kept::Table { .. } | Kept::List { .. } => vec![],
+            Kept::Table { .. } | Kept::Marks { .. } | Kept::List { .. } => vec![],
         }
     }
 }
@@ -234,6 +254,12 @@ impl Store {
                 timestamp: sound.timestamp,
                 blob: self.put_blob(sound.buffer.bytes())?,
             },
+            Value::Marks(marks) => Kept::Marks {
+                boxes: marks.boxes.iter().map(KeptMark::of).collect(),
+                summary: marks.summary.clone(),
+                toggle: marks.toggle.clone(),
+                legend: marks.legend,
+            },
             Value::List(items) => {
                 let mut hashes = Vec::with_capacity(items.len());
                 for item in items {
@@ -292,6 +318,12 @@ impl Store {
                 timestamp,
             }),
             Kept::Table { table } => Value::Table(table),
+            Kept::Marks { boxes, summary, toggle, legend } => Value::Marks(pe2_ext::Marks {
+                boxes: boxes.into_iter().map(KeptMark::into_mark).collect(),
+                summary,
+                toggle,
+                legend,
+            }),
             Kept::Pcm { rate, channels, blob } => {
                 let bytes = self.read_blob(&blob)?;
                 let samples = bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)).collect();

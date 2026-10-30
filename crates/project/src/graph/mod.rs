@@ -72,6 +72,7 @@ pub fn hash(value: &Value) -> String {
             sound.timestamp,
             sha1(sound.buffer.bytes())
         ),
+        Value::Marks(marks) => format!("marks\n{marks:?}"),
         Value::List(items) => items.iter().fold(String::from("list\n"), |mut text, item| {
             let _ = writeln!(text, "{}", hash(item));
             text

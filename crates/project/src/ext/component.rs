@@ -1836,6 +1836,19 @@ fn value_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<types
             channels: sound.channels,
             timestamp: sound.timestamp,
         }),
+        Data::Marks(marks) => types::Value::Marks(types::Marks {
+            boxes: marks
+                .boxes
+                .into_iter()
+                .map(|m| types::Mark {
+                    name: m.name,
+                    rect: types::Rect { x: m.rect.x, y: m.rect.y, width: m.rect.width, height: m.rect.height },
+                })
+                .collect(),
+            summary: marks.summary,
+            toggle: marks.toggle,
+            legend: marks.legend,
+        }),
     })
 }
 
@@ -1847,6 +1860,7 @@ fn item_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<Option
         types::Value::Typed(t) => types::Item::Typed(t),
         types::Value::Video(v) => types::Item::Video(v),
         types::Value::Audio(a) => types::Item::Audio(a),
+        types::Value::Marks(m) => types::Item::Marks(m),
         types::Value::Items(_) => return Ok(None),
     }))
 }
@@ -1868,6 +1882,7 @@ fn value_from_wit(value: types::Value, table: &mut ResourceTable) -> Result<pe2_
         types::Value::Typed(t) => item_from_wit(types::Item::Typed(t), table),
         types::Value::Video(v) => item_from_wit(types::Item::Video(v), table),
         types::Value::Audio(a) => item_from_wit(types::Item::Audio(a), table),
+        types::Value::Marks(m) => item_from_wit(types::Item::Marks(m), table),
         types::Value::Items(items) => {
             Ok(pe2_ext::Data::List(items.into_iter().map(|i| item_from_wit(i, table)).collect::<Result<_>>()?))
         }
@@ -1905,6 +1920,12 @@ fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext
             sample_rate: a.sample_rate,
             channels: a.channels,
             timestamp: a.timestamp,
+        }),
+        types::Item::Marks(m) => Data::Marks(pe2_ext::Marks {
+            boxes: m.boxes.into_iter().map(|b| pe2_ext::Mark { name: b.name, rect: rect(b.rect) }).collect(),
+            summary: m.summary,
+            toggle: m.toggle,
+            legend: m.legend,
         }),
     })
 }

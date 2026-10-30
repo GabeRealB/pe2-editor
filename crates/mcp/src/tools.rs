@@ -555,6 +555,12 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
         })),
         Made::Pcm(pcm) => text(json!({ "rate": pcm.rate, "channels": pcm.channels, "samples": pcm.samples.len() })),
         Made::List(items) => text(json!({ "items": items.len(), "type": value.ty().to_string() })),
+        Made::Marks(marks) => text(json!({
+            "marks": marks.boxes.iter().map(|m| json!({
+                "name": m.name, "x": m.rect.x, "y": m.rect.y, "width": m.rect.width, "height": m.rect.height,
+            })).collect::<Vec<_>>(),
+            "summary": marks.summary,
+        })),
         Made::Video(frame) => text(json!({
             "video": frame.format.name(), "width": frame.width, "height": frame.height,
             "timestamp": frame.timestamp, "bytes": frame.buffer.size(),

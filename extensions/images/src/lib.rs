@@ -2,8 +2,8 @@
 //! an atlas (texels in cells, each cell through its own palette).
 //!
 //! It registers what the host shows an image by: its picture in each of its looks and its palettes as parts, its
-//! thumbnail, its fields' labels and readings, its view (the picture on a canvas, with an atlas's cells or a wide
-//! texture's pages over it), its inspector sections (palettes, variants, cells), what agents are told of it and its
+//! thumbnail, its fields' labels and readings, what is marked on it (an atlas's cells, a wide texture's pages), its
+//! inspector sections (palettes, variants, cells), what agents are told of it and its
 //! palette tool; and VRAM - its slots (`vram_slot`) and the panel showing what an asset uploads where.
 
 mod extract;
@@ -11,7 +11,7 @@ mod inspector;
 mod ora;
 mod texels;
 mod tools;
-mod view;
+mod marks;
 mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
@@ -74,6 +74,13 @@ fn register(r: &mut Registry) -> Result<()> {
         let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no parts") };
         part_of(&call.lend_settings(&image.derived).asset(), &image, &part).ok_or_else(|| pe2_ext::anyhow!("it has no part {part}"))
     });
+    // What is marked on it: an atlas's cells, a wide texture's pages.
+    let marked = r.op("marks").label("Cells and pages").input::<NativeForm>("native").output::<ty::Marks>().run(|call| {
+        Ok(match call.take::<NativeForm>(0)? {
+            ty::Either::First(_) => pe2_ext::Marks::default(),
+            ty::Either::Second(image) => marks::of(&call.lend_settings(&image.derived).asset()),
+        })
+    });
     let image = r
         .kind("image")
         .alias("image")
@@ -89,7 +96,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("palettes").custom())
         .field(Field::new("cells").custom())
         .field(Field::new("variants").custom())
-        .view("Picture", |asset| Box::new(view::ImageView::new(asset)))
         .inspector("Palettes, variants and cells", |_| Box::new(inspector::Collections::default()))
         .parts(parts)
         // Its picture in each look; its palettes, variants and cells drawn.
@@ -97,6 +103,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] })
         .output("part", &part, Retain::Transient)
         .members(|asset| parts(asset).into_iter().map(|p| (p.id, p.label)).collect())
+        .output("marks", &marked, Retain::Transient)
         .register();
     let mut roles = HashMap::new();
     for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {

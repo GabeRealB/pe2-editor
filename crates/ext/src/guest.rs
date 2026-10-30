@@ -889,6 +889,12 @@ fn to_wit(value: Data) -> types::Value {
             channels: sound.channels,
             timestamp: sound.timestamp,
         }),
+        Data::Marks(marks) => types::Value::Marks(types::Marks {
+            boxes: marks.boxes.into_iter().map(|m| types::Mark { name: m.name, rect: rect(&m.rect) }).collect(),
+            summary: marks.summary,
+            toggle: marks.toggle,
+            legend: marks.legend,
+        }),
     }
 }
 
@@ -942,6 +948,7 @@ fn item_to_wit(value: Data) -> Option<types::Item> {
         types::Value::Typed(t) => types::Item::Typed(t),
         types::Value::Video(v) => types::Item::Video(v),
         types::Value::Audio(a) => types::Item::Audio(a),
+        types::Value::Marks(m) => types::Item::Marks(m),
         types::Value::Items(_) => return None,
     })
 }
@@ -973,6 +980,7 @@ fn from_wit(value: types::Value) -> Data {
         types::Value::Typed(t) => item_from_wit(types::Item::Typed(t)),
         types::Value::Video(v) => item_from_wit(types::Item::Video(v)),
         types::Value::Audio(a) => item_from_wit(types::Item::Audio(a)),
+        types::Value::Marks(m) => item_from_wit(types::Item::Marks(m)),
         types::Value::Items(items) => Data::List(items.into_iter().map(item_from_wit).collect()),
     }
 }
@@ -1002,6 +1010,19 @@ fn item_from_wit(item: types::Item) -> Data {
             sample_rate: a.sample_rate,
             channels: a.channels,
             timestamp: a.timestamp,
+        }),
+        types::Item::Marks(m) => Data::Marks(crate::Marks {
+            boxes: m
+                .boxes
+                .into_iter()
+                .map(|b| crate::Mark {
+                    name: b.name,
+                    rect: crate::Rect { x: b.rect.x, y: b.rect.y, width: b.rect.width, height: b.rect.height },
+                })
+                .collect(),
+            summary: m.summary,
+            toggle: m.toggle,
+            legend: m.legend,
         }),
     }
 }

@@ -29,7 +29,7 @@ mod ui;
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
-pub use image::{Image, Rect, Texture};
+pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use data::{Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;

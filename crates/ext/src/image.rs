@@ -59,6 +59,26 @@ pub struct Rect {
     pub height: f32,
 }
 
+/// A named rectangle over a picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub name: String,
+    pub rect: Rect,
+}
+
+/// What is marked on a node's pictures, in their pixels and the same in each look: an atlas's cells, a wide texture's
+/// pages. The preview draws them over the picture.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Marks {
+    pub boxes: Vec<Mark>,
+    /// What they are, beside their toggle: "12 cells".
+    pub summary: String,
+    /// The toggle showing them: "Cells".
+    pub toggle: String,
+    /// Each in a color of its own, named in a corner and in a legend; else plain.
+    pub legend: bool,
+}
+
 /// An image a view shows, by a key the host keeps its upload under: the same key with the same image is uploaded
 /// once, a new image under it replaces the old. In a component the host holds the image, made once and shown by
 /// handle.

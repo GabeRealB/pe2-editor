@@ -441,7 +441,7 @@ pub(crate) fn stored_contents(value: &Value, out: &mut Vec<String>) {
             Content::Inline(_) => None,
         })),
         Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
-        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) => {}
+        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) | Value::Marks(_) => {}
     }
 }
 
