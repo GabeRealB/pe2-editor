@@ -83,6 +83,19 @@ fn own_copy(
     changeset: &mut Changeset,
     uid: &str,
 ) -> Result<String> {
+    own(tx, index, layer, layer_name, changeset, uid, |_| true)
+}
+
+/// A layer's own version of an entry, made of those of its files `keep` takes.
+fn own(
+    tx: &mut crate::history::Transaction<'_>,
+    index: &Index,
+    layer: &Layer,
+    layer_name: &str,
+    changeset: &mut Changeset,
+    uid: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Result<String> {
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
     if below.kind == Kind::Folder {
         bail!("{}: a folder is overridden by its files, one by one", below.path);
@@ -94,7 +107,8 @@ fn own_copy(
     let at = target(op, &below.path);
     let to = matches!(op, Some(Op::Move { .. })).then(|| at.clone());
     let base = below.hash.clone().with_context(|| format!("{}: no content to override", below.path))?;
-    copy_in(tx, layer, &at, &below.files)?;
+    let files: Vec<(String, PathBuf)> = below.files.iter().filter(|(file, _)| keep(file)).cloned().collect();
+    copy_in(tx, layer, &at, &files)?;
     changeset.ops.insert(uid.to_string(), Op::Override { base, to });
     save(tx, layer, changeset)?;
     Ok(at)
@@ -156,6 +170,28 @@ pub fn override_entry(
     let shown = index.below(layer_name, uid).map_or_default(|b| target(changeset.ops.get(uid), &b.path));
     let mut tx = history.begin(format!("Override {} in {layer_name}", name(&shown)));
     own_copy(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    tx.commit()
+}
+
+/// Override an asset from below with its declaration alone, not its files: for a stack that reads what it needs of the
+/// version it replaces (the graph's `below`), so a large file stays the layer's below. Returns the paths touched.
+///
+/// # Errors
+/// As `override_entry`.
+pub fn override_declaration(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    uid: &str,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    if changeset.entries.contains_key(uid) {
+        bail!("{layer_name} makes it: it is the layer's own already");
+    }
+    let shown = index.below(layer_name, uid).map_or_default(|b| target(changeset.ops.get(uid), &b.path));
+    let mut tx = history.begin(format!("Override {} in {layer_name}", name(&shown)));
+    own(&mut tx, index, layer, layer_name, &mut changeset, uid, |file| file == crate::index::ASSET_FILE)?;
     tx.commit()
 }
 

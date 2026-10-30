@@ -164,6 +164,9 @@ impl OpDef {
 
 /// The built-in operations' names.
 pub const FILE: &str = "file";
+/// The version of a node the layer below has: an output of it (`output`, its `native` where unsaid), read as another
+/// node's. What an override keeps of what it replaces need not be copied: an import of a movie reads the STR it replaces.
+pub const BELOW: &str = "below";
 pub const CONSTANT: &str = "constant";
 pub const OUTPUT: &str = "output";
 pub const GRAPH: &str = "graph";
@@ -195,6 +198,11 @@ impl Default for Ops {
         ops.add(OpDef::new(CONSTANT, "Constant", "1").makes(Type::Table, |call| {
             let value = call.settings().get("value").and_then(Toml::as_table).cloned();
             value.map(Value::Table).ok_or_else(|| anyhow::anyhow!("its `value` is not a table"))
+        }));
+        ops.add(OpDef::new(BELOW, "The version below", "1").makes(Type::Any, |call| {
+            let address = call.settings().get("output").and_then(Toml::as_str).unwrap_or("native");
+            let reference = format!("{}{}", crate::index::BELOW, exec::id(call.recorder().node()));
+            call.output_of(&Toml::String(reference), address).map(|value| (*value).clone())
         }));
         ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)));
         ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {

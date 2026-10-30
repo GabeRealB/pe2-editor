@@ -3,15 +3,18 @@
 //! (INTER0.STR, INTER1.STR) are containers holding movies back to back (`pe2.game`'s `stream`), assembled from them; a
 //! record of a stage (`pe2.game`'s `movie_slot`) names the movie it plays. This extension extracts the movies from their
 //! containers (`extract`), says what one's stream is from a few of its sectors (`stream`): a movie is tens of
-//! megabytes - and decodes its video and sound to play it (`frames`), what `pe2.movies` takes a movie to be.
+//! megabytes - and decodes its video and sound to play it (`frames`), what `pe2.movies` takes a movie to be. Extraction
+//! makes no source of a movie: STR is its only truth, and what a source would hold is lossy by then. An import brings a
+//! stream to `encode`, which is held to the STR it replaces.
 //!
 //! A video file is made of that stream by what provides the `video-container` service; that dependency is optional, as
-//! a movie plays without one: without one a movie has no `mp4` output, nothing else changing.
+//! a movie plays without one: without one a movie has no `video` output, nothing else changing.
 
 use formats::str::{Coding, SECTOR, SECTORS_A_SECOND, Sector};
 use pe2_ext::ty::{self, Files, Registered, ValueType};
 use pe2_ext::{Asset, Call, Data, Name, Registry, Result, Retain, Signature, Table, Type, Value, anyhow};
 
+mod encode;
 mod extract;
 mod frames;
 
@@ -85,14 +88,20 @@ fn register(r: &mut Registry) -> Result<()> {
         let clip = call.take::<Str>(0)?;
         Ok(Box::new(frames::Frames::start(call, clip)?))
     });
+    // A movie made of a stream, with the one it replaces, as the layer below has it: an import's last step.
+    let _ = r.op("encode").label("STR").input::<ty::Stream<Playback>>("frames").input::<Str>("original").output::<Str>().run(|call| {
+        let stream = call.take::<ty::Stream<Playback>>(0)?;
+        let original = call.take::<Str>(1)?;
+        encode::encode(call, &stream, &original)
+    });
     r.add_stack(MOVIE, STACK);
     r.add_output(MOVIE, "stream", "pe2.str@stream", None, Retain::Transient);
     r.add_output(MOVIE, "frames", "pe2.str@frames", None, Retain::Transient);
     // Shown by a frame a quarter in: the first are often black.
     r.add_output(MOVIE, "frame", "pe2.movies@frame", Some("frames"), Retain::Transient)
         .members(|asset| timing(asset).map(|t| (t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect());
-    // A movie's frames, as a video file: made when it is asked for.
-    r.add_output(MOVIE, "mp4", "video-container@mp4_write", Some("frames"), Retain::Cache);
+    // A movie's frames, as a video file in an encoding: made when it is asked for.
+    r.add_output(MOVIE, "video", "video-container@encode", Some("frames"), Retain::Cache).members(|_| vec![("lossless".to_string(), "Lossless".to_string())]);
     let movie = Name::parse(MOVIE).ok_or_else(|| anyhow!("{MOVIE}: not a qualified kind"))?;
     let _ = r.extractor("clips", &movie, &[], extract::begin);
     Ok(())

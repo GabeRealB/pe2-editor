@@ -30,6 +30,9 @@ use crate::{FILE, Layer, LayerKind, Project, uid};
 
 pub const BUNDLE_SUFFIX: &str = ".asset";
 pub const ASSET_FILE: &str = "asset.toml";
+
+/// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
+pub const BELOW: &str = "below:";
 const STORE: &str = "index.db";
 
 /// A file of a bundle, from the layer whose version of the asset wins.
@@ -182,6 +185,8 @@ pub struct Below {
     pub hash: Option<String>,
     /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
     pub files: Vec<(String, PathBuf)>,
+    /// The layer holding its content.
+    pub layer: String,
 }
 
 /// A layer in the stack as the layer panel shows it.
@@ -803,6 +808,9 @@ pub type Report<'a> = dyn Fn(&str, usize, usize) + 'a;
 pub struct Index {
     /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
     pub assets: BTreeMap<String, Arc<Asset>>,
+    /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
+    /// nodes of their own, read through the graph's `below` operation.
+    versions: HashMap<String, Arc<Asset>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
     pub entries: Arc<BTreeMap<String, Entry>>,
@@ -856,6 +864,7 @@ impl Index {
         }
         let mut index = Index {
             assets: BTreeMap::new(),
+            versions: HashMap::new(),
             entries: Arc::default(),
             read: 0,
             by_uid: Arc::default(),
@@ -1334,6 +1343,7 @@ impl Index {
             path: path.clone(),
             hash: self.content_hash(*content, content_path, node.kind),
             files,
+            layer: source.name.clone(),
         })
     }
 
@@ -1641,8 +1651,63 @@ impl Index {
                     made_by: None,
                 });
             }
+            let (uid, top, overridden) = (node.uid.clone(), layer.name.clone(), !node.overrides.is_empty());
+            let at = asset.path.clone();
             self.assets.insert(asset.path.clone(), Arc::new(asset));
+            self.versions.retain(|version, _| version.trim_start_matches(BELOW) != uid);
+            if overridden {
+                self.assemble_versions(&at, &uid, top);
+            }
         }
+    }
+
+    /// The versions an asset overrides, each below the last, from the layer holding it.
+    fn assemble_versions(&mut self, at: &str, uid: &str, mut layer: String) {
+        let mut name = format!("{BELOW}{uid}");
+        while let Some(below) = self.below(&layer, uid) {
+            let mut asset = Asset {
+                path: at.to_string(),
+                uid: Some(name.clone()),
+                kind: None,
+                role: None,
+                variants: vec![],
+                files: vec![],
+                layers: vec![below.layer.clone()],
+                error: None,
+                text: Arc::from(""),
+                fields: OnceLock::new(),
+                imported: None,
+                applied: None,
+            };
+            for (file_name, file) in &below.files {
+                let Some(record) = self.records.get(file) else { continue };
+                if file_name == ASSET_FILE
+                    && let Some(d) = &record.declaration
+                {
+                    asset.kind.clone_from(&d.kind);
+                    asset.role.clone_from(&d.role);
+                    asset.text = d.text.clone();
+                }
+                asset.files.push(BundleFile {
+                    name: file_name.clone(),
+                    path: file.clone(),
+                    size: record.size,
+                    modified: record.modified,
+                    layer: below.layer.clone(),
+                    sha1: record.sha1.clone(),
+                    made_by: None,
+                });
+            }
+            self.versions.insert(name.clone(), Arc::new(asset));
+            name.insert_str(0, BELOW);
+            layer = below.layer;
+        }
+    }
+
+    /// A version an asset overrides, by its name: `below:<uid>`.
+    #[must_use]
+    pub fn version(&self, name: &str) -> Option<&Asset> {
+        self.versions.get(name).map(Arc::as_ref)
     }
 
     /// Resolve the uids and the references, and add what is wrong with the assets' declarations.
@@ -1837,6 +1902,11 @@ mod tests {
         assert!(index.assets["g/a"].files.iter().all(|f| f.layer == "top"));
         assert_eq!(index.assets["c"].uid, Some(uid_of("b.asset")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
+        // What it overrides is there, a node of its own.
+        let below = index.version("below:uid://a").unwrap();
+        assert_eq!((below.uid.as_deref(), below.layers.as_slice()), (Some("below:uid://a"), ["base".to_string()].as_slice()));
+        assert!(below.files.iter().all(|f| f.layer == "base"));
+        assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
         write(&root, ".layers/base/g/a.asset/native.texels", "retouched");
         let (_, index) = open(&root);

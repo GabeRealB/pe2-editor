@@ -1937,7 +1937,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 Ok(Box::new(ComponentGenerator { shared: shared.clone(), runner, resource: Some(resource), header })
                     as Box<dyn pe2_ext::Generator>)
             });
-            return;
+            continue;
         }
         let _ = builder.run(move |call| {
             let given = std::mem::take(&mut call.inputs);

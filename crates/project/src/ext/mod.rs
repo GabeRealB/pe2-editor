@@ -536,7 +536,15 @@ impl Extensions {
         }
         self.panels.extend(parts.panels);
         self.tools.extend(parts.tools);
-        self.services.extend(parts.services.into_iter().map(|s| (s.name.to_string(), s)));
+        // Its services, by their names and the services it provides, as its operations are: what requires one names
+        // them so.
+        let provided: Vec<&str> = extension.provides.iter().map(|p| requirement(p).0).collect();
+        for service in parts.services {
+            for name in &provided {
+                self.services.insert(format!("{name}@{}", service.name.local()), service.clone());
+            }
+            self.services.insert(service.name.to_string(), service);
+        }
         self.recognizers.extend(parts.types.iter().filter(|t| t.recognizable()).cloned());
         // Its operations, by their names and the services it provides: what requires one names them so.
         let offered: Vec<&str> = extension.provides.iter().map(|p| requirement(p).0).collect();
@@ -1322,7 +1330,9 @@ pub struct Graph<'a> {
 
 impl graph::exec::World for Graph<'_> {
     fn node(&self, reference: &toml::Value) -> Option<(&dyn graph::exec::Node, graph::Plan)> {
-        let asset: &index::Asset = if let Some(path) = reference.as_str().filter(|r| !r.starts_with("uid://")) {
+        let asset: &index::Asset = if let Some(version) = reference.as_str().filter(|r| r.starts_with(index::BELOW)) {
+            self.index.version(version)?
+        } else if let Some(path) = reference.as_str().filter(|r| !r.starts_with("uid://")) {
             self.index.assets.get(path)?
         } else {
             let (uid, path) = index::reference(reference)?;
@@ -1399,6 +1409,13 @@ impl StreamHost {
 impl pe2_ext::CallHost for StreamHost {
     fn path(&self) -> &str {
         &self.path
+    }
+
+    fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
+        match content {
+            pe2_ext::Content::Inline(_) => None,
+            pe2_ext::Content::Stored { sha1, .. } => StreamHost::path_of(self, sha1).ok().map(|p| p.display().to_string()),
+        }
     }
 
     fn kind(&self) -> Option<&str> {
