@@ -798,6 +798,24 @@ impl Extensions {
         graph::Plan::of(fields, &self.operations(), &self.tail(asset))
     }
 
+    /// An asset's plan as its declaration is written, applied or not: what its stack would do, for whoever edits it.
+    #[must_use]
+    pub fn plan_written(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
+        graph::Plan::of(asset.fields(), &self.operations(), &self.tail(asset))
+    }
+
+    /// The operations a stack's layer may be that take what comes down to it, each by the name it goes by - a service's,
+    /// where it provides one - and its label, in the labels' order. One taking several inputs belongs in a graph layer.
+    #[must_use]
+    pub fn layers_taking(&self, above: &pe2_ext::Type) -> Vec<(String, String)> {
+        let fits = |def: &pe2_ext::OpDef| matches!(def.inputs.as_slice(), [port] if port.ty.unify(above, &mut Vec::new()));
+        let by_service = |def: &pe2_ext::OpDef| self.ops.iter().any(|(name, other)| other.name == def.name && *name != def.name.to_string());
+        let named = self.ops.iter().filter(|(name, def)| fits(def) && (**name != def.name.to_string() || !by_service(def)));
+        let mut layers: Vec<(String, String)> = named.map(|(name, def)| (name.clone(), def.label.clone())).collect();
+        layers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        layers
+    }
+
     /// The assets whose outputs read those of these, through others or not: each referring to one whose stack reads
     /// the outputs of what it refers to (a `references` layer). These not among them, unless they read each other.
     #[must_use]
@@ -1692,6 +1710,15 @@ mod tests {
         assert!(wrong[0].contains("test.shape@clip"), "{wrong:?}");
         // A name nothing claims says nothing: told when it runs.
         assert_eq!(problems(&stack("a.bin", "wants")), Vec::<String>::new());
+        // What comes down to each layer, and so what may be added there.
+        let fields: toml::Table = stack("a.clip", "takes").parse().unwrap();
+        let (plan, _) = crate::graph::Plan::of(&fields, &extensions.operations(), &[]);
+        assert_eq!(plan.above.len(), 3);
+        assert_eq!(plan.above[0], None);
+        assert_eq!(plan.above[2], Some(pe2_ext::Type::Table));
+        let offered = extensions.layers_taking(plan.above[1].as_ref().unwrap());
+        assert_eq!(offered.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["test.shape@takes"]);
+        assert_eq!(extensions.layers_taking(&pe2_ext::Type::Table), Vec::<(String, String)>::new());
         // What the version below makes, as it is declared.
         let below = |ty: &str| format!("[[stack]]\nop = \"below\"\ntype = \"{ty}\"\n[[stack]]\nop = \"test.shape@takes\"\n");
         assert_eq!(problems(&below("test.shape@clip")), Vec::<String>::new());

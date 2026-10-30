@@ -650,7 +650,7 @@ impl Sourcing<'_> {
 }
 
 /// A bundle's `asset.toml` with a stack added, before the originals.
-fn with_stack(toml: &str, stack: &str) -> String {
+pub(crate) fn with_stack(toml: &str, stack: &str) -> String {
     let body = toml.find("\n[original.").map_or(toml.len(), |i| i + 1);
     let (body, originals) = toml.split_at(body);
     let separator = if originals.is_empty() { "" } else { "\n" };

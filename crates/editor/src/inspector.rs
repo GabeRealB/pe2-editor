@@ -838,14 +838,22 @@ fn stack_ui(
         .collect();
     let ops = ws.extensions.operations();
     let field_edit = &mut ws.field_edit;
-    // What is wrong with it, told from its shape.
-    let (_, wrong) = ws.extensions.plan(asset);
+    // What is wrong with it as it is written, told from its shape, and what comes down to each layer.
+    let (plan, wrong) = ws.extensions.plan_written(asset);
+    let editable = target.is_ok();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for (i, layer) in layers.iter().enumerate() {
                 let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
                 let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
-                ui.label(RichText::new(format!("{i}")).color(theme::weak()));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{i}")).color(theme::weak()));
+                    if editable {
+                        let (above, below) = (plan.above.get(i).cloned().flatten(), plan.above.get(i + 1).cloned().flatten());
+                        let place = Place { asset, at: i, count: layers.len(), above: above.as_ref(), below: below.as_ref() };
+                        layer_menu(ui, &ws.extensions, &ws.index, &place, edit);
+                    }
+                });
                 match op {
                     project::graph::FILE => {
                         ui.label(RichText::new("Stored file").color(theme::weak()));
@@ -886,16 +894,120 @@ fn stack_ui(
                 ui.end_row();
             }
         });
-        for problem in &wrong {
-            let said = format!("{}: {}", problem_place(&problem.at), problem.what);
-            ui.label(RichText::new(said).small().color(ui.visuals().error_fg_color));
+        if editable {
+            ui.menu_button(format!("{}  Add layer", icons::PLUS), |ui| {
+                let end = plan.above.last().cloned().flatten();
+                add_items(ui, &ws.extensions, &ws.index, asset, layers.len(), end.as_ref(), edit);
+            });
         }
+        problems_ui(ui, &wrong);
         if !settings.is_empty() {
             ui.add_space(4.0);
             property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
         }
         fits_ui(ui, &fits, name);
     });
+}
+
+/// What is wrong with a stack, each as its rows number it.
+fn problems_ui(ui: &mut egui::Ui, wrong: &[project::graph::Problem]) {
+    for problem in wrong {
+        let said = format!("{}: {}", problem_place(&problem.at), problem.what);
+        ui.label(RichText::new(said).small().color(ui.visuals().error_fg_color));
+    }
+}
+
+/// A layer of a stack, for its menu: where it is, what comes down to it and what comes out of it.
+struct Place<'a> {
+    asset: &'a Asset,
+    at: usize,
+    count: usize,
+    above: Option<&'a pe2_ext::Type>,
+    below: Option<&'a pe2_ext::Type>,
+}
+
+/// A change to a stack's layers, as an edit: `change` the declaration's text to the text wanted.
+fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<String>) -> Option<EditRequest> {
+    Some(EditRequest::Write {
+        uid: asset.uid.clone().unwrap_or_default(),
+        file: project::index::ASSET_FILE.to_string(),
+        bytes: text.ok()?.into_bytes(),
+        label,
+        merge: None,
+    })
+}
+
+/// A layer's menu: moving it, removing it, and adding one over or under it.
+fn layer_menu(ui: &mut egui::Ui, extensions: &project::ext::Extensions, index: &project::index::Index, place: &Place, edit: &mut Option<EditRequest>) {
+    use project::graph::layers;
+    let (asset, at) = (place.asset, place.at);
+    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    ui.menu_button(icons::DOTS_THREE, |ui| {
+        if ui.add_enabled(at > 0, egui::Button::new(format!("{}  Move up", icons::ARROW_UP))).clicked() {
+            *edit = layers_edit(asset, format!("Move a layer of {name} up"), layers::shift(asset.text(), at, at - 1));
+        }
+        if ui.add_enabled(at + 1 < place.count, egui::Button::new(format!("{}  Move down", icons::ARROW_DOWN))).clicked() {
+            *edit = layers_edit(asset, format!("Move a layer of {name} down"), layers::shift(asset.text(), at, at + 1));
+        }
+        if ui.button(format!("{}  Remove", icons::TRASH)).clicked() {
+            *edit = layers_edit(asset, format!("Remove a layer of {name}"), layers::remove(asset.text(), at));
+        }
+        ui.separator();
+        ui.menu_button(format!("{}  Add above", icons::PLUS), |ui| {
+            add_items(ui, extensions, index, asset, at, place.above, edit);
+        });
+        ui.menu_button(format!("{}  Add below", icons::PLUS), |ui| {
+            add_items(ui, extensions, index, asset, at + 1, place.below, edit);
+        });
+    });
+}
+
+/// What may be added at a place of a stack: what takes what comes down to it, a tap and a graph; on top, where nothing
+/// comes down, what starts a stack - a stored file, or the version below.
+fn add_items(
+    ui: &mut egui::Ui,
+    extensions: &project::ext::Extensions,
+    index: &project::index::Index,
+    asset: &Asset,
+    at: usize,
+    above: Option<&pe2_ext::Type>,
+    edit: &mut Option<EditRequest>,
+) {
+    use project::graph::{self, layers};
+    let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    let mut add = |ui: &mut egui::Ui, label: &str, says: &str, layer: toml::Table| {
+        if ui.button(label).on_hover_text(says).clicked() {
+            *edit = layers_edit(asset, format!("Add {label} to {name}"), layers::add(asset.text(), at, layer));
+            ui.close();
+        }
+    };
+    let table = |entries: &[(&str, &str)]| -> toml::Table { entries.iter().map(|(k, v)| ((*k).to_string(), toml::Value::from(*v))).collect() };
+    if let Some(above) = above {
+        for (op, label) in extensions.layers_taking(above) {
+            add(ui, &label, &op, table(&[("op", op.as_str())]));
+        }
+        ui.separator();
+        let taken: Vec<&str> = asset.fields().get("stack").and_then(toml::Value::as_array).into_iter().flatten().filter_map(|l| l.get("name")?.as_str()).collect();
+        let names = std::iter::once("output".to_string()).chain((2..=taken.len() + 2).map(|n| format!("output_{n}")));
+        let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
+        add(ui, "Output", "A tap: what is here, as an output of this node", table(&[("op", graph::OUTPUT), ("name", free.as_str())]));
+    } else {
+        for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::ASSET_FILE) {
+            add(ui, &file.name, "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
+        }
+        let version = asset.uid.as_ref().and_then(|uid| index.version(&format!("{}{uid}", project::index::BELOW)));
+        if let Some(version) = version {
+            // Its type declared, as a stack's shape cannot reach the version below.
+            let (plan, _) = extensions.plan(version);
+            let native = plan.outputs.iter().find(|o| o.name == "native").map(|o| plan.steps[o.from].ty.to_string());
+            let mut layer = table(&[("op", graph::BELOW)]);
+            if let Some(native) = native {
+                layer.insert("type".into(), native.into());
+            }
+            add(ui, "The version below", "What the layer below has of this asset, its native form, not copied", layer);
+        }
+    }
+    add(ui, "Graph", "Operations wired together, its result going on down", table(&[("op", graph::GRAPH)]));
 }
 
 /// Where a problem of a stack is, as its rows number it: `stack[0].ops.encoded` is layer 0's operation `encoded`.

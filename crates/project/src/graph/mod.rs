@@ -18,6 +18,7 @@
 //! and keeps only their trace - what they read, by hash - so a copy is known stale without the value being kept.
 
 pub mod exec;
+pub mod layers;
 pub mod store;
 pub mod stream;
 
@@ -322,6 +323,9 @@ pub struct Plan {
     pub steps: Vec<Step>,
     pub outputs: Vec<Output>,
     pub result: Option<usize>,
+    /// What comes down to each layer of its stack, by its place, and last what comes out of it: what a layer put there
+    /// is given. None where nothing does.
+    pub above: Vec<Option<Type>>,
 }
 
 /// An output a node's kind adds after its stack: made by an operation from the stack's result - or from what another
@@ -368,6 +372,7 @@ impl Plan {
                 None
             }
         };
+        lowering.plan.above.push(result.map(|step| lowering.plan.steps[step].ty.clone()));
         lowering.plan.result = result;
         // The node as its readers see it is its result: kept - by the stack where an output keeps it, else by the
         // host - unless it is a stored file, which its readers see as it is, or a family (one asset is no family).
@@ -515,6 +520,8 @@ impl Lowering<'_> {
     fn stack(&mut self, layers: &[Toml]) -> Option<usize> {
         let mut above: Option<usize> = None;
         for (i, layer) in layers.iter().enumerate() {
+            let passed = above.map(|step: usize| self.plan.steps[step].ty.clone());
+            self.plan.above.push(passed);
             let at = format!("stack[{i}]");
             let Some(layer) = layer.as_table() else {
                 self.problem(&at, "is not a table");
