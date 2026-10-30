@@ -97,6 +97,9 @@ pub fn ports(name: &str, ty: Type) -> Port {
 /// What an operation does when it runs.
 pub type Run = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Value> + Send + Sync;
 
+/// What an operation makes, as its settings say.
+pub type OutputOf = dyn Fn(&Table) -> Option<Type> + Send + Sync;
+
 /// What a stream operation does when it is opened: starts what makes its items.
 pub type Start = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Box<dyn stream::Producer>> + Send + Sync;
 
@@ -114,13 +117,23 @@ pub struct OpDef {
     pub run: Option<Arc<Run>>,
     /// For a stream operation: how it is opened.
     pub start: Option<Arc<Start>>,
+    /// What it makes as its settings say, where they say: what a stored file's name or a declared type tells of it
+    /// before anything runs, in place of `output`.
+    pub output_of: Option<Arc<OutputOf>>,
 }
 
 impl OpDef {
     #[must_use]
     pub fn new(name: &str, label: &str, version: &str) -> OpDef {
         let (name, label, version) = (name.to_string(), label.to_string(), version.to_string());
-        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None }
+        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None, output_of: None }
+    }
+
+    /// What it makes by its settings, where they say more than `output`.
+    #[must_use]
+    pub fn output_of(mut self, output_of: impl Fn(&Table) -> Option<Type> + Send + Sync + 'static) -> OpDef {
+        self.output_of = Some(Arc::new(output_of));
+        self
     }
 
     /// With a parameter: what reaches it is a family of it.
@@ -165,7 +178,8 @@ impl OpDef {
 /// The built-in operations' names.
 pub const FILE: &str = "file";
 /// The version of a node the layer below has: an output of it (`output`, its `native` where unsaid), read as another
-/// node's. What an override keeps of what it replaces need not be copied: an import of a movie reads the STR it replaces.
+/// node's, of the `type` it declares (else any, told when it runs). What an override keeps of what it replaces need not
+/// be copied: an import of a movie reads the STR it replaces.
 pub const BELOW: &str = "below";
 pub const CONSTANT: &str = "constant";
 pub const OUTPUT: &str = "output";
@@ -199,10 +213,15 @@ impl Default for Ops {
             let value = call.settings().get("value").and_then(Toml::as_table).cloned();
             value.map(Value::Table).ok_or_else(|| anyhow::anyhow!("its `value` is not a table"))
         }));
-        ops.add(OpDef::new(BELOW, "The version below", "1").makes(Type::Any, |call| {
+        let declared = |settings: &Table| Type::parse(settings.get("type")?.as_str()?, "").ok();
+        ops.add(OpDef::new(BELOW, "The version below", "1").output_of(declared).makes(Type::Any, move |call| {
             let address = call.settings().get("output").and_then(Toml::as_str).unwrap_or("native");
             let reference = format!("{}{}", crate::index::BELOW, exec::id(call.recorder().node()));
-            call.output_of(&Toml::String(reference), address).map(|value| (*value).clone())
+            let value = (*call.output_of(&Toml::String(reference), address)?).clone();
+            if let Some(ty) = declared(call.settings()) {
+                anyhow::ensure!(ty.unify(&value.ty(), &mut Vec::new()), "the version below makes {}, not {ty}", value.ty());
+            }
+            Ok(value)
         }));
         ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)));
         ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {
@@ -486,7 +505,8 @@ impl Lowering<'_> {
                 }
             }
         }
-        let ty = def.output.as_ref().map_or(Type::Any, |t| t.bind(&bound));
+        let told = def.output_of.as_ref().and_then(|output_of| output_of(&settings));
+        let ty = told.unwrap_or_else(|| def.output.as_ref().map_or(Type::Any, |t| t.bind(&bound)));
         self.plan.steps.push(Step { op: op.to_string(), settings, inputs, ty, at: at.to_string() });
         self.plan.steps.len() - 1
     }

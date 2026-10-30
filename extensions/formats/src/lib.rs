@@ -30,7 +30,7 @@ impl Registered for Png {
     const MEDIA_TYPE: Option<&str> = Some("image/png");
 
     fn signatures() -> Vec<Signature> {
-        vec![at(0, b"\x89PNG\r\n\x1a\n")]
+        vec![at(0, b"\x89PNG\r\n\x1a\n"), Signature::Name("*.png".into())]
     }
 }
 
@@ -45,7 +45,7 @@ impl Registered for Ora {
     const MEDIA_TYPE: Option<&str> = Some("image/openraster");
 
     fn signatures() -> Vec<Signature> {
-        vec![at(30, b"mimetypeimage/openraster")]
+        vec![at(30, b"mimetypeimage/openraster"), Signature::Name("*.ora".into())]
     }
 }
 

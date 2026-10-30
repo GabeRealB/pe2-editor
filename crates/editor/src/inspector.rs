@@ -838,6 +838,8 @@ fn stack_ui(
         .collect();
     let ops = ws.extensions.operations();
     let field_edit = &mut ws.field_edit;
+    // What is wrong with it, told from its shape.
+    let (_, wrong) = ws.extensions.plan(asset);
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for (i, layer) in layers.iter().enumerate() {
@@ -884,12 +886,26 @@ fn stack_ui(
                 ui.end_row();
             }
         });
+        for problem in &wrong {
+            let said = format!("{}: {}", problem_place(&problem.at), problem.what);
+            ui.label(RichText::new(said).small().color(ui.visuals().error_fg_color));
+        }
         if !settings.is_empty() {
             ui.add_space(4.0);
             property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
         }
         fits_ui(ui, &fits, name);
     });
+}
+
+/// Where a problem of a stack is, as its rows number it: `stack[0].ops.encoded` is layer 0's operation `encoded`.
+fn problem_place(at: &str) -> String {
+    let Some(rest) = at.strip_prefix("stack[") else { return at.to_string() };
+    let (layer, inside) = rest.split_once(']').unwrap_or((rest, ""));
+    match inside.strip_prefix(".ops.") {
+        Some(operation) => format!("Layer {layer}, {operation}"),
+        None => format!("Layer {layer}"),
+    }
 }
 
 /// A stack's layer of an operation: its label and name, then its settings, a row of their own under it.
@@ -1100,6 +1116,13 @@ pub fn size_text(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_problem_says_where_it_is_as_the_rows_number_it() {
+        assert_eq!(super::problem_place("stack[0].ops.encoded"), "Layer 0, encoded");
+        assert_eq!(super::problem_place("stack[2]"), "Layer 2");
+        assert_eq!(super::problem_place("kind.outputs[3]"), "kind.outputs[3]");
+    }
+
     use super::item;
 
     #[test]

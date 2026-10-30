@@ -11,8 +11,8 @@
 //! a movie plays without one: without one a movie has no `video` output, nothing else changing.
 
 use formats::str::{Coding, SECTOR, SECTORS_A_SECOND, Sector};
-use pe2_ext::ty::{self, Files, Registered, ValueType};
-use pe2_ext::{Asset, Call, Data, Name, Registry, Result, Retain, Signature, Table, Type, Value, anyhow};
+use pe2_ext::ty::{self, Files, Registered};
+use pe2_ext::{Asset, Name, Registry, Result, Retain, Signature, Table, Value, anyhow};
 
 mod encode;
 mod extract;
@@ -43,30 +43,6 @@ impl Registered for Str {
 
 impl Files for Str {}
 
-/// An item of a movie's stream, as `pe2.movies` registers it.
-pub struct Playback;
-
-impl ValueType for Playback {
-    type Value = Data;
-
-    fn ty() -> Type {
-        Type::Named(Self::NAME.to_string())
-    }
-
-    fn decode(data: Data, _: &Call<'_>) -> Result<Data> {
-        Ok(data)
-    }
-
-    fn encode(value: Data) -> Data {
-        value
-    }
-}
-
-impl Registered for Playback {
-    const NAME: &str = "pe2.movies@playback";
-    const LABEL: &str = "Playback";
-}
-
 /// A movie's stack: its stored sectors.
 const STACK: &str = r#"[[stack]]
 op = "file"
@@ -84,13 +60,13 @@ fn register(r: &mut Registry) -> Result<()> {
         Ok(self::stream(&call.lend(&clip).asset()))
     });
     // Played: each frame with the sound up to it.
-    let _ = r.op("frames").label("Frames").input::<Str>("clip").output::<Playback>().streams(|call| {
+    let _ = r.op("frames").label("Frames").input::<Str>("clip").output::<ty::Playback>().streams(|call| {
         let clip = call.take::<Str>(0)?;
         Ok(Box::new(frames::Frames::start(call, clip)?))
     });
     // A movie made of a stream, with the one it replaces, as the layer below has it: an import's last step.
-    let _ = r.op("encode").label("STR").input::<ty::Stream<Playback>>("frames").input::<Str>("original").output::<Str>().run(|call| {
-        let stream = call.take::<ty::Stream<Playback>>(0)?;
+    let _ = r.op("encode").label("STR").input::<ty::Stream<ty::Playback>>("frames").input::<Str>("original").output::<Str>().run(|call| {
+        let stream = call.take::<ty::Stream<ty::Playback>>(0)?;
         let original = call.take::<Str>(1)?;
         encode::encode(call, &stream, &original)
     });

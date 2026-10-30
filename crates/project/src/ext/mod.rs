@@ -1092,7 +1092,9 @@ impl Extensions {
         let mut ops = graph::Ops::default();
         let recognizers = Arc::new(self.recognizers.clone());
         let any_file = pe2_ext::Type::File(Box::new(pe2_ext::Type::Any));
-        let stored = graph::OpDef::new(graph::FILE, "Stored file", "1").makes(any_file, move |call| {
+        let by_name = recognizers.clone();
+        let named = move |settings: &toml::Table| named_type(&by_name, settings.get("file")?.as_str()?);
+        let stored = graph::OpDef::new(graph::FILE, "Stored file", "1").output_of(named).makes(any_file, move |call| {
             let name = call.setting_str("file")?.to_string();
             let node = call.recorder().node();
             let head = node.read_head(&name, HEAD);
@@ -1218,6 +1220,21 @@ fn type_names<'a>(types: impl Iterator<Item = &'a TypeDef>) -> Vec<String> {
 }
 
 /// The types a file of a name and size is recognized as, by its first bytes: each by its index among `types`.
+/// What a stored file is by its name alone, as a stack's shape tells it: a file of the types named so. Other signatures
+/// need its bytes, so a name nothing claims says nothing - and a name is a hint, the bytes told when it runs.
+fn named_type(types: &[TypeDef], name: &str) -> Option<pe2_ext::Type> {
+    use pe2_ext::{Signature, Type};
+    let claims = |pattern: &str| pattern.strip_prefix('*').map_or(name == pattern, |suffix| name.ends_with(suffix));
+    let claimed = types.iter().filter(|t| t.signatures.iter().any(|s| matches!(s, Signature::Name(p) if claims(p))));
+    let mut answers: Vec<Type> = type_names(claimed).into_iter().map(Type::Named).collect();
+    let of = match answers.len() {
+        0 => return None,
+        1 => answers.remove(0),
+        _ => Type::Union(answers),
+    };
+    Some(Type::File(Box::new(of)))
+}
+
 fn recognize_head(types: &[TypeDef], name: &str, size: u64, head: &[u8]) -> Vec<(usize, Recognized)> {
     let text = match std::str::from_utf8(head) {
         Ok(t) => !t.contains('\0'),
@@ -1635,6 +1652,50 @@ mod tests {
         register: fn(&mut Registry) -> Result<()>,
     ) -> Loadable {
         Extension { id, version, requires, weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register }.into()
+    }
+
+    #[test]
+    fn a_stack_is_checked_from_its_shape() {
+        struct Clip;
+        impl pe2_ext::ty::Registered for Clip {
+            const NAME: &str = "test.shape@clip";
+            const LABEL: &str = "A clip";
+            fn signatures() -> Vec<pe2_ext::Signature> {
+                vec![pe2_ext::Signature::Name("*.clip".into())]
+            }
+        }
+        impl pe2_ext::ty::Files for Clip {}
+        struct Other;
+        impl pe2_ext::ty::Registered for Other {
+            const NAME: &str = "test.shape@other";
+            const LABEL: &str = "Another";
+        }
+        impl pe2_ext::ty::Files for Other {}
+        fn register(r: &mut Registry) -> Result<()> {
+            let _ = r.value_type::<Clip>();
+            let _ = r.value_type::<Other>();
+            let _ = r.op("takes").input::<Clip>("clip").output::<pe2_ext::ty::Table>().run(|_| Ok(toml::Table::new()));
+            let _ = r.op("wants").input::<Other>("other").output::<pe2_ext::ty::Table>().run(|_| Ok(toml::Table::new()));
+            Ok(())
+        }
+        let extensions = Extensions::load(vec![extension("test.shape", "0.1.0", &[], register)], false);
+        assert_eq!(extensions.problems, Vec::<String>::new());
+        let problems = |text: &str| {
+            let fields: toml::Table = text.parse().unwrap();
+            crate::graph::Plan::of(&fields, &extensions.operations(), &[]).1.into_iter().map(|p| p.what).collect::<Vec<_>>()
+        };
+        let stack = |file: &str, op: &str| format!("[[stack]]\nop = \"file\"\nfile = \"{file}\"\n[[stack]]\nop = \"test.shape@{op}\"\n");
+        // Fits, and does not: told by the file's name and the operation's port, nothing run.
+        assert_eq!(problems(&stack("a.clip", "takes")), Vec::<String>::new());
+        let wrong = problems(&stack("a.clip", "wants"));
+        assert_eq!(wrong.len(), 1, "{wrong:?}");
+        assert!(wrong[0].contains("test.shape@clip"), "{wrong:?}");
+        // A name nothing claims says nothing: told when it runs.
+        assert_eq!(problems(&stack("a.bin", "wants")), Vec::<String>::new());
+        // What the version below makes, as it is declared.
+        let below = |ty: &str| format!("[[stack]]\nop = \"below\"\ntype = \"{ty}\"\n[[stack]]\nop = \"test.shape@takes\"\n");
+        assert_eq!(problems(&below("test.shape@clip")), Vec::<String>::new());
+        assert_eq!(problems(&below("test.shape@other")).len(), 1);
     }
 
     #[test]

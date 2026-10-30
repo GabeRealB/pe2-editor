@@ -248,6 +248,26 @@ impl<T: ValueType> ValueType for Stream<T> {
     }
 }
 
+/// An item of a stream of moving pictures, whoever makes or reads it: a frame's picture and the sound up to it, each
+/// where there is one.
+pub struct Playback;
+
+impl ValueType for Playback {
+    type Value = Data;
+
+    fn ty() -> Type {
+        Type::List(Box::new(Type::Union(vec![Type::Video, Type::Audio])))
+    }
+
+    fn decode(data: Data, _: &Call<'_>) -> Result<Data> {
+        Ok(data)
+    }
+
+    fn encode(value: Data) -> Data {
+        value
+    }
+}
+
 /// What is marked on a node's pictures.
 pub struct Marks;
 

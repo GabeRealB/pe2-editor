@@ -98,19 +98,19 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Video>();
     ask::register(r);
     // What is in a video file, as a stream.
-    let _ = r.op("decode").label("Frames and sound").input::<Video>("source").output::<ty::Any>().streams(|call| {
+    let _ = r.op("decode").label("Frames and sound").input::<Video>("source").output::<ty::Playback>().streams(|call| {
         let source = call.take::<Video>(0)?;
         Ok(Box::new(decode::Reading::start(call, &source)?))
     });
     let _ = r
         .op("encode")
         .label("Video file")
-        .input::<ty::Stream<ty::Any>>("frames")
+        .input::<ty::Stream<ty::Playback>>("frames")
         .output::<ty::File<Video>>()
         .parameter::<String>("encoding")
         .run(|call| {
             let encoding = Encoding::parse(&call.parameter::<String>()?)?;
-            let stream = call.take::<ty::Stream<ty::Any>>(0)?;
+            let stream = call.take::<ty::Stream<ty::Playback>>(0)?;
             let rate = stream.header().get("rate").and_then(Value::as_float).unwrap_or(15.0);
             let source = format!("source.{}", ask::extension(&encoding.container)?);
             let video = call.temp()?;
