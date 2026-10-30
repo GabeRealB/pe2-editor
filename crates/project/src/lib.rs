@@ -2,10 +2,12 @@
 //! the extraction that fills its game layer with asset bundles.
 
 pub mod applied;
+pub mod build;
 pub mod cache;
 pub mod changeset;
 pub mod declarations;
 pub mod edit;
+pub mod events;
 pub mod ext;
 pub mod extract;
 pub mod graph;
@@ -36,6 +38,41 @@ struct ProjectFile {
     mount: Vec<MountFile>,
     #[serde(default)]
     extensions: ExtensionsFile,
+    /// The builds it can be: `[config.<name>]`.
+    #[serde(default)]
+    config: std::collections::BTreeMap<String, ConfigFile>,
+    #[serde(default)]
+    build: BuildFile,
+}
+
+/// A build the project can be: `[config.<name>]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub name: String,
+    pub release: Option<String>,
+    /// The target building it, what its `target.<name>` sections are for.
+    pub target: Option<String>,
+    /// The assets left out of it, by path: no event reaches them, and looking for a kind's assets does not find them.
+    pub disabled: Vec<String>,
+}
+
+/// `[config.<name>]`: a release, and the target that builds it.
+#[derive(Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    release: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    disabled: Vec<String>,
+}
+
+/// `[build]`: where a build's results are also wanted.
+#[derive(Default, Deserialize)]
+struct BuildFile {
+    /// `[build.links]`: a link, relative to the project, for a deployed file: where a language server finds it.
+    #[serde(default)]
+    links: build::Links,
 }
 
 /// `[extensions]`: the extensions the project leaves off.
@@ -164,6 +201,10 @@ pub struct Project {
     pub disabled_extensions: Vec<String>,
     /// Its extensions' settings, by id (`[extensions."<id>"]`): the same for everyone on it.
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
+    /// The builds it can be, by name, in order.
+    pub configs: Vec<Config>,
+    /// Links wanted to what is deployed: where each goes, relative to the project, by the deployed file it stands for.
+    pub links: build::Links,
 }
 
 fn resolve_path(directory: &Path, value: &str) -> PathBuf {
@@ -247,7 +288,9 @@ impl Project {
                 _ => None,
             })
             .collect();
-        Ok(Project { root, game, layers, mounts, disabled_extensions, extension_settings })
+        let links = file.build.links;
+        let configs = file.config.into_iter().map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled }).collect();
+        Ok(Project { root, game, layers, mounts, disabled_extensions, extension_settings, configs, links })
     }
 
     /// A `res://` path's place on disk, through the mounts (the longest mount point first).

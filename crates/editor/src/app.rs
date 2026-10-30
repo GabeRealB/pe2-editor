@@ -14,6 +14,7 @@ use crate::panes::{self, EditorKind, Pane, PaneAction, PaneKind, PaneState, Pane
 use crate::settings::EditorSettings;
 use crate::windows::{Layouts, Window};
 use crate::workspace::{EditRequest, GraphAsk, Update, Workspace};
+use pe2_ext::events::{Build, Clean, ConfigChanged, Event};
 use crate::{icons, theme};
 use project::history::StepError;
 
@@ -143,6 +144,27 @@ pub struct Start {
     pub agents_drive: bool,
     /// The monitors, in pixels of the desktop: what a window's place is judged by.
     pub monitors: Vec<egui::Rect>,
+}
+
+/// An epoch running, in the status bar, and what stops it.
+fn epoch_status(ui: &mut egui::Ui, ws: &Workspace) {
+    if !ws.in_epoch() {
+        return;
+    }
+    ui.label(RichText::new("building").small().color(theme::weak()));
+    ui.add(egui::Spinner::new().size(10.0));
+    let cancel = ui.add(egui::Button::new(RichText::new("Cancel").small()).frame(false));
+    if cancel.on_hover_text("Stop once what is running now is done").clicked() {
+        ws.cancel_epoch();
+    }
+    ui.separator();
+}
+
+/// The config in use for a project: the one chosen, else its first.
+fn active_config(settings: &EditorSettings, project: &project::Project) -> Option<project::Config> {
+    let chosen = settings.active_configs.get(&project.root.display().to_string());
+    let found = chosen.and_then(|name| project.configs.iter().find(|config| config.name == *name));
+    found.or(project.configs.first()).cloned()
 }
 
 impl Editor {
@@ -319,6 +341,8 @@ impl Editor {
     /// Bring in what changed on disk; open the project again when its `project.toml` changed, keeping the selection.
     fn follow_disk(&mut self, ctx: &egui::Context) {
         let Some(ws) = &mut self.workspace else { return };
+        // The config in use, as what events set off reads it.
+        ws.config = active_config(&self.settings, &ws.project);
         ws.watch(ctx);
         ws.answer_agents();
         let focused = ctx.input(|i| i.focused);
@@ -328,6 +352,7 @@ impl Editor {
             Update::Refreshed(n) => {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
             }
+            Update::Said(said) => self.message = Some(said),
             Update::Reopen(why) => {
                 self.reopen();
                 self.message = Some(format!("{why}: the project was opened again"));
@@ -639,6 +664,8 @@ impl Editor {
             }
             Command::KeepTab | Command::ShowIn(_) => document.is_some(),
             Command::Import | Command::ReloadProject | Command::Refresh | Command::Extension(_) => ws.is_some(),
+            Command::Build | Command::Clean => ws.is_some_and(|ws| !ws.project.configs.is_empty()),
+            Command::CancelEpoch => ws.is_some_and(Workspace::in_epoch),
             Command::DeleteSelected => ws.is_some_and(|ws| ws.removing_selected().is_some()),
             Command::GraphFit | Command::GraphArrange => {
                 document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| state.editor == Some(EditorKind::Graph))
@@ -654,6 +681,13 @@ impl Editor {
                 self.open_dialog = Some(self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()));
             }
             Command::Import => self.import = Some(String::new()),
+            Command::Build => self.signal(Build::NAME),
+            Command::Clean => self.signal(Clean::NAME),
+            Command::CancelEpoch => {
+                if let Some(ws) = &self.workspace {
+                    ws.cancel_epoch();
+                }
+            }
             Command::ReloadProject => {
                 if let Some(root) = self.workspace.as_ref().map(|ws| ws.project.root.clone()) {
                     self.open(&root);
@@ -960,6 +994,47 @@ impl Editor {
     }
 
     /// The mode in use, at the end of the header, and what can be done with it.
+    /// The config in use for the project open.
+    fn active_config(&self) -> Option<project::Config> {
+        active_config(&self.settings, &self.workspace.as_ref()?.project)
+    }
+
+    /// Signal an event of the project open.
+    fn signal(&self, event: &str) {
+        if let Some(ws) = &self.workspace {
+            ws.signal(event);
+        }
+    }
+
+    /// The config in use: a header's dropdown, choosing one building for it.
+    fn config_menu(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.active_config() else { return };
+        let Some(ws) = self.workspace.as_ref() else { return };
+        let (configs, root) = (ws.project.configs.clone(), ws.project.root.display().to_string());
+        let mut chosen = None;
+        ui.scope(|ui| {
+            ui.menu_button(format!("{}  {}", active.name, icons::CARET_DOWN), |ui| {
+                for config in &configs {
+                    let label = config.target.as_ref().map_or_else(|| config.name.clone(), |target| format!("{}  ·  {target}", config.name));
+                    if ui.selectable_label(config.name == active.name, label).clicked() {
+                        chosen = Some(config.name.clone());
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                self.item(ui, Command::Build, "Build");
+                self.item(ui, Command::Clean, "Clean");
+            });
+        });
+        if let Some(name) = chosen {
+            self.settings.active_configs.insert(root, name);
+            if let Some(ws) = &mut self.workspace {
+                ws.config = active_config(&self.settings, &ws.project);
+            }
+            self.signal(ConfigChanged::NAME);
+        }
+    }
+
     fn mode_menu(&mut self, ui: &mut egui::Ui) {
         ui.scope(|ui| {
             let title = format!("{}  {}", self.layouts.modes[self.layouts.mode].name, icons::CARET_DOWN);
@@ -1259,6 +1334,7 @@ impl Editor {
             // The mode first, from the right: the path takes what is left, and gives way.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.mode_menu(ui);
+                self.config_menu(ui);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.toolbar(ui));
             });
         });
@@ -1362,6 +1438,7 @@ impl Editor {
                     ui.separator();
                 }
                 // Taking changes in, off the window's thread; or other programs' changes waiting for it.
+                epoch_status(ui, ws);
                 if ws.taking_in() {
                     ui.label(RichText::new("taking in changes").small().color(theme::weak()));
                     ui.add(egui::Spinner::new().size(10.0));

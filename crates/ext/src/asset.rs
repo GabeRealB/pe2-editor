@@ -47,6 +47,30 @@ pub trait Source {
         let _ = (path, name);
         None
     }
+    /// What an operation is lent of the project (`CallHost::entries`, `read_entry`): only a source for an operation's run has them.
+    fn entries(&self, folder: &str) -> Option<Result<Vec<String>>> {
+        let _ = folder;
+        None
+    }
+    fn read_entry(&self, path: &str) -> Option<Result<Vec<u8>>> {
+        let _ = path;
+        None
+    }
+    fn assets_of(&self, kind: &str) -> Option<Result<Vec<(String, String)>>> {
+        let _ = kind;
+        None
+    }
+    fn place(&self, path: &str) -> Option<String> {
+        let _ = path;
+        None
+    }
+    fn table_of(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
+        let _ = (path, address);
+        None
+    }
+    fn build_config(&self) -> Option<crate::data::BuildConfig> {
+        None
+    }
     fn path_of(&self, name: &str) -> Option<String> {
         let _ = name;
         None

@@ -114,6 +114,17 @@ fn ops() -> Ops {
         typed.files[0].content = Content::Inline(bytes);
         Ok(Value::Typed(typed))
     }));
+    ops.add(OpDef::new("t.tree", "Files of the project", "1").makes(file_type(), |call| {
+        ran(3);
+        let mut joined = Vec::new();
+        for path in call.entries("src")? {
+            joined.extend(call.read_entry(&path)?);
+        }
+        for (path, declaration) in call.assets_of("package")? {
+            joined.extend(format!("{path}{declaration}").into_bytes());
+        }
+        Ok(file(joined))
+    }));
     ops.add(OpDef::new("t.count", "Count", "1").input(port("in", file_type())).makes(Type::Table, |call| {
         ran(1);
         let input = call.take(0)?;
@@ -411,6 +422,59 @@ impl super::exec::World for Nodes {
     }
 }
 
+/// A node reading the project's plain files, held in a folder.
+struct Tree(Bundle, Ops, std::path::PathBuf);
+
+impl super::exec::World for Tree {
+    fn node(&self, _: &toml::Value) -> Option<(&dyn Node, Plan)> {
+        Some((&self.0 as &dyn Node, Plan::of(&self.0.fields, &self.1, &[]).0))
+    }
+
+    fn entries(&self, folder: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.2.join(folder)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names.into_iter().map(|name| format!("{folder}/{name}")).collect()
+    }
+
+    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
+        Some(self.2.join(path)).filter(|disk| disk.is_file())
+    }
+
+    fn assets_of(&self, _: &str) -> Vec<(String, String)> {
+        vec![("packages/one".to_string(), std::fs::read_to_string(self.2.join("declaration")).unwrap())]
+    }
+}
+
+#[test]
+fn what_is_made_from_the_projects_files_is_made_again_when_they_change() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tree/src")).unwrap();
+    std::fs::write(dir.join("tree/src/a.c"), "one").unwrap();
+    std::fs::write(dir.join("tree/declaration"), "public = []").unwrap();
+    let engine = Engine::new(ops(), Some(Store::at(dir.join("store")).unwrap()));
+    let declared = "[[stack]]\nop = \"t.tree\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
+    let world = Tree(Bundle::new(declared, &[]), engine.ops.clone(), dir.join("tree"));
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let make = || {
+        let (node, plan) = super::exec::World::node(&world, &toml::Value::String(String::new())).unwrap();
+        engine.output_in(Some(reach), &plan, node, "native", None, true).unwrap()
+    };
+    assert!(!make().kept);
+    assert!(make().kept, "nothing changed");
+    std::fs::write(dir.join("tree/src/a.c"), "two").unwrap();
+    assert!(!make().kept, "a file read changed");
+    assert!(make().kept);
+    std::fs::write(dir.join("tree/src/b.c"), "new").unwrap();
+    assert!(!make().kept, "a file came to the folder listed");
+    std::fs::remove_file(dir.join("tree/src/b.c")).unwrap();
+    assert!(!make().kept, "a file left it");
+    assert!(make().kept);
+    std::fs::write(dir.join("tree/declaration"), "public = [\"include\"]").unwrap();
+    assert!(!make().kept, "a declaration read changed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const PART: &str = "[[stack]]\nop = \"file\"\nfile = \"part.bin\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
 
 fn joining(parts: &str) -> String {
@@ -480,4 +544,83 @@ fn marks_are_kept_as_they_are() {
     store.put(&hash, &marks, &|_| None).unwrap();
     assert_eq!(store.get(&hash).unwrap(), marks);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn events_plan(stack: &str) -> (Plan, Vec<super::Problem>) {
+    let declaration: toml::Table = stack.parse().unwrap();
+    Plan::of(&declaration, &Ops::default(), &[])
+}
+
+const WIRED: &str = r#"
+[[stack]]
+op = "graph"
+result = "text"
+
+[stack.ops.text]
+op = "constant"
+value = {}
+
+[stack.ops.saved]
+op = "event"
+event = "saved"
+
+[stack.ops.busy]
+op = "event"
+event = "busy"
+
+[stack.ops.not_busy]
+op = "not"
+from = { inputs = "busy" }
+
+[stack.ops.ready]
+op = "and"
+from = { inputs = ["saved", "not_busy"] }
+
+[stack.ops.made]
+op = "output"
+name = "made"
+retain = "cache"
+from = { value = "text", pull = "ready" }
+
+[stack.ops.tell]
+op = "signal"
+event = "told"
+from = { when = "ready" }
+"#;
+
+#[test]
+fn gates_are_boxes_of_a_graph_and_what_they_come_to_wires_an_output() {
+    let (plan, problems) = events_plan(WIRED);
+    assert_eq!(problems, Vec::new());
+    let made = &plan.outputs[0];
+    let when = plan.expression(made.events.pull[0]);
+    assert!(when.holds(&|event| event == "saved"));
+    assert!(!when.holds(&|_| true));
+    assert!(when.waits());
+    assert_eq!(plan.rules.len(), 1);
+    assert_eq!(plan.rules[0].event, "told");
+}
+
+#[test]
+fn what_holds_with_nothing_signaled_is_no_trigger() {
+    let refused = WIRED.replace(r#"from = { value = "text", pull = "ready" }"#, r#"from = { value = "text", pull = "not_busy" }"#);
+    let (plan, problems) = events_plan(&refused);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].what.contains("every epoch"));
+    assert_eq!(plan.outputs[0].events.pull, Vec::<usize>::new());
+}
+
+#[test]
+fn deployed_outside_the_build_folder_is_refused() {
+    let elsewhere = WIRED.replace(r#"retain = "cache"
+from"#, r#"deploy = "../somewhere"
+from"#);
+    let (_, problems) = events_plan(&elsewhere);
+    assert!(problems.iter().any(|p| p.what.contains("under `build/`")), "{problems:?}");
+}
+
+#[test]
+fn a_gate_is_monotone_by_its_table() {
+    let monotone: Vec<&str> = crate::graph::GATES.iter().filter(|g| g.is_monotone()).map(|g| g.name).collect();
+    assert_eq!(monotone, ["and", "or"]);
 }

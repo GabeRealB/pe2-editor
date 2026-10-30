@@ -15,5 +15,7 @@ pe2-formats.workspace = true
 pe2-game.workspace = true
 pe2-images.workspace = true
 pe2-movies.workspace = true
+pe2-events.workspace = true
+pe2-packages.workspace = true
 pe2-str.workspace = true
 toml.workspace = true

@@ -67,6 +67,7 @@ pub enum PaneKind {
     Layer,
     History,
     Extensions,
+    Events,
     Panel(PanelName),
 }
 
@@ -87,6 +88,7 @@ enum StoredKind {
     Layer,
     History,
     Extensions,
+    Events,
     Panel(PanelName),
 }
 
@@ -106,6 +108,7 @@ impl From<StoredKind> for PaneKind {
             StoredKind::Layer => PaneKind::Layer,
             StoredKind::History => PaneKind::History,
             StoredKind::Extensions => PaneKind::Extensions,
+            StoredKind::Events => PaneKind::Events,
             StoredKind::Panel(name) => PaneKind::Panel(name),
         }
     }
@@ -113,7 +116,7 @@ impl From<StoredKind> for PaneKind {
 
 impl PaneKind {
     /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
-    pub const ALL: [PaneKind; 12] = [
+    pub const ALL: [PaneKind; 13] = [
         PaneKind::Assets,
         PaneKind::Document,
         PaneKind::Contents,
@@ -125,6 +128,7 @@ impl PaneKind {
         PaneKind::History,
         PaneKind::Project,
         PaneKind::Extensions,
+        PaneKind::Events,
         PaneKind::Settings,
     ];
 
@@ -154,6 +158,7 @@ impl PaneKind {
             PaneKind::Layer => icons::GIT_DIFF,
             PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
             PaneKind::Extensions => icons::PLUGS_CONNECTED,
+            PaneKind::Events => icons::TREE_STRUCTURE,
             PaneKind::Panel(name) => {
                 extensions::shared().panel(name.as_str()).and_then(|p| p.icon).map_or(icons::SQUARES_FOUR, icons::glyph)
             }
@@ -196,6 +201,7 @@ impl PaneKind {
             PaneKind::Layer => "Layer",
             PaneKind::History => "History",
             PaneKind::Extensions => "Extensions",
+            PaneKind::Events => "Events",
             PaneKind::Panel(name) => {
                 return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
             }
@@ -580,6 +586,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
+                    PaneKind::Events => crate::events_pane::events_ui(ui, ws, nav, message),
                     PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
                     PaneKind::Settings => {}
                 }
@@ -1812,6 +1819,26 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
         theme::section(ui, "Extensions", |ui| {
             for problem in &ws.extensions.problems {
                 ui.label(RichText::new(problem).color(ui.visuals().error_fg_color));
+            }
+        });
+    }
+    if let Some(epoch) = ws.last_epoch.as_ref().filter(|epoch| epoch.is_wrong()) {
+        theme::section(ui, &format!("Build  ·  {}", epoch.config), |ui| {
+            let wiring = epoch.problems.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
+            let failed = epoch.report.failed.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
+            let stale_why = "is stale: what it reads changed after it ran";
+            let stale = epoch.report.stale.iter().map(|(at, output)| (at, format!("{output} {stale_why}"), ui.visuals().warn_fg_color));
+            let shown: Vec<_> = wiring.chain(failed).chain(stale).collect();
+            for (at, why, tint) in shown {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icons::WARNING).color(tint));
+                        if ui.link(at.as_str()).clicked() {
+                            *nav = Some(at.clone());
+                        }
+                    });
+                    ui.label(RichText::new(why).monospace().color(theme::weak()));
+                });
             }
         });
     }

@@ -204,6 +204,31 @@ impl Source for Lent<'_> {
         Some(self.resource().temp().map_err(crate::Error::msg))
     }
 
+    fn entries(&self, folder: &str) -> Option<crate::Result<Vec<String>>> {
+        Some(self.resource().entries(folder).map_err(crate::Error::msg))
+    }
+
+    fn read_entry(&self, path: &str) -> Option<crate::Result<Vec<u8>>> {
+        Some(self.resource().read_entry(path).map_err(crate::Error::msg))
+    }
+
+    fn assets_of(&self, kind: &str) -> Option<crate::Result<Vec<(String, String)>>> {
+        Some(self.resource().assets_of(kind).map_err(crate::Error::msg))
+    }
+
+    fn place(&self, path: &str) -> Option<String> {
+        self.resource().place(path)
+    }
+
+    fn table_of(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
+        let told = self.resource().table_of(path, address).map_err(crate::Error::msg);
+        Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
+    }
+
+    fn build_config(&self) -> Option<crate::data::BuildConfig> {
+        self.resource().build_config().map(|c| crate::data::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder })
+    }
+
     fn keep(&self, path: &str, name: &str) -> Option<crate::Result<crate::File>> {
         Some(self.resource().keep(path, name).map(file_from_wit).map_err(crate::Error::msg))
     }
@@ -280,6 +305,11 @@ impl Project for Lens<'_> {
 
     fn part(&self, path: &str, part: &str) -> Option<crate::Result<Image>> {
         self.project.part(path, part).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    }
+
+    fn table(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
+        let told = self.project.table(path, address)?.map_err(crate::Error::msg);
+        Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
     }
 
     fn parts(&self, path: &str) -> Vec<crate::Part> {
@@ -770,6 +800,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         return Ok((number(parts), None));
     }
     let mut out = g::Registration {
+        events: parts.events.clone(),
+        hooks: parts.hooks.iter().map(|h| g::Hook { event: h.event.clone(), op: h.op.clone(), signals: h.signals.clone() }).collect(),
         kinds: vec![],
         roles: vec![],
         panels: vec![],
@@ -1010,6 +1042,30 @@ impl CallHost for NodeHost<'_> {
 
     fn writer(&self, name: &str) -> crate::Result<Box<dyn crate::FileWriter>> {
         Source::writer(self.0, name).ok_or_else(|| crate::anyhow!("the host makes no files for this call"))?
+    }
+
+    fn entries(&self, folder: &str) -> crate::Result<Vec<String>> {
+        Source::entries(self.0, folder).ok_or_else(|| crate::anyhow!("the host lists nothing here"))?
+    }
+
+    fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
+        Source::read_entry(self.0, path).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
+    }
+
+    fn assets_of(&self, kind: &str) -> crate::Result<Vec<(String, String)>> {
+        Source::assets_of(self.0, kind).ok_or_else(|| crate::anyhow!("the host finds nothing here"))?
+    }
+
+    fn place(&self, path: &str) -> Option<String> {
+        Source::place(self.0, path)
+    }
+
+    fn table_of(&self, path: &str, address: &str) -> crate::Result<crate::Table> {
+        Source::table_of(self.0, path, address).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
+    }
+
+    fn build_config(&self) -> Option<crate::data::BuildConfig> {
+        Source::build_config(self.0)
     }
 
     fn temp(&self) -> crate::Result<String> {

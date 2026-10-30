@@ -185,6 +185,14 @@ interface types {
 }
 
 interface host {
+    /// The config being built: its name, release and target, and the folder its results go to.
+    record build-config {
+        name: string,
+        release: option<string>,
+        target: option<string>,
+        folder: string,
+    }
+
     use types.{image, rect, style, icon, file};
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
@@ -212,6 +220,21 @@ interface host {
         keep: func(path: string, name: string) -> result<file, string>;
         /// For an unsandboxed extension's operation: where a content is on disk, to point a program at it.
         path-of: func(name: string) -> option<string>;
+        /// For an operation's run: the plain files under a folder of the project, each by its path, as the stack resolves it. What is
+        /// made is made again when the list changes.
+        entries: func(folder: string) -> result<list<string>, string>;
+        /// For an operation's run: a plain file of the project by its path, as the stack resolves it. What is made is made again when it
+        /// changes.
+        read-entry: func(path: string) -> result<list<u8>, string>;
+        /// For an operation's run: where a file or folder of the project is on disk, for what is told paths.
+        place: func(path: string) -> option<string>;
+        /// For an operation's run: another asset's output that is a table (TOML), recorded as read.
+        table-of: func(path: string, address: string) -> result<string, string>;
+        /// For an operation's run: the config being built, recorded as read.
+        build-config: func() -> option<build-config>;
+        /// For an operation's run: the assets of a kind, each by its path with its declaration as written. What is made is made again
+        /// when any changes, or one comes or goes.
+        assets-of: func(kind: string) -> result<list<tuple<string, string>>, string>;
     }
 
     /// A file being made, appended to a piece at a time and then finished: kept by the host as it comes - in memory
@@ -237,6 +260,8 @@ interface host {
         picture: func(path: string, look: u32) -> option<result<image, string>>;
         part: func(path: string, part: string) -> option<result<image, string>>;
         parts: func(path: string) -> list<tuple<string, string, list<string>>>;
+        /// An output of an asset that is a table (TOML): none where it has no such output, or why it could not be made.
+        table: func(path: string, address: string) -> option<result<string, string>>;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
         /// the services of the extensions this one requires, or its own.
         call: func(service: string, arguments: string) -> result<string, string>;
@@ -626,8 +651,20 @@ interface guest {
         stack: string,
     }
 
+    /// An operation run where an event is signaled.
+    record hook {
+        event: string,
+        /// The operation, qualified.
+        op: string,
+        /// The events it signals, where it succeeds.
+        signals: list<string>,
+    }
+
     record registration {
         kinds: list<kind>,
+        /// The events it declares, by name, with their labels.
+        events: list<tuple<string, string>>,
+        hooks: list<hook>,
         roles: list<role>,
         panels: list<panel>,
         tools: list<tool>,

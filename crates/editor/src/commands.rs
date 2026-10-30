@@ -20,6 +20,9 @@ pub enum Command {
     Redo,
     Refresh,
     DeleteSelected,
+    Build,
+    Clean,
+    CancelEpoch,
     Back,
     Forward,
     Up,
@@ -51,12 +54,12 @@ impl Command {
     /// Every command but the modes, which are the user's: a list that changes.
     pub fn all() -> Vec<Command> {
         use Command::{
-            ActualSize, Back, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward, Fullscreen, GraphArrange, GraphFit,
+            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward, Fullscreen, GraphArrange, GraphFit,
             Import, KeepTab, Maximize, NewMode, NextTab, OpenProject, Palette, PreviousTab, Quit, Redo, Refresh, ReloadProject,
             ResetLayout, ResetMode, Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
         };
         let fixed = [
-            Palette, OpenProject, Import, ReloadProject, Quit, Settings, Undo, Redo, Refresh, DeleteSelected, Back, Forward, Up,
+            Palette, OpenProject, Import, ReloadProject, Quit, Settings, Undo, Redo, Refresh, DeleteSelected, Build, Clean, CancelEpoch, Back, Forward, Up,
             CloseTab, KeepTab, NextTab, PreviousTab, ShowIn(EditorKind::Preview), ShowIn(EditorKind::Files),
             ShowIn(EditorKind::Graph), GraphFit, GraphArrange, DocumentsOnly, Maximize, Fullscreen, ResetLayout, NewMode,
             ResetMode, DeleteMode, ZoomIn, ZoomOut, ActualSize,
@@ -76,6 +79,9 @@ impl Command {
             Command::Palette => "palette".to_string(),
             Command::OpenProject => "file.open".to_string(),
             Command::Import => "file.import".to_string(),
+            Command::Build => "file.build".to_string(),
+            Command::Clean => "file.clean".to_string(),
+            Command::CancelEpoch => "file.cancel_build".to_string(),
             Command::ReloadProject => "file.reload".to_string(),
             Command::Quit => "file.quit".to_string(),
             Command::Settings => "edit.settings".to_string(),
@@ -115,6 +121,9 @@ impl Command {
             Command::Palette => "Commands".to_string(),
             Command::OpenProject => "Open project…".to_string(),
             Command::Import => "Import files…".to_string(),
+            Command::Build => "Build".to_string(),
+            Command::Clean => "Clean".to_string(),
+            Command::CancelEpoch => "Cancel build".to_string(),
             Command::ReloadProject => "Reload project".to_string(),
             Command::Quit => "Quit".to_string(),
             Command::Settings => "Settings".to_string(),
@@ -159,6 +168,7 @@ impl Command {
             Command::Undo => &["ctrl+Z"],
             Command::Redo => &["ctrl+shift+Z", "ctrl+Y"],
             Command::Refresh => &["F5"],
+            Command::Build => &["ctrl+b"],
             Command::DeleteSelected => &["Delete"],
             Command::GraphFit => &["Home"],
             Command::Fullscreen => &["F11"],

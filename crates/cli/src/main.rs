@@ -4,7 +4,8 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use pe2_ext::events::{Build, Clean, Event};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "pe2-cli", about = "The Parasite Eve II editor's tools")]
@@ -93,6 +94,38 @@ enum ProjectCommand {
         #[arg(long)]
         declarations: Option<PathBuf>,
     },
+    /// Build a project's packages for a config
+    Build {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The config (the project's first by default)
+        #[arg(long)]
+        config: Option<String>,
+        /// Clean first
+        #[arg(long)]
+        clean: bool,
+    },
+    /// Remove what a build deployed, and make it again next time
+    Clean {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The config (the project's first by default)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Signal an event, and wait for what it sets off
+    Signal {
+        /// The event's name
+        event: String,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The config (the project's first by default)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 const TOOLS: &[&str] = &["project", "convert", "uid"];
@@ -142,6 +175,58 @@ fn palette_to_png(input: &std::path::Path, output: &std::path::Path) -> Result<(
     write_png(output, palette.width.max(1), palette.rows.len().max(1), png::ColorType::Rgba, &rgba)
 }
 
+/// How long an editor is given to run an epoch.
+const EPOCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Run an epoch for each of these events, in turn, and say what came of them.
+fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
+    let p = project::Project::load(project)?;
+    // An editor with the project open holds it: it runs them, and says what came of them.
+    let events_named: Vec<String> = events.iter().map(ToString::to_string).collect();
+    let request = mcp::Request::Signal { events: events_named, config: config.map(str::to_string) };
+    if let Some(reply) = mcp::link::forward_within(&p.root, &request, EPOCH_PATIENCE) {
+        let said = reply.told().map_err(anyhow::Error::msg)?;
+        if !said.is_empty() {
+            println!("{said}");
+        }
+        return Ok(());
+    }
+    let chosen = p.configs.iter().find(|c| config.is_none_or(|name| c.name == name));
+    let chosen = chosen.with_context(|| "no such config in project.toml")?.clone();
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
+    let cache = project::cache::Cache::open(&p, &lock)?;
+    let index = project::index::Index::open(&p, &cache)?;
+    let extensions = extensions::for_project(&p, Some(&index));
+    for problem in &extensions.problems {
+        eprintln!("warning: {problem}");
+    }
+    extensions.keep_in(project::graph::store::Store::open(&cache)?);
+    let wiring = project::build::wiring(&index, &extensions, &chosen);
+    for (at, why) in &wiring.problems {
+        eprintln!("{at}: {why}");
+    }
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut failed = false;
+    for event in events {
+        let roots = [(*event).to_string()];
+        let report = project::build::epoch(&p, &index, &extensions, &wiring, &chosen, &roots, &cancel);
+        for (asset, output) in &report.made {
+            println!("{asset}: {output}");
+        }
+        for (asset, output) in &report.stale {
+            eprintln!("{asset}: {output} is stale: what it reads changed after it ran");
+        }
+        for (asset, why) in &report.failed {
+            eprintln!("{asset}: {why}");
+            failed = true;
+        }
+    }
+    anyhow::ensure!(!failed, "it failed");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let invoked = std::path::Path::new(&args[0]).file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -154,6 +239,12 @@ fn main() -> Result<()> {
             texture_to_png(&input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
         }
         Tool::Convert { command: ConvertCommand::Palette { input, output } } => palette_to_png(&input, &output)?,
+        Tool::Project { command: ProjectCommand::Build { project, config, clean } } => {
+            let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
+            signal(&project, config.as_deref(), events)?;
+        }
+        Tool::Project { command: ProjectCommand::Clean { project, config } } => signal(&project, config.as_deref(), &[Clean::NAME])?,
+        Tool::Project { command: ProjectCommand::Signal { event, project, config } } => signal(&project, config.as_deref(), &[event.as_str()])?,
         Tool::Project { command: ProjectCommand::Extract { project, release, roms, declarations } } => {
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {

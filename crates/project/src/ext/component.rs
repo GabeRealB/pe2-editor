@@ -462,6 +462,32 @@ impl host::HostAsset for State {
         })
     }
 
+    fn entries(&mut self, asset: Resource<LentAsset>, folder: String) -> wasmtime::Result<Result<Vec<String>, String>> {
+        Ok(self.lent(&asset)?.entries(&folder).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    }
+
+    fn read_entry(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        Ok(self.lent(&asset)?.read_entry(&path).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    }
+
+    fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<String>> {
+        Ok(self.lent(&asset)?.place(&path))
+    }
+
+    fn table_of(&mut self, asset: Resource<LentAsset>, path: String, address: String) -> wasmtime::Result<Result<String, String>> {
+        let told = self.lent(&asset)?.table_of(&path, &address).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        Ok(told.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
+    }
+
+    fn build_config(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<host::BuildConfig>> {
+        let told = self.lent(&asset)?.build_config();
+        Ok(told.map(|c| host::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder }))
+    }
+
+    fn assets_of(&mut self, asset: Resource<LentAsset>, kind: String) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
+        Ok(self.lent(&asset)?.assets_of(&kind).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    }
+
     fn temp(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Result<String, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
@@ -562,6 +588,13 @@ impl host::HostProject for State {
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
         Ok(elsewhere(project, move |p| p.part(&path, &part).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+    }
+
+    fn table(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<Option<Result<String, String>>> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| {
+            p.table(&path, &address).map(|made| made.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
+        }))
     }
 
     fn parts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<Vec<(String, String, Vec<String>)>> {
@@ -1859,6 +1892,12 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         let _ = registry.setting(setting(s)?);
     }
     add_outputs(registry, &registration.additions, registration.kinds.len(), shared)?;
+    for (name, label) in &registration.events {
+        registry.add_event(name, label);
+    }
+    for hook in registration.hooks {
+        registry.add_hook(pe2_ext::HookDef { event: hook.event, op: hook.op, signals: hook.signals });
+    }
     for (kind, stack) in &registration.stacks {
         registry.add_stack(kind, stack);
     }
@@ -2156,6 +2195,30 @@ impl Source for Node<'_> {
 
     fn temp(&self) -> Option<Result<String>> {
         Some(self.host.temp())
+    }
+
+    fn entries(&self, folder: &str) -> Option<Result<Vec<String>>> {
+        Some(self.host.entries(folder))
+    }
+
+    fn read_entry(&self, path: &str) -> Option<Result<Vec<u8>>> {
+        Some(self.host.read_entry(path))
+    }
+
+    fn place(&self, path: &str) -> Option<String> {
+        self.host.place(path)
+    }
+
+    fn table_of(&self, path: &str, address: &str) -> Option<Result<Table>> {
+        Some(self.host.table_of(path, address))
+    }
+
+    fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {
+        self.host.build_config()
+    }
+
+    fn assets_of(&self, kind: &str) -> Option<Result<Vec<(String, String)>>> {
+        Some(self.host.assets_of(kind))
     }
 
     fn keep(&self, path: &str, name: &str) -> Option<Result<pe2_ext::File>> {

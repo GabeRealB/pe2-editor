@@ -15,8 +15,10 @@ members = [
     "extensions/game",
     "extensions/images",
     "extensions/movies",
+    "extensions/packages",
     "extensions/str",
     "extensions/ffmpeg",
+    "extensions/psx",
 ]
 
 [workspace.package]
@@ -49,6 +51,8 @@ pe2-formats = { path = "extensions/formats" }
 pe2-game = { path = "extensions/game" }
 pe2-images = { path = "extensions/images" }
 pe2-movies = { path = "extensions/movies" }
+pe2-events = { path = "extensions/events" }
+pe2-packages = { path = "extensions/packages" }
 pe2-str = { path = "extensions/str" }
 mcp = { path = "crates/mcp" }
 # The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.

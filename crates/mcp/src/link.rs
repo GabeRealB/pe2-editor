@@ -40,6 +40,12 @@ fn name(root: &Path) -> std::io::Result<Name<'static>> {
 /// Hand a request to the editor serving the project in `root`; none when no editor is.
 #[must_use]
 pub fn forward(root: &Path, request: &Request) -> Option<Reply> {
+    forward_within(root, request, PATIENCE)
+}
+
+/// Hand a request to the editor serving the project in `root`, waiting this long for its answer; none when no editor is.
+#[must_use]
+pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
     let stream = Stream::connect(name(root).ok()?).ok()?;
     let line = serde_json::to_string(request).ok()?;
     // Read on a thread of its own, so an editor that does not answer is given up on.
@@ -54,7 +60,7 @@ pub fn forward(root: &Path, request: &Request) -> Option<Reply> {
         })();
         let _ = send.send(result);
     });
-    Some(match receive.recv_timeout(PATIENCE) {
+    Some(match receive.recv_timeout(patience) {
         Ok(Ok(reply)) => serde_json::from_str(&reply)
             .unwrap_or_else(|e| Reply::Error(format!("the editor's reply could not be read: {e}"))),
         Ok(Err(e)) => Reply::Error(format!("the editor's link failed: {e}")),

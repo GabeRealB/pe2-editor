@@ -395,8 +395,26 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
                     }
                 }
             });
+            config_toggle(ui, ws, asset);
         });
     });
+}
+
+/// Whether the config in use holds the asset, for what has to do with a build: an asset with no part in one has nothing to say.
+fn config_toggle(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
+    let Some(config) = ws.config.clone() else { return };
+    let (plan, _) = ws.extensions.plan(asset);
+    let wired = plan.outputs.iter().any(|output| !output.events.pull.is_empty());
+    if !wired && !config.disabled.contains(&asset.path) {
+        return;
+    }
+    let mut holds = !config.disabled.contains(&asset.path);
+    let toggle = ui.checkbox(&mut holds, RichText::new(format!("In {}", config.name)).small());
+    if toggle.on_hover_text("Left out, no event reaches it and nothing finds it among its kind").changed()
+        && let Err(why) = ws.set_disabled(&asset.path, !holds)
+    {
+        ws.watch_error = Some(why);
+    }
 }
 
 pub fn badge(ui: &mut egui::Ui, text: &str) {
@@ -1341,7 +1359,16 @@ fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, to
     let set = |key: &str, unset: &str| (key.to_string(), layer.get(key).cloned().unwrap_or_else(|| unset.into()));
     let retain = Field::new("retain").label("Kept").choices([("transient", "Not kept"), ("cache", "In the cache"), ("build", "With the build")]);
     let when = Field::new("when").label("Made").choices([("lazy", "When asked for"), ("eager", "As soon as it can be")]);
-    (vec![Field::new("name").label("Name"), retain, when], vec![set("name", ""), set("retain", "transient"), set("when", "lazy")])
+    let mut fields = vec![Field::new("name").label("Name"), retain, when];
+    let mut values = vec![set("name", ""), set("retain", "transient"), set("when", "lazy")];
+    // What it has to do with events, where it has.
+    for (key, label) in [("pull", "Made on"), ("listen", "Stale on"), ("deploy", "Goes to"), ("ran", "Ran"), ("changed", "Changed"), ("failed", "Failed")] {
+        if let Some(value) = layer.get(key) {
+            fields.push(Field::new(key).label(label));
+            values.push((key.to_string(), value.clone()));
+        }
+    }
+    (fields, values)
 }
 
 /// A layer's settings, for its sheet: its fields, and what each is, what a setting left out comes to where that is known.

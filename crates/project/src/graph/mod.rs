@@ -29,6 +29,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use toml::{Table, Value as Toml};
 
+use crate::events::Expr;
+
 pub use pe2_ext::{Content, Data as Value, File, Image, Pcm, Port, Retain, Type, Typed};
 
 /// A value's hash: of its type and its contents - a file's by its content's hash, inline or stored alike.
@@ -197,6 +199,49 @@ pub const RESULT: &str = "result";
 /// What a graph layer's operations name the result above it by.
 pub const ABOVE: &str = "above";
 
+/// An event as a box: it holds while its `event` is signaled. What it is the value of is no value: only a gate, a pull or a listen takes it.
+pub const EVENT: &str = "event";
+/// Signal an `event` where what it takes holds: a box that makes nothing, as an output does.
+pub const SIGNAL: &str = "signal";
+/// What event boxes pass along.
+pub const SIGNAL_TYPE: &str = "pe2.events@signal";
+
+/// An event gate: a truth table.
+#[derive(Debug)]
+pub struct Gate {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub table: fn(&[bool]) -> bool,
+}
+
+impl PartialEq for Gate {
+    fn eq(&self, other: &Gate) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Gate {}
+
+impl Gate {
+    /// Whether a further input turning on can only ever leave it true, so that it may be told before its inputs have settled. Found from its table.
+    #[must_use]
+    pub fn is_monotone(&self) -> bool {
+        let of = |bits: u8| [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
+        (0..8u8).all(|low| (0..8u8).filter(|high| low & !high == 0).all(|high| !(self.table)(&of(low)) || (self.table)(&of(high))))
+    }
+}
+
+/// The gates. What is left of `not` and the like with no input on would be true of every epoch, so a trigger must not be (`Plan::check_trigger`).
+pub const GATES: &[Gate] = &[
+    Gate { name: "and", label: "And", table: |inputs| inputs.iter().all(|i| *i) },
+    Gate { name: "or", label: "Or", table: |inputs| inputs.iter().any(|i| *i) },
+    Gate { name: "not", label: "Not", table: |inputs| !inputs.first().copied().unwrap_or(false) },
+    Gate { name: "xor", label: "Xor", table: |inputs| inputs.iter().filter(|i| **i).count() % 2 == 1 },
+    Gate { name: "nand", label: "Nand", table: |inputs| !inputs.iter().all(|i| *i) },
+    Gate { name: "nor", label: "Nor", table: |inputs| !inputs.iter().any(|i| *i) },
+    Gate { name: "xnor", label: "Xnor", table: |inputs| inputs.iter().filter(|i| **i).count() % 2 == 0 },
+];
+
 /// The operation types a project's stacks are made of: the built-ins, and those its extensions provide.
 #[derive(Clone)]
 pub struct Ops {
@@ -224,7 +269,15 @@ impl Default for Ops {
             }
             Ok(value)
         }));
-        ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)));
+        let signal = Type::Named(SIGNAL_TYPE.to_string());
+        let wires = |name: &str| Port { name: name.to_string(), ty: signal.clone(), many: true };
+        ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)).input(wires("pull")).input(wires("listen")));
+        ops.add(OpDef::new(EVENT, "Event", "1").makes(signal.clone(), |_| anyhow::bail!("an event is no value")));
+        ops.add(OpDef::new(SIGNAL, "Signal", "1").input(wires("when")));
+        for gate in GATES {
+            let made = OpDef::new(gate.name, gate.label, "1").input(wires("inputs"));
+            ops.add(made.makes(signal.clone(), |_| anyhow::bail!("a gate is no value")));
+        }
         ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {
             let field = call.setting_str("field")?;
             let key = call.settings().get("key").and_then(Toml::as_str);
@@ -319,6 +372,30 @@ pub struct Output {
     /// Made as soon as what it reads changes, rather than when asked for.
     pub eager: bool,
     pub at: String,
+    pub events: OutputEvents,
+}
+
+/// What an output has to do with events.
+#[derive(Clone, Debug, Default)]
+pub struct OutputEvents {
+    /// The steps saying when it is made current, any of them: event expressions.
+    pub pull: Vec<usize>,
+    /// The steps saying when it goes stale, any of them.
+    pub listen: Vec<usize>,
+    /// Where it goes once made, under `build/`: `{config}` the config's name, a trailing `/` keeping its file's name.
+    pub deploy: Vec<String>,
+    /// Signaled where a pull made it now, where that changed what it was, and where it could not be made.
+    pub ran: Option<String>,
+    pub changed: Option<String>,
+    pub failed: Option<String>,
+}
+
+/// A signal box: its event, where what it takes holds.
+#[derive(Clone, Debug)]
+pub struct Rule {
+    pub when: Vec<usize>,
+    pub event: String,
+    pub at: String,
 }
 
 /// A stack lowered: its operations, each after those it takes from, its outputs, and its result - the step its stack
@@ -331,6 +408,7 @@ pub struct Plan {
     /// What comes down to each layer of its stack, by its place, and last what comes out of it: what a layer put there
     /// is given. None where nothing does.
     pub above: Vec<Option<Type>>,
+    pub rules: Vec<Rule>,
 }
 
 /// An output a node's kind adds after its stack: made by an operation from the stack's result - or from what another
@@ -364,6 +442,17 @@ pub struct Problem {
 }
 
 impl Plan {
+    /// What an event step says.
+    #[must_use]
+    pub fn expression(&self, step: usize) -> Expr {
+        let step = &self.steps[step];
+        let inputs = || step.inputs.iter().flatten().map(|from| self.expression(*from)).collect();
+        match GATES.iter().find(|gate| gate.name == step.op) {
+            Some(gate) => Expr::Gate(gate, inputs()),
+            None => Expr::Event(step.settings.get("event").and_then(Toml::as_str).unwrap_or_default().to_string()),
+        }
+    }
+
     /// A declaration's stack lowered and checked: the plan, and what is wrong with it. A plan with problems still has
     /// the steps and outputs that are sound, so a node keeps what it can make.
     #[must_use]
@@ -390,7 +479,7 @@ impl Plan {
             layer.insert("name".into(), RESULT.into());
             layer.insert("retain".into(), retain_name(Retain::Cache).into());
             layer.insert("when".into(), "eager".into());
-            lowering.output(&layer, result, "stack");
+            lowering.output(&layer, result, "stack", &[]);
         }
         // The kind's outputs, after the stack: a node without a result has none of them.
         let mut made: Vec<Option<usize>> = Vec::with_capacity(tail.len());
@@ -398,6 +487,8 @@ impl Plan {
             let at = format!("kind.outputs[{i}]");
             let from = output.from.map_or(result, |f| made.get(f).copied().flatten());
             let step = match (from, ops.get(&output.op).cloned()) {
+                // One that takes nothing is about the node, not what its stack makes: a stack that fails, or has nothing to make, does not take it away.
+                (_, Some(def)) if def.inputs.is_empty() => Some(lowering.step(&def, &output.op, output.settings.clone(), Vec::new(), &at)),
                 (Some(from), Some(def)) => Some(lowering.step(&def, &output.op, output.settings.clone(), vec![vec![from]], &at)),
                 (Some(_), None) => {
                     lowering.problem(&at, &format!("`{}`: no extension provides it", output.op));
@@ -412,7 +503,7 @@ impl Plan {
                     layer.insert("fixed".into(), true.into());
                 }
                 layer.insert("retain".into(), retain_name(output.retain).into());
-                lowering.output(&layer, step, &at);
+                lowering.output(&layer, step, &at, &[]);
             }
             made.push(step);
         }
@@ -539,7 +630,7 @@ impl Lowering<'_> {
             match op {
                 OUTPUT => {
                     if let Some(from) = above {
-                        self.output(layer, from, &at);
+                        self.output(layer, from, &at, &[]);
                     } else {
                         self.problem(&at, "is an output with nothing above it");
                     }
@@ -613,7 +704,28 @@ impl Lowering<'_> {
         }
     }
 
-    fn output(&mut self, layer: &Table, from: usize, at: &str) {
+    /// What a list of event names or a name, or the wires of a port, come to: one step each, those that would fire on every epoch left out.
+    fn triggers(&mut self, layer: &Table, key: &str, wired: &[usize], at: &str) -> Vec<usize> {
+        let names: Vec<&str> = match layer.get(key) {
+            Some(Toml::String(name)) => vec![name.as_str()],
+            Some(Toml::Array(names)) => names.iter().filter_map(Toml::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let mut steps = wired.to_vec();
+        for name in names {
+            let mut settings = Table::new();
+            settings.insert("event".into(), name.into());
+            self.plan.steps.push(Step { op: EVENT.to_string(), settings, inputs: Vec::new(), ty: Type::Named(SIGNAL_TYPE.to_string()), at: at.to_string() });
+            steps.push(self.plan.steps.len() - 1);
+        }
+        let (kept, refused): (Vec<usize>, Vec<usize>) = steps.into_iter().partition(|step| !self.plan.expression(*step).holds(&|_| false));
+        if !refused.is_empty() {
+            self.problem(at, &format!("its `{key}` holds with nothing signaled: it would fire on every epoch"));
+        }
+        kept
+    }
+
+    fn output(&mut self, layer: &Table, from: usize, at: &str, wired: &[Vec<usize>]) {
         let Some(name) = layer.get("name").and_then(Toml::as_str) else {
             self.problem(at, "is an output without a name");
             return;
@@ -645,7 +757,19 @@ impl Lowering<'_> {
         };
         // A family where what it reaches has a parameter: found once it is lowered (`families`).
         let fixed = layer.get("fixed").and_then(Toml::as_bool).unwrap_or(false);
-        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, fixed, from, retain, eager, at: at.to_string() });
+        let pull = self.triggers(layer, "pull", wired.first().map_or(&[], Vec::as_slice), at);
+        let listen = self.triggers(layer, "listen", wired.get(1).map_or(&[], Vec::as_slice), at);
+        let text = |key: &str| layer.get(key).and_then(Toml::as_str).map(str::to_string);
+        let deploy = match layer.get("deploy") {
+            Some(Toml::String(place)) => vec![place.clone()],
+            Some(Toml::Array(places)) => places.iter().filter_map(Toml::as_str).map(str::to_string).collect(),
+            _ => Vec::new(),
+        };
+        for place in deploy.iter().filter(|place| !place.starts_with("build/") || place.split('/').any(|part| part == "..")) {
+            self.problem(at, &format!("`deploy = \"{place}\"`: what is deployed goes under `build/`"));
+        }
+        let events = OutputEvents { pull, listen, deploy, ran: text("ran"), changed: text("changed"), failed: text("failed") };
+        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, fixed, from, retain, eager, at: at.to_string(), events });
     }
 
     /// A graph layer's operations, after those they take from (the layer above's result as `above`): its result's
@@ -754,7 +878,16 @@ impl Lowering<'_> {
             inputs.push(steps);
         }
         if name == OUTPUT {
-            self.output(op, inputs[0][0], at);
+            self.output(op, inputs[0][0], at, &inputs[1..]);
+            return None;
+        }
+        if name == SIGNAL {
+            let Some(event) = op.get("event").and_then(Toml::as_str) else {
+                self.problem(at, "signals no `event`");
+                return None;
+            };
+            let when = self.triggers(&Table::new(), "when", &inputs[0], at);
+            self.plan.rules.push(Rule { when, event: event.to_string(), at: at.to_string() });
             return None;
         }
         Some(self.step(&def, name, settings_of(op, &["op", "from", layers::POS]), inputs, at))

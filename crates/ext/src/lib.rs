@@ -14,6 +14,7 @@
 
 mod asset;
 pub mod data;
+pub mod events;
 pub mod ty;
 mod extract;
 #[cfg(target_family = "wasm")]
@@ -31,10 +32,10 @@ pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
-pub use data::{Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
+pub use data::{BuildConfig, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
-pub use registry::{ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, Recipe, SheetOfPart, TabDef, 
+pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, Recipe, SheetOfPart, TabDef, 
     Extension, Field, Format, Icon, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, OpBuilder, PanelDef, Part, Parts,
     Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };

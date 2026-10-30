@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use eframe::egui;
+use pe2_ext::events::{Event, FilesChanged, ProjectOpened};
 use project::Project;
 use project::cache::Cache;
 use project::ext::{Extensions, Lens};
@@ -191,6 +192,14 @@ pub struct Workspace {
     pub window_requests: Vec<crate::drive::Request>,
     /// The take-in worker: it owns the index and the imports, and hands snapshots back.
     takein: crate::takein::TakeIn,
+    /// Runs what events set off.
+    runner: crate::runner::Runner,
+    /// The config in use.
+    pub config: Option<project::Config>,
+    /// How the last epoch ended.
+    pub last_epoch: Option<crate::runner::Finished>,
+    /// The name of an event being defined.
+    pub new_event_name: String,
     /// The assets' settings as last applied (`project::applied`): what their outputs are made from.
     applied: Arc<project::applied::Applied>,
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
@@ -327,6 +336,8 @@ pub enum Update {
     /// The project is opened again, as this changed: `project.toml` (its layers, the extensions it leaves off) or
     /// the extensions found (one in the project or the user's folder came, went or changed).
     Reopen(&'static str),
+    /// What someone asked for came to this.
+    Said(String),
 }
 
 /// A part's name, what its fragment says after its group: `cursor` of `cells/cursor`.
@@ -510,7 +521,12 @@ impl Workspace {
             extensions_found.clone(),
             tree.clone(),
         );
+        let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
         let mut workspace = Workspace {
+            runner,
+            config: None,
+            last_epoch: None,
+            new_event_name: String::new(),
             project,
             applied,
             history,
@@ -582,6 +598,7 @@ impl Workspace {
             return;
         }
         self.takein.wake(ctx);
+        self.runner.wake(ctx);
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
         }
@@ -598,6 +615,70 @@ impl Workspace {
             Err(e) => self.watch_error = Some(format!("the layers are not watched: {e}")),
         }
         self.serve(ctx);
+        self.signal(ProjectOpened::NAME);
+    }
+
+    /// Signal an event: an epoch begins, on the project as last taken in, for the config in use.
+    pub fn signal(&self, event: &str) {
+        self.signal_all(vec![event.to_string()], None, None);
+    }
+
+    /// Define an event of the project: an asset of the active layer.
+    ///
+    /// # Errors
+    /// No layer takes it, or it cannot be written.
+    pub fn new_event(&mut self, name: &str) -> Result<(), String> {
+        let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
+        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id))).map_err(|e| e.to_string())?;
+        let uid = project::uid::text(id);
+        let slug: String = name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        let quoted = toml::Value::String(name.to_string());
+        let declaration = format!("uid = \"{uid}\"\nkind = \"event\"\nlabel = {quoted}\n");
+        project::edit::create(&self.project, &self.index, &layer, &uid, &format!("events/{slug}"), &declaration, &mut self.history).map_err(|e| format!("{e:#}"))?;
+        Ok(())
+    }
+
+    /// Leave an asset out of the config in use, or take it back. It is the project's, so written in its `project.toml`, as a step.
+    ///
+    /// # Errors
+    /// The project has no config, or it cannot be written.
+    pub fn set_disabled(&mut self, path: &str, disabled: bool) -> Result<(), String> {
+        let config = self.config.as_ref().ok_or("the project has no config")?.name.clone();
+        let file = self.project.root.join(project::FILE);
+        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        let mut document: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+        let section = document["config"][config.as_str()].as_table_mut().ok_or("no such config in project.toml")?;
+        let list = section.entry("disabled").or_insert(toml_edit::value(toml_edit::Array::new()));
+        let list = list.as_array_mut().ok_or("its `disabled` is no list")?;
+        list.retain(|item| item.as_str() != Some(path));
+        if disabled {
+            list.push(path);
+        }
+        let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
+        let mut step = self.history.begin(label);
+        step.write(&file, document.to_string().as_bytes()).map_err(|e| format!("{e:#}"))?;
+        step.commit().map_err(|e| format!("{e:#}"))?;
+        Ok(())
+    }
+
+    /// Stop the epoch running.
+    pub fn cancel_epoch(&self) {
+        self.runner.cancel();
+    }
+
+    /// An epoch is running or waiting.
+    pub fn in_epoch(&self) -> bool {
+        self.runner.busy()
+    }
+
+    fn signal_all(&self, roots: Vec<String>, config: Option<project::Config>, reply: Option<mpsc::Sender<mcp::Reply>>) {
+        let Some(config) = config.or_else(|| self.config.clone()) else {
+            if let Some(reply) = reply {
+                let _ = reply.send(mcp::Reply::failed("the project has no config".to_string()));
+            }
+            return;
+        };
+        self.runner.run(crate::runner::Job { roots, index: self.index.clone(), config, reply });
     }
 
     /// Listen for agents: each request is passed to the frame loop (`answer_agents`), which wakes for it.
@@ -626,6 +707,11 @@ impl Workspace {
         let Some(requests) = &self.requests else { return };
         let arrived: Vec<_> = requests.try_iter().collect();
         for (request, reply) in arrived {
+            if let mcp::Request::Signal { events, config } = &request {
+                let config = config.as_ref().and_then(|name| self.project.configs.iter().find(|c| c.name == *name)).cloned();
+                self.signal_all(events.clone(), config, Some(reply));
+                continue;
+            }
             if request.uses_window() {
                 self.window_requests.push((request, reply));
                 continue;
@@ -683,6 +769,14 @@ impl Workspace {
         }
         let ready = self.takein.poll();
         self.apply(ready);
+        for ended in self.runner.poll() {
+            if matches!(self.outcome, Update::Nothing)
+                && let Some(said) = ended.said()
+            {
+                self.outcome = Update::Said(said);
+            }
+            self.last_epoch = Some(ended);
+        }
         std::mem::take(&mut self.outcome)
     }
 
@@ -746,6 +840,9 @@ impl Workspace {
                 self.outcome = Update::Reopen(why);
             }
             self.index = snapshot.index;
+            if snapshot.files {
+                self.signal(FilesChanged::NAME);
+            }
             if let Some(pictures) = &mut self.textures.pictures {
                 if snapshot.all {
                     pictures.clear();
@@ -860,7 +957,8 @@ impl Workspace {
         let Some(asset) = self.index.assets.get(&path).cloned() else { return false };
         if let Some(part) = inner.strip_prefix('#') {
             let row = self.contents_of(&asset).rows.iter().any(|row| row.id == part && !row.is_heading());
-            return row || self.extensions.parts(&asset).iter().any(|named| named.id == part);
+            // A view may hold what it selected; only it could say whether that is still there.
+            return row || self.extensions.parts(&asset).iter().any(|named| named.id == part) || !self.extensions.contents_views(&asset).is_empty();
         }
         crate::inspector::layer_of_inner(&inner).is_none_or(|(at, op)| {
             let layer = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
@@ -1361,6 +1459,11 @@ impl Workspace {
     /// contents, which need be no part.
     pub fn select_part(&mut self, name: &str) {
         let Some(asset) = self.selected.as_ref().and_then(|path| self.index.assets.get(path)).cloned() else { return };
+        // A fragment is the view's own to name: what it stands for may be neither a part nor a row.
+        if name.contains('/') {
+            self.inner = Some((asset.path.clone(), format!("#{name}")));
+            return;
+        }
         let is_it = |id: &str| id == name || part_name(id) == name;
         let part = self.extensions.parts(&asset).into_iter().map(|part| part.id).find(|id| is_it(id));
         let contents = self.contents_of(&asset);

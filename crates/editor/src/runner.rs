@@ -1,0 +1,164 @@
+//! The epoch worker: what events set off, off the UI thread. Each job is an epoch on the project as last taken in, one at a time, in the order asked, so a clean and the build
+//! after it stay two: only batches of files waiting behind each other are one, as they mean the same. It wakes the window when one ends.
+
+use eframe::egui;
+use pe2_ext::events::{Build, Clean, Event, FilesChanged};
+use project::events::Report;
+use project::ext::Extensions;
+use project::index::Index;
+use project::{Config, Project};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
+
+/// An epoch to run.
+pub struct Job {
+    pub roots: Vec<String>,
+    pub index: Arc<Index>,
+    pub config: Config,
+    /// Who waits for it, over the editor's link.
+    pub reply: Option<Sender<mcp::Reply>>,
+}
+
+/// An epoch as it ended.
+pub struct Finished {
+    pub roots: Vec<String>,
+    pub config: String,
+    pub report: Report,
+    /// What could not be wired.
+    pub problems: Vec<(String, String)>,
+    /// How much is wired to each event.
+    pub wired: BTreeMap<String, usize>,
+}
+
+impl Finished {
+    /// What to say of it, where someone asked for it.
+    pub fn said(&self) -> Option<String> {
+        let asked = |event: &str| self.roots.iter().any(|root| root == event);
+        let what = if asked(Build::NAME) { "Built" } else if asked(Clean::NAME) { "Cleaned" } else { return None };
+        Some(match self.report.failed.first() {
+            _ if self.report.cancelled => "Cancelled".to_string(),
+            Some((path, _)) => format!("{path} failed: see Problems"),
+            None => format!("{what} {}: {} made", self.config, self.report.made.len()),
+        })
+    }
+
+    /// Whether it left something to be told.
+    pub fn is_wrong(&self) -> bool {
+        !(self.problems.is_empty() && self.report.failed.is_empty() && self.report.stale.is_empty())
+    }
+}
+
+/// The worker, as the UI holds it.
+pub struct Runner {
+    jobs: Option<Sender<Job>>,
+    finished: Receiver<Finished>,
+    /// Stops the epoch running at its next step.
+    cancel: Arc<AtomicBool>,
+    /// The epochs asked for and not ended.
+    waiting: Arc<AtomicUsize>,
+    ctx: Arc<OnceLock<egui::Context>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Whether a job can be run as part of the next: they say the same thing of the same config.
+fn same(job: &Job, next: &Job) -> bool {
+    let files = |job: &Job| job.reply.is_none() && matches!(job.roots.as_slice(), [one] if one == FilesChanged::NAME);
+    files(job) && files(next) && job.config == next.config
+}
+
+fn text(report: &Report) -> mcp::Reply {
+    let mut lines: Vec<String> = report.made.iter().map(|(asset, output)| format!("{asset}: {output}")).collect();
+    let failed = report.failed.iter().map(|(asset, why)| format!("{asset}: {why}"));
+    let stale = report.stale.iter().map(|(asset, output)| format!("{asset}: {output} is stale: what it reads changed after it ran"));
+    lines.extend(failed.chain(stale));
+    let answer = lines.join("\n");
+    if report.failed.is_empty() && !report.cancelled {
+        mcp::Reply::text(answer)
+    } else {
+        mcp::Reply::failed(answer)
+    }
+}
+
+impl Runner {
+    pub fn start(project: Project, extensions: Arc<Extensions>) -> Runner {
+        let (jobs, queued) = mpsc::channel::<Job>();
+        let (done, finished) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
+        let (stop, left, wake) = (cancel.clone(), waiting.clone(), ctx.clone());
+        let thread = std::thread::Builder::new()
+            .name("epochs".into())
+            .spawn(move || {
+                let mut held: Option<Job> = None;
+                loop {
+                    let Some(mut job) = held.take().or_else(|| queued.recv().ok()) else { return };
+                    for next in queued.try_iter() {
+                        if same(&job, &next) {
+                            left.fetch_sub(1, Ordering::Relaxed);
+                            job = next;
+                        } else {
+                            held = Some(next);
+                            break;
+                        }
+                    }
+                    stop.store(false, Ordering::Relaxed);
+                    let wiring = project::build::wiring(&job.index, &extensions, &job.config);
+                    let report = project::build::epoch(&project, &job.index, &extensions, &wiring, &job.config, &job.roots, &stop);
+                    if let Some(reply) = &job.reply {
+                        let _ = reply.send(text(&report));
+                    }
+                    left.fetch_sub(1, Ordering::Relaxed);
+                    let wired = wiring.counts();
+                    let ended = Finished { roots: job.roots, config: job.config.name, report, problems: wiring.problems, wired };
+                    if done.send(ended).is_err() {
+                        return;
+                    }
+                    if let Some(ctx) = wake.get() {
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .ok();
+        Runner { jobs: Some(jobs), finished, cancel, waiting, ctx, thread }
+    }
+
+    /// The window to wake when an epoch ends.
+    pub fn wake(&self, ctx: &egui::Context) {
+        let _ = self.ctx.set(ctx.clone());
+    }
+
+    pub fn run(&self, job: Job) {
+        if let Some(jobs) = &self.jobs {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            let _ = jobs.send(job);
+        }
+    }
+
+    /// The epochs that ended since the last poll.
+    pub fn poll(&self) -> Vec<Finished> {
+        self.finished.try_iter().collect()
+    }
+
+    pub fn busy(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) > 0
+    }
+
+    /// Stop the epoch running, once what it is running now is done.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.cancel();
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}

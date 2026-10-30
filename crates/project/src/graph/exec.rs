@@ -123,6 +123,12 @@ pub struct Reads {
     /// Other nodes' outputs read, each by `<node>#<address>` (its node as traces name it), with its hash.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, String>,
+    /// The project's plain files read, each by its path, with its hash; a folder listed, by its path and a `/`, with its list's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entries: BTreeMap<String, String>,
+    /// The config it was made for, where it read which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
 }
 
 impl Reads {
@@ -130,19 +136,26 @@ impl Reads {
     pub fn merge(&mut self, other: &Reads) {
         self.files.extend(other.files.iter().map(|(k, v)| (k.clone(), v.clone())));
         self.outputs.extend(other.outputs.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.entries.extend(other.entries.iter().map(|(k, v)| (k.clone(), v.clone())));
         if other.declaration.is_some() {
             self.declaration.clone_from(&other.declaration);
+        }
+        if other.config.is_some() {
+            self.config.clone_from(&other.config);
         }
     }
 
     /// Whether the node still reads the same: each file read has its hash, the declaration its, and each other node's
     /// output read its - made, where it must be, in `reach` (without which none can be told).
+    /// Each of the project's files and folders read has its too.
     #[must_use]
     pub fn hold(&self, node: &dyn Node, reach: Option<Reach<'_>>) -> bool {
         self.files.iter().all(|(name, sha1)| node.file_sha1(name).unwrap_or_default() == *sha1)
             && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
             && (self.outputs.is_empty()
                 || reach.is_some_and(|reach| self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))))
+            && (self.entries.is_empty()
+                || reach.is_some_and(|reach| self.entries.iter().all(|(read, hash)| reach.entry_hash(read).as_deref() == Some(hash))))
     }
 }
 
@@ -150,6 +163,41 @@ impl Reads {
 /// path }`, or a path), with its plan.
 pub trait World: Sync {
     fn node(&self, reference: &toml::Value) -> Option<(&dyn Node, Plan)>;
+    /// The plain files under a folder of the project, by their paths, in order.
+    fn entries(&self, folder: &str) -> Vec<String> {
+        let _ = folder;
+        vec![]
+    }
+    /// Where a plain file of the project is on disk.
+    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
+        let _ = path;
+        None
+    }
+
+    /// Where a file or folder is on disk, followed through links.
+    fn place(&self, path: &str) -> Option<std::path::PathBuf> {
+        let _ = path;
+        None
+    }
+    /// The assets of a kind, each by its path with its declaration as written.
+    fn assets_of(&self, kind: &str) -> Vec<(String, String)> {
+        let _ = kind;
+        vec![]
+    }
+}
+
+/// How a trace names a kind's assets, as no path of the project can begin.
+const KIND_READ: &str = "kind:";
+
+/// The hash a kind's assets have together, what tells one changed, come or gone.
+fn kind_hash(assets: &[(String, String)]) -> String {
+    let joined: Vec<String> = assets.iter().map(|(path, text)| format!("{path}\n{text}")).collect();
+    list_hash(&joined)
+}
+
+/// The hash a folder's list has, what tells a file added or gone.
+fn list_hash(files: &[String]) -> String {
+    crate::extract::sha1_hex(files.join("\n").as_bytes())
 }
 
 /// What evaluation reaches beyond its node: the engine making other nodes' outputs, in a world of them.
@@ -178,6 +226,17 @@ impl<'a> Reach<'a> {
         let given = self.engine.output_in(Some(*self), &plan, node, address, None, true);
         MAKING.with(|m| m.borrow_mut().pop());
         Ok((read, given?, node))
+    }
+
+    /// The hash a project's file or folder has now, by how a trace names it (a folder's with a `/`).
+    fn entry_hash(&self, read: &str) -> Option<String> {
+        if let Some(kind) = read.strip_prefix(KIND_READ) {
+            return Some(kind_hash(&self.world.assets_of(kind)));
+        }
+        match read.strip_suffix('/') {
+            Some(folder) => Some(list_hash(&self.world.entries(folder))),
+            None => std::fs::read(self.world.entry(read)?).ok().map(|bytes| crate::extract::sha1_hex(&bytes)),
+        }
     }
 
     /// The hash another node's output has now, by how a trace names it (`<node>#<address>`).
@@ -320,6 +379,8 @@ impl<'a> Call<'a> {
         for sha1 in stored {
             let path = match (reach.engine.store(), node.content_path(&sha1)) {
                 (_, Some(path)) => path,
+                // What a node's own output made is in no file of its: the store has it already.
+                (Some(store), None) if store.blob_path(&sha1).exists() => store.blob_path(&sha1),
                 (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1),
                 (None, None) => continue,
             };
@@ -327,6 +388,54 @@ impl<'a> Call<'a> {
         }
         self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outputs.insert(read, given.hash);
         Ok(value)
+    }
+
+    /// The plain files under a folder of the project, recorded as read.
+    ///
+    /// # Errors
+    /// Nothing beyond its node is reachable here.
+    pub fn entries(&self, folder: &str) -> Result<Vec<String>> {
+        let files = self.reach.context("the project is not reachable here")?.world.entries(folder);
+        let read = format!("{}/", folder.trim_end_matches('/'));
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, list_hash(&files));
+        Ok(files)
+    }
+
+    /// A plain file of the project, recorded as read.
+    ///
+    /// # Errors
+    /// Nothing beyond its node is reachable here, the project holds no such file, or it cannot be read.
+    pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+        let disk = self.reach.context("the project is not reachable here")?.world.entry(path).with_context(|| format!("{path}: no such file"))?;
+        let bytes = std::fs::read(&disk).with_context(|| disk.display().to_string())?;
+        let hash = crate::extract::sha1_hex(&bytes);
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(path.to_string(), hash);
+        Ok(bytes)
+    }
+
+    /// The assets of a kind, each by its path with its declaration as written, recorded as read.
+    ///
+    /// # Errors
+    /// Nothing beyond its node is reachable here.
+    pub fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
+        let assets = self.reach.context("the project is not reachable here")?.world.assets_of(kind);
+        let read = format!("{KIND_READ}{kind}");
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, kind_hash(&assets));
+        Ok(assets)
+    }
+
+    /// Where a file or folder of the project is on disk.
+    #[must_use]
+    pub fn place(&self, path: &str) -> Option<String> {
+        Some(self.reach?.world.place(path)?.display().to_string())
+    }
+
+    /// The config being built, recorded as read.
+    #[must_use]
+    pub fn config(&self) -> Option<pe2_ext::data::BuildConfig> {
+        let config = self.reach?.engine.config.clone()?;
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config = Some(config.name.clone());
+        Some(config)
     }
 
     /// Its node's settings, recorded as read (its declaration as a whole).
@@ -698,6 +807,8 @@ impl Evaluation<'_> {
 pub struct Engine {
     pub ops: Ops,
     store: Option<Store>,
+    /// The config being built.
+    pub config: Option<pe2_ext::data::BuildConfig>,
 }
 
 /// An output as the engine gives it: its value, where it was made or read now, its hash, and what it read - by which
@@ -714,7 +825,7 @@ impl Engine {
     /// An engine keeping retained outputs in a store; none keeps nothing.
     #[must_use]
     pub fn new(ops: Ops, store: Option<Store>) -> Engine {
-        Engine { ops, store }
+        Engine { ops, store, config: None }
     }
 
     #[must_use]
@@ -741,7 +852,8 @@ impl Engine {
     pub fn kept_in(&self, reach: Option<Reach<'_>>, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
-        (trace.node == id(node) && trace.reads.hold(node, reach) && store.has(&trace.value)).then_some(trace)
+        let same_config = trace.reads.config.as_ref().is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
+        (trace.node == id(node) && same_config && trace.reads.hold(node, reach) && store.has(&trace.value)).then_some(trace)
     }
 
     /// An output by its address (`native`, `picture/night`): found kept where its trace holds - its value then read only
@@ -839,13 +951,21 @@ impl Engine {
     /// # Errors
     /// No extension provides it, or it failed.
     pub fn run(&self, op: &str, inputs: Vec<Vec<Value>>, settings: &Table, node: &dyn Node) -> Result<Value> {
+        self.run_in(None, op, inputs, settings, node)
+    }
+
+    /// `run`, reaching the project in `reach`.
+    ///
+    /// # Errors
+    /// No extension provides it, or it failed.
+    pub fn run_in(&self, reach: Option<Reach<'_>>, op: &str, inputs: Vec<Vec<Value>>, settings: &Table, node: &dyn Node) -> Result<Value> {
         let def = self.ops.get(op).with_context(|| format!("`{op}`: no extension provides it"))?;
         let run = def.run.as_ref().with_context(|| format!("`{op}` makes nothing"))?;
         let reads = Mutex::new(Reads::default());
         let inputs = inputs.into_iter().map(|port| port.into_iter().map(|v| Input(Arc::new(v))).collect()).collect();
         let recorder = Recorder { node, reads: &reads };
         let others = &Mutex::default();
-        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach: None, others };
+        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach, others };
         run(&mut call)
     }
 
@@ -860,6 +980,38 @@ impl Engine {
                 Some((o.from, Arc::new(value), trace.reads))
             })
             .collect()
+    }
+}
+
+/// The node of what is about no asset: a hook's.
+#[derive(Default)]
+pub struct Nowhere {
+    fields: Table,
+}
+
+impl Node for Nowhere {
+    fn path(&self) -> &'static str {
+        ""
+    }
+
+    fn uid(&self) -> Option<&str> {
+        None
+    }
+
+    fn declaration(&self) -> &'static str {
+        ""
+    }
+
+    fn fields(&self) -> &Table {
+        &self.fields
+    }
+
+    fn file_sha1(&self, _: &str) -> Option<String> {
+        None
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>> {
+        anyhow::bail!("{name}: it has no node")
     }
 }
 

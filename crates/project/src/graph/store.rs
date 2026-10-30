@@ -357,6 +357,11 @@ impl Store {
         write_atomic(&self.trace_path(key), toml::to_string(trace)?.as_bytes())
     }
 
+    /// Forget a trace: what it was the trace of is made again when next asked for, though its value stays.
+    pub fn forget_trace(&self, key: &str) {
+        let _ = std::fs::remove_file(self.trace_path(key));
+    }
+
     /// Remove the traces of nodes not `live`, and of each live node's output all but the newest (what made it
     /// before) - never those under the keys `used`, which what swept them reads - then the values no trace left
     /// names, then the blobs no value left names: what was swept, as (traces, values, blobs). It may run beside what

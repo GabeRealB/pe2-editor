@@ -24,6 +24,11 @@ pub trait Project {
     fn picture(&self, path: &str, look: usize) -> Option<Result<Image>>;
     /// A part's picture (`palettes/default`); none where it has none.
     fn part(&self, path: &str, part: &str) -> Option<Result<Image>>;
+    /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
+    fn table(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
+        let _ = (path, address);
+        None
+    }
     /// An asset's parts, as its kind lists them.
     fn parts(&self, path: &str) -> Vec<Part>;
     /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only

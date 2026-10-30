@@ -30,6 +30,8 @@ pub enum Request {
     Call { name: String, arguments: serde_json::Map<String, serde_json::Value> },
     /// A resource read by its URI (`uid://...`).
     Read { uri: String },
+    /// Events signaled, one epoch each: answered once they have ended, only by an editor.
+    Signal { events: Vec<String>, config: Option<String> },
 }
 
 /// Its answer.
@@ -43,6 +45,22 @@ pub enum Reply {
 }
 
 impl Reply {
+    /// What a tool said, or why it failed, as text.
+    ///
+    /// # Errors
+    /// It failed, or it was no tool's answer.
+    pub fn told(&self) -> Result<String, String> {
+        match self {
+            Reply::Call(result) => {
+                let texts = result.content.iter().filter_map(|block| block.as_text().map(|text| text.text.clone()));
+                let said = texts.collect::<Vec<_>>().join("\n");
+                if result.is_error == Some(true) { Err(said) } else { Ok(said) }
+            }
+            Reply::Read(_) => Err("it answered with something else".to_string()),
+            Reply::Error(why) => Err(why.clone()),
+        }
+    }
+
     /// A tool's answer as text.
     #[must_use]
     pub fn text(text: String) -> Reply {
@@ -102,5 +120,6 @@ pub fn answer(view: &mut View, request: &Request) -> Reply {
             Ok(result) => Reply::Read(result),
             Err(e) => Reply::Error(e),
         },
+        Request::Signal { .. } => Reply::Error("events are signaled to an editor".to_string()),
     }
 }

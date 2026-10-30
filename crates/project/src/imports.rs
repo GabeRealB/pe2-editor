@@ -322,7 +322,9 @@ pub fn live_nodes(index: &Index) -> HashSet<String> {
 /// result that is a stored file is seen as it is.)
 fn import_output(plan: &Plan) -> Option<(String, usize)> {
     let result = plan.result.filter(|_| !plan.result_stored())?;
-    Some((plan.steps[result].op.clone(), plan.result_output()?))
+    let output = plan.result_output()?;
+    // What events make current is theirs: taking a project in compiles nothing.
+    plan.outputs[output].events.pull.is_empty().then(|| (plan.steps[result].op.clone(), output))
 }
 
 /// The file an asset's stack takes as its import's source, from its bundle.

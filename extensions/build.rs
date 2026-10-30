@@ -9,10 +9,10 @@ use std::process::Command;
 const TARGET: &str = "wasm32-wasip3";
 /// The built-ins, by package: each a crate in a folder of this one.
 const BUILTINS: &[(&str, &str)] =
-    &[("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images"), ("pe2-movies", "movies"), ("pe2-str", "str")];
+    &[("pe2-events", "events"), ("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images"), ("pe2-movies", "movies"), ("pe2-packages", "packages"), ("pe2-str", "str")];
 
 /// Components built here too, and never embedded: what needs enabling is not shipped inside the editor.
-const SEPARATE: &[(&str, &str)] = &[("pe2-ffmpeg", "ffmpeg")];
+const SEPARATE: &[(&str, &str)] = &[("pe2-ffmpeg", "ffmpeg"), ("pe2-psx", "psx")];
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));

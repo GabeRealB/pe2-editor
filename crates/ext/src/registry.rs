@@ -345,6 +345,10 @@ pub struct Parts {
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Outputs it adds to a kind it requires, by the kind's name.
     pub additions: Vec<(String, OutputDef)>,
+    /// The events it declares, by name, with their labels.
+    pub events: Vec<(String, String)>,
+    /// What it runs where an event is signaled.
+    pub hooks: Vec<HookDef>,
     /// Stacks it gives kinds of others that have none, by the kind's name (TOML).
     pub stacks: Vec<(String, String)>,
     /// What files replace assets of kinds, with what.
@@ -802,6 +806,30 @@ pub struct RoleDef {
     pub contents_views: Vec<ViewDef>,
 }
 
+/// An operation run where an event is signaled, before what the event pulls: failing, it stops those.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookDef {
+    pub event: String,
+    /// The operation, qualified.
+    pub op: String,
+    /// The events it signals, where it succeeds.
+    pub signals: Vec<String>,
+}
+
+/// A hook being registered.
+pub struct HookBuilder<'a> {
+    hook: &'a mut HookDef,
+}
+
+impl HookBuilder<'_> {
+    /// Say an event it signals where it succeeds: what a project's graphs are planned by, so it cannot be decided as it runs.
+    #[must_use]
+    pub fn signals<E: crate::events::Event>(self) -> Self {
+        self.hook.signals.push(E::NAME.to_string());
+        self
+    }
+}
+
 /// What an extension registers, as its entry point calls it. The host checks the outcome: a role's kind must be its
 /// extension's or a dependency's, an alias a built-in's, a name registered once.
 pub struct Registry {
@@ -983,6 +1011,35 @@ impl Registry {
         OpBuilder { registry: self, def, same: Vec::new(), list_of: None, out: PhantomData }
     }
 
+
+    /// Declare an event of this extension, for others to wire to and for it to signal.
+    pub fn event<E: crate::events::Event>(&mut self) {
+        self.parts.events.push((E::NAME.to_string(), E::LABEL.to_string()));
+    }
+
+    /// Run this where an event is signaled: called with the event's name as its `event` setting, seeing the config and the project as any operation does.
+    pub fn on<E: crate::events::Event>(&mut self, run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static) -> HookBuilder<'_> {
+        self.on_id(E::NAME, run)
+    }
+
+    /// `on`, for an event only known by its id: a project's own, from the extension's settings.
+    pub fn on_id(&mut self, event: &str, run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static) -> HookBuilder<'_> {
+        let at = self.parts.hooks.len();
+        let name = format!("on-{at}");
+        let op = self.op(&name).label("Hook").output::<crate::ty::Table>().run(move |call| run(call).map(|()| crate::Table::new()));
+        self.parts.hooks.push(HookDef { event: event.to_string(), op: op.to_string(), signals: Vec::new() });
+        HookBuilder { hook: &mut self.parts.hooks[at] }
+    }
+
+    /// Add a hook another side of the contract described.
+    pub fn add_hook(&mut self, hook: HookDef) {
+        self.parts.hooks.push(hook);
+    }
+
+    /// Declare an event another side of the contract described.
+    pub fn add_event(&mut self, name: &str, label: &str) {
+        self.parts.events.push((name.to_string(), label.to_string()));
+    }
 
     /// Add an output to a kind of an extension this one depends on: named `name`, made by `op` of what its output `from`
     /// makes - one before it - or of its nodes' results. A kind's own extension can so stay free of what the output needs: where that is

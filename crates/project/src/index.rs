@@ -724,6 +724,13 @@ struct Node {
     moved: Option<usize>,
 }
 
+impl Node {
+    /// An entry as the layer creating it left it.
+    fn created(kind: Kind, uid: &str, home: usize, path: &str) -> Node {
+        Node { kind, uid: uid.to_string(), home, content: (home, path.to_string()), overrides: vec![], moved: None }
+    }
+}
+
 /// The stack applied: the resolved entries, what is wrong, and each layer's operations with their status and the path
 /// their entry had.
 struct Resolution {
@@ -1169,6 +1176,12 @@ impl Index {
                 };
                 accounted.insert(path.clone());
                 if let Some(other) = resolved.get(path) {
+                    // A folder has no content: two layers making one are adding to the same place, its first uid and its
+                    // second naming it alike.
+                    if kind == Kind::Folder && other.kind == Kind::Folder {
+                        where_is.insert(uid.clone(), path.clone());
+                        continue;
+                    }
                     let layers = vec![self.layers[other.home].name.clone(), layer.name.clone()];
                     problems.push(Problem::Conflict { path: path.clone(), layers });
                     continue;
@@ -1177,15 +1190,7 @@ impl Index {
                     problems.push(Problem::DuplicateUid { uid: uid.clone(), paths: vec![other.clone(), path.clone()] });
                     continue;
                 }
-                let node = Node {
-                    kind,
-                    uid: uid.clone(),
-                    home: i,
-                    content: (i, path.clone()),
-                    overrides: vec![],
-                    moved: None,
-                };
-                resolved.insert(path.clone(), node);
+                resolved.insert(path.clone(), Node::created(kind, uid, i, path));
                 where_is.insert(uid.clone(), path.clone());
             }
             for (uid, op) in &layer.changeset.ops {
@@ -1912,6 +1917,20 @@ mod tests {
         let (_, index) = open(&root);
         assert_eq!(index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.asset".into() }]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn two_layers_making_one_folder_add_to_it() {
+        let root = project("one-folder");
+        open(&root);
+        let mut top = Changeset::default();
+        top.entries.insert("uid://again".into(), "g".into());
+        top.entries.insert("uid://beside".into(), "g/beside.asset".into());
+        top.save(&root.join(".layers/top.toml")).unwrap();
+        write(&root, ".layers/top/g/beside.asset/asset.toml", "kind = \"file\"\n");
+        let (_, index) = open(&root);
+        assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
+        assert!(index.assets.contains_key("g/a") && index.assets.contains_key("g/beside"));
     }
 
     #[test]

@@ -144,6 +144,9 @@ pub struct EditorSettings {
     /// Extensions' user settings, by id (`[extensions."<id>"]`): the extensions read them from this file too.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extensions: std::collections::BTreeMap<String, toml::Table>,
+    /// The config chosen for a project, by its folder (state, not a preference): each person's own, never the project's.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub active_configs: std::collections::BTreeMap<String, String>,
     /// The project opened last (state, not a preference).
     pub last_project: Option<PathBuf>,
     /// Where the main window was (state, not a preference).

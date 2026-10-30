@@ -702,6 +702,7 @@ dependencies = [
  "codecs",
  "extensions",
  "mcp",
+ "pe2-ext",
  "png",
  "project",
 ]
@@ -1591,11 +1592,13 @@ dependencies = [
 name = "extensions"
 version = "0.1.0"
 dependencies = [
+ "pe2-events",
  "pe2-ext",
  "pe2-formats",
  "pe2-game",
  "pe2-images",
  "pe2-movies",
+ "pe2-packages",
  "pe2-str",
  "project",
  "toml",
@@ -3614,6 +3617,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pe2-events"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
 name = "pe2-ext"
 version = "0.1.0"
 dependencies = [
@@ -3657,6 +3667,22 @@ dependencies = [
 
 [[package]]
 name = "pe2-movies"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
+name = "pe2-packages"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "pe2-psx"
 version = "0.1.0"
 dependencies = [
  "pe2-ext",

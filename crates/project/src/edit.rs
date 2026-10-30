@@ -151,6 +151,21 @@ pub fn write_file(
     tx.commit()
 }
 
+/// Make a new bundle in a layer, of this declaration, under its uid. Returns the paths touched.
+///
+/// # Errors
+/// The layer holds no such uid to give, or it cannot be written.
+pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, path: &str, declaration: &str, history: &mut History) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
+    let bundle = format!("{path}{BUNDLE_SUFFIX}");
+    let mut tx = history.begin(format!("New {}", name(&bundle)));
+    tx.write(&layer.disk(&bundle).join(crate::index::ASSET_FILE), declaration.as_bytes())?;
+    changeset.entries.insert(uid.to_string(), bundle);
+    save(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
 /// Override an entry from below in a layer: its own copy, made from the version directly below. Returns the paths
 /// touched.
 ///

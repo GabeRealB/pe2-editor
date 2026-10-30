@@ -459,6 +459,44 @@ pub trait CallHost {
         let _ = (path, name);
         bail!("{}: nothing is kept here", self.path())
     }
+    /// The plain files under a folder of the project, each by its path, as the stack resolves it; recorded as read, so what is made
+    /// is made again when the list changes.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here.
+    fn entries(&self, folder: &str) -> Result<Vec<String>> {
+        bail!("{}: {folder}: no project to list here", self.path())
+    }
+    /// A plain file of the project by its path, as the stack resolves it; recorded as read.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here, or holds no such file.
+    fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+        bail!("{}: {path}: no project to read here", self.path())
+    }
+    /// The assets of a kind, each by its path with its declaration as written; recorded as read.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here.
+    fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
+        bail!("{}: {kind}: no project to look in here", self.path())
+    }
+    /// Where a file or folder of the project is on disk, followed through links; none where it has no such place.
+    fn place(&self, path: &str) -> Option<String> {
+        let _ = path;
+        None
+    }
+    /// Another asset's output that is a table; recorded as read.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here, or it could not be made.
+    fn table_of(&self, path: &str, address: &str) -> Result<Table> {
+        bail!("{path}: {address}: no project to look in here")
+    }
+    /// The config being built; recorded as read, so what reads it is made again for another.
+    fn build_config(&self) -> Option<BuildConfig> {
+        None
+    }
     /// Where a content is on disk, for an unsandboxed extension's operation to point a program at.
     fn path_of(&self, content: &Content) -> Option<String> {
         let _ = content;
@@ -592,6 +630,50 @@ impl Call<'_> {
     /// It cannot be kept.
     pub fn keep(&self, path: &str, name: &str) -> Result<File> {
         self.host.keep(path, name)
+    }
+
+    /// The plain files under a folder of the project; made again when the list changes.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here.
+    pub fn entries(&self, folder: &str) -> Result<Vec<String>> {
+        self.host.entries(folder)
+    }
+
+    /// A plain file of the project; made again when it changes.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here, or holds no such file.
+    pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+        self.host.read_entry(path)
+    }
+
+    /// The assets of a kind, each by its path with its declaration as written; made again when any changes, or one comes or goes.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here.
+    pub fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
+        self.host.assets_of(kind)
+    }
+
+    /// Where a file or folder of the project is on disk, followed through links.
+    #[must_use]
+    pub fn place(&self, path: &str) -> Option<String> {
+        self.host.place(path)
+    }
+
+    /// Another asset's output that is a table; made again when it changes.
+    ///
+    /// # Errors
+    /// The project cannot be reached from here, or it could not be made.
+    pub fn table_of(&self, path: &str, address: &str) -> Result<Table> {
+        self.host.table_of(path, address)
+    }
+
+    /// The config being built; made again for another.
+    #[must_use]
+    pub fn config(&self) -> Option<BuildConfig> {
+        self.host.build_config()
     }
 
     /// Where a file is on disk, for this extension to point a program at; none where it is held in memory.
@@ -736,6 +818,15 @@ pub trait Generator: Send {
         let _ = (call, position);
         Ok(false)
     }
+}
+
+/// The config being built: `[config.<name>]`, with the folder its results go to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildConfig {
+    pub name: String,
+    pub release: Option<String>,
+    pub target: Option<String>,
+    pub folder: String,
 }
 
 /// An operation as registered.

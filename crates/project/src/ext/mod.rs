@@ -262,6 +262,14 @@ impl Origin {
 /// The extensions loaded, and what they registered.
 #[derive(Default)]
 pub struct Extensions {
+    /// The config being built.
+    config: std::sync::RwLock<Option<pe2_ext::data::BuildConfig>>,
+    /// The assets it leaves out.
+    disabled: std::sync::RwLock<std::collections::BTreeSet<String>>,
+    /// The events extensions declare, by name, with their labels.
+    pub events: Vec<(String, String)>,
+    /// What extensions run where events are signaled.
+    pub hooks: Vec<pe2_ext::HookDef>,
     /// What files replace assets of kinds, with what.
     recipes: Vec<pe2_ext::Recipe>,
     /// What extensions offer among the editor's commands.
@@ -559,11 +567,17 @@ impl Extensions {
             self.ops.insert(op.name.to_string(), op);
         }
         self.add_to_kinds(additions, parts.stacks);
-        self.recipes.extend(parts.recipes);
-        self.commands.extend(parts.commands);
+        self.add_declared(parts.events, parts.hooks, parts.recipes, parts.commands);
         self.types.extend(parts.types.into_iter().map(|t| (t.name.to_string(), t)));
         self.extractors.extend(parts.extractors);
         Ok(registers)
+    }
+
+    fn add_declared(&mut self, events: Vec<(String, String)>, hooks: Vec<pe2_ext::HookDef>, recipes: Vec<pe2_ext::Recipe>, commands: Vec<pe2_ext::CommandDef>) {
+        self.events.extend(events);
+        self.hooks.extend(hooks);
+        self.recipes.extend(recipes);
+        self.commands.extend(commands);
     }
 
     /// Who provides each service, and at what version: the first of several, the others said.
@@ -929,16 +943,61 @@ impl Extensions {
         engine.output_in(Some(reach), &plan, asset, address, None, read)
     }
 
+    /// Whether an output is not what it would be made as now.
+    #[must_use]
+    pub fn output_is_stale(&self, engine: &graph::exec::Engine, index: &index::Index, asset: &index::Asset, plan: &graph::Plan, output: usize) -> bool {
+        let world = Graph { index, extensions: self };
+        engine.kept_in(Some(graph::exec::Reach { engine, world: &world }), plan, asset, output, None).is_none()
+    }
+
+    /// Run an extension's hook, its node the project as a whole.
+    ///
+    /// # Errors
+    /// No extension provides it, or it failed.
+    pub fn run_hook(&self, engine: &graph::exec::Engine, index: &index::Index, op: &str, event: &str) -> Result<()> {
+        let world = Graph { index, extensions: self };
+        let reach = graph::exec::Reach { engine, world: &world };
+        let mut settings = Table::new();
+        settings.insert("event".into(), event.into());
+        engine.run_in(Some(reach), op, Vec::new(), &settings, &graph::exec::Nowhere::default()).map(|_| ())
+    }
+
+    /// An output of an asset that is a table, made or found kept.
+    ///
+    /// # Errors
+    /// It has no such output, it could not be made, or it is no table.
+    pub fn table(&self, asset: &index::Asset, index: &index::Index, address: &str) -> Result<Table> {
+        let given = self.output(&self.engine(), index, asset, address, true)?;
+        match given.value.as_deref() {
+            Some(graph::Value::Table(table)) => Ok(table.clone()),
+            _ => anyhow::bail!("{}: {address} is no table", asset.path),
+        }
+    }
+
     /// An engine for what is asked now, in passing: the extensions' operations, reading what the project's store
     /// keeps (`keep_in`), keeping what it is asked to.
     #[must_use]
     pub fn engine(&self) -> graph::exec::Engine {
-        graph::exec::Engine::new(self.operations(), self.store.get().cloned())
+        let mut engine = graph::exec::Engine::new(self.operations(), self.store.get().cloned());
+        engine.config.clone_from(&self.config.read().unwrap_or_else(std::sync::PoisonError::into_inner));
+        engine
     }
 
     /// The store outputs are kept in, for what is asked in passing: the project's, once it is open.
     pub fn keep_in(&self, store: graph::store::Store) {
         let _ = self.store.set(store);
+    }
+
+    /// The config what is made from now on is made for, with the assets left out of it.
+    pub fn set_config(&self, config: Option<pe2_ext::data::BuildConfig>, disabled: &[String]) {
+        *self.config.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        *self.disabled.write().unwrap_or_else(std::sync::PoisonError::into_inner) = disabled.iter().cloned().collect();
+    }
+
+    /// Whether the config being built leaves an asset out.
+    #[must_use]
+    pub fn is_disabled(&self, path: &str) -> bool {
+        self.disabled.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(path)
     }
 
     /// Whether a kind's output is a family: its operation has a parameter.
@@ -1475,6 +1534,11 @@ impl Project for Lens<'_> {
         self.index.assets.get(path).map_or_default(|a| self.extensions.parts(a))
     }
 
+    fn table(&self, path: &str, address: &str) -> Option<Result<Table>> {
+        let asset = self.index.assets.get(path)?;
+        Some(self.extensions.table(asset, self.index, address))
+    }
+
     fn call(&self, service: &str, arguments: &Value) -> Result<Value> {
         let def = self.extensions.service(service).with_context(|| format!("no service {service}"))?;
         (def.run)(self, arguments).with_context(|| service.to_string())
@@ -1503,6 +1567,25 @@ impl graph::exec::World for Graph<'_> {
         };
         let (plan, _) = self.extensions.plan(asset);
         Some((asset as &dyn graph::exec::Node, plan))
+    }
+
+    fn entries(&self, folder: &str) -> Vec<String> {
+        let within = format!("{}/", folder.trim_end_matches('/'));
+        let files = self.index.entries.range(within.clone()..).take_while(|(path, _)| path.starts_with(&within));
+        files.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.clone()).collect()
+    }
+
+    fn place(&self, path: &str) -> Option<std::path::PathBuf> {
+        std::fs::canonicalize(&self.index.entries.get(path)?.disk).ok()
+    }
+
+    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
+        self.index.entries.get(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
+    }
+
+    fn assets_of(&self, kind: &str) -> Vec<(String, String)> {
+        let found = self.extensions.find(self.index, kind).filter(|asset| !self.extensions.is_disabled(&asset.path));
+        found.map(|asset| (asset.path.clone(), asset.text().to_string())).collect()
     }
 }
 
@@ -1677,6 +1760,34 @@ impl pe2_ext::CallHost for Hosted<'_> {
 
     fn temp(&self) -> Result<String> {
         Ok(self.call.temp()?.display().to_string())
+    }
+
+    fn entries(&self, folder: &str) -> Result<Vec<String>> {
+        self.call.entries(folder)
+    }
+
+    fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
+        self.call.read_entry(path)
+    }
+
+    fn place(&self, path: &str) -> Option<String> {
+        self.call.place(path)
+    }
+
+    fn table_of(&self, path: &str, address: &str) -> Result<Table> {
+        let value = self.call.output_of(&toml::Value::String(path.to_string()), address)?;
+        match &*value {
+            graph::Value::Table(table) => Ok(table.clone()),
+            other => anyhow::bail!("{path}: {address} is {}, no table", other.ty()),
+        }
+    }
+
+    fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {
+        self.call.config()
+    }
+
+    fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
+        self.call.assets_of(kind)
     }
 
     fn keep(&self, path: &str, name: &str) -> Result<pe2_ext::File> {

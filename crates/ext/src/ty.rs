@@ -49,6 +49,18 @@ pub trait Registered: ValueType {
     }
 }
 
+/// What a package compiles from, gathered by `pe2.packages` for a target: each file by its place. `pe2.h` at the top, `pkg/<name>/<path>` for
+/// what `PE2_PACKAGE` reaches, `self/<path>` for the package's own, `units` listing what to compile, and `target/<target>/<package>/<key>/<name>`
+/// for what a package names under `target.<target>`.
+pub struct SourceTree;
+
+impl Registered for SourceTree {
+    const NAME: &'static str = "pe2.packages@tree";
+    const LABEL: &'static str = "Source tree";
+}
+
+impl Files for SourceTree {}
+
 /// A registered type whose value is kept as its files - its encoding - read when asked, by reference.
 pub trait Files: Registered<Value = Typed> {}
 

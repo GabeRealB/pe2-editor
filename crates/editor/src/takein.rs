@@ -40,6 +40,8 @@ pub struct Snapshot {
     pub layers: Vec<LayerInfo>,
     /// The assets whose content or entry changed; every asset where `all`.
     pub changed: BTreeSet<String>,
+    /// It took in files changed, assets or not.
+    pub files: bool,
     pub all: bool,
     /// The project is to be opened again, as this changed (`project.toml`, the extensions found).
     pub reopen: Option<&'static str>,
@@ -92,7 +94,9 @@ impl TakeIn {
                 // Each job as it comes, with those queued behind it merged in.
                 while let Ok(first) = queued.recv() {
                     let jobs: Vec<(u64, Job)> = std::iter::once(first).chain(queued.try_iter()).collect();
-                    let snapshot = worker.take_in(jobs);
+                    let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
+                    let mut snapshot = worker.take_in(jobs);
+                    snapshot.files = files;
                     if made.send(snapshot).is_err() {
                         return;
                     }
@@ -269,6 +273,7 @@ impl Worker {
             all,
             reopen,
             error,
+            files: false,
         }
     }
 }

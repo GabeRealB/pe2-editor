@@ -13,6 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+pe2-ext.workspace = true
 codecs.workspace = true
 project.workspace = true
 mcp.workspace = true

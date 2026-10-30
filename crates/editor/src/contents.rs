@@ -386,7 +386,7 @@ pub fn contents_ui(
         });
     }
     let asked = rows_ui(ui, ws, &asset, (&contents.rows, right, editable), nav);
-    if !contents.rows.is_empty() && !layers.is_empty() {
+    if (!contents.rows.is_empty() || has_views) && !layers.is_empty() {
         ui.horizontal(|ui| {
             let heading = Line { style: ContentStyle::Heading, ..Line::plain(right, 0, false, "", "Stack", "") };
             line(ui, &heading);
