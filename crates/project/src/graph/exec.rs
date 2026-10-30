@@ -343,6 +343,26 @@ impl<'a> Call<'a> {
         Writer { name: name.to_string(), store: self.store.cloned(), memory: Vec::new(), spilled: None, hasher: Sha1::new(), size: 0 }
     }
 
+    /// A path in the store for a program to write to.
+    ///
+    /// # Errors
+    /// There is no store, or it cannot be made.
+    pub fn temp(&self) -> Result<std::path::PathBuf> {
+        Ok(self.store.context("no store to keep it in")?.spill()?.1)
+    }
+
+    /// A file made kept as a content: moved to its blob, named `name`.
+    ///
+    /// # Errors
+    /// There is no store, or it cannot be read or moved.
+    pub fn keep(&self, path: &std::path::Path, name: &str) -> Result<File> {
+        let store = self.store.context("no store to keep it in")?;
+        let sha1 = crate::extract::sha1_file(path).with_context(|| path.display().to_string())?;
+        let size = std::fs::metadata(path).with_context(|| path.display().to_string())?.len();
+        store.adopt(path, &sha1)?;
+        Ok(File { name: name.to_string(), content: Content::Stored { sha1, size } })
+    }
+
     /// Copy a content into a writer, a range at a time: never read whole.
     ///
     /// # Errors
@@ -441,7 +461,7 @@ pub(crate) fn stored_contents(value: &Value, out: &mut Vec<String>) {
             Content::Inline(_) => None,
         })),
         Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
-        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) | Value::Marks(_) => {}
+        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) | Value::Marks(_) | Value::Stream(_) => {}
     }
 }
 
@@ -616,8 +636,17 @@ impl Evaluation<'_> {
         let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
         let Some(def) = self.ops.get(&step.op) else { return fail(format!("`{}`: no extension provides it", step.op)) };
         let Some(run) = def.run.as_ref() else {
-            let what = if def.start.is_some() { "is a stream, opened rather than made" } else { "makes nothing" };
-            return fail(format!("`{}` {what}", step.op));
+            let Some(start) = def.start.as_ref() else { return fail(format!("`{}` makes nothing", step.op)) };
+            // A stream, for what takes it from here: opened, and read in turn.
+            let others = self.others;
+            let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others };
+            return match start(&mut call) {
+                Ok(producer) => {
+                    let stream = super::stream::Stream::open(producer);
+                    Ok(Arc::new(Value::Stream(pe2_ext::StreamInput::of(Arc::new(super::stream::InTurn::new(&stream))))))
+                }
+                Err(e) => fail(format!("{e:#}")),
+            };
         };
         let mut bound = Vec::new();
         for (port, given) in def.inputs.iter().zip(&mut inputs) {

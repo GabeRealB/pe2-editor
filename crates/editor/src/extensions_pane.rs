@@ -1,20 +1,22 @@
 //! The Extensions pane: every extension present, enabled or not, and how they depend on each other.
 //!
 //! Its overview is a graph: a node an extension, colored by what became of it (loaded, left off by the project, refused)
-//! and marked by where it comes from; an edge a requirement, from the extension needing it down to the one it needs,
-//! labeled with the version wanted and the one found, red where it is not met; a requirement nothing provides is a
-//! dashed node of its own. Extensions are laid out in rows by depth, those depending on others above them. Selecting
+//! and marked by where it comes from; an edge a dependency, from the extension having it down to the one it names,
+//! labeled with the version wanted and the one found, red where a requirement is not met, dashed where it is weak and
+//! dotted where optional; a requirement nothing provides is a dashed node of its own, and any other dependency, none. Extensions are laid out in rows by depth, those depending on others above them. Selecting
 //! one lights what it needs and what needs it, and shows it beside the graph: who it is, where from, its size, how long
 //! it took to load and the memory it holds, what it requires and what requires it, what it registers, and why it is
 //! not loaded where it is not. A filterable list below the graph names them all.
 //!
 //! An extension is turned off or on for the project (`[extensions] disabled` in `project.toml`, a step of the
-//! history), saying first what goes with it: those requiring it, turned off with it, or those it requires, turned on
-//! with it. The editor then opens the project again with its extensions as they now are.
+//! history), saying first what goes with it: those requiring it and those weakly linked to it, turned off with it, or
+//! those it requires, turned on with it. The editor then opens the project again with its extensions as they now
+//! are. One that runs outside the sandbox is enabled first, by the user and for every project; until then it does not
+//! run.
 
 use eframe::egui::{self, Color32, RichText};
 use pe2_ext::{Scope, Setting};
-use project::ext::{Origin, Present, Status};
+use project::ext::{Dependency, Origin, Present, Status};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::workspace::Workspace;
@@ -27,7 +29,12 @@ struct State {
     filter: String,
     /// A change asked for, waiting for its confirmation: the extensions to turn off or on, the one asked first.
     asked: Option<(bool, String, Vec<String>)>,
+    /// The services behind dependencies shown through what provides them, by the dependency as shown: name and version.
+    services: Services,
 }
+
+/// Services by a dependency on them as shown (`pe2.ffmpeg@^1`): their name and version.
+type Services = HashMap<String, (String, String)>;
 
 const NODE: egui::Vec2 = egui::vec2(170.0, 46.0);
 const GAP: egui::Vec2 = egui::vec2(28.0, 54.0);
@@ -37,7 +44,8 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, user: &mut UserSetti
     let id = egui::Id::unique("extensions pane");
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     // One of an id in effect; those whose place it takes are listed, and named in its details.
-    let all = ws.extensions.present.clone();
+    let (all, services) = through_providers(ws.extensions.present.clone());
+    state.services = services;
     let present: Vec<Present> = all.iter().filter(|p| !matches!(p.status, Status::Replaced(_))).cloned().collect();
     if state.selected.as_ref().is_none_or(|s| !present.iter().any(|p| p.id == *s)) {
         state.selected = present.first().map(|p| p.id.clone());
@@ -62,6 +70,42 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, user: &mut UserSetti
 }
 
 /// An extension's id from a requirement (`pe2.images@^0.1`), and the version it wants.
+/// The extensions present with each requirement of a service shown as what provides it, where something does: what the
+/// pane draws is what is met by what.
+fn through_providers(mut present: Vec<Present>) -> (Vec<Present>, Services) {
+    let providers: HashMap<String, (String, String)> = present
+        .iter()
+        .filter(|p| !matches!(p.status, Status::Replaced(_)))
+        .flat_map(|p| {
+            p.provides.iter().map(|s| {
+                let (service, version) = requirement(s);
+                (service.to_string(), (p.id.clone(), version.unwrap_or("0.0.0").to_string()))
+            })
+        })
+        .collect();
+    let mut services = Services::new();
+    for p in &mut present {
+        for text in p.requires.iter_mut().chain(&mut p.weak).chain(&mut p.optional).chain(&mut p.linked) {
+            let (service, wanted) = requirement(text);
+            if let Some((provider, version)) = providers.get(service) {
+                let shown = wanted.map_or_else(|| provider.clone(), |wanted| format!("{provider}@{wanted}"));
+                services.insert(shown.clone(), (service.to_string(), version.clone()));
+                *text = shown;
+            }
+        }
+    }
+    (present, services)
+}
+
+/// What a dependency as shown asks for, said, and the version of the service meeting it, where one does.
+fn asked_for<'a>(state: &'a State, text: &str) -> (String, Option<&'a str>) {
+    let wanted = requirement(text).1.unwrap_or("any");
+    match state.services.get(text) {
+        Some((service, version)) => (format!("{service} {wanted}"), Some(version)),
+        None => (wanted.to_string(), None),
+    }
+}
+
 fn requirement(text: &str) -> (&str, Option<&str>) {
     match text.split_once('@') {
         Some((id, version)) => (id, Some(version)),
@@ -72,7 +116,7 @@ fn requirement(text: &str) -> (&str, Option<&str>) {
 fn status_color(ui: &egui::Ui, status: Option<&Status>) -> Color32 {
     match status {
         Some(Status::Loaded) => theme::accent(),
-        Some(Status::Disabled | Status::Replaced(_)) => theme::weak(),
+        Some(Status::Disabled | Status::NotEnabled { .. } | Status::Replaced(_)) => theme::weak(),
         Some(Status::Refused(_)) => ui.visuals().error_fg_color,
         None => ui.visuals().warn_fg_color,
     }
@@ -82,6 +126,8 @@ fn status_text(status: &Status) -> &'static str {
     match status {
         Status::Loaded => "loaded",
         Status::Disabled => "left off by the project",
+        Status::NotEnabled { changed: false } => "not enabled",
+        Status::NotEnabled { changed: true } => "not the one you enabled",
         Status::Refused(_) => "not loaded",
         Status::Replaced(_) => "replaced",
     }
@@ -94,14 +140,31 @@ fn origin_text(origin: &Origin) -> String {
         Origin::Component(path) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
         Origin::Project { .. } => "project".into(),
         Origin::User(_) => "user".into(),
+        Origin::Install(_) => "beside the editor".into(),
     }
+}
+
+/// What an extension is linked to weakly: turned off, it goes too.
+fn weakly_linked(p: &Present) -> impl Iterator<Item = &str> {
+    p.weak.iter().filter(|text| p.linked.contains(text)).map(|text| requirement(text).0)
+}
+
+/// What an extension goes with: what it requires, and what it is weakly linked to.
+fn held(p: &Present) -> impl Iterator<Item = &str> {
+    p.requires.iter().map(|text| requirement(text).0).chain(weakly_linked(p))
+}
+
+/// Of those going with an extension turned off, the ones to leave off by name: those weakly linked to it or to another
+/// going, which would otherwise run without. What requires one is refused by itself, and back when it is.
+fn left_off_too(present: &[Present], asked: &str, with: &[String]) -> Vec<String> {
+    let going = |id: &str| id == asked || with.iter().any(|w| w == id);
+    let linked = |id: &String| present.iter().find(|q| q.id == *id).is_some_and(|q| weakly_linked(q).any(going));
+    with.iter().filter(|id| linked(id)).cloned().collect()
 }
 
 /// What an extension needs, and what needs it, both ways transitively.
 fn chains(present: &[Present], id: &str) -> (HashSet<String>, HashSet<String>) {
-    let needs_of = |id: &str| -> Vec<String> {
-        present.iter().find(|p| p.id == id).map_or_default(|p| p.requires.iter().map(|r| requirement(r).0.to_string()).collect())
-    };
+    let needs_of = |id: &str| -> Vec<String> { present.iter().find(|p| p.id == id).map_or_default(|p| held(p).map(str::to_string).collect()) };
     let mut needs = HashSet::new();
     let mut stack = needs_of(id);
     while let Some(next) = stack.pop() {
@@ -112,7 +175,7 @@ fn chains(present: &[Present], id: &str) -> (HashSet<String>, HashSet<String>) {
     let mut needed = HashSet::new();
     let mut stack = vec![id.to_string()];
     while let Some(next) = stack.pop() {
-        for p in present.iter().filter(|p| p.requires.iter().any(|r| requirement(r).0 == next)) {
+        for p in present.iter().filter(|p| held(p).any(|r| r == next)) {
             if needed.insert(p.id.clone()) {
                 stack.push(p.id.clone());
             }
@@ -130,9 +193,20 @@ fn depth_of(id: &str, present: &[Present], depth: &mut HashMap<String, usize>, s
         return 0; // a cycle: its members on one row
     }
     let needs = present.iter().find(|p| p.id == id).map_or_default(|p| p.requires.clone());
-    let d = needs.iter().map(|r| depth_of(requirement(r).0, present, depth, seen) + 1).max().unwrap_or(0);
+    let d = needs.iter().map(|r| depth_of(r, present, depth, seen) + 1).max().unwrap_or(0);
     depth.insert(id.to_string(), d);
     d
+}
+
+/// An edge's line: whole for a requirement, dashed where weak, dotted where optional.
+fn edge(painter: &egui::Painter, ends: [egui::Pos2; 2], stroke: egui::Stroke, dependency: Dependency) {
+    match dependency {
+        Dependency::Required => {
+            painter.line_segment(ends, stroke);
+        }
+        Dependency::Weak => painter.extend(egui::Shape::dashed_line(&ends, stroke, 6.0, 4.0)),
+        Dependency::Optional => painter.extend(egui::Shape::dashed_line(&ends, stroke, 2.0, 4.0)),
+    }
 }
 
 /// The graph: extensions in rows by depth (those depending on others above them), requirements as edges.
@@ -154,7 +228,7 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
         by_row[depth[id]].push(id);
     }
     // Within a row, those most needed first: when the row wraps, they stay closest to what needs them.
-    let needed_by = |id: &str| present.iter().filter(|p| p.requires.iter().any(|r| requirement(r).0 == id)).count();
+    let needed_by = |id: &str| present.iter().filter(|p| p.dependencies().any(|(r, _)| requirement(r).0 == id)).count();
     for row in &mut by_row {
         row.sort_by(|a, b| needed_by(b).cmp(&needed_by(a)).then_with(|| a.cmp(b)));
     }
@@ -186,20 +260,25 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
     let font = egui::TextStyle::Small.resolve(ui.style());
     // Edges first, under the nodes.
     for p in present {
-        for text in &p.requires {
-            let (id, wanted) = requirement(text);
+        for (text, dependency) in p.dependencies() {
+            let id = requirement(text).0;
             let (Some(from), Some(to)) = (places.get(&p.id), places.get(&id.to_string())) else { continue };
             let found = present.iter().find(|q| q.id == id);
             // Met: what it needs is loaded, and it was not refused over it (a version too old).
-            let met = found.is_some_and(|q| q.status == Status::Loaded) && !matches!(p.status, Status::Refused(_));
+            let refused = matches!(&p.status, Status::Refused(why) if why.contains(id));
+            let there = found.is_some_and(|q| q.status == Status::Loaded) && !refused;
+            let met = there || dependency != Dependency::Required;
             let on = lit(&p.id) && lit(id);
             let color = if !met { ui.visuals().error_fg_color } else if on { theme::accent() } else { theme::border().gamma_multiply(2.0) };
             let (a, b) = (from.center_bottom(), to.center_top());
-            painter.line_segment([a, b], egui::Stroke::new(if on { 2.0 } else { 1.0 }, color));
+            let stroke = egui::Stroke::new(if on { 2.0 } else { 1.0 }, color);
+            edge(&painter, [a, b], stroke, dependency);
             let tip = b - (b - a).normalized() * 9.0;
             let across = (b - a).normalized().rot90() * 4.0;
             painter.add(egui::Shape::convex_polygon(vec![b, tip + across, tip - across], color, egui::Stroke::NONE));
-            let label = format!("{}  ·  has {}", wanted.unwrap_or("any"), found.map_or("none", |q| q.version.as_str()));
+            // Short, on a line of its own beside the edge: the details name the service.
+            let (wanted, service) = (requirement(text).1, asked_for(state, text).1);
+            let label = format!("{}  ·  has {}", wanted.unwrap_or("any"), service.or(found.map(|q| q.version.as_str())).unwrap_or("none"));
             painter.text(a.lerp(b, 0.5) + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, label, font.clone(), color);
         }
     }
@@ -301,6 +380,7 @@ fn details_ui(
         ui.label(RichText::new(why).small().color(ui.visuals().error_fg_color));
     }
     ui.add_space(6.0);
+    unsandboxed_ui(ui, p, message);
     switch_ui(ui, ws, present, p, state, message);
     theme::section(ui, "About", |ui| {
         egui::Grid::new("extension about").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
@@ -315,9 +395,12 @@ fn details_ui(
                 row("Version", p.version.clone());
             }
             row("From", origin_text(&p.origin));
+            if p.trust.is_some() {
+                row("Sandbox", "none".to_string());
+            }
             match &p.origin {
                 Origin::Project { asset, .. } => row("Asset", asset.clone()),
-                Origin::User(path) | Origin::Component(path) => row("File", path.display().to_string()),
+                Origin::User(path) | Origin::Install(path) | Origin::Component(path) => row("File", path.display().to_string()),
                 Origin::Builtin | Origin::Linked => {}
             }
             for q in all.iter().filter(|q| q.id == p.id && matches!(q.status, Status::Replaced(_))) {
@@ -352,33 +435,7 @@ fn details_ui(
         });
     });
     settings_ui(ui, ws, p, user, message);
-    theme::section(ui, "Requires", |ui| {
-        if p.requires.is_empty() {
-            ui.label(RichText::new("Nothing").color(theme::weak()));
-        }
-        for text in &p.requires {
-            let (id, wanted) = requirement(text);
-            let found = present.iter().find(|q| q.id == id);
-            ui.horizontal_wrapped(|ui| {
-                if ui.link(id).clicked() && found.is_some() {
-                    state.selected = Some(id.to_string());
-                }
-                let have = found.map_or_else(|| "not installed".to_string(), |q| format!("{} ({})", q.version, status_text(&q.status)));
-                ui.label(RichText::new(format!("wants {}, has {have}", wanted.unwrap_or("any"))).small().color(theme::weak()));
-            });
-        }
-    });
-    theme::section(ui, "Required by", |ui| {
-        let by: Vec<&Present> = present.iter().filter(|q| q.requires.iter().any(|r| requirement(r).0 == p.id)).collect();
-        if by.is_empty() {
-            ui.label(RichText::new("Nothing").color(theme::weak()));
-        }
-        for q in by {
-            if ui.link(&q.id).clicked() {
-                state.selected = Some(q.id.clone());
-            }
-        }
-    });
+    dependencies_ui(ui, p, present, state);
     theme::section(ui, "Registers", |ui| {
         if p.registers.iter().all(|(_, names)| names.is_empty()) {
             let note = if p.status == Status::Loaded { "Nothing" } else { "Nothing: it is not loaded" };
@@ -515,8 +572,72 @@ fn setting_input(ui: &mut egui::Ui, id: (&str, &str), label: &str, setting: &Set
     }
 }
 
+/// For an unsandboxed extension: enabling it, which is the user's and no project's. Until then nothing of it runs.
+fn unsandboxed_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
+    let Some(trust) = &p.trust else { return };
+    let enable = matches!(p.status, Status::NotEnabled { .. });
+    if enable {
+        ui.label("This extension runs outside the sandbox: it and the programs it starts can read and change your files and reach the network. Enable it only if you trust where it came from.");
+        if matches!(p.origin, Origin::Project { .. }) {
+            ui.label(RichText::new("It came with this project.").strong());
+        }
+    }
+    let label = if enable { "Enable" } else { "Disable" };
+    if ui.button(label).on_hover_text("For you, on this computer, in every project").clicked()
+        && let Err(e) = extensions::set_unsandboxed_enabled(trust, &p.id, enable)
+    {
+        *message = Some(format!("{}: {e}", p.id));
+    }
+    ui.add_space(6.0);
+}
+
+/// What an extension depends on and what depends on it, each a link to it.
+fn dependencies_ui(ui: &mut egui::Ui, p: &Present, present: &[Present], state: &mut State) {
+    theme::section(ui, "Requires", |ui| {
+        if p.dependencies().next().is_none() {
+            ui.label(RichText::new("Nothing").color(theme::weak()));
+        }
+        for (text, dependency) in p.dependencies() {
+            let id = requirement(text).0;
+            let found = present.iter().find(|q| q.id == id);
+            let (asked, service) = asked_for(state, text);
+            let service = service.map(str::to_string);
+            ui.horizontal_wrapped(|ui| {
+                if ui.link(id).clicked() && found.is_some() {
+                    state.selected = Some(id.to_string());
+                }
+                let have = found.map_or_else(
+                    || "not installed".to_string(),
+                    |q| format!("{} ({})", service.as_deref().unwrap_or(&q.version), status_text(&q.status)),
+                );
+                let how = match dependency {
+                    Dependency::Required => "",
+                    Dependency::Weak => "if it can, and goes with it: ",
+                    Dependency::Optional => "if it can, ",
+                };
+                ui.label(RichText::new(format!("{how}wants {asked}, has {have}")).small().color(theme::weak()));
+            });
+        }
+    });
+    theme::section(ui, "Required by", |ui| {
+        let by: Vec<&Present> = present.iter().filter(|q| q.dependencies().any(|(r, _)| requirement(r).0 == p.id)).collect();
+        if by.is_empty() {
+            ui.label(RichText::new("Nothing").color(theme::weak()));
+        }
+        for q in by {
+            if ui.link(&q.id).clicked() {
+                state.selected = Some(q.id.clone());
+            }
+        }
+    });
+}
+
 /// The switch: on or off for the project, saying first what goes with it.
 fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, state: &mut State, message: &mut Option<String>) {
+    // Not enabled, it is not this project's to turn on.
+    if matches!(p.status, Status::NotEnabled { .. }) {
+        return;
+    }
     let disabled: BTreeSet<String> = ws.project.disabled_extensions.iter().cloned().collect();
     let off = disabled.contains(&p.id);
     if !off && matches!(p.status, Status::Refused(_)) {
@@ -541,6 +662,7 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
                     }
                 } else {
                     next.insert(asked.clone());
+                    next.extend(left_off_too(present, &asked, &with));
                 }
                 let next: Vec<String> = next.into_iter().collect();
                 let label = format!("Turn {asked} {verb}");
@@ -560,7 +682,7 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
     let mut on = !off;
     if ui.checkbox(&mut on, "Enabled for this project").changed() {
         let (needs, needed) = chains(present, &p.id);
-        // Off: those requiring it go with it. On: those it requires and the project left off come with it.
+        // Off: those going with it. On: those it requires and the project left off come with it.
         let with: Vec<String> = if on {
             needs.into_iter().filter(|id| disabled.contains(id)).collect()
         } else {
@@ -569,5 +691,65 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
         let mut with = with;
         with.sort();
         state.asked = Some((on, p.id.clone(), with));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{State, asked_for, chains, left_off_too, requirement, through_providers};
+    use project::ext::{Origin, Present, Status};
+
+    fn extension(id: &str, requires: &[&str], weak: &[&str], optional: &[&str], linked: &[&str]) -> Present {
+        let strings = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        Present {
+            id: id.to_string(),
+            version: "0.1.0".to_string(),
+            origin: Origin::Builtin,
+            requires: strings(requires),
+            weak: strings(weak),
+            optional: strings(optional),
+            provides: vec![],
+            linked: strings(linked),
+            status: Status::Loaded,
+            size: None,
+            contract: None,
+            load: None,
+            registers: vec![],
+            trust: None,
+        }
+    }
+
+    #[test]
+    fn a_service_is_shown_through_what_provides_it_as_it_was_asked_for() {
+        let mut provider = extension("pe2.ffmpeg", &[], &[], &[], &[]);
+        provider.provides = vec!["video-container@1.0.0".to_string()];
+        let present = vec![extension("user", &[], &["video-container@^1"], &[], &["video-container@^1"]), provider, extension("plain", &["pe2.ffmpeg"], &[], &[], &[])];
+        let (shown, services) = through_providers(present);
+        let state = State { services, ..State::default() };
+        let weak = &shown[0].weak[0];
+        assert_eq!(requirement(weak), ("pe2.ffmpeg", Some("^1")));
+        assert_eq!(shown[0].linked, shown[0].weak);
+        assert_eq!(asked_for(&state, weak), ("video-container ^1".to_string(), Some("1.0.0")));
+        // Asking for the extension itself is not asking for its service, and any version is any.
+        assert_eq!(asked_for(&state, &shown[2].requires[0]), ("any".to_string(), None));
+    }
+
+    #[test]
+    fn turning_one_off_takes_what_is_linked_weakly_and_what_requires_it() {
+        let present = [
+            extension("a", &[], &[], &[], &[]),
+            extension("linked", &[], &["a@^0.1"], &[], &["a@^0.1"]),
+            extension("unlinked", &[], &["a@^2"], &[], &[]),
+            extension("optional", &[], &[], &["a"], &["a"]),
+            extension("requiring", &["a"], &[], &[], &["a"]),
+            extension("after", &["linked"], &[], &[], &["linked"]),
+            extension("further", &[], &["linked"], &[], &["linked"]),
+        ];
+        let (_, going) = chains(&present, "a");
+        let mut with: Vec<String> = going.into_iter().collect();
+        with.sort();
+        assert_eq!(with, ["after", "further", "linked", "requiring"]);
+        // What is requires follows by itself, and comes back by itself.
+        assert_eq!(left_off_too(&present, "a", &with), ["further", "linked"]);
     }
 }

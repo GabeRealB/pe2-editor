@@ -173,7 +173,12 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
         }
-        std::fs::rename(written, &path).with_context(|| path.display().to_string())
+        // Moved; or, made on another file system, copied.
+        if std::fs::rename(written, &path).is_err() {
+            std::fs::copy(written, &path).with_context(|| path.display().to_string())?;
+            let _ = std::fs::remove_file(written);
+        }
+        Ok(())
     }
 
     /// Keep bytes as a blob, where a program can read them (`blob_path`).
@@ -260,6 +265,7 @@ impl Store {
                 toggle: marks.toggle.clone(),
                 legend: marks.legend,
             },
+            Value::Stream(_) => anyhow::bail!("a stream is read, not kept"),
             Value::List(items) => {
                 let mut hashes = Vec::with_capacity(items.len());
                 for item in items {

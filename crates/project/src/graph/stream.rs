@@ -239,6 +239,46 @@ impl Reader {
     }
 }
 
+/// A stream as an operation takes it: its items in turn, from the start or where it is sent, waiting for each.
+pub struct InTurn {
+    reader: Reader,
+    at: std::sync::atomic::AtomicU64,
+}
+
+impl InTurn {
+    #[must_use]
+    pub fn new(stream: &Arc<Stream>) -> InTurn {
+        InTurn { reader: stream.reader(), at: std::sync::atomic::AtomicU64::new(0) }
+    }
+}
+
+impl pe2_ext::StreamSource for InTurn {
+    fn header(&self) -> Table {
+        self.reader.stream.header.clone()
+    }
+
+    fn next(&self) -> Result<Option<Value>> {
+        let at = self.at.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shared = &self.reader.stream.shared;
+        loop {
+            match self.reader.get(at) {
+                Poll::Ready(item) => return Ok(Some((*item).clone())),
+                Poll::End => return Ok(None),
+                Poll::Failed(e) => anyhow::bail!(e),
+                Poll::Pending => {
+                    // Woken by what is made; a batch ending just before this waits at most this long.
+                    let state = shared.state();
+                    let _ = shared.changed.wait_timeout(state, std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    fn seek(&self, position: u64) {
+        self.at.store(position, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for Reader {
     fn drop(&mut self) {
         self.stream.shared.state().readers.remove(&self.id);

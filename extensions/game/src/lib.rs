@@ -1,4 +1,4 @@
-//! pe2.game: the kinds of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`) - the discs and
+//! pe2.game: the kinds of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`, `pe2.str`) - the discs and
 //! their stages, folders and files, the files grouped, the disc's movie files (`stream`: a list of entries, each a
 //! movie in order, assembled from them; the entries are the parts the records name), the stages' records of the movies
 //! they play (`movie_slot`: a `StreamSlot`'s fields, naming its movie file's entry) and of their scenes' audio, the

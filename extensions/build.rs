@@ -8,7 +8,11 @@ use std::process::Command;
 
 const TARGET: &str = "wasm32-wasip3";
 /// The built-ins, by package: each a crate in a folder of this one.
-const BUILTINS: &[(&str, &str)] = &[("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images"), ("pe2-movies", "movies")];
+const BUILTINS: &[(&str, &str)] =
+    &[("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images"), ("pe2-movies", "movies"), ("pe2-str", "str")];
+
+/// Components built here too, and never embedded: what needs enabling is not shipped inside the editor.
+const SEPARATE: &[(&str, &str)] = &[("pe2-ffmpeg", "ffmpeg")];
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
@@ -25,13 +29,13 @@ fn main() {
         workspace.join("Cargo.lock"),
         workspace.join(".cargo/config.toml"),
     ];
-    inputs.extend(BUILTINS.iter().map(|(_, folder)| here.join(folder)));
+    inputs.extend(BUILTINS.iter().chain(SEPARATE).map(|(_, folder)| here.join(folder)));
     for input in &inputs {
         println!("cargo::rerun-if-changed={}", input.display());
     }
     let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo.current_dir(&workspace).args(["build", "--release", "--target", TARGET, "--target-dir"]).arg(&built);
-    for (package, _) in BUILTINS {
+    for (package, _) in BUILTINS.iter().chain(SEPARATE) {
         cargo.args(["-p", package]);
     }
     // This build's own flags and wrappers are for the host, not the components.

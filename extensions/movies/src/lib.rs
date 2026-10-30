@@ -1,180 +1,61 @@
-//! pe2.movies: the game's movies. A movie is a clip of an STR stream - its run of sectors as the disc stores it, MDEC
-//! video in BS frames interleaved with XA ADPCM audio - kept as `native.str`. The disc's movie files (INTER0.STR,
-//! INTER1.STR) are containers holding movies back to back (`pe2.game`'s `stream`), assembled from them; a record of
-//! a stage (`pe2.game`'s `movie_slot`) names the movie it plays. This extension extracts the movies from their
-//! containers (`extract`) and says what one's stream is from a few of its sectors (`stream`): a movie is tens of megabytes.
+//! pe2.movies: what a movie is, in whatever form it is kept: pictures and sound played in time. A form's extension
+//! (`pe2.str`) adds to the kind what it takes to read one: its stack, its `stream` of `Playback` and which frame shows it.
+//! Here is what holds for any: what a stream of a movie carries, and a frame taken from one (`frame`). Without such an
+//! extension a movie is its files.
 
-use formats::str::{SECTOR, Sector};
-use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Asset, Icon, Image, Registry, Result, Retain, Signature, Table, Tint, Value, anyhow};
-
-mod extract;
-mod frames;
+use pe2_ext::media::VideoFrame;
+use pe2_ext::ty::{self, Registered, ValueType};
+use pe2_ext::{Call, Data, Icon, Image, Registry, Result, Tint, Type, anyhow};
 
 pe2_ext::extension!("pe2.movies", "0.1.0", register);
 
-/// A movie's native file: its sectors.
-pub const NATIVE: &str = "native.str";
+/// An item of a movie's stream: a list of a frame's picture and the sound up to it (`Data::Video`, `Data::Audio`).
+pub struct Playback;
 
-/// A movie's native form: its sectors as the disc stores them, recognized by their name, passed by reference.
-pub struct Str;
+impl ValueType for Playback {
+    type Value = Data;
 
-impl Registered for Str {
-    const NAME: &str = "pe2.movies@str";
-    const LABEL: &str = "STR movie";
+    fn ty() -> Type {
+        Type::Named(Self::NAME.to_string())
+    }
 
-    fn signatures() -> Vec<Signature> {
-        vec![Signature::Name(NATIVE.into())]
+    fn decode(data: Data, _: &Call<'_>) -> Result<Data> {
+        Ok(data)
+    }
+
+    fn encode(value: Data) -> Data {
+        value
     }
 }
 
-impl Files for Str {}
-
-/// A movie's stack: its stored sectors.
-const STACK: &str = r#"[[stack]]
-op = "file"
-file = "native.str"
-
-[[stack]]
-op = "output"
-name = "native"
-"#;
-
-/// The INTER files are read at the drive's double speed: 150 sectors a second.
-const SECTORS_A_SECOND: u64 = 150;
-
-/// How many sectors at either end are looked through for a video one, or an audio one (they are interleaved).
-const LOOK: u64 = 32;
+impl Registered for Playback {
+    const NAME: &str = "pe2.movies@playback";
+    const LABEL: &str = "Playback";
+}
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    let _ = r.value_type::<Str>();
-    let stream = r.op("stream").label("Stream").input::<Str>("clip").output::<ty::Table>().run(|call| {
-        let clip = call.take::<Str>(0)?;
-        Ok(self::stream(&call.lend(&clip).asset()))
-    });
-    let frame = r.op("frame").label("Frame").input::<Str>("clip").output::<ty::Image>().parameter::<u32>("frame").run(|call| {
+    let _ = r.value_type::<Playback>();
+    let _ = r.op("frame").label("Frame").input::<ty::Stream<Playback>>("frames").output::<ty::Image>().parameter::<u32>("frame").run(|call| {
         let number = call.parameter::<u32>()?;
-        let clip = call.take::<Str>(0)?;
-        self::frame(&call.lend(&clip).asset(), number)
+        let frames = call.take::<ty::Stream<Playback>>(0)?;
+        frames.seek(number.into());
+        let item = frames.next()?.ok_or_else(|| anyhow!("no frame {number}"))?;
+        picture(&item).ok_or_else(|| anyhow!("frame {number} has no picture"))?
     });
-    // Played: each frame with the sound up to it.
-    let played = r.op("frames").label("Frames").input::<Str>("clip").output::<ty::List<ty::Any>>().streams(|call| {
-        let clip = call.take::<Str>(0)?;
-        Ok(Box::new(frames::Frames::start(call, clip)?))
-    });
-    let movie = r
-        .kind("movie")
-        .alias("movie")
-        .label("Movie")
-        .icon(Icon::Film, Tint::Motion)
-        .stack(STACK)
-        .output("stream", &stream, Retain::Transient)
-        // Shown by a frame a quarter in: the first are often black.
-        .output("frame", &frame, Retain::Transient)
-        .members(|asset| timing(asset).map(|t| (t.first + t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect())
-        .output("frames", &played, Retain::Transient)
-        .register();
-    let _ = r.extractor("clips", &movie, &[], extract::begin);
+    let _ = r.kind("movie").alias("movie").label("Movie").icon(Icon::Film, Tint::Motion).register();
     Ok(())
 }
 
-/// The bytes of a count of sectors.
-pub(crate) fn sectors(count: u64) -> usize {
-    usize::try_from(count).unwrap_or(usize::MAX).saturating_mul(SECTOR)
-}
-
-/// The first video sector's chunk at or after a sector, among the `LOOK` from it.
-pub(crate) fn chunk_at(asset: &Asset, at: u64) -> Option<formats::str::Chunk> {
-    let bytes = asset.read_range(NATIVE, at * SECTOR as u64, sectors(LOOK)).ok()?;
-    bytes.as_chunks::<SECTOR>().0.iter().find_map(|s| match Sector::raw(s) {
-        Sector::Video(chunk, _) => Some(chunk),
-        _ => None,
-    })
-}
-
-/// How a movie plays: frames numbered from `first`, `count` of them, `rate` a second.
-pub(crate) struct Timing {
-    pub first: u32,
-    pub count: u32,
-    pub rate: f64,
-}
-
-/// How a movie plays: its frames, by the numbers its first and last carry, at the rate they fill its sectors.
-pub(crate) fn timing(asset: &Asset) -> Option<Timing> {
-    let sectors = asset.size(NATIVE)? / SECTOR as u64;
-    let first = chunk_at(asset, 0)?.frame;
-    let last = (0..LOOK.min(sectors)).find_map(|back| {
-        let bytes = asset.read_range(NATIVE, (sectors - 1 - back) * SECTOR as u64, SECTOR).ok()?;
-        match Sector::raw(&bytes) {
-            Sector::Video(chunk, _) => Some(chunk.frame),
-            _ => None,
-        }
-    })?;
-    let count = last.checked_sub(first)? + 1;
-    #[expect(clippy::cast_precision_loss, reason = "sector counts")]
-    let rate = f64::from(count) * SECTORS_A_SECOND as f64 / sectors as f64;
-    Some(Timing { first, count, rate })
-}
-
-/// A movie's frame, by its number: found by halving its sectors (a video sector's frame number never goes back), its
-/// chunks read and joined, decoded at the size they say.
-fn frame(asset: &Asset, number: u32) -> Result<Image> {
-    // Its chunks follow, audio between them: a window holding the largest frame's.
-    const WINDOW: u64 = 96;
-    let sectors = asset.size(NATIVE).ok_or_else(|| anyhow!("{}: no {NATIVE}", asset.path()))? / SECTOR as u64;
-    let (mut low, mut high) = (0, sectors);
-    while low < high {
-        let middle = u64::midpoint(low, high);
-        match chunk_at(asset, middle) {
-            Some(chunk) if chunk.frame < number => low = middle + 1,
-            _ => high = middle,
-        }
+/// An item's picture, as an image; none where it has none.
+fn picture(item: &Data) -> Option<Result<Image>> {
+    let frame = |data: &Data| if let Data::Video(frame) = data { Some(image(frame)) } else { None };
+    match item {
+        Data::List(parts) => parts.iter().find_map(frame),
+        other => frame(other),
     }
-    let bytes = asset.read_range(NATIVE, low * SECTOR as u64, self::sectors(WINDOW.min(sectors - low)))?;
-    let frames = formats::str::frames(bytes.as_chunks::<SECTOR>().0.iter().map(|s| Sector::raw(s)));
-    let found = frames.into_iter().find(|f| f.number == number).ok_or_else(|| anyhow!("{}: no whole frame {number}", asset.path()))?;
-    let decoded = codecs::bs::decode_frame(&found.bytes, found.width.into(), found.height.into())
-        .map_err(|e| anyhow!("{}: frame {number}: {e}", asset.path()))?;
-    let rgba = decoded.rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect();
-    Ok(Image { width: decoded.width, height: decoded.height, rgba })
 }
 
-/// What a movie's stream is, from a few sectors at each end: its sectors and duration, its frames (the last one's
-/// number) and their size, the sectors a frame takes, and its audio.
-fn stream(asset: &Asset) -> Table {
-    let mut stream = Table::new();
-    let Some(size) = asset.size(NATIVE) else { return stream };
-    let sectors = size / SECTOR as u64;
-    let integer = |v: u64| Value::Integer(i64::try_from(v).unwrap_or(i64::MAX));
-    stream.insert("sectors".into(), integer(sectors));
-    let seconds = sectors / SECTORS_A_SECOND;
-    stream.insert("duration".into(), Value::String(format!("{}:{:02}", seconds / 60, seconds % 60)));
-    let read = |at: u64| asset.read_range(NATIVE, at * SECTOR as u64, SECTOR).ok();
-    let near = |start: u64, forward: bool| {
-        (0..LOOK.min(sectors)).filter_map(move |i| if forward { Some(start + i) } else { start.checked_sub(i) })
-    };
-    let first = near(0, true).filter_map(read).find_map(|s| match Sector::raw(&s) {
-        Sector::Video(chunk, _) => Some(chunk),
-        _ => None,
-    });
-    let last = near(sectors.saturating_sub(1), false).filter_map(read).find_map(|s| match Sector::raw(&s) {
-        Sector::Video(chunk, _) => Some(chunk),
-        _ => None,
-    });
-    if let (Some(first), Some(last)) = (first, last) {
-        stream.insert("frames".into(), integer(u64::from(last.frame)));
-        stream.insert("frame_size".into(), Value::Array(vec![integer(first.width.into()), integer(first.height.into())]));
-        stream.insert("sectors_per_frame".into(), integer(first.chunks.into()));
-    }
-    let audio = near(0, true).filter_map(read).find_map(|s| match Sector::raw(&s) {
-        Sector::Audio(coding, _) => Some(codecs::xa::Coding::of(coding)),
-        _ => None,
-    });
-    let audio = audio.map_or_else(
-        || "none".to_string(),
-        |c| format!("XA ADPCM, {}, {} Hz", if c.stereo { "stereo" } else { "mono" }, c.rate),
-    );
-    stream.insert("audio".into(), Value::String(audio));
-    stream
+fn image(frame: &VideoFrame) -> Result<Image> {
+    Ok(Image { width: frame.width as usize, height: frame.height as usize, rgba: frame.rgba()? })
 }

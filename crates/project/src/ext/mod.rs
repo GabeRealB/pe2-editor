@@ -8,6 +8,7 @@
 //! a name only once. An extension is a component the host runs (`component`), or a crate linked into the host whose
 //! entry point it calls - the built-ins' fallback while developing.
 
+pub mod unsandboxed;
 pub mod component;
 
 use anyhow::{Context, Result};
@@ -39,6 +40,8 @@ pub enum Origin {
     Project { asset: String, file: PathBuf },
     /// A component in the user's own extensions folder.
     User(PathBuf),
+    /// A component in the extensions folder beside the editor.
+    Install(PathBuf),
     /// Linked into the host, its entry point called directly: a built-in, for debugging.
     Linked,
 }
@@ -51,6 +54,12 @@ pub struct Loadable {
     pub id: String,
     pub version: String,
     pub requires: Vec<String>,
+    /// What it uses where a compatible one is enabled, and is turned off with once linked.
+    pub weak: Vec<String>,
+    /// What it uses where a compatible one is enabled.
+    pub optional: Vec<String>,
+    /// The services it offers (`c-compiler@1.0.0`).
+    pub provides: Vec<String>,
     pub origin: Origin,
     register: Option<Register>,
     /// Its component, where it runs as one - set when it registers: its instances, their memory.
@@ -64,6 +73,10 @@ pub struct Loadable {
     pub build: Option<String>,
     /// The settings kept for it, by scope (`{ project = { ... }, user = { ... } }`), which it reads as it registers.
     pub settings: toml::Table,
+    /// For an unsandboxed extension, its hash: what the user enabled.
+    pub trust: Option<String>,
+    /// What it depends on and has, once it is to register.
+    reaches: Vec<String>,
 }
 
 impl From<Extension> for Loadable {
@@ -72,6 +85,9 @@ impl From<Extension> for Loadable {
             id: extension.id.to_string(),
             version: extension.version.to_string(),
             requires: extension.requires.iter().map(ToString::to_string).collect(),
+            weak: extension.weak.iter().map(ToString::to_string).collect(),
+            optional: extension.optional.iter().map(ToString::to_string).collect(),
+            provides: extension.provides.iter().map(ToString::to_string).collect(),
             origin: Origin::Linked,
             register: Some(Box::new(move |registry| (extension.register)(registry))),
             component: None,
@@ -79,6 +95,8 @@ impl From<Extension> for Loadable {
             contract: None,
             build: None,
             settings: toml::Table::new(),
+            trust: None,
+            reaches: Vec::new(),
         }
     }
 }
@@ -91,8 +109,8 @@ pub struct Loaded {
     /// Its component's hash; none linked in.
     pub build: Option<String>,
     pub origin: Origin,
-    /// What it requires (`pe2.images@^0.1`): whose services it may call.
-    pub requires: Vec<String>,
+    /// What it depends on and has (`pe2.images@^0.1`): whose services it may call.
+    pub reaches: Vec<String>,
 }
 
 /// An extension present, loaded or not: who it is, what became of it, what it registered.
@@ -102,6 +120,14 @@ pub struct Present {
     pub version: String,
     pub origin: Origin,
     pub requires: Vec<String>,
+    /// What it uses where a compatible one is enabled, and is turned off with once linked.
+    pub weak: Vec<String>,
+    /// What it uses where a compatible one is enabled.
+    pub optional: Vec<String>,
+    /// The services it offers.
+    pub provides: Vec<String>,
+    /// What it depends on and was linked to as it loaded, as written.
+    pub linked: Vec<String>,
     pub status: Status,
     /// Its component's size in bytes, where it is one.
     pub size: Option<usize>,
@@ -112,6 +138,8 @@ pub struct Present {
     /// What it registered, by what it is - kinds, roles, formats, importers, extractors, panels, tools, services -
     /// each name qualified.
     pub registers: Registers,
+    /// For an unsandboxed extension, its hash: what enabling it records.
+    pub trust: Option<String>,
 }
 
 /// What an extension registered, by what it is (`kinds`, `services`, ...), each name qualified.
@@ -124,12 +152,57 @@ impl Present {
             version: extension.version.clone(),
             origin: extension.origin.clone(),
             requires: extension.requires.clone(),
+            weak: extension.weak.clone(),
+            optional: extension.optional.clone(),
+            provides: extension.provides.clone(),
+            linked: vec![],
             status,
             size: extension.size,
             contract: extension.contract.clone(),
             load: None,
             registers: vec![],
+            trust: extension.trust.clone(),
         }
+    }
+}
+
+/// How an extension depends on another. Either a compatible one is enabled, and it is linked, or it is not, whatever the
+/// reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dependency {
+    /// Not linked, the extension is refused.
+    Required,
+    /// Not linked, the extension runs without it. Linked, turning it off turns the extension off too.
+    Weak,
+    /// Not linked, the extension runs without it. Linked, turning it off leaves the extension on.
+    Optional,
+}
+
+/// Who provides each service, and at what version.
+type Provided = HashMap<String, (String, String)>;
+
+/// How a dependency stands for an extension about to load.
+enum Fit {
+    /// It is there, and fits.
+    Has,
+    /// No compatible one is enabled, and the extension does without.
+    Without,
+    /// It is yet to load.
+    Waiting,
+    /// The extension cannot load: why.
+    Refused(String),
+}
+
+/// Dependencies, each as written, and how.
+fn dependencies<'a>(requires: &'a [String], weak: &'a [String], optional: &'a [String]) -> impl Iterator<Item = (&'a String, Dependency)> {
+    let lists = [(requires, Dependency::Required), (weak, Dependency::Weak), (optional, Dependency::Optional)];
+    lists.into_iter().flat_map(|(texts, dependency)| texts.iter().map(move |text| (text, dependency)))
+}
+
+impl Present {
+    /// What it depends on: each as written, and how.
+    pub fn dependencies(&self) -> impl Iterator<Item = (&String, Dependency)> {
+        dependencies(&self.requires, &self.weak, &self.optional)
     }
 }
 
@@ -142,6 +215,9 @@ pub enum Status {
     /// Not loaded, and why: a requirement missing, disabled or too old, a cycle, its registration failing, another of
     /// its id from the same place.
     Refused(String),
+    /// An unsandboxed extension the user has not enabled, or - `changed` - that is no longer what they enabled: nothing
+    /// of it was run.
+    NotEnabled { changed: bool },
     /// Not loaded: one of its id from a nearer place (the project before the user's folder before the built-ins) takes
     /// its place, named.
     Replaced(String),
@@ -153,7 +229,7 @@ impl Origin {
         match self {
             Origin::Project { .. } => 0,
             Origin::User(_) => 1,
-            Origin::Component(_) => 2,
+            Origin::Component(_) | Origin::Install(_) => 2,
             Origin::Builtin | Origin::Linked => 3,
         }
     }
@@ -167,12 +243,17 @@ impl Origin {
     /// Where it is from, said in a few words.
     #[must_use]
     pub fn said(&self) -> String {
-        let file = |path: &std::path::Path| path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
+        // One in a folder goes by the folder.
+        let file = |path: &std::path::Path| {
+            let named = if path.file_name().is_some_and(|n| n == EXTENSION_COMPONENT) { path.parent().unwrap_or(path) } else { path };
+            named.file_name().map_or_default(|n| n.to_string_lossy().into_owned())
+        };
         match self {
             Origin::Builtin => "built in".into(),
             Origin::Linked => "linked in".into(),
             Origin::Project { asset, .. } => format!("the project's {asset}"),
             Origin::User(path) => format!("your {}", file(path)),
+            Origin::Install(path) => format!("{}, beside the editor", file(path)),
             Origin::Component(path) => file(path),
         }
     }
@@ -209,6 +290,8 @@ pub struct Extensions {
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     kind_aliases: HashMap<String, String>,
     role_aliases: HashMap<String, String>,
+    /// Who provides each service: its provider's id.
+    providers: HashMap<String, String>,
     /// The streams open, by the key of the output each is: one is shared by its readers while what it read holds.
     streams: Mutex<HashMap<String, (std::sync::Weak<graph::stream::Stream>, graph::exec::Reads)>>,
 }
@@ -244,7 +327,7 @@ impl Extensions {
         Extensions::load_without(extensions, builtin, &[])
     }
 
-    /// Load `extensions` but those a project leaves off (`disabled`, by id) - and those requiring them.
+    /// Load `extensions` but those a project leaves off (`disabled`, by id) - and those needing them.
     #[must_use]
     pub fn load_without(extensions: Vec<Loadable>, builtin: bool, disabled: &[String]) -> Extensions {
         let mut out = Extensions::default();
@@ -272,6 +355,7 @@ impl Extensions {
             }
         }
         let ids: HashSet<String> = pending.iter().map(|e| e.id.clone()).collect();
+        let provided = out.note_providers(&pending);
         let mut off: HashSet<String> = HashSet::new();
         let mut status: HashMap<String, Status> = HashMap::new();
         for extension in pending.iter().filter(|e| disabled.contains(&e.id)) {
@@ -279,6 +363,8 @@ impl Extensions {
             status.insert(extension.id.clone(), Status::Disabled);
         }
         let mut timings: HashMap<String, (std::time::Duration, Registers)> = HashMap::new();
+        // Nothing left to do but what waits on another: what waits only on those it can do without goes on without them.
+        let mut impatient = false;
         loop {
             let mut progress = false;
             for extension in &mut pending {
@@ -286,32 +372,26 @@ impl Extensions {
                     continue;
                 }
                 let mut ready = true;
-                for text in &extension.requires {
-                    let (id, version) = requirement(text);
-                    let blocked = if !ids.contains(id) {
-                        Some(format!("it needs {text}, which is not installed"))
-                    } else if off.contains(id) {
-                        Some(format!("it needs {id}, which is disabled"))
-                    } else if let Some(loaded) = out.loaded.iter().find(|l| l.id == id) {
-                        version.filter(|v| !satisfies(&loaded.version, v)).map(|v| {
-                            format!("it needs {id} {v}, and {} is installed", loaded.version)
-                        })
-                    } else {
-                        ready = false;
-                        None
-                    };
-                    if let Some(why) = blocked {
-                        out.problems.push(format!("{} is disabled: {why}", extension.id));
-                        status.insert(extension.id.clone(), Status::Refused(why));
-                        off.insert(extension.id.clone());
-                        ready = false;
-                        progress = true;
-                        break;
+                let mut reaches = Vec::new();
+                for (text, dependency) in dependencies(&extension.requires, &extension.weak, &extension.optional) {
+                    match out.fit(text, dependency, (&provided, &ids, &off)) {
+                        Fit::Has => reaches.push(text.clone()),
+                        Fit::Without => {}
+                        Fit::Waiting => ready = ready && impatient && dependency != Dependency::Required,
+                        Fit::Refused(why) => {
+                            out.problems.push(format!("{} is disabled: {why}", extension.id));
+                            status.insert(extension.id.clone(), Status::Refused(why));
+                            off.insert(extension.id.clone());
+                            ready = false;
+                            progress = true;
+                            break;
+                        }
                     }
                 }
                 if !ready || off.contains(&extension.id) {
                     continue;
                 }
+                extension.reaches = reaches;
                 progress = true;
                 let started = std::time::Instant::now();
                 let builtin = builtin && (extension.origin.builtin() || standing_in.contains(&extension.id));
@@ -327,9 +407,10 @@ impl Extensions {
                     }
                 }
             }
-            if !progress {
+            if !progress && impatient {
                 break;
             }
+            impatient = !progress;
         }
         for extension in &pending {
             let status = status.remove(&extension.id).unwrap_or_else(|| {
@@ -338,6 +419,7 @@ impl Extensions {
                 Status::Refused(why)
             });
             let mut present = Present::of(extension, status);
+            present.linked.clone_from(&extension.reaches);
             if let Some((load, registers)) = timings.remove(&extension.id) {
                 present.load = Some(load);
                 present.registers = registers;
@@ -347,6 +429,30 @@ impl Extensions {
         out
     }
 
+
+    /// How a dependency of an extension about to load stands, given who provides what, the ids there are and those off.
+    fn fit(
+        &self,
+        text: &str,
+        dependency: Dependency,
+        (provided, ids, off): (&Provided, &HashSet<String>, &HashSet<String>),
+    ) -> Fit {
+        let (named, version) = requirement(text);
+        let (id, service) = provided.get(named).map_or((named, None), |(id, v)| (id.as_str(), Some(v.as_str())));
+        let none = |why: String| if dependency == Dependency::Required { Fit::Refused(why) } else { Fit::Without };
+        if !ids.contains(id) {
+            return none(format!("it needs {text}, which is not installed"));
+        }
+        if off.contains(id) {
+            return none(format!("it needs {id}, which is disabled"));
+        }
+        let Some(loaded) = self.loaded.iter().find(|l| l.id == id) else { return Fit::Waiting };
+        let installed = service.unwrap_or(&loaded.version);
+        match version.filter(|v| !satisfies(installed, v)) {
+            Some(version) => none(format!("it needs {named} {version}, and {installed} is installed")),
+            None => Fit::Has,
+        }
+    }
 
     /// Call an extension's entry point and take what it registered, checked: what it registered, by what it is.
     fn register(&mut self, extension: &mut Loadable, builtin: bool) -> Result<Registers> {
@@ -367,7 +473,10 @@ impl Extensions {
             ("services", listed(parts.services.iter().map(|s| &s.name).collect())),
         ];
         let (kinds, roles) = (parts.kinds, parts.roles);
-        let dependencies: Vec<&str> = extension.requires.iter().map(|r| requirement(r).0).collect();
+        // What it requires, a service also by its provider.
+        let wanted = extension.reaches.iter().map(|r| requirement(r).0);
+        let behind: Vec<String> = wanted.clone().filter_map(|r| self.providers.get(r).cloned()).collect();
+        let dependencies: Vec<&str> = wanted.chain(behind.iter().map(String::as_str)).collect();
         let mut seen = HashSet::new();
         let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
@@ -404,13 +513,15 @@ impl Extensions {
         for alias in aliases {
             anyhow::ensure!(builtin, "only a built-in extension names a kind or role bare ({alias})");
         }
+        let additions = self.additions(extension, &dependencies, parts.additions)?;
+        self.check_stacks(&extension.id, &dependencies, &parts.stacks)?;
         let index = self.loaded.len();
         if let Some(component) = &extension.component {
             self.components.push((extension.id.clone(), component.clone()));
         }
         let (id, version, origin) = (extension.id.clone(), extension.version.clone(), extension.origin.clone());
-        let requires = extension.requires.clone();
-        self.loaded.push(Loaded { id, version, build: extension.build.clone(), origin, requires });
+        let reaches = extension.reaches.clone();
+        self.loaded.push(Loaded { id, version, build: extension.build.clone(), origin, reaches });
         for kind in kinds {
             if let Some(alias) = &kind.alias {
                 self.kind_aliases.insert(alias.clone(), kind.name.to_string());
@@ -427,10 +538,90 @@ impl Extensions {
         self.tools.extend(parts.tools);
         self.services.extend(parts.services.into_iter().map(|s| (s.name.to_string(), s)));
         self.recognizers.extend(parts.types.iter().filter(|t| t.recognizable()).cloned());
-        self.ops.extend(parts.ops.into_iter().map(|o| (o.name.to_string(), o)));
+        // Its operations, by their names and the services it provides: what requires one names them so.
+        let offered: Vec<&str> = extension.provides.iter().map(|p| requirement(p).0).collect();
+        for op in parts.ops {
+            for service in &offered {
+                self.ops.insert(format!("{service}@{}", op.name.local()), op.clone());
+            }
+            self.ops.insert(op.name.to_string(), op);
+        }
+        self.add_to_kinds(additions, parts.stacks);
         self.types.extend(parts.types.into_iter().map(|t| (t.name.to_string(), t)));
         self.extractors.extend(parts.extractors);
         Ok(registers)
+    }
+
+    /// Who provides each service, and at what version: the first of several, the others said.
+    fn note_providers(&mut self, pending: &[Loadable]) -> Provided {
+        let mut provided = Provided::new();
+        for extension in pending {
+            for text in &extension.provides {
+                let (service, version) = requirement(text);
+                if let Some((first, _)) = provided.get(service) {
+                    self.problems.push(format!("{} and {first} both provide {service}: {first} is used", extension.id));
+                } else {
+                    provided.insert(service.to_string(), (extension.id.clone(), version.unwrap_or("0.0.0").to_string()));
+                }
+            }
+        }
+        self.providers = provided.iter().map(|(service, (id, _))| (service.clone(), id.clone())).collect();
+        provided
+    }
+
+    /// The outputs an extension adds to kinds of what it depends on, checked. One through what it can do without and
+    /// does not have is not there.
+    fn additions(
+        &self,
+        extension: &Loadable,
+        dependencies: &[&str],
+        additions: Vec<(String, pe2_ext::OutputDef)>,
+    ) -> Result<Vec<(String, pe2_ext::OutputDef)>> {
+        let id = extension.id.as_str();
+        let absent = |owner: &str| {
+            !dependencies.contains(&owner) && extension.weak.iter().chain(&extension.optional).any(|d| requirement(d).0 == owner)
+        };
+        let mut added = Vec::new();
+        for (kind, output) in additions {
+            let owner = kind.split_once('@').map_or("", |(owner, _)| owner);
+            let made_by = output.op.split_once('@').map_or("", |(owner, _)| owner);
+            if absent(owner) || absent(made_by) {
+                continue;
+            }
+            anyhow::ensure!(dependencies.contains(&owner), "{id} adds to {kind}, which it does not require");
+            anyhow::ensure!(
+                made_by == id || dependencies.contains(&made_by),
+                "{id}'s output {} on {kind} is made by {}, which neither it nor what it requires registers",
+                output.name,
+                output.op
+            );
+            anyhow::ensure!(self.kinds.contains_key(&kind), "{id}: no kind {kind}");
+            added.push((kind, output));
+        }
+        Ok(added)
+    }
+
+    /// The stacks an extension gives kinds, checked: of what it depends on.
+    fn check_stacks(&self, id: &str, dependencies: &[&str], stacks: &[(String, String)]) -> Result<()> {
+        for (kind, _) in stacks {
+            let owner = kind.split_once('@').map_or("", |(owner, _)| owner);
+            anyhow::ensure!(dependencies.contains(&owner) && self.kinds.contains_key(kind), "{id} gives {kind} a stack, which it does not require");
+        }
+        Ok(())
+    }
+
+    /// Outputs and stacks added to kinds, checked; a kind keeps the stack it has.
+    fn add_to_kinds(&mut self, additions: Vec<(String, pe2_ext::OutputDef)>, stacks: Vec<(String, String)>) {
+        for (kind, output) in additions {
+            if let Some((def, _)) = self.kinds.get_mut(&kind) {
+                def.outputs.push(output);
+            }
+        }
+        for (kind, stack) in stacks {
+            if let Some((def, _)) = self.kinds.get_mut(&kind) {
+                def.stack.get_or_insert(stack);
+            }
+        }
     }
 
     /// What an extension registers for the work graph, checked: its registration's own problems; that what its
@@ -563,6 +754,7 @@ impl Extensions {
     #[must_use]
     pub fn tail(&self, asset: &index::Asset) -> Vec<graph::Tail> {
         let Some(kind) = self.kind_of(asset) else { return Vec::new() };
+        let from = |o: &pe2_ext::OutputDef| o.from.as_ref().and_then(|name| kind.outputs.iter().position(|o| o.name == *name));
         let mut tail: Vec<graph::Tail> = kind
             .outputs
             .iter()
@@ -571,7 +763,7 @@ impl Extensions {
                 fixed: false,
                 op: o.op.clone(),
                 retain: o.retain,
-                from: None,
+                from: from(o),
                 settings: Table::new(),
             })
             .collect();
@@ -842,7 +1034,9 @@ impl Extensions {
     pub fn may_call(&self, caller: &str, service: &str) -> bool {
         let Some(owner) = self.services.get(service).map(|s| s.name.extension()) else { return false };
         owner == caller
-            || self.loaded.iter().find(|l| l.id == caller).is_some_and(|l| l.requires.iter().any(|r| requirement(r).0 == owner))
+            || self.loaded.iter().find(|l| l.id == caller).is_some_and(|l| {
+                l.reaches.iter().map(|r| requirement(r).0).any(|r| r == owner || self.providers.get(r).is_some_and(|p| p == owner))
+            })
     }
 
     /// The tools the extensions registered, for agents.
@@ -905,9 +1099,9 @@ impl Extensions {
         qualified.extend(self.roles.keys().map(|r| (r.clone(), r.clone())));
         qualified.extend(self.role_aliases.iter().map(|(a, q)| (a.clone(), q.clone())));
         let qualified = Arc::new(qualified);
-        for def in self.ops.values() {
+        for (name, def) in &self.ops {
             let version = self.version_of(def.name.extension());
-            let mut op = graph::OpDef::new(&def.name.to_string(), &def.label, &version);
+            let mut op = graph::OpDef::new(name, &def.label, &version);
             op.inputs.clone_from(&def.inputs);
             op.parameter = def.parameter.as_ref().map(|(name, _)| name.clone());
             let (run, qualified) = (def.run.clone(), qualified.clone());
@@ -1300,6 +1494,21 @@ impl pe2_ext::CallHost for Hosted<'_> {
     fn writer(&self, name: &str) -> Result<Box<dyn pe2_ext::FileWriter>> {
         Ok(Box::new(self.call.writer(name)))
     }
+
+    fn temp(&self) -> Result<String> {
+        Ok(self.call.temp()?.display().to_string())
+    }
+
+    fn keep(&self, path: &str, name: &str) -> Result<pe2_ext::File> {
+        self.call.keep(std::path::Path::new(path), name)
+    }
+
+    fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
+        match content {
+            pe2_ext::Content::Inline(_) => None,
+            pe2_ext::Content::Stored { sha1, .. } => self.call.content_path(sha1).map(|p| p.display().to_string()),
+        }
+    }
 }
 
 impl Source for index::Asset {
@@ -1408,7 +1617,125 @@ mod tests {
         requires: &'static [&'static str],
         register: fn(&mut Registry) -> Result<()>,
     ) -> Loadable {
-        Extension { id, version, requires, register }.into()
+        Extension { id, version, requires, weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register }.into()
+    }
+
+    #[test]
+    fn a_dependency_holds_as_its_kind_says() {
+        fn compiler(r: &mut Registry) -> Result<()> {
+            let _ = r.op("compile").output::<pe2_ext::ty::Image>().run(|_| Ok(pe2_ext::Image { width: 1, height: 1, rgba: vec![0; 4] }));
+            Ok(())
+        }
+        fn movie(r: &mut Registry) -> Result<()> {
+            let _ = r.kind("movie").register();
+            Ok(())
+        }
+        fn editing(r: &mut Registry) -> Result<()> {
+            r.add_output("test.movies@movie", "built", "c-compiler@compile", None, pe2_ext::Retain::Transient);
+            Ok(())
+        }
+        let of = |id, requires, weak, optional, register| Extension {
+            id,
+            version: "0.1.0",
+            requires,
+            weak,
+            optional,
+            provides: &[],
+            platforms: &[],
+            unsandboxed: false,
+            register,
+        };
+        let load = |extensions: Vec<Loadable>| Extensions::load(extensions, false);
+        let user = |weak, optional| Loadable::from(of("test.user", &[], weak, optional, nothing));
+        let gcc = || Loadable::from(Extension { provides: &["c-compiler@1.2.0"], ..of("test.gcc", &[], &[], &[], compiler) });
+        let loaded = |extensions: &Extensions| extensions.loaded.iter().any(|l| l.id == "test.user");
+        // No compatible one enabled, for each reason there is: weak and optional run without it, nothing said.
+        let broken = || Loadable::from(of("test.broken", &["test.nothing"], &[], &[], nothing));
+        let off = |user| Extensions::load_without(vec![user, gcc()], false, &["test.gcc".to_string()]);
+        for (weak, optional) in [(&["test.gcc"] as &'static [&'static str], &[] as &'static [&'static str]), (&[], &["test.gcc"])] {
+            assert!(loaded(&load(vec![user(weak, optional)])));
+            assert!(loaded(&off(user(weak, optional))));
+        }
+        for (weak, optional) in [(&["c-compiler@^2"] as &'static [&'static str], &[] as &'static [&'static str]), (&[], &["c-compiler@^2"])] {
+            let without = load(vec![user(weak, optional), gcc()]);
+            assert!(loaded(&without));
+            assert_eq!(without.problems, Vec::<String>::new());
+        }
+        for (weak, optional) in [(&["test.broken"] as &'static [&'static str], &[] as &'static [&'static str]), (&[], &["test.broken"])] {
+            assert!(loaded(&load(vec![user(weak, optional), broken()])));
+        }
+        assert!(!loaded(&off(of("test.user", &["test.gcc"], &[], &[], nothing).into())));
+        // A compatible one enabled: it comes first and is linked, its services the extension's to call.
+        for extensions in [load(vec![user(&["c-compiler@^1"], &[]), gcc()]), load(vec![user(&[], &["c-compiler@^1"]), gcc()])] {
+            assert_eq!(extensions.loaded[0].id, "test.gcc");
+            assert_eq!(extensions.loaded[1].reaches, ["c-compiler@^1"]);
+            assert!(extensions.present.iter().any(|p| p.id == "test.user" && p.linked == ["c-compiler@^1"]));
+        }
+        // None enabled, nothing is linked.
+        assert!(load(vec![user(&["test.gcc"], &[])]).present.iter().all(|p| p.linked.is_empty()));
+        // Each optional to the other: neither is left waiting. A requirement going round still is.
+        let round = |id, requires, optional| Loadable::from(of(id, requires, &[], optional, nothing));
+        let both = load(vec![round("test.a", &[], &["test.b"]), round("test.b", &[], &["test.a"])]);
+        assert_eq!(both.loaded.len(), 2, "{:?}", both.problems);
+        let both = load(vec![round("test.a", &["test.b"], &[]), round("test.b", &["test.a"], &[])]);
+        assert_eq!(both.loaded, vec![]);
+        // What makes an output, weak and absent: the output is not there, and nothing else changes. Not declared, it is
+        // an error.
+        let movies = || Loadable::from(of("test.movies", &[], &[], &[], movie));
+        let plain = load(vec![movies(), of("test.editing", &["test.movies"], &["c-compiler@^1"], &[], editing).into()]);
+        assert_eq!(plain.loaded.len(), 2, "{:?}", plain.problems);
+        assert_eq!(plain.kinds["test.movies@movie"].0.outputs.len(), 0);
+        let added = load(vec![movies(), gcc(), of("test.editing", &["test.movies"], &["c-compiler@^1"], &[], editing).into()]);
+        assert_eq!(added.kinds["test.movies@movie"].0.outputs.len(), 1);
+        let undeclared = load(vec![movies(), of("test.editing", &["test.movies"], &[], &[], editing).into()]);
+        assert_eq!(undeclared.loaded.len(), 1);
+    }
+
+    #[test]
+    fn a_service_is_met_by_what_provides_it_and_an_extension_adds_to_a_kind() {
+        fn compiler(r: &mut Registry) -> Result<()> {
+            let _ = r.op("compile").output::<pe2_ext::ty::Image>().run(|_| Ok(pe2_ext::Image { width: 1, height: 1, rgba: vec![0; 4] }));
+            Ok(())
+        }
+        fn nothing(_: &mut Registry) -> Result<()> {
+            Ok(())
+        }
+        fn movie(r: &mut Registry) -> Result<()> {
+            let _ = r.kind("movie").register();
+            Ok(())
+        }
+        fn editing(r: &mut Registry) -> Result<()> {
+            r.add_output("test.movies@movie", "built", "c-compiler@compile", None, pe2_ext::Retain::Transient);
+            Ok(())
+        }
+        let load = |extensions: Vec<Extension>| {
+            let loadable = extensions.into_iter().map(Loadable::from).collect();
+            Extensions::load(loadable, false)
+        };
+        let extension = |id, requires, provides, register| Extension { id, version: "0.1.0", requires, weak: &[], optional: &[], provides, platforms: &[], unsandboxed: false, register };
+        let extensions = load(vec![
+            extension("test.gcc", &[], &["c-compiler@1.2.0"], compiler),
+            extension("test.movies", &[], &[], movie),
+            extension("test.user", &["c-compiler@^1", "test.movies"], &[], editing),
+            extension("test.newer", &["c-compiler@^2"], &[], nothing),
+            extension("test.other", &["fortran-compiler@^1"], &[], nothing),
+        ]);
+        let status = |id: &str| extensions.present.iter().find(|p| p.id == id).map(|p| p.status.clone()).unwrap();
+        assert_eq!(status("test.user"), Status::Loaded);
+        assert!(matches!(status("test.newer"), Status::Refused(why) if why.contains("c-compiler ^2, and 1.2.0")), "{:?}", status("test.newer"));
+        assert!(matches!(status("test.other"), Status::Refused(why) if why.contains("not installed")));
+        // Its operations, by the service: what uses it does not name what provides it.
+        assert!(extensions.operations().get("c-compiler@compile").is_some());
+        assert!(extensions.kinds["test.movies@movie"].0.outputs.iter().any(|o| o.name == "built"));
+        // Two providers: the first, the other said.
+        let both = load(vec![
+            extension("test.gcc", &[], &["c-compiler@1.0.0"], compiler),
+            extension("test.clang", &[], &["c-compiler@1.0.0"], compiler),
+        ]);
+        assert!(both.problems.iter().any(|p| p.contains("both provide c-compiler")), "{:?}", both.problems);
+        // Adding to a kind it does not require is refused.
+        let stray = load(vec![extension("test.movies", &[], &[], movie), extension("test.stray", &["c-compiler"], &[], editing)]);
+        assert!(stray.problems.iter().any(|p| p.contains("test.stray is disabled")), "{:?}", stray.problems);
     }
 
     #[test]
@@ -1577,7 +1904,7 @@ mod calling {
             std::fs::write(path, text).unwrap();
         }
         let extension = |id: &'static str, requires: &'static [&'static str], register: fn(&mut Registry) -> Result<()>| {
-            Loadable::from(Extension { id, version: "0.1.0", requires, register })
+            Loadable::from(Extension { id, version: "0.1.0", requires, weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register })
         };
         let extensions = Extensions::load(
             vec![
@@ -1606,7 +1933,7 @@ mod calling {
     #[test]
     fn a_project_leaves_extensions_off_with_those_requiring_them() {
         let extension = |id: &'static str, requires: &'static [&'static str], register: fn(&mut Registry) -> Result<()>| {
-            Loadable::from(Extension { id, version: "0.1.0", requires, register })
+            Loadable::from(Extension { id, version: "0.1.0", requires, weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register })
         };
         let loaded = Extensions::load_without(
             vec![extension("test.paint", &[], paint), extension("test.scene", &["test.paint@^0.1"], scene), extension("test.stray", &[], stray)],

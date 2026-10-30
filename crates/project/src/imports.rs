@@ -593,7 +593,7 @@ mod attaching {
         write(&root, ".layers/base/s.asset/source.txt", "a b");
         write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\nfine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
         let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], register: strips })], true);
+            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (1, 0, 0));
@@ -655,7 +655,7 @@ mod attaching {
         write(&root, ".layers/base/t.asset/source.txt", "a");
         write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\none = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
         let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], register: strips })], true);
+            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         let project = Project::load(&root).unwrap();
         let (mut index, _) = open(&root, &extensions);
         let lock = Lock::try_acquire(&root, "a test").unwrap();

@@ -555,6 +555,7 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
         })),
         Made::Pcm(pcm) => text(json!({ "rate": pcm.rate, "channels": pcm.channels, "samples": pcm.samples.len() })),
         Made::List(items) => text(json!({ "items": items.len(), "type": value.ty().to_string() })),
+        Made::Stream(stream) => text(json!({ "stream": serde_json::to_value(stream.header()).unwrap_or_default() })),
         Made::Marks(marks) => text(json!({
             "marks": marks.boxes.iter().map(|m| json!({
                 "name": m.name, "x": m.rect.x, "y": m.rect.y, "width": m.rect.width, "height": m.rect.height,

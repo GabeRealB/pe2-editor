@@ -1367,7 +1367,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
                     project::ext::Origin::Project { asset, .. } => {
                         ui.label(RichText::new("project").small().color(theme::weak())).on_hover_text(asset);
                     }
-                    project::ext::Origin::User(path) | project::ext::Origin::Component(path) => {
+                    project::ext::Origin::User(path) | project::ext::Origin::Install(path) | project::ext::Origin::Component(path) => {
                         let text = path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
                         ui.label(RichText::new(text).small().color(theme::weak())).on_hover_text(path.display().to_string());
                     }

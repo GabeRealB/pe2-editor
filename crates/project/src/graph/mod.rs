@@ -73,6 +73,7 @@ pub fn hash(value: &Value) -> String {
             sha1(sound.buffer.bytes())
         ),
         Value::Marks(marks) => format!("marks\n{marks:?}"),
+        Value::Stream(stream) => format!("stream\n{}", toml::to_string(&stream.header()).unwrap_or_default()),
         Value::List(items) => items.iter().fold(String::from("list\n"), |mut text, item| {
             let _ = writeln!(text, "{}", hash(item));
             text

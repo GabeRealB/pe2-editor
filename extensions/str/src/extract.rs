@@ -1,4 +1,4 @@
-//! Extracting movies (`pe2.movies@clips`). A disc's movie file (`pe2.game`'s `stream`) is a list of entries, each a
+//! Extracting movies (`pe2.str@clips`). A disc's movie file (`pe2.game`'s `stream`) is a list of entries, each a
 //! movie, its clips back to back in the entries' order; a movie is located by the entries naming it - the file's slot
 //! on a disc, and the entry's place - and declares only its sha1. A clip starts where a video sector's frame number
 //! drops below the one before it (each clip counts its frames from 1); the records of the stages start exactly there.

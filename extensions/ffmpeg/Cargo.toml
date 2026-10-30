@@ -1,0 +1,16 @@
+[package]
+name = "pe2-ffmpeg"
+description = "pe2.ffmpeg, an unsandboxed extension: video files written and read through ffmpeg, offered as the video-container service"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A component built for wasm32-wasip3, in a bundle (`project::ext::bundle`); never embedded in the editor.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true

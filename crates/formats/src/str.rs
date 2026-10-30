@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 /// An INTER file's sector: subheader, data, error correction.
 pub const SECTOR: usize = 2336;
+/// The INTER files are read at the drive's double speed: 150 sectors a second.
+pub const SECTORS_A_SECOND: u64 = 150;
 /// A sector's data.
 pub const DATA: usize = 2048;
 /// The XA subheader before a raw sector's data.
@@ -73,6 +75,23 @@ impl Chunk {
             width: u16_at(16)?,
             height: u16_at(18)?,
         })
+    }
+}
+
+/// How a sector's audio is coded: its subheader's coding byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coding {
+    pub stereo: bool,
+    /// Samples a second, a channel: 37800 or 18900.
+    pub rate: u32,
+    /// 4 bits a sample; else 8, which PE2 does not use.
+    pub four_bit: bool,
+}
+
+impl Coding {
+    #[must_use]
+    pub fn of(byte: u8) -> Coding {
+        Coding { stereo: byte & 3 == 1, rate: if (byte >> 2) & 3 == 1 { 18900 } else { 37800 }, four_bit: (byte >> 4) & 3 != 1 }
     }
 }
 

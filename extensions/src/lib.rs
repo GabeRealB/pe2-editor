@@ -6,7 +6,8 @@
 //! step through one in a debugger or compare the two.
 
 use project::Project;
-use project::ext::{EXTENSION_COMPONENT, EXTENSION_KIND, Extensions, Loadable, Origin, Present, Status, component};
+use project::ext::component::Unsandboxed;
+use project::ext::{EXTENSION_COMPONENT, EXTENSION_KIND, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
 use project::index::Index;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,7 +25,7 @@ pub fn components() -> &'static [(&'static str, &'static [u8])] {
 /// The built-in extensions linked in.
 #[must_use]
 pub fn linked() -> Vec<pe2_ext::Extension> {
-    vec![pe2_formats::extension(), pe2_game::extension(), pe2_images::extension(), pe2_movies::extension()]
+    vec![pe2_formats::extension(), pe2_game::extension(), pe2_images::extension(), pe2_movies::extension(), pe2_str::extension()]
 }
 
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
@@ -41,7 +42,10 @@ pub type Kept = BTreeMap<String, Table>;
 pub struct Found {
     pub origin: Origin,
     pub file: PathBuf,
-    /// What tells this version of it from another: its hash where the index knows it, else its size and time.
+    /// The folder it is in with what it ships, where it is in one of its own.
+    pub folder: Option<PathBuf>,
+    /// What tells this version of it from another: its hash where the index knows it, else its size and time - and
+    /// what the user enabled, as that changes what it runs as.
     pub stamp: String,
 }
 
@@ -63,25 +67,49 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
     // Those that cannot be loaded at all, present as refused: named by where they are, as who they say they are may
     // not be readable, and is no claim on an id.
     let mut unloadable = vec![];
+    let enabled = enabled_unsandboxed();
     for found in found {
         let loaded = std::fs::read(&found.file).map_err(|e| format!("it cannot be read: {e}")).and_then(|bytes| {
             if !bytes.starts_with(b"\0asm") {
                 return Err("it is not a WebAssembly component".to_string());
             }
+            let about = component::about(&bytes);
+            if let Some(why) = about.as_ref().and_then(|a| unsandboxed::elsewhere(&a.platforms)) {
+                return Err(why);
+            }
             let name = found.origin.said();
+            // Unsandboxed, it runs only as the user enabled it; until then, it is read for who it is.
+            let held = match about.filter(|a| a.unsandboxed) {
+                Some(about) => {
+                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref()).map_err(|e| format!("{e:#}"))?;
+                    if !enabled.contains_key(&trust) {
+                        unloadable.push(not_enabled(about, found, &bytes, trust, &enabled));
+                        return Ok(None);
+                    }
+                    Some(Unsandboxed { folder: found.folder.clone(), trust })
+                }
+                None => None,
+            };
             // The first line of what went wrong: the parser's is followed by the bytes it found.
-            component::load_bytes(&name, &bytes, found.origin.clone()).map_err(|e| {
+            let loaded = match held {
+                Some(held) => component::load_unsandboxed(&name, &bytes, found.origin.clone(), held),
+                None => component::load_bytes(&name, &bytes, found.origin.clone()),
+            };
+            let loaded = loaded.map_err(|e| {
                 let why = format!("{e:#}");
                 why.lines().next().unwrap_or_default().trim_end_matches(['[', ' ', '=']).to_string()
-            })
+            });
+            loaded.map(Some)
         });
         match loaded {
-            Ok(extension) => loadable.push(extension),
+            Ok(Some(extension)) => loadable.push(extension),
+            Ok(None) => {}
             Err(e) => {
                 failed.push(format!("{}: {e}", found.origin.said()));
-                // Named by where it is: the asset's path, the file's name.
-                let name = match &found.origin {
-                    Origin::Project { asset, .. } => asset.clone(),
+                // Named by where it is: the asset's path, the folder's name, the file's.
+                let name = match (&found.origin, &found.folder) {
+                    (Origin::Project { asset, .. }, _) => asset.clone(),
+                    (_, Some(folder)) => folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned()),
                     _ => found.file.file_name().map_or_default(|n| n.to_string_lossy().into_owned()),
                 };
                 unloadable.push(Present {
@@ -89,11 +117,16 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
                     version: String::new(),
                     origin: found.origin.clone(),
                     requires: vec![],
+                    weak: vec![],
+                    optional: vec![],
+                    provides: vec![],
+                    linked: vec![],
                     status: Status::Refused(e),
                     size: std::fs::metadata(&found.file).ok().and_then(|m| usize::try_from(m.len()).ok()),
                     contract: None,
                     load: None,
                     registers: vec![],
+                    trust: None,
                 });
             }
         }
@@ -108,6 +141,60 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
     extensions.problems.extend(failed);
     extensions.present.extend(unloadable);
     extensions
+}
+
+/// An unsandboxed extension not run, as it is shown: who it says it is, read without running anything.
+fn not_enabled(about: component::About, found: &Found, bytes: &[u8], trust: String, enabled: &BTreeMap<String, String>) -> Present {
+    Present {
+        status: Status::NotEnabled { changed: enabled.values().any(|id| *id == about.id) },
+        id: about.id,
+        version: about.version,
+        origin: found.origin.clone(),
+        requires: about.requires,
+        weak: about.weak,
+        optional: about.optional,
+        provides: about.provides,
+        linked: vec![],
+        size: Some(bytes.len()),
+        contract: component::contract(bytes),
+        load: None,
+        registers: vec![],
+        trust: Some(trust),
+    }
+}
+
+/// The file holding what the user enabled.
+fn enabled_file() -> Option<PathBuf> {
+    Some(data_folder()?.join("unsandboxed.toml"))
+}
+
+/// The unsandboxed extensions the user enabled: each one's hash, with its id. They live with the user, never in a
+/// project.
+#[must_use]
+pub fn enabled_unsandboxed() -> BTreeMap<String, String> {
+    let text = enabled_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    let table: Table = toml::from_str(&text).unwrap_or_default();
+    let Some(Value::Table(enabled)) = table.get("enabled") else { return BTreeMap::new() };
+    enabled.iter().filter_map(|(trust, id)| Some((trust.clone(), id.as_str()?.to_string()))).collect()
+}
+
+/// Enable an unsandboxed extension, by its hash, in place of what was enabled of its id; or not.
+///
+/// # Errors
+/// What is enabled could not be written.
+pub fn set_unsandboxed_enabled(trust: &str, id: &str, on: bool) -> std::io::Result<()> {
+    let file = enabled_file().ok_or_else(|| std::io::Error::other("no data folder"))?;
+    let mut enabled = enabled_unsandboxed();
+    enabled.retain(|_, of| of != id);
+    if on {
+        enabled.insert(trust.to_string(), id.to_string());
+    }
+    let mut table = Table::new();
+    table.insert("enabled".into(), Value::Table(enabled.into_iter().map(|(t, id)| (t, Value::String(id))).collect()));
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(file, toml::to_string(&table).unwrap_or_default())
 }
 
 /// The built-ins, loaded once a process.
@@ -154,12 +241,18 @@ pub fn user_settings() -> BTreeMap<String, Table> {
         .collect()
 }
 
-/// The components found beside the built-ins: the project's (where the index is given), then the user's. Two
-/// findings differ where a component came, went or changed: the extensions are loaded again.
+/// The components found beside the built-ins: the project's (where the index is given), the user's, those beside the
+/// editor. Two findings differ where a component came, went or changed, or what the user enabled did: the extensions
+/// are loaded again.
 #[must_use]
 pub fn found(index: Option<&Index>) -> Vec<Found> {
     let mut found = index.map_or_default(project_components);
     found.extend(user_components());
+    found.extend(install_components());
+    let enabled = enabled_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    for found in &mut found {
+        found.stamp.push_str(&enabled);
+    }
     found
 }
 
@@ -201,7 +294,8 @@ pub fn project_components(index: &Index) -> Vec<Found> {
         .filter_map(|a| {
             let file = a.files.iter().find(|f| f.name == EXTENSION_COMPONENT)?;
             let origin = Origin::Project { asset: a.path.clone(), file: file.path.clone() };
-            Some(Found { origin, file: file.path.clone(), stamp: file.sha1.clone() })
+            let stamp = a.files.iter().map(|f| f.sha1.as_str()).collect::<Vec<_>>().join(" ");
+            Some(Found { origin, file: file.path.clone(), folder: file.path.parent().map(PathBuf::from), stamp })
         })
         .collect()
 }
@@ -229,27 +323,55 @@ pub fn data_folder() -> Option<PathBuf> {
     }
 }
 
-/// The components in the user's folder (`*.wasm`), in name order.
+/// The extensions folder beside the editor.
 #[must_use]
-pub fn user_components() -> Vec<Found> {
-    let Some(folder) = user_folder() else { return vec![] };
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&folder)
+pub fn install_folder() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("extensions"))
+}
+
+/// What tells a file's version from another: its size and time.
+fn file_stamp(file: &std::path::Path) -> String {
+    let meta = std::fs::metadata(file).ok();
+    let time = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    format!("{} {}", meta.map_or(0, |m| m.len()), time.map_or(0, |t| t.as_nanos()))
+}
+
+/// The stamps of what a folder holds, below it too.
+fn folder_stamp(folder: &std::path::Path) -> String {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    entries.sort();
+    entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
+}
+
+/// The components in an extensions folder, in name order: each a `*.wasm`, or a folder holding an `extension.wasm`
+/// and what it ships.
+fn components_in(folder: &std::path::Path, origin: fn(PathBuf) -> Origin) -> Vec<Found> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    entries.sort();
+    entries
         .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "wasm"))
-        .collect();
-    files.sort();
-    files
-        .into_iter()
-        .map(|file| {
-            let meta = std::fs::metadata(&file).ok();
-            let time = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-            let stamp = format!("{} {}", meta.map_or(0, |m| m.len()), time.map_or(0, |t| t.as_nanos()));
-            Found { origin: Origin::User(file.clone()), file, stamp }
+        .filter_map(|entry| {
+            if entry.is_dir() {
+                let file = entry.join(EXTENSION_COMPONENT);
+                let stamp = folder_stamp(&entry);
+                return file.is_file().then(|| Found { origin: origin(file.clone()), file, folder: Some(entry), stamp });
+            }
+            let wasm = entry.extension().is_some_and(|e| e == "wasm");
+            wasm.then(|| Found { origin: origin(entry.clone()), stamp: file_stamp(&entry), file: entry, folder: None })
         })
         .collect()
+}
+
+/// The components in the user's folder.
+#[must_use]
+pub fn user_components() -> Vec<Found> {
+    user_folder().map_or_default(|folder| components_in(&folder, Origin::User))
+}
+
+/// The components beside the editor.
+#[must_use]
+pub fn install_components() -> Vec<Found> {
+    install_folder().map_or_default(|folder| components_in(&folder, Origin::Install))
 }
 
 #[cfg(test)]
@@ -394,6 +516,8 @@ mod tests {
             let declared = linked().into_iter().find(|e| e.id == about.id).unwrap_or_else(|| panic!("{}: not linked", about.id));
             assert_eq!(about.version, declared.version, "{package}");
             assert_eq!(about.requires, declared.requires, "{package}");
+            assert_eq!(about.weak, declared.weak, "{package}");
+            assert_eq!(about.optional, declared.optional, "{package}");
         }
     }
 }

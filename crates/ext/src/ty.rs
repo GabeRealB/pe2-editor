@@ -226,6 +226,28 @@ impl ValueType for Pcm {
     }
 }
 
+/// A stream of a type's items, given to an operation to read in turn.
+pub struct Stream<T>(PhantomData<T>);
+
+impl<T: ValueType> ValueType for Stream<T> {
+    type Value = crate::data::StreamInput;
+
+    fn ty() -> Type {
+        Type::Stream(Box::new(T::ty()))
+    }
+
+    fn decode(data: Data, _: &Call<'_>) -> Result<crate::data::StreamInput> {
+        match data {
+            Data::Stream(stream) => Ok(stream),
+            other => bail!("given {}, not a stream", other.ty()),
+        }
+    }
+
+    fn encode(value: crate::data::StreamInput) -> Data {
+        Data::Stream(value)
+    }
+}
+
 /// What is marked on a node's pictures.
 pub struct Marks;
 

@@ -99,6 +99,15 @@ impl MediaBuffer {
         self.size
     }
 
+    /// A copy of its bytes.
+    #[must_use]
+    pub fn read(&self) -> Vec<u8> {
+        #[cfg(not(target_family = "wasm"))]
+        return self.bytes.to_vec();
+        #[cfg(target_family = "wasm")]
+        self.handle.bytes()
+    }
+
     /// A buffer of bytes the host holds already.
     #[cfg(not(target_family = "wasm"))]
     #[must_use]
@@ -116,6 +125,12 @@ impl MediaBuffer {
     #[cfg(target_family = "wasm")]
     pub(crate) fn from_host(handle: crate::guest::bindings::pe2::extension::media::MediaBuffer) -> MediaBuffer {
         MediaBuffer { size: handle.size(), handle: std::rc::Rc::new(handle) }
+    }
+
+    /// The handle the host knows it by.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn handle(&self) -> &crate::guest::bindings::pe2::extension::media::MediaBuffer {
+        &self.handle
     }
 
     /// The handle to give the host: this one where nothing else holds it, else another to the same bytes.
@@ -150,6 +165,46 @@ pub struct VideoFrame {
     pub timestamp: u64,
 }
 
+impl VideoFrame {
+    /// Its picture as RGBA, row by row: YCbCr as the decoder of the game's movies turns it into RGB (BT.601, the chroma
+    /// offset by 128, each chroma sample covering four pixels), as the player's shader does.
+    ///
+    /// # Errors
+    /// Its layout is one this cannot read, or its buffer is short.
+    pub fn rgba(&self) -> crate::Result<Vec<u8>> {
+        let (width, height) = (self.width as usize, self.height as usize);
+        let bytes = self.buffer.read();
+        let size = usize::try_from(self.format.size(self.width, self.height))?;
+        if bytes.len() < size {
+            crate::bail!("a frame of {} bytes, not {size}", bytes.len());
+        }
+        match self.format {
+            PixelFormat::Rgba8888 => Ok(bytes),
+            PixelFormat::Yuv420p => {
+                let (half_w, half_h) = (width.div_ceil(2), height.div_ceil(2));
+                let (y, chroma) = bytes.split_at(width * height);
+                let (cb, cr) = chroma.split_at(half_w * half_h);
+                let mut rgba = Vec::with_capacity(width * height * 4);
+                for row in 0..height {
+                    for column in 0..width {
+                        let at = row / 2 * half_w + column / 2;
+                        let l = f64::from(y[row * width + column]);
+                        let (b, r) = (f64::from(cb[at]) - 128.0, f64::from(cr[at]) - 128.0);
+                        rgba.extend([channel(l + 1.402 * r), channel(l - 0.3437 * b - 0.7143 * r), channel(l + 1.772 * b), 255]);
+                    }
+                }
+                Ok(rgba)
+            }
+            other => crate::bail!("a frame in {} cannot be read", other.name()),
+        }
+    }
+}
+
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to 0..=255 first")]
+fn channel(value: f64) -> u8 {
+    value.clamp(0.0, 255.0) as u8
+}
+
 /// A stretch of sound: its buffer, its layout, rate and channels, when it begins (in microseconds).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioData {
@@ -176,4 +231,27 @@ pub fn sample_formats() -> Vec<SampleFormat> {
     return crate::guest::sample_formats();
     #[cfg(not(target_family = "wasm"))]
     vec![SampleFormat::S16Interleaved]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaBuffer, PixelFormat, VideoFrame};
+
+    fn frame(format: PixelFormat, bytes: Vec<u8>) -> VideoFrame {
+        VideoFrame { buffer: MediaBuffer::new(bytes), format, width: 2, height: 2, timestamp: 0 }
+    }
+
+    #[test]
+    fn a_frame_reads_as_rgba() {
+        // Grey where the chroma is neutral, the luma's own value in each channel.
+        let grey = frame(PixelFormat::Yuv420p, vec![10, 20, 30, 40, 128, 128]);
+        assert_eq!(grey.rgba().unwrap(), [10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255]);
+        // Red chroma, clamped.
+        let red = frame(PixelFormat::Yuv420p, vec![200; 4].into_iter().chain([128, 255]).collect());
+        assert_eq!(&red.rgba().unwrap()[..4], [255, 109, 200, 255]);
+        let plain = frame(PixelFormat::Rgba8888, vec![1; 16]);
+        assert_eq!(plain.rgba().unwrap(), vec![1; 16]);
+        assert!(frame(PixelFormat::Yuv420p, vec![0; 3]).rgba().is_err());
+        assert!(frame(PixelFormat::Nv12, vec![0; 6]).rgba().is_err());
+    }
 }

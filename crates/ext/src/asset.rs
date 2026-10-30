@@ -38,6 +38,19 @@ pub trait Source {
         let _ = name;
         None
     }
+    /// What an unsandboxed extension's operation is lent of the host (`CallHost::temp`, `keep`, `path_of`): only an asset lent
+    /// for an operation's run has them.
+    fn temp(&self) -> Option<Result<String>> {
+        None
+    }
+    fn keep(&self, path: &str, name: &str) -> Option<Result<crate::File>> {
+        let _ = (path, name);
+        None
+    }
+    fn path_of(&self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
 }
 
 /// An asset, lent for one call: what an extension keeps of it, it copies. Its kind and role are qualified names

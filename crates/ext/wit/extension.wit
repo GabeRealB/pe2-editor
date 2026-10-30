@@ -29,6 +29,8 @@ interface media {
     resource media-buffer {
         constructor(data: list<u8>);
         size: func() -> u64;
+        /// A copy of its bytes.
+        bytes: func() -> list<u8>;
         /// Another handle to the same bytes.
         share: func() -> media-buffer;
     }
@@ -54,6 +56,31 @@ interface media {
     /// The layouts the host takes: what a generator makes its frames and sound in, where it can.
     pixel-formats: func() -> list<pixel-format>;
     sample-formats: func() -> list<sample-format>;
+}
+
+/// What an extension declared unsandboxed has beyond WASI, which it has in full, once the user enabled it: starting
+/// programs, which WASI cannot. Others are refused. What it launches - what it ships, or what it finds on the system -
+/// is outside any sandbox; a command line goes no further than this component, what uses it depending on it and calling
+/// its operations, not knowing what is behind them.
+interface unsandboxed {
+    use media.{media-buffer};
+
+    /// A program running: what is written goes to its standard input, what it writes to its standard output is read.
+    resource process {
+        write: func(bytes: list<u8>) -> result<_, string>;
+        /// A buffer's bytes written straight to its input: they pass through no component's memory.
+        write-buffer: func(buffer: borrow<media-buffer>) -> result<_, string>;
+        /// Its input ends.
+        close-input: func();
+        /// Up to `len` bytes of its output: none at its end.
+        read: func(len: u32) -> result<list<u8>, string>;
+        /// Wait for it to end, what it says on its standard error the reason where it failed.
+        wait: func() -> result<_, string>;
+    }
+
+    /// Start a program: where it ships one (for this platform, in `<platform>/` of its folder, or any), else as the
+    /// system finds it.
+    spawn: func(tool: string, args: list<string>) -> result<process, string>;
 }
 
 interface types {
@@ -124,6 +151,14 @@ interface types {
         notes: list<string>,
     }
 
+    /// A stream given to an operation: its header (TOML), its items in turn, none at its end, waiting for each.
+    resource stream-reader {
+        header: func() -> string;
+        next: func() -> result<option<value>, string>;
+        /// Go on from an item.
+        seek: func(position: u64);
+    }
+
     /// A value that is no list (a table as TOML).
     variant item {
         image(image),
@@ -144,6 +179,7 @@ interface types {
         video(video-frame),
         audio(audio-data),
         marks(marks),
+        %stream(stream-reader),
         items(list<item>),
     }
 }
@@ -169,6 +205,13 @@ interface host {
         /// A file the operation it is lent to makes, named `name`, written through the host: only the node lent to an
         /// operation's run makes one.
         writer: func(name: string) -> result<writer, string>;
+        /// For an unsandboxed extension's operation: a path to have a program write to, on the file system its contents are
+        /// kept on.
+        temp: func() -> result<string, string>;
+        /// For an unsandboxed extension's operation: a file it made kept as a content, moved rather than read, named `name`.
+        keep: func(path: string, name: string) -> result<file, string>;
+        /// For an unsandboxed extension's operation: where a content is on disk, to point a program at it.
+        path-of: func(name: string) -> option<string>;
     }
 
     /// A file being made, appended to a piece at a time and then finished: kept by the host as it comes - in memory
@@ -310,6 +353,16 @@ interface guest {
         id: string,
         version: string,
         requires: list<string>,
+        /// What it uses where a compatible one is enabled, and is turned off with once linked.
+        weak: list<string>,
+        /// What it uses where a compatible one is enabled.
+        optional: list<string>,
+        /// The services it offers, by name and version: what requires one takes whichever provides it.
+        provides: list<string>,
+        /// The platforms it runs on (`linux-x86_64`); none, any.
+        platforms: list<string>,
+        /// It runs outside the sandbox: it runs only once the user enabled it.
+        unsandboxed: bool,
     }
 
     /// A field, its readings by handle.
@@ -340,6 +393,8 @@ interface guest {
         op: string,
         retain: retain,
         members: bool,
+        /// The output of its kind it is made from; none, its node's result.
+        %from: option<string>,
     }
 
     /// A kind; its outputs' members and its parts called back by its index.
@@ -460,6 +515,10 @@ interface guest {
         ops: list<op>,
         types: list<value-type>,
         extractors: list<extractor>,
+        /// Outputs it adds to kinds of what it requires, by the kind's qualified name.
+        additions: list<tuple<string, output>>,
+        /// The stacks it gives kinds of what it requires that have none, by the kind's qualified name (TOML).
+        stacks: list<tuple<string, string>>,
         /// The memory a job of something it registered may take, where more than the host's default: by its name
         /// (qualified), in bytes.
         memory: list<tuple<string, u64>>,
@@ -474,7 +533,8 @@ interface guest {
     /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
     /// parameter.
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
-    /// A family's members, of an asset: each by its parameter's value, with a label.
+    /// A family's members, of an asset: each by its parameter's value, with a label. An added output goes by its place
+    /// after the kinds, as `kind`.
     members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
@@ -527,5 +587,6 @@ interface guest {
 
 world extension {
     import host;
+    import unsandboxed;
     export guest;
 }

@@ -45,6 +45,8 @@ struct Registered {
     types: Vec<TypeDef>,
     ops: Vec<OpDef>,
     extractors: Vec<crate::ExtractorDef>,
+    /// Outputs added to others' kinds.
+    additions: Vec<crate::OutputDef>,
     reclaimable: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
@@ -196,6 +198,18 @@ impl Source for Lent<'_> {
     fn writer(&self, name: &str) -> Option<crate::Result<Box<dyn crate::FileWriter>>> {
         let writer = self.resource().writer(name).map_err(crate::Error::msg);
         Some(writer.map(|w| Box::new(HostWriter(Some(w))) as Box<dyn crate::FileWriter>))
+    }
+
+    fn temp(&self) -> Option<crate::Result<String>> {
+        Some(self.resource().temp().map_err(crate::Error::msg))
+    }
+
+    fn keep(&self, path: &str, name: &str) -> Option<crate::Result<crate::File>> {
+        Some(self.resource().keep(path, name).map(file_from_wit).map_err(crate::Error::msg))
+    }
+
+    fn path_of(&self, name: &str) -> Option<String> {
+        self.resource().path_of(name)
     }
 }
 
@@ -542,6 +556,11 @@ impl g::Guest for Component {
             id: extension.id.to_string(),
             version: extension.version.to_string(),
             requires: extension.requires.iter().map(ToString::to_string).collect(),
+            weak: extension.weak.iter().map(ToString::to_string).collect(),
+            optional: extension.optional.iter().map(ToString::to_string).collect(),
+            provides: extension.provides.iter().map(ToString::to_string).collect(),
+            platforms: extension.platforms.iter().map(ToString::to_string).collect(),
+            unsandboxed: extension.unsandboxed,
         }
     }
 
@@ -570,7 +589,12 @@ impl g::Guest for Component {
 
     fn members(kind: u32, output: u32, asset: &host::Asset) -> Vec<(String, String)> {
         let lent = Lent::borrowed(asset);
-        let output = registered().kinds.get(kind as usize).and_then(|k| k.outputs.get(output as usize));
+        let registered = registered();
+        // An added output goes by its place after the kinds.
+        let output = match registered.kinds.get(kind as usize) {
+            Some(kind) => kind.outputs.get(output as usize),
+            None => (kind as usize).checked_sub(registered.kinds.len()).and_then(|at| registered.additions.get(at)),
+        };
         output.and_then(|o| o.members.as_ref()).map_or_else(Vec::new, |members| members(&lent.asset()))
     }
 
@@ -640,6 +664,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         types: vec![],
         ops: vec![],
         extractors: vec![],
+        additions: vec![],
         reclaimable: None,
     };
     if !describe {
@@ -654,6 +679,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         ops: vec![],
         types: vec![],
         extractors: vec![],
+        additions: parts.additions.iter().map(|(kind, output)| (kind.clone(), describe_output(output))).collect(),
+        stacks: parts.stacks.clone(),
         memory: parts.memory.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect(),
         settings: parts.settings.iter().map(|(s, _)| setting(s)).collect(),
     };
@@ -698,6 +725,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
     numbered.types = parts.types;
     numbered.ops = parts.ops;
     numbered.extractors = parts.extractors;
+    numbered.additions = parts.additions.into_iter().map(|(_, output)| output).collect();
     numbered.kinds = parts.kinds;
     numbered.reclaimable = parts.reclaimable;
     Ok((numbered, Some(out)))
@@ -714,21 +742,22 @@ fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
         parts: kind.parts.is_some(),
         views: views(&kind.views, numbered),
         inspector: views(&kind.inspector, numbered),
-        outputs: kind
-            .outputs
-            .iter()
-            .map(|o| g::Output {
-                name: o.name.clone(),
-                op: o.op.clone(),
-                retain: match o.retain {
-                    crate::Retain::Cache => g::Retain::Cache,
-                    crate::Retain::Build => g::Retain::Build,
-                    crate::Retain::Transient => g::Retain::Transient,
-                },
-                members: o.members.is_some(),
-            })
-            .collect(),
+        outputs: kind.outputs.iter().map(describe_output).collect(),
         stack: kind.stack.clone(),
+    }
+}
+
+fn describe_output(o: &crate::OutputDef) -> g::Output {
+    g::Output {
+        name: o.name.clone(),
+        op: o.op.clone(),
+        retain: match o.retain {
+            crate::Retain::Cache => g::Retain::Cache,
+            crate::Retain::Build => g::Retain::Build,
+            crate::Retain::Transient => g::Retain::Transient,
+        },
+        members: o.members.is_some(),
+        from: o.from.clone(),
     }
 }
 
@@ -744,6 +773,7 @@ fn number(parts: crate::registry::Parts) -> Registered {
         types: vec![],
         ops: vec![],
         extractors: vec![],
+        additions: vec![],
         reclaimable: None,
     };
     for kind in &parts.kinds {
@@ -763,6 +793,7 @@ fn number(parts: crate::registry::Parts) -> Registered {
     numbered.types = parts.types;
     numbered.ops = parts.ops;
     numbered.extractors = parts.extractors;
+    numbered.additions = parts.additions.into_iter().map(|(_, output)| output).collect();
     numbered.kinds = parts.kinds;
     numbered.reclaimable = parts.reclaimable;
     numbered
@@ -865,6 +896,21 @@ impl CallHost for NodeHost<'_> {
     fn writer(&self, name: &str) -> crate::Result<Box<dyn crate::FileWriter>> {
         Source::writer(self.0, name).ok_or_else(|| crate::anyhow!("the host makes no files for this call"))?
     }
+
+    fn temp(&self) -> crate::Result<String> {
+        Source::temp(self.0).ok_or_else(|| crate::anyhow!("the host has no temporary files for this call"))?
+    }
+
+    fn keep(&self, path: &str, name: &str) -> crate::Result<crate::File> {
+        Source::keep(self.0, path, name).ok_or_else(|| crate::anyhow!("the host keeps nothing for this call"))?
+    }
+
+    fn path_of(&self, content: &Content) -> Option<String> {
+        match content {
+            Content::Inline(_) => None,
+            Content::Stored { sha1, .. } => Source::path_of(self.0, sha1),
+        }
+    }
 }
 
 /// A value as the contract carries it: a list's items that are lists themselves are dropped (it carries one level).
@@ -895,6 +941,8 @@ fn to_wit(value: Data) -> types::Value {
             toggle: marks.toggle,
             legend: marks.legend,
         }),
+        // A stream is read, not handed back: an operation's result is what it made of it.
+        Data::Stream(_) => types::Value::Items(vec![]),
     }
 }
 
@@ -949,7 +997,7 @@ fn item_to_wit(value: Data) -> Option<types::Item> {
         types::Value::Video(v) => types::Item::Video(v),
         types::Value::Audio(a) => types::Item::Audio(a),
         types::Value::Marks(m) => types::Item::Marks(m),
-        types::Value::Items(_) => return None,
+        types::Value::Items(_) | types::Value::Stream(_) => return None,
     })
 }
 
@@ -972,8 +1020,9 @@ fn typed_to_wit(t: crate::Typed) -> types::Typed {
 }
 
 /// A value as the contract carried it.
-fn from_wit(value: types::Value) -> Data {
+pub(crate) fn from_wit(value: types::Value) -> Data {
     match value {
+        types::Value::Stream(reader) => Data::Stream(crate::StreamInput::from_host(reader)),
         types::Value::Image(i) => item_from_wit(types::Item::Image(i)),
         types::Value::Table(t) => item_from_wit(types::Item::Table(t)),
         types::Value::Pcm(p) => item_from_wit(types::Item::Pcm(p)),

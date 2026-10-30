@@ -276,6 +276,90 @@ pub enum Value {
     Video(crate::media::VideoFrame),
     Audio(crate::media::AudioData),
     Marks(crate::Marks),
+    Stream(StreamInput),
+}
+
+/// What reads a stream for an operation it is given to, in the host: its items in turn.
+pub trait StreamSource: Send + Sync {
+    fn header(&self) -> Table;
+    /// The next item, waiting for it; none at the stream's end.
+    ///
+    /// # Errors
+    /// It could not be made.
+    fn next(&self) -> Result<Option<Value>>;
+    /// Go on from an item.
+    fn seek(&self, position: u64);
+}
+
+/// A stream given to an operation: read in turn. In the host, its reader; in a component, a handle to it.
+#[derive(Clone)]
+pub struct StreamInput {
+    #[cfg(not(target_family = "wasm"))]
+    source: Arc<dyn StreamSource>,
+    #[cfg(target_family = "wasm")]
+    handle: std::rc::Rc<crate::guest::bindings::pe2::extension::types::StreamReader>,
+}
+
+impl StreamInput {
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn of(source: Arc<dyn StreamSource>) -> StreamInput {
+        StreamInput { source }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn source(&self) -> &Arc<dyn StreamSource> {
+        &self.source
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn from_host(handle: crate::guest::bindings::pe2::extension::types::StreamReader) -> StreamInput {
+        StreamInput { handle: std::rc::Rc::new(handle) }
+    }
+
+    /// What the stream is (`Generator::header`).
+    #[must_use]
+    pub fn header(&self) -> Table {
+        #[cfg(not(target_family = "wasm"))]
+        return self.source.header();
+        #[cfg(target_family = "wasm")]
+        toml::from_str(&self.handle.header()).unwrap_or_default()
+    }
+
+    /// The next item, waiting for it; none at the stream's end.
+    ///
+    /// # Errors
+    /// It could not be made.
+    pub fn next(&self) -> Result<Option<Value>> {
+        #[cfg(not(target_family = "wasm"))]
+        return self.source.next();
+        #[cfg(target_family = "wasm")]
+        self.handle.next().map(|item| item.map(crate::guest::from_wit)).map_err(|e| anyhow!(e))
+    }
+
+    /// Go on from an item.
+    pub fn seek(&self, position: u64) {
+        #[cfg(not(target_family = "wasm"))]
+        self.source.seek(position);
+        #[cfg(target_family = "wasm")]
+        self.handle.seek(position);
+    }
+}
+
+impl fmt::Debug for StreamInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StreamInput")
+    }
+}
+
+impl PartialEq for StreamInput {
+    fn eq(&self, other: &StreamInput) -> bool {
+        #[cfg(not(target_family = "wasm"))]
+        return Arc::ptr_eq(&self.source, &other.source);
+        #[cfg(target_family = "wasm")]
+        std::rc::Rc::ptr_eq(&self.handle, &other.handle)
+    }
 }
 
 impl Value {
@@ -288,6 +372,7 @@ impl Value {
             Value::Video(_) => Type::Video,
             Value::Audio(_) => Type::Audio,
             Value::Marks(_) => Type::Marks,
+            Value::Stream(_) => Type::Stream(Box::new(Type::Any)),
             Value::List(items) => Type::List(Box::new(items.first().map_or(Type::Any, Value::ty))),
             Value::Typed(typed) => {
                 let named = |name: &str| if name == BYTES { Type::Bytes } else { Type::Named(name.to_string()) };
@@ -358,6 +443,26 @@ pub trait CallHost {
     /// The host cannot make one.
     fn writer(&self, name: &str) -> Result<Box<dyn FileWriter>> {
         Ok(Box::new(InMemory { name: name.to_string(), bytes: Vec::new() }))
+    }
+    /// A path for a program to write to, for an unsandboxed extension's operation.
+    ///
+    /// # Errors
+    /// The host has none to give.
+    fn temp(&self) -> Result<String> {
+        bail!("{}: no temporary files here", self.path())
+    }
+    /// A file an unsandboxed extension's program made kept as a content, moved rather than read.
+    ///
+    /// # Errors
+    /// It cannot be kept.
+    fn keep(&self, path: &str, name: &str) -> Result<File> {
+        let _ = (path, name);
+        bail!("{}: nothing is kept here", self.path())
+    }
+    /// Where a content is on disk, for an unsandboxed extension's operation to point a program at.
+    fn path_of(&self, content: &Content) -> Option<String> {
+        let _ = content;
+        None
     }
 }
 
@@ -471,6 +576,28 @@ impl Call<'_> {
     /// The host cannot make one.
     pub fn writer(&self, name: &str) -> Result<Writer> {
         Ok(Writer { inner: self.host.writer(name)?, piece: Vec::new() })
+    }
+
+    /// A path for a program of this extension to write to: `keep` it, or remove it.
+    ///
+    /// # Errors
+    /// The host has none to give.
+    pub fn temp(&self) -> Result<String> {
+        self.host.temp()
+    }
+
+    /// A file a program of this extension made kept as a content, named `name`.
+    ///
+    /// # Errors
+    /// It cannot be kept.
+    pub fn keep(&self, path: &str, name: &str) -> Result<File> {
+        self.host.keep(path, name)
+    }
+
+    /// Where a file is on disk, for this extension to point a program at; none where it is held in memory.
+    #[must_use]
+    pub fn path_of(&self, file: &File) -> Option<String> {
+        self.host.path_of(&file.content)
     }
 
     /// A file's content, whole.
@@ -646,6 +773,8 @@ pub struct OutputDef {
     pub retain: Retain,
     /// Its members, for a family.
     pub members: Option<Arc<Members>>,
+    /// The output of its kind it is made from; none, its node's result.
+    pub from: Option<String>,
 }
 
 #[cfg(test)]

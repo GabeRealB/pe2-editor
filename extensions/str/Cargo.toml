@@ -1,0 +1,19 @@
+[package]
+name = "pe2-str"
+description = "pe2.str, a built-in extension: movies kept as STR - extracted, decoded to play, and made into video files through whatever provides the video-container service"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A library linked into the editor, and a component built for wasm32-wasip3.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+codecs.workspace = true
+formats.workspace = true
+pe2-ext.workspace = true
+sha1.workspace = true

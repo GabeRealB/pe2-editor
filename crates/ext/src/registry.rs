@@ -10,14 +10,29 @@ use crate::ty::ValueType;
 use crate::import::{Recognized, Signature, TypeDef};
 use crate::{Asset, Project, Result, Table, Value, View};
 
-/// An extension: its id, its version, the extensions it needs and its entry point. `extension!` makes it.
+/// An extension: its id, its version, how it depends on others and its entry point. `extension!` makes it.
 pub struct Extension {
     pub id: &'static str,
     /// Its version, as semver: `0.1.0`.
     pub version: &'static str,
     /// The extensions it needs, by id and the versions it accepts: `pe2.images@^0.1` (a version alone is a caret
-    /// requirement; an id alone takes any). It may extend only kinds these register.
+    /// requirement; an id alone takes any). It may extend only kinds these register. Without one, or with one
+    /// refused, left off by the project or of another version, it is refused.
     pub requires: &'static [&'static str],
+    /// What it uses where a compatible one is enabled, and otherwise does without, as `optional`. Linked, turning it off
+    /// turns this extension off too. What it adds through one not linked is not there (`Registry::add_output`).
+    pub weak: &'static [&'static str],
+    /// What it uses where a compatible one is enabled, and otherwise does without. Linked, turning it off leaves this
+    /// extension on.
+    pub optional: &'static [&'static str],
+    /// The services it offers, by name and version: `c-compiler@1.0.0`. What requires one takes whichever provides it,
+    /// not knowing what is behind it, its operations named by the service (`c-compiler@compile`).
+    pub provides: &'static [&'static str],
+    /// The platforms it runs on, as `<os>-<arch>` (`linux-x86_64`); none, any.
+    pub platforms: &'static [&'static str],
+    /// It runs outside the sandbox: all of WASI, and programs (`pe2_ext::process`). The user enables it first, and
+    /// until then none of it runs.
+    pub unsandboxed: bool,
     pub register: fn(&mut Registry) -> Result<()>,
 }
 
@@ -29,14 +44,31 @@ pub struct Extension {
 /// ```
 #[macro_export]
 macro_rules! extension {
-    ($id:literal, $version:literal, $register:path $(, requires = [$($requires:literal),* $(,)?])? $(,)?) => {
+    ($id:literal, $version:literal, $register:path
+        $(, requires = [$($requires:literal),* $(,)?])?
+        $(, weak = [$($weak:literal),* $(,)?])?
+        $(, optional = [$($optional:literal),* $(,)?])?
+        $(, provides = [$($provides:literal),* $(,)?])?
+        $(, platforms = [$($platforms:literal),* $(,)?])?
+        $(, unsandboxed = $unsandboxed:literal)?
+        $(,)?) => {
         /// This extension's id.
         pub const ID: &str = $id;
 
         /// This extension, for the host to load.
         #[must_use]
         pub fn extension() -> $crate::Extension {
-            $crate::Extension { id: $id, version: $version, requires: &[$($($requires),*)?], register: $register }
+            $crate::Extension {
+                id: $id,
+                version: $version,
+                requires: &[$($($requires),*)?],
+                weak: &[$($($weak),*)?],
+                optional: &[$($($optional),*)?],
+                provides: &[$($($provides),*)?],
+                platforms: &[$($($platforms),*)?],
+                unsandboxed: false $(|| $unsandboxed)?,
+                register: $register,
+            }
         }
 
         /// This extension, for the SDK's component exports.
@@ -47,10 +79,13 @@ macro_rules! extension {
         }
 
         /// Who it is, as its component carries it in the section the host reads without running it
-        /// (`pe2-extension`): its id, version and requirements as TOML.
+        /// (`pe2-extension`): as TOML.
         #[cfg(target_family = "wasm")]
         const __PE2_ABOUT: &str = concat!(
-            "id = \"", $id, "\"\nversion = \"", $version, "\"\nrequires = [", $($("\"", $requires, "\", ",)*)? "]\n"
+            "id = \"", $id, "\"\nversion = \"", $version, "\"\nrequires = [", $($("\"", $requires, "\", ",)*)? "]\nweak = [",
+            $($("\"", $weak, "\", ",)*)? "]\noptional = [", $($("\"", $optional, "\", ",)*)? "]\nprovides = [",
+            $($("\"", $provides, "\", ",)*)? "]\nplatforms = [", $($("\"", $platforms, "\", ",)*)? "]\n"
+            $(, "unsandboxed = ", $unsandboxed, "\n")?
         );
         #[cfg(target_family = "wasm")]
         #[unsafe(link_section = "pe2-extension")]
@@ -290,6 +325,10 @@ pub struct Parts {
     pub extractors: Vec<crate::ExtractorDef>,
     /// Whether its instance may be reclaimed now; without, always.
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Outputs it adds to a kind it requires, by the kind's name.
+    pub additions: Vec<(String, OutputDef)>,
+    /// Stacks it gives kinds of others that have none, by the kind's name (TOML).
+    pub stacks: Vec<(String, String)>,
     /// The memory a job of something it registered may take, where more than the host's default, by its name.
     pub memory: Vec<(Name, u64)>,
     /// Its settings, as declared, each with the value it took.
@@ -398,6 +437,23 @@ pub struct KindDef {
     pub outputs: Vec<OutputDef>,
     /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
     pub stack: Option<String>,
+}
+
+/// An output added to another's kind.
+pub struct AddedOutput<'a> {
+    output: &'a mut OutputDef,
+}
+
+impl AddedOutput<'_> {
+    /// The members of the family it is: each by a value of its operation's parameter, with a label.
+    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) {
+        self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect());
+    }
+
+    /// The members of a family as described where values cross as text.
+    pub fn members_described(self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) {
+        self.output.members = Some(Arc::new(members));
+    }
 }
 
 /// A role as registered, on a kind of its extension's or of one it requires.
@@ -590,6 +646,22 @@ impl Registry {
     }
 
 
+    /// Add an output to a kind of an extension this one depends on: named `name`, made by `op` of what its output `from`
+    /// makes - one before it - or of its nodes' results. A kind's own extension can so stay free of what the output needs: where that is
+    /// a `weak` or `optional` dependency not linked, the output is not there, and nothing else changes.
+    pub fn add_output(&mut self, kind: &str, name: &str, op: &str, from: Option<&str>, retain: Retain) -> AddedOutput<'_> {
+        let output = OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None, from: from.map(str::to_string) };
+        let at = self.parts.additions.len();
+        self.parts.additions.push((kind.to_string(), output));
+        AddedOutput { output: &mut self.parts.additions[at].1 }
+    }
+
+    /// Give a kind of an extension this one depends on the stack its nodes have where their bundles state none: a form
+    /// of the kind knows what a node of it is made of, as the kind need not. The first given holds.
+    pub fn add_stack(&mut self, kind: &str, stack: &str) {
+        self.parts.stacks.push((kind.to_string(), stack.to_string()));
+    }
+
     /// A tool for agents, `<id>@<name>`: what it does, its arguments as a JSON schema, its work.
     pub fn tool(
         &mut self,
@@ -681,7 +753,7 @@ impl KindBuilder<'_> {
     /// An output as described where names cross as text (its operation qualified).
     #[must_use]
     pub fn output_described(mut self, name: &str, op: &str, retain: Retain) -> Self {
-        self.def.outputs.push(OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None });
+        self.def.outputs.push(OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None, from: None });
         self
     }
 
@@ -696,6 +768,15 @@ impl KindBuilder<'_> {
     pub fn members_described(mut self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) -> Self {
         if let Some(output) = self.def.outputs.last_mut() {
             output.members = Some(Arc::new(members));
+        }
+        self
+    }
+
+    /// The last output is made from another output of the kind, not its nodes' result.
+    #[must_use]
+    pub fn from(mut self, output: &str) -> Self {
+        if let Some(last) = self.def.outputs.last_mut() {
+            last.from = Some(output.to_string());
         }
         self
     }

@@ -13,22 +13,7 @@ const FILTERS: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, 
 pub const SOUND_DATA: usize = 2304;
 const GROUP: usize = 128;
 
-/// How a sector's audio is coded: its subheader's coding byte.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Coding {
-    pub stereo: bool,
-    /// Samples a second, a channel: 37800 or 18900.
-    pub rate: u32,
-    /// 4 bits a sample; else 8, which PE2 does not use.
-    pub four_bit: bool,
-}
-
-impl Coding {
-    #[must_use]
-    pub fn of(byte: u8) -> Coding {
-        Coding { stereo: byte & 3 == 1, rate: if (byte >> 2) & 3 == 1 { 18900 } else { 37800 }, four_bit: (byte >> 4) & 3 != 1 }
-    }
-}
+pub use formats::str::Coding;
 
 /// A stream's decoding state: each channel's two previous samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

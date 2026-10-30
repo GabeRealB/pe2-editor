@@ -73,7 +73,7 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
     hex(&Sha1::digest(bytes))
 }
 
-fn sha1_file(path: &Path) -> Result<String> {
+pub(crate) fn sha1_file(path: &Path) -> Result<String> {
     let mut f = fs::File::open(path)?;
     let (mut h, mut buf) = (Sha1::new(), vec![0; 1 << 22]);
     loop {

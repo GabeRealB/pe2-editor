@@ -13,7 +13,4 @@ crate-type = ["rlib", "cdylib"]
 workspace = true
 
 [dependencies]
-codecs.workspace = true
-formats.workspace = true
 pe2-ext.workspace = true
-sha1.workspace = true

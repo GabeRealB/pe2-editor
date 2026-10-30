@@ -1596,6 +1596,7 @@ dependencies = [
  "pe2-game",
  "pe2-images",
  "pe2-movies",
+ "pe2-str",
  "project",
  "toml",
 ]
@@ -3622,6 +3623,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-ffmpeg"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
 name = "pe2-formats"
 version = "0.1.0"
 dependencies = [
@@ -3649,6 +3657,13 @@ dependencies = [
 
 [[package]]
 name = "pe2-movies"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
+name = "pe2-str"
 version = "0.1.0"
 dependencies = [
  "codecs",
