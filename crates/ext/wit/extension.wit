@@ -290,7 +290,8 @@ interface host {
         /// A checkbox showing `value`; its value after this frame.
         checkbox: func(text: string, value: bool) -> bool;
         badge: func(text: string);
-        chip: func(text: string) -> bool;
+        /// A small framed name, marked where `selected`; whether it was clicked.
+        chip: func(text: string, selected: bool) -> bool;
         image: func(texture: borrow<texture>, width: f32, height: f32);
         /// The host's chip for a reference (TOML), opening its asset.
         reference: func(reference: string);
@@ -318,6 +319,10 @@ interface host {
         /// it - with its width and height: none while it is being drawn (the view is drawn again when it is).
         picture: func(path: string, look: u32) -> option<result<tuple<texture, u32, u32>, string>>;
         navigate: func(path: string);
+        /// The part selected of the asset shown: its fragment (`cells/cursor`).
+        selected: func() -> option<string>;
+        /// Select a part of the asset shown, as clicking it anywhere would.
+        select: func(part: string);
     }
 
     /// The declarations, lent to an extraction session's beginning.
@@ -377,10 +382,106 @@ interface guest {
         custom: bool,
     }
 
-    /// A view or a panel's view, by handle.
+    /// The place a view has of its own, an inspector's tab or an editor beside the preview: its icon, and the fields that bring
+    /// it, it being shown for an asset with any of them (with none named, for every asset).
+    record tab {
+        icon: icon,
+        fields: list<string>,
+    }
+
+    /// A view or a panel's view, by handle; in the inspector, with a tab of its own or among the properties.
     record view {
         handle: u32,
         name: string,
+        tab: option<tab>,
+    }
+
+    /// What can be done to a row of the contents, or to the pane: its id, how it reads, its icon. With `on-row`, a button on the
+    /// row itself rather than an entry of its menu, `on` holding it down: a row's visibility.
+    record content-action {
+        id: string,
+        label: string,
+        icon: option<icon>,
+        on-row: bool,
+        on: bool,
+    }
+
+    /// How a row reads: an `item` is selected, `dim` greyed (left out, hidden), a `heading` only names those under it.
+    enum content-style { item, dim, heading }
+
+    /// A row dragged: what it is, which rows that `take` it hold, and whether those of the same `what` go around it.
+    record content-drag {
+        what: string,
+        reorders: bool,
+    }
+
+    /// A row of what is inside an asset: what selecting it selects, how it reads, what it says beside that and on hovering it,
+    /// how deep in the tree it is; a row deeper than the one before it is under that one, which folds, `open` being how it
+    /// starts. Its `icon` and tint, `picture` showing its part's picture instead. `look`, one of its asset's looks, is what the
+    /// asset is shown in once it is selected. `link`, an asset's path, is opened by a double-click. `rename` offers renaming it. `drag` is what it is when dragged, `takes` what it holds. What comes of each
+    /// of these is `content-act`'s.
+    record content-row {
+        id: string,
+        label: string,
+        detail: string,
+        hint: string,
+        depth: u32,
+        style: content-style,
+        icon: option<tuple<icon, tint>>,
+        picture: bool,
+        open: bool,
+        look: option<u32>,
+        link: option<string>,
+        rename: bool,
+        drag: option<content-drag>,
+        takes: list<string>,
+        actions: list<content-action>,
+    }
+
+    /// What is inside an asset: its rows, what the pane offers above them, and whether its stack follows them.
+    record asset-contents {
+        rows: list<content-row>,
+        actions: list<content-action>,
+        stack: bool,
+    }
+
+    /// Where a row dragged lands by the row it is dropped on.
+    enum content-place { before, inside, after }
+
+    /// What was done in the contents: an action of a row (empty: of the pane), a row renamed, a row dragged onto another.
+    variant content-request {
+        action(tuple<string, string>),
+        rename(tuple<string, string>),
+        moved(tuple<string, string, content-place>),
+    }
+
+    /// A value of the declaration set, by its path (each step a key, or a list's place), or removed.
+    record content-set {
+        path: list<string>,
+        value: option<string>,
+    }
+
+    /// What comes of it: its name in the history, what it changes in the declaration, what is selected after it.
+    record content-outcome {
+        label: string,
+        sets: list<content-set>,
+        select: option<string>,
+    }
+
+    /// A field of a part in the inspector: its value (TOML; none: left out, reading as `absent`), what it can be set to.
+    record part-field {
+        key: string,
+        label: string,
+        value: option<string>,
+        absent: option<string>,
+        choices: list<tuple<string, string>>,
+        read-only: bool,
+    }
+
+    /// A part's fields, and the table of the declaration they are in.
+    record part-sheet {
+        within: list<string>,
+        fields: list<part-field>,
     }
 
     /// How an output is kept: in the project's store, in its build directory, or not at all.
@@ -405,8 +506,16 @@ interface guest {
         icon: option<tuple<icon, tint>>,
         fields: list<field>,
         parts: bool,
+        /// Whether it says what is inside its assets, rather than that following from their parts.
+        contents: bool,
+        /// Whether it says what a part's fields are, rather than those being what its table holds.
+        part-sheet: bool,
         views: list<view>,
         inspector: list<view>,
+        /// Editors of its own, beside the preview: each of these a document can show instead of it.
+        editors: list<view>,
+        /// Views at the head of the contents pane, over its rows: what rows cannot say.
+        contents-views: list<view>,
         outputs: list<output>,
         /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
         stack: option<string>,
@@ -421,6 +530,10 @@ interface guest {
         fields: list<field>,
         views: list<view>,
         inspector: list<view>,
+        /// Editors of its own, beside the preview: each of these a document can show instead of it.
+        editors: list<view>,
+        /// Views at the head of the contents pane, over its rows: what rows cannot say.
+        contents-views: list<view>,
     }
 
     record panel {
@@ -505,6 +618,14 @@ interface guest {
         choices: list<tuple<string, string>>,
     }
 
+    /// How a file replaces what an asset is made of: a kind's assets, the files of a name (`*.mp4`), and the stack they
+    /// then have (TOML), the file written `{file}`.
+    record recipe {
+        kind: string,
+        pattern: string,
+        stack: string,
+    }
+
     record registration {
         kinds: list<kind>,
         roles: list<role>,
@@ -519,6 +640,10 @@ interface guest {
         additions: list<tuple<string, output>>,
         /// The stacks it gives kinds of what it requires that have none, by the kind's qualified name (TOML).
         stacks: list<tuple<string, string>>,
+        /// What files replace assets of kinds, with what.
+        recipes: list<recipe>,
+        /// Commands: each a label, and the tool of its own it runs, with no arguments.
+        commands: list<tuple<string, string>>,
         /// The memory a job of something it registered may take, where more than the host's default: by its name
         /// (qualified), in bytes.
         memory: list<tuple<string, u64>>,
@@ -547,6 +672,12 @@ interface guest {
 
     /// An asset's parts, in order.
     parts: func(kind: u32, asset: borrow<asset>) -> list<part>;
+    /// What is inside an asset, in order.
+    contents: func(kind: u32, asset: borrow<asset>) -> asset-contents;
+    /// What comes of something done in the contents: why it cannot be, where it cannot.
+    content-act: func(kind: u32, asset: borrow<asset>, request: content-request) -> result<content-outcome, string>;
+    /// A part's fields, by its fragment.
+    part-sheet-of: func(kind: u32, asset: borrow<asset>, part: string) -> option<part-sheet>;
     /// A type's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
     sniff: func(ty: u32, name: string, size: u64, head: list<u8>) -> option<string>;
     /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the

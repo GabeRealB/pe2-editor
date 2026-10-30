@@ -955,8 +955,8 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn chip(&mut self, ui: Resource<Frame>, text: String) -> wasmtime::Result<bool> {
-        Ok(self.frame(&ui)?.chip(&text))
+    fn chip(&mut self, ui: Resource<Frame>, text: String, selected: bool) -> wasmtime::Result<bool> {
+        Ok(self.frame(&ui)?.chip(&text, selected))
     }
 
     fn image(&mut self, ui: Resource<Frame>, texture: Resource<HostTexture>, width: f32, height: f32) -> wasmtime::Result<()> {
@@ -1109,6 +1109,15 @@ impl host::HostUi for State {
 
     fn navigate(&mut self, ui: Resource<Frame>, path: String) -> wasmtime::Result<()> {
         self.frame(&ui)?.navigate(&path);
+        Ok(())
+    }
+
+    fn selected(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<String>> {
+        Ok(self.frame(&ui)?.selected())
+    }
+
+    fn select(&mut self, ui: Resource<Frame>, part: String) -> wasmtime::Result<()> {
+        self.frame(&ui)?.select(&part);
         Ok(())
     }
 
@@ -1666,9 +1675,9 @@ fn views_cap(id: &str, registration: &g::Registration, caps: &std::collections::
     let with_views = registration
         .kinds
         .iter()
-        .filter(|k| !k.views.is_empty() || !k.inspector.is_empty())
+        .filter(|k| !k.views.is_empty() || !k.inspector.is_empty() || !k.editors.is_empty() || !k.contents_views.is_empty())
         .map(|k| k.name.as_str())
-        .chain(registration.roles.iter().filter(|r| !r.views.is_empty() || !r.inspector.is_empty()).map(|r| r.name.as_str()))
+        .chain(registration.roles.iter().filter(|r| !r.views.is_empty() || !r.inspector.is_empty() || !r.editors.is_empty() || !r.contents_views.is_empty()).map(|r| r.name.as_str()))
         .chain(registration.panels.iter().map(|p| p.name.as_str()));
     with_views.filter_map(|local| caps.get(&format!("{id}@{local}")).copied()).fold(MEMORY, u64::max)
 }
@@ -1728,6 +1737,80 @@ fn tint(tint: types::Tint) -> pe2_ext::Tint {
 
 /// Register what a component registered: its callbacks are calls into it.
 /// A view of an asset, made in its component.
+/// What is inside an asset as a component said.
+fn contents_of(contents: g::AssetContents) -> pe2_ext::Contents {
+    let action = |a: g::ContentAction| pe2_ext::ContentAction { id: a.id, label: a.label, icon: a.icon.map(icon), on_row: a.on_row, on: a.on };
+    let rows = contents.rows.into_iter().map(|r| pe2_ext::ContentRow {
+        id: r.id,
+        label: r.label,
+        detail: r.detail,
+        hint: r.hint,
+        depth: r.depth,
+        style: match r.style {
+            g::ContentStyle::Item => pe2_ext::ContentStyle::Item,
+            g::ContentStyle::Dim => pe2_ext::ContentStyle::Dim,
+            g::ContentStyle::Heading => pe2_ext::ContentStyle::Heading,
+        },
+        icon: r.icon.map(|(i, t)| (icon(i), tint(t))),
+        picture: r.picture,
+        open: r.open,
+        look: r.look,
+        link: r.link,
+        rename: r.rename,
+        drag: r.drag.map(|drag| pe2_ext::ContentDrag { what: drag.what, reorders: drag.reorders }),
+        takes: r.takes,
+        actions: r.actions.into_iter().map(action).collect(),
+    });
+    let actions = contents.actions.into_iter().map(action).collect();
+    pe2_ext::Contents { rows: rows.collect(), actions, stack: contents.stack, problem: None }
+}
+
+fn content_request(request: pe2_ext::ContentRequest) -> g::ContentRequest {
+    match request {
+        pe2_ext::ContentRequest::Action { row, action } => g::ContentRequest::Action((row, action)),
+        pe2_ext::ContentRequest::Rename { row, name } => g::ContentRequest::Rename((row, name)),
+        pe2_ext::ContentRequest::Moved { row, onto, place } => {
+            let place = match place {
+                pe2_ext::ContentPlace::Before => g::ContentPlace::Before,
+                pe2_ext::ContentPlace::Inside => g::ContentPlace::Inside,
+                pe2_ext::ContentPlace::After => g::ContentPlace::After,
+            };
+            g::ContentRequest::Moved((row, onto, place))
+        }
+    }
+}
+
+/// A value a component gave, by what it is the value of: one that does not parse is an error, never a removal or a part of an edit.
+fn parsed(text: &str, of: &str) -> Result<Value> {
+    parse_value(text).ok_or_else(|| anyhow!("{of}: its value does not parse: {text}"))
+}
+
+/// What comes of something done in the contents: all of it, or nothing.
+fn content_outcome(outcome: g::ContentOutcome) -> Result<pe2_ext::ContentOutcome> {
+    let mut sets = vec![];
+    for set in outcome.sets {
+        let value = set.value.as_deref().map(|text| parsed(text, &set.path.join("."))).transpose()?;
+        sets.push((set.path, value));
+    }
+    Ok(pe2_ext::ContentOutcome { label: outcome.label, sets, select: outcome.select })
+}
+
+fn part_sheet_of(sheet: g::PartSheet) -> Result<pe2_ext::PartSheet> {
+    let mut fields = vec![];
+    for f in sheet.fields {
+        let value = f.value.as_deref().map(|text| parsed(text, &f.key)).transpose()?;
+        let choices = f.choices.into_iter().map(|(value, label)| Ok((parsed(&value, &f.key)?, label))).collect::<Result<_>>()?;
+        fields.push(pe2_ext::PartField { key: f.key, label: f.label, value, absent: f.absent, choices, read_only: f.read_only });
+    }
+    Ok(pe2_ext::PartSheet { within: sheet.within, fields, problem: None })
+}
+
+/// A view a component declared, with the place it has of its own.
+fn view_def(shared: &Arc<Shared>, v: &g::View) -> pe2_ext::ViewDef {
+    let tab = v.tab.as_ref().map(|tab| pe2_ext::TabDef { icon: icon(tab.icon), fields: tab.fields.clone() });
+    pe2_ext::ViewDef { name: v.name.clone(), make: Arc::new(view(shared, v.handle)), tab }
+}
+
 fn view(shared: &Arc<Shared>, handle: u32) -> impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static {
     let shared = shared.clone();
     move |asset: &Asset| -> Box<dyn View> { Box::new(ComponentView::new(shared.clone(), handle, Some(asset))) }
@@ -1779,7 +1862,36 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     for (kind, stack) in &registration.stacks {
         registry.add_stack(kind, stack);
     }
-    for (index, kind) in registration.kinds.into_iter().enumerate() {
+    for recipe in &registration.recipes {
+        registry.add_recipe(&recipe.kind, &recipe.pattern, &recipe.stack);
+    }
+    for (label, tool) in &registration.commands {
+        registry.command(label, tool);
+    }
+    apply_kinds(registry, registration.kinds, shared)?;
+    apply_roles(registry, registration.roles, shared)?;
+    for panel in registration.panels {
+        let (shared, handle) = (shared.clone(), panel.handle);
+        let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
+        registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
+    }
+    apply_types(registry, registration.types, shared);
+    apply_ops(registry, registration.ops, shared);
+    apply_extractors(registry, registration.extractors, shared)?;
+    for service in registration.services {
+        let run = called(shared, service.handle, &service.name, true);
+        let _ = registry.service(&service.name, &service.description, &service.schema, run);
+    }
+    for tool in registration.tools {
+        let run = called(shared, tool.handle, &tool.name, false);
+        registry.tool(&tool.name, &tool.description, &tool.schema, run);
+    }
+    Ok(())
+}
+
+/// Register a component's kinds; what they compute calls into it, by each one's place.
+fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared>) -> Result<()> {
+    for (index, kind) in kinds.into_iter().enumerate() {
         let index = u32::try_from(index)?;
         let mut builder = registry.kind(&kind.name).label(&kind.label);
         if let Some(alias) = &kind.alias {
@@ -1823,15 +1935,57 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
                 parts.into_iter().map(|p| pe2_ext::Part { id: p.id, label: p.label, made_of: p.made_of }).collect()
             });
         }
+        if kind.contents {
+            let lister = shared.clone();
+            builder = builder.contents(move |asset| {
+                let contents = lister.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_contents(a, index, lent).await));
+                contents.map_or_else(
+                    |why| pe2_ext::Contents { problem: Some(format!("{why:#}")), ..pe2_ext::Contents::default() },
+                    contents_of,
+                )
+            });
+            let shared = shared.clone();
+            builder = builder.content_act(move |asset, request| {
+                let request = content_request(request);
+                let done = shared.read(|r| {
+                    r.with_asset(asset, QUICK, async |a, g, lent| g.call_content_act(a, index, lent, request.clone()).await)
+                })?;
+                content_outcome(done.map_err(|why| anyhow!(why))?)
+            });
+        }
+        if kind.part_sheet {
+            let shared = shared.clone();
+            builder = builder.part_sheet(move |asset, part| {
+                let sheet = shared.read(|r| {
+                    r.with_asset(asset, QUICK, async |a, g, lent| g.call_part_sheet_of(a, index, lent, part.to_string()).await)
+                });
+                let problem = |why: anyhow::Error| pe2_ext::PartSheet { problem: Some(format!("{why:#}")), ..pe2_ext::PartSheet::default() };
+                match sheet {
+                    Ok(sheet) => sheet.map(|sheet| part_sheet_of(sheet).unwrap_or_else(problem)),
+                    Err(why) => Some(problem(why)),
+                }
+            });
+        }
         for v in kind.views {
             builder = builder.view(&v.name, view(shared, v.handle));
         }
-        for v in kind.inspector {
-            builder = builder.inspector(&v.name, view(shared, v.handle));
+        for v in &kind.inspector {
+            builder = builder.inspector_def(view_def(shared, v));
+        }
+        for v in &kind.editors {
+            builder = builder.editor_def(view_def(shared, v));
+        }
+        for v in &kind.contents_views {
+            builder = builder.contents_view_def(view_def(shared, v));
         }
         let _ = builder.register();
     }
-    for role in registration.roles {
+    Ok(())
+}
+
+/// Register a component's roles.
+fn apply_roles(registry: &mut Registry, roles: Vec<g::Role>, shared: &Arc<Shared>) -> Result<()> {
+    for role in roles {
         let kind = Name::parse(&role.kind).with_context(|| format!("{}: not a qualified kind", role.kind))?;
         let mut builder = registry.role(&kind, &role.name).label(&role.label);
         if let Some(alias) = &role.alias {
@@ -1843,26 +1997,16 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         for v in role.views {
             builder = builder.view(&v.name, view(shared, v.handle));
         }
-        for v in role.inspector {
-            builder = builder.inspector(&v.name, view(shared, v.handle));
+        for v in &role.inspector {
+            builder = builder.inspector_def(view_def(shared, v));
+        }
+        for v in &role.editors {
+            builder = builder.editor_def(view_def(shared, v));
+        }
+        for v in &role.contents_views {
+            builder = builder.contents_view_def(view_def(shared, v));
         }
         let _ = builder.register();
-    }
-    for panel in registration.panels {
-        let (shared, handle) = (shared.clone(), panel.handle);
-        let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
-        registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
-    }
-    apply_types(registry, registration.types, shared);
-    apply_ops(registry, registration.ops, shared);
-    apply_extractors(registry, registration.extractors, shared)?;
-    for service in registration.services {
-        let run = called(shared, service.handle, &service.name, true);
-        let _ = registry.service(&service.name, &service.description, &service.schema, run);
-    }
-    for tool in registration.tools {
-        let run = called(shared, tool.handle, &tool.name, false);
-        registry.tool(&tool.name, &tool.description, &tool.schema, run);
     }
     Ok(())
 }

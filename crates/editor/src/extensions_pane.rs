@@ -51,8 +51,8 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, user: &mut UserSetti
         state.selected = present.first().map(|p| p.id.clone());
     }
     // At most most of the pane: a long value is cut short in it, never widening it over the graph.
-    let widest = (ui.available_width() * 0.5).max(260.0);
-    egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(260.0..=widest).show(ui, |ui| {
+    let widest = (ui.available_width() * 0.5).max(160.0);
+    egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(160.0..=widest).show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if let Some(selected) = state.selected.clone() {
                 details_ui(ui, ws, &all, &selected, &mut state, user, message);

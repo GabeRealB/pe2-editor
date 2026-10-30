@@ -177,3 +177,19 @@ pub fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut eg
         },
     );
 }
+
+/// The steps of a path that fit a width with what separates them, from the end: the first step to show.
+pub fn fitting_steps(ui: &egui::Ui, steps: &[&str], width: f32) -> usize {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let wide = |text: &str| ui.painter().layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE).size().x;
+    let (gap, mut used) = (wide(" / ") + ui.spacing().item_spacing.x * 2.0, 0.0);
+    let mut first = steps.len();
+    while first > 0 {
+        used += wide(steps[first - 1]) + gap;
+        if used > width {
+            break;
+        }
+        first -= 1;
+    }
+    first.min(steps.len().saturating_sub(1))
+}

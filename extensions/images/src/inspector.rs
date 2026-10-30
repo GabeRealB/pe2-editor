@@ -1,7 +1,7 @@
 //! The image's parts in the properties pane, each keyed by name: its palettes, each with a swatch of its colors and
 //! where it is uploaded; its variants (a texture's each a palette, an atlas's each the cells it recolors); its cells.
 
-use pe2_ext::{Asset, Icon, Style, Table, Texture, Ui, Value, View};
+use pe2_ext::{Asset, Canvas, ContentOutcome, ContentPlace, ContentRequest, Icon, Placed, Rect, Result, Style, Table, Texture, Ui, Value, View, bail};
 use std::collections::HashMap;
 
 use crate::{palette_names, rect, role};
@@ -75,6 +75,7 @@ impl Shown {
 /// The sections, keeping each palette's swatch and the names being typed for variants.
 #[derive(Default)]
 pub(crate) struct Collections {
+    shows: Shows,
     swatches: HashMap<String, Option<Texture>>,
     names: HashMap<String, String>,
 }
@@ -87,6 +88,7 @@ enum Change {
     Keep(usize, String),
     Up(usize),
     Down(usize),
+    Move(usize, usize),
     Remove(usize),
     Add,
 }
@@ -110,6 +112,10 @@ impl Shown {
             Change::Up(i) if i > 0 => variants.swap(i, i - 1),
             Change::Down(i) if i + 1 < variants.len() => variants.swap(i, i + 1),
             Change::Up(_) | Change::Down(_) => {}
+            Change::Move(from, to) => {
+                let variant = variants.remove(from);
+                variants.insert(to, variant);
+            }
             Change::Remove(i) => {
                 variants.remove(i);
             }
@@ -279,6 +285,20 @@ fn small_swatch(ui: &mut Ui, texture: Option<&Texture>) {
     }
 }
 
+/// Which of an image's collections a tab of the inspector shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Shows {
+    #[default]
+    Palettes,
+    Cells,
+}
+
+impl Collections {
+    pub(crate) fn of(shows: Shows) -> Collections {
+        Collections { shows, ..Collections::default() }
+    }
+}
+
 impl View for Collections {
     fn show(&mut self, ui: &mut Ui) {
         let shown = {
@@ -288,6 +308,25 @@ impl View for Collections {
             }
             Shown::read(&asset)
         };
+        if self.shows == Shows::Cells {
+            let selected = ui.selected();
+            if !shown.cells.is_empty() {
+                ui.section(&format!("Cells  ·  {}", shown.cells.len()), |ui| {
+                    ui.wrapped(|ui| {
+                        for (name, hint) in &shown.cells {
+                            let part = format!("cells/{name}");
+                            if ui.chip(name, selected.as_deref() == Some(part.as_str())) {
+                                ui.select(&part);
+                            }
+                            if !hint.is_empty() {
+                                ui.tooltip(hint);
+                            }
+                        }
+                    });
+                });
+            }
+            return;
+        }
         let swatches = &self.swatches;
         let swatch_of = |name: &str| swatches.get(name).and_then(Option::as_ref);
         if !shown.palettes.is_empty() {
@@ -309,18 +348,116 @@ impl View for Collections {
             let value = shown.changed(change);
             ui.set("variants", value.as_ref());
         }
-        if !shown.cells.is_empty() {
-            ui.section(&format!("Cells  ·  {}", shown.cells.len()), |ui| {
-                ui.wrapped(|ui| {
-                    for (name, hint) in &shown.cells {
-                        ui.chip(name);
-                        if !hint.is_empty() {
-                            ui.tooltip(hint);
-                        }
-                    }
-                });
-            });
+    }
+}
+
+/// What comes of something done in an image's contents: the variants' rows act on them as the inspector's controls do.
+pub(crate) fn act(asset: &Asset, request: ContentRequest) -> Result<ContentOutcome> {
+    let shown = Shown::read(asset);
+    let variant = |row: &str| row.strip_prefix("variants/").and_then(|name| shown.variants.iter().position(|v| v.title == name));
+    let of_variants = |label: String, change, select| ContentOutcome {
+        label,
+        sets: vec![(vec!["variants".to_string()], shown.changed(change))],
+        select,
+    };
+    match request {
+        ContentRequest::Action { action, .. } if action == "add" => Ok(of_variants("Add a variant".to_string(), Change::Add, None)),
+        ContentRequest::Action { row, action } if action == "remove" => match variant(&row) {
+            Some(i) => Ok(of_variants(format!("Remove {}", shown.variants[i].title), Change::Remove(i), None)),
+            None => bail!("no such variant"),
+        },
+        ContentRequest::Rename { row, name } => {
+            let Some(i) = variant(&row) else { bail!("no such variant") };
+            if name.is_empty() || shown.variants.iter().any(|v| v.title == name) {
+                bail!("a variant needs a name of its own");
+            }
+            let select = format!("variants/{name}");
+            Ok(of_variants(format!("Rename {} to {name}", shown.variants[i].title), Change::Rename(i, name), Some(select)))
         }
+        ContentRequest::Moved { row, onto, place } => {
+            if let (Some(cell), Some(palette)) = (row.strip_prefix("cells/"), onto.strip_prefix("palettes/")) {
+                return Ok(ContentOutcome {
+                    label: format!("Draw {cell} through {palette}"),
+                    sets: vec![(vec!["cells".to_string(), cell.to_string(), "palette".to_string()], Some(Value::String(palette.to_string())))],
+                    select: None,
+                });
+            }
+            let (Some(from), Some(by)) = (variant(&row), variant(&onto)) else { bail!("it does not go there") };
+            let by = if from < by { by - 1 } else { by };
+            let to = if place == ContentPlace::After { by + 1 } else { by };
+            Ok(of_variants(format!("Move {}", shown.variants[from].title), Change::Move(from, to), None))
+        }
+        ContentRequest::Action { action, .. } => bail!("an image has no action {action}"),
+    }
+}
+
+/// The head of the contents pane: how much of each an image holds.
+pub(crate) struct Summary;
+
+impl View for Summary {
+    fn show(&mut self, ui: &mut Ui) {
+        let said = {
+            let Some(asset) = ui.asset() else { return };
+            let shown = Shown::read(&asset);
+            let counts = [(shown.cells.len(), "cells"), (shown.palette_names.len(), "palettes"), (shown.variants.len(), "variants")];
+            let said: Vec<String> = counts.iter().filter(|(n, _)| *n > 0).map(|(n, plural)| count_of(*n, plural)).collect();
+            said.join("  ·  ")
+        };
+        if !said.is_empty() {
+            ui.styled(&said, Style::Note);
+        }
+    }
+}
+
+/// The Cells editor: an atlas's cells to pick from, the one selected at its own size, zoomed and panned as any picture is.
+#[derive(Default)]
+pub(crate) struct CellSheet {
+    pictures: HashMap<String, Option<(Texture, f32, f32)>>,
+}
+
+impl CellSheet {
+    fn picture_of(&mut self, asset: &Asset, part: &str) -> Option<(Texture, f32, f32)> {
+        let picture = self.pictures.entry(part.to_string()).or_insert_with(|| {
+            let image = crate::part_picture(asset, part)?.ok()?;
+            #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
+            let (width, height) = (image.width as f32, image.height as f32);
+            Some((Texture::new(format!("{}#{part}#sheet", asset.path()), image), width, height))
+        });
+        picture.clone()
+    }
+}
+
+impl View for CellSheet {
+    fn show(&mut self, ui: &mut Ui) {
+        let selected = ui.selected();
+        let (names, shown) = {
+            let Some(asset) = ui.asset() else { return };
+            let names: Vec<String> = crate::cells(&asset).into_iter().map(|cell| cell.name).collect();
+            let first = names.first().map(|name| format!("cells/{name}"));
+            let part = selected.clone().filter(|part| part.starts_with("cells/")).or(first);
+            let shown = part.and_then(|part| Some((self.picture_of(&asset, &part)?, part)));
+            (names, shown)
+        };
+        ui.wrapped(|ui| {
+            for name in &names {
+                let part = format!("cells/{name}");
+                if ui.chip(name, selected.as_deref() == Some(part.as_str())) {
+                    ui.select(&part);
+                }
+            }
+        });
+        let Some(((texture, width, height), part)) = shown else { return };
+        let rect = Rect { x: 0.0, y: 0.0, width, height };
+        ui.canvas(&Canvas {
+            width,
+            height,
+            pictures: vec![Placed { texture, rect, label: None, link: None }],
+            boxes: vec![],
+            summary: part,
+            toggle: String::new(),
+            legend: false,
+            grid: None,
+        });
     }
 }
 

@@ -138,11 +138,27 @@ pub struct EditorSettings {
     pub agents: Agents,
     /// Changes made outside the editor.
     pub changes: Changes,
+    /// What runs a command, by its id, where it is not what it comes with.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
     /// Extensions' user settings, by id (`[extensions."<id>"]`): the extensions read them from this file too.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extensions: std::collections::BTreeMap<String, toml::Table>,
     /// The project opened last (state, not a preference).
     pub last_project: Option<PathBuf>,
+    /// Where the main window was (state, not a preference).
+    pub main_window: Option<WindowState>,
+}
+
+/// The main window as it was left: the place it comes back to, whether it filled the screen on top of that.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    #[serde(flatten)]
+    pub place: crate::windows::Place,
+    #[serde(default)]
+    pub maximized: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
 }
 
 /// Where the settings live: the editor's per-user storage directory.

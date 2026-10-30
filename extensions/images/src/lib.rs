@@ -16,7 +16,7 @@ mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
 pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, Field, Icon, Image, Part, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
+use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, Part, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -96,8 +96,14 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("palettes").custom())
         .field(Field::new("cells").custom())
         .field(Field::new("variants").custom())
-        .inspector("Palettes, variants and cells", |_| Box::new(inspector::Collections::default()))
+        .inspector_tab("Palettes", Icon::Palette, &["palettes", "variants"], |_| Box::new(inspector::Collections::of(inspector::Shows::Palettes)))
+        .inspector_tab("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::Collections::of(inspector::Shows::Cells)))
+        .editor("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::CellSheet::default()))
         .parts(parts)
+        .contents(contents)
+        .content_act(inspector::act)
+        .part_sheet(part_sheet)
+        .contents_view("Summary", |_| Box::new(inspector::Summary))
         // Its picture in each look; its palettes, variants and cells drawn.
         .output("picture", &draw, Retain::Transient)
         .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] })
@@ -172,6 +178,80 @@ pub fn looks(asset: &Asset) -> Vec<String> {
     } else {
         named.collect()
     }
+}
+
+/// What is inside an image: its parts by group, a palette and a cell shown by their pictures. A cell is dropped on the palette
+/// that draws it, a variant renamed, moved and removed; a cell's name and rectangle are its source's.
+fn contents(asset: &Asset) -> Contents {
+    let palette_of: HashMap<String, Option<usize>> = cells(asset).into_iter().map(|cell| (cell.name, cell.palette)).collect();
+    let names = palette_names(asset);
+    let has_cells = !palette_of.is_empty();
+    let shown_looks = looks(asset);
+    let mut rows = Vec::new();
+    let mut group = String::new();
+    for part in parts(asset) {
+        let (within, name) = part.id.split_once('/').unwrap_or(("", part.id.as_str()));
+        if !within.is_empty() && within != group {
+            within.clone_into(&mut group);
+            let label = match within {
+                "palettes" => "Palettes",
+                "cells" => "Cells",
+                _ => "Variants",
+            };
+            rows.push(ContentRow::heading(within, label));
+        }
+        let row = ContentRow::new(&part.id, &part.label).depth(u32::from(!within.is_empty()));
+        rows.push(match within {
+            "palettes" if has_cells => row
+                .icon(Icon::Palette, Tint::Picture)
+                .picture()
+                .takes(&["cell"])
+                .hint("Drop a cell here to draw it through this palette"),
+            "palettes" => row.icon(Icon::Palette, Tint::Picture).picture(),
+            "cells" => {
+                let palette = palette_of.get(name).copied().flatten().and_then(|at| names.get(at));
+                row.icon(Icon::Grid, Tint::Picture).picture().drags("cell").detail(palette.map_or("", String::as_str))
+            }
+            "variants" => {
+                let remove = ContentAction::new("remove", "Remove the variant").icon(Icon::Cross).on_row();
+                let row = row.icon(Icon::Image, Tint::Picture).renames().reorders("variant").action(remove);
+                match shown_looks.iter().position(|look| look == name).and_then(|at| u32::try_from(at).ok()) {
+                    Some(look) => row.look(look),
+                    None => row,
+                }
+            }
+            _ => row.icon(Icon::Image, Tint::Picture),
+        });
+    }
+    let offered = !rows.is_empty() && is_texture(asset);
+    let actions = offered.then(|| ContentAction::new("add", "Add variant").icon(Icon::Plus)).into_iter().collect();
+    Contents { rows, actions, ..Contents::default() }
+}
+
+/// A cell's fields: its palette and depth are settings, its rectangle its source's.
+fn part_sheet(asset: &Asset, part: &str) -> Option<PartSheet> {
+    let name = part.strip_prefix("cells/")?;
+    let (_, cell) = asset.parts("cells").into_iter().find(|(cell, _)| *cell == name)?;
+    let palettes = palette_names(asset).into_iter().map(|p| (Value::String(p.clone()), p)).collect();
+    let field = |key: &str, label: &str| PartField {
+        key: key.to_string(),
+        label: label.to_string(),
+        value: cell.get(key).cloned(),
+        absent: None,
+        choices: vec![],
+        read_only: false,
+    };
+    let depth = depth_of(asset.field("mode").and_then(Value::as_str).unwrap_or_default());
+    let modes = MODES.iter().map(|(mode, label)| (Value::String((*mode).to_string()), (*label).to_string())).collect();
+    Some(PartSheet {
+        within: vec!["cells".to_string(), name.to_string()],
+        fields: vec![
+            PartField { choices: palettes, absent: Some("None".to_string()), ..field("palette", "Palette") },
+            PartField { choices: modes, absent: Some(format!("As the image ({} bpp)", depth.unwrap_or_default())), ..field("mode", "Mode") },
+            PartField { read_only: true, ..field("rect", "Rectangle") },
+        ],
+        problem: None,
+    })
 }
 
 /// An image's parts: its texels, its palettes, its cells, and its variants - looks made of the texels through the

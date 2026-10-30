@@ -29,7 +29,5 @@ cpal.workspace = true
 png.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
-
-# Choosing X11 over Wayland (main.rs) is Linux's alone.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The event loop is the editor's own: it is what knows the monitors (main.rs).
 winit.workspace = true

@@ -20,7 +20,7 @@ mod tools;
 use rmcp::model::{CallToolResult, ReadResourceResult};
 use serde::{Deserialize, Serialize};
 
-pub use tools::{ActArgs, EDITOR_UI, ScreenshotArgs, TypeArgs, UiArgs, definitions};
+pub use tools::{ActArgs, EDITOR_UI, RunArgs, ScreenshotArgs, TypeArgs, UiArgs, definitions};
 
 /// A request to the project.
 #[derive(Clone, Debug, Serialize, Deserialize)]

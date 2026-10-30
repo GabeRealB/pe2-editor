@@ -122,6 +122,8 @@ pub struct Driver {
     /// The main window's panes as drawn last frame.
     panes: Vec<(String, egui::Rect)>,
     installed: bool,
+    /// What agents asked of the commands, which the editor answers.
+    pub commands: Vec<(String, serde_json::Map<String, serde_json::Value>, mpsc::Sender<mcp::Reply>)>,
     /// When an agent last asked: the tree is built until a while after.
     asked: Option<Instant>,
     /// When an agent last acted: the status bar says so for a while.
@@ -135,6 +137,7 @@ impl Driver {
             pending: Vec::new(),
             panes: Vec::new(),
             installed: false,
+            commands: Vec::new(),
             asked: None,
             acted: None,
         }
@@ -154,6 +157,10 @@ impl Driver {
         let after = lock(&self.shared).frames;
         for (request, reply) in requests {
             let mcp::Request::Call { name, arguments } = request else { continue };
+            if name == "editor_commands" || name == "editor_run" {
+                self.commands.push((name, arguments, reply));
+                continue;
+            }
             self.pending.push(Pending { job: Job::Waiting { name, arguments, after }, reply, since: Instant::now() });
         }
     }
@@ -590,7 +597,7 @@ fn typing(tree: &Tree, args: &mcp::TypeArgs) -> Result<Vec<Vec<egui::Event>>, St
 }
 
 /// A key and its modifiers: `ctrl+shift+Z`.
-fn chord(combo: &str) -> Result<(egui::Key, egui::Modifiers), String> {
+pub(crate) fn chord(combo: &str) -> Result<(egui::Key, egui::Modifiers), String> {
     let mut parts: Vec<&str> = combo.split('+').map(str::trim).collect();
     let name = parts.pop().filter(|n| !n.is_empty()).ok_or_else(|| format!("{combo}: no key"))?;
     let key = egui::Key::from_name(name).ok_or_else(|| format!("{name}: not a key's name (Enter, Tab, A, F2...)"))?;

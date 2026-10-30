@@ -370,17 +370,22 @@ impl Player {
 }
 
 /// The picture shown: through the texture, or a YCbCr frame through the GPU's shader; or why there is none yet.
+/// How much to scale a picture to fit what is left, its controls still under it.
+fn fitting(ui: &egui::Ui, size: egui::Vec2) -> f32 {
+    const CONTROLS: f32 = 76.0;
+    (ui.available_width() / size.x).min((ui.available_height() - CONTROLS) / size.y).max(0.1)
+}
+
 fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>, player: u64) {
     match (&shown.showing, texture) {
         (Some(Showing::Texture), Some(texture)) => {
             let size = texture.size_vec2();
-            let scale = (ui.available_width() / size.x).max(0.1);
-            ui.add(egui::Image::new((texture.id(), size * scale)));
+            ui.add(egui::Image::new((texture.id(), size * fitting(ui, size))));
         }
         (Some(Showing::Yuv(frame, key)), _) => {
             #[expect(clippy::cast_precision_loss, reason = "a frame's size")]
             let size = egui::vec2(frame.width as f32, frame.height as f32);
-            let (rect, _) = ui.allocate_exact_size(size * (ui.available_width() / size.x).max(0.1), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(size * fitting(ui, size), egui::Sense::hover());
             let draw = crate::yuv::Draw { frame: frame.clone(), key: *key, player };
             ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, draw));
         }
@@ -512,7 +517,7 @@ fn stop_at_end(shown: &mut Shown) {
 /// Play or pause, where it is (an item), and the time; the sound's controls.
 fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u64, view: &mut Preview) {
     let last = shown.last();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let playing = shown.playing.is_some() || shown.sounding.is_some() || shown.held;
         let (glyph, says) = if playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
         if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {

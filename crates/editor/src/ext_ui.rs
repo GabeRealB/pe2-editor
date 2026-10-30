@@ -101,6 +101,8 @@ pub struct Frame<'a> {
     pub count: usize,
     /// Whether the asset can be edited.
     pub editable: bool,
+    /// The part selected of the asset: its fragment.
+    pub part: Option<&'a str>,
 }
 
 /// What a view set of the asset it shows this frame: each field's new value, or none to remove it.
@@ -142,7 +144,7 @@ impl<'a> Host<'a> {
             Some(asset) if fields => self.lens.extensions.fields(asset).into_iter().cloned().collect(),
             _ => vec![],
         };
-        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: None, derived: None }
+        Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: vec![], derived: None }
     }
 
     fn child(&mut self, kind: Child) -> Box<dyn UiHost + '_> {
@@ -209,8 +211,9 @@ impl UiHost for Host<'_> {
         self.last = None;
     }
 
-    fn chip(&mut self, text: &str) -> bool {
-        let response = crate::inspector::chip(self.target.ui(), crate::icons::SQUARES_FOUR, text, theme::weak());
+    fn chip(&mut self, text: &str, selected: bool) -> bool {
+        let tint = if selected { theme::accent() } else { theme::weak() };
+        let response = crate::inspector::chip(self.target.ui(), crate::icons::SQUARES_FOUR, text, tint);
         let clicked = response.clicked();
         self.last = Some(response);
         clicked
@@ -375,11 +378,13 @@ impl UiHost for Host<'_> {
             .iter()
             .map(|p| (self.textures.get(&ctx, &p.texture, upscale), to_rect(p.rect), p.label.clone(), p.link.clone()))
             .collect();
+        let shown = self.frame.part.map(crate::workspace::part_name);
         let overlay = Overlay {
             id: self.frame.asset.map_or_else(|| format!("{:?}", ui.scope_id()), |a| a.path.clone()),
             size: egui::vec2(canvas.width, canvas.height),
             pictures,
-            boxes: canvas.boxes.iter().map(|b| (b.name.clone(), to_rect(b.rect), b.highlight)).collect(),
+            // The selected one is the host's to mark, whatever view drew it.
+            boxes: canvas.boxes.iter().map(|b| (b.name.clone(), to_rect(b.rect), b.highlight || shown == Some(b.name.as_str()))).collect(),
             summary: canvas.summary.clone(),
             toggle: canvas.toggle.clone(),
             legend: canvas.legend,
@@ -398,6 +403,14 @@ impl UiHost for Host<'_> {
 
     fn navigate(&mut self, path: &str) {
         *self.nav = Some(path.to_string());
+    }
+
+    fn selected(&self) -> Option<String> {
+        self.frame.part.map(str::to_string)
+    }
+
+    fn select(&mut self, part: &str) {
+        *self.nav = Some(format!("#{part}"));
     }
 
     fn asset(&self) -> Option<pe2_ext::Asset<'_>> {

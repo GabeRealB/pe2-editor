@@ -131,6 +131,13 @@ pub struct TypeArgs {
     pub node: Option<String>,
 }
 
+/// A command to run.
+#[derive(Deserialize, JsonSchema)]
+pub struct RunArgs {
+    /// Its id, from `editor_commands` (`edit.undo`, `pane.assets`).
+    pub command: String,
+}
+
 /// What of the window to capture.
 #[derive(Deserialize, JsonSchema)]
 pub struct ScreenshotArgs {
@@ -151,7 +158,7 @@ fn acting<T: JsonSchema + 'static>(name: &'static str, description: &'static str
 }
 
 /// The tools that use the editor's window: only the editor answers them, across frames.
-pub const EDITOR_UI: [&str; 4] = ["editor_ui", "editor_act", "editor_type", "editor_screenshot"];
+pub const EDITOR_UI: [&str; 6] = ["editor_ui", "editor_act", "editor_type", "editor_screenshot", "editor_commands", "editor_run"];
 
 /// An extension's tool as agents see it: by its name within its extension (`palette`), its arguments as it declares
 /// them.
@@ -247,6 +254,16 @@ fn own() -> Vec<Tool> {
             "Type text and press keys in the editor, into the focused widget or one focused first. A text field \
              commits on Enter. Returns what changed. Only when the editor has the project open and the user lets \
              agents use it.",
+        ),
+        tool::<NoArgs>(
+            "editor_commands",
+            "Every command of the editor: its id, its name, what it is bound to and whether it can run now - everything the \
+             menus and the command palette offer, what extensions add among them. Only when the editor has the project open.",
+        ),
+        acting::<RunArgs>(
+            "editor_run",
+            "Run a command of the editor by its id, as the user would from its palette; what it edits is undoable in its \
+             history. Only when the editor has the project open and the user lets agents use it (its settings, Agents).",
         ),
         tool::<ScreenshotArgs>(
             "editor_screenshot",

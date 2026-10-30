@@ -34,6 +34,9 @@ icons! {
     MUSIC_NOTES = "\u{E340}",
     DISC = "\u{E564}",
     STACK = "\u{E466}",
+    SLIDERS_HORIZONTAL = "\u{E434}",
+    LIST_BULLETS = "\u{E2F2}",
+    LINK_SIMPLE = "\u{E2E6}",
     TERMINAL_WINDOW = "\u{EAE8}",
     BINARY = "\u{EE60}",
     PACKAGE = "\u{E390}",
@@ -130,7 +133,7 @@ pub fn glyph(icon: Icon) -> &'static str {
     }
 }
 
-fn tint(tint: Tint) -> Color32 {
+pub fn tint(tint: Tint) -> Color32 {
     match tint {
         Tint::Structure => STRUCTURE,
         Tint::Picture => PICTURE,

@@ -78,8 +78,8 @@ pub trait UiHost {
     fn checkbox(&mut self, text: &str, value: &mut bool) -> bool;
     /// A word in a pill: a type, a flag.
     fn badge(&mut self, text: &str);
-    /// A small framed name: a cell, an item; whether it was clicked.
-    fn chip(&mut self, text: &str) -> bool;
+    /// A small framed name, marked where `selected`: a cell, an item; whether it was clicked.
+    fn chip(&mut self, text: &str, selected: bool) -> bool;
     /// An image at a size, framed: a palette's swatch.
     fn image(&mut self, texture: &Texture, width: f32, height: f32);
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
@@ -116,6 +116,10 @@ pub trait UiHost {
     fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>>;
     /// Select the asset at a path, as clicking it in the tree would.
     fn navigate(&mut self, path: &str);
+    /// The part selected of the asset shown: its fragment (`cells/cursor`), wherever it was selected.
+    fn selected(&self) -> Option<String>;
+    /// Select a part of the asset shown, as clicking it anywhere would.
+    fn select(&mut self, part: &str);
     /// The asset the view shows, lent for the frame; none for a panel.
     fn asset(&self) -> Option<Asset<'_>>;
     /// The look the asset is shown in (an index into its picture's looks), as the host's look picker chose it.
@@ -162,8 +166,8 @@ impl<'a> Ui<'a> {
         self.host.badge(text);
     }
 
-    pub fn chip(&mut self, text: &str) -> bool {
-        self.host.chip(text)
+    pub fn chip(&mut self, text: &str, selected: bool) -> bool {
+        self.host.chip(text, selected)
     }
 
     pub fn image(&mut self, texture: &Texture, width: f32, height: f32) {
@@ -251,6 +255,17 @@ impl<'a> Ui<'a> {
 
     pub fn navigate(&mut self, path: &str) {
         self.host.navigate(path);
+    }
+
+    /// The part selected of the asset shown, wherever it was selected.
+    #[must_use]
+    pub fn selected(&self) -> Option<String> {
+        self.host.selected()
+    }
+
+    /// Select a part of the asset shown: in the contents, the inspector and every view of it.
+    pub fn select(&mut self, part: &str) {
+        self.host.select(part);
     }
 
     /// The asset shown; none for a panel.

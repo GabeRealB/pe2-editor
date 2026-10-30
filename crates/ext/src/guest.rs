@@ -356,8 +356,8 @@ impl UiHost for Frame<'_> {
         self.ui().badge(text);
     }
 
-    fn chip(&mut self, text: &str) -> bool {
-        self.ui().chip(text)
+    fn chip(&mut self, text: &str, selected: bool) -> bool {
+        self.ui().chip(text, selected)
     }
 
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
@@ -467,6 +467,14 @@ impl UiHost for Frame<'_> {
         self.ui().navigate(path);
     }
 
+    fn selected(&self) -> Option<String> {
+        self.ui().selected()
+    }
+
+    fn select(&mut self, part: &str) {
+        self.ui().select(part);
+    }
+
     fn asset(&self) -> Option<Asset<'_>> {
         self.asset
     }
@@ -519,9 +527,46 @@ fn views(list: &[ViewDef], numbered: &mut Registered) -> Vec<g::View> {
             #[expect(clippy::cast_possible_truncation, reason = "a handful of views")]
             let handle = numbered.views.len() as u32;
             numbered.views.push(Maker::Asset(v.clone()));
-            g::View { handle, name: v.name.clone() }
+            let tab = v.tab.as_ref().map(|tab| g::Tab { icon: icon(tab.icon), fields: tab.fields.clone() });
+            g::View { handle, name: v.name.clone(), tab }
         })
         .collect()
+}
+
+/// A kind's or role's views, each list as the host is told of it: the one order they are numbered in, whether or not the host
+/// is being told (`number`).
+fn views_in_order(lists: [&[ViewDef]; 4], numbered: &mut Registered) -> [Vec<g::View>; 4] {
+    lists.map(|list| views(list, numbered))
+}
+
+/// An action of the contents as the host is told of it.
+fn content_action(action: crate::ContentAction) -> g::ContentAction {
+    g::ContentAction { id: action.id, label: action.label, icon: action.icon.map(icon), on_row: action.on_row, on: action.on }
+}
+
+/// A row of the contents as the host is told of it.
+fn content_row(row: crate::ContentRow) -> g::ContentRow {
+    g::ContentRow {
+        id: row.id,
+        label: row.label,
+        detail: row.detail,
+        hint: row.hint,
+        depth: row.depth,
+        style: match row.style {
+            crate::ContentStyle::Item => g::ContentStyle::Item,
+            crate::ContentStyle::Dim => g::ContentStyle::Dim,
+            crate::ContentStyle::Heading => g::ContentStyle::Heading,
+        },
+        icon: row.icon.map(|(i, t)| (icon(i), tint(t))),
+        picture: row.picture,
+        open: row.open,
+        look: row.look,
+        link: row.link,
+        rename: row.rename,
+        drag: row.drag.map(|drag| g::ContentDrag { what: drag.what, reorders: drag.reorders }),
+        takes: row.takes,
+        actions: row.actions.into_iter().map(content_action).collect(),
+    }
 }
 
 /// The extension, as the component exports it.
@@ -613,6 +658,60 @@ impl g::Guest for Component {
             .collect()
     }
 
+    fn contents(kind: u32, asset: &host::Asset) -> g::AssetContents {
+        let lent = Lent::borrowed(asset);
+        let contents = registered().kinds[kind as usize].contents.as_ref();
+        let contents = contents.map_or_else(crate::Contents::default, |contents| contents(&lent.asset()));
+        g::AssetContents {
+            rows: contents.rows.into_iter().map(content_row).collect(),
+            actions: contents.actions.into_iter().map(content_action).collect(),
+            stack: contents.stack,
+        }
+    }
+
+    fn content_act(kind: u32, asset: &host::Asset, request: g::ContentRequest) -> Result<g::ContentOutcome, String> {
+        let lent = Lent::borrowed(asset);
+        let act = registered().kinds[kind as usize].content_act.as_ref().ok_or("its contents do nothing")?;
+        let request = match request {
+            g::ContentRequest::Action((row, action)) => crate::ContentRequest::Action { row, action },
+            g::ContentRequest::Rename((row, name)) => crate::ContentRequest::Rename { row, name },
+            g::ContentRequest::Moved((row, onto, place)) => {
+                let place = match place {
+                    g::ContentPlace::Before => crate::ContentPlace::Before,
+                    g::ContentPlace::Inside => crate::ContentPlace::Inside,
+                    g::ContentPlace::After => crate::ContentPlace::After,
+                };
+                crate::ContentRequest::Moved { row, onto, place }
+            }
+        };
+        let outcome = act(&lent.asset(), request).map_err(|e| format!("{e:#}"))?;
+        Ok(g::ContentOutcome {
+            label: outcome.label,
+            sets: outcome.sets.into_iter().map(|(path, value)| g::ContentSet { path, value: value.as_ref().map(value_text) }).collect(),
+            select: outcome.select,
+        })
+    }
+
+    fn part_sheet_of(kind: u32, asset: &host::Asset, part: String) -> Option<g::PartSheet> {
+        let lent = Lent::borrowed(asset);
+        let sheet = registered().kinds[kind as usize].part_sheet.as_ref()?(&lent.asset(), &part)?;
+        Some(g::PartSheet {
+            within: sheet.within,
+            fields: sheet
+                .fields
+                .into_iter()
+                .map(|f| g::PartField {
+                    key: f.key,
+                    label: f.label,
+                    value: f.value.as_ref().map(value_text),
+                    absent: f.absent,
+                    choices: f.choices.iter().map(|(value, label)| (value_text(value), label.clone())).collect(),
+                    read_only: f.read_only,
+                })
+                .collect(),
+        })
+    }
+
     fn sniff(ty: u32, name: String, size: u64, head: Vec<u8>) -> Option<String> {
         let sniff = registered().types.get(ty as usize)?.sniff.as_ref()?;
         sniff(&name, size, &head).map(|r| r.version.unwrap_or_default())
@@ -681,6 +780,12 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         extractors: vec![],
         additions: parts.additions.iter().map(|(kind, output)| (kind.clone(), describe_output(output))).collect(),
         stacks: parts.stacks.clone(),
+        commands: parts.commands.iter().map(|c| (c.label.clone(), c.tool.local().to_string())).collect(),
+        recipes: parts
+            .recipes
+            .iter()
+            .map(|r| g::Recipe { kind: r.kind.clone(), pattern: r.pattern.clone(), stack: r.stack.clone() })
+            .collect(),
         memory: parts.memory.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect(),
         settings: parts.settings.iter().map(|(s, _)| setting(s)).collect(),
     };
@@ -688,14 +793,18 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         out.kinds.push(describe_kind(kind, &mut numbered));
     }
     for role in &parts.roles {
+        let lists = [&role.views[..], &role.inspector, &role.editors, &role.contents_views];
+        let [role_views, inspector, editors, contents_views] = views_in_order(lists, &mut numbered);
         out.roles.push(g::Role {
             name: role.name.local().to_string(),
             kind: role.kind.to_string(),
             alias: role.alias.clone(),
             label: role.label.clone(),
             fields: role.fields.iter().map(|f| field(f, &mut numbered)).collect(),
-            views: views(&role.views, &mut numbered),
-            inspector: views(&role.inspector, &mut numbered),
+            views: role_views,
+            inspector,
+            editors,
+            contents_views,
         });
     }
     for panel in parts.panels {
@@ -733,6 +842,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
 
 /// A kind as the contract describes it, its fields and views numbered.
 fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
+    let lists = [&kind.views[..], &kind.inspector, &kind.editors, &kind.contents_views];
+    let [kind_views, inspector, editors, contents_views] = views_in_order(lists, numbered);
     g::Kind {
         name: kind.name.local().to_string(),
         alias: kind.alias.clone(),
@@ -740,8 +851,12 @@ fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
         icon: kind.icon.map(|(i, t)| (icon(i), tint(t))),
         fields: kind.fields.iter().map(|f| field(f, numbered)).collect(),
         parts: kind.parts.is_some(),
-        views: views(&kind.views, numbered),
-        inspector: views(&kind.inspector, numbered),
+        contents: kind.contents.is_some(),
+        part_sheet: kind.part_sheet.is_some(),
+        views: kind_views,
+        inspector,
+        editors,
+        contents_views,
         outputs: kind.outputs.iter().map(describe_output).collect(),
         stack: kind.stack.clone(),
     }
@@ -778,11 +893,11 @@ fn number(parts: crate::registry::Parts) -> Registered {
     };
     for kind in &parts.kinds {
         numbered.fields.extend(kind.fields.iter().cloned());
-        numbered.views.extend(kind.views.iter().chain(&kind.inspector).cloned().map(Maker::Asset));
+        views_in_order([&kind.views, &kind.inspector, &kind.editors, &kind.contents_views], &mut numbered);
     }
     for role in &parts.roles {
         numbered.fields.extend(role.fields.iter().cloned());
-        numbered.views.extend(role.views.iter().chain(&role.inspector).cloned().map(Maker::Asset));
+        views_in_order([&role.views, &role.inspector, &role.editors, &role.contents_views], &mut numbered);
     }
     numbered.views.extend(parts.panels.into_iter().map(Maker::Panel));
     for op in &parts.ops {

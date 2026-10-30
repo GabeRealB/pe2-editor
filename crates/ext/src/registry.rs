@@ -208,6 +208,8 @@ pub struct Field {
     pub read_only: bool,
     /// Drawn by its kind's inspector view, not by the host's property sheet.
     pub custom: bool,
+    /// How it reads when left out, which a choice can go back to; a field's value is then empty.
+    pub absent: Option<String>,
 }
 
 impl Field {
@@ -221,6 +223,7 @@ impl Field {
             choices: vec![],
             read_only: false,
             custom: false,
+            absent: None,
         }
     }
 
@@ -267,6 +270,21 @@ impl Field {
         self.custom = true;
         self
     }
+}
+
+/// A command an extension offers: its label, and the tool it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDef {
+    pub label: String,
+    pub tool: Name,
+}
+
+/// How a file replaces what an asset is made of: a kind's assets, the files of a name, the stack they then have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recipe {
+    pub kind: String,
+    pub pattern: String,
+    pub stack: String,
 }
 
 /// Makes a view of an asset.
@@ -329,6 +347,10 @@ pub struct Parts {
     pub additions: Vec<(String, OutputDef)>,
     /// Stacks it gives kinds of others that have none, by the kind's name (TOML).
     pub stacks: Vec<(String, String)>,
+    /// What files replace assets of kinds, with what.
+    pub recipes: Vec<Recipe>,
+    /// What it offers among the editor's commands.
+    pub commands: Vec<CommandDef>,
     /// The memory a job of something it registered may take, where more than the host's default, by its name.
     pub memory: Vec<(Name, u64)>,
     /// Its settings, as declared, each with the value it took.
@@ -418,7 +440,302 @@ impl Setting {
 pub struct ViewDef {
     pub name: String,
     pub make: Arc<MakeView>,
+    /// In the inspector: the tab it has of its own; none, it is among the properties.
+    pub tab: Option<TabDef>,
 }
+
+/// The place a view has of its own, an inspector's tab or an editor: shown for an asset with any of the fields, or with none
+/// named for every asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabDef {
+    pub icon: Icon,
+    pub fields: Vec<String>,
+}
+
+/// What can be done to a row of the contents, or to the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentAction {
+    pub id: String,
+    pub label: String,
+    pub icon: Option<Icon>,
+    /// A button on the row itself, not an entry of its menu.
+    pub on_row: bool,
+    /// Held down: a row's visibility.
+    pub on: bool,
+}
+
+impl ContentAction {
+    #[must_use]
+    pub fn new(id: &str, label: &str) -> ContentAction {
+        ContentAction { id: id.to_string(), label: label.to_string(), icon: None, on_row: false, on: false }
+    }
+
+    #[must_use]
+    pub fn icon(mut self, icon: Icon) -> ContentAction {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// A button on the row itself.
+    #[must_use]
+    pub fn on_row(mut self) -> ContentAction {
+        self.on_row = true;
+        self
+    }
+
+    /// Held down.
+    #[must_use]
+    pub fn on(mut self, on: bool) -> ContentAction {
+        self.on = on;
+        self
+    }
+}
+
+/// How a row of the contents reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContentStyle {
+    /// Selected when clicked.
+    #[default]
+    Item,
+    /// Greyed: left out, hidden.
+    Dim,
+    /// Only a name for those under it: not selected.
+    Heading,
+}
+
+/// A row dragged: what it is, and whether those of the same `what` go around it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentDrag {
+    pub what: String,
+    pub reorders: bool,
+}
+
+/// A row of what is inside an asset. `id` is what selecting it selects, a part's fragment where it is a part; a row deeper
+/// than the one before it is under that one, which folds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentRow {
+    pub id: String,
+    pub label: String,
+    /// What it says beside its label.
+    pub detail: String,
+    /// What it says on hovering it.
+    pub hint: String,
+    pub depth: u32,
+    pub style: ContentStyle,
+    pub icon: Option<(Icon, Tint)>,
+    /// Its part's picture, where its icon would go.
+    pub picture: bool,
+    /// How it starts, where it folds.
+    pub open: bool,
+    /// The look its asset is shown in once it is selected.
+    pub look: Option<u32>,
+    /// An asset's path, opened by a double-click.
+    pub link: Option<String>,
+    /// Offers renaming it.
+    pub rename: bool,
+    /// What it is when dragged; none, it stays.
+    pub drag: Option<ContentDrag>,
+    /// What it holds, by what those are when dragged.
+    pub takes: Vec<String>,
+    pub actions: Vec<ContentAction>,
+}
+
+impl ContentRow {
+    #[must_use]
+    pub fn new(id: &str, label: &str) -> ContentRow {
+        ContentRow {
+            id: id.to_string(),
+            label: label.to_string(),
+            detail: String::new(),
+            hint: String::new(),
+            depth: 0,
+            style: ContentStyle::Item,
+            icon: None,
+            picture: false,
+            open: true,
+            look: None,
+            link: None,
+            rename: false,
+            drag: None,
+            takes: vec![],
+            actions: vec![],
+        }
+    }
+
+    /// A name for the rows under it.
+    #[must_use]
+    pub fn heading(id: &str, label: &str) -> ContentRow {
+        ContentRow { style: ContentStyle::Heading, ..ContentRow::new(id, label) }
+    }
+
+    /// Whether it only names those under it.
+    #[must_use]
+    pub fn is_heading(&self) -> bool {
+        self.style == ContentStyle::Heading
+    }
+
+    #[must_use]
+    pub fn detail(mut self, detail: &str) -> ContentRow {
+        detail.clone_into(&mut self.detail);
+        self
+    }
+
+    #[must_use]
+    pub fn hint(mut self, hint: &str) -> ContentRow {
+        hint.clone_into(&mut self.hint);
+        self
+    }
+
+    #[must_use]
+    pub fn depth(mut self, depth: u32) -> ContentRow {
+        self.depth = depth;
+        self
+    }
+
+    #[must_use]
+    pub fn icon(mut self, icon: Icon, tint: Tint) -> ContentRow {
+        self.icon = Some((icon, tint));
+        self
+    }
+
+    /// Show its part's picture where its icon would go.
+    #[must_use]
+    pub fn picture(mut self) -> ContentRow {
+        self.picture = true;
+        self
+    }
+
+    /// Start folded.
+    #[must_use]
+    pub fn closed(mut self) -> ContentRow {
+        self.open = false;
+        self
+    }
+
+    /// Greyed: left out, hidden.
+    #[must_use]
+    pub fn dim(mut self, dim: bool) -> ContentRow {
+        self.style = if dim { ContentStyle::Dim } else { ContentStyle::Item };
+        self
+    }
+
+    /// Show its asset in this look once it is selected.
+    #[must_use]
+    pub fn look(mut self, look: u32) -> ContentRow {
+        self.look = Some(look);
+        self
+    }
+
+    /// Open an asset on a double-click.
+    #[must_use]
+    pub fn link(mut self, path: &str) -> ContentRow {
+        self.link = Some(path.to_string());
+        self
+    }
+
+    #[must_use]
+    pub fn renames(mut self) -> ContentRow {
+        self.rename = true;
+        self
+    }
+
+    /// Dragged, as what: onto the rows that take it.
+    #[must_use]
+    pub fn drags(mut self, what: &str) -> ContentRow {
+        self.drag = Some(ContentDrag { what: what.to_string(), reorders: false });
+        self
+    }
+
+    /// Dragged, as what: onto the rows that take it, and around others of the same.
+    #[must_use]
+    pub fn reorders(mut self, what: &str) -> ContentRow {
+        self.drag = Some(ContentDrag { what: what.to_string(), reorders: true });
+        self
+    }
+
+    /// Holds what is dragged as these.
+    #[must_use]
+    pub fn takes(mut self, drags: &[&str]) -> ContentRow {
+        self.takes = drags.iter().map(|what| (*what).to_string()).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn action(mut self, action: ContentAction) -> ContentRow {
+        self.actions.push(action);
+        self
+    }
+}
+
+/// What is inside an asset: its rows, what the pane offers above them, and whether its stack follows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Contents {
+    pub rows: Vec<ContentRow>,
+    pub actions: Vec<ContentAction>,
+    pub stack: bool,
+    /// Why they could not be told: the host's to say, not an extension's.
+    pub problem: Option<String>,
+}
+
+impl Default for Contents {
+    fn default() -> Contents {
+        Contents { rows: vec![], actions: vec![], stack: true, problem: None }
+    }
+}
+
+/// Where a row dragged lands by the row it is dropped on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentPlace {
+    Before,
+    Inside,
+    After,
+}
+
+/// What was done in the contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentRequest {
+    /// An action, of a row, or of the pane where `row` is empty.
+    Action { row: String, action: String },
+    Rename { row: String, name: String },
+    Moved { row: String, onto: String, place: ContentPlace },
+}
+
+/// What comes of it: its name in the history, what it changes in the declaration, each by its path (keys, a list's place) and
+/// removed where it has no value, and what is selected after it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContentOutcome {
+    pub label: String,
+    pub sets: Vec<(Vec<String>, Option<Value>)>,
+    pub select: Option<String>,
+}
+
+/// A field of a part in the inspector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartField {
+    pub key: String,
+    pub label: String,
+    /// None: left out, reading as `absent`.
+    pub value: Option<Value>,
+    pub absent: Option<String>,
+    pub choices: Vec<(Value, String)>,
+    pub read_only: bool,
+}
+
+/// A part's fields, and the table of the declaration they are in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PartSheet {
+    pub within: Vec<String>,
+    pub fields: Vec<PartField>,
+    /// Why it could not be told: the host's to say, not an extension's.
+    pub problem: Option<String>,
+}
+
+/// What is inside an asset.
+pub type ListContents = dyn Fn(&Asset) -> Contents + Send + Sync;
+/// What comes of something done in an asset's contents.
+pub type ActOnContents = dyn Fn(&Asset, ContentRequest) -> Result<ContentOutcome> + Send + Sync;
+/// A part's fields, by its fragment.
+pub type SheetOfPart = dyn Fn(&Asset, &str) -> Option<PartSheet> + Send + Sync;
 
 /// A kind as registered.
 #[derive(Clone)]
@@ -432,7 +749,17 @@ pub struct KindDef {
     pub views: Vec<ViewDef>,
     /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
     pub inspector: Vec<ViewDef>,
+    /// Editors of its own, beside the preview.
+    pub editors: Vec<ViewDef>,
+    /// Views at the head of the contents pane.
+    pub contents_views: Vec<ViewDef>,
     pub parts: Option<Arc<ListParts>>,
+    /// What is inside its assets, where that is not their parts.
+    pub contents: Option<Arc<ListContents>>,
+    /// What comes of something done in its assets' contents.
+    pub content_act: Option<Arc<ActOnContents>>,
+    /// Its parts' fields, where those are not what their tables hold.
+    pub part_sheet: Option<Arc<SheetOfPart>>,
     /// The outputs every node of it has, made from its stack's result (`picture(look)`, `facts`).
     pub outputs: Vec<OutputDef>,
     /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
@@ -469,6 +796,10 @@ pub struct RoleDef {
     pub views: Vec<ViewDef>,
     /// Inspector views it adds to its kind's.
     pub inspector: Vec<ViewDef>,
+    /// Editors it adds to its kind's.
+    pub editors: Vec<ViewDef>,
+    /// Views it adds at the head of the contents pane.
+    pub contents_views: Vec<ViewDef>,
 }
 
 /// What an extension registers, as its entry point calls it. The host checks the outcome: a role's kind must be its
@@ -533,7 +864,12 @@ impl Registry {
             fields: vec![],
             views: vec![],
             inspector: vec![],
+            editors: vec![],
+            contents_views: vec![],
             parts: None,
+            contents: None,
+            content_act: None,
+            part_sheet: None,
             outputs: vec![],
             stack: None,
         };
@@ -550,6 +886,8 @@ impl Registry {
             fields: vec![],
             views: vec![],
             inspector: vec![],
+            editors: vec![],
+            contents_views: vec![],
         };
         RoleBuilder { registry: self, def }
     }
@@ -662,6 +1000,18 @@ impl Registry {
         self.parts.stacks.push((kind.to_string(), stack.to_string()));
     }
 
+    /// Files of a name (`*.mp4`) replace what an asset of a kind is made of: the stack it then has (TOML), the file written
+    /// `{file}`.
+    pub fn add_recipe(&mut self, kind: &str, pattern: &str, stack: &str) {
+        self.parts.recipes.push(Recipe { kind: kind.to_string(), pattern: pattern.to_string(), stack: stack.to_string() });
+    }
+
+    /// A command among the editor's: a label, and a tool of this extension it runs with no arguments. It can be bound to a
+    /// shortcut like any, and agents can run it.
+    pub fn command(&mut self, label: &str, tool: &str) {
+        self.parts.commands.push(CommandDef { label: label.to_string(), tool: Name::of(&self.id, tool) });
+    }
+
     /// A tool for agents, `<id>@<name>`: what it does, its arguments as a JSON schema, its work.
     pub fn tool(
         &mut self,
@@ -731,14 +1081,75 @@ impl KindBuilder<'_> {
 
     #[must_use]
     pub fn view(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
         self
     }
 
     /// A view drawn in the inspector, after the property sheet: what the kind's custom fields hold.
     #[must_use]
     pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
+        self
+    }
+
+    /// A view with a tab of its own in the inspector, shown for an asset with any of `fields` (with none, for every asset).
+    #[must_use]
+    pub fn inspector_tab(
+        mut self,
+        name: &str,
+        icon: Icon,
+        fields: &[&str],
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
+        self
+    }
+
+    /// An editor of its own, beside the preview: what a document can show instead of it, for an asset with any of `fields`
+    /// (with none, for every asset). A stage's viewport is one.
+    #[must_use]
+    pub fn editor(
+        mut self,
+        name: &str,
+        icon: Icon,
+        fields: &[&str],
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
+        self.def.editors.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
+        self
+    }
+
+    /// An inspector view as a component declared it.
+    #[must_use]
+    pub fn inspector_def(mut self, view: ViewDef) -> Self {
+        self.def.inspector.push(view);
+        self
+    }
+
+    /// An editor as a component declared it.
+    #[must_use]
+    pub fn editor_def(mut self, view: ViewDef) -> Self {
+        self.def.editors.push(view);
+        self
+    }
+
+    /// A view at the head of the contents pane, over its rows: for what rows cannot say. With no rows, the pane is its own.
+    #[must_use]
+    pub fn contents_view(
+        mut self,
+        name: &str,
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        self.def.contents_views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
+        self
+    }
+
+    /// A contents view as a component declared it.
+    #[must_use]
+    pub fn contents_view_def(mut self, view: ViewDef) -> Self {
+        self.def.contents_views.push(view);
         self
     }
 
@@ -795,6 +1206,27 @@ impl KindBuilder<'_> {
         self
     }
 
+    /// What is inside its assets, for the contents pane, where its parts by themselves do not say enough.
+    #[must_use]
+    pub fn contents(mut self, contents: impl Fn(&Asset) -> Contents + Send + Sync + 'static) -> Self {
+        self.def.contents = Some(Arc::new(contents));
+        self
+    }
+
+    /// What comes of what is done to its contents: a row's action, a row renamed or dragged.
+    #[must_use]
+    pub fn content_act(mut self, act: impl Fn(&Asset, ContentRequest) -> Result<ContentOutcome> + Send + Sync + 'static) -> Self {
+        self.def.content_act = Some(Arc::new(act));
+        self
+    }
+
+    /// Its parts' fields, where those are not simply what their tables hold.
+    #[must_use]
+    pub fn part_sheet(mut self, sheet: impl Fn(&Asset, &str) -> Option<PartSheet> + Send + Sync + 'static) -> Self {
+        self.def.part_sheet = Some(Arc::new(sheet));
+        self
+    }
+
     /// Register it; its name, which roles name it by.
     #[expect(clippy::must_use_candidate, reason = "a kind without roles needs no name")]
     pub fn register(self) -> Name {
@@ -831,14 +1263,75 @@ impl RoleBuilder<'_> {
 
     #[must_use]
     pub fn view(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
         self
     }
 
     /// A view drawn in the inspector, after its kind's.
     #[must_use]
     pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make) });
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
+        self
+    }
+
+    /// A view with a tab of its own in the inspector, shown for an asset with any of `fields` (with none, for every asset).
+    #[must_use]
+    pub fn inspector_tab(
+        mut self,
+        name: &str,
+        icon: Icon,
+        fields: &[&str],
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
+        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
+        self
+    }
+
+    /// An editor of its own, beside the preview: what a document can show instead of it, for an asset with any of `fields`
+    /// (with none, for every asset). A stage's viewport is one.
+    #[must_use]
+    pub fn editor(
+        mut self,
+        name: &str,
+        icon: Icon,
+        fields: &[&str],
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
+        self.def.editors.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
+        self
+    }
+
+    /// An inspector view as a component declared it.
+    #[must_use]
+    pub fn inspector_def(mut self, view: ViewDef) -> Self {
+        self.def.inspector.push(view);
+        self
+    }
+
+    /// An editor as a component declared it.
+    #[must_use]
+    pub fn editor_def(mut self, view: ViewDef) -> Self {
+        self.def.editors.push(view);
+        self
+    }
+
+    /// A view at the head of the contents pane, over its rows: for what rows cannot say. With no rows, the pane is its own.
+    #[must_use]
+    pub fn contents_view(
+        mut self,
+        name: &str,
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) -> Self {
+        self.def.contents_views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
+        self
+    }
+
+    /// A contents view as a component declared it.
+    #[must_use]
+    pub fn contents_view_def(mut self, view: ViewDef) -> Self {
+        self.def.contents_views.push(view);
         self
     }
 

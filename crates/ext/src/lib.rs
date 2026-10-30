@@ -34,7 +34,7 @@ pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use data::{Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
-pub use registry::{
+pub use registry::{ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, Recipe, SheetOfPart, TabDef, 
     Extension, Field, Format, Icon, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, OpBuilder, PanelDef, Part, Parts,
     Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };

@@ -70,6 +70,12 @@ impl Node {
     }
 
     /// The children in natural order: `view2` before `view10`.
+    /// The node at a path below it.
+    #[must_use]
+    pub fn at(&self, path: &str) -> Option<&Node> {
+        path.split('/').filter(|step| !step.is_empty()).try_fold(self, |node, step| node.children.get(step))
+    }
+
     pub fn sorted_children(&self) -> Vec<(&String, &Node)> {
         let mut children: Vec<(&String, &Node)> = self.children.iter().collect();
         children.sort_by_cached_key(|(name, _)| natural(name));
@@ -141,11 +147,31 @@ pub struct Workspace {
     /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
     /// What plays in the preview: a movie, frame by frame.
+    /// Asked of the graph in front.
+    pub graph_ask: Option<GraphAsk>,
+    /// The folder the assets' browser shows, and those it came from and went back from.
+    pub asset_folder: String,
+    folders_back: Vec<String>,
+    folders_forward: Vec<String>,
+    /// A folder chosen in the browser's grid: a click marks it, a double click opens it.
+    pub marked_folder: Option<String>,
+    /// Whether the pointer was over the browser: where back and forward are its own.
+    pub in_browser: bool,
+    /// Whether the folder shown changed: the tree beside the grid goes to it.
+    pub folder_moved: bool,
     /// A player for each document tab playing, and the tabs that drew theirs this frame.
     players: HashMap<crate::panes::Pane, crate::player::Player>,
     played: HashSet<crate::panes::Pane>,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
     views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
+    /// What is inside assets, as their kinds said: asked again when the asset changes, not each frame.
+    contents: HashMap<String, Arc<pe2_ext::Contents>>,
+    /// Parts' sheets, as their kinds said: as `contents`.
+    part_sheets: HashMap<(String, String), Arc<Option<pe2_ext::PartSheet>>>,
+    /// Rows of the contents folded or unfolded by hand: by asset and row.
+    pub content_open: HashMap<(String, String), bool>,
+    /// The row of the contents being renamed: the asset, the row, what is typed.
+    pub content_rename: Option<(String, String, String)>,
     /// The view an asset is shown in, where its kind and role have several.
     pub view_choice: HashMap<String, usize>,
     /// What the views show, uploaded.
@@ -258,6 +284,30 @@ pub struct FieldEdit {
     pub text: String,
 }
 
+/// What commands ask of the graph in front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphAsk {
+    Fit,
+    Arrange,
+}
+
+/// The edit that puts a file in an asset's bundle.
+///
+/// # Errors
+/// It cannot be read.
+pub fn adding(asset: &Asset, file: &Path) -> std::result::Result<EditRequest, String> {
+    let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
+    let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let short = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+    Ok(EditRequest::Write {
+        uid: asset.uid.clone().ok_or("It has no uid")?,
+        file: name.to_string(),
+        bytes,
+        label: format!("Add {name} to {short}"),
+        merge: None,
+    })
+}
+
 /// A path's size and time of change.
 type Stamp = (u64, std::time::SystemTime);
 
@@ -279,18 +329,38 @@ pub enum Update {
     Reopen(&'static str),
 }
 
+/// A part's name, what its fragment says after its group: `cursor` of `cells/cursor`.
+#[must_use]
+pub fn part_name(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, name)| name)
+}
+
 /// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its kind draws it.
 #[derive(Default)]
 pub struct Parts {
     shown: HashMap<(String, String), Picture>,
+    /// Those its kind draws nothing of: asked once, like the others.
+    none: HashSet<(String, String)>,
 }
 
 impl Parts {
+    /// Whether an asset's part has been asked for: getting it costs nothing.
+    pub fn has(&self, asset: &Asset, part: &str) -> bool {
+        let key = (asset.path.clone(), part.to_string());
+        self.shown.contains_key(&key) || self.none.contains(&key)
+    }
+
     /// An asset's part, uploaded; none where its kind draws no such part.
     pub fn get(&mut self, ctx: &egui::Context, extensions: &Extensions, asset: &Asset, part: &str) -> Option<&Picture> {
         let key = (asset.path.clone(), part.to_string());
+        if self.none.contains(&key) {
+            return None;
+        }
         if !self.shown.contains_key(&key) {
-            let drawn = extensions.part(asset, part)?;
+            let Some(drawn) = extensions.part(asset, part) else {
+                self.none.insert(key);
+                return None;
+            };
             let shown = drawn.map_err(|e| format!("{e:#}")).map(|image| {
                 #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
                 let size = egui::vec2(image.width as f32, image.height as f32);
@@ -305,6 +375,7 @@ impl Parts {
 
     fn forget(&mut self, assets: &BTreeSet<String>) {
         self.shown.retain(|(asset, _), _| !assets.contains(asset));
+        self.none.retain(|(asset, _)| !assets.contains(asset));
     }
 }
 
@@ -444,10 +515,21 @@ impl Workspace {
             applied,
             history,
             thumbs,
+            graph_ask: None,
+            asset_folder: String::new(),
+            folders_back: Vec::new(),
+            folders_forward: Vec::new(),
+            marked_folder: None,
+            in_browser: false,
+            folder_moved: false,
             players: HashMap::new(),
             played: HashSet::new(),
             extensions,
             views: HashMap::new(),
+            contents: HashMap::new(),
+            part_sheets: HashMap::new(),
+            content_open: HashMap::new(),
+            content_rename: None,
             view_choice: HashMap::new(),
             textures: crate::ext_ui::Textures::with_pictures(pictures),
             layers,
@@ -679,6 +761,8 @@ impl Workspace {
                 self.inspector_views.clear();
                 self.panels.clear();
                 self.views.clear();
+                self.contents.clear();
+                self.part_sheets.clear();
                 self.thumbs.clear();
             } else if !snapshot.changed.is_empty() {
                 let changed = &snapshot.changed;
@@ -687,6 +771,8 @@ impl Workspace {
                 self.inspector_views.retain(|(asset, ..), _| !changed.contains(asset));
                 self.panels.clear();
                 self.views.retain(|(_, asset, _), _| !changed.contains(asset));
+                self.contents.retain(|asset, _| !changed.contains(asset));
+                self.part_sheets.retain(|(asset, _), _| !changed.contains(asset));
                 self.thumbs.forget(changed);
             }
             self.drop_lost_selection();
@@ -763,6 +849,23 @@ impl Workspace {
         {
             self.selected = None;
         }
+        if !self.inner_is_there() {
+            self.inner = None;
+        }
+    }
+
+    /// Whether what is selected inside an asset is still in it: a part or a row by its id, a layer or operation by its place.
+    fn inner_is_there(&mut self) -> bool {
+        let Some((path, inner)) = self.inner.clone() else { return true };
+        let Some(asset) = self.index.assets.get(&path).cloned() else { return false };
+        if let Some(part) = inner.strip_prefix('#') {
+            let row = self.contents_of(&asset).rows.iter().any(|row| row.id == part && !row.is_heading());
+            return row || self.extensions.parts(&asset).iter().any(|named| named.id == part);
+        }
+        crate::inspector::layer_of_inner(&inner).is_none_or(|(at, op)| {
+            let layer = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
+            layer.is_some_and(|layer| op.is_none_or(|op| layer.get("ops").and_then(|ops| ops.get(op)).is_some()))
+        })
     }
 
     // --- the layers ---------------------------------------------------------------------------------------------------
@@ -1124,6 +1227,74 @@ impl Workspace {
         !self.forward.is_empty()
     }
 
+    /// Run an extension's tool for a command, with no arguments; what it answers, briefly.
+    ///
+    /// # Errors
+    /// It is gone, or it fails.
+    pub fn run_tool(&self, name: &str) -> std::result::Result<String, String> {
+        let tool = self.extensions.tools().iter().find(|t| t.name.to_string() == name).ok_or_else(|| format!("no tool {name}"))?;
+        let lens = Lens { index: &self.index, extensions: &self.extensions, selection: self.selected.as_deref(), looks: None };
+        let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
+        Ok(answer.to_string())
+    }
+
+    /// The edit removing what is selected inside an asset: an operation of a graph, or a layer.
+    #[must_use]
+    pub fn removing_selected(&self) -> Option<EditRequest> {
+        use project::graph::layers;
+        let asset = self.index.assets.get(self.selected.as_deref()?)?;
+        let (at, op) = crate::inspector::layer_of_inner(self.inner_of(&asset.path)?)?;
+        let (label, text) = match op {
+            Some(id) => (format!("Remove {id}"), layers::remove_operation(asset.text(), at, id)),
+            None => (format!("Remove layer {at}"), layers::remove(asset.text(), at)),
+        };
+        crate::inspector::layers_edit(asset, label, text)
+    }
+
+    /// Show a folder in the browser, the one left to go back to.
+    pub fn open_folder(&mut self, folder: String) {
+        if folder != self.asset_folder {
+            self.folders_back.push(std::mem::replace(&mut self.asset_folder, folder));
+            self.folders_forward.clear();
+            self.folder_moved = true;
+        }
+        self.marked_folder = None;
+    }
+
+    pub fn folder_back(&mut self) {
+        if let Some(folder) = self.folders_back.pop() {
+            self.folders_forward.push(std::mem::replace(&mut self.asset_folder, folder));
+            self.marked_folder = None;
+            self.folder_moved = true;
+        }
+    }
+
+    pub fn folder_forward(&mut self) {
+        if let Some(folder) = self.folders_forward.pop() {
+            self.folders_back.push(std::mem::replace(&mut self.asset_folder, folder));
+            self.marked_folder = None;
+            self.folder_moved = true;
+        }
+    }
+
+    /// The folder holding the one shown.
+    pub fn folder_up(&mut self) {
+        if !self.asset_folder.is_empty() {
+            let parent = self.asset_folder.rsplit_once('/').map_or_else(String::new, |(parent, _)| parent.to_string());
+            self.open_folder(parent);
+        }
+    }
+
+    #[must_use]
+    pub fn can_folder_back(&self) -> bool {
+        !self.folders_back.is_empty()
+    }
+
+    #[must_use]
+    pub fn can_folder_forward(&self) -> bool {
+        !self.folders_forward.is_empty()
+    }
+
     /// A document tab's asset, played.
     pub fn play(&mut self, ui: &mut egui::Ui, pane: crate::panes::Pane, path: &str, view: &mut crate::settings::Preview) {
         self.played.insert(pane);
@@ -1141,6 +1312,31 @@ impl Workspace {
         }
     }
 
+    /// The edits that make a file the source of an asset, by its kind's recipe: the file in its bundle, and its stack.
+    ///
+    /// # Errors
+    /// Nothing makes this file of this asset, or it cannot be read.
+    pub fn replacing(&self, asset: &Asset, file: &Path) -> std::result::Result<Vec<EditRequest>, String> {
+        let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
+        let stack = self.extensions.recipe_for(asset, name).ok_or("Nothing imports it over this")??;
+        let uid = asset.uid.clone().ok_or("It has no uid")?;
+        let mut document = asset.text().parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+        document.remove("stack");
+        // As text, after the rest: a table inserted keeps its place in the document it came from.
+        let declaration = format!("{}\n\n{stack}", document.to_string().trim_end());
+        let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let short = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+        let (label, merge) = (format!("Import {name} over {short}"), Some(format!("import {}", asset.path)));
+        let write = |file: &str, bytes: Vec<u8>| EditRequest::Write {
+            uid: uid.clone(),
+            file: file.to_string(),
+            bytes,
+            label: label.clone(),
+            merge: merge.clone(),
+        };
+        Ok(vec![write(name, bytes), write(project::index::ASSET_FILE, declaration.into_bytes())])
+    }
+
     /// Whether an entry opens as a document: an asset, a container folder among them, or a plain file; a filesystem
     /// folder does not.
     #[must_use]
@@ -1148,7 +1344,39 @@ impl Workspace {
         self.index.assets.contains_key(path) || self.entry_at(path).is_some_and(|(_, e)| e.kind == project::index::Kind::File)
     }
 
-    /// What is selected inside an asset, as a path in its declaration.
+    /// What is inside an asset, as its kind says.
+    pub fn contents_of(&mut self, asset: &Asset) -> Arc<pe2_ext::Contents> {
+        let extensions = &self.extensions;
+        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(asset))).clone()
+    }
+
+    /// A part's sheet, where its asset's kind says what it holds.
+    pub fn part_sheet_of(&mut self, asset: &Asset, part: &str) -> Arc<Option<pe2_ext::PartSheet>> {
+        let extensions = &self.extensions;
+        let key = (asset.path.clone(), part.to_string());
+        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(asset, part))).clone()
+    }
+
+    /// Select the part of the asset selected a fragment or a name stands for - a box knows only its name - or a row of its
+    /// contents, which need be no part.
+    pub fn select_part(&mut self, name: &str) {
+        let Some(asset) = self.selected.as_ref().and_then(|path| self.index.assets.get(path)).cloned() else { return };
+        let is_it = |id: &str| id == name || part_name(id) == name;
+        let part = self.extensions.parts(&asset).into_iter().map(|part| part.id).find(|id| is_it(id));
+        let contents = self.contents_of(&asset);
+        let row = || contents.rows.iter().filter(|row| !row.is_heading()).map(|row| row.id.clone()).find(|id| is_it(id));
+        if let Some(id) = part.or_else(row) {
+            self.inner = Some((asset.path.clone(), format!("#{id}")));
+        }
+    }
+
+    /// The part selected of an asset: its fragment.
+    #[must_use]
+    pub fn part_of(&self, asset: &str) -> Option<&str> {
+        self.inner_of(asset)?.strip_prefix('#')
+    }
+
+    /// What is selected inside an asset, as a path in its declaration, or `#` and a part's fragment.
     #[must_use]
     pub fn inner_of(&self, asset: &str) -> Option<&str> {
         self.inner.as_ref().filter(|(of, _)| of == asset).map(|(_, inner)| inner.as_str())
@@ -1298,9 +1526,6 @@ impl Workspace {
             self.show_picture(ui, path, preview, count, nav);
             return;
         }
-        let look = self.variant(path);
-        // As the inspector's own fields: an asset from below is overridden into the active layer.
-        let editable = self.editable_layer().is_ok();
         let Some(asset) = self.index.assets.get(path) else { return };
         let views = self.extensions.views(asset);
         if views.is_empty() {
@@ -1315,15 +1540,45 @@ impl Workspace {
             });
             self.view_choice.insert(path.to_string(), chosen);
         }
-        let make = &views[chosen].make;
-        let view = self.views.entry((pane, path.to_string(), chosen)).or_insert_with(|| make(&self.extensions.lend(asset)));
+        let make = views[chosen].make.clone();
+        self.draw_view(ui, (pane, path.to_string(), chosen), &*make, preview, count, nav);
+    }
+
+    /// Show an editor an extension gives an asset, made when first shown.
+    pub fn show_editor(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: &str, name: &str, preview: Preview, nav: &mut Option<String>) {
+        let Some(asset) = self.index.assets.get(path) else { return };
+        // After its views, in the numbers the pane keeps views by.
+        let views = self.extensions.views(asset).len();
+        let editors = self.extensions.editors(asset);
+        let Some((at, def)) = editors.iter().enumerate().find(|(_, def)| def.name == name) else { return };
+        let (at, make) = (views + at, def.make.clone());
+        self.draw_view(ui, (pane, path.to_string(), at), &*make, preview, 1, nav);
+    }
+
+    /// Show a view of an asset in a pane, made when first shown.
+    fn draw_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: (egui::Id, String, usize),
+        make: &pe2_ext::MakeView,
+        preview: Preview,
+        count: usize,
+        nav: &mut Option<String>,
+    ) {
+        let path = key.1.clone();
+        let look = self.variant(&path);
+        // As the inspector's own fields: an asset from below is overridden into the active layer.
+        let editable = self.editable_layer().is_ok();
+        let part = self.part_of(&path).map(str::to_string);
+        let Some(asset) = self.index.assets.get(&path) else { return };
+        let view = self.views.entry(key).or_insert_with(|| make(&self.extensions.lend(asset)));
         let lens = Lens {
             index: &self.index,
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
         };
-        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable };
+        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable, part: part.as_deref() };
         let mut sets = vec![];
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1353,11 +1608,12 @@ impl Workspace {
         let id = self.textures.get(ui.ctx(), &texture, preview.upscale);
         #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
         let size = egui::vec2(image.width as f32, image.height as f32);
+        let selected = self.part_of(path).map(part_name).map(str::to_string);
         let overlay = crate::panes::Overlay {
             id: path.to_string(),
             size,
             pictures: vec![(id, egui::Rect::from_min_size(egui::Pos2::ZERO, size), None, None)],
-            boxes: marks.boxes.iter().map(|m| (m.name.clone(), crate::ext_ui::to_rect(m.rect), false)).collect(),
+            boxes: marks.boxes.iter().map(|m| (m.name.clone(), crate::ext_ui::to_rect(m.rect), selected.as_ref() == Some(&m.name))).collect(),
             summary: marks.summary.clone(),
             toggle: marks.toggle.clone(),
             legend: marks.legend,
@@ -1369,11 +1625,35 @@ impl Workspace {
     }
 
     /// Show an asset's inspector views - what its kind and role draw of it after the property sheet - made when first
-    /// shown.
-    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
+    /// shown: those of a tab, or those with none.
+    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, tab: Option<usize>, nav: &mut Option<String>) {
+        self.show_lent_views(ui, path, nav, |extensions, asset| {
+            let shown = extensions.inspector(asset).into_iter().enumerate();
+            shown.filter(|(i, def)| tab.map_or(def.tab.is_none(), |tab| tab == *i)).collect()
+        });
+    }
+
+    /// Show the views a kind and a role give the head of the contents pane, made when first shown.
+    pub fn show_contents_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
+        self.show_lent_views(ui, path, nav, |extensions, asset| {
+            // After the inspector's, in the numbers these are kept by.
+            let inspector = extensions.inspector(asset).len();
+            extensions.contents_views(asset).into_iter().enumerate().map(|(i, def)| (inspector + i, def)).collect()
+        });
+    }
+
+    /// Show those of an asset's views `chosen` says, each by the number it is kept by.
+    fn show_lent_views(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &str,
+        nav: &mut Option<String>,
+        chosen: impl for<'a> Fn(&'a Extensions, &'a Asset) -> Vec<(usize, &'a pe2_ext::ViewDef)>,
+    ) {
         let look = self.variant(path);
         // As the inspector's own fields: an asset from below is overridden into the active layer.
         let editable = self.editable_layer().is_ok();
+        let part = self.part_of(path).map(str::to_string);
         let Some(asset) = self.index.assets.get(path) else { return };
         let lens = Lens {
             index: &self.index,
@@ -1381,10 +1661,10 @@ impl Workspace {
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
         };
-        for (i, def) in self.extensions.inspector(asset).into_iter().enumerate() {
+        for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
-            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable };
+            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable, part: part.as_deref() };
             let mut sets = vec![];
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1410,7 +1690,7 @@ impl Workspace {
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };
-        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview, count: 1, editable: false };
+        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview, count: 1, editable: false, part: None };
         let mut sets = vec![];
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));

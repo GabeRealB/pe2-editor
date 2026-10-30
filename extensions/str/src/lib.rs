@@ -53,6 +53,37 @@ op = "output"
 name = "native"
 "#;
 
+/// A movie made of a video file, over the one it replaces: decoded by the service that reads video, and encoded by this.
+const IMPORT: &str = r#"[[stack]]
+op = "graph"
+result = "encoded"
+
+[stack.ops.source]
+op = "file"
+file = "{file}"
+
+[stack.ops.decoded]
+op = "video-container@decode"
+from = { source = "source" }
+
+[stack.ops.original]
+op = "below"
+type = "pe2.str@str"
+
+[stack.ops.encoded]
+op = "pe2.str@encode"
+from = { frames = "decoded", original = "original" }
+
+[[stack]]
+op = "output"
+name = "native"
+retain = "cache"
+when = "eager"
+"#;
+
+/// The files that take: what a video container commonly is.
+const VIDEO: [&str; 5] = ["*.mp4", "*.mkv", "*.mov", "*.webm", "*.avi"];
+
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Str>();
     let _ = r.op("stream").label("Stream").input::<Str>("clip").output::<ty::Table>().run(|call| {
@@ -71,6 +102,9 @@ fn register(r: &mut Registry) -> Result<()> {
         encode::encode(call, &stream, &original)
     });
     r.add_stack(MOVIE, STACK);
+    for pattern in VIDEO {
+        r.add_recipe(MOVIE, pattern, IMPORT);
+    }
     r.add_output(MOVIE, "stream", "pe2.str@stream", None, Retain::Transient);
     r.add_output(MOVIE, "frames", "pe2.str@frames", None, Retain::Transient);
     // Shown by a frame a quarter in: the first are often black.

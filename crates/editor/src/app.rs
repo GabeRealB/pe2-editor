@@ -3,26 +3,39 @@
 //! remembered in eframe's storage, the editor's settings in their own `settings.toml`.
 
 use eframe::egui::{self, RichText};
-use egui_tiles::TileId;
+use egui_tiles::{Behavior as _, TileId};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::panes::{self, Pane, PaneAction, PaneKind, PaneState, Panes};
+use crate::commands::{Binding, Command};
+use crate::panes::{self, EditorKind, Pane, PaneAction, PaneKind, PaneState, Panes};
 use crate::settings::EditorSettings;
 use crate::windows::{Layouts, Window};
-use crate::workspace::{EditRequest, Update, Workspace};
+use crate::workspace::{EditRequest, GraphAsk, Update, Workspace};
 use crate::{icons, theme};
 use project::history::StepError;
 
-const LAYOUT_KEY: &str = "layout";
+/// What eframe and earlier versions stored and nothing reads any more. eframe's window goes on being applied, whether or not it
+/// is told to persist one: left there, it maximizes every window it opens.
+const OLD_KEYS: [&str; 3] = ["window", "layout", "sidebar"];
+const LAYOUT_KEY: &str = "main layout";
+const MODES_KEY: &str = "modes";
+const MODE_KEY: &str = "mode";
 const WINDOWS_KEY: &str = "windows";
 const PANES_KEY: &str = "panes";
 const HOMES_KEY: &str = "homes";
 const SETTINGS_KEY: &str = "settings";
 /// How long the status bar says an agent is using the editor after it last acted.
 const AGENT_ACTED: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The palette while it is up: what is typed, and the row marked.
+#[derive(Default)]
+struct Palette {
+    typed: String,
+    at: usize,
+}
 
 /// Frames to wait before a screenshot, so the window has its size and the selection has scrolled into view.
 const CAPTURE_AFTER_FRAMES: u32 = 30;
@@ -90,6 +103,27 @@ pub struct Editor {
     in_use: Option<(PathBuf, String)>,
     /// The selection last opened as a document.
     opened: Option<String>,
+    /// Files being imported: their paths, a line each.
+    import: Option<String>,
+    /// Whether the assets are up in their drawer.
+    drawer: bool,
+    /// The panes put away to leave the documents alone, while they are.
+    bare: Option<Vec<TileId>>,
+    /// A new mode being named.
+    naming: Option<String>,
+    /// The palette, while it is up.
+    palette: Option<Palette>,
+    /// Whether the pointer is over the assets' browser: back and forward are then its own.
+    in_browser: bool,
+    /// What reads where the main window is, and the place it was last seen in.
+    tracker: crate::windows::Tracker,
+    place: Option<crate::windows::Place>,
+    /// Whether it fills the screen now: maximized, in full screen.
+    filling: (bool, bool),
+    /// How it filled the screen when it was left, until it is back where it was.
+    refill: Option<(bool, bool)>,
+    /// What eframe stored of the window, applied to this one and to be undone.
+    stored_window: Option<String>,
     error: Option<String>,
     capture: Option<Capture>,
     /// The device's largest surface side in pixels, which the window must not outgrow; applied once, then taken.
@@ -107,6 +141,8 @@ pub struct Start {
     pub max_surface: Option<u32>,
     /// Agents may act in the editor this session, whatever the settings say.
     pub agents_drive: bool,
+    /// The monitors, in pixels of the desktop: what a window's place is judged by.
+    pub monitors: Vec<egui::Rect>,
 }
 
 impl Editor {
@@ -119,7 +155,17 @@ impl Editor {
             stored(PANES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let homes: Vec<(Pane, TileId)> =
             stored(HOMES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let modes: Vec<crate::windows::Mode> =
+            stored(MODES_KEY).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(crate::windows::first_modes);
+        let mode = stored(MODE_KEY).and_then(|s| s.parse().ok()).filter(|at| *at < modes.len()).unwrap_or(0);
         let (mut settings, problem) = EditorSettings::load();
+        // A place on a monitor no longer there is no place: the platform chooses, and the windows of its own open anew.
+        let window = settings.main_window.filter(|window| window.place.is_reachable(&start.monitors));
+        let window_lost = settings.main_window.is_some() && window.is_none();
+        let mut windows = windows;
+        for window in &mut windows {
+            window.place = window.place.filter(|place| place.is_reachable(&start.monitors));
+        }
         if crate::settings::path().is_some_and(|p| !p.exists())
             && let Some(old) = stored(SETTINGS_KEY).and_then(|s| serde_json::from_str::<OldSettings>(&s).ok())
         {
@@ -146,11 +192,13 @@ impl Editor {
                 homes: homes.into_iter().collect(),
                 focused: None,
                 reveal: None,
+                modes,
+                mode,
             },
             focus: None,
             saved: settings.clone(),
             settings,
-            message: None,
+            message: window_lost.then(|| "The monitor the window was on is gone: it opened on another".to_string()),
             applied_zoom: None,
             zoomed_for: None,
             steady: (0.0, 0),
@@ -161,6 +209,17 @@ impl Editor {
             layers_state: crate::layers::LayersState::default(),
             in_use: None,
             opened: None,
+            import: None,
+            drawer: false,
+            bare: None,
+            naming: None,
+            palette: None,
+            in_browser: false,
+            tracker: crate::windows::Tracker::new(window.map(|window| window.place)),
+            place: window.map(|window| window.place),
+            filling: window.map_or((false, false), |window| (window.maximized, window.fullscreen)),
+            refill: window.map(|window| (window.maximized, window.fullscreen)),
+            stored_window: stored("window").filter(|text| !text.is_empty()),
             error: problem,
             capture: start.screenshot.map(|path| Capture {
                 path,
@@ -316,7 +375,10 @@ impl Editor {
             return;
         }
         if matches!(request, EditRequest::ShowGraph) {
-            self.show_pane(Pane::first(crate::panes::PaneKind::Graph));
+            if let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone()) {
+                self.layouts.open(&path, false);
+                self.layouts.show_in(crate::panes::EditorKind::Graph);
+            }
             return;
         }
         let Some(ws) = &mut self.workspace else { return };
@@ -480,12 +542,6 @@ impl Editor {
     }
 
     /// F5: what other programs changed taken in now.
-    fn refresh_key(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
-            self.refresh();
-        }
-    }
-
     fn refresh(&mut self) {
         let Some(ws) = &mut self.workspace else { return };
         let pending = ws.pending();
@@ -497,22 +553,6 @@ impl Editor {
     }
 
     /// Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y redo - unless a text field has the keyboard, which undoes its own text.
-    fn history_keys(&mut self, ctx: &egui::Context) {
-        if self.workspace.is_none() || ctx.memory(|m| m.focused().is_some()) {
-            return;
-        }
-        let shortcut = |modifiers, key| egui::KeyboardShortcut::new(modifiers, key);
-        let (command, shift) = (egui::Modifiers::COMMAND, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
-        let redo = ctx.input_mut(|i| {
-            i.consume_shortcut(&shortcut(shift, egui::Key::Z)) || i.consume_shortcut(&shortcut(command, egui::Key::Y))
-        });
-        if redo {
-            self.step(true, false);
-        } else if ctx.input_mut(|i| i.consume_shortcut(&shortcut(command, egui::Key::Z))) {
-            self.step(false, false);
-        }
-    }
-
     /// Follow the monitor's size unless the user chose a zoom: a 4K monitor without OS scaling (X11 under `WSLg`)
     /// would otherwise draw everything at half size. A zoom made with the keyboard (Ctrl +/-/0) is kept as chosen.
     fn zoom(&mut self, ctx: &egui::Context) {
@@ -560,7 +600,477 @@ impl Editor {
 
     /// Show a pane and bring its tab to the front - and its window, where it is in one.
     fn show_pane(&mut self, pane: Pane) {
+        self.leave_bare();
         self.focus = self.layouts.show(pane);
+    }
+
+    /// Every command there is now: the modes are the user's.
+    fn commands(&self) -> Vec<Command> {
+        Command::all().into_iter().chain((0..self.layouts.modes.len()).map(Command::Mode)).collect()
+    }
+
+    /// A command's name: a mode's is its own.
+    fn title_of(&self, command: Command) -> String {
+        match command {
+            Command::Mode(at) => format!("Mode: {}", self.layouts.modes[at].name),
+            other => other.title(),
+        }
+    }
+
+    /// Whether a command can be run now.
+    fn can_run(&self, command: Command) -> bool {
+        let ws = self.workspace.as_ref();
+        let document = self.layouts.active_document();
+        match command {
+            Command::Palette | Command::OpenProject | Command::Quit | Command::Settings | Command::DocumentsOnly
+            | Command::Maximize | Command::Fullscreen | Command::ResetLayout | Command::NewMode | Command::ResetMode | Command::ZoomIn | Command::ZoomOut
+            | Command::ActualSize | Command::Pane(_) | Command::Mode(_) => true,
+            Command::DeleteMode => self.layouts.modes.len() > 1,
+            Command::Undo => ws.is_some_and(|ws| !ws.history.done().is_empty()),
+            Command::Redo => ws.is_some_and(|ws| !ws.history.undone().is_empty()),
+            Command::Back => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_back() } else { ws.can_go_back() }),
+            Command::Forward => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_forward() } else { ws.can_go_forward() }),
+            Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_empty()),
+            Command::CloseTab | Command::NextTab | Command::PreviousTab => self.layouts.has_tab(),
+            // An extension's is an editor of some assets.
+            Command::ShowIn(editor @ EditorKind::Extension(_)) => {
+                let path = document.and_then(|pane| self.layouts.states.get(&pane)?.pinned.as_deref());
+                path.zip(ws).is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&editor))
+            }
+            Command::KeepTab | Command::ShowIn(_) => document.is_some(),
+            Command::Import | Command::ReloadProject | Command::Refresh | Command::Extension(_) => ws.is_some(),
+            Command::DeleteSelected => ws.is_some_and(|ws| ws.removing_selected().is_some()),
+            Command::GraphFit | Command::GraphArrange => {
+                document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| state.editor == Some(EditorKind::Graph))
+            }
+        }
+    }
+
+    /// Do what a command says.
+    fn run(&mut self, ctx: &egui::Context, command: Command) {
+        match command {
+            Command::Palette => self.palette = self.palette.is_none().then(Palette::default),
+            Command::OpenProject => {
+                self.open_dialog = Some(self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()));
+            }
+            Command::Import => self.import = Some(String::new()),
+            Command::ReloadProject => {
+                if let Some(root) = self.workspace.as_ref().map(|ws| ws.project.root.clone()) {
+                    self.open(&root);
+                }
+            }
+            Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Settings => self.show_pane(Pane::first(PaneKind::Settings)),
+            Command::Undo => drop(self.step(false, false)),
+            Command::Redo => drop(self.step(true, false)),
+            Command::Refresh => self.refresh(),
+            Command::Back | Command::Forward => {
+                let (back, in_browser) = (command == Command::Back, self.in_browser);
+                if let Some(ws) = &mut self.workspace {
+                    match (in_browser, back) {
+                        (true, true) => ws.folder_back(),
+                        (true, false) => ws.folder_forward(),
+                        (false, true) => ws.go_back(),
+                        (false, false) => ws.go_forward(),
+                    }
+                }
+            }
+            Command::Up => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.folder_up();
+                }
+            }
+            Command::CloseTab => {
+                self.layouts.close_tab();
+                self.select_in_use();
+            }
+            Command::KeepTab => {
+                if let Some((window, tile)) = self.layouts.active_document().and_then(|pane| self.layouts.find(pane)) {
+                    self.layouts.act(window, tile, PaneAction::Keep);
+                }
+            }
+            Command::NextTab | Command::PreviousTab => {
+                self.layouts.next_tab(command == Command::NextTab);
+                self.select_in_use();
+            }
+            Command::ShowIn(editor) => {
+                self.layouts.focused = self.layouts.active_document();
+                self.layouts.show_in(editor);
+            }
+            Command::DocumentsOnly => self.toggle_bare(),
+            Command::ResetLayout => {
+                self.bare = None;
+                self.layouts = Layouts::new(panes::default_layout());
+                self.opened = None;
+            }
+            Command::NewMode => self.naming = Some(String::new()),
+            Command::ResetMode => {
+                self.leave_bare();
+                self.layouts.reset_mode();
+            }
+            Command::DeleteMode => {
+                self.leave_bare();
+                self.layouts.delete_mode();
+            }
+            Command::ZoomIn => self.set_zoom(Some(ctx.zoom_factor() + 0.25)),
+            Command::ZoomOut => self.set_zoom(Some(ctx.zoom_factor() - 0.25)),
+            Command::ActualSize => self.set_zoom(Some(1.0)),
+            Command::Pane(kind) => self.show_pane(Pane::first(kind)),
+            Command::Mode(at) => {
+                self.leave_bare();
+                self.layouts.switch_mode(at);
+            }
+            other => self.run_on_what_is_shown(ctx, other),
+        }
+    }
+
+    /// The commands acting on what is selected, the graph in front, the window itself and what extensions offer.
+    fn run_on_what_is_shown(&mut self, ctx: &egui::Context, command: Command) {
+        match command {
+            Command::DeleteSelected => {
+                if let Some(request) = self.workspace.as_ref().and_then(Workspace::removing_selected) {
+                    self.edit(&request);
+                    if let Some(ws) = &mut self.workspace {
+                        ws.inner = None;
+                    }
+                }
+            }
+            Command::GraphFit | Command::GraphArrange => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.graph_ask = Some(if command == Command::GraphFit { GraphAsk::Fit } else { GraphAsk::Arrange });
+                }
+            }
+            Command::Maximize => {
+                let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            Command::Fullscreen => {
+                let fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+            }
+            Command::Extension(tool) => {
+                let answer = self.workspace.as_ref().map(|ws| ws.run_tool(tool.as_str()));
+                match answer {
+                    Some(Ok(answer)) => self.message = Some(answer),
+                    Some(Err(why)) => self.error = Some(why),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What the document tab in use shows is what is selected.
+    fn select_in_use(&mut self) {
+        let path = self.layouts.focused.and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
+        if let (Some(ws), Some(path)) = (self.workspace.as_mut(), path) {
+            ws.navigate(path);
+            self.opened.clone_from(&ws.selected);
+        }
+    }
+
+    /// Answer what agents asked of the commands, as the palette would: the same list, the same refusal.
+    fn agent_commands(&mut self, ctx: &egui::Context, drive: bool) {
+        for (name, arguments, reply) in std::mem::take(&mut self.drive.commands) {
+            let answer = if name == "editor_commands" {
+                self.commands_listed()
+            } else if !drive {
+                mcp::Reply::failed("the user has not let agents use the editor (its Settings, Agents, or --agents-drive)".into())
+            } else {
+                match serde_json::from_value::<mcp::RunArgs>(serde_json::Value::Object(arguments)) {
+                    Ok(args) => self.run_by_id(ctx, &args.command),
+                    Err(e) => mcp::Reply::failed(format!("arguments: {e}")),
+                }
+            };
+            let _ = reply.send(answer);
+        }
+    }
+
+    /// The commands, as agents read them.
+    fn commands_listed(&self) -> mcp::Reply {
+        let listed: Vec<serde_json::Value> = self
+            .commands()
+            .into_iter()
+            .map(|command| {
+                let keys: Vec<String> = command.bindings(&self.settings).into_iter().map(Binding::text).collect();
+                serde_json::json!({ "id": command.id(), "title": self.title_of(command), "keys": keys, "can_run": self.can_run(command) })
+            })
+            .collect();
+        mcp::Reply::text(serde_json::Value::Array(listed).to_string())
+    }
+
+    /// Run a command an agent named.
+    fn run_by_id(&mut self, ctx: &egui::Context, id: &str) -> mcp::Reply {
+        let Some(command) = self.commands().into_iter().find(|command| command.id() == id) else {
+            return mcp::Reply::failed(format!("{id}: no such command (editor_commands lists them)"));
+        };
+        if !self.can_run(command) {
+            return mcp::Reply::failed(format!("{id}: it cannot run now"));
+        }
+        self.drive.acted = Some(std::time::Instant::now());
+        self.run(ctx, command);
+        mcp::Reply::text(format!("ran {}", self.title_of(command)))
+    }
+
+    /// Note where the main window is, once its scale has settled.
+    fn note_place(&mut self, ctx: &egui::Context) {
+        if self.stored_window.take().is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        if self.steady.1 < 2 {
+            return;
+        }
+        // Noticed first: what a window does on its way out is not a place.
+        let filling = ctx.input(|i| (i.viewport().maximized == Some(true), i.viewport().fullscreen == Some(true)));
+        if self.refill.is_none() && self.filling != filling {
+            if filling == (false, false) {
+                self.tracker.return_to(self.place);
+            }
+            self.filling = filling;
+        }
+        if let Some(place) = self.tracker.observe(ctx) {
+            self.place = Some(place);
+        }
+        if !self.tracker.is_settled() {
+            return;
+        }
+        match self.refill.take() {
+            Some((true, _)) => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true)),
+            Some((_, true)) => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true)),
+            _ => {}
+        }
+    }
+
+    /// Run what was pressed. Keys typed into a field are the field's, and the palette takes its own.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if let Some(ws) = &mut self.workspace {
+            self.in_browser = std::mem::take(&mut ws.in_browser);
+        }
+        if crate::commands::is_taking(ctx) {
+            return;
+        }
+        let mut bound: Vec<(Binding, Command)> = Vec::new();
+        for command in self.commands() {
+            bound.extend(command.bindings(&self.settings).into_iter().map(|binding| (binding, command)));
+        }
+        bound.sort_by_key(|(binding, _)| std::cmp::Reverse(binding.weight()));
+        let typing = ctx.egui_wants_keyboard_input();
+        for (binding, command) in bound {
+            let pressed = match binding {
+                Binding::Key(shortcut) => (!typing || command == Command::Palette) && ctx.input_mut(|i| i.consume_shortcut(&shortcut)),
+                Binding::Mouse(button) => ctx.input(|i| i.pointer.button_pressed(button)),
+            };
+            if pressed {
+                if self.can_run(command) {
+                    self.run(ctx, command);
+                }
+                return;
+            }
+        }
+    }
+
+    /// A menu's item for a command, what runs it beside it.
+    fn item(&mut self, ui: &mut egui::Ui, command: Command, label: &str) {
+        let button = egui::Button::new(label).shortcut_text(command.keys(&self.settings));
+        if ui.add_enabled(self.can_run(command), button).clicked() {
+            self.run(ui.ctx(), command);
+            ui.close();
+        }
+    }
+
+    /// The palette: every command that can run, what is typed narrowing them, Enter running the one marked.
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut palette) = self.palette.take() else { return };
+        let mut found: Vec<(u32, String, Command)> = Vec::new();
+        for command in self.commands().into_iter().filter(|command| self.can_run(*command) && *command != Command::Palette) {
+            let title = self.title_of(command);
+            if let Some(rank) = crate::commands::rank(&title, &palette.typed) {
+                found.push((rank, title, command));
+            }
+        }
+        found.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let (up, down, enter, escape) = ctx.input_mut(|i| {
+            let mut key = |key| i.consume_key(egui::Modifiers::NONE, key);
+            (key(egui::Key::ArrowUp), key(egui::Key::ArrowDown), key(egui::Key::Enter), key(egui::Key::Escape))
+        });
+        let last = found.len().saturating_sub(1);
+        palette.at = if down { (palette.at + 1).min(last) } else { palette.at.saturating_sub(usize::from(up)).min(last) };
+        let mut chosen = (enter && !found.is_empty()).then(|| found[palette.at].2);
+        let drawn = egui::Area::new(egui::Id::unique("palette"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
+            .fade_in(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).fill(ui.visuals().panel_fill).show(ui, |ui| {
+                    ui.set_width(520.0);
+                    let edit = egui::TextEdit::singleline(&mut palette.typed).hint_text("Type a command").desired_width(f32::INFINITY);
+                    let edit = ui.add(edit);
+                    edit.request_focus();
+                    if edit.changed() {
+                        palette.at = 0;
+                    }
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for (at, (_, title, command)) in found.iter().enumerate() {
+                            let keys = command.keys(&self.settings);
+                            let row = egui::Button::selectable(at == palette.at, title.as_str()).right_text(RichText::new(keys).small().color(theme::weak()));
+                            let row = ui.add_sized([ui.available_width(), 22.0], row);
+                            if at == palette.at && (up || down) {
+                                row.scroll_to_me(None);
+                            }
+                            if row.clicked() {
+                                chosen = Some(*command);
+                            }
+                        }
+                        if found.is_empty() {
+                            ui.label(RichText::new("No such command").color(theme::weak()));
+                        }
+                    });
+                });
+            });
+        let away = ctx.input(|i| i.pointer.any_pressed() && i.pointer.latest_pos().is_some_and(|at| !drawn.response.rect.contains(at)));
+        if let Some(command) = chosen {
+            self.run(ctx, command);
+        } else if !escape && !away {
+            self.palette = Some(palette);
+        }
+    }
+
+    /// Put away everything but the documents, or bring it back.
+    fn toggle_bare(&mut self) {
+        if self.bare.is_some() {
+            self.leave_bare();
+            return;
+        }
+        let main = &mut self.layouts.main;
+        let others = crate::windows::panes_of(main).into_iter().filter(|(_, pane)| pane.kind != PaneKind::Document);
+        let shown: Vec<TileId> = others.map(|(tile, _)| tile).filter(|tile| main.tiles.is_visible(*tile)).collect();
+        for tile in &shown {
+            main.tiles.set_visible(*tile, false);
+        }
+        self.bare = Some(shown);
+    }
+
+    /// Bring back what was put away.
+    fn leave_bare(&mut self) {
+        for tile in self.bare.take().into_iter().flatten() {
+            self.layouts.main.tiles.set_visible(tile, true);
+        }
+    }
+
+    /// The mode in use, at the end of the header, and what can be done with it.
+    fn mode_menu(&mut self, ui: &mut egui::Ui) {
+        ui.scope(|ui| {
+            let title = format!("{}  {}", self.layouts.modes[self.layouts.mode].name, icons::CARET_DOWN);
+            ui.menu_button(title, |ui| {
+                let mut chosen = None;
+                for (at, mode) in self.layouts.modes.iter().enumerate() {
+                    if ui.selectable_label(at == self.layouts.mode, &mode.name).clicked() {
+                        chosen = Some(at);
+                    }
+                }
+                if let Some(at) = chosen {
+                    self.leave_bare();
+                    self.layouts.switch_mode(at);
+                }
+                ui.separator();
+                self.item(ui, Command::NewMode, "New mode…");
+                self.item(ui, Command::ResetMode, "Reset this mode");
+                self.item(ui, Command::DeleteMode, "Delete this mode");
+            });
+        });
+    }
+
+    /// Naming a new mode.
+    fn naming_dialog(&mut self, ctx: &egui::Context) {
+        let Some(name) = &mut self.naming else { return };
+        let (mut add, mut cancel) = (false, false);
+        egui::Window::new("New mode").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
+            ui.label("A copy of this mode, called:");
+            let edit = ui.add(egui::TextEdit::singleline(name).desired_width(240.0));
+            // Before it takes the focus back, or it has never lost it.
+            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            edit.request_focus();
+            let named = !name.trim().is_empty();
+            ui.horizontal(|ui| {
+                add = ui.add_enabled(named, egui::Button::new("Add")).clicked() || (entered && named);
+                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        });
+        if add {
+            let name = name.trim().to_string();
+            self.leave_bare();
+            self.layouts.add_mode(&name);
+        }
+        if add || cancel {
+            self.naming = None;
+        }
+    }
+
+    /// The main window's layout, and the assets' drawer over it.
+    fn center(&mut self, ui: &mut egui::Ui, titles: &[(u64, String)], reveal: Option<Pane>) -> Outcome {
+        let mut outcome = Outcome::default();
+        let opening = self.opening_shown();
+        let mut docked = false;
+        let assets = Pane::first(PaneKind::Assets);
+        let docked_already = self.layouts.is_showing(assets);
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            let mut behavior = Panes {
+                workspace: self.workspace.as_mut(),
+                nav: None,
+                pick: None,
+                focus: None,
+                reveal,
+                settings: &mut self.settings,
+                layers: &mut self.layers_state,
+                states: &mut self.layouts.states,
+                windows: titles,
+                window: None,
+                actions: vec![],
+                steps: None,
+                edit: None,
+                message: None,
+                opening,
+            };
+            self.layouts.main.ui(&mut behavior, ui);
+            // Up over the layout, on a click, and away again once something else is used. What is dragged out of it needs
+            // what is under it.
+            self.drawer &= !docked_already && egui::DragAndDrop::payload::<crate::dnd::Dragged>(ui.ctx()).is_none();
+            if self.drawer {
+                let room = ui.max_rect();
+                let size = egui::vec2(room.width() * 0.6, room.height() * 0.5);
+                let drawn = egui::Area::new(egui::Id::unique("assets drawer"))
+                    .order(egui::Order::Foreground)
+                    .fade_in(false)
+                    .fixed_pos(egui::pos2(room.left() + 6.0, room.bottom() - size.y - 8.0))
+                    .show(ui.ctx(), |ui| {
+                        let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::ZERO).fill(ui.visuals().panel_fill);
+                        frame.show(ui, |ui| {
+                            ui.set_max_size(size);
+                            ui.set_min_size(size);
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("ASSETS").small().strong().color(theme::weak()));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(6.0);
+                                    let hint = "Keep them in the layout";
+                                    docked = ui.button(RichText::new("Dock").small()).on_hover_text(hint).clicked();
+                                });
+                            });
+                            let _ = behavior.pane_ui(ui, TileId::from_u64(u64::MAX), &mut { assets });
+                        });
+                    });
+                let pressed = ui.ctx().input(|i| i.pointer.any_pressed().then(|| i.pointer.latest_pos()).flatten());
+                self.drawer = !pressed.is_some_and(|at| room.contains(at) && !drawn.response.rect.contains(at));
+            }
+            outcome.take(behavior, None);
+        });
+        if docked {
+            self.drawer = false;
+            self.show_pane(Pane::first(PaneKind::Assets));
+        }
+        outcome
     }
 
     /// What was selected since last time, whatever selected it, opens as a document.
@@ -638,7 +1148,10 @@ impl Editor {
                 }
             }
             // Asked for, it opens even selected already: its tab may have been closed.
-            if let Some(path) = outcome.nav {
+            // A part named is selected in what is shown: what the preview's boxes ask.
+            if let Some(name) = outcome.nav.as_deref().and_then(|path| path.strip_prefix('#')) {
+                ws.select_part(name);
+            } else if let Some(path) = outcome.nav {
                 ws.navigate(path);
                 self.opened = None;
             } else if let Some(pick) = outcome.pick {
@@ -686,24 +1199,27 @@ impl Editor {
         }
     }
 
+    /// Every pane, shown where it belongs or put away, and the documents alone.
+    fn window_menu(&mut self, ui: &mut egui::Ui) {
+        for kind in PaneKind::with_panels().into_iter().filter(|kind| *kind != PaneKind::Document) {
+            let pane = Pane::first(kind);
+            let mut visible = self.pane_visible(pane);
+            if ui.checkbox(&mut visible, kind.title()).clicked() {
+                self.toggle_pane(pane);
+            }
+        }
+        ui.separator();
+        self.item(ui, Command::DocumentsOnly, "Documents only");
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open project…").clicked() {
-                    self.open_dialog = Some(
-                        self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()),
-                    );
-                }
-                if let Some(ws) = &self.workspace
-                    && ui.button("Reload project").clicked()
-                {
-                    let root = ws.project.root.clone();
-                    self.open(&root);
-                }
+                self.item(ui, Command::OpenProject, "Open project…");
+                self.item(ui, Command::Import, "Import…");
+                self.item(ui, Command::ReloadProject, "Reload project");
                 ui.separator();
-                if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                self.item(ui, Command::Quit, "Quit");
             });
             ui.menu_button("Edit", |ui| {
                 let labels = self.workspace.as_ref().map(|ws| {
@@ -711,76 +1227,47 @@ impl Editor {
                     (label(ws.history.done().last()), label(ws.history.undone().last()))
                 });
                 let (undo, redo) = labels.unwrap_or_default();
-                let item = |verb: &str, label: &Option<String>, keys: &str| {
-                    let text = label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"));
-                    egui::Button::new(text).shortcut_text(keys)
-                };
-                if ui.add_enabled(undo.is_some(), item("Undo", &undo, "Ctrl+Z")).clicked() {
-                    self.step(false, false);
-                }
-                if ui.add_enabled(redo.is_some(), item("Redo", &redo, "Ctrl+Shift+Z")).clicked() {
-                    self.step(true, false);
-                }
+                let text = |verb: &str, label: &Option<String>| label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"));
+                self.item(ui, Command::Undo, &text("Undo", &undo));
+                self.item(ui, Command::Redo, &text("Redo", &redo));
                 ui.separator();
-                if ui.button(format!("{}  Settings…", icons::GEAR)).clicked() {
-                    self.show_pane(Pane::first(PaneKind::Settings));
-                }
+                self.item(ui, Command::Settings, &format!("{}  Settings…", icons::GEAR));
             });
+            ui.menu_button("Window", |ui| self.window_menu(ui));
             ui.menu_button("View", |ui| {
-                for kind in PaneKind::with_panels().into_iter().filter(|kind| *kind != PaneKind::Document) {
-                    let pane = Pane::first(kind);
-                    let mut visible = self.pane_visible(pane);
-                    if ui.checkbox(&mut visible, kind.title()).clicked() {
-                        self.toggle_pane(pane);
-                    }
-                }
+                self.item(ui, Command::Refresh, "Refresh");
                 ui.separator();
-                let refresh = ui.add_enabled(self.workspace.is_some(), egui::Button::new("Refresh").shortcut_text("F5"));
-                if refresh.on_hover_text("Take in what other programs changed in the project's files").clicked() {
-                    self.refresh();
-                    ui.close();
-                }
+                self.item(ui, Command::ResetLayout, "Reset layout");
                 ui.separator();
-                if ui.button("Reset layout").on_hover_text("Close the other windows and the extra instances").clicked()
-                {
-                    self.layouts = Layouts::new(panes::default_layout());
-                    self.opened = None;
-                }
-                ui.separator();
+                self.item(ui, Command::ZoomIn, "Zoom in");
+                self.item(ui, Command::ZoomOut, "Zoom out");
+                self.item(ui, Command::ActualSize, "Actual size");
                 let zoom = ui.ctx().zoom_factor();
-                if ui.button("Zoom in").on_hover_text("Ctrl +").clicked() {
-                    self.set_zoom(Some(zoom + 0.25));
-                }
-                if ui.button("Zoom out").on_hover_text("Ctrl −").clicked() {
-                    self.set_zoom(Some(zoom - 0.25));
-                }
-                if ui.button("Actual size").on_hover_text("Ctrl 0").clicked() {
-                    self.set_zoom(Some(1.0));
-                }
                 let mut automatic = self.settings.appearance.zoom.is_none();
                 if ui.checkbox(&mut automatic, "Zoom with the monitor").clicked() {
                     self.set_zoom(if automatic { None } else { Some(zoom) });
                 }
             });
             ui.menu_button("Go", |ui| {
-                let ws = self.workspace.as_mut();
-                let (back, forward) = ws.as_ref().map_or((false, false), |w| (w.can_go_back(), w.can_go_forward()));
-                if let Some(ws) = ws {
-                    if ui.add_enabled(back, egui::Button::new("Back")).clicked() {
-                        ws.go_back();
-                    }
-                    if ui.add_enabled(forward, egui::Button::new("Forward")).clicked() {
-                        ws.go_forward();
-                    }
-                }
+                self.item(ui, Command::Back, "Back");
+                self.item(ui, Command::Forward, "Forward");
+                self.item(ui, Command::Up, "Up a folder");
+                ui.separator();
+                self.item(ui, Command::Palette, "Commands…");
             });
             ui.separator();
-            self.toolbar(ui);
+            // The mode first, from the right: the path takes what is left, and gives way.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.mode_menu(ui);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.toolbar(ui));
+            });
         });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            let hint = |command: Command| format!("{} ({})", command.title(), command.keys(&self.settings));
+            let (back, forward) = (hint(Command::Back), hint(Command::Forward));
             let Some(ws) = &mut self.workspace else {
                 let text = if self.opening.is_some() { "Opening..." } else { "No project" };
                 ui.label(RichText::new(text).color(theme::weak()));
@@ -788,14 +1275,14 @@ impl Editor {
             };
             if ui
                 .add_enabled(ws.can_go_back(), egui::Button::new(icons::CARET_LEFT))
-                .on_hover_text("Back (mouse button 4)")
+                .on_hover_text(back)
                 .clicked()
             {
                 ws.go_back();
             }
             if ui
                 .add_enabled(ws.can_go_forward(), egui::Button::new(icons::CARET_RIGHT))
-                .on_hover_text("Forward (mouse button 5)")
+                .on_hover_text(forward)
                 .clicked()
             {
                 ws.go_forward();
@@ -803,9 +1290,13 @@ impl Editor {
             ui.add_space(8.0);
             if let Some(path) = ws.selected.clone() {
                 let parts: Vec<&str> = path.split('/').collect();
-                for (i, part) in parts.iter().enumerate() {
+                let first = theme::fitting_steps(ui, &parts, ui.available_width());
+                if first > 0 {
+                    ui.label(RichText::new("…").color(theme::weak()));
+                }
+                for (i, part) in parts.iter().enumerate().skip(first) {
                     if i + 1 == parts.len() {
-                        ui.label(RichText::new(*part).strong());
+                        ui.add(egui::Label::new(RichText::new(*part).strong()).truncate());
                     } else {
                         ui.label(RichText::new(*part).color(theme::weak()));
                         ui.label(RichText::new("/").color(theme::border().gamma_multiply(3.0)));
@@ -815,15 +1306,13 @@ impl Editor {
         });
     }
 
-    /// The panes the status bar opens, and the active layer's name beside them; the pane asked for.
+    /// The active layer's name in the status bar; the pane it asks for.
     fn pane_buttons(&self, ui: &mut egui::Ui) -> Option<PaneKind> {
-        const KINDS: [PaneKind; 5] = [PaneKind::Assets, PaneKind::Project, PaneKind::Layers, PaneKind::History, PaneKind::Extensions];
         let mut open = None;
-        for kind in KINDS {
-            let button = egui::Button::new(RichText::new(kind.icon()).small().color(theme::weak())).frame(false);
-            if ui.add(button).on_hover_text(kind.title()).clicked() {
-                open = Some(kind);
-            }
+        let drawer = format!("{}  Assets  {}", icons::FOLDER, if self.drawer { icons::CARET_DOWN } else { icons::CARET_UP });
+        let button = egui::Button::new(RichText::new(drawer).small()).frame(false);
+        if ui.add(button).on_hover_text("The assets, in a drawer over the window").clicked() {
+            open = Some(PaneKind::Assets);
         }
         if let Some(layer) = self.workspace.as_ref().and_then(|ws| ws.active_layer()) {
             let label = egui::Label::new(RichText::new(format!("{}  {}", icons::STACK_SIMPLE, layer.name)).small().color(theme::text()));
@@ -964,6 +1453,86 @@ impl Editor {
         }
     }
 
+    /// Files dropped on the window: winit says that they were, not where, so they go through the dialog rather than to a
+    /// place guessed. While they are held over it, it says so.
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<String> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().display().to_string()).collect());
+        if !dropped.is_empty() {
+            self.import = Some(dropped.join("\n"));
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            egui::Area::new(egui::Id::unique("files over the window"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
+                        ui.label(RichText::new("Drop to import").strong());
+                    });
+                });
+        }
+    }
+
+    /// Importing files into the selected asset: from a drop or from the menu, which takes pasted paths.
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = &mut self.import else { return };
+        let Some(ws) = &self.workspace else { return };
+        let asset = ws.selected.as_ref().and_then(|path| ws.index.assets.get(path)).cloned();
+        let files: Vec<PathBuf> = text.lines().filter_map(local_path).collect();
+        let (mut replace, mut add, mut cancel) = (false, false, false);
+        egui::Window::new("Import").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
+            ui.label("Files, one a line:");
+            ui.add(egui::TextEdit::multiline(text).desired_width(460.0).desired_rows(2));
+            ui.add_space(4.0);
+            let Some(asset) = &asset else {
+                ui.label(RichText::new("Select the asset they go into").color(theme::weak()));
+                cancel = ui.button("Cancel").clicked();
+                return;
+            };
+            let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+            let missing = files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
+            let name_of = |file: &PathBuf| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let recipe = match files.as_slice() {
+                [] => Err("No file yet".to_string()),
+                [file] => ws.extensions.recipe_for(asset, &name_of(file)).unwrap_or_else(|| Err(format!("Nothing imports it over {name}"))),
+                _ => Err("One file replaces an asset's source".to_string()),
+            };
+            ui.horizontal(|ui| {
+                let can = recipe.is_ok() && missing.is_none();
+                let button = ui.add_enabled(can, egui::Button::new(format!("Replace the source of {name}")));
+                let button = button.on_disabled_hover_text(recipe.clone().err().or_else(|| missing.clone()).unwrap_or_default());
+                replace = button.clicked();
+                let can = !files.is_empty() && missing.is_none();
+                add = ui.add_enabled(can, egui::Button::new(format!("Add to {name}"))).clicked();
+                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+            if let Some(why) = missing.or(recipe.err()) {
+                ui.label(RichText::new(why).small().color(theme::weak()));
+            }
+        });
+        let (Some(asset), true) = (asset, replace || add) else {
+            if cancel {
+                self.import = None;
+            }
+            return;
+        };
+        let requests: Result<Vec<EditRequest>, String> = if replace {
+            ws.replacing(&asset, &files[0])
+        } else {
+            files.iter().map(|file| crate::workspace::adding(&asset, file)).collect()
+        };
+        self.import = None;
+        match requests {
+            Ok(requests) => {
+                self.layouts.keep(&asset.path);
+                for request in &requests {
+                    self.edit(request);
+                }
+            }
+            Err(why) => self.error = Some(why),
+        }
+    }
+
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let Some(text) = &mut self.open_dialog else { return };
         let (mut open, mut cancel) = (false, false);
@@ -974,10 +1543,10 @@ impl Editor {
             .show(ctx, |ui| {
                 ui.label("The project's directory, the one holding its project.toml:");
                 let edit = ui.add(egui::TextEdit::singleline(text).desired_width(460.0));
-                edit.request_focus();
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     open = true;
                 }
+                edit.request_focus();
                 ui.horizontal(|ui| {
                     open |= ui.button("Open").clicked();
                     cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1037,6 +1606,11 @@ fn automatic_zoom(ctx: &egui::Context, height: f32) -> f32 {
 }
 
 impl eframe::App for Editor {
+    /// What is behind the panes, which paint none of their own: eframe's is see-through, and comes out by what is under it.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if let Some(max) = self.max_surface.take() {
@@ -1053,20 +1627,13 @@ impl eframe::App for Editor {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
         }
         self.drive.update(&ctx, self.agents_drive || self.settings.agents.drive);
+        self.agent_commands(&ctx, self.agents_drive || self.settings.agents.drive);
+        self.note_place(&ctx);
         // A frame of the extensions' readings: one unused for long enough gives its memory back.
         if let Some(ws) = &self.workspace {
             ws.extensions.frame();
         }
-        self.history_keys(&ctx);
-        self.refresh_key(&ctx);
-        if let Some(ws) = &mut self.workspace {
-            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1)) {
-                ws.go_back();
-            }
-            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2)) {
-                ws.go_forward();
-            }
-        }
+        self.shortcuts(&ctx);
         let bar = egui::Frame::new().fill(theme::background()).inner_margin(egui::Margin::symmetric(6, 1));
         // One row: what a window can spare for what is not its work.
         egui::Panel::top("menu").frame(bar).show(ui, |ui| {
@@ -1076,48 +1643,34 @@ impl eframe::App for Editor {
         if show_problems {
             self.show_pane(Pane::first(PaneKind::Problems));
         }
-        if let Some(kind) = open {
-            self.show_pane(Pane::first(kind));
+        match open {
+            Some(PaneKind::Assets) if self.layouts.is_showing(Pane::first(PaneKind::Assets)) => {}
+            Some(PaneKind::Assets) => self.drawer = !self.drawer,
+            Some(kind) => self.show_pane(Pane::first(kind)),
+            None => {}
         }
         if apply_all && let Some(ws) = self.workspace.as_mut() {
             ws.apply_all_settings();
         }
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
-        let mut outcome = Outcome::default();
-        let opening = self.opening_shown();
         let reveal = self.layouts.reveal.take();
-        egui::CentralPanel::no_frame().show(ui, |ui| {
-            let mut behavior = Panes {
-                workspace: self.workspace.as_mut(),
-                nav: None,
-                pick: None,
-                focus: None,
-                reveal,
-                settings: &mut self.settings,
-                layers: &mut self.layers_state,
-                states: &mut self.layouts.states,
-                windows: &titles,
-                window: None,
-                actions: vec![],
-                steps: None,
-                edit: None,
-                message: None,
-                opening,
-            };
-            self.layouts.main.ui(&mut behavior, ui);
-            outcome.take(behavior, None);
-        });
+        let mut outcome = self.center(ui, &titles, reveal);
         if let Some(opening) = self.opening_shown() {
             panes::opening_ui(&ctx, &opening);
         }
         let windows = self.show_windows(&ctx, &titles, reveal);
         outcome.merge(windows);
         self.apply(outcome);
+        crate::dnd::ghost(&ctx);
         let layouts = &self.layouts;
         if let Some(ws) = self.workspace.as_mut() {
             ws.settle_players(|pane| layouts.find(pane).is_some());
         }
         self.open_dialog(&ctx);
+        self.naming_dialog(&ctx);
+        self.palette_ui(&ctx);
+        self.dropped_files(&ctx);
+        self.import_dialog(&ctx);
         self.in_use_dialog(&ctx);
         self.force_dialog(&ctx);
         self.rename_dialog(&ctx);
@@ -1140,10 +1693,27 @@ impl eframe::App for Editor {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.leave_bare();
+        self.settings.main_window = self.place.map(|place| crate::settings::WindowState {
+            place,
+            maximized: self.filling.0,
+            fullscreen: self.filling.1,
+        });
+        if self.settings != self.saved {
+            let _ = self.settings.save();
+            self.saved = self.settings.clone();
+        }
+        for key in OLD_KEYS {
+            storage.set_string(key, String::new());
+        }
         let layouts = &self.layouts;
         if let Ok(layout) = serde_json::to_string(&layouts.main) {
             storage.set_string(LAYOUT_KEY, layout);
         }
+        if let Ok(modes) = serde_json::to_string(&layouts.modes) {
+            storage.set_string(MODES_KEY, modes);
+        }
+        storage.set_string(MODE_KEY, layouts.mode.to_string());
         if let Ok(windows) = serde_json::to_string(&layouts.windows) {
             storage.set_string(WINDOWS_KEY, windows);
         }
@@ -1202,6 +1772,23 @@ impl Outcome {
     }
 }
 
+/// A line of pasted paths as a path here: without the quotes Windows' Copy as path puts round it, and under WSL a Windows
+/// path where Windows' disks are mounted.
+fn local_path(line: &str) -> Option<PathBuf> {
+    let line = line.trim().trim_matches('"');
+    if line.is_empty() {
+        return None;
+    }
+    if cfg!(target_os = "linux")
+        && let [drive, b':', b'\\' | b'/', ..] = line.as_bytes()
+        && drive.is_ascii_alphabetic()
+    {
+        let rest = line[3..].replace('\\', "/");
+        return Some(PathBuf::from(format!("/mnt/{}/{rest}", drive.to_ascii_lowercase() as char)));
+    }
+    Some(PathBuf::from(line))
+}
+
 fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
     let [width, height] = image.size;
     let mut encoder = png::Encoder::new(
@@ -1214,4 +1801,17 @@ fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::er
     let pixels: Vec<u8> = image.pixels.iter().flat_map(egui::Color32::to_array).collect();
     encoder.write_header()?.write_image_data(&pixels)?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::local_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_pasted_path_is_read_as_a_path_here() {
+        assert_eq!(local_path("  \"/tmp/a b.mp4\" "), Some(PathBuf::from("/tmp/a b.mp4")));
+        assert_eq!(local_path(r#""C:\Users\me\a.mp4""#), Some(PathBuf::from("/mnt/c/Users/me/a.mp4")));
+        assert_eq!(local_path("   "), None);
+    }
 }

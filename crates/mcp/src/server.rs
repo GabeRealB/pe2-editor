@@ -26,7 +26,7 @@ layer extracted from the discs at the bottom, read-only), resolved into one tree
 declaration is its asset.toml), follow references both ways with references, see images with preview. The project \
 is read-only here. Where the editor has the project open, its window is served too: editor_ui reads its widgets (ids \
 to act on), editor_screenshot shows it, and - where the user lets agents use the editor - editor_act clicks, drags \
-and scrolls, editor_type types and presses keys, the edits these make being the editor's own, undoable in its \
+and scrolls, editor_type types and presses keys, editor_commands lists and editor_run runs its commands, the edits these make being the editor's own, undoable in its \
 history.";
 
 /// Answer a request for the project in `root`: through the editor when it serves the project, else here.

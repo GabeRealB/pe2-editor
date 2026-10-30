@@ -262,6 +262,10 @@ impl Origin {
 /// The extensions loaded, and what they registered.
 #[derive(Default)]
 pub struct Extensions {
+    /// What files replace assets of kinds, with what.
+    recipes: Vec<pe2_ext::Recipe>,
+    /// What extensions offer among the editor's commands.
+    commands: Vec<pe2_ext::CommandDef>,
     pub loaded: Vec<Loaded>,
     /// Every extension present, in the order found, loaded or not.
     pub present: Vec<Present>,
@@ -555,6 +559,8 @@ impl Extensions {
             self.ops.insert(op.name.to_string(), op);
         }
         self.add_to_kinds(additions, parts.stacks);
+        self.recipes.extend(parts.recipes);
+        self.commands.extend(parts.commands);
         self.types.extend(parts.types.into_iter().map(|t| (t.name.to_string(), t)));
         self.extractors.extend(parts.extractors);
         Ok(registers)
@@ -760,6 +766,28 @@ impl Extensions {
     /// The outputs an asset's kind adds after its stack, as its plan lowers them - then the host's thumbnail (the
     /// first that is a picture, made small, kept).
     #[must_use]
+    /// The stack a file makes of an asset, by what the extensions say of its kind and the file's name, its file named in it.
+    /// None where nothing does.
+    ///
+    /// # Errors
+    /// One does, by an operation no extension provides.
+    pub fn recipe_for(&self, asset: &index::Asset, file: &str) -> Option<std::result::Result<String, String>> {
+        let kind = self.kind_of(asset)?;
+        let lower = file.to_lowercase();
+        let recipe = self.recipes.iter().find(|r| r.kind == kind.name.to_string() && name_matches(&r.pattern, &lower))?;
+        let stack = recipe.stack.replace("{file}", file);
+        let table: Table = match stack.parse() {
+            Ok(table) => table,
+            Err(e) => return Some(Err(format!("{}'s recipe does not read: {e}", recipe.kind))),
+        };
+        let ops = self.operations();
+        let name_of = |t: &toml::Value| t.get("op").and_then(toml::Value::as_str).map(str::to_string);
+        let layers = table.get("stack").and_then(toml::Value::as_array).map_or(&[][..], Vec::as_slice);
+        let inner = layers.iter().filter_map(|l| l.get("ops")?.as_table()).flat_map(|o| o.values());
+        let missing = layers.iter().chain(inner).filter_map(name_of).find(|name| name != graph::GRAPH && ops.get(name).is_none());
+        Some(missing.map_or(Ok(stack), |name| Err(format!("It takes {name}, which no extension provides"))))
+    }
+
     pub fn tail(&self, asset: &index::Asset) -> Vec<graph::Tail> {
         let Some(kind) = self.kind_of(asset) else { return Vec::new() };
         let from = |o: &pe2_ext::OutputDef| o.from.as_ref().and_then(|name| kind.outputs.iter().position(|o| o.name == *name));
@@ -1025,6 +1053,28 @@ impl Extensions {
         kind.iter().chain(role).collect()
     }
 
+    /// An asset's inspector views with a tab of their own, by their place among its inspector views: those it has what brings.
+    #[must_use]
+    pub fn inspector_tabs(&self, asset: &index::Asset) -> Vec<(usize, &ViewDef)> {
+        self.inspector(asset).into_iter().enumerate().filter(|(_, view)| view.tab.is_some() && brought(view, asset)).collect()
+    }
+
+    /// The editors its kind and role give an asset, of those it has what brings.
+    #[must_use]
+    pub fn editors(&self, asset: &index::Asset) -> Vec<&ViewDef> {
+        let kind = self.kind_of(asset).map_or(&[][..], |k| k.editors.as_slice());
+        let role = self.role_of(asset).map_or(&[][..], |r| r.editors.as_slice());
+        kind.iter().chain(role).filter(|view| brought(view, asset)).collect()
+    }
+
+    /// The name of every editor any kind or role gives.
+    #[must_use]
+    pub fn editor_names(&self) -> std::collections::BTreeSet<&str> {
+        let kinds = self.kinds.values().flat_map(|(kind, _)| &kind.editors);
+        let roles = self.roles.values().flat_map(|role| &role.editors);
+        kinds.chain(roles).map(|view| view.name.as_str()).collect()
+    }
+
     /// A part of an asset as a picture (`palettes/<name>`): the member of a family of its kind's pictures keyed by it;
     /// none where none is.
     #[must_use]
@@ -1040,6 +1090,38 @@ impl Extensions {
     #[must_use]
     pub fn parts(&self, asset: &index::Asset) -> Vec<pe2_ext::Part> {
         self.kind_of(asset).and_then(|k| k.parts.as_ref()).map_or_default(|parts| parts(&self.lend(asset)))
+    }
+
+    /// What is inside an asset: what its kind says, else its parts, under a heading for each group of them.
+    #[must_use]
+    pub fn contents(&self, asset: &index::Asset) -> pe2_ext::Contents {
+        if let Some(contents) = self.kind_of(asset).and_then(|k| k.contents.as_ref()) {
+            return contents(&self.lend(asset));
+        }
+        pe2_ext::Contents { rows: rows_of_parts(&self.parts(asset)), ..pe2_ext::Contents::default() }
+    }
+
+    /// What comes of something done in an asset's contents.
+    ///
+    /// # Errors
+    /// Why it cannot be, as its kind says.
+    pub fn content_act(&self, asset: &index::Asset, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
+        let act = self.kind_of(asset).and_then(|k| k.content_act.as_ref()).context("its kind does nothing with its contents")?;
+        act(&self.lend(asset), request)
+    }
+
+    /// A part's fields, where its kind says what they are.
+    #[must_use]
+    pub fn part_sheet(&self, asset: &index::Asset, part: &str) -> Option<pe2_ext::PartSheet> {
+        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), part)
+    }
+
+    /// The views a kind and a role give the head of the contents pane.
+    #[must_use]
+    pub fn contents_views(&self, asset: &index::Asset) -> Vec<&ViewDef> {
+        let kind = self.kind_of(asset).map_or(&[][..], |k| k.contents_views.as_slice());
+        let role = self.role_of(asset).map_or(&[][..], |r| r.contents_views.as_slice());
+        kind.iter().chain(role).collect()
     }
 
     /// Whether an asset's kind lists its parts.
@@ -1080,6 +1162,11 @@ impl Extensions {
     #[must_use]
     pub fn tools(&self) -> &[ToolDef] {
         &self.tools
+    }
+
+    #[must_use]
+    pub fn commands(&self) -> &[pe2_ext::CommandDef] {
+        &self.commands
     }
 
     /// Every asset of a kind, by its qualified name or a built-in's bare one.
@@ -1249,6 +1336,39 @@ fn type_names<'a>(types: impl Iterator<Item = &'a TypeDef>) -> Vec<String> {
 }
 
 /// The types a file of a name and size is recognized as, by its first bytes: each by its index among `types`.
+/// Whether an asset has a field that brings a view: any where none is named.
+fn brought(view: &ViewDef, asset: &index::Asset) -> bool {
+    let settings = asset.settings();
+    view.tab.as_ref().is_none_or(|tab| tab.fields.is_empty() || tab.fields.iter().any(|field| settings.contains_key(field)))
+}
+
+/// Parts as rows: a group's (`cells/` of `cells/cursor`) under its heading, those of no group as they are.
+fn rows_of_parts(parts: &[pe2_ext::Part]) -> Vec<pe2_ext::ContentRow> {
+    let mut rows = Vec::new();
+    let mut group = "";
+    for part in parts {
+        let within = part.id.split_once('/').map(|(within, _)| within);
+        if let Some(within) = within
+            && within != group
+        {
+            group = within;
+            let mut letters = within.chars();
+            let label: String = letters.next().map_or_else(String::new, |first| first.to_uppercase().chain(letters).collect());
+            rows.push(pe2_ext::ContentRow::heading(within, &label));
+        }
+        rows.push(pe2_ext::ContentRow::new(&part.id, &part.label).depth(u32::from(within.is_some())));
+    }
+    rows
+}
+
+/// Whether a file's name is a pattern's: `*.png`, or the name itself.
+fn name_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_prefix('*') {
+        Some(suffix) => name.ends_with(suffix),
+        None => name == pattern,
+    }
+}
+
 /// What a stored file is by its name alone, as a stack's shape tells it: a file of the types named so. Other signatures
 /// need its bytes, so a name nothing claims says nothing - and a name is a hint, the bytes told when it runs.
 fn named_type(types: &[TypeDef], name: &str) -> Option<pe2_ext::Type> {
@@ -1270,10 +1390,7 @@ fn recognize_head(types: &[TypeDef], name: &str, size: u64, head: &[u8]) -> Vec<
         // A cut through a character at the end of what was read: what is before it decides.
         Err(e) => e.error_len().is_none() && !head[..e.valid_up_to()].contains(&0),
     };
-    let named = |pattern: &str| match pattern.strip_prefix('*') {
-        Some(suffix) => name.ends_with(suffix),
-        None => name == pattern,
-    };
+    let named = |pattern: &str| name_matches(pattern, name);
     let mut out = vec![];
     for (i, format) in types.iter().enumerate() {
         let signed = format.signatures.iter().any(|signature| match signature {
@@ -1668,6 +1785,27 @@ mod tests {
     fn stray(r: &mut Registry) -> Result<()> {
         r.role(&Name::parse("test.images@image").unwrap(), "font").register();
         Ok(())
+    }
+
+    #[test]
+    fn parts_make_rows_under_a_heading_for_each_group() {
+        let part = |id: &str, label: &str| pe2_ext::Part { id: id.to_string(), label: label.to_string(), made_of: vec![] };
+        let rows = super::rows_of_parts(&[part("texels", "Texels"), part("cells/a", "a"), part("cells/b", "b"), part("palettes/p", "p")]);
+        let read: Vec<(&str, bool, u32)> = rows.iter().map(|r| (r.id.as_str(), r.is_heading(), r.depth)).collect();
+        let expected = [("texels", false, 0), ("cells", true, 0), ("cells/a", false, 1), ("cells/b", false, 1), ("palettes", true, 0), ("palettes/p", false, 1)];
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn a_command_of_an_extension_is_offered_by_the_tool_it_runs() {
+        fn offering(r: &mut Registry) -> Result<()> {
+            r.command("Say hello", "hello");
+            Ok(())
+        }
+        let extensions = Extensions::load(vec![extension("test.greeter", "0.1.0", &[], offering)], false);
+        let commands = extensions.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!((commands[0].label.as_str(), commands[0].tool.to_string().as_str()), ("Say hello", "test.greeter@hello"));
     }
 
     fn nothing(_: &mut Registry) -> Result<()> {

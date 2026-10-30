@@ -1,4 +1,4 @@
-//! The graph pane: a graph layer of a stack, opened as what it is. An operation is a box, its input ports down its left
+//! The graph editor: a graph layer of a stack, a document's way of showing it. An operation is a box, its input ports down its left
 //! and what it makes at its foot on the right; what comes down from above is a box at the left, and what the layer passes
 //! on down one at the right. Ports and wires are colored by what they carry. Dragging from a port to another makes a
 //! wire, refused where the types do not fit, ports lit while one is being drawn; dragging a wire off an input moves or
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use toml::Value;
 
 use crate::inspector;
-use crate::workspace::{EditRequest, Workspace};
+use crate::workspace::{EditRequest, GraphAsk, Workspace};
 use crate::theme;
 
 const WIDTH: f32 = 172.0;
@@ -83,6 +83,12 @@ impl Node {
     fn output(&self) -> Pos2 {
         self.at + vec2(WIDTH, HEADER + ROW * (rows(self.ports.len()) + 0.5))
     }
+}
+
+/// Whether an asset's stack has a graph layer.
+pub fn has_graph(asset: &Asset) -> bool {
+    let layers = asset.fields().get("stack").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some(graph::GRAPH))
 }
 
 /// The graph layer a pane shows of an asset: the one selected, else its first.
@@ -487,12 +493,6 @@ fn canvas_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &m
     if inspector::edit_target(canvas.ws, canvas.asset).is_ok() {
         background.context_menu(|ui| add_menu(ui, canvas.ws, canvas.asset, (canvas.at, canvas.layer), state, edit));
     }
-    if ui.input(|i| i.key_pressed(egui::Key::Delete))
-        && !ui.ctx().egui_wants_keyboard_input()
-        && let Some(id) = state.selected.take()
-    {
-        *edit = canvas.edit(format!("Remove {id}"), layers::remove_operation(canvas.asset.text(), canvas.at, &id));
-    }
 }
 
 /// Over the canvas: which layer this is, fitting it and arranging it.
@@ -507,15 +507,20 @@ fn toolbar_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &
         }
         let editable = inspector::edit_target(canvas.ws, canvas.asset).is_ok();
         if ui.add_enabled(editable, egui::Button::new("Arrange")).on_hover_text("Put the boxes in columns, by what feeds what").clicked() {
-            let places = arrangement(&canvas.nodes);
-            let mut text = Ok(canvas.asset.text().to_string());
-            for (id, place) in &places {
-                text = text.and_then(|t| layers::place(&t, canvas.at, id, [f64::from(place.x), f64::from(place.y)]));
-            }
-            *edit = canvas.edit(format!("Arrange layer {}", canvas.at), text);
-            state.view = None;
+            arrange(canvas, state, edit);
         }
     });
+}
+
+/// Put the boxes in columns, by what feeds what.
+fn arrange(canvas: &Canvas<'_>, state: &mut State, edit: &mut Option<EditRequest>) {
+    let places = arrangement(&canvas.nodes);
+    let mut text = Ok(canvas.asset.text().to_string());
+    for (id, place) in &places {
+        text = text.and_then(|t| layers::place(&t, canvas.at, id, [f64::from(place.x), f64::from(place.y)]));
+    }
+    *edit = canvas.edit(format!("Arrange layer {}", canvas.at), text);
+    state.view = None;
 }
 
 /// The pane.
@@ -542,7 +547,13 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
         node.at = *place;
     }
     let above = plan.above.get(at).cloned().flatten();
+    let ask = ws.graph_ask.take();
     let canvas = Canvas { ws, asset: &asset, at, layer: &layer, nodes, above, wrong };
+    match ask {
+        Some(GraphAsk::Fit) => state.view = None,
+        Some(GraphAsk::Arrange) if inspector::edit_target(canvas.ws, canvas.asset).is_ok() => arrange(&canvas, &mut state, edit),
+        _ => {}
+    }
     egui::Panel::top(("graph tools", id)).show(ui, |ui| toolbar_ui(ui, &canvas, &mut state, edit));
     if !canvas.wrong.is_empty() || state.refused.is_some() {
         egui::Panel::bottom(("graph problems", id)).show(ui, |ui| {

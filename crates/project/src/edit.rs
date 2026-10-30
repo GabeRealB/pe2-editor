@@ -241,6 +241,15 @@ pub fn delete(
     tx.commit()
 }
 
+/// What a rename is called: of the name, or of the folder where the name stays.
+fn rename_label(from: &str, to: &str) -> String {
+    if name(from) != name(to) {
+        return format!("Rename {} to {}", name(from), name(to));
+    }
+    let folder = to.rsplit_once('/').map_or("the top", |(folder, _)| folder.rsplit('/').next().unwrap_or(folder));
+    format!("Move {} to {folder}", name(to))
+}
+
 /// Rename or move an entry to another resolved path: one the layer makes moves on disk; one from below gets a move.
 ///
 /// # Errors
@@ -259,7 +268,7 @@ pub fn rename(
         bail!("{to}: an entry is there already");
     }
     if let Some(from) = changeset.entries.get(uid).cloned() {
-        let mut tx = history.begin(format!("Rename {} to {}", name(&from), name(to)));
+        let mut tx = history.begin(rename_label(&from, to));
         tx.rename(&layer.disk(&from), &layer.disk(to))?;
         let inside = format!("{from}/");
         for path in changeset.entries.values_mut() {
@@ -278,7 +287,7 @@ pub fn rename(
         bail!("{layer_name} deletes {}", below.path);
     }
     let from = target(op.as_ref(), &below.path);
-    let mut tx = history.begin(format!("Rename {} to {}", name(&from), name(to)));
+    let mut tx = history.begin(rename_label(&from, to));
     let back = (to != below.path).then(|| to.to_string());
     let new = match op {
         Some(Op::Override { base, .. }) => {
