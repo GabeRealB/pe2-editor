@@ -141,7 +141,9 @@ pub struct Workspace {
     /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
     /// What plays in the preview: a movie, frame by frame.
-    pub player: crate::player::Player,
+    /// A player for each document tab playing, and the tabs that drew theirs this frame.
+    players: HashMap<crate::panes::Pane, crate::player::Player>,
+    played: HashSet<crate::panes::Pane>,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
     views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
     /// The view an asset is shown in, where its kind and role have several.
@@ -437,13 +439,13 @@ impl Workspace {
             extensions_found.clone(),
             tree.clone(),
         );
-        let player = crate::player::Player::new(extensions.clone());
         let mut workspace = Workspace {
             project,
             applied,
             history,
             thumbs,
-            player,
+            players: HashMap::new(),
+            played: HashSet::new(),
             extensions,
             views: HashMap::new(),
             view_choice: HashMap::new(),
@@ -1120,6 +1122,30 @@ impl Workspace {
 
     pub fn can_go_forward(&self) -> bool {
         !self.forward.is_empty()
+    }
+
+    /// A document tab's asset, played.
+    pub fn play(&mut self, ui: &mut egui::Ui, pane: crate::panes::Pane, path: &str, view: &mut crate::settings::Preview) {
+        self.played.insert(pane);
+        let (extensions, index) = (self.extensions.clone(), self.index.clone());
+        let player = self.players.entry(pane).or_insert_with(|| crate::player::Player::new(extensions.clone()));
+        player.ui(ui, (&extensions, &index), path, view);
+    }
+
+    /// Once every window is drawn: a tab gone takes its player, and one not shown pauses.
+    pub fn settle_players(&mut self, open: impl Fn(crate::panes::Pane) -> bool) {
+        let played = std::mem::take(&mut self.played);
+        self.players.retain(|pane, _| open(*pane));
+        for (_, player) in self.players.iter_mut().filter(|(pane, _)| !played.contains(*pane)) {
+            player.pause();
+        }
+    }
+
+    /// Whether an entry opens as a document: an asset, a container folder among them, or a plain file; a filesystem
+    /// folder does not.
+    #[must_use]
+    pub fn is_document(&self, path: &str) -> bool {
+        self.index.assets.contains_key(path) || self.entry_at(path).is_some_and(|(_, e)| e.kind == project::index::Kind::File)
     }
 
     /// What is selected inside an asset, as a path in its declaration.

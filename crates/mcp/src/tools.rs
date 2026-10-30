@@ -84,7 +84,7 @@ struct NoArgs {}
 /// What of the editor's window to read.
 #[derive(Deserialize, JsonSchema)]
 pub struct UiArgs {
-    /// Only this pane (its tab's title: `Inspector`, `Preview 2`); the whole window when absent.
+    /// Only this pane (its tab's title: `Inspector`, `Document 2`); the whole window when absent.
     #[serde(default)]
     pub pane: Option<String>,
     /// Only widgets whose label or value contains this text (case-insensitive), each with the labels it is within.

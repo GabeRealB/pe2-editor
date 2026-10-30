@@ -204,6 +204,8 @@ impl SoundClock {
 
 pub struct Player {
     extensions: Arc<Extensions>,
+    /// Which player it is, to the renderer.
+    id: u64,
     shown: Option<Shown>,
     texture: Option<egui::TextureHandle>,
     /// The key of the YCbCr frame shown last: each new one a new key.
@@ -214,9 +216,26 @@ pub struct Player {
     device: Arc<Mutex<Option<String>>>,
 }
 
+impl Drop for Player {
+    fn drop(&mut self) {
+        crate::yuv::forget(self.id);
+    }
+}
+
 impl Player {
     pub fn new(extensions: Arc<Extensions>) -> Player {
-        Player { extensions, shown: None, texture: None, keys: 0, gain: Arc::new(AtomicU32::new(1f32.to_bits())), device: Arc::default() }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Player { extensions, id: NEXT.fetch_add(1, Ordering::Relaxed), shown: None, texture: None, keys: 0, gain: Arc::new(AtomicU32::new(1f32.to_bits())), device: Arc::default() }
+    }
+
+    /// Stop where it is: its tab is not shown, and what is not seen is not heard.
+    pub fn pause(&mut self) {
+        let Some(shown) = &mut self.shown else { return };
+        if shown.sounding.is_some() {
+            shown.by_clock();
+        }
+        shown.playing = None;
+        shown.held = false;
     }
 
     /// Whether an asset plays: its kind has a stream output.
@@ -341,7 +360,7 @@ impl Player {
             }
             Poll::Failed(e) => shown.failed = Some(e),
         }
-        show(ui, shown, self.texture.as_ref());
+        show(ui, shown, self.texture.as_ref(), self.id);
         ui.add_space(6.0);
         controls(ui, shown, number, view);
         if shown.playing.is_some() || shown.sounding.is_some() {
@@ -351,7 +370,7 @@ impl Player {
 }
 
 /// The picture shown: through the texture, or a YCbCr frame through the GPU's shader; or why there is none yet.
-fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>) {
+fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>, player: u64) {
     match (&shown.showing, texture) {
         (Some(Showing::Texture), Some(texture)) => {
             let size = texture.size_vec2();
@@ -362,7 +381,7 @@ fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>)
             #[expect(clippy::cast_precision_loss, reason = "a frame's size")]
             let size = egui::vec2(frame.width as f32, frame.height as f32);
             let (rect, _) = ui.allocate_exact_size(size * (ui.available_width() / size.x).max(0.1), egui::Sense::hover());
-            let draw = crate::yuv::Draw { frame: frame.clone(), key: *key };
+            let draw = crate::yuv::Draw { frame: frame.clone(), key: *key, player };
             ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, draw));
         }
         _ => {

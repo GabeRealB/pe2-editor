@@ -88,6 +88,8 @@ pub struct Editor {
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
     in_use: Option<(PathBuf, String)>,
+    /// The selection last opened as a document.
+    opened: Option<String>,
     error: Option<String>,
     capture: Option<Capture>,
     /// The device's largest surface side in pixels, which the window must not outgrow; applied once, then taken.
@@ -142,6 +144,8 @@ impl Editor {
                 windows,
                 states: states.into_iter().collect(),
                 homes: homes.into_iter().collect(),
+                focused: None,
+                reveal: None,
             },
             focus: None,
             saved: settings.clone(),
@@ -156,6 +160,7 @@ impl Editor {
             choosing: None,
             layers_state: crate::layers::LayersState::default(),
             in_use: None,
+            opened: None,
             error: problem,
             capture: start.screenshot.map(|path| Capture {
                 path,
@@ -223,7 +228,11 @@ impl Editor {
                     self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
                 }
                 let mut ws = Workspace::from_opened(opened);
-                if let Some(path) = opening.select.filter(|p| ws.exists(p)) {
+                // A layout outlives a project: tabs of what is not here close, and what is in front is what is selected.
+                self.layouts.close_documents(|path| !ws.exists(path));
+                self.opened = None;
+                let front = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
+                if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
                 self.workspace = Some(ws);
@@ -554,9 +563,21 @@ impl Editor {
         self.focus = self.layouts.show(pane);
     }
 
+    /// What was selected since last time, whatever selected it, opens as a document.
+    fn open_selected(&mut self) {
+        let Some(ws) = self.workspace.as_ref() else { return };
+        if ws.selected == self.opened {
+            return;
+        }
+        self.opened.clone_from(&ws.selected);
+        if let Some(path) = self.opened.as_deref().filter(|path| ws.is_document(path)) {
+            self.layouts.open(path, false);
+        }
+    }
+
     /// The windows: each its own native window (an immediate viewport, drawn now, with the editor's state), with a
     /// dock-back button; closing one docks its panes back.
-    fn show_windows(&mut self, ctx: &egui::Context, titles: &[(u64, String)]) -> Outcome {
+    fn show_windows(&mut self, ctx: &egui::Context, titles: &[(u64, String)], reveal: Option<Pane>) -> Outcome {
         let mut outcome = Outcome::default();
         let opening = self.opening_shown();
         for window in &mut self.layouts.windows {
@@ -574,6 +595,8 @@ impl Editor {
                         workspace: self.workspace.as_mut(),
                         nav: None,
                         pick: None,
+                focus: None,
+                reveal,
                         settings: &mut self.settings,
                         layers: &mut self.layers_state,
                         states: &mut self.layouts.states,
@@ -602,24 +625,56 @@ impl Editor {
 
     /// Apply what the layouts asked for this frame.
     fn apply(&mut self, outcome: Outcome) {
+        let mut keep = None;
         if let Some(message) = outcome.message {
             self.message = Some(message);
         }
         if let Some(ws) = self.workspace.as_mut() {
+            if let Some(pane) = outcome.focus {
+                self.layouts.focused = Some(pane);
+                if let Some(path) = self.layouts.subject(pane).map(str::to_string) {
+                    ws.navigate(path);
+                    self.opened.clone_from(&ws.selected);
+                }
+            }
+            // Asked for, it opens even selected already: its tab may have been closed.
             if let Some(path) = outcome.nav {
                 ws.navigate(path);
-            } else if let Some(path) = outcome.pick {
-                ws.select(path);
+                self.opened = None;
+            } else if let Some(pick) = outcome.pick {
+                ws.select(pick.path.clone());
+                self.opened = None;
+                keep = pick.keep.then_some(pick.path);
             }
         }
         for window in outcome.docked {
             self.layouts.dock_back(window);
         }
         for (window, tile, action) in outcome.actions {
+            let closed = action == PaneAction::Close;
             self.layouts.act(window, tile, action);
+            // What comes to the front is what is selected.
+            if closed
+                && let Some(pane) = self.layouts.focused
+                && let Some(ws) = self.workspace.as_mut()
+                && let Some(path) = self.layouts.subject(pane).map(str::to_string)
+            {
+                ws.navigate(path);
+                self.opened.clone_from(&ws.selected);
+            }
+        }
+        self.open_selected();
+        if let Some(path) = keep {
+            self.layouts.open(&path, true);
         }
         let view_edit = self.workspace.as_mut().and_then(|ws| ws.view_edit.take());
         if let Some(request) = outcome.edit.or(view_edit) {
+            // An edit keeps what it edited open.
+            if matches!(request, EditRequest::Override(_) | EditRequest::OverrideIn(..) | EditRequest::EditIn(_) | EditRequest::Write { .. })
+                && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
+            {
+                self.layouts.keep(&path);
+            }
             self.edit(&request);
         }
         if let Some((redo, count)) = outcome.steps {
@@ -672,7 +727,7 @@ impl Editor {
                 }
             });
             ui.menu_button("View", |ui| {
-                for kind in PaneKind::with_panels() {
+                for kind in PaneKind::with_panels().into_iter().filter(|kind| *kind != PaneKind::Document) {
                     let pane = Pane::first(kind);
                     let mut visible = self.pane_visible(pane);
                     if ui.checkbox(&mut visible, kind.title()).clicked() {
@@ -689,6 +744,7 @@ impl Editor {
                 if ui.button("Reset layout").on_hover_text("Close the other windows and the extra instances").clicked()
                 {
                     self.layouts = Layouts::new(panes::default_layout());
+                    self.opened = None;
                 }
                 ui.separator();
                 let zoom = ui.ctx().zoom_factor();
@@ -1029,11 +1085,14 @@ impl eframe::App for Editor {
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
         let mut outcome = Outcome::default();
         let opening = self.opening_shown();
+        let reveal = self.layouts.reveal.take();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let mut behavior = Panes {
                 workspace: self.workspace.as_mut(),
                 nav: None,
                 pick: None,
+                focus: None,
+                reveal,
                 settings: &mut self.settings,
                 layers: &mut self.layers_state,
                 states: &mut self.layouts.states,
@@ -1051,9 +1110,13 @@ impl eframe::App for Editor {
         if let Some(opening) = self.opening_shown() {
             panes::opening_ui(&ctx, &opening);
         }
-        let windows = self.show_windows(&ctx, &titles);
+        let windows = self.show_windows(&ctx, &titles, reveal);
         outcome.merge(windows);
         self.apply(outcome);
+        let layouts = &self.layouts;
+        if let Some(ws) = self.workspace.as_mut() {
+            ws.settle_players(|pane| layouts.find(pane).is_some());
+        }
         self.open_dialog(&ctx);
         self.in_use_dialog(&ctx);
         self.force_dialog(&ctx);
@@ -1107,7 +1170,8 @@ struct Choosing {
 #[derive(Default)]
 struct Outcome {
     nav: Option<String>,
-    pick: Option<String>,
+    pick: Option<panes::Pick>,
+    focus: Option<Pane>,
     message: Option<String>,
     docked: Vec<u64>,
     actions: Vec<(Option<u64>, TileId, PaneAction)>,
@@ -1119,6 +1183,7 @@ impl Outcome {
     fn take(&mut self, behavior: Panes<'_>, window: Option<u64>) {
         self.nav = self.nav.take().or(behavior.nav);
         self.pick = self.pick.take().or(behavior.pick);
+        self.focus = self.focus.take().or(behavior.focus);
         self.message = self.message.take().or(behavior.message);
         self.steps = self.steps.take().or(behavior.steps);
         self.edit = self.edit.take().or(behavior.edit);
@@ -1128,6 +1193,7 @@ impl Outcome {
     fn merge(&mut self, other: Outcome) {
         self.nav = self.nav.take().or(other.nav);
         self.pick = self.pick.take().or(other.pick);
+        self.focus = self.focus.take().or(other.focus);
         self.message = self.message.take().or(other.message);
         self.docked.extend(other.docked);
         self.actions.extend(other.actions);

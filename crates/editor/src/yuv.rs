@@ -3,6 +3,9 @@
 //! The pipeline is made when the window is (`install`), for its target's format; a frame is drawn by a paint callback
 //! (`Draw`), its planes uploaded once a frame they change.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use pe2_ext::media::VideoFrame;
@@ -52,7 +55,16 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uploaded: Option<Uploaded>,
+    /// By player: each shows a frame of its own.
+    uploaded: HashMap<u64, Uploaded>,
+}
+
+/// Players gone, whose planes are let go at the next upload.
+static GONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// A player is gone: its planes are not needed.
+pub fn forget(player: u64) {
+    GONE.lock().unwrap_or_else(PoisonError::into_inner).push(player);
 }
 
 /// A frame's planes on the GPU: which frame, their size, and the bind group drawing them.
@@ -131,7 +143,7 @@ pub fn install(state: &egui_wgpu::RenderState) {
         min_filter: wgpu::FilterMode::Linear,
         ..wgpu::SamplerDescriptor::default()
     });
-    state.renderer.write().callback_resources.insert(Renderer { pipeline, layout, sampler, uploaded: None });
+    state.renderer.write().callback_resources.insert(Renderer { pipeline, layout, sampler, uploaded: HashMap::new() });
 }
 
 /// A YCbCr 4:2:0 frame to draw where the callback is, known by a key: one with the key drawn last is not uploaded
@@ -139,6 +151,7 @@ pub fn install(state: &egui_wgpu::RenderState) {
 pub struct Draw {
     pub frame: VideoFrame,
     pub key: u64,
+    pub player: u64,
 }
 
 impl egui_wgpu::CallbackTrait for Draw {
@@ -151,14 +164,17 @@ impl egui_wgpu::CallbackTrait for Draw {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(renderer) = resources.get_mut::<Renderer>() else { return Vec::new() };
-        if renderer.uploaded.as_ref().is_some_and(|u| u.key == self.key) {
+        for gone in GONE.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+            renderer.uploaded.remove(&gone);
+        }
+        if renderer.uploaded.get(&self.player).is_some_and(|u| u.key == self.key) {
             return Vec::new();
         }
         let (width, height) = (self.frame.width, self.frame.height);
         let (half_w, half_h) = (width.div_ceil(2), height.div_ceil(2));
         let sizes = [(width, height), (half_w, half_h), (half_w, half_h)];
         // Planes made again only where the size changed.
-        if renderer.uploaded.as_ref().is_none_or(|u| u.size != (width, height)) {
+        if renderer.uploaded.get(&self.player).is_none_or(|u| u.size != (width, height)) {
             let planes = sizes.map(|(w, h)| {
                 device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("yuv420p plane"),
@@ -182,9 +198,9 @@ impl egui_wgpu::CallbackTrait for Draw {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&renderer.sampler) },
                 ],
             });
-            renderer.uploaded = Some(Uploaded { key: self.key, size: (width, height), planes, bind });
+            renderer.uploaded.insert(self.player, Uploaded { key: self.key, size: (width, height), planes, bind });
         }
-        let Some(uploaded) = &mut renderer.uploaded else { return Vec::new() };
+        let Some(uploaded) = renderer.uploaded.get_mut(&self.player) else { return Vec::new() };
         let bytes = self.frame.buffer.bytes();
         let mut at = 0usize;
         for (plane, &(w, h)) in uploaded.planes.iter().zip(&sizes) {
@@ -214,7 +230,7 @@ impl egui_wgpu::CallbackTrait for Draw {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(renderer) = resources.get::<Renderer>() else { return };
-        let Some(uploaded) = &renderer.uploaded else { return };
+        let Some(uploaded) = renderer.uploaded.get(&self.player) else { return };
         pass.set_pipeline(&renderer.pipeline);
         pass.set_bind_group(0, &uploaded.bind, &[]);
         pass.draw(0..3, 0..1);

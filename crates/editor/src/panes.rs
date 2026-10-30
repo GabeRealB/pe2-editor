@@ -53,7 +53,8 @@ impl<'de> Deserialize<'de> for PanelName {
 #[serde(from = "StoredKind")]
 pub enum PaneKind {
     Assets,
-    Preview,
+    /// A tab of the centre showing one entry: the Preview pane as layouts saved it.
+    Document,
     Inspector,
     References,
     Problems,
@@ -72,6 +73,7 @@ pub enum PaneKind {
 enum StoredKind {
     Assets,
     Preview,
+    Document,
     Inspector,
     References,
     Problems,
@@ -90,7 +92,7 @@ impl From<StoredKind> for PaneKind {
     fn from(stored: StoredKind) -> PaneKind {
         match stored {
             StoredKind::Assets => PaneKind::Assets,
-            StoredKind::Preview => PaneKind::Preview,
+            StoredKind::Preview | StoredKind::Document => PaneKind::Document,
             StoredKind::Inspector => PaneKind::Inspector,
             StoredKind::References => PaneKind::References,
             StoredKind::Problems => PaneKind::Problems,
@@ -111,7 +113,7 @@ impl PaneKind {
     /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
     pub const ALL: [PaneKind; 12] = [
         PaneKind::Assets,
-        PaneKind::Preview,
+        PaneKind::Document,
         PaneKind::Graph,
         PaneKind::Layer,
         PaneKind::Inspector,
@@ -127,7 +129,7 @@ impl PaneKind {
     pub fn icon(self) -> &'static str {
         match self {
             PaneKind::Assets => icons::FOLDER,
-            PaneKind::Preview => icons::IMAGE,
+            PaneKind::Document => icons::FILE,
             PaneKind::Inspector => icons::FILE_TEXT,
             PaneKind::References => icons::STACK,
             PaneKind::Problems => icons::WARNING,
@@ -152,24 +154,24 @@ impl PaneKind {
 
     /// Whether it may be open several times, each instance with its own state; the others are singletons.
     pub fn several(self) -> bool {
-        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Panel(_))
+        matches!(self, PaneKind::Document | PaneKind::Inspector | PaneKind::References | PaneKind::Panel(_))
     }
 
     /// Whether it shows one asset or entry: the selection, or the one an instance is pinned to.
     pub fn shows_subject(self) -> bool {
-        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Graph)
+        matches!(self, PaneKind::Document | PaneKind::Inspector | PaneKind::References | PaneKind::Graph)
     }
 
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Graph | PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview | PaneKind::Extensions)
+        matches!(self, PaneKind::Graph | PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Document | PaneKind::Extensions)
     }
 
     pub fn title(self) -> String {
         match self {
             PaneKind::Assets => "Assets",
-            PaneKind::Preview => "Preview",
+            PaneKind::Document => "Document",
             PaneKind::Inspector => "Inspector",
             PaneKind::References => "References",
             PaneKind::Problems => "Problems",
@@ -202,11 +204,27 @@ impl Pane {
 }
 
 /// What an instance keeps of its own: the entry it is pinned to (its real path), where it does not follow the
-/// selection - unlinked from it, as an inspector locked to one asset.
+/// selection - unlinked from it, as an inspector locked to one asset. A document tab always shows its own, and `preview`
+/// says the next entry opened replaces it, until it is kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneState {
     #[serde(default)]
     pub pinned: Option<String>,
+    #[serde(default)]
+    pub preview: bool,
+}
+
+/// A click on an entry of the tree: the entry, and whether it was a double click, which keeps its tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pick {
+    pub path: String,
+    pub keep: bool,
+}
+
+impl Pick {
+    fn of(response: &egui::Response, path: &str) -> Pick {
+        Pick { path: path.to_string(), keep: response.double_clicked() }
+    }
 }
 
 /// What a tab asks for, done once every layout is drawn.
@@ -216,6 +234,8 @@ pub enum PaneAction {
     Another,
     /// Show this entry, whatever is selected.
     Pin(String),
+    /// A document tab no entry replaces.
+    Keep,
     /// Follow the selection again.
     Follow,
     /// Into a window of its own.
@@ -233,7 +253,7 @@ pub fn default_layout() -> egui_tiles::Tree<Pane> {
     let left = [PaneKind::Assets, PaneKind::Project].map(|k| tiles.insert_pane(Pane::first(k)));
     let left = tiles.insert_tab_tile(left.to_vec());
     let panels = PaneKind::with_panels().into_iter().filter(|k| matches!(k, PaneKind::Panel(_)));
-    let center = std::iter::once(PaneKind::Preview).chain(panels).chain([PaneKind::Layer]);
+    let center = std::iter::once(PaneKind::Document).chain(panels).chain([PaneKind::Layer]);
     let center = center.map(|k| tiles.insert_pane(Pane::first(k))).collect();
     let center = tiles.insert_tab_tile(center);
     let inspector = tiles.insert_pane(Pane::first(PaneKind::Inspector));
@@ -260,7 +280,11 @@ pub fn default_layout() -> egui_tiles::Tree<Pane> {
 pub struct Panes<'a> {
     pub workspace: Option<&'a mut Workspace>,
     pub nav: Option<String>,
-    pub pick: Option<String>,
+    pub pick: Option<Pick>,
+    /// The document tab used, by a click on it or in it.
+    pub focus: Option<Pane>,
+    /// A tab just brought to the front: its strip scrolls to it.
+    pub reveal: Option<Pane>,
     pub settings: &'a mut EditorSettings,
     pub layers: &'a mut crate::layers::LayersState,
     /// Each instance's own state.
@@ -321,6 +345,9 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let pane = *pane;
         let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
         crate::drive::note_pane(ui, format!("{}{number}", pane.kind.title()));
+        if pane.kind == PaneKind::Document && ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(ui.max_rect()) {
+            self.focus = Some(pane);
+        }
         if pane.kind == PaneKind::Settings {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
@@ -339,7 +366,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         };
         // An instance pinned to an entry shows it; the others show the selection.
         let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
-        let subject = pinned.clone().or_else(|| ws.selected.clone());
+        let subject = pinned.clone().or_else(|| ws.selected.clone().filter(|_| pane.kind != PaneKind::Document));
         let (nav, pick, settings, layers, message, steps, edit) = (
             &mut self.nav,
             &mut self.pick,
@@ -359,7 +386,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 let subject = subject.as_deref();
                 match pane.kind {
                     PaneKind::Assets => assets_ui(ui, ws, pick, edit),
-                    PaneKind::Preview => preview_ui(ui, ws, egui::Id::unique(pane), subject, nav, &mut settings.preview),
+                    PaneKind::Document => preview_ui(ui, ws, pane, subject, nav, &mut settings.preview),
                     PaneKind::Panel(name) => {
                         ws.show_panel(ui, egui::Id::unique(pane), name.as_str(), settings.preview, nav);
                     }
@@ -387,6 +414,16 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
+        if pane.kind == PaneKind::Document
+            && let Some(state) = self.states.get(pane)
+            && let Some(path) = &state.pinned
+        {
+            let name = path.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(path);
+            let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path.as_str())?)));
+            let icon = asset.map_or(icons::FILE, |(ws, asset)| icons::for_kind(&ws.extensions, asset.kind.as_deref()).0);
+            let text = RichText::new(format!("{icon}  {name}"));
+            return if state.preview { text.italics() } else { text }.into();
+        }
         let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
         let pinned = self.states.get(pane).and_then(|s| s.pinned.as_deref()).map_or_else(String::new, |pinned| {
             let name = pinned.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(pinned);
@@ -410,7 +447,22 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let Some(Tile::Pane(pane)) = tiles.get(tile_id) else { return response };
         let pane = *pane;
         response.context_menu(|ui| self.tab_menu(ui, tile_id, pane));
-        response
+        if self.reveal == Some(pane) {
+            response.scroll_to_me(None);
+        }
+        if pane.kind != PaneKind::Document {
+            return response;
+        }
+        if response.clicked() {
+            self.focus = Some(pane);
+        }
+        if response.double_clicked() {
+            self.actions.push((tile_id, PaneAction::Keep));
+        }
+        match self.states.get(&pane).and_then(|s| s.pinned.clone()) {
+            Some(path) => response.on_hover_text(path),
+            None => response,
+        }
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
@@ -442,7 +494,12 @@ impl Panes<'_> {
         if pane.kind.several() && ui.button(format!("{}  Another {}", icons::PLUS, pane.kind.title())).clicked() {
             ask(PaneAction::Another);
         }
-        if pane.kind.shows_subject() {
+        if pane.kind == PaneKind::Document {
+            let previewed = self.states.get(&pane).is_some_and(|s| s.preview);
+            if previewed && ui.button(format!("{}  Keep open", icons::PUSH_PIN)).on_hover_text("The next asset opened takes another tab").clicked() {
+                ask(PaneAction::Keep);
+            }
+        } else if pane.kind.shows_subject() {
             let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
             let selected = self.workspace.as_ref().and_then(|ws| ws.selected.clone());
             if pinned.is_some() {
@@ -519,7 +576,7 @@ fn scroll(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui::Ui))
 
 // --- assets -----------------------------------------------------------------------------------------------------------
 
-fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<String>, edit: &mut Option<EditRequest>) {
+fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<Pick>, edit: &mut Option<EditRequest>) {
     ui.add(
         egui::TextEdit::singleline(&mut ws.filter)
             .hint_text(format!("{}  Filter by path or kind", icons::MAGNIFYING_GLASS))
@@ -552,7 +609,7 @@ struct TreeView<'a> {
 }
 
 impl TreeView<'_> {
-    fn ui(&self, ui: &mut egui::Ui, node: &Node, prefix: &str, pick: &mut Option<String>, chosen: &mut Option<Entry>) {
+    fn ui(&self, ui: &mut egui::Ui, node: &Node, prefix: &str, pick: &mut Option<Pick>, chosen: &mut Option<Entry>) {
         for (name, child) in node.sorted_children() {
             let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
             if child.children.is_empty() {
@@ -628,7 +685,7 @@ impl TreeView<'_> {
         ui: &mut egui::Ui,
         name: &str,
         node: &Node,
-        pick: &mut Option<String>,
+        pick: &mut Option<Pick>,
     ) -> Option<egui::Response> {
         let asset = node.asset.as_deref()?;
         let found = self.ws.index.assets.get(asset);
@@ -655,7 +712,7 @@ impl TreeView<'_> {
             response.scroll_to_me(Some(egui::Align::Center));
         }
         if response.clicked() {
-            *pick = Some(asset.to_string());
+            *pick = Some(Pick::of(&response, asset));
         }
         self.menu(&response, node);
         self.badge(ui, node);
@@ -663,7 +720,7 @@ impl TreeView<'_> {
     }
 
     /// A plain file, or a folder with nothing in it: selected by its real path.
-    fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<String>) {
+    fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<Pick>) {
         let Some(path) = node.path.as_deref() else { return };
         let icon = if node.file { icons::FILE } else { icons::FOLDER };
         let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, !self.ws.is_editable(path));
@@ -673,7 +730,7 @@ impl TreeView<'_> {
                 response.scroll_to_me(Some(egui::Align::Center));
             }
             if response.clicked() {
-                *pick = Some(path.to_string());
+                *pick = Some(Pick::of(&response, path));
             }
             self.menu(&response, node);
             self.badge(ui, node);
@@ -766,7 +823,7 @@ fn icon_and_name(
     job
 }
 
-fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Option<String>) {
+fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Option<Pick>) {
     const SHOWN: usize = 500;
     let matches: Vec<&Asset> = ws
         .index
@@ -779,8 +836,9 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
     for asset in matches.iter().take(SHOWN) {
         let selected = ws.selected.as_deref() == Some(asset.path.as_str());
         let job = labelled(&ws.extensions, ui.style(), asset.kind.as_deref(), &asset.path, !ws.is_editable(&asset.path));
-        if ui.add(egui::Button::selectable(selected, job).truncate()).clicked() {
-            *pick = Some(asset.path.clone());
+        let response = ui.add(egui::Button::selectable(selected, job).truncate());
+        if response.clicked() {
+            *pick = Some(Pick::of(&response, &asset.path));
         }
     }
     if matches.len() > SHOWN {
@@ -793,7 +851,7 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
 fn preview_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
-    pane: egui::Id,
+    pane: Pane,
     subject: Option<&str>,
     nav: &mut Option<String>,
     view: &mut Preview,
@@ -812,8 +870,8 @@ fn preview_ui(
     };
     // One that plays, in the player.
     if crate::player::Player::plays(&ws.extensions, asset) {
-        let (extensions, index, path) = (ws.extensions.clone(), ws.index.clone(), asset.path.clone());
-        ws.player.ui(ui, (&extensions, &index), &path, view);
+        let path = asset.path.clone();
+        ws.play(ui, pane, &path, view);
         return;
     }
     let shown = ws.previews_of(asset);
@@ -821,7 +879,7 @@ fn preview_ui(
         files_view_ui(ui, ws, &asset.clone());
         return;
     }
-    scroll(ui, "preview", |ui| views_ui(ui, ws, pane, nav, view, shown));
+    scroll(ui, "preview", |ui| views_ui(ui, ws, egui::Id::unique(pane), nav, view, shown));
 }
 
 /// An asset without a picture: one of its files at a time, as text or bytes - its native form first, by default.

@@ -206,7 +206,11 @@ pub fn badge(ui: &mut egui::Ui, text: &str) {
         .fill(theme::accent().gamma_multiply(0.25))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(7, 1))
-        .show(ui, |ui| ui.label(RichText::new(text).small().color(theme::link())));
+        .show(ui, |ui| {
+            // Too narrow a row clips it: wrapped, a word stands letter by letter.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.label(RichText::new(text).small().color(theme::link()))
+        });
 }
 
 // --- properties -------------------------------------------------------------------------------------------------------

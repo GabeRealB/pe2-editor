@@ -95,11 +95,15 @@ pub struct Layouts {
     pub states: BTreeMap<Pane, PaneState>,
     /// The group of the main layout each pane in a window came from, to return it there.
     pub homes: BTreeMap<Pane, TileId>,
+    /// The document tab last used: a new one opens beside it.
+    pub focused: Option<Pane>,
+    /// A tab just brought to the front, to scroll its strip to.
+    pub reveal: Option<Pane>,
 }
 
 impl Layouts {
     pub fn new(main: Tree<Pane>) -> Layouts {
-        Layouts { main, windows: vec![], states: BTreeMap::new(), homes: BTreeMap::new() }
+        Layouts { main, windows: vec![], states: BTreeMap::new(), homes: BTreeMap::new(), focused: None, reveal: None }
     }
 
     /// Where a pane is: its window (none: the main one) and its tile.
@@ -137,7 +141,8 @@ impl Layouts {
     /// window to bring to the front, where it is in one.
     pub fn show(&mut self, pane: Pane) -> Option<egui::ViewportId> {
         let Some((window, tile)) = self.find(pane) else {
-            put(&mut self.main, pane, None, Some(Pane::first(PaneKind::Preview)));
+            let beside = self.anchor();
+            put(&mut self.main, pane, None, beside);
             return None;
         };
         if let Some(tree) = self.tree_mut(window) {
@@ -153,6 +158,106 @@ impl Layouts {
         trees.flat_map(panes_of).filter(|(_, p)| p.kind == kind).map(|(_, p)| p.instance + 1).max().unwrap_or(0)
     }
 
+    /// The document tabs, in the order they were opened.
+    fn documents(&self) -> Vec<Pane> {
+        let trees = std::iter::once(&self.main).chain(self.windows.iter().map(|w| &w.tree));
+        let mut documents: Vec<Pane> = trees.flat_map(panes_of).map(|(_, p)| p).filter(|p| p.kind == PaneKind::Document).collect();
+        documents.sort();
+        documents
+    }
+
+    /// What a document tab shows.
+    pub fn subject(&self, pane: Pane) -> Option<&str> {
+        self.states.get(&pane)?.pinned.as_deref()
+    }
+
+    /// Whether a document tab is the one the next asset opened replaces.
+    fn is_preview(&self, pane: Pane) -> bool {
+        self.states.get(&pane).is_none_or(|s| s.pinned.is_none() || s.preview)
+    }
+
+    /// A pane a new tab of the document kind joins.
+    fn anchor(&self) -> Option<Pane> {
+        let open = |pane: &Pane| self.find(*pane).is_some();
+        self.focused.filter(open).or_else(|| self.documents().first().copied()).or(Some(Pane::first(PaneKind::Layer)).filter(open))
+    }
+
+    /// Show an entry as a document: in the tab already showing it, else in the tab the last one previewed in, else in a new
+    /// one. Kept, no later entry replaces it.
+    pub fn open(&mut self, path: &str, keep: bool) {
+        let documents = self.documents();
+        let showing = |pane: &&Pane| self.subject(**pane) == Some(path);
+        let tab = self.focused.iter().find(showing).or_else(|| documents.iter().find(showing)).copied();
+        let tab = tab.or_else(|| documents.iter().copied().find(|pane| self.is_preview(*pane))).unwrap_or_else(|| {
+            let pane = Pane { kind: PaneKind::Document, instance: self.next_instance(PaneKind::Document) };
+            let beside = self.anchor();
+            let window = beside.and_then(|pane| self.find(pane)).and_then(|(window, _)| window);
+            if let Some(tree) = self.tree_mut(window) {
+                let tile = put(tree, pane, None, beside);
+                if let Some(beside) = beside.and_then(|beside| tile_of(tree, beside)) {
+                    move_beside(tree, tile, beside);
+                }
+            }
+            pane
+        });
+        let previewed = self.states.get(&tab).is_none_or(|s| s.pinned.as_deref() != Some(path) || s.preview);
+        self.states.insert(tab, PaneState { pinned: Some(path.to_string()), preview: previewed && !keep });
+        self.focused = Some(tab);
+        self.reveal = Some(tab);
+        if let Some((window, tile)) = self.find(tab)
+            && let Some(tree) = self.tree_mut(window)
+        {
+            tree.tiles.set_visible(tile, true);
+            activate(tree, tile);
+        }
+    }
+
+    /// An entry's document tab is kept: it was edited.
+    pub fn keep(&mut self, path: &str) {
+        for state in self.states.values_mut().filter(|s| s.pinned.as_deref() == Some(path)) {
+            state.preview = false;
+        }
+    }
+
+    /// The document tab in front: the one last used where it is, else the first in front in any layout.
+    pub fn active_document(&self) -> Option<Pane> {
+        let trees = std::iter::once(&self.main).chain(self.windows.iter().map(|w| &w.tree));
+        let front: Vec<TileId> = trees.flat_map(Tree::active_tiles).collect();
+        let shown = |pane: &Pane| self.find(*pane).is_some_and(|(_, tile)| front.contains(&tile));
+        self.focused.filter(shown).or_else(|| self.documents().into_iter().find(shown))
+    }
+
+    /// The tab in use closed: the last document of its group comes to the front, else the last of any.
+    fn front_after_close(&mut self, window: Option<u64>, group: Option<TileId>) {
+        let Some(tree) = self.tree_mut(window) else { return };
+        let children = match group.and_then(|group| tree.tiles.get(group)) {
+            Some(Tile::Container(Container::Tabs(tabs))) => tabs.children.clone(),
+            _ => vec![],
+        };
+        let is_document = |tile: &TileId| matches!(tree.tiles.get(*tile), Some(Tile::Pane(p)) if p.kind == PaneKind::Document);
+        if let Some(tile) = children.iter().rev().find(|tile| is_document(tile)).copied() {
+            activate(tree, tile);
+            self.focused = panes_of(tree).into_iter().find_map(|(id, pane)| (id == tile).then_some(pane));
+        } else if let Some(pane) = self.documents().last().copied()
+            && let Some((window, tile)) = self.find(pane)
+            && let Some(tree) = self.tree_mut(window)
+        {
+            activate(tree, tile);
+            self.focused = Some(pane);
+        }
+    }
+
+    /// Close the document tabs an entry is gone from: a layout outlives the project its tabs were opened in.
+    pub fn close_documents(&mut self, gone: impl Fn(&str) -> bool) {
+        for pane in self.documents() {
+            if self.subject(pane).is_some_and(&gone)
+                && let Some((window, tile)) = self.find(pane)
+            {
+                self.act(window, tile, PaneAction::Close);
+            }
+        }
+    }
+
     /// Do what a tab asked: in the layout of `window` (none: the main one), for the pane in `tile`.
     pub fn act(&mut self, window: Option<u64>, tile: TileId, action: PaneAction) {
         let Some(tree) = self.tree_mut(window) else { return };
@@ -163,6 +268,18 @@ impl Layouts {
                 if let Some(tree) = self.tree_mut(window) {
                     let group = tree.tiles.parent_of(tile);
                     put(tree, another, group, None);
+                }
+                // A document's other tab shows the same, kept.
+                if pane.kind == PaneKind::Document
+                    && let Some(subject) = self.subject(pane).map(str::to_string)
+                {
+                    self.states.insert(another, PaneState { pinned: Some(subject), preview: false });
+                    self.focused = Some(another);
+                }
+            }
+            PaneAction::Keep => {
+                if let Some(state) = self.states.get_mut(&pane) {
+                    state.preview = false;
                 }
             }
             PaneAction::Pin(path) => self.states.entry(pane).or_default().pinned = Some(path),
@@ -180,10 +297,15 @@ impl Layouts {
                     self.place(target, pane);
                 }
             }
-            PaneAction::Close if pane.instance > 0 => {
+            PaneAction::Close if pane.instance > 0 || pane.kind == PaneKind::Document => {
+                let group = self.tree_mut(window).and_then(|tree| tree.tiles.parent_of(tile));
                 self.take(window, tile);
                 self.states.remove(&pane);
                 self.homes.remove(&pane);
+                if self.focused == Some(pane) {
+                    self.focused = None;
+                    self.front_after_close(window, group);
+                }
             }
             PaneAction::Close => match window {
                 Some(_) => {
@@ -211,12 +333,12 @@ impl Layouts {
 
     /// Put a pane into a window's layout (none: the main one, in the group it came from).
     fn place(&mut self, window: Option<u64>, pane: Pane) -> TileId {
-        let preview = Some(Pane::first(PaneKind::Preview));
+        let beside = self.anchor();
         if let Some(target) = window.and_then(|id| self.windows.iter_mut().find(|w| w.id == id)) {
             put(&mut target.tree, pane, None, None)
         } else {
             let home = self.homes.remove(&pane);
-            put(&mut self.main, pane, home, preview)
+            put(&mut self.main, pane, home, beside)
         }
     }
 
@@ -281,6 +403,18 @@ pub fn put(tree: &mut Tree<Pane>, pane: Pane, group: Option<TileId>, beside: Opt
     id
 }
 
+/// Move a tab next after another of its group.
+fn move_beside(tree: &mut Tree<Pane>, tile: TileId, beside: TileId) {
+    if let Some(parent) = tree.tiles.parent_of(tile)
+        && let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get_mut(parent)
+        && let Some(from) = tabs.children.iter().position(|child| *child == tile)
+    {
+        tabs.children.remove(from);
+        let at = tabs.children.iter().position(|child| *child == beside).map_or(from, |at| at + 1);
+        tabs.children.insert(at, tile);
+    }
+}
+
 /// Bring a tile's tab to the front of its group.
 pub fn activate(tree: &mut Tree<Pane>, tile: TileId) {
     if let Some(parent) = tree.tiles.parent_of(tile)
@@ -337,6 +471,48 @@ mod tests {
         layouts.dock_back(layouts.windows[0].id);
         assert!(layouts.windows.is_empty() && layouts.is_visible(inspector));
         assert_eq!(layouts.main.tiles.parent_of(tile(&layouts, inspector).1), group);
+    }
+
+    #[test]
+    fn an_entry_opens_as_a_document() {
+        let mut layouts = Layouts::new(default_layout());
+        let first = Pane::first(PaneKind::Document);
+        let second = Pane { kind: PaneKind::Document, instance: 1 };
+        let front = |l: &Layouts| l.active_document().and_then(|p| l.subject(p).map(str::to_string));
+        // The preview tab is replaced; a double click keeps it; the next opens beside it.
+        layouts.open("g/a", false);
+        layouts.open("g/b", false);
+        assert_eq!(layouts.subject(first), Some("g/b"));
+        assert!(layouts.find(second).is_none());
+        layouts.open("g/b", true);
+        layouts.open("g/c", false);
+        assert_eq!((layouts.subject(first), layouts.subject(second)), (Some("g/b"), Some("g/c")));
+        let group = layouts.main.tiles.parent_of(layouts.find(first).unwrap().1);
+        assert_eq!(layouts.main.tiles.parent_of(layouts.find(second).unwrap().1), group);
+        assert_eq!(front(&layouts).as_deref(), Some("g/c"));
+        // It opens next to the one in use, not after what else is in the group.
+        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) = layouts.main.tiles.get(group.unwrap()) else { panic!() };
+        let at = |tile| tabs.children.iter().position(|t| *t == tile).unwrap();
+        assert_eq!(at(layouts.find(second).unwrap().1), at(layouts.find(first).unwrap().1) + 1);
+        // One open comes to the front, and the preview tab stays what it was.
+        layouts.open("g/b", false);
+        assert_eq!(front(&layouts).as_deref(), Some("g/b"));
+        assert!(!layouts.is_preview(first) && layouts.subject(second) == Some("g/c"));
+        // An edit keeps it.
+        layouts.keep("g/c");
+        layouts.open("g/d", false);
+        let third = Pane { kind: PaneKind::Document, instance: 2 };
+        assert_eq!(layouts.subject(third), Some("g/d"));
+        // Closing goes, the first as any other; what is left is in front; the last closed, one opens where they were.
+        let (window, at) = layouts.find(first).unwrap();
+        layouts.act(window, at, PaneAction::Close);
+        assert!(layouts.find(first).is_none());
+        layouts.close_documents(|path| path == "g/d");
+        assert_eq!(front(&layouts).as_deref(), Some("g/c"));
+        layouts.close_documents(|_| true);
+        layouts.open("g/e", false);
+        assert_eq!(layouts.main.tiles.parent_of(layouts.find(first).unwrap().1), group);
+        assert_eq!(front(&layouts).as_deref(), Some("g/e"));
     }
 
     #[test]
