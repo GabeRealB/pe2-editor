@@ -841,17 +841,20 @@ fn stack_ui(
     // What is wrong with it as it is written, told from its shape, and what comes down to each layer.
     let (plan, wrong) = ws.extensions.plan_written(asset);
     let editable = target.is_ok();
+    // The layer whose settings are shown, kept while the asset is shown.
+    let selection = egui::Id::unique(("stack layer", &asset.path));
+    let selected: Option<usize> = ui.data(|d| d.get_temp::<Option<usize>>(selection)).flatten();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for (i, layer) in layers.iter().enumerate() {
                 let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
                 let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{i}")).color(theme::weak()));
+                    layer_number(ui, selection, selected, i);
                     if editable {
-                        let (above, below) = (plan.above.get(i).cloned().flatten(), plan.above.get(i + 1).cloned().flatten());
-                        let place = Place { asset, at: i, count: layers.len(), above: above.as_ref(), below: below.as_ref() };
-                        layer_menu(ui, &ws.extensions, &ws.index, &place, edit);
+                        let around = |at: usize| plan.above.get(at).cloned().flatten();
+                        let (above, below) = (around(i), around(i + 1));
+                        layer_menu(ui, &ws.extensions, &ws.index, &Place { asset, at: i, count: layers.len(), above: above.as_ref(), below: below.as_ref() }, edit);
                     }
                 });
                 match op {
@@ -872,19 +875,8 @@ fn stack_ui(
                             edit_in_button(ui, *category, home, &active, source, uid, edit);
                         }
                     }
-                    project::graph::OUTPUT => {
-                        ui.label(RichText::new("Output").color(theme::weak()));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(text("name").unwrap_or_default()).monospace());
-                            badge(ui, text("retain").unwrap_or("transient"));
-                            badge(ui, text("when").unwrap_or("lazy"));
-                        });
-                    }
-                    project::graph::GRAPH => {
-                        ui.label(RichText::new("Graph").color(theme::weak()));
-                        let count = layer.get("ops").and_then(toml::Value::as_table).map_or(0, toml::Table::len);
-                        ui.label(format!("{count} operation{}", if count == 1 { "" } else { "s" }));
-                    }
+                    project::graph::OUTPUT => output_row(ui, layer),
+                    project::graph::GRAPH => graph_row(ui, layer),
                     _ if Some(i) == importing => {
                         ui.label(RichText::new("Importer").color(theme::weak()));
                         importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
@@ -901,12 +893,102 @@ fn stack_ui(
             });
         }
         problems_ui(ui, &wrong);
+        if let Some(at) = selected.filter(|at| Some(*at) != importing) {
+            layer_sheet(ui, (&ws.index, &ws.extensions), field_edit, target, asset, (at, layers.get(at)), nav, edit);
+        }
         if !settings.is_empty() {
             ui.add_space(4.0);
             property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
         }
         fits_ui(ui, &fits, name);
     });
+}
+
+/// A stack's output layer: its name and how it is kept.
+fn output_row(ui: &mut egui::Ui, layer: &toml::Value) {
+    let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
+    ui.label(RichText::new("Output").color(theme::weak()));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(text("name").unwrap_or_default()).monospace());
+        badge(ui, text("retain").unwrap_or("transient"));
+        badge(ui, text("when").unwrap_or("lazy"));
+    });
+}
+
+/// A stack's graph layer: how many operations it holds.
+fn graph_row(ui: &mut egui::Ui, layer: &toml::Value) {
+    ui.label(RichText::new("Graph").color(theme::weak()));
+    let count = layer.get("ops").and_then(toml::Value::as_table).map_or(0, toml::Table::len);
+    ui.label(format!("{count} operation{}", if count == 1 { "" } else { "s" }));
+}
+
+/// A layer's number, choosing the layer whose settings are shown; chosen again, none.
+fn layer_number(ui: &mut egui::Ui, selection: egui::Id, selected: Option<usize>, at: usize) {
+    let number = ui.selectable_label(selected == Some(at), RichText::new(format!("{at}")).color(theme::weak()));
+    if number.on_hover_text("This layer's settings").clicked() {
+        ui.data_mut(|d| d.insert_temp(selection, (selected != Some(at)).then_some(at)));
+    }
+}
+
+/// A layer's settings, as a sheet.
+#[expect(clippy::too_many_arguments, reason = "a sheet's context")]
+fn layer_sheet(
+    ui: &mut egui::Ui,
+    (index, extensions): (&Index, &Extensions),
+    field_edit: &mut Option<FieldEdit>,
+    target: &Result<String, String>,
+    asset: &Asset,
+    (at, layer): (usize, Option<&toml::Value>),
+    nav: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
+) {
+    let Some(layer) = layer else { return };
+    let (fields, values) = layer_settings(extensions, asset, layer);
+    let sheet = Sheet { index, extensions, fields, within: Some(format!("stack.{at}")), derived: None };
+    let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
+    if !shown.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("Layer {at}")).color(theme::weak()));
+        property_sheet(ui, &sheet, field_edit, target, asset, &shown, nav, edit);
+    }
+}
+
+/// An output layer's settings: what one left out comes to is what it reads as.
+fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+    use pe2_ext::Field;
+    let set = |key: &str, unset: &str| (key.to_string(), layer.get(key).cloned().unwrap_or_else(|| unset.into()));
+    let retain = Field::new("retain").label("Kept").choices([("transient", "Not kept"), ("cache", "In the cache"), ("build", "With the build")]);
+    let when = Field::new("when").label("Made").choices([("lazy", "When asked for"), ("eager", "As soon as it can be")]);
+    (vec![Field::new("name").label("Name"), retain, when], vec![set("name", ""), set("retain", "transient"), set("when", "lazy")])
+}
+
+/// A layer's settings, for its sheet: its fields, and what each is, what a setting left out comes to where that is known.
+fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+    use pe2_ext::Field;
+    use project::graph;
+    let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
+    let set = |key: &str, unset: &str| (key.to_string(), layer.get(key).cloned().unwrap_or_else(|| unset.into()));
+    match op {
+        graph::OUTPUT => output_settings(layer),
+        graph::FILE => {
+            let mut file = Field::new("file").label("File");
+            let stored = asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::ASSET_FILE);
+            file.choices = stored.map(|f| (f.name.as_str().into(), f.name.clone())).collect();
+            (vec![file], vec![set("file", "")])
+        }
+        graph::BELOW => (
+            vec![Field::new("output").label("Output"), Field::new("type").label("Type")],
+            vec![set("output", "native"), set("type", "")],
+        ),
+        graph::GRAPH => (vec![], vec![]),
+        _ => {
+            let fields = extensions.op(op).map_or_default(|def| def.fields.clone());
+            let declared = fields.iter().filter(|f| !f.custom).map(|f| set(&f.key, ""));
+            let others = layer.as_table().into_iter().flatten().filter(|(k, _)| k.as_str() != "op" && !fields.iter().any(|f| f.key == **k));
+            let values = declared.chain(others.map(|(k, v)| (k.clone(), v.clone()))).collect();
+            (fields, values)
+        }
+    }
 }
 
 /// What is wrong with a stack, each as its rows number it.
@@ -1228,6 +1310,15 @@ pub fn size_text(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_setting_left_out_shows_what_it_comes_to() {
+        let layer: toml::Value = toml::from_str("op = \"output\"\nname = \"native\"\nretain = \"cache\"\n").unwrap();
+        let (fields, values) = super::output_settings(&layer);
+        assert_eq!(fields.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(), ["name", "retain", "when"]);
+        let word = |key: &str| values.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str()).unwrap();
+        assert_eq!((word("name"), word("retain"), word("when")), ("native", "cache", "lazy"));
+    }
+
     #[test]
     fn a_problem_says_where_it_is_as_the_rows_number_it() {
         assert_eq!(super::problem_place("stack[0].ops.encoded"), "Layer 0, encoded");
