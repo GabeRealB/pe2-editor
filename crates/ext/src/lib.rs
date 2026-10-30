@@ -33,8 +33,8 @@ pub use data::{Call, CallHost, Content, File, FileWriter, Lent, Members, merged,
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
 pub use registry::{
-    Extension, Field, Format, Icon, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, OpBuilder, PanelDef, Part, Parts,
-    Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
+    Extension, Field, Format, Icon, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, OpBuilder, PanelDef, Part, Parts, PlaybackDef,
+    Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Timing, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};
 pub use ui::{Canvas, Cell, Marked, Placed, Style, Ui, UiHost, View};

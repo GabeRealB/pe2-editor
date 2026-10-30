@@ -140,6 +140,8 @@ pub struct Workspace {
     pub thumbs: crate::thumbs::Thumbs,
     /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
+    /// What plays in the preview: a movie, frame by frame.
+    pub player: crate::player::Player,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
     views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
     /// The view an asset is shown in, where its kind and role have several.
@@ -430,11 +432,13 @@ impl Workspace {
             extensions_found.clone(),
             tree.clone(),
         );
+        let player = crate::player::Player::new(extensions.clone());
         let mut workspace = Workspace {
             project,
             applied,
             history,
             thumbs,
+            player,
             extensions,
             views: HashMap::new(),
             view_choice: HashMap::new(),

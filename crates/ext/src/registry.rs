@@ -398,6 +398,28 @@ pub struct KindDef {
     pub outputs: Vec<OutputDef>,
     /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
     pub stack: Option<String>,
+    /// How its nodes play, where they do.
+    pub playback: Option<PlaybackDef>,
+}
+
+/// How a kind's nodes play in the host's player: their frames, by number, the members of a family output; their
+/// sound, an output; and each node's timing.
+#[derive(Clone)]
+pub struct PlaybackDef {
+    pub frames: String,
+    pub audio: Option<String>,
+    pub timing: Arc<TimingOf>,
+}
+
+/// A node's timing, where it can tell.
+pub type TimingOf = dyn Fn(&Asset) -> Option<Timing> + Send + Sync;
+
+/// What plays: frames numbered from `first`, `count` of them, `rate` a second.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timing {
+    pub first: u32,
+    pub count: u32,
+    pub rate: f64,
 }
 
 /// A role as registered, on a kind of its extension's or of one it requires.
@@ -480,6 +502,7 @@ impl Registry {
             parts: None,
             outputs: vec![],
             stack: None,
+            playback: None,
         };
         KindBuilder { registry: self, def }
     }
@@ -696,6 +719,15 @@ impl KindBuilder<'_> {
         if let Some(output) = self.def.outputs.last_mut() {
             output.members = Some(Arc::new(members));
         }
+        self
+    }
+
+    /// Its nodes play: their frames the members of the family output `frames` by number, their sound the output
+    /// `audio`, each node's timing as `timing` tells it.
+    #[must_use]
+    pub fn playback(mut self, frames: &str, audio: Option<&str>, timing: impl Fn(&Asset) -> Option<Timing> + Send + Sync + 'static) -> Self {
+        let (frames, audio) = (frames.to_string(), audio.map(str::to_string));
+        self.def.playback = Some(PlaybackDef { frames, audio, timing: Arc::new(timing) });
         self
     }
 

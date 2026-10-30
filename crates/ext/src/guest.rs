@@ -561,6 +561,13 @@ impl g::Guest for Component {
         format(&parse_value(&value)?)
     }
 
+    fn timing_of(kind: u32, asset: &host::Asset) -> Option<g::Timing> {
+        let lent = Lent::borrowed(asset);
+        let playback = registered().kinds.get(kind as usize)?.playback.as_ref()?;
+        let timing = (playback.timing)(&lent.asset())?;
+        Some(g::Timing { first: timing.first, count: timing.count, rate: timing.rate })
+    }
+
     fn parts(kind: u32, asset: &host::Asset) -> Vec<g::Part> {
         let lent = Lent::borrowed(asset);
         let parts = registered().kinds[kind as usize].parts.as_ref();
@@ -710,6 +717,7 @@ fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
             })
             .collect(),
         stack: kind.stack.clone(),
+        playback: kind.playback.as_ref().map(|p| g::Playback { frames: p.frames.clone(), audio: p.audio.clone() }),
     }
 }
 

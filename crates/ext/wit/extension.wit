@@ -276,6 +276,20 @@ interface guest {
         members: bool,
     }
 
+    /// How a kind's nodes play in the host's player: their frames the members of a family output by number, their sound
+    /// an output; each node's timing called back by the kind's index.
+    record playback {
+        frames: string,
+        audio: option<string>,
+    }
+
+    /// What plays: frames numbered from `first`, `count` of them, `rate` a second.
+    record timing {
+        first: u32,
+        count: u32,
+        rate: f64,
+    }
+
     /// A kind; its outputs' members and its parts called back by its index.
     record kind {
         name: string,
@@ -289,6 +303,7 @@ interface guest {
         outputs: list<output>,
         /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
         stack: option<string>,
+        playback: option<playback>,
     }
 
     record role {
@@ -410,6 +425,8 @@ interface guest {
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
     /// A family's members, of an asset: each by its parameter's value, with a label.
     members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
+    /// An asset's timing, of a kind that plays.
+    timing-of: func(kind: u32, asset: borrow<asset>) -> option<timing>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
     /// A part of an asset, by its fragment; a virtual one made of others.

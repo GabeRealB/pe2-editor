@@ -25,6 +25,7 @@ egui_extras.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 notify.workspace = true
+cpal.workspace = true
 png.workspace = true
 toml.workspace = true
 toml_edit.workspace = true

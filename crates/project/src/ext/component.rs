@@ -1483,6 +1483,13 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         if let Some(stack) = &kind.stack {
             builder = builder.stack(stack);
         }
+        if let Some(playback) = &kind.playback {
+            let shared = shared.clone();
+            builder = builder.playback(&playback.frames, playback.audio.as_deref(), move |asset| {
+                let timing = shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_timing_of(a, index, lent).await));
+                timing.ok().flatten().map(|t| pe2_ext::Timing { first: t.first, count: t.count, rate: t.rate })
+            });
+        }
         if kind.parts {
             let shared = shared.clone();
             builder = builder.parts(move |asset| {

@@ -22,6 +22,7 @@ mod icons;
 mod inspector;
 mod layers;
 mod panes;
+mod player;
 mod settings;
 mod theme;
 mod pictures;

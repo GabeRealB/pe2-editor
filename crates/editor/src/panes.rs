@@ -803,6 +803,12 @@ fn preview_ui(
         ui.label(RichText::new("Select an asset").color(theme::weak()));
         return;
     };
+    // One that plays, in the player.
+    if crate::player::Player::plays(&ws.extensions, asset) {
+        let (extensions, index, path) = (ws.extensions.clone(), ws.index.clone(), asset.path.clone());
+        ws.player.ui(ui, (&extensions, &index), &path, view);
+        return;
+    }
     let shown = ws.previews_of(asset);
     if shown.is_empty() {
         files_view_ui(ui, ws, &asset.clone());

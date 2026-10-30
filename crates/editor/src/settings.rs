@@ -67,11 +67,14 @@ pub struct Preview {
     pub upscale: Upscale,
     /// A texel grid over a picture, its spacing following the zoom.
     pub grid: bool,
+    /// The player's volume, 0 to 1 (its amplitude this squared), and whether it is muted.
+    pub volume: f32,
+    pub muted: bool,
 }
 
 impl Default for Preview {
     fn default() -> Self {
-        Preview { upscale: Upscale::default(), grid: true }
+        Preview { upscale: Upscale::default(), grid: true, volume: 1.0, muted: false }
     }
 }
 

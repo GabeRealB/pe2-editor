@@ -667,6 +667,14 @@ impl Extensions {
         Some((output, members))
     }
 
+    /// How an asset plays, where its kind's nodes do: its frames' output and its sound's, and its timing.
+    #[must_use]
+    pub fn playback(&self, asset: &index::Asset) -> Option<(&pe2_ext::PlaybackDef, pe2_ext::Timing)> {
+        let playback = self.kind_of(asset)?.playback.as_ref()?;
+        let timing = (playback.timing)(&self.lend(asset))?;
+        Some((playback, timing))
+    }
+
     /// Whether an asset's kind shows its nodes by a picture: it outputs one.
     #[must_use]
     pub fn shows_pictures(&self, asset: &index::Asset) -> bool {
