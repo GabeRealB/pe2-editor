@@ -3,8 +3,9 @@
 //! on down one at the right. Ports and wires are colored by what they carry. Dragging from a port to another makes a
 //! wire, refused where the types do not fit, ports lit while one is being drawn; dragging a wire off an input moves or
 //! removes it. Right-clicking the canvas adds an operation, a box is dragged to place it and Delete removes the one
-//! selected, whose settings - the sheet a stack's layer has - open beside the canvas. Every edit is written as any is:
-//! undoable, unapplied until applied, and what is wrong with the stack as written is told from its shape, under the canvas.
+//! selected. A box selected is what is selected inside the asset, its settings in the inspector with everything else
+//! selected there. Every edit is written as any is: undoable, unapplied until applied, and what is wrong with the stack as
+//! written is told from its shape, under the canvas.
 //!
 //! The canvas is a scene: the wheel zooms, dragging where nothing is pans and a double-click fits, as in the preview. A
 //! box not yet placed sits by how far it is from its sources, as Arrange puts them all.
@@ -14,12 +15,11 @@ use pe2_ext::{Port, Type};
 use project::graph::{self, ABOVE, layers};
 use project::index::Asset;
 use std::collections::HashMap;
-use std::sync::Arc;
 use toml::Value;
 
-use crate::inspector::{self, Sheet};
+use crate::inspector;
 use crate::workspace::{EditRequest, Workspace};
-use crate::{icons, theme};
+use crate::theme;
 
 const WIDTH: f32 = 172.0;
 /// The boxes at either end, which say little.
@@ -85,11 +85,11 @@ impl Node {
     }
 }
 
-/// The graph layer a pane shows of an asset: the one chosen in its stack, else its first.
-fn layer_of(ui: &egui::Ui, asset: &Asset) -> Option<usize> {
+/// The graph layer a pane shows of an asset: the one selected, else its first.
+fn layer_of(ws: &Workspace, asset: &Asset) -> Option<usize> {
     let layers = asset.fields().get("stack")?.as_array()?;
     let is_graph = |at: usize| layers.get(at).and_then(|l| l.get("op")?.as_str()) == Some(graph::GRAPH);
-    let chosen: Option<usize> = ui.data(|d| d.get_temp::<Option<usize>>(inspector::layer_selection(asset))).flatten();
+    let chosen = ws.inner_of(&asset.path).and_then(inspector::layer_of_inner).map(|(at, _)| at);
     chosen.filter(|at| is_graph(*at)).or_else(|| (0..layers.len()).find(|at| is_graph(*at)))
 }
 
@@ -223,37 +223,6 @@ fn port_response(ui: &egui::Ui, salt: (&str, &str, &str), at: Pos2, says: &str) 
     let label = says.to_string();
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
     response.on_hover_text(says)
-}
-
-/// The side panel: the selected operation's settings, and what is wrong with the layer.
-fn details_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Arc<Asset>, (at, layer): (usize, &Value), state: &mut State, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
-    let Some(id) = state.selected.clone() else {
-        ui.label(RichText::new("Select an operation to see its settings. Right-click the canvas to add one.").color(theme::weak()));
-        return;
-    };
-    let Some(op) = layer.get("ops").and_then(|o| o.get(&id)) else { return };
-    let name = op.get("op").and_then(Value::as_str).unwrap_or_default();
-    let label = ws.extensions.operations().get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
-    ui.label(RichText::new(&label).heading());
-    ui.label(RichText::new(name).small().color(theme::weak()));
-    ui.add_space(6.0);
-    let target = inspector::edit_target(ws, asset);
-    let (fields, values) = inspector::layer_settings(&ws.extensions, asset, op);
-    let values: Vec<(String, Value)> = values.into_iter().filter(|(key, _)| key != "from" && key != layers::POS).collect();
-    let shown: Vec<(&String, &Value)> = values.iter().map(|(key, value)| (key, value)).collect();
-    let within = Some(format!("stack.{at}.ops.{id}"));
-    let sheet = Sheet { index: &ws.index, extensions: &ws.extensions, fields, within, derived: None };
-    inspector::property_sheet(ui, &sheet, &mut ws.field_edit, &target, asset, &shown, nav, edit);
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        if ui.add_enabled(target.is_ok(), egui::Button::new("Pass on down")).on_hover_text("Make this what the layer gives the next").clicked() {
-            *edit = inspector::layers_edit(asset, format!("Set what {id} passes on"), layers::set_result(asset.text(), at, Some(&id)));
-        }
-        if ui.add_enabled(target.is_ok(), egui::Button::new(format!("{}  Remove", icons::TRASH))).clicked() {
-            *edit = inspector::layers_edit(asset, format!("Remove {id}"), layers::remove_operation(asset.text(), at, &id));
-            state.selected = None;
-        }
-    });
 }
 
 /// What the add menu offers, narrowed by what is typed: choosing one adds it where the menu was opened.
@@ -550,26 +519,21 @@ fn toolbar_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &
 }
 
 /// The pane.
-pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
+pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, edit: &mut Option<EditRequest>) {
     let Some(asset) = subject.and_then(|s| ws.index.assets.get(s)).cloned() else {
         ui.label(RichText::new("Select an asset with a graph layer.").color(theme::weak()));
         return;
     };
-    let Some(at) = layer_of(ui, &asset) else {
+    let Some(at) = layer_of(ws, &asset) else {
         ui.label(RichText::new("This asset's stack has no graph layer. Add one in the Inspector.").color(theme::weak()));
         return;
     };
     let Some(layer) = asset.fields().get("stack").and_then(Value::as_array).and_then(|l| l.get(at)).cloned() else { return };
     let id = egui::Id::unique(("graph pane", &asset.path, at));
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
-    // Only what is selected has settings to show: the canvas has the room otherwise.
-    if state.selected.is_some() {
-        egui::Panel::right(("graph details", id)).resizable(true).default_size(240.0).size_range(180.0..=420.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                details_ui(ui, ws, &asset, (at, &layer), &mut state, nav, edit);
-            });
-        });
-    }
+    // What is selected of it is the workspace's: every pane shows the same.
+    state.selected = ws.inner_of(&asset.path).and_then(inspector::layer_of_inner).filter(|(of, _)| *of == at).and_then(|(_, op)| op.map(str::to_string));
+    let before = state.selected.clone();
     let (plan, wrong) = ws.extensions.plan_written(&asset);
     let mut nodes = nodes_of(ws, &layer, &plan, at);
     if let Some((moving, place)) = &state.moving
@@ -590,6 +554,10 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, na
         });
     }
     egui::CentralPanel::no_frame().show(ui, |ui| canvas_ui(ui, &canvas, &mut state, edit));
+    if state.selected != before {
+        let inner = state.selected.as_ref().map_or_else(|| format!("stack.{at}"), |op| format!("stack.{at}.ops.{op}"));
+        ws.inner = Some((asset.path.clone(), inner));
+    }
     ui.data_mut(|d| d.insert_temp(id, state));
 }
 

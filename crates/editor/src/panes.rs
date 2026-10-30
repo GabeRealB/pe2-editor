@@ -371,7 +371,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Project => project_ui(ui, ws, nav),
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
-                    PaneKind::Graph => crate::graph_pane::graph_ui(ui, ws, subject, nav, edit),
+                    PaneKind::Graph => crate::graph_pane::graph_ui(ui, ws, subject, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
                     PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
                     PaneKind::Settings => {}
@@ -418,7 +418,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
     }
 
     fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
-        28.0
+        24.0
     }
 
     fn gap_width(&self, _style: &egui::Style) -> f32 {

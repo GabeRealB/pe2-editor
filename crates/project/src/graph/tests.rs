@@ -261,6 +261,13 @@ fn a_cycle_in_a_graph_layer() {
 }
 
 #[test]
+fn what_takes_from_an_operation_that_failed_says_nothing() {
+    let failed = "[[stack]]\nop = \"graph\"\nresult = \"x\"\nops.x = { op = \"t.upper\", from = { in = \"y\" } }\n\
+                  ops.y = { op = \"nobody.makes\" }";
+    assert_eq!(problems(failed), ["stack[0].ops.y: `nobody.makes`: no extension provides it"]);
+}
+
+#[test]
 fn a_value_taken_once_is_moved() {
     let ops = ops();
     let (plan, _) = Plan::of(&toml::from_str(STACK).unwrap(), &ops, &[]);

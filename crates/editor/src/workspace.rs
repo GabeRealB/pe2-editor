@@ -192,6 +192,9 @@ pub struct Workspace {
     /// drawn dimmed.
     editable: HashSet<String>,
     pub selected: Option<String>,
+    /// What is selected inside an asset: its path, and a path in its declaration (`stack.1`, `stack.0.ops.draw`). The one
+    /// address every pane showing the asset shares.
+    pub inner: Option<(String, String)>,
     back: Vec<String>,
     forward: Vec<String>,
     pub filter: String,
@@ -469,6 +472,7 @@ impl Workspace {
             tree,
             editable: HashSet::new(),
             selected: None,
+            inner: None,
             back: vec![],
             forward: vec![],
             filter: String::new(),
@@ -1116,6 +1120,12 @@ impl Workspace {
 
     pub fn can_go_forward(&self) -> bool {
         !self.forward.is_empty()
+    }
+
+    /// What is selected inside an asset, as a path in its declaration.
+    #[must_use]
+    pub fn inner_of(&self, asset: &str) -> Option<&str> {
+        self.inner.as_ref().filter(|(of, _)| of == asset).map(|(_, inner)| inner.as_str())
     }
 
     pub fn navigate(&mut self, path: String) {

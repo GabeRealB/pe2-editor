@@ -72,6 +72,7 @@ pub fn inspector_ui(
     header_ui(ui, ws, &asset);
     unapplied_ui(ui, ws, &asset, nav, edit);
     let target = edit_target(ws, &asset);
+    selected_ui(ui, ws, &asset, &target, nav, edit);
     {
         let sheet = Sheet {
             index: &ws.index,
@@ -229,7 +230,7 @@ fn label_of(key: &str) -> String {
 }
 
 #[expect(clippy::too_many_arguments, reason = "a sheet's context")]
-pub(crate) fn property_sheet(
+fn property_sheet(
     ui: &mut egui::Ui,
     sheet: &Sheet,
     field_edit: &mut Option<FieldEdit>,
@@ -836,21 +837,21 @@ fn stack_ui(
         .flatten()
         .filter(|(k, v)| k.as_str() != "op" && !sheet.custom(k) && !is_table_list(v))
         .collect();
+    let selected = ws.inner_of(&asset.path).and_then(layer_of_inner).map(|(at, _)| at);
     let ops = ws.extensions.operations();
     let field_edit = &mut ws.field_edit;
     // What is wrong with it as it is written, told from its shape, and what comes down to each layer.
     let (plan, wrong) = ws.extensions.plan_written(asset);
     let editable = target.is_ok();
-    // The layer whose settings are shown, kept while the asset is shown.
-    let selection = layer_selection(asset);
-    let selected: Option<usize> = ui.data(|d| d.get_temp::<Option<usize>>(selection)).flatten();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for (i, layer) in layers.iter().enumerate() {
                 let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
                 let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
                 ui.horizontal(|ui| {
-                    layer_number(ui, selection, selected, i);
+                    if layer_number(ui, selected, i) {
+                        ws.inner = (selected != Some(i)).then(|| (asset.path.clone(), format!("stack.{i}")));
+                    }
                     if editable {
                         let around = |at: usize| plan.above.get(at).cloned().flatten();
                         let (above, below) = (around(i), around(i + 1));
@@ -878,7 +879,7 @@ fn stack_ui(
                     project::graph::OUTPUT => output_row(ui, layer),
                     project::graph::GRAPH => {
                         if graph_row(ui, layer) {
-                            ui.data_mut(|d| d.insert_temp(selection, Some(i)));
+                            ws.inner = Some((asset.path.clone(), format!("stack.{i}")));
                             *edit = Some(EditRequest::ShowGraph);
                         }
                     }
@@ -898,9 +899,6 @@ fn stack_ui(
             });
         }
         problems_ui(ui, &wrong);
-        if let Some(at) = selected.filter(|at| Some(*at) != importing) {
-            layer_sheet(ui, (&ws.index, &ws.extensions), field_edit, target, asset, (at, layers.get(at)), nav, edit);
-        }
         if !settings.is_empty() {
             ui.add_space(4.0);
             property_sheet(ui, &sheet, field_edit, target, asset, &settings, nav, edit);
@@ -909,9 +907,11 @@ fn stack_ui(
     });
 }
 
-/// What keeps the layer of an asset's stack chosen, while it is shown.
-pub(crate) fn layer_selection(asset: &Asset) -> egui::Id {
-    egui::Id::unique(("stack layer", &asset.path))
+/// The layer of a stack, and the operation of a graph layer, a path inside an asset names: `stack.1`, `stack.0.ops.draw`.
+pub(crate) fn layer_of_inner(inner: &str) -> Option<(usize, Option<&str>)> {
+    let rest = inner.strip_prefix("stack.")?;
+    let (layer, op) = rest.split_once(".ops.").map_or((rest, None), |(layer, op)| (layer, Some(op)));
+    Some((layer.parse().ok()?, op))
 }
 
 /// A stack's output layer: its name and how it is kept.
@@ -936,35 +936,59 @@ fn graph_row(ui: &mut egui::Ui, layer: &toml::Value) -> bool {
     .inner
 }
 
-/// A layer's number, choosing the layer whose settings are shown; chosen again, none.
-fn layer_number(ui: &mut egui::Ui, selection: egui::Id, selected: Option<usize>, at: usize) {
+/// A layer's number, choosing the layer selected; whether it was clicked.
+fn layer_number(ui: &mut egui::Ui, selected: Option<usize>, at: usize) -> bool {
     let number = ui.selectable_label(selected == Some(at), RichText::new(format!("{at}")).color(theme::weak()));
-    if number.on_hover_text("This layer's settings").clicked() {
-        ui.data_mut(|d| d.insert_temp(selection, (selected != Some(at)).then_some(at)));
-    }
+    number.on_hover_text("Select this layer").clicked()
 }
 
-/// A layer's settings, as a sheet.
-#[expect(clippy::too_many_arguments, reason = "a sheet's context")]
-fn layer_sheet(
+/// What is selected inside the asset, wherever it was selected: its settings, and what can be done to it.
+fn selected_ui(
     ui: &mut egui::Ui,
-    (index, extensions): (&Index, &Extensions),
-    field_edit: &mut Option<FieldEdit>,
-    target: &Result<String, String>,
+    ws: &mut Workspace,
     asset: &Asset,
-    (at, layer): (usize, Option<&toml::Value>),
+    target: &Result<String, String>,
     nav: &mut Option<String>,
     edit: &mut Option<EditRequest>,
 ) {
-    let Some(layer) = layer else { return };
-    let (fields, values) = layer_settings(extensions, asset, layer);
-    let sheet = Sheet { index, extensions, fields, within: Some(format!("stack.{at}")), derived: None };
-    let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
-    if !shown.is_empty() {
-        ui.add_space(4.0);
-        ui.label(RichText::new(format!("Layer {at}")).color(theme::weak()));
-        property_sheet(ui, &sheet, field_edit, target, asset, &shown, nav, edit);
+    let Some(inner) = ws.inner_of(&asset.path).map(str::to_string) else { return };
+    let Some((at, op)) = layer_of_inner(&inner) else { return };
+    let Some(layer) = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|l| l.get(at)) else { return };
+    let chosen = op.map_or(Some(layer), |id| layer.get("ops")?.get(id));
+    let Some(chosen) = chosen else { return };
+    // An importer's settings are the stack's own.
+    let name = chosen.get("op").and_then(toml::Value::as_str).unwrap_or_default();
+    if op.is_none() && project::graph::import_of(asset.fields()).is_some_and(|i| i.op == name) {
+        return;
     }
+    let (fields, values) = layer_settings(&ws.extensions, asset, chosen);
+    let values: Vec<(String, toml::Value)> = values.into_iter().filter(|(key, _)| key != "from" && key != project::graph::layers::POS).collect();
+    let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
+    let label = ws.extensions.operations().get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    let sheet = Sheet { index: &ws.index, extensions: &ws.extensions, fields, within: Some(inner.clone()), derived: None };
+    let field_edit = &mut ws.field_edit;
+    theme::section(ui, "Selected", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(label).strong());
+            ui.label(RichText::new(name).small().color(theme::weak()));
+        });
+        if !shown.is_empty() {
+            ui.add_space(4.0);
+            property_sheet(ui, &sheet, field_edit, target, asset, &shown, nav, edit);
+        }
+        let Some(id) = op else { return };
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            use project::graph::layers;
+            let button = |ui: &mut egui::Ui, text: String| ui.add_enabled(target.is_ok(), egui::Button::new(text));
+            if button(ui, "Pass on down".to_string()).on_hover_text("Make this what the layer gives the next").clicked() {
+                *edit = layers_edit(asset, format!("Pass {id} on down"), layers::set_result(asset.text(), at, Some(id)));
+            }
+            if button(ui, format!("{}  Remove", icons::TRASH)).clicked() {
+                *edit = layers_edit(asset, format!("Remove {id}"), layers::remove_operation(asset.text(), at, id));
+            }
+        });
+    });
 }
 
 /// An output layer's settings: what one left out comes to is what it reads as.
@@ -977,7 +1001,7 @@ fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, to
 }
 
 /// A layer's settings, for its sheet: its fields, and what each is, what a setting left out comes to where that is known.
-pub(crate) fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     use pe2_ext::Field;
     use project::graph;
     let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
@@ -1324,6 +1348,13 @@ pub fn size_text(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_path_inside_an_asset_says_its_layer_and_operation() {
+        assert_eq!(super::layer_of_inner("stack.2"), Some((2, None)));
+        assert_eq!(super::layer_of_inner("stack.0.ops.draw"), Some((0, Some("draw"))));
+        assert_eq!(super::layer_of_inner("placements.3"), None);
+    }
+
     #[test]
     fn a_setting_left_out_shows_what_it_comes_to() {
         let layer: toml::Value = toml::from_str("op = \"output\"\nname = \"native\"\nretain = \"cache\"\n").unwrap();

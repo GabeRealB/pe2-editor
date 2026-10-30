@@ -22,7 +22,7 @@ pub mod layers;
 pub mod store;
 pub mod stream;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -681,19 +681,27 @@ impl Lowering<'_> {
                 .collect();
             wiring.insert(id, (op, ins));
         }
-        // Kahn's order: each operation once all it takes from are placed; what is left is in a cycle.
+        // Kahn's order: each operation once all it takes from are settled; what is left is in a cycle. One that cannot be
+        // lowered has said why, and what takes from it has nothing to say.
         let mut placed: HashMap<&str, usize> = HashMap::new();
+        let mut failed: HashSet<&str> = HashSet::new();
         let mut left: Vec<&str> = wiring.keys().copied().collect();
         loop {
             let ready = left.iter().position(|id| {
-                wiring[id].1.iter().flatten().all(|from| *from == ABOVE || placed.contains_key(from) || !wiring.contains_key(from))
+                wiring[id].1.iter().flatten().all(|from| *from == ABOVE || placed.contains_key(from) || failed.contains(from) || !wiring.contains_key(from))
             });
             let Some(i) = ready else { break };
             let id = left.remove(i);
             let (op, ins) = &wiring[id];
             let here = format!("{at}.ops.{id}");
-            if let Some(step) = self.graph_op(op, ins, &placed, above, &here) {
-                placed.insert(id, step);
+            let settled = !ins.iter().flatten().any(|from| failed.contains(from));
+            match settled.then(|| self.graph_op(op, ins, &placed, above, &here)).flatten() {
+                Some(step) => {
+                    placed.insert(id, step);
+                }
+                None => {
+                    failed.insert(id);
+                }
             }
         }
         for id in &left {

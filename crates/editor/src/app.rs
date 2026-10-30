@@ -718,6 +718,8 @@ impl Editor {
                     }
                 }
             });
+            ui.separator();
+            self.toolbar(ui);
         });
     }
 
@@ -757,13 +759,33 @@ impl Editor {
         });
     }
 
-    /// The status bar; whether its problem count was clicked, and whether its unapplied count was.
-    fn status_bar(&self, ui: &mut egui::Ui) -> (bool, bool) {
-        let (mut show_problems, mut apply_all) = (false, false);
+    /// The panes the status bar opens, and the active layer's name beside them; the pane asked for.
+    fn pane_buttons(&self, ui: &mut egui::Ui) -> Option<PaneKind> {
+        const KINDS: [PaneKind; 5] = [PaneKind::Assets, PaneKind::Project, PaneKind::Layers, PaneKind::History, PaneKind::Extensions];
+        let mut open = None;
+        for kind in KINDS {
+            let button = egui::Button::new(RichText::new(kind.icon()).small().color(theme::weak())).frame(false);
+            if ui.add(button).on_hover_text(kind.title()).clicked() {
+                open = Some(kind);
+            }
+        }
+        if let Some(layer) = self.workspace.as_ref().and_then(|ws| ws.active_layer()) {
+            let label = egui::Label::new(RichText::new(format!("{}  {}", icons::STACK_SIMPLE, layer.name)).small().color(theme::text()));
+            if ui.add(label.sense(egui::Sense::click())).on_hover_text("The active layer: edits go there").clicked() {
+                open = Some(PaneKind::Layers);
+            }
+        }
+        ui.separator();
+        open
+    }
+
+    /// The status bar; whether its problem count was clicked, whether its unapplied count was, and a pane asked for.
+    fn status_bar(&self, ui: &mut egui::Ui) -> (bool, bool, Option<PaneKind>) {
+        let (mut show_problems, mut apply_all, mut open) = (false, false, None);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let zoom = ui.ctx().zoom_factor();
-            let mode = if self.settings.appearance.zoom.is_some() { "" } else { " (monitor)" };
-            ui.label(RichText::new(format!("zoom {:.0}%{mode}", zoom * 100.0)).small().color(theme::weak()));
+            let mode = if self.settings.appearance.zoom.is_some() { "set in Settings" } else { "the monitor's" };
+            ui.label(RichText::new(format!("{:.0}%", zoom * 100.0)).small().color(theme::weak())).on_hover_text(format!("Zoom: {mode}"));
             if let Some(ws) = &self.workspace {
                 ui.separator();
                 if !ws.index.dangling.is_empty() {
@@ -815,7 +837,7 @@ impl Editor {
                     let (text, color) = if recent {
                         ("an agent is using the editor", ui.visuals().warn_fg_color)
                     } else {
-                        ("agents may use the editor", theme::weak())
+                        ("agents allowed", theme::weak())
                     };
                     ui.label(RichText::new(text).small().color(color)).on_hover_text(
                         "Agents connected to the project may click, type and press keys here; what they edit is in \
@@ -834,6 +856,7 @@ impl Editor {
                 ui.label(RichText::new(format!("{} assets", ws.index.assets.len())).small().color(theme::weak()));
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                open = self.pane_buttons(ui);
                 if let Some(error) = &self.error {
                     ui.add(
                         egui::Label::new(RichText::new(error).small().color(ui.visuals().error_fg_color)).truncate(),
@@ -851,7 +874,7 @@ impl Editor {
                 }
             });
         });
-        (show_problems, apply_all)
+        (show_problems, apply_all, open)
     }
 
     /// A project another process holds: it cannot be opened until that process lets go of it.
@@ -988,15 +1011,17 @@ impl eframe::App for Editor {
                 ws.go_forward();
             }
         }
-        let bar = egui::Frame::new().fill(theme::background()).inner_margin(egui::Margin::symmetric(8, 4));
+        let bar = egui::Frame::new().fill(theme::background()).inner_margin(egui::Margin::symmetric(6, 1));
+        // One row: what a window can spare for what is not its work.
         egui::Panel::top("menu").frame(bar).show(ui, |ui| {
             self.menu_bar(ui);
-            ui.add_space(2.0);
-            self.toolbar(ui);
         });
-        let (show_problems, apply_all) = egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
+        let (show_problems, apply_all, open) = egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
         if show_problems {
             self.show_pane(Pane::first(PaneKind::Problems));
+        }
+        if let Some(kind) = open {
+            self.show_pane(Pane::first(kind));
         }
         if apply_all && let Some(ws) = self.workspace.as_mut() {
             ws.apply_all_settings();
