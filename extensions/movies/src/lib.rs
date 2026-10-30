@@ -6,9 +6,10 @@
 
 use formats::str::{SECTOR, Sector};
 use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Asset, Icon, Image, Pcm, Registry, Result, Retain, Signature, Table, Timing, Tint, Value, anyhow};
+use pe2_ext::{Asset, Icon, Image, Registry, Result, Retain, Signature, Table, Tint, Value, anyhow};
 
 mod extract;
+mod frames;
 
 pe2_ext::extension!("pe2.movies", "0.1.0", register);
 
@@ -57,9 +58,10 @@ fn register(r: &mut Registry) -> Result<()> {
         let clip = call.take::<Str>(0)?;
         self::frame(&call.lend(&clip).asset(), number)
     });
-    let audio = r.op("audio").label("Sound").input::<Str>("clip").output::<ty::Pcm>().run(|call| {
+    // Played: each frame with the sound up to it.
+    let played = r.op("frames").label("Frames").input::<Str>("clip").output::<ty::List<ty::Any>>().streams(|call| {
         let clip = call.take::<Str>(0)?;
-        self::audio(&call.lend(&clip).asset())
+        Ok(Box::new(frames::Frames::start(call, clip)?))
     });
     let movie = r
         .kind("movie")
@@ -71,20 +73,19 @@ fn register(r: &mut Registry) -> Result<()> {
         // Shown by a frame a quarter in: the first are often black.
         .output("frame", &frame, Retain::Transient)
         .members(|asset| timing(asset).map(|t| (t.first + t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect())
-        .output("audio", &audio, Retain::Transient)
-        .playback("frame", Some("audio"), timing)
+        .output("frames", &played, Retain::Transient)
         .register();
     let _ = r.extractor("clips", &movie, &[], extract::begin);
     Ok(())
 }
 
 /// The bytes of a count of sectors.
-fn sectors(count: u64) -> usize {
+pub(crate) fn sectors(count: u64) -> usize {
     usize::try_from(count).unwrap_or(usize::MAX).saturating_mul(SECTOR)
 }
 
 /// The first video sector's chunk at or after a sector, among the `LOOK` from it.
-fn chunk_at(asset: &Asset, at: u64) -> Option<formats::str::Chunk> {
+pub(crate) fn chunk_at(asset: &Asset, at: u64) -> Option<formats::str::Chunk> {
     let bytes = asset.read_range(NATIVE, at * SECTOR as u64, sectors(LOOK)).ok()?;
     bytes.as_chunks::<SECTOR>().0.iter().find_map(|s| match Sector::raw(s) {
         Sector::Video(chunk, _) => Some(chunk),
@@ -92,8 +93,15 @@ fn chunk_at(asset: &Asset, at: u64) -> Option<formats::str::Chunk> {
     })
 }
 
+/// How a movie plays: frames numbered from `first`, `count` of them, `rate` a second.
+pub(crate) struct Timing {
+    pub first: u32,
+    pub count: u32,
+    pub rate: f64,
+}
+
 /// How a movie plays: its frames, by the numbers its first and last carry, at the rate they fill its sectors.
-fn timing(asset: &Asset) -> Option<Timing> {
+pub(crate) fn timing(asset: &Asset) -> Option<Timing> {
     let sectors = asset.size(NATIVE)? / SECTOR as u64;
     let first = chunk_at(asset, 0)?.frame;
     let last = (0..LOOK.min(sectors)).find_map(|back| {
@@ -130,29 +138,6 @@ fn frame(asset: &Asset, number: u32) -> Result<Image> {
         .map_err(|e| anyhow!("{}: frame {number}: {e}", asset.path()))?;
     let rgba = decoded.rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect();
     Ok(Image { width: decoded.width, height: decoded.height, rgba })
-}
-
-/// A movie's sound: its XA sectors decoded in order, a range of sectors read at a time.
-fn audio(asset: &Asset) -> Result<Pcm> {
-    const RANGE: u64 = 4096;
-    let sectors = asset.size(NATIVE).ok_or_else(|| anyhow!("{}: no {NATIVE}", asset.path()))? / SECTOR as u64;
-    let mut decoder = codecs::xa::Decoder::default();
-    let mut pcm = Pcm { rate: 0, channels: 0, samples: Vec::new() };
-    let mut at = 0;
-    while at < sectors {
-        let count = RANGE.min(sectors - at);
-        let bytes = asset.read_range(NATIVE, at * SECTOR as u64, self::sectors(count))?;
-        for sector in bytes.as_chunks::<SECTOR>().0 {
-            let Sector::Audio(coding, data) = Sector::raw(sector) else { continue };
-            let coding = codecs::xa::Coding::of(coding);
-            if pcm.rate == 0 {
-                (pcm.rate, pcm.channels) = (coding.rate, if coding.stereo { 2 } else { 1 });
-            }
-            pcm.samples.extend(decoder.sector(coding, data).unwrap_or_default());
-        }
-        at += count;
-    }
-    Ok(pcm)
 }
 
 /// What a movie's stream is, from a few sectors at each end: its sectors and duration, its frames (the last one's

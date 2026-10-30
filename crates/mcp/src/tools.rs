@@ -208,9 +208,10 @@ fn own() -> Vec<Tool> {
         ),
         tool::<OutputArgs>(
             "get_output",
-            "One of an asset's outputs (get_asset lists them), made now or found kept: a table (a movie's stream) as \
+            "One of an asset's outputs (get_asset lists them), made now or found kept: a table (a movie's facts) as \
              JSON; a picture as PNG; a value of an extension's type as its files (name, size, sha1) and the settings \
-             made with it. A family's member by its parameter's value: `picture/default`, `part/palettes/default`.",
+             made with it; a stream (a movie's frames) as its header. A family's member by its parameter's value: \
+             `picture/default`, `part/palettes/default`."
         ),
         tool::<PreviewArgs>(
             "preview",
@@ -514,6 +515,12 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
     use project::graph::{Content, Value as Made};
     let asset = asset(index, &args.asset)?;
     let engine = extensions.engine();
+    // A stream is opened, not made: what it is, its header.
+    if extensions.stream_output(asset).as_deref() == Some(args.output.as_str()) {
+        let stream = extensions.stream(&engine, index, asset, &args.output).map_err(|e| format!("{e:#}"))?;
+        let header = serde_json::to_value(stream.header()).unwrap_or_default();
+        return Ok(CallToolResult::success(vec![ContentBlock::text(json!({ "stream": header }).to_string())]));
+    }
     // The thumbnail is of the first look, which it is given when asked for.
     let given = if args.output == project::graph::THUMBNAIL {
         extensions.thumbnail(&engine, asset)
@@ -548,6 +555,14 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
         })),
         Made::Pcm(pcm) => text(json!({ "rate": pcm.rate, "channels": pcm.channels, "samples": pcm.samples.len() })),
         Made::List(items) => text(json!({ "items": items.len(), "type": value.ty().to_string() })),
+        Made::Video(frame) => text(json!({
+            "video": frame.format.name(), "width": frame.width, "height": frame.height,
+            "timestamp": frame.timestamp, "bytes": frame.buffer.size(),
+        })),
+        Made::Audio(sound) => text(json!({
+            "audio": sound.format.name(), "sample_rate": sound.sample_rate, "channels": sound.channels,
+            "timestamp": sound.timestamp, "bytes": sound.buffer.size(),
+        })),
     }
 }
 

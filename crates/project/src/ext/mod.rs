@@ -209,6 +209,8 @@ pub struct Extensions {
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     kind_aliases: HashMap<String, String>,
     role_aliases: HashMap<String, String>,
+    /// The streams open, by the key of the output each is: one is shared by its readers while what it read holds.
+    streams: Mutex<HashMap<String, (std::sync::Weak<graph::stream::Stream>, graph::exec::Reads)>>,
 }
 
 /// A version's major, minor and patch numbers.
@@ -619,6 +621,38 @@ impl Extensions {
         found
     }
 
+    /// A stream output of an asset of `index`, by its address, open: shared with whatever reads it already, while what
+    /// it read holds; else opened now.
+    ///
+    /// # Errors
+    /// It has no such output, it is no stream, or it could not be opened.
+    pub fn stream(
+        &self,
+        engine: &graph::exec::Engine,
+        index: &index::Index,
+        asset: &index::Asset,
+        address: &str,
+    ) -> Result<Arc<graph::stream::Stream>> {
+        let (plan, _) = self.plan(asset);
+        let world = Graph { index, extensions: self };
+        let reach = graph::exec::Reach { engine, world: &world };
+        let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", asset.path))?;
+        let key = engine.key(&plan, asset, output, parameter.as_deref());
+        let mut streams = self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        streams.retain(|_, (stream, _)| stream.strong_count() > 0);
+        if let Some((stream, reads)) = streams.get(&key)
+            && let Some(stream) = stream.upgrade()
+            && reads.hold(asset, Some(reach))
+        {
+            return Ok(stream);
+        }
+        drop(streams);
+        let (producer, reads, key) = engine.open_stream(Some(reach), &plan, asset, address)?;
+        let stream = graph::stream::Stream::open(producer);
+        self.streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (Arc::downgrade(&stream), reads));
+        Ok(stream)
+    }
+
     /// An output of an asset of `index`, by its address (`native`, `picture/night`), through `engine`: what it reads
     /// of other nodes made in the index.
     ///
@@ -667,12 +701,12 @@ impl Extensions {
         Some((output, members))
     }
 
-    /// How an asset plays, where its kind's nodes do: its frames' output and its sound's, and its timing.
+    /// The first of an asset's kind's outputs that is a stream, by name: what plays.
     #[must_use]
-    pub fn playback(&self, asset: &index::Asset) -> Option<(&pe2_ext::PlaybackDef, pe2_ext::Timing)> {
-        let playback = self.kind_of(asset)?.playback.as_ref()?;
-        let timing = (playback.timing)(&self.lend(asset))?;
-        Some((playback, timing))
+    pub fn stream_output(&self, asset: &index::Asset) -> Option<String> {
+        let kind = self.kind_of(asset)?;
+        let stream = kind.outputs.iter().find(|o| self.ops.get(&o.op).is_some_and(|op| op.output.is_stream()))?;
+        Some(stream.name.clone())
     }
 
     /// Whether an asset's kind shows its nodes by a picture: it outputs one.
@@ -869,6 +903,10 @@ impl Extensions {
             op.inputs.clone_from(&def.inputs);
             op.parameter = def.parameter.as_ref().map(|(name, _)| name.clone());
             let (run, qualified) = (def.run.clone(), qualified.clone());
+            if let (Some(start), pe2_ext::Type::Stream(item)) = (def.start.clone(), &def.output) {
+                ops.add(op.streams((**item).clone(), move |call| start_stream(call, &qualified, &*start)));
+                continue;
+            }
             ops.add(op.makes(def.output.clone(), move |call| {
                 let inputs = call.take_inputs();
                 let hosted = Hosted::new(call, &qualified);
@@ -1108,6 +1146,121 @@ impl<'a> Hosted<'a> {
         let fields = recorder.node().fields();
         let named = |key: &str| fields.get(key).and_then(Value::as_str).and_then(|n| qualified.get(n)).map(String::as_str);
         Hosted { call, kind: named("kind"), role: named("role") }
+    }
+}
+
+/// Start an extension's stream operation: its generator given what the call is, then kept with what it reads by - its
+/// node's settings, and the contents its inputs held, where they are - for the stream's life past the call.
+fn start_stream(
+    call: &mut graph::exec::Call<'_>,
+    qualified: &HashMap<String, String>,
+    start: &pe2_ext::StartStream,
+) -> Result<Box<dyn graph::stream::Producer>> {
+    let inputs = call.take_inputs();
+    let mut stored = Vec::new();
+    for value in inputs.iter().flatten() {
+        graph::exec::stored_contents(value, &mut stored);
+    }
+    let contents: HashMap<String, std::path::PathBuf> =
+        stored.into_iter().filter_map(|sha1| Some((sha1.clone(), call.content_path(&sha1)?))).collect();
+    let hosted = Hosted::new(call, qualified);
+    let mut lent = pe2_ext::Call { inputs, settings: call.settings(), parameter_text: call.parameter(), host: &hosted };
+    let generator = start(&mut lent)?;
+    let node = call.recorder().node();
+    let host = StreamHost {
+        path: node.path().to_string(),
+        kind: hosted.kind.map(str::to_string),
+        role: hosted.role.map(str::to_string),
+        fields: node.fields().clone(),
+        contents,
+    };
+    let (settings, parameter) = (call.settings().clone(), call.parameter().map(str::to_string));
+    Ok(Box::new(Generating { generator, host, settings, parameter }))
+}
+
+/// What a stream's generator is lent between its calls: its node's path, kind, role and settings, and the contents its
+/// inputs held, read where they are.
+struct StreamHost {
+    path: String,
+    kind: Option<String>,
+    role: Option<String>,
+    fields: Table,
+    contents: HashMap<String, std::path::PathBuf>,
+}
+
+impl StreamHost {
+    fn path_of(&self, sha1: &str) -> Result<&std::path::Path> {
+        self.contents.get(sha1).map(std::path::PathBuf::as_path).with_context(|| format!("{}: no content {sha1}", self.path))
+    }
+}
+
+impl pe2_ext::CallHost for StreamHost {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    fn role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+
+    fn fields(&self) -> &Table {
+        &self.fields
+    }
+
+    fn read(&self, content: &pe2_ext::Content) -> Result<Vec<u8>> {
+        match content {
+            pe2_ext::Content::Inline(bytes) => Ok(bytes.clone()),
+            pe2_ext::Content::Stored { sha1, .. } => {
+                let path = self.path_of(sha1)?;
+                std::fs::read(path).with_context(|| path.display().to_string())
+            }
+        }
+    }
+
+    fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        match content {
+            pe2_ext::Content::Inline(bytes) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+            }
+            pe2_ext::Content::Stored { sha1, .. } => {
+                let path = self.path_of(sha1)?;
+                let mut file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut out = Vec::new();
+                file.take(len as u64).read_to_end(&mut out)?;
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// An extension's generator as the host drives it: each call given its node as `StreamHost` lends it.
+struct Generating {
+    generator: Box<dyn pe2_ext::Generator>,
+    host: StreamHost,
+    settings: Table,
+    parameter: Option<String>,
+}
+
+impl graph::stream::Producer for Generating {
+    fn header(&self) -> Table {
+        self.generator.header()
+    }
+
+    fn next(&mut self, count: usize) -> Result<Vec<graph::Value>> {
+        let call = pe2_ext::Call { inputs: vec![], settings: &self.settings, parameter_text: self.parameter.as_deref(), host: &self.host };
+        self.generator.next(&call, count)
+    }
+
+    fn seek(&mut self, position: u64) -> Result<bool> {
+        let call = pe2_ext::Call { inputs: vec![], settings: &self.settings, parameter_text: self.parameter.as_deref(), host: &self.host };
+        self.generator.seek(&call, position)
     }
 }
 

@@ -13,7 +13,52 @@
 /// 0.1.0, changing freely.
 package pe2:extension@0.1.0;
 
+/// Media as the host holds it, shaped after the `wasi:media` draft's `types` (WebAssembly/WASI#917), to become it if it
+/// is standardized: frames and sound in buffers the host keeps, made from the guest's bytes once and passed by handle,
+/// in the formats the host says it takes.
+interface media {
+    /// A frame's layout. `yuv420p`: three planes back to back - Y at full size, then Cb and Cr at half each way.
+    /// `nv12`: Y, then Cb and Cr interleaved at half each way. `rgba8888` and `bgra8888`: one plane, row by row.
+    enum pixel-format { rgba8888, bgra8888, yuv420p, nv12 }
+
+    /// A stretch of sound's layout: `s16-interleaved`, 16-bit little-endian samples, the channels' interleaved;
+    /// `f32-planar`, 32-bit float samples, each channel's in turn.
+    enum sample-format { s16-interleaved, f32-planar }
+
+    /// Bytes the host holds: a frame's planes, a stretch of sound.
+    resource media-buffer {
+        constructor(data: list<u8>);
+        size: func() -> u64;
+        /// Another handle to the same bytes.
+        share: func() -> media-buffer;
+    }
+
+    /// A frame: its buffer, its layout and size, when it is shown (in microseconds from its stream's start).
+    record video-frame {
+        buffer: media-buffer,
+        format: pixel-format,
+        width: u32,
+        height: u32,
+        timestamp: u64,
+    }
+
+    /// A stretch of sound: its buffer, its layout, rate and channels, when it begins (in microseconds).
+    record audio-data {
+        buffer: media-buffer,
+        format: sample-format,
+        sample-rate: u32,
+        channels: u32,
+        timestamp: u64,
+    }
+
+    /// The layouts the host takes: what a generator makes its frames and sound in, where it can.
+    pixel-formats: func() -> list<pixel-format>;
+    sample-formats: func() -> list<sample-format>;
+}
+
 interface types {
+    use media.{video-frame, audio-data};
+
     /// Pixels as unmultiplied RGBA, row by row.
     record image {
         width: u32,
@@ -70,6 +115,8 @@ interface types {
         table(string),
         pcm(pcm),
         typed(typed),
+        video(video-frame),
+        audio(audio-data),
     }
 
     /// A value: an item, or a list of items.
@@ -78,6 +125,8 @@ interface types {
         table(string),
         pcm(pcm),
         typed(typed),
+        video(video-frame),
+        audio(audio-data),
         items(list<item>),
     }
 }
@@ -276,20 +325,6 @@ interface guest {
         members: bool,
     }
 
-    /// How a kind's nodes play in the host's player: their frames the members of a family output by number, their sound
-    /// an output; each node's timing called back by the kind's index.
-    record playback {
-        frames: string,
-        audio: option<string>,
-    }
-
-    /// What plays: frames numbered from `first`, `count` of them, `rate` a second.
-    record timing {
-        first: u32,
-        count: u32,
-        rate: f64,
-    }
-
     /// A kind; its outputs' members and its parts called back by its index.
     record kind {
         name: string,
@@ -303,7 +338,6 @@ interface guest {
         outputs: list<output>,
         /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
         stack: option<string>,
-        playback: option<playback>,
     }
 
     record role {
@@ -425,8 +459,6 @@ interface guest {
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
     /// A family's members, of an asset: each by its parameter's value, with a label.
     members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
-    /// An asset's timing, of a kind that plays.
-    timing-of: func(kind: u32, asset: borrow<asset>) -> option<timing>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
     /// A part of an asset, by its fragment; a virtual one made of others.
@@ -460,6 +492,20 @@ interface guest {
         constructor(view: u32, asset: option<borrow<asset>>);
         show: func(ui: borrow<ui>, project: borrow<project>, asset: option<borrow<asset>>, look: u32);
     }
+
+    /// What makes a stream's items (`start-stream`), living in an instance of its own while the stream is read: its
+    /// header (TOML), up to `count` items after the last (fewer at its end), going on from an item elsewhere where it
+    /// can. Each call is lent the node it was started for - its settings, its files the contents its values hold, by
+    /// hash - through which it reads what it kept.
+    resource generator {
+        header: func() -> string;
+        next: func(node: borrow<asset>, count: u32) -> result<list<value>, string>;
+        seek: func(node: borrow<asset>, position: u64) -> result<bool, string>;
+    }
+
+    /// A stream operation opened: lent its node, given its values by port, its settings and its output's parameter
+    /// (as `run-op`), it starts its generator.
+    start-stream: func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<generator, string>;
 }
 
 world extension {

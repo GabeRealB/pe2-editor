@@ -22,7 +22,7 @@ pub mod bindings {
 }
 
 use bindings::exports::pe2::extension::guest as g;
-use bindings::pe2::extension::{host, types};
+use bindings::pe2::extension::{host, media, types};
 
 unsafe extern "Rust" {
     /// The extension's declaration, defined by `extension!` in the extension's crate.
@@ -516,6 +516,25 @@ pub struct Component;
 impl g::Guest for Component {
     type ViewState = ViewState;
     type Extraction = Extraction;
+    type Generator = Generating;
+
+    fn start_stream(
+        op: u32,
+        node: &host::Asset,
+        inputs: Vec<Vec<types::Value>>,
+        settings: String,
+        parameter: Option<String>,
+    ) -> Result<g::Generator, String> {
+        let def = registered().ops.get(op as usize).ok_or("no such operation")?;
+        let start = def.start.as_ref().ok_or("it is no stream")?;
+        let lent = Lent::borrowed(node);
+        let settings: Table = toml::from_str(&settings).unwrap_or_default();
+        let inputs = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
+        let host = NodeHost(&lent);
+        let mut call = crate::Call { inputs, settings: &settings, parameter_text: parameter.as_deref(), host: &host };
+        let generator = start(&mut call).map_err(|e| format!("{e:#}"))?;
+        Ok(g::Generator::new(Generating { generator: RefCell::new(generator), settings, parameter }))
+    }
 
     fn describe() -> g::About {
         let extension = __pe2_extension();
@@ -559,13 +578,6 @@ impl g::Guest for Component {
         let field = &registered().fields[field as usize];
         let format = if brief { field.brief.as_ref() } else { field.format.as_ref() }?;
         format(&parse_value(&value)?)
-    }
-
-    fn timing_of(kind: u32, asset: &host::Asset) -> Option<g::Timing> {
-        let lent = Lent::borrowed(asset);
-        let playback = registered().kinds.get(kind as usize)?.playback.as_ref()?;
-        let timing = (playback.timing)(&lent.asset())?;
-        Some(g::Timing { first: timing.first, count: timing.count, rate: timing.rate })
     }
 
     fn parts(kind: u32, asset: &host::Asset) -> Vec<g::Part> {
@@ -717,7 +729,6 @@ fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
             })
             .collect(),
         stack: kind.stack.clone(),
-        playback: kind.playback.as_ref().map(|p| g::Playback { frames: p.frames.clone(), audio: p.audio.clone() }),
     }
 }
 
@@ -864,7 +875,63 @@ fn to_wit(value: Data) -> types::Value {
         Data::Table(table) => types::Value::Table(toml::to_string(&table).unwrap_or_default()),
         Data::Pcm(pcm) => types::Value::Pcm(types::Pcm { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples }),
         Data::Typed(t) => types::Value::Typed(typed_to_wit(t)),
+        Data::Video(frame) => types::Value::Video(media::VideoFrame {
+            buffer: frame.buffer.into_host(),
+            format: pixel_format_to_wit(frame.format),
+            width: frame.width,
+            height: frame.height,
+            timestamp: frame.timestamp,
+        }),
+        Data::Audio(sound) => types::Value::Audio(media::AudioData {
+            buffer: sound.buffer.into_host(),
+            format: sample_format_to_wit(sound.format),
+            sample_rate: sound.sample_rate,
+            channels: sound.channels,
+            timestamp: sound.timestamp,
+        }),
     }
+}
+
+fn pixel_format_to_wit(format: crate::media::PixelFormat) -> media::PixelFormat {
+    match format {
+        crate::media::PixelFormat::Rgba8888 => media::PixelFormat::Rgba8888,
+        crate::media::PixelFormat::Bgra8888 => media::PixelFormat::Bgra8888,
+        crate::media::PixelFormat::Yuv420p => media::PixelFormat::Yuv420p,
+        crate::media::PixelFormat::Nv12 => media::PixelFormat::Nv12,
+    }
+}
+
+fn pixel_format_from_wit(format: media::PixelFormat) -> crate::media::PixelFormat {
+    match format {
+        media::PixelFormat::Rgba8888 => crate::media::PixelFormat::Rgba8888,
+        media::PixelFormat::Bgra8888 => crate::media::PixelFormat::Bgra8888,
+        media::PixelFormat::Yuv420p => crate::media::PixelFormat::Yuv420p,
+        media::PixelFormat::Nv12 => crate::media::PixelFormat::Nv12,
+    }
+}
+
+fn sample_format_to_wit(format: crate::media::SampleFormat) -> media::SampleFormat {
+    match format {
+        crate::media::SampleFormat::S16Interleaved => media::SampleFormat::S16Interleaved,
+        crate::media::SampleFormat::F32Planar => media::SampleFormat::F32Planar,
+    }
+}
+
+fn sample_format_from_wit(format: media::SampleFormat) -> crate::media::SampleFormat {
+    match format {
+        media::SampleFormat::S16Interleaved => crate::media::SampleFormat::S16Interleaved,
+        media::SampleFormat::F32Planar => crate::media::SampleFormat::F32Planar,
+    }
+}
+
+/// The frame layouts the host takes.
+pub(crate) fn pixel_formats() -> Vec<crate::media::PixelFormat> {
+    media::pixel_formats().into_iter().map(pixel_format_from_wit).collect()
+}
+
+/// The sound layouts the host takes.
+pub(crate) fn sample_formats() -> Vec<crate::media::SampleFormat> {
+    media::sample_formats().into_iter().map(sample_format_from_wit).collect()
 }
 
 fn item_to_wit(value: Data) -> Option<types::Item> {
@@ -873,6 +940,8 @@ fn item_to_wit(value: Data) -> Option<types::Item> {
         types::Value::Table(t) => types::Item::Table(t),
         types::Value::Pcm(p) => types::Item::Pcm(p),
         types::Value::Typed(t) => types::Item::Typed(t),
+        types::Value::Video(v) => types::Item::Video(v),
+        types::Value::Audio(a) => types::Item::Audio(a),
         types::Value::Items(_) => return None,
     })
 }
@@ -902,6 +971,8 @@ fn from_wit(value: types::Value) -> Data {
         types::Value::Table(t) => item_from_wit(types::Item::Table(t)),
         types::Value::Pcm(p) => item_from_wit(types::Item::Pcm(p)),
         types::Value::Typed(t) => item_from_wit(types::Item::Typed(t)),
+        types::Value::Video(v) => item_from_wit(types::Item::Video(v)),
+        types::Value::Audio(a) => item_from_wit(types::Item::Audio(a)),
         types::Value::Items(items) => Data::List(items.into_iter().map(item_from_wit).collect()),
     }
 }
@@ -917,6 +988,20 @@ fn item_from_wit(item: types::Item) -> Data {
             files: t.files.into_iter().map(file_from_wit).collect(),
             settings: toml::from_str(&t.settings).unwrap_or_default(),
             notes: t.notes,
+        }),
+        types::Item::Video(v) => Data::Video(crate::media::VideoFrame {
+            buffer: crate::media::MediaBuffer::from_host(v.buffer),
+            format: pixel_format_from_wit(v.format),
+            width: v.width,
+            height: v.height,
+            timestamp: v.timestamp,
+        }),
+        types::Item::Audio(a) => Data::Audio(crate::media::AudioData {
+            buffer: crate::media::MediaBuffer::from_host(a.buffer),
+            format: sample_format_from_wit(a.format),
+            sample_rate: a.sample_rate,
+            channels: a.channels,
+            timestamp: a.timestamp,
         }),
     }
 }
@@ -948,6 +1033,38 @@ impl g::GuestViewState for ViewState {
         let asset = shown.as_ref().map(Lent::asset);
         let mut frame = Frame { ui: Handle::Lent(ui), project: &lens, asset, look: look as usize };
         self.0.borrow_mut().show(&mut crate::Ui::new(&mut frame));
+    }
+}
+
+/// A stream's generator, kept while its stream is read, with the settings and parameter it was started with.
+pub struct Generating {
+    generator: RefCell<Box<dyn crate::Generator>>,
+    settings: Table,
+    parameter: Option<String>,
+}
+
+impl Generating {
+    /// Call the generator with its node lent.
+    fn with<R>(&self, node: &host::Asset, call: impl FnOnce(&mut dyn crate::Generator, &crate::Call<'_>) -> crate::Result<R>) -> Result<R, String> {
+        let lent = Lent::borrowed(node);
+        let host = NodeHost(&lent);
+        let lent_call = crate::Call { inputs: vec![], settings: &self.settings, parameter_text: self.parameter.as_deref(), host: &host };
+        call(&mut **self.generator.borrow_mut(), &lent_call).map_err(|e| format!("{e:#}"))
+    }
+}
+
+impl g::GuestGenerator for Generating {
+    fn header(&self) -> String {
+        toml::to_string(&self.generator.borrow().header()).unwrap_or_default()
+    }
+
+    fn next(&self, node: &host::Asset, count: u32) -> Result<Vec<types::Value>, String> {
+        let items = self.with(node, |generator, call| generator.next(call, count as usize))?;
+        Ok(items.into_iter().map(to_wit).collect())
+    }
+
+    fn seek(&self, node: &host::Asset, position: u64) -> Result<bool, String> {
+        self.with(node, |generator, call| generator.seek(call, position))
     }
 }
 

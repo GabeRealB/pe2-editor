@@ -13,6 +13,9 @@
 //! Panes moved into windows of their own open as native windows; `PE2_EDITOR_EMBED_WINDOWS=1` draws those windows
 //! inside the main one instead (and so in its screenshots).
 
+// wgpu's handles are Send through a deep chain of types: proving it for the player's renderer needs a higher limit.
+#![recursion_limit = "256"]
+
 mod app;
 mod drive;
 mod ext_ui;
@@ -33,6 +36,7 @@ mod viewer;
 mod watch;
 mod windows;
 mod workspace;
+mod yuv;
 
 use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
@@ -108,6 +112,8 @@ fn main() -> eframe::Result {
                 // wgpu panics on an error nobody handles; a surface that cannot be configured (a window larger than
                 // the device allows) then ends the editor. Log instead: the frame is lost, not the program.
                 state.device.on_uncaptured_error(Arc::new(|e| eprintln!("wgpu: {e}")));
+                // The player's YCbCr frames are drawn by a pipeline of its own.
+                yuv::install(state);
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
             let start = app::Start { project, select, show, screenshot, max_surface, agents_drive };

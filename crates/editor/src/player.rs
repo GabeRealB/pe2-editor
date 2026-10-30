@@ -1,76 +1,171 @@
-//! The player: an asset of a kind that plays (`KindBuilder::playback`) shown in the preview frame by frame. Its frames
-//! are the members of its kind's frame output, made off the window's thread - those just ahead while it plays - and
-//! shown through one texture. Its sound, its kind's audio output, is made once on a thread of its own and played from
-//! where it is, resampled to the device's rate; while it sounds, where it is follows the samples played, else the
-//! clock.
+//! The player: an asset whose kind has a stream output (`stream<T>`) played in the preview. The stream, opened on a
+//! thread of its own, is read by two readers of the player's: one for the picture, at the item shown, and one for the
+//! sound, half a second ahead, feeding each item's samples to the device. An item is shown by what it holds: a
+//! picture, sound, or both (a list of them): a picture as RGBA through a texture, a frame in YCbCr 4:2:0 through the
+//! GPU's shader (`yuv`); sound as 16-bit samples.
+//!
+//! Where it is follows the sound while it sounds - the samples the device has played, mapped back to the items they
+//! came with - else the clock at the stream's rate, which waits while the item it is at is not made yet: no item is
+//! skipped for being late.
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use eframe::egui::{self, RichText};
 use project::ext::Extensions;
+use project::graph::Value;
+use project::graph::stream::{Poll, Reader, Stream};
 use project::index::Index;
+use pe2_ext::media::{PixelFormat, SampleFormat, VideoFrame};
 
 use crate::settings::Preview;
 use crate::{icons, theme};
 
-/// How many frames are asked for ahead of the one shown while it plays.
-const AHEAD: u32 = 8;
-/// How many frames are kept behind the one shown.
-const BEHIND: u32 = 4;
+/// How far ahead of the picture the sound is fed, in items.
+const FEED: u64 = 8;
 
-/// Frames to make of an asset, in order: the newest request replaces those not begun.
-struct Request {
-    index: Arc<Index>,
-    path: String,
-    output: String,
-    numbers: Vec<u32>,
+/// A picture an item holds, in a layout the player shows.
+enum Picture<'a> {
+    Rgba { width: usize, height: usize, rgba: &'a [u8] },
+    Yuv(&'a VideoFrame),
 }
 
-/// A frame made, or why not; none where its request was replaced before it was begun.
-type Made = (String, u32, Option<Result<Arc<egui::ColorImage>, String>>);
+/// Sound an item holds: its rate, its channels, and its 16-bit samples, interleaved - as numbers, or as their bytes.
+struct Sound<'a> {
+    rate: u32,
+    channels: usize,
+    samples: Samples<'a>,
+}
 
-/// What is shown: its asset (as it was when its timing was read), its frames' output and timing, where it is.
+enum Samples<'a> {
+    S16(&'a [i16]),
+    Le(&'a [u8]),
+}
+
+impl Sound<'_> {
+    fn len(&self) -> usize {
+        match self.samples {
+            Samples::S16(s) => s.len(),
+            Samples::Le(b) => b.len() / 2,
+        }
+    }
+
+    fn extend(&self, into: &mut VecDeque<i16>) {
+        match self.samples {
+            Samples::S16(s) => into.extend(s),
+            Samples::Le(b) => into.extend(b.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b))),
+        }
+    }
+}
+
+/// What an item holds to play, of what the player shows: its picture and its sound, either or both.
+fn parts(item: &Value) -> (Option<Picture<'_>>, Option<Sound<'_>>) {
+    match item {
+        Value::Image(image) => (Some(Picture::Rgba { width: image.width, height: image.height, rgba: &image.rgba }), None),
+        Value::Video(frame) => match frame.format {
+            PixelFormat::Rgba8888 => {
+                let (width, height) = (frame.width as usize, frame.height as usize);
+                (Some(Picture::Rgba { width, height, rgba: frame.buffer.bytes() }), None)
+            }
+            PixelFormat::Yuv420p => (Some(Picture::Yuv(frame)), None),
+            PixelFormat::Bgra8888 | PixelFormat::Nv12 => (None, None),
+        },
+        Value::Pcm(pcm) => {
+            (None, Some(Sound { rate: pcm.rate, channels: usize::from(pcm.channels.max(1)), samples: Samples::S16(&pcm.samples) }))
+        }
+        Value::Audio(sound) if sound.format == SampleFormat::S16Interleaved => {
+            let channels = (sound.channels as usize).max(1);
+            (None, Some(Sound { rate: sound.sample_rate, channels, samples: Samples::Le(sound.buffer.bytes()) }))
+        }
+        Value::List(items) => {
+            let found: Vec<_> = items.iter().map(parts).collect();
+            let mut picture = None;
+            let mut sound = None;
+            for (p, s) in found {
+                picture = picture.or(p);
+                sound = sound.or(s);
+            }
+            (picture, sound)
+        }
+        _ => (None, None),
+    }
+}
+
+/// The picture shown: through the texture, or a YCbCr frame by its key.
+enum Showing {
+    Texture,
+    Yuv(VideoFrame, u64),
+}
+
+/// A stream being opened, or open.
+enum Opening {
+    Waiting(mpsc::Receiver<Result<Arc<Stream>, String>>),
+    Open { picture: Reader, sound: Reader },
+    Failed(String),
+}
+
+/// What is shown: its asset (as it was when opened), its stream, where it is.
 struct Shown {
     asset: Arc<project::index::Asset>,
-    output: String,
-    timing: pe2_ext::Timing,
-    /// The frame shown, a fraction past it while playing.
+    opening: Opening,
+    /// Items a second, how many there are where known, the number its first is called by.
+    rate: f64,
+    count: Option<u64>,
+    first: u64,
+    /// The item shown, a fraction past it while playing.
     at: f64,
-    /// Playing: since when, from where.
+    /// Playing by the clock: since when, from where.
     playing: Option<(Instant, f64)>,
     /// Held on the timeline while it played: it plays again from there when let go.
     held: bool,
-    frames: BTreeMap<u32, Arc<egui::ColorImage>>,
-    /// Asked for and not made yet.
-    asked: Vec<u32>,
-    failed: Option<String>,
-    /// Its audio output, where its kind has one.
-    audio: Option<String>,
-    sound: Sound,
-    /// Sounding: the device's stream, and where it is.
     sounding: Option<Sounding>,
+    /// No sound to play, and why: the stream has none, the device would not, it ended.
+    silent: Option<String>,
+    /// The item shown last, and how.
+    at_item: Option<u64>,
+    showing: Option<Showing>,
+    failed: Option<String>,
 }
 
-/// An asset's sound.
-enum Sound {
-    Unasked,
-    Making,
-    Made(Arc<pe2_ext::Pcm>),
-    /// None to play, or none could be.
-    Silent(String),
+impl Shown {
+    fn last(&self) -> u64 {
+        self.count.map_or(u64::MAX, |c| c.saturating_sub(1))
+    }
+
+    /// Play from where it is by the clock - the sound to follow, where there is one.
+    fn by_clock(&mut self) {
+        self.sounding = None;
+        self.playing = Some((Instant::now(), self.at));
+    }
 }
 
-/// Sound playing on the device: its stream, and where it is.
+/// Sound playing on the device: its stream, the queue it plays from and where it is, and the items its samples came
+/// with.
 struct Sounding {
-    _stream: cpal::Stream,
+    _device: cpal::Stream,
+    queue: Arc<Mutex<Queue>>,
     clock: Arc<SoundClock>,
+    /// The rate its samples come at, told by the first fed: shared with the device's callback.
     rate: u32,
+    source_rate: Arc<AtomicU32>,
+    /// The next item whose sound is fed.
+    fed: u64,
+    /// Each item fed and where its samples begin, in samples (frames of channels) since the sound began.
+    spans: VecDeque<(u64, f64)>,
+    /// The samples fed.
+    total: f64,
+    started: bool,
+}
+
+/// The samples to play, and how many channels they come in.
+struct Queue {
+    samples: VecDeque<i16>,
+    channels: usize,
 }
 
 /// Where a sound is, in samples (frames of its channels): told by each buffer the device takes - the sample it begins
@@ -86,8 +181,8 @@ struct SoundClock {
 }
 
 impl SoundClock {
-    fn new(from: f64) -> SoundClock {
-        SoundClock { begun: Instant::now(), at: AtomicU64::new(from.to_bits()), len: AtomicU64::new(0), taken: AtomicU64::new(0) }
+    fn new() -> SoundClock {
+        SoundClock { begun: Instant::now(), at: AtomicU64::new(0f64.to_bits()), len: AtomicU64::new(0), taken: AtomicU64::new(0) }
     }
 
     fn took(&self, at: f64, len: f64) {
@@ -107,16 +202,12 @@ impl SoundClock {
     }
 }
 
-type MadeSound = (String, Result<Arc<pe2_ext::Pcm>, String>);
-
 pub struct Player {
     extensions: Arc<Extensions>,
-    requests: mpsc::Sender<Request>,
-    made: mpsc::Receiver<Made>,
-    sounds: (mpsc::Sender<MadeSound>, mpsc::Receiver<MadeSound>),
     shown: Option<Shown>,
-    texture: Option<(egui::TextureHandle, String, u32)>,
-    ctx: Arc<OnceLock<egui::Context>>,
+    texture: Option<egui::TextureHandle>,
+    /// The key of the YCbCr frame shown last: each new one a new key.
+    keys: u64,
     /// The amplitude sound plays at, as `f32` bits: shared with what sounds, so a change is heard at once.
     gain: Arc<AtomicU32>,
     /// Why the device would not play, where it would not.
@@ -125,318 +216,380 @@ pub struct Player {
 
 impl Player {
     pub fn new(extensions: Arc<Extensions>) -> Player {
-        let worker = extensions.clone();
-        let (requests, asked) = mpsc::channel::<Request>();
-        let (made_tx, made) = mpsc::channel();
-        let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
-        let wake = ctx.clone();
-        let _ = std::thread::Builder::new().name("player".into()).spawn(move || {
-            let extensions = worker;
-            let engine = extensions.engine();
-            while let Ok(mut request) = asked.recv() {
-                // Only the newest request is made.
-                while let Ok(newer) = asked.try_recv() {
-                    // Those it asked for are not made: asked for again where still wanted.
-                    let replaced = std::mem::replace(&mut request, newer);
-                    for number in replaced.numbers {
-                        let _ = made_tx.send((replaced.path.clone(), number, None));
-                    }
-                }
-                for number in request.numbers {
-                    let made = request.index.assets.get(&request.path).map(|asset| {
-                        extensions.output(&engine, &request.index, asset, &format!("{}/{number}", request.output), true)
-                    });
-                    let image = match made {
-                        Some(Ok(given)) => match given.value.as_deref() {
-                            Some(project::graph::Value::Image(image)) => Ok(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width, image.height],
-                                &image.rgba,
-                            ))),
-                            _ => Err("it made no picture".to_string()),
-                        },
-                        Some(Err(e)) => Err(format!("{e:#}")),
-                        None => Err("it is gone".to_string()),
-                    };
-                    if made_tx.send((request.path.clone(), number, Some(image))).is_err() {
-                        return;
-                    }
-                    if let Some(ctx) = wake.get() {
-                        ctx.request_repaint();
-                    }
-                }
-            }
-        });
-        let sounds = mpsc::channel();
-        Player { extensions, requests, made, sounds, shown: None, texture: None, ctx, gain: Arc::new(AtomicU32::new(1f32.to_bits())), device: Arc::default() }
+        Player { extensions, shown: None, texture: None, keys: 0, gain: Arc::new(AtomicU32::new(1f32.to_bits())), device: Arc::default() }
     }
 
-    /// Make an asset's sound, on a thread of its own: sent to `made`, the window woken by `wake`.
-    fn make_sound(extensions: &Arc<Extensions>, made: &mpsc::Sender<MadeSound>, wake: &Arc<OnceLock<egui::Context>>, at: (&Arc<Index>, &str, &str)) {
-        let (index, path, output) = at;
-        let (extensions, index, path, output) = (extensions.clone(), index.clone(), path.to_string(), output.to_string());
-        let (made, wake) = (made.clone(), wake.clone());
-        let _ = std::thread::Builder::new().name("player sound".into()).spawn(move || {
-            let engine = extensions.engine();
-            let sound = match index.assets.get(&path).map(|a| extensions.output(&engine, &index, a, &output, true)) {
-                Some(Ok(given)) => match given.value.as_deref() {
-                    Some(project::graph::Value::Pcm(pcm)) if !pcm.samples.is_empty() => Ok(Arc::new(pcm.clone())),
-                    Some(project::graph::Value::Pcm(_)) => Err("it has none".to_string()),
-                    _ => Err("it made no sound".to_string()),
-                },
-                Some(Err(e)) => Err(format!("{e:#}")),
-                None => Err("it is gone".to_string()),
-            };
-            let _ = made.send((path, sound));
-            if let Some(ctx) = wake.get() {
-                ctx.request_repaint();
-            }
-        });
-    }
-
-    /// Whether an asset plays.
+    /// Whether an asset plays: its kind has a stream output.
     pub fn plays(extensions: &Extensions, asset: &project::index::Asset) -> bool {
-        extensions.kind_of(asset).is_some_and(|k| k.playback.is_some())
+        extensions.stream_output(asset).is_some()
     }
 
-    /// Its sound made and sounding while it plays, unless muted; where it is, by the sound's samples or the clock.
-    fn keep_time(&mut self, index: &Arc<Index>, path: &str, muted: bool) {
-        let Some(shown) = &mut self.shown else { return };
-        for (made_path, sound) in self.sounds.1.try_iter() {
-            if made_path == shown.asset.path {
-                shown.sound = sound.map_or_else(Sound::Silent, Sound::Made);
+    /// Open an asset's stream on a thread of its own.
+    fn open(&self, ctx: &egui::Context, index: &Arc<Index>, asset: &Arc<project::index::Asset>) -> Shown {
+        let (sent, opening) = mpsc::channel();
+        let (extensions, index, path, ctx) = (self.extensions.clone(), index.clone(), asset.path.clone(), ctx.clone());
+        let _ = std::thread::Builder::new().name("player open".into()).spawn(move || {
+            let engine = extensions.engine();
+            let opened = index.assets.get(&path).ok_or_else(|| "it is gone".to_string()).and_then(|asset| {
+                let output = extensions.stream_output(asset).ok_or_else(|| "it has no stream".to_string())?;
+                extensions.stream(&engine, &index, asset, &output).map_err(|e| format!("{e:#}"))
+            });
+            if let Ok(stream) = &opened {
+                let wake = ctx.clone();
+                stream.on_made(Arc::new(move || wake.request_repaint()));
             }
-        }
-        // The device failing stops the sound: the clock goes on.
-        if let Some(failed) = self.device.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            shown.sound = Sound::Silent(format!("the device: {failed}"));
-            shown.sounding = None;
-            shown.playing = shown.playing.map(|_| (Instant::now(), shown.at));
-        }
-        let (first, last) = (shown.timing.first, shown.timing.first + shown.timing.count.saturating_sub(1));
-        // Sounding while it plays, unless muted: from where it is.
-        if shown.playing.is_none() || muted {
-            shown.sounding = None;
-        } else if shown.sounding.is_none() {
-            match (&shown.sound, &shown.audio) {
-                (Sound::Unasked, Some(output)) => {
-                    shown.sound = Sound::Making;
-                    let output = output.clone();
-                    Player::make_sound(&self.extensions, &self.sounds.0, &self.ctx, (index, path, &output));
-                }
-                (Sound::Made(pcm), _) => {
-                    let start = (shown.at - f64::from(first)) / shown.timing.rate * f64::from(pcm.rate);
-                    match sound(pcm.clone(), start.max(0.0), &self.gain, self.device.clone()) {
-                        Ok(sounding) => {
-                            shown.sounding = Some(sounding);
-                            // The clock goes on from here, should the sound stop.
-                            shown.playing = Some((Instant::now(), shown.at));
-                        }
-                        Err(e) => shown.sound = Sound::Silent(e),
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some((since, from)) = shown.playing {
-            shown.at = match &shown.sounding {
-                // Never back: a buffer may begin a little before where the time since the last put it.
-                Some(s) => {
-                    let rate = f64::from(s.rate);
-                    shown.at.max(f64::from(first) + s.clock.now(rate) / rate * shown.timing.rate)
-                }
-                None => from + since.elapsed().as_secs_f64() * shown.timing.rate,
-            };
-            if shown.at >= f64::from(last) {
-                shown.at = f64::from(last);
-                shown.playing = None;
-                shown.sounding = None;
-            }
+            let _ = sent.send(opened);
+            ctx.request_repaint();
+        });
+        Shown {
+            asset: asset.clone(),
+            opening: Opening::Waiting(opening),
+            rate: 15.0,
+            count: None,
+            first: 0,
+            at: 0.0,
+            playing: None,
+            held: false,
+            sounding: None,
+            silent: None,
+            at_item: None,
+            showing: None,
+            failed: None,
         }
     }
 
-    /// An asset played: its frame where it is, the controls under it.
-    pub fn ui(&mut self, ui: &mut egui::Ui, (extensions, index): (&Extensions, &Arc<Index>), path: &str, view: &mut Preview) {
-        let _ = self.ctx.set(ui.ctx().clone());
+    /// An asset played: its picture where it is, the controls under it.
+    pub fn ui(&mut self, ui: &mut egui::Ui, (_, index): (&Extensions, &Arc<Index>), path: &str, view: &mut Preview) {
         let volume = view.volume.clamp(0.0, 1.0);
         self.gain.store((volume * volume).to_bits(), Ordering::Relaxed);
         let Some(asset) = index.assets.get(path) else { return };
-        // Its timing read again where it is another asset, or changed.
+        // Opened again where it is another asset, or changed: where it was kept.
         if self.shown.as_ref().is_none_or(|s| !Arc::ptr_eq(&s.asset, asset)) {
             let at = self.shown.as_ref().filter(|s| s.asset.path == *path).map(|s| s.at);
-            self.shown = extensions.playback(asset).map(|(playback, timing)| Shown {
-                asset: asset.clone(),
-                output: playback.frames.clone(),
-                timing,
-                at: at.unwrap_or(f64::from(timing.first)),
-                playing: None,
-                held: false,
-                frames: BTreeMap::new(),
-                asked: Vec::new(),
-                failed: None,
-                audio: playback.audio.clone(),
-                sound: Sound::Unasked,
-                sounding: None,
-            });
+            let mut shown = self.open(ui.ctx(), index, asset);
+            shown.at = at.unwrap_or(0.0);
+            self.shown = Some(shown);
+            self.texture = None;
         }
-        let Some(shown) = &mut self.shown else {
-            ui.label(RichText::new("It does not say how it plays").color(theme::weak()));
-            return;
-        };
-        for (made_path, number, image) in self.made.try_iter() {
-            if made_path != shown.asset.path {
-                continue;
-            }
-            shown.asked.retain(|&n| n != number);
-            match image {
-                Some(Ok(image)) => {
-                    shown.frames.insert(number, image);
-                }
-                Some(Err(e)) => shown.failed = Some(format!("frame {number}: {e}")),
-                None => {}
-            }
-        }
-        self.keep_time(index, path, view.muted);
         let Some(shown) = &mut self.shown else { return };
-        let (first, last) = (shown.timing.first, shown.timing.first + shown.timing.count.saturating_sub(1));
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a frame number within its count")]
-        let number = (shown.at.floor() as u32).clamp(first, last);
-        // Ask for the frame and, playing, those after it; keep those near it.
-        let wanted: Vec<u32> = if shown.playing.is_some() { (number..=last.min(number + AHEAD)).collect() } else { vec![number] };
-        let missing: Vec<u32> = wanted.into_iter().filter(|n| !shown.frames.contains_key(n) && !shown.asked.contains(n)).collect();
-        if !missing.is_empty() {
-            shown.asked.extend(&missing);
-            let output = shown.output.clone();
-            let _ = self.requests.send(Request { index: index.clone(), path: path.to_string(), output, numbers: missing });
-        }
-        shown.frames.retain(|&n, _| n + BEHIND >= number && n <= number + AHEAD);
-        // The frame shown: this one where it is made, else the last one shown.
-        if let Some(image) = shown.frames.get(&number)
-            && self.texture.as_ref().is_none_or(|(_, p, n)| p != path || *n != number)
+        if let Opening::Waiting(opening) = &shown.opening
+            && let Ok(opened) = opening.try_recv()
         {
-            let options = egui::TextureOptions::LINEAR;
-            if let Some((handle, p, n)) = &mut self.texture {
-                handle.set((**image).clone(), options);
-                (*p, *n) = (path.to_string(), number);
-            } else {
-                let handle = ui.ctx().load_texture("player", (**image).clone(), options);
-                self.texture = Some((handle, path.to_string(), number));
+            shown.opening = match opened {
+                Ok(stream) => {
+                    let header = stream.header();
+                    shown.rate = header.get("rate").and_then(toml::Value::as_float).filter(|r| *r > 0.0).unwrap_or(15.0);
+                    shown.count = header.get("count").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok());
+                    shown.first = header.get("first").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok()).unwrap_or(0);
+                    Opening::Open { picture: stream.reader(), sound: stream.reader() }
+                }
+                Err(e) => Opening::Failed(e),
+            };
+        }
+        match &shown.opening {
+            Opening::Waiting(_) => {
+                ui.label(RichText::new("Opening…").color(theme::weak()));
+                return;
             }
+            Opening::Failed(why) => {
+                ui.label(RichText::new(format!("It could not be opened: {why}")).color(theme::weak()));
+                return;
+            }
+            Opening::Open { .. } => {}
         }
-        if let Some((handle, _, _)) = self.texture.as_ref().filter(|(_, p, _)| p == path) {
-            let size = handle.size_vec2();
-            let scale = (ui.available_width() / size.x).max(0.1);
-            ui.add(egui::Image::new((handle.id(), size * scale)));
-        } else {
-            ui.add_space(8.0);
-            ui.label(RichText::new(shown.failed.as_deref().unwrap_or("Making its frame…")).color(theme::weak()));
+        let device = self.device.lock().unwrap_or_else(PoisonError::into_inner).take();
+        keep_time(shown, view.muted, device, &self.gain, &self.device);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an item's place")]
+        let number = (shown.at.max(0.0).floor() as u64).min(shown.last());
+        let Opening::Open { picture, sound } = &shown.opening else { return };
+        // Not feeding, the sound's reader keeps with the picture's: an old place would keep the queue filling there.
+        if shown.sounding.is_none() {
+            let _ = sound.get(number);
         }
+        match picture.get(number) {
+            Poll::Ready(item) if shown.at_item != Some(number) => {
+                match parts(&item).0 {
+                    Some(Picture::Rgba { width, height, rgba }) => {
+                        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba);
+                        match &mut self.texture {
+                            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+                            None => self.texture = Some(ui.ctx().load_texture("player", image, egui::TextureOptions::LINEAR)),
+                        }
+                        shown.showing = Some(Showing::Texture);
+                    }
+                    Some(Picture::Yuv(frame)) => {
+                        self.keys += 1;
+                        shown.showing = Some(Showing::Yuv(frame.clone(), self.keys));
+                    }
+                    None => {}
+                }
+                shown.at_item = Some(number);
+            }
+            Poll::Ready(_) => {}
+            // Not made yet: by the clock, it waits here.
+            Poll::Pending => {
+                if shown.sounding.is_none()
+                    && let Some((_, _)) = shown.playing
+                {
+                    shown.playing = Some((Instant::now(), shown.at));
+                }
+            }
+            Poll::End => {
+                shown.count = Some(number);
+                shown.playing = None;
+                shown.sounding = None;
+            }
+            Poll::Failed(e) => shown.failed = Some(e),
+        }
+        show(ui, shown, self.texture.as_ref());
         ui.add_space(6.0);
         controls(ui, shown, number, view);
-        if shown.playing.is_some() {
+        if shown.playing.is_some() || shown.sounding.is_some() {
             ui.ctx().request_repaint();
         }
     }
 }
 
-/// Play or pause, where it is (a frame), and the time.
-fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u32, view: &mut Preview) {
-    let (first, last) = (shown.timing.first, shown.timing.first + shown.timing.count.saturating_sub(1));
-    let rate = shown.timing.rate.max(1.0);
+/// The picture shown: through the texture, or a YCbCr frame through the GPU's shader; or why there is none yet.
+fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>) {
+    match (&shown.showing, texture) {
+        (Some(Showing::Texture), Some(texture)) => {
+            let size = texture.size_vec2();
+            let scale = (ui.available_width() / size.x).max(0.1);
+            ui.add(egui::Image::new((texture.id(), size * scale)));
+        }
+        (Some(Showing::Yuv(frame, key)), _) => {
+            #[expect(clippy::cast_precision_loss, reason = "a frame's size")]
+            let size = egui::vec2(frame.width as f32, frame.height as f32);
+            let (rect, _) = ui.allocate_exact_size(size * (ui.available_width() / size.x).max(0.1), egui::Sense::hover());
+            let draw = crate::yuv::Draw { frame: frame.clone(), key: *key };
+            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, draw));
+        }
+        _ => {
+            ui.add_space(8.0);
+            ui.label(RichText::new(shown.failed.as_deref().unwrap_or("Making its first item…")).color(theme::weak()));
+        }
+    }
+}
+
+/// Where it is: by the sound while it sounds - fed half a second ahead - else by the clock; sounding started while it
+/// plays, unless muted or silent.
+fn keep_time(shown: &mut Shown, muted: bool, device: Option<String>, gain: &Arc<AtomicU32>, failed: &Arc<Mutex<Option<String>>>) {
+    if let Some(device) = device {
+        shown.silent = Some(format!("the device: {device}"));
+        if shown.sounding.is_some() {
+            shown.by_clock();
+        }
+    }
+    if muted && shown.sounding.is_some() {
+        shown.by_clock();
+    }
+    let playing = shown.playing.is_some() || shown.sounding.is_some();
+    if !playing {
+        shown.sounding = None;
+        return;
+    }
+    // Sounding from where it is.
+    if shown.sounding.is_none() && !muted && shown.silent.is_none() {
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an item's place")]
+        let from = shown.at.max(0.0).floor() as u64;
+        match sound(gain, failed.clone()) {
+            Ok((device, queue, clock, source_rate)) => {
+                let spans = VecDeque::new();
+                shown.sounding =
+                    Some(Sounding { _device: device, queue, clock, rate: 0, source_rate, fed: from, spans, total: 0.0, started: false });
+                shown.at = shown.at.floor();
+                shown.playing = None;
+            }
+            Err(e) => shown.silent = Some(e),
+        }
+    }
+    let Some(sounding) = &mut shown.sounding else {
+        if let Some((since, from)) = shown.playing {
+            shown.at = from + since.elapsed().as_secs_f64() * shown.rate;
+        }
+        stop_at_end(shown);
+        return;
+    };
+    // Fed ahead of the picture.
+    let Opening::Open { sound, .. } = &shown.opening else { return };
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an item's place")]
+    let ahead = shown.at.max(0.0) as u64 + FEED;
+    let mut ended = false;
+    while sounding.fed <= ahead {
+        match sound.get(sounding.fed) {
+            Poll::Ready(item) => {
+                let heard = parts(&item).1;
+                let mut queue = sounding.queue.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(heard) = heard.filter(|h| h.rate > 0) {
+                    if sounding.rate == 0 {
+                        sounding.rate = heard.rate;
+                        sounding.source_rate.store(heard.rate, Ordering::Relaxed);
+                        queue.channels = heard.channels;
+                    }
+                    sounding.spans.push_back((sounding.fed, sounding.total));
+                    heard.extend(&mut queue.samples);
+                    #[expect(clippy::cast_precision_loss, reason = "samples of a sound")]
+                    let frames = (heard.len() / queue.channels) as f64;
+                    sounding.total += frames;
+                } else {
+                    sounding.spans.push_back((sounding.fed, sounding.total));
+                }
+                sounding.fed += 1;
+            }
+            Poll::End => {
+                ended = true;
+                break;
+            }
+            Poll::Pending | Poll::Failed(_) => break,
+        }
+    }
+    // It sounds once what is fed carries sound; none in the first items fed - made, not waited for - it has none.
+    if !sounding.started {
+        if sounding.total > 0.0 {
+            sounding.started = true;
+        } else if sounding.spans.len() as u64 > FEED {
+            shown.silent = Some("it has none".to_string());
+            shown.by_clock();
+        }
+        return;
+    }
+    // Where it is: the item whose sound is playing - its sound being what led up to it.
+    // Items fed without sound begin where the next does: the place stays on the last that sounded.
+    let played = sounding.clock.now(f64::from(sounding.rate)).min(sounding.total);
+    while sounding.spans.len() > 1 && sounding.spans[1].1 < played {
+        sounding.spans.pop_front();
+    }
+    if let Some(&(item, start)) = sounding.spans.front() {
+        let end = sounding.spans.get(1).map_or(sounding.total, |s| s.1);
+        let into = if end > start { ((played - start) / (end - start)).clamp(0.0, 1.0) } else { 0.0 };
+        #[expect(clippy::cast_precision_loss, reason = "an item's place")]
+        let at = (item as f64 - 1.0 + into).max(0.0);
+        // Never back: a buffer may begin a little before where the time since the last put it.
+        shown.at = shown.at.max(at);
+    }
+    // The sound has ended before the items: the clock goes on.
+    let empty = sounding.queue.lock().unwrap_or_else(PoisonError::into_inner).samples.is_empty();
+    #[expect(clippy::cast_precision_loss, reason = "an item's place")]
+    let fed_past = sounding.fed as f64 > shown.at + 1.0;
+    if empty && (ended || played >= sounding.total) && fed_past {
+        shown.silent = Some("its sound has ended".to_string());
+        shown.by_clock();
+    }
+    stop_at_end(shown);
+}
+
+/// Stop at its last item.
+fn stop_at_end(shown: &mut Shown) {
+    #[expect(clippy::cast_precision_loss, reason = "an item's place")]
+    let last = shown.last() as f64;
+    if shown.at >= last {
+        shown.at = last;
+        shown.playing = None;
+        shown.sounding = None;
+    }
+}
+
+/// Play or pause, where it is (an item), and the time; the sound's controls.
+fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u64, view: &mut Preview) {
+    let last = shown.last();
     ui.horizontal(|ui| {
-        let playing = shown.playing.is_some() || shown.held;
+        let playing = shown.playing.is_some() || shown.sounding.is_some() || shown.held;
         let (glyph, says) = if playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
         if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
-            shown.playing = if playing {
+            if playing {
                 shown.held = false;
-                None
+                shown.playing = None;
+                shown.sounding = None;
             } else {
                 // From the start again where it ended.
                 if number >= last {
-                    shown.at = f64::from(first);
+                    shown.at = 0.0;
                 }
-                Some((Instant::now(), shown.at))
-            };
+                shown.silent = shown.silent.take().filter(|s| s.starts_with("it has none"));
+                shown.by_clock();
+            }
         }
         // The timeline takes what the time and the sound's controls leave.
-        let sound = if shown.audio.is_some() { 120.0 } else { 0.0 };
         let mut chosen = number;
-        ui.spacing_mut().slider_width = (ui.available_width() - 110.0 - sound).max(80.0);
-        let slider = ui.add(egui::Slider::new(&mut chosen, first..=last).show_value(false));
+        ui.spacing_mut().slider_width = (ui.available_width() - 230.0).max(80.0);
+        let slider = ui.add(egui::Slider::new(&mut chosen, 0..=last.min(u64::from(u32::MAX))).show_value(false));
         // Held, it stops where it is held - picture and sound - and plays on from there when let go, if it played.
         if slider.is_pointer_button_down_on() || slider.dragged() {
-            if shown.playing.take().is_some() {
+            if shown.playing.take().is_some() | shown.sounding.take().is_some() {
                 shown.held = true;
-                shown.sounding = None;
             }
         } else if std::mem::take(&mut shown.held) {
-            shown.playing = Some((Instant::now(), shown.at));
+            shown.by_clock();
         }
         if slider.changed() {
-            shown.at = f64::from(chosen);
-            if shown.playing.is_some() {
-                // Sounding again from there.
-                shown.playing = Some((Instant::now(), shown.at));
-                shown.sounding = None;
+            #[expect(clippy::cast_precision_loss, reason = "an item's place")]
+            let chosen = chosen as f64;
+            shown.at = chosen;
+            shown.silent = shown.silent.take().filter(|s| s.starts_with("it has none"));
+            if shown.playing.is_some() || shown.sounding.is_some() {
+                shown.by_clock();
             }
         }
-        let time = |frame: u32| {
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "seconds of a movie")]
-            let seconds = (f64::from(frame - first) / rate) as u64;
+        let rate = shown.rate;
+        let time = |item: u64| {
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, reason = "seconds of a stream")]
+            let seconds = (item as f64 / rate) as u64;
             format!("{}:{:02}", seconds / 60, seconds % 60)
         };
-        ui.label(RichText::new(format!("{} / {}", time(number), time(last))).monospace());
-        if shown.audio.is_some() {
-            ui.add_space(8.0);
-            let (glyph, says) = if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
-            if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
-                view.muted = !view.muted;
-            }
-            ui.spacing_mut().slider_width = 70.0;
-            ui.add_enabled_ui(!view.muted, |ui| {
-                let percent = (view.volume * 100.0).round();
-                ui.add(egui::Slider::new(&mut view.volume, 0.0..=1.0).step_by(0.05).show_value(false)).on_hover_text(format!("Volume {percent}%"));
-            });
+        let total = if shown.count.is_some() { time(last) } else { "…".to_string() };
+        ui.label(RichText::new(format!("{} / {total}", time(number))).monospace());
+        ui.add_space(8.0);
+        let (glyph, says) = if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
+        if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
+            view.muted = !view.muted;
         }
+        ui.spacing_mut().slider_width = 70.0;
+        ui.add_enabled_ui(!view.muted, |ui| {
+            let percent = (view.volume * 100.0).round();
+            ui.add(egui::Slider::new(&mut view.volume, 0.0..=1.0).step_by(0.05).show_value(false))
+                .on_hover_text(format!("Volume {percent}%"));
+        });
     });
+    let of = shown.count.map_or_else(|| "…".to_string(), |c| format!("{}", shown.first + c.saturating_sub(1)));
     ui.label(
-        RichText::new(format!("Frame {number} of {first}–{last}  ·  {:.3} a second", shown.timing.rate))
+        RichText::new(format!("Item {} of {}–{of}  ·  {:.3} a second", shown.first + number, shown.first, shown.rate))
             .small()
             .color(theme::weak()),
     );
     if let Some(failed) = &shown.failed {
         ui.label(RichText::new(failed).small().color(theme::weak()));
     }
-    let sound = match &shown.sound {
-        _ if shown.audio.is_none() => None,
-        Sound::Unasked => Some("Sound: made when it plays".to_string()),
-        Sound::Making => Some("Sound: being made…".to_string()),
-        Sound::Made(pcm) => Some(format!(
-            "Sound: {} Hz, {}",
-            pcm.rate,
-            if pcm.channels == 2 { "stereo" } else { "mono" }
-        )),
-        Sound::Silent(why) => Some(format!("No sound: {why}")),
+    let sound = match (&shown.sounding, &shown.silent) {
+        (Some(s), _) if s.started => Some(format!("Sound: {} Hz", s.rate)),
+        (_, Some(why)) => Some(format!("No sound: {why}")),
+        _ => None,
     };
     if let Some(sound) = sound {
         ui.label(RichText::new(sound).small().color(theme::weak()));
     }
 }
 
-/// Play a sound on the default device from a sample of it (a frame of its channels, fractional), resampled to the
-/// device's rate: what plays, and where it is.
-fn sound(pcm: Arc<pe2_ext::Pcm>, from: f64, gain: &Arc<AtomicU32>, failed: Arc<Mutex<Option<String>>>) -> Result<Sounding, String> {
+/// Sound on the default device, played from a queue fed as items are read, resampled to the device's rate: the
+/// device's stream, the queue, where it is, and the rate the queue's samples come at (none until the first are fed).
+type Opened = (cpal::Stream, Arc<Mutex<Queue>>, Arc<SoundClock>, Arc<AtomicU32>);
+
+fn sound(gain: &Arc<AtomicU32>, failed: Arc<Mutex<Option<String>>>) -> Result<Opened, String> {
     let device = output_device().ok_or("no sound device")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
-    let clock = Arc::new(SoundClock::new(from));
-    let rate = pcm.rate;
+    let queue = Arc::new(Mutex::new(Queue { samples: VecDeque::new(), channels: 2 }));
+    let clock = Arc::new(SoundClock::new());
+    // The rate the queue's samples come at: told by the first fed, which the callback reads each buffer.
+    let rate = Arc::new(AtomicU32::new(0));
+    let given = (queue.clone(), gain.clone(), clock.clone(), rate.clone());
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => stream::<f32>(&device, &config.into(), (pcm, gain.clone()), (from, clock.clone()), failed),
-        cpal::SampleFormat::I16 => stream::<i16>(&device, &config.into(), (pcm, gain.clone()), (from, clock.clone()), failed),
-        cpal::SampleFormat::U16 => stream::<u16>(&device, &config.into(), (pcm, gain.clone()), (from, clock.clone()), failed),
+        cpal::SampleFormat::F32 => stream::<f32>(&device, &config.into(), given, failed),
+        cpal::SampleFormat::I16 => stream::<i16>(&device, &config.into(), given, failed),
+        cpal::SampleFormat::U16 => stream::<u16>(&device, &config.into(), given, failed),
         other => return Err(format!("the device takes {other} samples")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok(Sounding { _stream: stream, clock, rate })
+    Ok((stream, queue, clock, rate))
 }
 
 /// The device sound goes to: `PulseAudio`'s, where ALSA has one - where a desktop's default goes, and the only way out
@@ -447,36 +600,48 @@ fn output_device() -> Option<cpal::Device> {
     pulse.or_else(|| host.default_output_device())
 }
 
+type Given = (Arc<Mutex<Queue>>, Arc<AtomicU32>, Arc<SoundClock>, Arc<AtomicU32>);
+
 fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    (pcm, gain): (Arc<pe2_ext::Pcm>, Arc<AtomicU32>),
-    (from, clock): (f64, Arc<SoundClock>),
+    (queue, gain, clock, rate): Given,
     failed: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String> {
     let channels = usize::from(config.channels);
-    let source = usize::from(pcm.channels.max(1));
-    let frames = pcm.samples.len() / source;
-    let step = f64::from(pcm.rate) / f64::from(config.sample_rate.0);
-    let sample = move |frame: usize, channel: usize| {
-        let s = pcm.samples.get(frame * source + channel.min(source - 1)).copied().unwrap_or(0);
-        f32::from(s) / 32768.0 * f32::from_bits(gain.load(Ordering::Relaxed))
-    };
-    let mut position = from;
+    let device_rate = f64::from(config.sample_rate.0);
+    // The samples taken from the queue, a fraction into the next, and the one held.
+    let mut taken = 0.0f64;
+    let mut phase = 0.0f64;
+    let mut held = [0.0f32; 2];
     let output = move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        // Nothing taken until the queue's rate is told.
+        let step = f64::from(rate.load(Ordering::Relaxed)) / device_rate;
         #[expect(clippy::cast_precision_loss, reason = "a buffer's samples")]
-        clock.took(position, (out.len() / channels) as f64 * step);
+        clock.took(taken, (out.len() / channels) as f64 * step);
+        let gain = f32::from_bits(gain.load(Ordering::Relaxed));
+        let source = queue.channels.max(1);
         for frame in out.chunks_mut(channels) {
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a sample's place in the sound")]
-            let i = position as usize;
-            for (c, out) in frame.iter_mut().enumerate() {
-                *out = T::from_sample(if i < frames && c < 2 { sample(i, c) } else { 0.0 });
+            phase += step;
+            while phase >= 1.0 && queue.samples.len() >= source {
+                let samples: Vec<i16> = queue.samples.drain(..source).collect();
+                held = [f32::from(samples[0]) / 32768.0, f32::from(samples[source.min(2) - 1]) / 32768.0];
+                phase -= 1.0;
+                taken += 1.0;
             }
-            position += step;
+            if phase >= 1.0 {
+                // Starved: silence, and the place holds.
+                held = [0.0; 2];
+                phase = 0.0;
+            }
+            for (c, out) in frame.iter_mut().enumerate() {
+                *out = T::from_sample(if c < 2 { held[c] * gain } else { 0.0 });
+            }
         }
     };
     let error = move |e: cpal::StreamError| {
-        *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
+        *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
     };
     device.build_output_stream(config, output, error, None).map_err(|e| e.to_string())
 }

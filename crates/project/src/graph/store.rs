@@ -63,6 +63,8 @@ pub enum Kept {
     Image { width: usize, height: usize, blob: Blob },
     Table { table: Table },
     Pcm { rate: u32, channels: u16, blob: Blob },
+    Video { format: String, width: u32, height: u32, timestamp: u64, blob: Blob },
+    Audio { format: String, sample_rate: u32, channels: u32, timestamp: u64, blob: Blob },
     /// Its items, each kept by its own hash.
     List { items: Vec<String> },
 }
@@ -72,7 +74,9 @@ impl Kept {
     fn blobs(&self) -> Vec<&Blob> {
         match self {
             Kept::Typed { files, .. } => files.iter().map(|f| &f.blob).collect(),
-            Kept::Image { blob, .. } | Kept::Pcm { blob, .. } => vec![blob],
+            Kept::Image { blob, .. } | Kept::Pcm { blob, .. } | Kept::Video { blob, .. } | Kept::Audio { blob, .. } => {
+                vec![blob]
+            }
             Kept::Table { .. } | Kept::List { .. } => vec![],
         }
     }
@@ -216,6 +220,20 @@ impl Store {
                 let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
                 Kept::Pcm { rate: pcm.rate, channels: pcm.channels, blob: self.put_blob(&bytes)? }
             }
+            Value::Video(frame) => Kept::Video {
+                format: frame.format.name().to_string(),
+                width: frame.width,
+                height: frame.height,
+                timestamp: frame.timestamp,
+                blob: self.put_blob(frame.buffer.bytes())?,
+            },
+            Value::Audio(sound) => Kept::Audio {
+                format: sound.format.name().to_string(),
+                sample_rate: sound.sample_rate,
+                channels: sound.channels,
+                timestamp: sound.timestamp,
+                blob: self.put_blob(sound.buffer.bytes())?,
+            },
             Value::List(items) => {
                 let mut hashes = Vec::with_capacity(items.len());
                 for item in items {
@@ -259,6 +277,20 @@ impl Store {
                 Value::Typed(Typed { ty, also, files: files.into_iter().map(file).collect(), settings, notes })
             }
             Kept::Image { width, height, blob } => Value::Image(Image { width, height, rgba: self.read_blob(&blob)? }),
+            Kept::Video { format, width, height, timestamp, blob } => Value::Video(pe2_ext::media::VideoFrame {
+                format: pe2_ext::media::PixelFormat::named(&format).with_context(|| format!("{hash}: no layout {format}"))?,
+                buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
+                width,
+                height,
+                timestamp,
+            }),
+            Kept::Audio { format, sample_rate, channels, timestamp, blob } => Value::Audio(pe2_ext::media::AudioData {
+                format: pe2_ext::media::SampleFormat::named(&format).with_context(|| format!("{hash}: no layout {format}"))?,
+                buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
+                sample_rate,
+                channels,
+                timestamp,
+            }),
             Kept::Table { table } => Value::Table(table),
             Kept::Pcm { rate, channels, blob } => {
                 let bytes = self.read_blob(&blob)?;

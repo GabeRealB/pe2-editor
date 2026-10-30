@@ -434,14 +434,14 @@ impl pe2_ext::FileWriter for Writer {
 }
 
 /// The hashes of a value's stored contents.
-fn stored_contents(value: &Value, out: &mut Vec<String>) {
+pub(crate) fn stored_contents(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::Typed(typed) => out.extend(typed.files.iter().filter_map(|f| match &f.content {
             Content::Stored { sha1, .. } => Some(sha1.clone()),
             Content::Inline(_) => None,
         })),
         Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
-        Value::Image(_) | Value::Table(_) | Value::Pcm(_) => {}
+        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) => {}
     }
 }
 
@@ -555,9 +555,15 @@ struct Evaluation<'a> {
 
 impl Evaluation<'_> {
     fn run(&self, outputs: &[usize], parameter: Option<&str>) -> Vec<Made> {
+        let steps: Vec<usize> = outputs.iter().map(|&o| self.plan.outputs[o].from).collect();
+        self.run_steps(&steps, parameter)
+    }
+
+    /// The values of these steps, made as `run` makes outputs'.
+    fn run_steps(&self, targets: &[usize], parameter: Option<&str>) -> Vec<Made> {
         let plan = self.plan;
         let known: HashMap<usize, (&Arc<Value>, &Reads)> = self.known.iter().map(|(s, v, r)| (*s, (v, r))).collect();
-        let needed = plan.reached_until(outputs, &known.keys().copied().collect());
+        let needed = plan.steps_reached(targets, &known.keys().copied().collect());
         // How many times each step's value is still to be taken: by the steps needed, and by the outputs.
         let mut left = vec![0usize; plan.steps.len()];
         for (s, step) in plan.steps.iter().enumerate().filter(|(s, _)| needed[*s] && !known.contains_key(s)) {
@@ -566,8 +572,8 @@ impl Evaluation<'_> {
                 left[from] += 1;
             }
         }
-        for &o in outputs {
-            left[plan.outputs[o].from] += 1;
+        for &t in targets {
+            left[t] += 1;
         }
         let mut slots: Vec<Option<Made>> = vec![None; plan.steps.len()];
         let take = |slots: &mut Vec<Option<Made>>, left: &mut Vec<usize>, s: usize| -> Made {
@@ -601,7 +607,7 @@ impl Evaluation<'_> {
             };
             slots[s] = Some(made);
         }
-        outputs.iter().map(|&o| take(&mut slots, &mut left, plan.outputs[o].from)).collect()
+        targets.iter().map(|&t| take(&mut slots, &mut left, t)).collect()
     }
 
     /// Run a step: what it is given checked against its ports (their variables bound by it), what it makes against
@@ -609,7 +615,10 @@ impl Evaluation<'_> {
     fn step(&self, step: &super::Step, mut inputs: Vec<Vec<Input>>, parameter: Option<&str>, recorder: Recorder<'_>) -> Made {
         let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
         let Some(def) = self.ops.get(&step.op) else { return fail(format!("`{}`: no extension provides it", step.op)) };
-        let Some(run) = def.run.as_ref() else { return fail(format!("`{}` makes nothing", step.op)) };
+        let Some(run) = def.run.as_ref() else {
+            let what = if def.start.is_some() { "is a stream, opened rather than made" } else { "makes nothing" };
+            return fail(format!("`{}` {what}", step.op));
+        };
         let mut bound = Vec::new();
         for (port, given) in def.inputs.iter().zip(&mut inputs) {
             for value in given {
@@ -760,6 +769,39 @@ impl Engine {
             store.put_trace(&self.key(plan, node, output, parameter), &trace)?;
         }
         Ok(Given { value: Some(value), hash, kept: false, reads })
+    }
+
+    /// Open a stream output (`stream`): what its operation takes evaluated as any output's inputs - found kept where
+    /// they are - and its producer started with them. Returns the producer, what it read, and the key it is known by.
+    ///
+    /// # Errors
+    /// The node has no such output, it is no stream, or what it takes could not be made.
+    pub fn open_stream(
+        &self,
+        reach: Option<Reach<'_>>,
+        plan: &Plan,
+        node: &dyn Node,
+        address: &str,
+    ) -> Result<(Box<dyn super::stream::Producer>, Reads, String)> {
+        let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
+        let parameter = parameter.as_deref();
+        let step = &plan.steps[plan.outputs[output].from];
+        let def = self.ops.get(&step.op).with_context(|| format!("`{}`: no extension provides it", step.op))?;
+        let start = def.start.as_ref().with_context(|| format!("{address} is no stream"))?;
+        let known = self.known(reach, plan, node, output);
+        let reads = Mutex::new(Reads::default());
+        let others = Mutex::default();
+        let context = Evaluation { plan, ops: &self.ops, node, known: &known, store: self.store.as_ref(), reach, reads: &reads, others: &others };
+        let mut inputs = Vec::with_capacity(step.inputs.len());
+        for port in &step.inputs {
+            let values = context.run_steps(port, parameter);
+            inputs.push(values.into_iter().map(|v| v.map(Input).map_err(|e| anyhow!("{e}"))).collect::<Result<Vec<_>>>()?);
+        }
+        let recorder = Recorder { node, reads: &reads };
+        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store.as_ref(), reach, others: &others };
+        let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()))?;
+        let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((producer, reads, self.key(plan, node, output, parameter)))
     }
 
     /// Run one operation now, outside any plan, given its values by port: what an inverse writes from what its import

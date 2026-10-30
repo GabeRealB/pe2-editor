@@ -39,11 +39,18 @@ pub enum Type {
     Union(Vec<Type>),
     /// Of a type, as one file: a representation, which the host makes a value of the type take where it can.
     File(Box<Type>),
+    /// A stream of values of a type: a header, then its items made as they are read (`Generator`). Never a value: an
+    /// output that is one is opened, not made.
+    Stream(Box<Type>),
+    /// A frame, in a buffer the host holds (`media::VideoFrame`).
+    Video,
+    /// A stretch of sound, in a buffer the host holds (`media::AudioData`).
+    Audio,
 }
 
 impl Type {
     /// A type as it is written: `any`, `image`, `table`, `pcm`, `bytes`, a variable (one capital letter, `T`),
-    /// `list<T>`, `file<T>` (`file` alone: `file<any>`), a union (`a | b`), or a type's name - bare, qualified by `id`
+    /// `list<T>`, `file<T>` (`file` alone: `file<any>`), `stream<T>`, a union (`a | b`), or a type's name - bare, qualified by `id`
     /// - or a media type.
     ///
     /// # Errors
@@ -75,10 +82,13 @@ impl Type {
             "image" => Type::Image,
             "table" => Type::Table,
             "pcm" => Type::Pcm,
+            "video" => Type::Video,
+            "audio" => Type::Audio,
             "bytes" => Type::Bytes,
             "file" => Type::File(Box::new(Type::Any)),
             _ if inner("file<").is_some() => Type::File(Box::new(Type::parse(inner("file<").unwrap_or_default(), id)?)),
             _ if inner("list<").is_some() => Type::List(Box::new(Type::parse(inner("list<").unwrap_or_default(), id)?)),
+            _ if inner("stream<").is_some() => Type::Stream(Box::new(Type::parse(inner("stream<").unwrap_or_default(), id)?)),
             _ if text.len() == 1 && text.chars().all(|c| c.is_ascii_uppercase()) => Type::Var(text.to_string()),
             _ if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "_.@-/+".contains(c)) => {
                 Type::Named(qualify(text, id))
@@ -114,10 +124,10 @@ impl Type {
             (port, Type::Union(given)) => given.iter().any(|g| port.unify(g, bound)),
             (Type::File(port), Type::File(given)) => port.unify(given, bound),
             // What the host holds in memory alone is no file.
-            (Type::File(_), Type::Image | Type::Table | Type::Pcm | Type::List(_)) => false,
+            (Type::File(_), Type::Image | Type::Table | Type::Pcm | Type::Video | Type::Audio | Type::List(_)) => false,
             (Type::File(port), given) => port.unify(given, bound),
             (port, Type::File(given)) => port.unify(given.as_ref(), bound),
-            (Type::List(a), Type::List(b)) => a.unify(b, bound),
+            (Type::List(a), Type::List(b)) | (Type::Stream(a), Type::Stream(b)) => a.unify(b, bound),
             (a, b) => a == b,
         }
     }
@@ -129,6 +139,7 @@ impl Type {
             Type::Var(v) => bound.iter().find(|(b, _)| b == v).map_or_else(|| self.clone(), |(_, t)| t.clone()),
             Type::List(item) => Type::List(Box::new(item.bind(bound))),
             Type::File(of) => Type::File(Box::new(of.bind(bound))),
+            Type::Stream(item) => Type::Stream(Box::new(item.bind(bound))),
             Type::Union(any) => Type::Union(any.iter().map(|t| t.bind(bound)).collect()),
             _ => self.clone(),
         }
@@ -138,6 +149,12 @@ impl Type {
     #[must_use]
     pub fn wants_file(&self) -> bool {
         matches!(self, Type::File(_))
+    }
+
+    /// Whether it is a stream: what an output of it is opened as.
+    #[must_use]
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Type::Stream(_))
     }
 }
 
@@ -156,8 +173,11 @@ impl fmt::Display for Type {
             Type::Image => f.write_str("image"),
             Type::Table => f.write_str("table"),
             Type::Pcm => f.write_str("pcm"),
+            Type::Video => f.write_str("video"),
+            Type::Audio => f.write_str("audio"),
             Type::Bytes => f.write_str("bytes"),
             Type::List(item) => write!(f, "list<{item}>"),
+            Type::Stream(item) => write!(f, "stream<{item}>"),
             Type::Named(name) => f.write_str(name),
             Type::Union(any) => {
                 let names: Vec<String> = any.iter().map(ToString::to_string).collect();
@@ -249,6 +269,8 @@ pub enum Value {
     Pcm(Pcm),
     List(Vec<Value>),
     Typed(Typed),
+    Video(crate::media::VideoFrame),
+    Audio(crate::media::AudioData),
 }
 
 impl Value {
@@ -258,6 +280,8 @@ impl Value {
             Value::Image(_) => Type::Image,
             Value::Table(_) => Type::Table,
             Value::Pcm(_) => Type::Pcm,
+            Value::Video(_) => Type::Video,
+            Value::Audio(_) => Type::Audio,
             Value::List(items) => Type::List(Box::new(items.first().map_or(Type::Any, Value::ty))),
             Value::Typed(typed) => {
                 let named = |name: &str| if name == BYTES { Type::Bytes } else { Type::Named(name.to_string()) };
@@ -555,6 +579,32 @@ impl Source for Lent<'_> {
 /// What an operation does when it runs.
 pub type RunOp = dyn Fn(&mut Call<'_>) -> Result<Value> + Send + Sync;
 
+/// What a stream operation does when it is opened: given its inputs, settings and parameter, it starts its generator.
+pub type StartStream = dyn Fn(&mut Call<'_>) -> Result<Box<dyn Generator>> + Send + Sync;
+
+/// What makes a stream's items, a batch at a time, as its readers come near the end of those made: started by a
+/// stream operation from what it is given (keeping what it reads by - its inputs' files, by content), then asked for
+/// more, or to go on from elsewhere. Each call is given a `Call` of no inputs - the node's settings, its contents by
+/// hash - through which it reads what it kept.
+pub trait Generator: Send {
+    /// What the stream is: a table its readers understand (`rate`, items a second; `count`, where it is known; what
+    /// its items hold).
+    fn header(&self) -> Table;
+    /// Up to `count` items after the last: fewer, or none, where the stream ends.
+    ///
+    /// # Errors
+    /// They cannot be made.
+    fn next(&mut self, call: &Call<'_>, count: usize) -> Result<Vec<Value>>;
+    /// Go on from the item at `position`: whether it can (else it goes on as it was, and is read up to there).
+    ///
+    /// # Errors
+    /// It could not get there.
+    fn seek(&mut self, call: &Call<'_>, position: u64) -> Result<bool> {
+        let _ = (call, position);
+        Ok(false)
+    }
+}
+
 /// An operation as registered.
 #[derive(Clone)]
 pub struct OpDef {
@@ -574,6 +624,8 @@ pub struct OpDef {
     /// Which of several operations taking a source is offered first: the highest.
     pub priority: i32,
     pub run: Arc<RunOp>,
+    /// For a stream operation (its output a `stream<T>`): how it is opened.
+    pub start: Option<Arc<StartStream>>,
 }
 
 /// A family's members: each by the value of its parameter, with a label.

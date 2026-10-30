@@ -55,12 +55,13 @@ mod bindings {
             "pe2:extension/host.declarations": super::LentDeclarations,
             "pe2:extension/host.discs": super::LentDiscs,
             "pe2:extension/host.writer": super::HostWriter,
+            "pe2:extension/media.media-buffer": super::HostMediaBuffer,
         },
     });
 }
 
 use bindings::exports::pe2::extension::guest as g;
-use bindings::pe2::extension::{host, types};
+use bindings::pe2::extension::{host, media, types};
 
 /// The engine's epoch ticks this often: deadlines are counted in its ticks.
 const TICK: Duration = Duration::from_millis(10);
@@ -247,6 +248,9 @@ pub struct LentAsset {
 
 // SAFETY: a lent asset is read only during the call that lent it, on the thread making the call.
 unsafe impl Send for LentAsset {}
+
+/// Bytes the host holds for a component: a frame's planes, a stretch of sound - shared by every handle to them.
+pub struct HostMediaBuffer(Arc<Vec<u8>>);
 
 /// A file an operation makes, held for the component writing it: the host's writer (`CallHost::writer`) until it is
 /// finished.
@@ -654,6 +658,70 @@ impl host::HostTexture for State {
     fn drop(&mut self, texture: Resource<HostTexture>) -> wasmtime::Result<()> {
         self.table.delete(texture)?;
         Ok(())
+    }
+}
+
+impl media::Host for State {
+    fn pixel_formats(&mut self) -> wasmtime::Result<Vec<media::PixelFormat>> {
+        Ok(pe2_ext::media::pixel_formats().into_iter().map(pixel_format_to_wit).collect())
+    }
+
+    fn sample_formats(&mut self) -> wasmtime::Result<Vec<media::SampleFormat>> {
+        Ok(pe2_ext::media::sample_formats().into_iter().map(sample_format_to_wit).collect())
+    }
+}
+
+impl media::HostMediaBuffer for State {
+    fn new(&mut self, data: Vec<u8>) -> wasmtime::Result<Resource<HostMediaBuffer>> {
+        Ok(self.table.push(HostMediaBuffer(Arc::new(data)))?)
+    }
+
+    fn size(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<u64> {
+        Ok(self.table.get(&buffer)?.0.len() as u64)
+    }
+
+    fn share(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<Resource<HostMediaBuffer>> {
+        let bytes = self.table.get(&buffer)?.0.clone();
+        Ok(self.table.push(HostMediaBuffer(bytes))?)
+    }
+
+    fn drop(&mut self, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<()> {
+        self.table.delete(buffer)?;
+        Ok(())
+    }
+}
+
+fn pixel_format_to_wit(format: pe2_ext::media::PixelFormat) -> media::PixelFormat {
+    use pe2_ext::media::PixelFormat as F;
+    match format {
+        F::Rgba8888 => media::PixelFormat::Rgba8888,
+        F::Bgra8888 => media::PixelFormat::Bgra8888,
+        F::Yuv420p => media::PixelFormat::Yuv420p,
+        F::Nv12 => media::PixelFormat::Nv12,
+    }
+}
+
+fn pixel_format_from_wit(format: media::PixelFormat) -> pe2_ext::media::PixelFormat {
+    use pe2_ext::media::PixelFormat as F;
+    match format {
+        media::PixelFormat::Rgba8888 => F::Rgba8888,
+        media::PixelFormat::Bgra8888 => F::Bgra8888,
+        media::PixelFormat::Yuv420p => F::Yuv420p,
+        media::PixelFormat::Nv12 => F::Nv12,
+    }
+}
+
+fn sample_format_to_wit(format: pe2_ext::media::SampleFormat) -> media::SampleFormat {
+    match format {
+        pe2_ext::media::SampleFormat::S16Interleaved => media::SampleFormat::S16Interleaved,
+        pe2_ext::media::SampleFormat::F32Planar => media::SampleFormat::F32Planar,
+    }
+}
+
+fn sample_format_from_wit(format: media::SampleFormat) -> pe2_ext::media::SampleFormat {
+    match format {
+        media::SampleFormat::S16Interleaved => pe2_ext::media::SampleFormat::S16Interleaved,
+        media::SampleFormat::F32Planar => pe2_ext::media::SampleFormat::F32Planar,
     }
 }
 
@@ -1260,6 +1328,52 @@ impl Drop for ComponentView {
     }
 }
 
+/// A stream's generator living in an instance of its own while the stream is read.
+struct ComponentGenerator {
+    shared: Arc<Shared>,
+    runner: Runner,
+    resource: Option<ResourceAny>,
+    header: Table,
+}
+
+impl pe2_ext::Generator for ComponentGenerator {
+    fn header(&self) -> Table {
+        self.header.clone()
+    }
+
+    fn next(&mut self, call: &pe2_ext::Call<'_>, count: usize) -> Result<Vec<pe2_ext::Data>> {
+        let resource = self.resource.context("closed")?;
+        let node = Node::new(call.host);
+        let asset = Asset::new(&node, call.host.kind(), call.host.role());
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let made = self
+            .runner
+            .with_asset(&asset, LONG, async |a, g, lent| g.generator().call_next(a, resource, lent, count).await)?;
+        self.shared.peak.fetch_max(self.runner.bytes(), Ordering::Relaxed);
+        let table = &mut self.runner.store.data_mut().table;
+        made.map_err(|e| anyhow!(e))?.into_iter().map(|v| value_from_wit(v, table)).collect()
+    }
+
+    fn seek(&mut self, call: &pe2_ext::Call<'_>, position: u64) -> Result<bool> {
+        let resource = self.resource.context("closed")?;
+        let node = Node::new(call.host);
+        let asset = Asset::new(&node, call.host.kind(), call.host.role());
+        let moved = self
+            .runner
+            .with_asset(&asset, LONG, async |a, g, lent| g.generator().call_seek(a, resource, lent, position).await)?;
+        moved.map_err(|e| anyhow!(e))
+    }
+}
+
+impl Drop for ComponentGenerator {
+    fn drop(&mut self) {
+        if let Some(resource) = self.resource.take() {
+            let Runner { store, runtime, .. } = &mut self.runner;
+            let _ = drive(runtime, resource.resource_drop_async(&mut *store));
+        }
+    }
+}
+
 /// An extraction session in an instance of its own, which keeps what the session read between its assets.
 struct ComponentExtraction {
     id: String,
@@ -1483,13 +1597,6 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         if let Some(stack) = &kind.stack {
             builder = builder.stack(stack);
         }
-        if let Some(playback) = &kind.playback {
-            let shared = shared.clone();
-            builder = builder.playback(&playback.frames, playback.audio.as_deref(), move |asset| {
-                let timing = shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_timing_of(a, index, lent).await));
-                timing.ok().flatten().map(|t| pe2_ext::Timing { first: t.first, count: t.count, rate: t.rate })
-            });
-        }
         if kind.parts {
             let shared = shared.clone();
             builder = builder.parts(move |asset| {
@@ -1594,17 +1701,40 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             builder = builder.parameter_described(name, kind);
         }
         let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
+        if op.output.starts_with("stream<") {
+            let _ = builder.streams_described(move |call| {
+                let given = std::mem::take(&mut call.inputs);
+                let settings = toml::to_string(call.settings).unwrap_or_default();
+                let parameter = call.parameter_text.map(str::to_string);
+                let node = Node::new(call.host);
+                let asset = Asset::new(&node, call.host.kind(), call.host.role());
+                // An instance of its own, kept while the stream is read.
+                let mut runner = shared.instantiate(cap).with_context(|| shared.id.clone())?;
+                let inputs = values_to_wit(given, &mut runner.store.data_mut().table)?;
+                let started = runner.with_asset(&asset, LONG, async |a, g, lent| {
+                    g.call_start_stream(a, handle, lent, inputs, settings, parameter).await
+                })?;
+                let resource = started.map_err(|e| anyhow!(e))?;
+                let header = runner.call(QUICK, async |a, g| g.generator().call_header(a, resource).await)?;
+                let header = toml::from_str(&header).unwrap_or_default();
+                Ok(Box::new(ComponentGenerator { shared: shared.clone(), runner, resource: Some(resource), header })
+                    as Box<dyn pe2_ext::Generator>)
+            });
+            return;
+        }
         let _ = builder.run(move |call| {
-            let inputs: Vec<Vec<types::Value>> =
-                std::mem::take(&mut call.inputs).into_iter().map(|port| port.into_iter().map(value_to_wit).collect()).collect();
+            let given = std::mem::take(&mut call.inputs);
             let settings = toml::to_string(call.settings).unwrap_or_default();
             let parameter = call.parameter_text.map(str::to_string);
             let node = Node::new(call.host);
             let asset = Asset::new(&node, call.host.kind(), call.host.role());
-            let made = shared.job(cap, |r| {
-                r.with_asset(&asset, LONG, async |a, g, lent| g.call_run_op(a, handle, lent, inputs, settings, parameter).await)
-            })?;
-            made.map(value_from_wit).map_err(|e| anyhow!(e))
+            shared.job(cap, |r| {
+                let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
+                let made = r.with_asset(&asset, LONG, async |a, g, lent| {
+                    g.call_run_op(a, handle, lent, inputs, settings, parameter).await
+                })?;
+                value_from_wit(made.map_err(|e| anyhow!(e))?, &mut r.store.data_mut().table)
+            })
         });
     }
 }
@@ -1664,11 +1794,24 @@ impl Source for Node<'_> {
     }
 }
 
+/// Each port's values as the contract carries them, their media buffers handed to the instance.
+fn values_to_wit(ports: Vec<Vec<pe2_ext::Data>>, table: &mut ResourceTable) -> Result<Vec<Vec<types::Value>>> {
+    ports.into_iter().map(|port| port.into_iter().map(|v| value_to_wit(v, table)).collect()).collect()
+}
+
+/// A media buffer the host holds, handed to an instance.
+fn buffer_to_wit(buffer: &pe2_ext::media::MediaBuffer, table: &mut ResourceTable) -> Result<Resource<HostMediaBuffer>> {
+    Ok(table.push(HostMediaBuffer(buffer.bytes().clone()))?)
+}
+
 /// A value as the contract carries it: a list's items that are lists themselves are dropped (it carries one level).
-fn value_to_wit(value: pe2_ext::Data) -> types::Value {
+fn value_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<types::Value> {
     use pe2_ext::Data;
-    match value {
-        Data::List(items) => types::Value::Items(items.into_iter().filter_map(item_to_wit).collect()),
+    Ok(match value {
+        Data::List(items) => {
+            let items: Vec<Option<types::Item>> = items.into_iter().map(|v| item_to_wit(v, table)).collect::<Result<_>>()?;
+            types::Value::Items(items.into_iter().flatten().collect())
+        }
         Data::Image(image) => types::Value::Image(to_wit(image)),
         Data::Table(table) => types::Value::Table(toml::to_string(&table).unwrap_or_default()),
         Data::Pcm(pcm) => types::Value::Pcm(types::Pcm { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples }),
@@ -1679,17 +1822,33 @@ fn value_to_wit(value: pe2_ext::Data) -> types::Value {
             settings: toml::to_string(&t.settings).unwrap_or_default(),
             notes: t.notes,
         }),
-    }
+        Data::Video(frame) => types::Value::Video(media::VideoFrame {
+            buffer: buffer_to_wit(&frame.buffer, table)?,
+            format: pixel_format_to_wit(frame.format),
+            width: frame.width,
+            height: frame.height,
+            timestamp: frame.timestamp,
+        }),
+        Data::Audio(sound) => types::Value::Audio(media::AudioData {
+            buffer: buffer_to_wit(&sound.buffer, table)?,
+            format: sample_format_to_wit(sound.format),
+            sample_rate: sound.sample_rate,
+            channels: sound.channels,
+            timestamp: sound.timestamp,
+        }),
+    })
 }
 
-fn item_to_wit(value: pe2_ext::Data) -> Option<types::Item> {
-    Some(match value_to_wit(value) {
+fn item_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<Option<types::Item>> {
+    Ok(Some(match value_to_wit(value, table)? {
         types::Value::Image(i) => types::Item::Image(i),
         types::Value::Table(t) => types::Item::Table(t),
         types::Value::Pcm(p) => types::Item::Pcm(p),
         types::Value::Typed(t) => types::Item::Typed(t),
-        types::Value::Items(_) => return None,
-    })
+        types::Value::Video(v) => types::Item::Video(v),
+        types::Value::Audio(a) => types::Item::Audio(a),
+        types::Value::Items(_) => return Ok(None),
+    }))
 }
 
 fn file_to_wit(f: pe2_ext::File) -> types::File {
@@ -1701,19 +1860,28 @@ fn file_to_wit(f: pe2_ext::File) -> types::File {
 }
 
 /// A value as the contract carried it.
-fn value_from_wit(value: types::Value) -> pe2_ext::Data {
+fn value_from_wit(value: types::Value, table: &mut ResourceTable) -> Result<pe2_ext::Data> {
     match value {
-        types::Value::Image(i) => item_from_wit(types::Item::Image(i)),
-        types::Value::Table(t) => item_from_wit(types::Item::Table(t)),
-        types::Value::Pcm(p) => item_from_wit(types::Item::Pcm(p)),
-        types::Value::Typed(t) => item_from_wit(types::Item::Typed(t)),
-        types::Value::Items(items) => pe2_ext::Data::List(items.into_iter().map(item_from_wit).collect()),
+        types::Value::Image(i) => item_from_wit(types::Item::Image(i), table),
+        types::Value::Table(t) => item_from_wit(types::Item::Table(t), table),
+        types::Value::Pcm(p) => item_from_wit(types::Item::Pcm(p), table),
+        types::Value::Typed(t) => item_from_wit(types::Item::Typed(t), table),
+        types::Value::Video(v) => item_from_wit(types::Item::Video(v), table),
+        types::Value::Audio(a) => item_from_wit(types::Item::Audio(a), table),
+        types::Value::Items(items) => {
+            Ok(pe2_ext::Data::List(items.into_iter().map(|i| item_from_wit(i, table)).collect::<Result<_>>()?))
+        }
     }
 }
 
-fn item_from_wit(item: types::Item) -> pe2_ext::Data {
+/// A media buffer an instance hands over: its handle taken back, the bytes it names kept.
+fn buffer_from_wit(buffer: Resource<HostMediaBuffer>, table: &mut ResourceTable) -> Result<pe2_ext::media::MediaBuffer> {
+    Ok(pe2_ext::media::MediaBuffer::shared(table.delete(buffer)?.0))
+}
+
+fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext::Data> {
     use pe2_ext::Data;
-    match item {
+    Ok(match item {
         types::Item::Image(i) => Data::Image(Image { width: i.width as usize, height: i.height as usize, rgba: i.rgba }),
         types::Item::Table(t) => Data::Table(toml::from_str(&t).unwrap_or_default()),
         types::Item::Pcm(p) => Data::Pcm(pe2_ext::Pcm { rate: p.rate, channels: p.channels, samples: p.samples }),
@@ -1724,7 +1892,21 @@ fn item_from_wit(item: types::Item) -> pe2_ext::Data {
             settings: toml::from_str(&t.settings).unwrap_or_default(),
             notes: t.notes,
         }),
-    }
+        types::Item::Video(v) => Data::Video(pe2_ext::media::VideoFrame {
+            buffer: buffer_from_wit(v.buffer, table)?,
+            format: pixel_format_from_wit(v.format),
+            width: v.width,
+            height: v.height,
+            timestamp: v.timestamp,
+        }),
+        types::Item::Audio(a) => Data::Audio(pe2_ext::media::AudioData {
+            buffer: buffer_from_wit(a.buffer, table)?,
+            format: sample_format_from_wit(a.format),
+            sample_rate: a.sample_rate,
+            channels: a.channels,
+            timestamp: a.timestamp,
+        }),
+    })
 }
 
 fn file_from_wit(f: types::File) -> pe2_ext::File {

@@ -19,6 +19,7 @@
 
 pub mod exec;
 pub mod store;
+pub mod stream;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -55,6 +56,22 @@ pub fn hash(value: &Value) -> String {
             let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
             format!("pcm {} {}\n{}", pcm.rate, pcm.channels, sha1(&bytes))
         }
+        Value::Video(frame) => format!(
+            "video {} {}x{} {}\n{}",
+            frame.format.name(),
+            frame.width,
+            frame.height,
+            frame.timestamp,
+            sha1(frame.buffer.bytes())
+        ),
+        Value::Audio(sound) => format!(
+            "audio {} {} {} {}\n{}",
+            sound.format.name(),
+            sound.sample_rate,
+            sound.channels,
+            sound.timestamp,
+            sha1(sound.buffer.bytes())
+        ),
         Value::List(items) => items.iter().fold(String::from("list\n"), |mut text, item| {
             let _ = writeln!(text, "{}", hash(item));
             text
@@ -78,6 +95,9 @@ pub fn ports(name: &str, ty: Type) -> Port {
 /// What an operation does when it runs.
 pub type Run = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Value> + Send + Sync;
 
+/// What a stream operation does when it is opened: starts what makes its items.
+pub type Start = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Box<dyn stream::Producer>> + Send + Sync;
+
 /// An operation type: its ports, what it makes, and how. One taking nothing is a source; one making nothing an output.
 #[derive(Clone)]
 pub struct OpDef {
@@ -90,13 +110,15 @@ pub struct OpDef {
     /// Its parameter's name: what reaches it is a family of it.
     pub parameter: Option<String>,
     pub run: Option<Arc<Run>>,
+    /// For a stream operation: how it is opened.
+    pub start: Option<Arc<Start>>,
 }
 
 impl OpDef {
     #[must_use]
     pub fn new(name: &str, label: &str, version: &str) -> OpDef {
         let (name, label, version) = (name.to_string(), label.to_string(), version.to_string());
-        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None }
+        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None }
     }
 
     /// With a parameter: what reaches it is a family of it.
@@ -109,6 +131,18 @@ impl OpDef {
     #[must_use]
     pub fn input(mut self, port: Port) -> OpDef {
         self.inputs.push(port);
+        self
+    }
+
+    /// A stream operation: it makes a stream of `item`s, opened by starting what `start` makes.
+    #[must_use]
+    pub fn streams(
+        mut self,
+        item: Type,
+        start: impl Fn(&mut exec::Call<'_>) -> anyhow::Result<Box<dyn stream::Producer>> + Send + Sync + 'static,
+    ) -> OpDef {
+        self.output = Some(Type::Stream(Box::new(item)));
+        self.start = Some(Arc::new(start));
         self
     }
 
@@ -380,8 +414,15 @@ impl Plan {
     /// The steps an output reaches, not going past those `known` (made already).
     #[must_use]
     pub fn reached_until(&self, outputs: &[usize], known: &std::collections::HashSet<usize>) -> Vec<bool> {
+        let steps: Vec<usize> = outputs.iter().map(|&o| self.outputs[o].from).collect();
+        self.steps_reached(&steps, known)
+    }
+
+    /// The steps these reach, themselves among them, not going past those `known`.
+    #[must_use]
+    pub fn steps_reached(&self, steps: &[usize], known: &std::collections::HashSet<usize>) -> Vec<bool> {
         let mut needed = vec![false; self.steps.len()];
-        let mut todo: Vec<usize> = outputs.iter().map(|&o| self.outputs[o].from).collect();
+        let mut todo: Vec<usize> = steps.to_vec();
         while let Some(s) = todo.pop() {
             if !std::mem::replace(&mut needed[s], true) && !known.contains(&s) {
                 todo.extend(self.steps[s].inputs.iter().flatten());
