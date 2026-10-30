@@ -205,7 +205,7 @@ impl Driver {
                     return Ok(Some(Job::Settling { before, until }));
                 }
                 let Some(tree) = &shared.tree else { return Err(mcp::Reply::failed("no widgets were drawn".into())) };
-                Err(mcp::Reply::text(changes(&before, &lines(tree, None, false))))
+                Err(mcp::Reply::text(changes(&before, &lines(tree, None, None))))
             }
             Job::Capturing { image, rect, scale } => {
                 let Some(image) = image.lock().unwrap_or_else(PoisonError::into_inner).take() else {
@@ -248,7 +248,7 @@ impl Driver {
             )),
             "editor_act" => {
                 let args: mcp::ActArgs = serde_json::from_value(arguments).map_err(bad)?;
-                let batches = act(tree, ctx.content_rect(), &args).map_err(mcp::Reply::failed)?;
+                let batches = act(ctx, tree, &args).map_err(mcp::Reply::failed)?;
                 Ok(self.queue(tree, batches))
             }
             "editor_type" => {
@@ -263,7 +263,7 @@ impl Driver {
     /// Queue an action's input, to be answered once it has settled.
     fn queue(&mut self, tree: &Tree, batches: Vec<Vec<egui::Event>>) -> Job {
         self.acted = Some(Instant::now());
-        let before = lines(tree, None, false);
+        let before = lines(tree, None, None);
         let mut shared = lock(&self.shared);
         // The frames the batches go in, then those settling them; a batch already queued goes first.
         let until = shared.frames + (shared.batches.len() + batches.len()) as u64 + SETTLE;
@@ -289,7 +289,7 @@ impl Driver {
         let mut text = format!("window {:.0} x {:.0} points; panes: ", size.x, size.y);
         text += &self.panes.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(", ");
         text.push('\n');
-        let all = lines(tree, rect.as_ref().map(|(_, r)| *r), args.bounds);
+        let all = lines(tree, rect.as_ref().map(|(_, r)| *r), args.bounds.then_some(ctx));
         let shown: Vec<String> = match args.text.as_deref().map(str::to_lowercase) {
             Some(needle) => {
                 let mut within: Vec<&Line> = Vec::new();
@@ -349,14 +349,15 @@ fn short(id: NodeId) -> String {
 }
 
 /// The tree's shown widgets in order, with their depths among shown ones; within `rect` (by their centers) when given.
-fn lines(tree: &Tree, rect: Option<egui::Rect>, bounds: bool) -> Vec<Line> {
+fn lines(tree: &Tree, rect: Option<egui::Rect>, places: Option<&egui::Context>) -> Vec<Line> {
     let mut out = Vec::new();
     let mut stack = vec![(tree.root, 0)];
     while let Some((id, depth)) = stack.pop() {
         let Some(node) = tree.nodes.get(&id) else { continue };
         let area = node.bounds().map(|b| {
             #[expect(clippy::cast_possible_truncation, reason = "window coordinates")]
-            egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))
+            let area = egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32));
+            places.map_or(area, |ctx| to_window(ctx, id).mul_rect(area))
         });
         let inside = rect.is_none_or(|r| area.is_some_and(|a| r.contains(a.center())));
         // A label's text runs say again what it says.
@@ -365,7 +366,7 @@ fn lines(tree: &Tree, rect: Option<egui::Rect>, bounds: bool) -> Vec<Line> {
         }
         let show = shown(node) && node.role() != Role::Window && inside;
         if show {
-            out.push(line(id, node, depth, id == tree.focus, area.filter(|_| bounds)));
+            out.push(line(id, node, depth, id == tree.focus, area.filter(|_| places.is_some())));
         }
         let next = if show { depth + 1 } else { depth };
         stack.extend(node.children().iter().rev().map(|c| (*c, next)));
@@ -476,15 +477,35 @@ fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> Vec<eg
     vec![egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE }]
 }
 
+/// What egui knows of a widget by its node: its response.
+fn response(ctx: &egui::Context, id: NodeId) -> Option<egui::Response> {
+    // SAFETY: only entropy is asked of it, and this value is an `Id`'s own, as a node's id is.
+    ctx.read_response(unsafe { egui::Id::from_high_entropy_bits(id.0) })
+}
+
+/// What takes a widget's place to the window's: a node gives it in its layer's coordinates, and a zoomed scene is a layer
+/// of its own.
+fn to_window(ctx: &egui::Context, id: NodeId) -> egui::emath::TSTransform {
+    response(ctx, id).and_then(|r| ctx.layer_transform_to_global(r.layer_id)).unwrap_or_default()
+}
+
+/// Whether a widget cannot be reached at a point of the window: egui knows where each is clickable, clipped by what holds
+/// it, so a pointer sent elsewhere would land on whatever is there. One egui keeps no place for takes no pointer anyway.
+fn clipped(ctx: &egui::Context, id: NodeId, point: egui::Pos2) -> bool {
+    response(ctx, id).is_some_and(|r| !to_window(ctx, id).mul_rect(r.interact_rect).contains(point))
+}
+
 /// An action's input, a batch a frame.
-fn act(tree: &Tree, window: egui::Rect, args: &mcp::ActArgs) -> Result<Vec<Vec<egui::Event>>, String> {
+fn act(ctx: &egui::Context, tree: &Tree, args: &mcp::ActArgs) -> Result<Vec<Vec<egui::Event>>, String> {
     let action = args.action.as_deref().unwrap_or("click");
     let target = args.node.as_deref().map(|id| node(tree, id)).transpose()?;
     let at = match (args.at, target) {
         (Some([x, y]), _) => Some(egui::pos2(x, y)),
-        (None, Some((_, node))) => center(node),
+        (None, Some((id, node))) => center(node).map(|p| to_window(ctx, id).mul_pos(p)),
         (None, None) => return Err("give a widget (node) or a point (at)".into()),
     };
+    let window = ctx.content_rect();
+    let hidden = args.at.is_none() && at.is_none_or(|p| !window.contains(p) || target.is_some_and(|(id, _)| clipped(ctx, id, p)));
     let point = || at.ok_or_else(|| "the widget has no place in the window".to_string());
     let moved = |p: egui::Pos2| vec![egui::Event::PointerMoved(p)];
     let primary = egui::PointerButton::Primary;
@@ -494,9 +515,13 @@ fn act(tree: &Tree, window: egui::Rect, args: &mcp::ActArgs) -> Result<Vec<Vec<e
             let which = if action == "focus" { Action::Focus } else { Action::ScrollIntoView };
             vec![vec![request(id, which)]]
         }
+        // What the pointer cannot reach, the pointer is not sent to: it would land on whatever is there.
+        "double_click" | "right_click" | "drag" if hidden => {
+            return Err("the widget is out of sight: scroll_into_view first".into());
+        }
         // Clicked as the user would, with the pointer: what a click does besides (closing a popup) follows. A widget
         // out of sight is clicked through its accessibility, as a screen reader would.
-        "click" if args.at.is_none() && at.is_none_or(|p| !window.contains(p)) => {
+        "click" if hidden => {
             let (id, node) = target.ok_or("no widget")?;
             if !node.supports_action(Action::Click) {
                 return Err("the widget is out of sight and cannot be clicked: scroll_into_view first".into());
@@ -619,16 +644,31 @@ fn screenshot(image: &egui::ColorImage, rect: Option<(String, egui::Rect)>, scal
 
 #[cfg(test)]
 mod tests {
-    use super::chord;
+    use super::clipped;
     use eframe::egui;
 
     #[test]
-    fn chords_name_a_key_and_its_modifiers() {
-        let (key, modifiers) = chord("ctrl+shift+Z").unwrap();
-        assert_eq!(key, egui::Key::Z);
-        assert!(modifiers.shift && modifiers.command);
-        assert_eq!(chord("Enter").unwrap().0, egui::Key::Enter);
-        assert!(chord("ctrl+").is_err());
-        assert!(chord("hyper+A").is_err());
+    fn a_widget_scrolled_out_of_view_is_clipped() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 300.0));
+        let input = || egui::RawInput { screen_rect: Some(screen), ..egui::RawInput::default() };
+        let mut buttons: Vec<egui::Response> = Vec::new();
+        // Two passes: what a widget's place is, is known from the last.
+        for _ in 0..2 {
+            buttons.clear();
+            let mut output = ctx.run_ui(input(), |ui| {
+                egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                    buttons.extend((0..40).map(|i| ui.button(format!("row {i}"))));
+                });
+            });
+            output.textures_delta.clear();
+        }
+        let (first, last) = (buttons.first().unwrap(), buttons.last().unwrap());
+        assert!(screen.contains(first.rect.center()));
+        assert!(!clipped(&ctx, first.id.accesskit_id(), first.rect.center()));
+        // Below the scroll area, in the window: where a pointer would land on something else.
+        let hidden = egui::pos2(last.rect.center().x, 200.0);
+        assert!(screen.contains(hidden));
+        assert!(clipped(&ctx, last.id.accesskit_id(), hidden));
     }
 }

@@ -233,6 +233,8 @@ pub enum EditRequest {
     /// Edit the asset's source in the tool its format is edited in: copied into the active layer first where it is
     /// below it, and imported again when the tool saves it.
     EditIn(String),
+    /// Show the graph pane, for the graph layer chosen.
+    ShowGraph,
     /// Write a file of the entry (its `asset.toml`; empty: a plain file itself), labeled for the history; edits of one
     /// merge key made in a row are one step.
     Write {
@@ -981,6 +983,7 @@ impl Workspace {
             | EditRequest::Resolve(uid, _)
             | EditRequest::EditIn(uid)
             | EditRequest::Write { uid, .. } => uid.clone(),
+            EditRequest::ShowGraph => return Ok(String::new()),
         };
         // Code goes to a files layer: an override of it in an asset layer is asked of the user first
         // (`override_choice`), and a write into it is made there.
@@ -1003,7 +1006,7 @@ impl Workspace {
             EditRequest::Write { uid, file, bytes, label, merge } => {
                 edit::write_file(project, index, &name, uid, file, bytes, label.clone(), merge.clone(), history)?
             }
-            EditRequest::Rename(..) | EditRequest::EditIn(_) => return Ok(String::new()),
+            EditRequest::Rename(..) | EditRequest::EditIn(_) | EditRequest::ShowGraph => return Ok(String::new()),
         };
         self.history.note_selection(self.selected.clone());
         let label = self.history.done().last().map_or_default(|s| s.label.clone());

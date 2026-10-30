@@ -21,6 +21,7 @@ mod drive;
 mod ext_ui;
 mod extensions_pane;
 mod external;
+mod graph_pane;
 mod icons;
 mod inspector;
 mod layers;

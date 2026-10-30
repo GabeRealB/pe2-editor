@@ -317,7 +317,7 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
 }
 
 /// Text on one line centered at `at`, cut short with an ellipsis where wider than `width`.
-fn fitted(painter: &egui::Painter, at: egui::Pos2, text: &str, font: egui::FontId, color: Color32, width: f32) {
+pub(crate) fn fitted(painter: &egui::Painter, at: egui::Pos2, text: &str, font: egui::FontId, color: Color32, width: f32) {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(width);
     let galley = painter.layout_job(job);

@@ -63,6 +63,7 @@ pub enum PaneKind {
     Layer,
     History,
     Extensions,
+    Graph,
     Panel(PanelName),
 }
 
@@ -82,6 +83,7 @@ enum StoredKind {
     History,
     Extensions,
     Panel(PanelName),
+    Graph,
 }
 
 impl From<StoredKind> for PaneKind {
@@ -99,6 +101,7 @@ impl From<StoredKind> for PaneKind {
             StoredKind::Layer => PaneKind::Layer,
             StoredKind::History => PaneKind::History,
             StoredKind::Extensions => PaneKind::Extensions,
+            StoredKind::Graph => PaneKind::Graph,
             StoredKind::Panel(name) => PaneKind::Panel(name),
         }
     }
@@ -106,9 +109,10 @@ impl From<StoredKind> for PaneKind {
 
 impl PaneKind {
     /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
-    pub const ALL: [PaneKind; 11] = [
+    pub const ALL: [PaneKind; 12] = [
         PaneKind::Assets,
         PaneKind::Preview,
+        PaneKind::Graph,
         PaneKind::Layer,
         PaneKind::Inspector,
         PaneKind::References,
@@ -133,6 +137,7 @@ impl PaneKind {
             PaneKind::Layer => icons::GIT_DIFF,
             PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
             PaneKind::Extensions => icons::PLUGS_CONNECTED,
+            PaneKind::Graph => icons::TREE_STRUCTURE,
             PaneKind::Panel(name) => {
                 extensions::shared().panel(name.as_str()).and_then(|p| p.icon).map_or(icons::SQUARES_FOUR, icons::glyph)
             }
@@ -152,13 +157,13 @@ impl PaneKind {
 
     /// Whether it shows one asset or entry: the selection, or the one an instance is pinned to.
     pub fn shows_subject(self) -> bool {
-        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References)
+        matches!(self, PaneKind::Preview | PaneKind::Inspector | PaneKind::References | PaneKind::Graph)
     }
 
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview | PaneKind::Extensions)
+        matches!(self, PaneKind::Graph | PaneKind::Assets | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Preview | PaneKind::Extensions)
     }
 
     pub fn title(self) -> String {
@@ -174,6 +179,7 @@ impl PaneKind {
             PaneKind::Layer => "Layer",
             PaneKind::History => "History",
             PaneKind::Extensions => "Extensions",
+            PaneKind::Graph => "Graph",
             PaneKind::Panel(name) => {
                 return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
             }
@@ -365,6 +371,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Project => project_ui(ui, ws, nav),
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
+                    PaneKind::Graph => crate::graph_pane::graph_ui(ui, ws, subject, nav, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
                     PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
                     PaneKind::Settings => {}

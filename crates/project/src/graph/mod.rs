@@ -277,6 +277,11 @@ impl Default for Ops {
 }
 
 impl Ops {
+    /// Every operation, by the name stacks use.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<OpDef>)> {
+        self.defs.iter()
+    }
+
     pub fn add(&mut self, def: OpDef) {
         self.defs.insert(def.name.clone(), Arc::new(def));
     }
@@ -744,7 +749,7 @@ impl Lowering<'_> {
             self.output(op, inputs[0][0], at);
             return None;
         }
-        Some(self.step(&def, name, settings_of(op, &["op", "from"]), inputs, at))
+        Some(self.step(&def, name, settings_of(op, &["op", "from", layers::POS]), inputs, at))
     }
 }
 

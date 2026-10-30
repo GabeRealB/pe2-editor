@@ -306,6 +306,10 @@ impl Editor {
             self.renaming = Some((uid.clone(), real.clone(), name.to_string()));
             return;
         }
+        if matches!(request, EditRequest::ShowGraph) {
+            self.show_pane(Pane::first(crate::panes::PaneKind::Graph));
+            return;
+        }
         let Some(ws) = &mut self.workspace else { return };
         if let EditRequest::EditIn(uid) = request {
             self.message = Some(match ws.edit_in(uid, &self.settings.tools) {

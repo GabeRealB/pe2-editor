@@ -816,6 +816,17 @@ impl Extensions {
         layers
     }
 
+    /// The operations a graph layer may hold, each by the name it goes by and its label, in the labels' order.
+    #[must_use]
+    pub fn graph_operations(&self) -> Vec<(String, String)> {
+        let by_service = |name: &str| self.ops.iter().any(|(other, def)| def.name.to_string() == name && other != name);
+        let operations = self.operations();
+        let shown = operations.iter().filter(|(name, _)| name.as_str() != graph::GRAPH && !by_service(name));
+        let mut listed: Vec<(String, String)> = shown.map(|(name, def)| (name.clone(), def.label.clone())).collect();
+        listed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        listed
+    }
+
     /// The assets whose outputs read those of these, through others or not: each referring to one whose stack reads
     /// the outputs of what it refers to (a `references` layer). These not among them, unless they read each other.
     #[must_use]

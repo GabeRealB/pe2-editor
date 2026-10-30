@@ -57,6 +57,7 @@ icons! {
     ARROW_DOWN = "\u{E03E}",
     DOTS_THREE = "\u{E1FE}",
     TRASH = "\u{E4A6}",
+    TREE_STRUCTURE = "\u{E67C}",
     PLUGS_CONNECTED = "\u{EB5A}",
     STACK_SIMPLE = "\u{E468}",
     GIT_DIFF = "\u{E27C}",

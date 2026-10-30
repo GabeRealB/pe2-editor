@@ -110,7 +110,7 @@ pub fn inspector_ui(
 
 /// Where an edit of an asset goes, as said beside its controls: the active layer - copied into it first where the asset
 /// comes from below - or why it cannot be edited.
-fn edit_target(ws: &Workspace, asset: &Asset) -> Result<String, String> {
+pub(crate) fn edit_target(ws: &Workspace, asset: &Asset) -> Result<String, String> {
     let layer = ws.editable_layer()?;
     let theirs = !asset.layers.contains(&layer.name);
     Ok(if theirs { format!("Saving overrides it in {}", layer.name) } else { format!("Saved in {}", layer.name) })
@@ -229,7 +229,7 @@ fn label_of(key: &str) -> String {
 }
 
 #[expect(clippy::too_many_arguments, reason = "a sheet's context")]
-fn property_sheet(
+pub(crate) fn property_sheet(
     ui: &mut egui::Ui,
     sheet: &Sheet,
     field_edit: &mut Option<FieldEdit>,
@@ -842,7 +842,7 @@ fn stack_ui(
     let (plan, wrong) = ws.extensions.plan_written(asset);
     let editable = target.is_ok();
     // The layer whose settings are shown, kept while the asset is shown.
-    let selection = egui::Id::unique(("stack layer", &asset.path));
+    let selection = layer_selection(asset);
     let selected: Option<usize> = ui.data(|d| d.get_temp::<Option<usize>>(selection)).flatten();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
@@ -876,7 +876,12 @@ fn stack_ui(
                         }
                     }
                     project::graph::OUTPUT => output_row(ui, layer),
-                    project::graph::GRAPH => graph_row(ui, layer),
+                    project::graph::GRAPH => {
+                        if graph_row(ui, layer) {
+                            ui.data_mut(|d| d.insert_temp(selection, Some(i)));
+                            *edit = Some(EditRequest::ShowGraph);
+                        }
+                    }
                     _ if Some(i) == importing => {
                         ui.label(RichText::new("Importer").color(theme::weak()));
                         importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
@@ -904,6 +909,11 @@ fn stack_ui(
     });
 }
 
+/// What keeps the layer of an asset's stack chosen, while it is shown.
+pub(crate) fn layer_selection(asset: &Asset) -> egui::Id {
+    egui::Id::unique(("stack layer", &asset.path))
+}
+
 /// A stack's output layer: its name and how it is kept.
 fn output_row(ui: &mut egui::Ui, layer: &toml::Value) {
     let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
@@ -915,11 +925,15 @@ fn output_row(ui: &mut egui::Ui, layer: &toml::Value) {
     });
 }
 
-/// A stack's graph layer: how many operations it holds.
-fn graph_row(ui: &mut egui::Ui, layer: &toml::Value) {
+/// A stack's graph layer: how many operations it holds, and whether it was asked to be opened.
+fn graph_row(ui: &mut egui::Ui, layer: &toml::Value) -> bool {
     ui.label(RichText::new("Graph").color(theme::weak()));
     let count = layer.get("ops").and_then(toml::Value::as_table).map_or(0, toml::Table::len);
-    ui.label(format!("{count} operation{}", if count == 1 { "" } else { "s" }));
+    ui.horizontal(|ui| {
+        ui.label(format!("{count} operation{}", if count == 1 { "" } else { "s" }));
+        ui.small_button("Open").clicked()
+    })
+    .inner
 }
 
 /// A layer's number, choosing the layer whose settings are shown; chosen again, none.
@@ -963,7 +977,7 @@ fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, to
 }
 
 /// A layer's settings, for its sheet: its fields, and what each is, what a setting left out comes to where that is known.
-fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+pub(crate) fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     use pe2_ext::Field;
     use project::graph;
     let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
@@ -992,7 +1006,7 @@ fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &
 }
 
 /// What is wrong with a stack, each as its rows number it.
-fn problems_ui(ui: &mut egui::Ui, wrong: &[project::graph::Problem]) {
+pub(crate) fn problems_ui(ui: &mut egui::Ui, wrong: &[project::graph::Problem]) {
     for problem in wrong {
         let said = format!("{}: {}", problem_place(&problem.at), problem.what);
         ui.label(RichText::new(said).small().color(ui.visuals().error_fg_color));
@@ -1009,7 +1023,7 @@ struct Place<'a> {
 }
 
 /// A change to a stack's layers, as an edit: `change` the declaration's text to the text wanted.
-fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<String>) -> Option<EditRequest> {
+pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<String>) -> Option<EditRequest> {
     Some(EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
         file: project::index::ASSET_FILE.to_string(),
