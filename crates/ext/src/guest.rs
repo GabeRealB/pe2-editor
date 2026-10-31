@@ -391,12 +391,36 @@ impl UiHost for Frame<'_> {
         self.ui().chip(text, selected)
     }
 
+    fn toggle(&mut self, text: &str, on: bool) -> bool {
+        self.ui().toggle(text, on)
+    }
+
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
         self.ui().image(texture.handle(), width, height);
     }
 
-    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
-        self.ui().gpu_image(id, width, height);
+    fn available(&mut self) -> (f32, f32, f32) {
+        self.ui().available()
+    }
+
+    fn gpu_viewport(&mut self, id: u64, width: f32, height: f32) -> crate::ViewportInput {
+        let input = self.ui().gpu_viewport(id, width, height);
+        crate::ViewportInput {
+            hovered: input.hovered,
+            pointer: input.pointer,
+            drag: input.drag,
+            held: input.held,
+            pressed: input.pressed,
+            released: input.released,
+            clicked: input.clicked,
+            scroll: input.scroll,
+            modifiers: crate::Modifiers { shift: input.modifiers.0, ctrl: input.modifiers.1, alt: input.modifiers.2 },
+            keys: input.keys,
+        }
+    }
+
+    fn request_repaint(&mut self) {
+        self.ui().request_repaint();
     }
 
     fn reference(&mut self, reference: &Value) {

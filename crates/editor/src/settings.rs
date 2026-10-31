@@ -91,15 +91,46 @@ pub struct Tools {
     pub hex: String,
 }
 
+/// How the window reaches the screen on Linux, the one platform with a choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayServer {
+    /// X11 under `WSLg`, whose Wayland compositor has crashed on a maximize; elsewhere what the system offers.
+    #[default]
+    Auto,
+    X11,
+    Wayland,
+}
+
+impl DisplayServer {
+    pub const ALL: [DisplayServer; 3] = [DisplayServer::Auto, DisplayServer::X11, DisplayServer::Wayland];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DisplayServer::Auto => "Auto",
+            DisplayServer::X11 => "X11",
+            DisplayServer::Wayland => "Wayland",
+        }
+    }
+
+    #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde hands `skip_serializing_if` a reference")]
+    fn is_auto(&self) -> bool {
+        *self == DisplayServer::Auto
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Startup {
     pub reopen_last_project: bool,
+    /// Read before there is a window, so a change waits for the next start.
+    #[serde(skip_serializing_if = "DisplayServer::is_auto")]
+    pub display_server: DisplayServer,
 }
 
 impl Default for Startup {
     fn default() -> Self {
-        Startup { reopen_last_project: true }
+        Startup { reopen_last_project: true, display_server: DisplayServer::Auto }
     }
 }
 
@@ -136,6 +167,8 @@ pub struct EditorSettings {
     pub tools: Tools,
     pub startup: Startup,
     pub agents: Agents,
+    /// The performance overlay over the window.
+    pub performance_overlay: bool,
     /// Changes made outside the editor.
     pub changes: Changes,
     /// What runs a command, by its id, where it is not what it comes with.

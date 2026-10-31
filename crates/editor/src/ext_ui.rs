@@ -219,11 +219,33 @@ impl UiHost for Host<'_> {
         clicked
     }
 
-    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
+    fn toggle(&mut self, text: &str, on: bool) -> bool {
+        let response = self.target.ui().selectable_label(on, text);
+        let clicked = response.clicked();
+        self.last = Some(response);
+        clicked
+    }
+
+    fn available(&mut self) -> (f32, f32, f32) {
         let ui = self.target.ui();
-        let Some(native) = crate::gpu_view::texture_id(id) else { return };
-        let shown = ui.add(egui::Image::new(egui::load::SizedTexture::new(native, egui::vec2(width, height))));
-        self.last = Some(shown);
+        let room = ui.available_size();
+        (room.x, room.y, ui.ctx().pixels_per_point())
+    }
+
+    fn gpu_viewport(&mut self, id: u64, width: f32, height: f32) -> pe2_ext::ViewportInput {
+        let ui = self.target.ui();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        if let Some(native) = crate::gpu_view::texture_id(id) {
+            let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(native, rect, whole, egui::Color32::WHITE);
+        }
+        let input = crate::gpu_view::input(ui, &response, rect);
+        self.last = Some(response);
+        input
+    }
+
+    fn request_repaint(&mut self) {
+        self.target.ui().ctx().request_repaint();
     }
 
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {

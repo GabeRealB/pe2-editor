@@ -43,6 +43,7 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ActualSize,
+    PerformanceOverlay,
     Pane(PaneKind),
     /// The mode at a place in the list.
     Mode(usize),
@@ -54,7 +55,7 @@ impl Command {
     /// Every command but the modes, which are the user's: a list that changes.
     pub fn all() -> Vec<Command> {
         use Command::{
-            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward, Fullscreen, GraphArrange, GraphFit,
+            ActualSize, PerformanceOverlay, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward, Fullscreen, GraphArrange, GraphFit,
             Import, KeepTab, Maximize, NewMode, NextTab, OpenProject, Palette, PreviousTab, Quit, Redo, Refresh, ReloadProject,
             ResetLayout, ResetMode, Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
         };
@@ -62,7 +63,7 @@ impl Command {
             Palette, OpenProject, Import, ReloadProject, Quit, Settings, Undo, Redo, Refresh, DeleteSelected, Build, Clean, CancelEpoch, Back, Forward, Up,
             CloseTab, KeepTab, NextTab, PreviousTab, ShowIn(EditorKind::Preview), ShowIn(EditorKind::Files),
             ShowIn(EditorKind::Graph), GraphFit, GraphArrange, DocumentsOnly, Maximize, Fullscreen, ResetLayout, NewMode,
-            ResetMode, DeleteMode, ZoomIn, ZoomOut, ActualSize,
+            ResetMode, DeleteMode, ZoomIn, ZoomOut, ActualSize, PerformanceOverlay,
         ];
         // Settings is a command of its own, and a document is opened, not shown.
         let shown = |kind: &PaneKind| !matches!(kind, PaneKind::Document | PaneKind::Settings);
@@ -110,6 +111,7 @@ impl Command {
             Command::ZoomIn => "view.zoom_in".to_string(),
             Command::ZoomOut => "view.zoom_out".to_string(),
             Command::ActualSize => "view.actual_size".to_string(),
+            Command::PerformanceOverlay => "view.performance_overlay".to_string(),
             Command::Pane(kind) => format!("pane.{}", kind.title().to_lowercase().replace(' ', "_")),
             Command::Mode(at) => format!("mode.{at}"),
         }
@@ -156,6 +158,7 @@ impl Command {
             Command::ZoomIn => "Zoom in".to_string(),
             Command::ZoomOut => "Zoom out".to_string(),
             Command::ActualSize => "Actual size".to_string(),
+            Command::PerformanceOverlay => "Performance overlay".to_string(),
             Command::Pane(kind) => format!("Show {}", kind.title()),
             Command::Mode(at) => format!("Mode {at}"),
         }

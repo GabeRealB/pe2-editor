@@ -66,6 +66,33 @@ pub struct Canvas {
     pub grid: Option<(f32, f32)>,
 }
 
+/// The keys held with what else is done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+/// What the pointer and the keys did over a viewport this frame. Positions are in points from its corner.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ViewportInput {
+    pub hovered: bool,
+    pub pointer: Option<(f32, f32)>,
+    /// What it moved by while held.
+    pub drag: (f32, f32),
+    /// The primary, the secondary and the middle button.
+    pub held: (bool, bool, bool),
+    pub pressed: (bool, bool, bool),
+    pub released: (bool, bool, bool),
+    /// A press and release of the primary button without moving.
+    pub clicked: bool,
+    pub scroll: f32,
+    pub modifiers: Modifiers,
+    /// The keys pressed this frame while over it, by name (`A`, `Num1`, `Home`, `Period`).
+    pub keys: Vec<String>,
+}
+
 /// What the host gives a view to draw with: its widgets, and what it knows. The host implements it over its own UI; a
 /// component reaches the same through the host's `ui` and `project` resources.
 pub trait UiHost {
@@ -80,12 +107,21 @@ pub trait UiHost {
     fn badge(&mut self, text: &str);
     /// A small framed name, marked where `selected`: a cell, an item; whether it was clicked.
     fn chip(&mut self, text: &str, selected: bool) -> bool;
+    /// A word lit while it is on, a toolbar's; whether it was clicked.
+    fn toggle(&mut self, text: &str, on: bool) -> bool;
     /// An image at a size, framed: a palette's swatch.
     fn image(&mut self, texture: &Texture, width: f32, height: f32);
-    /// A texture published through `gpu`, at this size.
-    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
-        let _ = (id, width, height);
+    /// How much room is left here, in points, and how many pixels a point is.
+    fn available(&mut self) -> (f32, f32, f32) {
+        (0.0, 0.0, 1.0)
     }
+    /// A texture published through `gpu`, filling this many points, taking what the pointer and the keys do over it.
+    fn gpu_viewport(&mut self, id: u64, width: f32, height: f32) -> ViewportInput {
+        let _ = (id, width, height);
+        ViewportInput::default()
+    }
+    /// Draw again next frame, nothing having happened.
+    fn request_repaint(&mut self) {}
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
     fn reference(&mut self, reference: &Value);
     /// A field within a row, the host's way: its label and its reading (a reference as a chip, a flag as a badge).
@@ -174,9 +210,24 @@ impl<'a> Ui<'a> {
         self.host.chip(text, selected)
     }
 
-    /// A texture published through `gpu`, at this size.
-    pub fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
-        self.host.gpu_image(id, width, height);
+    /// A word lit while it is on, a toolbar's; whether it was clicked.
+    pub fn toggle(&mut self, text: &str, on: bool) -> bool {
+        self.host.toggle(text, on)
+    }
+
+    /// How much room is left here, in points, and how many pixels a point is.
+    pub fn available(&mut self) -> (f32, f32, f32) {
+        self.host.available()
+    }
+
+    /// A texture published through `gpu`, filling this many points, taking what the pointer and the keys do over it.
+    pub fn gpu_viewport(&mut self, id: u64, width: f32, height: f32) -> ViewportInput {
+        self.host.gpu_viewport(id, width, height)
+    }
+
+    /// Draw again next frame, nothing having happened.
+    pub fn request_repaint(&mut self) {
+        self.host.request_repaint();
     }
 
     pub fn image(&mut self, texture: &Texture, width: f32, height: f32) {

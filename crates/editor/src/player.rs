@@ -23,7 +23,7 @@ use project::graph::stream::{Poll, Reader, Stream};
 use project::index::Index;
 use pe2_ext::media::{PixelFormat, SampleFormat, VideoFrame};
 
-use crate::settings::Preview;
+use crate::settings::{Preview, Upscale};
 use crate::{icons, theme};
 
 /// How far ahead of the picture the sound is fed, in items.
@@ -279,6 +279,9 @@ impl Player {
 
     /// An asset played: its picture where it is, the controls under it.
     pub fn ui(&mut self, ui: &mut egui::Ui, (_, index): (&Extensions, &Arc<Index>), path: &str, view: &mut Preview) {
+        // As the pictures are: the frame as it is, unless the setting says otherwise. Filling the pane is `fitting`'s.
+        let smooth = matches!(view.upscale, Upscale::Bilinear | Upscale::Sharp);
+        let sampling = if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
         let volume = view.volume.clamp(0.0, 1.0);
         self.gain.store((volume * volume).to_bits(), Ordering::Relaxed);
         let Some(asset) = index.assets.get(path) else { return };
@@ -331,8 +334,8 @@ impl Player {
                     Some(Picture::Rgba { width, height, rgba }) => {
                         let image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba);
                         match &mut self.texture {
-                            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
-                            None => self.texture = Some(ui.ctx().load_texture("player", image, egui::TextureOptions::LINEAR)),
+                            Some(texture) => texture.set(image, sampling),
+                            None => self.texture = Some(ui.ctx().load_texture("player", image, sampling)),
                         }
                         shown.showing = Some(Showing::Texture);
                     }
@@ -360,7 +363,7 @@ impl Player {
             }
             Poll::Failed(e) => shown.failed = Some(e),
         }
-        show(ui, shown, self.texture.as_ref(), self.id);
+        show(ui, shown, self.texture.as_ref(), self.id, smooth);
         ui.add_space(6.0);
         controls(ui, shown, number, view);
         if shown.playing.is_some() || shown.sounding.is_some() {
@@ -376,7 +379,11 @@ fn fitting(ui: &egui::Ui, size: egui::Vec2) -> f32 {
     (ui.available_width() / size.x).min((ui.available_height() - CONTROLS) / size.y).max(0.1)
 }
 
-fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>, player: u64) {
+fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>, player: u64, smooth: bool) {
+    ui.vertical_centered(|ui| show_centered(ui, shown, texture, player, smooth));
+}
+
+fn show_centered(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>, player: u64, smooth: bool) {
     match (&shown.showing, texture) {
         (Some(Showing::Texture), Some(texture)) => {
             let size = texture.size_vec2();
@@ -386,7 +393,7 @@ fn show(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::TextureHandle>,
             #[expect(clippy::cast_precision_loss, reason = "a frame's size")]
             let size = egui::vec2(frame.width as f32, frame.height as f32);
             let (rect, _) = ui.allocate_exact_size(size * fitting(ui, size), egui::Sense::hover());
-            let draw = crate::yuv::Draw { frame: frame.clone(), key: *key, player };
+            let draw = crate::yuv::Draw { frame: frame.clone(), key: *key, player, smooth };
             ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, draw));
         }
         _ => {
@@ -517,7 +524,7 @@ fn stop_at_end(shown: &mut Shown) {
 /// Play or pause, where it is (an item), and the time; the sound's controls.
 fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u64, view: &mut Preview) {
     let last = shown.last();
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         let playing = shown.playing.is_some() || shown.sounding.is_some() || shown.held;
         let (glyph, says) = if playing { (icons::PAUSE, "Pause") } else { (icons::PLAY, "Play") };
         if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
@@ -534,45 +541,48 @@ fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u64, view: &mut Previe
                 shown.by_clock();
             }
         }
-        // The timeline takes what the time and the sound's controls leave.
-        let mut chosen = number;
-        ui.spacing_mut().slider_width = (ui.available_width() - 230.0).max(80.0);
-        let slider = ui.add(egui::Slider::new(&mut chosen, 0..=last.min(u64::from(u32::MAX))).show_value(false));
-        // Held, it stops where it is held - picture and sound - and plays on from there when let go, if it played.
-        if slider.is_pointer_button_down_on() || slider.dragged() {
-            if shown.playing.take().is_some() | shown.sounding.take().is_some() {
-                shown.held = true;
+        // From the pane's edge inward, so that these are always whole.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().slider_width = 70.0;
+            ui.add_enabled_ui(!view.muted, |ui| {
+                let percent = (view.volume * 100.0).round();
+                ui.add(egui::Slider::new(&mut view.volume, 0.0..=1.0).step_by(0.05).show_value(false))
+                    .on_hover_text(format!("Volume {percent}%"));
+            });
+            let (glyph, says) = if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
+            if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
+                view.muted = !view.muted;
             }
-        } else if std::mem::take(&mut shown.held) {
-            shown.by_clock();
-        }
-        if slider.changed() {
-            #[expect(clippy::cast_precision_loss, reason = "an item's place")]
-            let chosen = chosen as f64;
-            shown.at = chosen;
-            shown.silent = shown.silent.take().filter(|s| s.starts_with("it has none"));
-            if shown.playing.is_some() || shown.sounding.is_some() {
+            ui.add_space(8.0);
+            let rate = shown.rate;
+            let time = |item: u64| {
+                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, reason = "seconds of a stream")]
+                let seconds = (item as f64 / rate) as u64;
+                format!("{}:{:02}", seconds / 60, seconds % 60)
+            };
+            let total = if shown.count.is_some() { time(last) } else { "…".to_string() };
+            ui.label(RichText::new(format!("{} / {total}", time(number))).monospace());
+            // The timeline takes what they leave.
+            let mut chosen = number;
+            ui.spacing_mut().slider_width = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
+            let slider = ui.add(egui::Slider::new(&mut chosen, 0..=last.min(u64::from(u32::MAX))).show_value(false));
+            // Held, it stops where it is held - picture and sound - and plays on from there when let go, if it played.
+            if slider.is_pointer_button_down_on() || slider.dragged() {
+                if shown.playing.take().is_some() | shown.sounding.take().is_some() {
+                    shown.held = true;
+                }
+            } else if std::mem::take(&mut shown.held) {
                 shown.by_clock();
             }
-        }
-        let rate = shown.rate;
-        let time = |item: u64| {
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, reason = "seconds of a stream")]
-            let seconds = (item as f64 / rate) as u64;
-            format!("{}:{:02}", seconds / 60, seconds % 60)
-        };
-        let total = if shown.count.is_some() { time(last) } else { "…".to_string() };
-        ui.label(RichText::new(format!("{} / {total}", time(number))).monospace());
-        ui.add_space(8.0);
-        let (glyph, says) = if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
-        if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
-            view.muted = !view.muted;
-        }
-        ui.spacing_mut().slider_width = 70.0;
-        ui.add_enabled_ui(!view.muted, |ui| {
-            let percent = (view.volume * 100.0).round();
-            ui.add(egui::Slider::new(&mut view.volume, 0.0..=1.0).step_by(0.05).show_value(false))
-                .on_hover_text(format!("Volume {percent}%"));
+            if slider.changed() {
+                #[expect(clippy::cast_precision_loss, reason = "an item's place")]
+                let chosen = chosen as f64;
+                shown.at = chosen;
+                shown.silent = shown.silent.take().filter(|s| s.starts_with("it has none"));
+                if shown.playing.is_some() || shown.sounding.is_some() {
+                    shown.by_clock();
+                }
+            }
         });
     });
     let of = shown.count.map_or_else(|| "…".to_string(), |c| format!("{}", shown.first + c.saturating_sub(1)));

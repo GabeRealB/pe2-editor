@@ -99,6 +99,8 @@ pub struct EditorState {
     pub variant: Option<String>,
     /// Set by a request: the asset to show.
     pub show: Option<String>,
+    /// What the editor is costing now.
+    pub performance: serde_json::Value,
 }
 
 /// The project as a request sees it.

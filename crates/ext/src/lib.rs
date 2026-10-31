@@ -40,4 +40,4 @@ pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentActio
     Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};
-pub use ui::{Canvas, Cell, Marked, Placed, Style, Ui, UiHost, View};
+pub use ui::{Canvas, Cell, Marked, Modifiers, Placed, Style, Ui, UiHost, View, ViewportInput};

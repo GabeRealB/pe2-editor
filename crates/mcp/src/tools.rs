@@ -229,6 +229,12 @@ fn own() -> Vec<Tool> {
             "editor_selection",
             "The asset selected in the editor and the look it is shown in. Only when the editor has the project open.",
         ),
+        tool::<NoArgs>(
+            "editor_performance",
+            "What the editor costs, sampled each second: frames shown and what one takes, CPU (100 is one core's whole \
+             time), memory, the GPU's use and memory where they can be read, the window, what draws it. Asking \
+             starts the GPU's sampling. Only when the editor has the project open.",
+        ),
         tool::<AssetArgs>(
             "editor_show",
             "Select an asset in the editor and reveal it in its tree, for the user to look at. Changes only what the \
@@ -289,6 +295,7 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
             return parse(arguments).and_then(|a| get_output(view.index, view.extensions, &a)).unwrap_or_else(failure);
         }
         "editor_selection" => editor_selection(view),
+        "editor_performance" => view.editor.as_ref().map(|editor| editor.performance.clone()).ok_or_else(|| NO_EDITOR.to_string()),
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
         name if EDITOR_UI.contains(&name) => Err(NO_EDITOR.to_string()),
         _ => run_extension_tool(view, name, arguments),

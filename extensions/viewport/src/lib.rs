@@ -29,7 +29,7 @@ impl View for Viewport {
         match &self.drawn {
             Some(scene) => {
                 scene.draw();
-                ui.gpu_image(scene.id(), 512.0, 512.0);
+                ui.gpu_viewport(scene.id(), 512.0, 512.0);
             }
             None => ui.label("Nothing here draws"),
         }

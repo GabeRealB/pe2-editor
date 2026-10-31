@@ -307,10 +307,33 @@ interface host {
 
     /// The host's UI, lent to a view for a frame; a row, a section or a collapsing body of it is drawn on until it is
     /// dropped.
+    /// What the pointer and the keys did over a viewport this frame. Positions are in points from its corner.
+    record viewport-input {
+        hovered: bool,
+        pointer: option<tuple<f32, f32>>,
+        /// What it moved by while held.
+        drag: tuple<f32, f32>,
+        /// The primary, the secondary and the middle button: held, pressed this frame, released this frame.
+        held: tuple<bool, bool, bool>,
+        pressed: tuple<bool, bool, bool>,
+        released: tuple<bool, bool, bool>,
+        /// A press and release of the primary button without moving.
+        clicked: bool,
+        scroll: f32,
+        /// Shift, Ctrl and Alt.
+        modifiers: tuple<bool, bool, bool>,
+        /// The keys pressed this frame while over it, by name (`A`, `Num1`, `Home`, `Period`).
+        keys: list<string>,
+    }
+
     resource ui {
         label: func(text: string, style: style);
-        /// A texture published through `gpu`, at this size.
-        gpu-image: func(id: u64, width: f32, height: f32);
+        /// How much room is left here, in points, and how many pixels a point is: what a view sizes what it renders by.
+        available: func() -> tuple<f32, f32, f32>;
+        /// A texture published through `gpu`, filling this many points, taking what the pointer and the keys do over it.
+        gpu-viewport: func(id: u64, width: f32, height: f32) -> viewport-input;
+        /// Draw again next frame, nothing having happened: a view that is animating.
+        request-repaint: func();
         button: func(text: string) -> bool;
         /// A button showing an icon of the host's set, what it does said on hovering it; whether it was clicked.
         icon-button: func(icon: icon, hint: string) -> bool;
@@ -319,6 +342,8 @@ interface host {
         badge: func(text: string);
         /// A small framed name, marked where `selected`; whether it was clicked.
         chip: func(text: string, selected: bool) -> bool;
+        /// A word lit while it is on, a toolbar's; whether it was clicked.
+        toggle: func(text: string, on: bool) -> bool;
         image: func(texture: borrow<texture>, width: f32, height: f32);
         /// The host's chip for a reference (TOML), opening its asset.
         reference: func(reference: string);
@@ -761,7 +786,7 @@ interface gpu {
 
     /// None where nothing draws: the command line, the MCP server.
     device: func() -> option<gpu-device>;
-    /// What `ui.gpu-image` knows a texture by, while it is kept: publishing it again gives the same.
+    /// What `ui.gpu-viewport` knows a texture by, while it is kept: publishing it again gives the same.
     publish: func(texture: borrow<gpu-texture>) -> u64;
     /// The window lets go of a published texture.
     unpublish: func(id: u64);

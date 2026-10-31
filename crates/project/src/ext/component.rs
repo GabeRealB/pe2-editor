@@ -988,12 +988,36 @@ impl host::HostUi for State {
         Ok(())
     }
 
+    fn toggle(&mut self, ui: Resource<Frame>, text: String, on: bool) -> wasmtime::Result<bool> {
+        Ok(self.frame(&ui)?.toggle(&text, on))
+    }
+
     fn chip(&mut self, ui: Resource<Frame>, text: String, selected: bool) -> wasmtime::Result<bool> {
         Ok(self.frame(&ui)?.chip(&text, selected))
     }
 
-    fn gpu_image(&mut self, ui: Resource<Frame>, id: u64, width: f32, height: f32) -> wasmtime::Result<()> {
-        self.frame(&ui)?.gpu_image(id, width, height);
+    fn available(&mut self, ui: Resource<Frame>) -> wasmtime::Result<(f32, f32, f32)> {
+        Ok(self.frame(&ui)?.available())
+    }
+
+    fn gpu_viewport(&mut self, ui: Resource<Frame>, id: u64, width: f32, height: f32) -> wasmtime::Result<host::ViewportInput> {
+        let input = self.frame(&ui)?.gpu_viewport(id, width, height);
+        Ok(host::ViewportInput {
+            hovered: input.hovered,
+            pointer: input.pointer,
+            drag: input.drag,
+            held: input.held,
+            pressed: input.pressed,
+            released: input.released,
+            clicked: input.clicked,
+            scroll: input.scroll,
+            modifiers: (input.modifiers.shift, input.modifiers.ctrl, input.modifiers.alt),
+            keys: input.keys,
+        })
+    }
+
+    fn request_repaint(&mut self, ui: Resource<Frame>) -> wasmtime::Result<()> {
+        self.frame(&ui)?.request_repaint();
         Ok(())
     }
 

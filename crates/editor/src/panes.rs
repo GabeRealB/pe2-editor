@@ -286,13 +286,14 @@ pub fn editors_of(ws: &Workspace, path: &str) -> Vec<EditorKind> {
     if crate::player::Player::plays(&ws.extensions, asset) || !ws.previews_of(asset).is_empty() {
         editors.push(EditorKind::Preview);
     }
+    // What a kind says it is edited in, before what any asset has: a model opens in 3D, not as its bytes.
+    editors.extend(ws.extensions.editors(asset).into_iter().map(|def| EditorKind::Extension(PanelName::new(&def.name))));
     if !asset.files.is_empty() {
         editors.push(EditorKind::Files);
     }
     if crate::graph_pane::has_graph(asset) {
         editors.push(EditorKind::Graph);
     }
-    editors.extend(ws.extensions.editors(asset).into_iter().map(|def| EditorKind::Extension(PanelName::new(&def.name))));
     editors
 }
 
@@ -2061,7 +2062,12 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
             scroll(ui, "settings page", |ui| {
                 ui.label(RichText::new(page.title()).heading());
                 match (page, ws) {
-                    (SettingsPage::Appearance, _) => appearance_ui(ui, settings),
+                    (SettingsPage::Appearance, _) => {
+                        appearance_ui(ui, settings);
+                        theme::section(ui, "Performance", |ui| {
+                            ui.checkbox(&mut settings.performance_overlay, "Show what the editor costs, over the window");
+                        });
+                    }
                     (SettingsPage::Tools, _) => tools_ui(ui, &mut settings.tools),
                     (SettingsPage::Files, _) => {
                         use crate::settings::TakeIn;
@@ -2088,6 +2094,9 @@ fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Wor
                                 ui.label(RichText::new(last.display().to_string()).small().color(theme::weak()));
                             }
                         });
+                        if cfg!(target_os = "linux") {
+                            display_server_ui(ui, &mut settings.startup.display_server);
+                        }
                     }
                     (SettingsPage::Agents, _) => {
                         theme::section(ui, "Agents connected to the project", |ui| {
@@ -2138,6 +2147,23 @@ const PAGES: [SettingsPage; 10] = [
     SettingsPage::ProjectLayers,
     SettingsPage::ProjectConfigurations,
 ];
+
+fn display_server_ui(ui: &mut egui::Ui, chosen: &mut crate::settings::DisplayServer) {
+    theme::section(ui, "Display server", |ui| {
+        ui.horizontal(|ui| {
+            for server in crate::settings::DisplayServer::ALL {
+                ui.radio_value(chosen, server, server.label());
+            }
+        });
+        let note = "Takes effect the next time the editor starts. Auto is X11 under WSL, where Wayland draws faster but \
+                    its compositor has crashed on a maximize, taking every Linux window with it; elsewhere, what the \
+                    system offers.";
+        ui.label(RichText::new(note).small().color(theme::weak()));
+        if std::env::var_os("PE2_EDITOR_BACKEND").is_some() {
+            ui.label(RichText::new("PE2_EDITOR_BACKEND is set, and overrides this.").small().color(theme::weak()));
+        }
+    });
+}
 
 fn appearance_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
     let appearance = &mut settings.appearance;

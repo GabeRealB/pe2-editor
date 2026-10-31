@@ -54,7 +54,8 @@ fn rgb(uv: vec2<f32>) -> vec3<f32> {
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    /// Nearest, then linear.
+    samplers: [wgpu::Sampler; 2],
     /// By player: each shows a frame of its own.
     uploaded: HashMap<u64, Uploaded>,
 }
@@ -72,7 +73,8 @@ struct Uploaded {
     key: u64,
     size: (u32, u32),
     planes: [wgpu::Texture; 3],
-    bind: wgpu::BindGroup,
+    /// By sampler.
+    binds: [wgpu::BindGroup; 2],
 }
 
 /// Make the pipeline for the window's renderer.
@@ -137,13 +139,15 @@ pub fn install(state: &egui_wgpu::RenderState) {
         multiview_mask: None,
         cache: None,
     });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("yuv420p"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        ..wgpu::SamplerDescriptor::default()
+    let samplers = [wgpu::FilterMode::Nearest, wgpu::FilterMode::Linear].map(|filter| {
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("yuv420p"),
+            mag_filter: filter,
+            min_filter: filter,
+            ..wgpu::SamplerDescriptor::default()
+        })
     });
-    state.renderer.write().callback_resources.insert(Renderer { pipeline, layout, sampler, uploaded: HashMap::new() });
+    state.renderer.write().callback_resources.insert(Renderer { pipeline, layout, samplers, uploaded: HashMap::new() });
 }
 
 /// A YCbCr 4:2:0 frame to draw where the callback is, known by a key: one with the key drawn last is not uploaded
@@ -152,6 +156,8 @@ pub struct Draw {
     pub frame: VideoFrame,
     pub key: u64,
     pub player: u64,
+    /// Blended between its pixels, rather than each kept as it is.
+    pub smooth: bool,
 }
 
 impl egui_wgpu::CallbackTrait for Draw {
@@ -188,17 +194,17 @@ impl egui_wgpu::CallbackTrait for Draw {
                 })
             });
             let views = planes.each_ref().map(|p| p.create_view(&wgpu::TextureViewDescriptor::default()));
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let binds = [0, 1].map(|sampler| device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("yuv420p"),
                 layout: &renderer.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&renderer.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&renderer.samplers[sampler]) },
                 ],
-            });
-            renderer.uploaded.insert(self.player, Uploaded { key: self.key, size: (width, height), planes, bind });
+            }));
+            renderer.uploaded.insert(self.player, Uploaded { key: self.key, size: (width, height), planes, binds });
         }
         let Some(uploaded) = renderer.uploaded.get_mut(&self.player) else { return Vec::new() };
         let bytes = self.frame.buffer.bytes();
@@ -232,7 +238,7 @@ impl egui_wgpu::CallbackTrait for Draw {
         let Some(renderer) = resources.get::<Renderer>() else { return };
         let Some(uploaded) = renderer.uploaded.get(&self.player) else { return };
         pass.set_pipeline(&renderer.pipeline);
-        pass.set_bind_group(0, &uploaded.bind, &[]);
+        pass.set_bind_group(0, &uploaded.binds[usize::from(self.smooth)], &[]);
         pass.draw(0..3, 0..1);
     }
 }

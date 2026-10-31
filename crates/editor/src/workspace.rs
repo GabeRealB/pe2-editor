@@ -734,7 +734,7 @@ impl Workspace {
     fn answer_agent(&mut self, request: &mcp::Request, reply: &mpsc::Sender<mcp::Reply>) {
         let selection = self.selected.clone();
         let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
-        let editor = mcp::EditorState { selection, variant, show: None };
+        let editor = mcp::EditorState { selection, variant, show: None, performance: crate::perf::read() };
         let mut view = mcp::View { project: &self.project, index: &self.index, extensions: &self.extensions, editor: Some(editor) };
         let answer = mcp::answer(&mut view, request);
         let show = view.editor.and_then(|e| e.show);

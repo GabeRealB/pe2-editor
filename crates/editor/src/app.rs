@@ -649,7 +649,7 @@ impl Editor {
         match command {
             Command::Palette | Command::OpenProject | Command::Quit | Command::Settings | Command::DocumentsOnly
             | Command::Maximize | Command::Fullscreen | Command::ResetLayout | Command::NewMode | Command::ResetMode | Command::ZoomIn | Command::ZoomOut
-            | Command::ActualSize | Command::Pane(_) | Command::Mode(_) => true,
+            | Command::ActualSize | Command::PerformanceOverlay | Command::Pane(_) | Command::Mode(_) => true,
             Command::DeleteMode => self.layouts.modes.len() > 1,
             Command::Undo => ws.is_some_and(|ws| !ws.history.done().is_empty()),
             Command::Redo => ws.is_some_and(|ws| !ws.history.undone().is_empty()),
@@ -749,6 +749,7 @@ impl Editor {
             Command::ZoomIn => self.set_zoom(Some(ctx.zoom_factor() + 0.25)),
             Command::ZoomOut => self.set_zoom(Some(ctx.zoom_factor() - 0.25)),
             Command::ActualSize => self.set_zoom(Some(1.0)),
+            Command::PerformanceOverlay => self.settings.performance_overlay = !self.settings.performance_overlay,
             Command::Pane(kind) => self.show_pane(Pane::first(kind)),
             Command::Mode(at) => {
                 self.leave_bare();
@@ -853,6 +854,14 @@ impl Editor {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
         }
         if self.steady.1 < 2 {
+            return;
+        }
+        // Wayland says nothing of where a window is, so all it comes back with is its size, the one it has filling the
+        // screen too: told to fill it, `WSLg`'s compositor can crash, and this would be every time it opens.
+        if ctx.input(|i| i.viewport().inner_rect.is_none()) {
+            self.refill = None;
+            let size = ctx.content_rect().size();
+            self.place = Some(crate::windows::Place { position: [0.0, 0.0], size: size.into(), contents: [0.0, 0.0], scale: 0.0 });
             return;
         }
         // Noticed first: what a window does on its way out is not a place.
@@ -1175,7 +1184,9 @@ impl Editor {
                         outcome.docked.push(id);
                     }
                 });
-                egui::CentralPanel::no_frame().show(ui, |ui| {
+                // Its own, as eframe clears a window of this kind to nothing whatever `clear_color` says.
+                let body = egui::Frame::NONE.fill(ui.visuals().panel_fill);
+                egui::CentralPanel::no_frame().frame(body).show(ui, |ui| {
                     let mut behavior = Panes {
                         workspace: self.workspace.as_mut(),
                         nav: None,
@@ -1317,6 +1328,8 @@ impl Editor {
                 self.item(ui, Command::ZoomIn, "Zoom in");
                 self.item(ui, Command::ZoomOut, "Zoom out");
                 self.item(ui, Command::ActualSize, "Actual size");
+                ui.separator();
+                self.item(ui, Command::PerformanceOverlay, "Performance overlay");
                 let zoom = ui.ctx().zoom_factor();
                 let mut automatic = self.settings.appearance.zoom.is_none();
                 if ui.checkbox(&mut automatic, "Zoom with the monitor").clicked() {
@@ -1688,8 +1701,16 @@ impl eframe::App for Editor {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let pixels = ctx.content_rect().size() * ctx.pixels_per_point();
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a window's pixels")]
+        crate::perf::frame(frame.info().cpu_usage, [pixels.x as u32, pixels.y as u32]);
+        if self.settings.performance_overlay {
+            crate::perf::overlay(&ctx);
+        } else {
+            crate::perf::overlay_hidden();
+        }
         if let Some(max) = self.max_surface.take() {
             // In points: the surface is the window's size times the scale factor.
             #[expect(clippy::cast_precision_loss, reason = "texture limits are far below f32's exact integers")]
