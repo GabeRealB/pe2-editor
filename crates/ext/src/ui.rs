@@ -48,6 +48,18 @@ pub struct Marked {
     pub highlight: bool,
 }
 
+/// A polygon over a canvas, in its units: a face where a texture has it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Traced {
+    pub corners: Vec<(f32, f32)>,
+    /// Filled and drawn stronger: what is selected.
+    pub strong: bool,
+    /// What hovering it says.
+    pub label: Option<String>,
+    /// What clicking it opens: a path, or `#` and a part.
+    pub link: Option<String>,
+}
+
 /// Images laid out on a canvas the host zooms and pans, with named boxes over them: an atlas's cells, an image's
 /// pages, VRAM's slots. Sizes and rectangles are in the canvas's own units (an image's pixels, VRAM's halfwords).
 #[derive(Clone, Default)]
@@ -64,6 +76,8 @@ pub struct Canvas {
     pub legend: bool,
     /// Lines every so many units across and down: VRAM's texture pages.
     pub grid: Option<(f32, f32)>,
+    /// Polygons over the pictures.
+    pub traces: Vec<Traced>,
 }
 
 /// The keys held with what else is done.
@@ -124,6 +138,10 @@ pub trait UiHost {
     fn request_repaint(&mut self) {}
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
     fn reference(&mut self, reference: &Value);
+    /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its other keys
+    /// kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with the dropped asset's
+    /// uid. `label` says what is being set.
+    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value>;
     /// A field within a row, the host's way: its label and its reading (a reference as a chip, a flag as a badge).
     fn field(&mut self, key: &str, value: &Value);
     /// What hovering the last widget says.
@@ -138,10 +156,20 @@ pub trait UiHost {
     /// Set a field of the asset shown - its whole value, or none to remove it - in one undoable step with the frame's
     /// other changes. A table of parts keeps a line each.
     fn set(&mut self, key: &str, value: Option<&Value>);
+    /// As `set`, a step of its own: what a gesture ended with, where `set` keeps a value being adjusted in one.
+    fn set_step(&mut self, key: &str, value: Option<&Value>);
+    /// What a gesture has made so far of fields of the part selected, nothing being written yet: the inspector shows
+    /// these over what the asset holds until the asset next changes, or this is called with none.
+    fn live(&mut self, fields: &[(&str, Value)]);
+    /// A field of the part selected the inspector is being dragged or typed in, with what it holds so far, nothing being
+    /// written yet.
+    fn editing(&self) -> Option<(String, Value)>;
     /// A row: what is drawn on it is laid out left to right, until it is dropped.
     fn horizontal(&mut self) -> Box<dyn UiHost + '_>;
     /// A row that wraps where the pane is narrow.
     fn wrapped(&mut self) -> Box<dyn UiHost + '_>;
+    /// What is drawn on it one under the other, beside what its row holds.
+    fn vertical(&mut self) -> Box<dyn UiHost + '_>;
     /// What is drawn on it indented.
     fn indented(&mut self) -> Box<dyn UiHost + '_>;
     /// One of the inspector's sections, titled.
@@ -158,6 +186,9 @@ pub trait UiHost {
     fn navigate(&mut self, path: &str);
     /// The part selected of the asset shown: its fragment (`cells/cursor`), wherever it was selected.
     fn selected(&self) -> Option<String>;
+    /// What a view of the asset last left for itself: a view is made again whenever what it shows changes.
+    fn note(&self) -> Option<String>;
+    fn leave_note(&mut self, text: &str);
     /// Select a part of the asset shown, as clicking it anywhere would.
     fn select(&mut self, part: &str);
     /// The asset the view shows, lent for the frame; none for a panel.
@@ -238,6 +269,13 @@ impl<'a> Ui<'a> {
         self.host.reference(reference);
     }
 
+    /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its other keys
+    /// kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with the dropped asset's
+    /// uid. `label` says what is being set.
+    pub fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
+        self.host.reference_taking(label, kind, reference)
+    }
+
     pub fn field(&mut self, key: &str, value: &Value) {
         self.host.field(key, value);
     }
@@ -267,10 +305,34 @@ impl<'a> Ui<'a> {
         self.host.set(key, value);
     }
 
+    /// As `set`, a step of its own: what a gesture ended with, where `set` keeps a value being adjusted in one.
+    pub fn set_step(&mut self, key: &str, value: Option<&Value>) {
+        self.host.set_step(key, value);
+    }
+
+    /// What a gesture has made so far of fields of the part selected, nothing being written yet: the inspector shows
+    /// these over what the asset holds until the asset next changes, or this is called with none.
+    pub fn live(&mut self, fields: &[(&str, Value)]) {
+        self.host.live(fields);
+    }
+
+    /// A field of the part selected the inspector is being dragged or typed in, with what it holds so far, nothing being
+    /// written yet.
+    #[must_use]
+    pub fn editing(&self) -> Option<(String, Value)> {
+        self.host.editing()
+    }
+
     /// What `body` draws, in a row.
     pub fn horizontal(&mut self, body: impl FnOnce(&mut Ui)) {
         let mut row = self.host.horizontal();
         body(&mut Ui { host: &mut *row });
+    }
+
+    /// What `body` draws, one under the other, beside what its row holds.
+    pub fn vertical(&mut self, body: impl FnOnce(&mut Ui)) {
+        let mut column = self.host.vertical();
+        body(&mut Ui { host: &mut *column });
     }
 
     /// What `body` draws, in a row wrapping where the pane is narrow.
@@ -321,6 +383,16 @@ impl<'a> Ui<'a> {
     #[must_use]
     pub fn selected(&self) -> Option<String> {
         self.host.selected()
+    }
+
+    /// What a view of the asset last left for itself: a view is made again whenever what it shows changes.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        self.host.note()
+    }
+
+    pub fn leave_note(&mut self, text: &str) {
+        self.host.leave_note(text);
     }
 
     /// Select a part of the asset shown: in the contents, the inspector and every view of it.

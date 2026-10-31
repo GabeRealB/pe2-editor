@@ -81,6 +81,9 @@ fn icon(icon: Icon) -> types::Icon {
         Icon::Speaker => types::Icon::Speaker,
         Icon::Music => types::Icon::Music,
         Icon::Package => types::Icon::Package,
+        Icon::Cube => types::Icon::Cube,
+        Icon::Bone => types::Icon::Bone,
+        Icon::Polygon => types::Icon::Polygon,
         Icon::Terminal => types::Icon::Terminal,
         Icon::Text => types::Icon::Text,
         Icon::Binary => types::Icon::Binary,
@@ -427,6 +430,17 @@ impl UiHost for Frame<'_> {
         self.ui().reference(&value_text(reference));
     }
 
+    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
+        let taken = self.ui().reference_taking(label, kind, reference.map(value_text).as_deref())?;
+        format!("v = {taken}").parse::<Table>().ok()?.remove("v")
+    }
+
+    fn editing(&self) -> Option<(String, Value)> {
+        let (key, value) = self.ui().editing()?;
+        let value = format!("v = {value}").parse::<Table>().ok()?.remove("v")?;
+        Some((key, value))
+    }
+
     fn field(&mut self, key: &str, value: &Value) {
         self.ui().field(key, &value_text(value));
     }
@@ -453,6 +467,15 @@ impl UiHost for Frame<'_> {
         self.ui().set(key, value.map(value_text).as_deref());
     }
 
+    fn set_step(&mut self, key: &str, value: Option<&Value>) {
+        self.ui().set_step(key, value.map(value_text).as_deref());
+    }
+
+    fn live(&mut self, fields: &[(&str, Value)]) {
+        let fields: Vec<(String, String)> = fields.iter().map(|(key, value)| ((*key).to_string(), value_text(value))).collect();
+        self.ui().live(&fields);
+    }
+
     fn horizontal(&mut self) -> Box<dyn UiHost + '_> {
         let row = self.ui().horizontal();
         self.child(row)
@@ -461,6 +484,11 @@ impl UiHost for Frame<'_> {
     fn wrapped(&mut self) -> Box<dyn UiHost + '_> {
         let row = self.ui().wrapped();
         self.child(row)
+    }
+
+    fn vertical(&mut self) -> Box<dyn UiHost + '_> {
+        let column = self.ui().vertical();
+        self.child(column)
     }
 
     fn indented(&mut self) -> Box<dyn UiHost + '_> {
@@ -511,6 +539,7 @@ impl UiHost for Frame<'_> {
             toggle: canvas.toggle.clone(),
             legend: canvas.legend,
             grid: canvas.grid,
+            traces: canvas.traces.iter().map(|t| host::Traced { corners: t.corners.clone(), strong: t.strong, label: t.label.clone(), link: t.link.clone() }).collect(),
         });
     }
 
@@ -528,6 +557,14 @@ impl UiHost for Frame<'_> {
 
     fn selected(&self) -> Option<String> {
         self.ui().selected()
+    }
+
+    fn note(&self) -> Option<String> {
+        self.ui().note()
+    }
+
+    fn leave_note(&mut self, text: &str) {
+        self.ui().leave_note(text);
     }
 
     fn select(&mut self, part: &str) {
@@ -717,10 +754,11 @@ impl g::Guest for Component {
             .collect()
     }
 
-    fn contents(kind: u32, asset: &host::Asset) -> g::AssetContents {
+    fn contents(kind: u32, asset: &host::Asset, project: &host::Project) -> g::AssetContents {
         let lent = Lent::borrowed(asset);
+        let around = Lens::new(project);
         let contents = registered().kinds[kind as usize].contents.as_ref();
-        let contents = contents.map_or_else(crate::Contents::default, |contents| contents(&lent.asset()));
+        let contents = contents.map_or_else(crate::Contents::default, |contents| contents(&lent.asset(), &around));
         g::AssetContents {
             rows: contents.rows.into_iter().map(content_row).collect(),
             actions: contents.actions.into_iter().map(content_action).collect(),
@@ -728,12 +766,14 @@ impl g::Guest for Component {
         }
     }
 
-    fn content_act(kind: u32, asset: &host::Asset, request: g::ContentRequest) -> Result<g::ContentOutcome, String> {
+    fn content_act(kind: u32, asset: &host::Asset, project: &host::Project, request: g::ContentRequest) -> Result<g::ContentOutcome, String> {
         let lent = Lent::borrowed(asset);
+        let around = Lens::new(project);
         let act = registered().kinds[kind as usize].content_act.as_ref().ok_or("its contents do nothing")?;
         let request = match request {
             g::ContentRequest::Action((row, action)) => crate::ContentRequest::Action { row, action },
             g::ContentRequest::Rename((row, name)) => crate::ContentRequest::Rename { row, name },
+            g::ContentRequest::Dropped((row, asset)) => crate::ContentRequest::Dropped { row, asset },
             g::ContentRequest::Moved((row, onto, place)) => {
                 let place = match place {
                     g::ContentPlace::Before => crate::ContentPlace::Before,
@@ -743,7 +783,7 @@ impl g::Guest for Component {
                 crate::ContentRequest::Moved { row, onto, place }
             }
         };
-        let outcome = act(&lent.asset(), request).map_err(|e| format!("{e:#}"))?;
+        let outcome = act(&lent.asset(), &around, request).map_err(|e| format!("{e:#}"))?;
         Ok(g::ContentOutcome {
             label: outcome.label,
             sets: outcome.sets.into_iter().map(|(path, value)| g::ContentSet { path, value: value.as_ref().map(value_text) }).collect(),
@@ -751,9 +791,10 @@ impl g::Guest for Component {
         })
     }
 
-    fn part_sheet_of(kind: u32, asset: &host::Asset, part: String) -> Option<g::PartSheet> {
+    fn part_sheet_of(kind: u32, asset: &host::Asset, project: &host::Project, part: String) -> Option<g::PartSheet> {
         let lent = Lent::borrowed(asset);
-        let sheet = registered().kinds[kind as usize].part_sheet.as_ref()?(&lent.asset(), &part)?;
+        let around = Lens::new(project);
+        let sheet = registered().kinds[kind as usize].part_sheet.as_ref()?(&lent.asset(), &around, &part)?;
         Some(g::PartSheet {
             within: sheet.within,
             fields: sheet

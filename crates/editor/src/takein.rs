@@ -12,7 +12,7 @@ use project::Project;
 use project::applied::Applied;
 use project::ext::Extensions;
 use project::imports::Imports;
-use project::index::{Index, LayerInfo};
+use project::index::{Asset, Index, LayerInfo};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -238,6 +238,8 @@ impl Worker {
             let Some(old) = before.get(path) else { continue };
             let Some(uid) = old.uid.as_deref() else { continue };
             match self.index.assets.get(path) {
+                // What makes nothing has nothing to apply: whatever reads it has the settings as they are.
+                Some(now) if now.uid.as_deref() == Some(uid) && !makes_outputs(&self.extensions, now) => {}
                 Some(now) if now.uid.as_deref() == Some(uid) => {
                     let _ = self.applied.changed(uid, old.text(), now.text());
                 }
@@ -276,4 +278,10 @@ impl Worker {
             files: false,
         }
     }
+}
+
+/// Whether anything is made from an asset's settings.
+fn makes_outputs(extensions: &Extensions, asset: &Asset) -> bool {
+    let (ops, tail) = (extensions.operations(), extensions.tail(asset));
+    !project::graph::Plan::of(asset.fields(), &ops, &tail).0.outputs.is_empty()
 }

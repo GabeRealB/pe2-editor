@@ -100,7 +100,7 @@ interface types {
         height: f32,
     }
 
-    enum icon { disc, stack, image, palette, grid, film, waveform, speaker, music, %package, terminal, text, binary, file, folder, caret-up, caret-down, cross, plus }
+    enum icon { disc, stack, image, palette, grid, film, waveform, speaker, music, %package, cube, bone, polygon, terminal, text, binary, file, folder, caret-up, caret-down, cross, plus }
 
     enum tint { structure, picture, motion, sound, code, plain }
 
@@ -293,6 +293,15 @@ interface host {
         highlight: bool,
     }
 
+    /// A polygon over a canvas, in its units: the selected ones drawn filled.
+    record traced {
+        corners: list<tuple<f32, f32>>,
+        strong: bool,
+        /// What hovering it says, and what clicking it opens: a path, or `#` and a part.
+        label: option<string>,
+        link: option<string>,
+    }
+
     /// Images on a canvas the host zooms and pans, with named boxes over them.
     record canvas {
         width: f32,
@@ -303,6 +312,7 @@ interface host {
         toggle: string,
         legend: bool,
         grid: option<tuple<f32, f32>>,
+        traces: list<traced>,
     }
 
     /// The host's UI, lent to a view for a frame; a row, a section or a collapsing body of it is drawn on until it is
@@ -358,12 +368,26 @@ interface host {
         editable: func() -> bool;
         /// Set a field of the asset shown (TOML), or remove it.
         set: func(key: string, value: option<string>);
+        /// As `set`, a step of its own: what a gesture ended with, where `set` keeps a value being adjusted in one.
+        set-step: func(key: string, value: option<string>);
+        /// What a gesture has made so far of fields of the part selected (TOML), nothing being written yet: the
+        /// inspector shows these over what the asset holds until the asset next changes, or this is called with none.
+        live: func(fields: list<tuple<string, string>>);
+        /// A field of the part selected the inspector is being dragged or typed in, with what it holds so far, nothing
+        /// being written yet.
+        editing: func() -> option<tuple<string, string>>;
         horizontal: func() -> ui;
         wrapped: func() -> ui;
+        /// What is drawn on it one under the other, beside what its row holds.
+        vertical: func() -> ui;
         indented: func() -> ui;
         section: func(title: string) -> ui;
         collapsing: func(id: string, title: string, note: string) -> option<ui>;
         canvas: func(canvas: canvas);
+        /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its
+        /// other keys kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with
+        /// the dropped asset's uid. `label` says what is being set.
+        reference-taking: func(label: string, kind: string, reference: option<string>) -> option<string>;
         /// Rows of cells in aligned columns, `id` keeping its widths: the cell of a button clicked this frame (its
         /// row, its column).
         table: func(id: string, rows: list<list<cell>>) -> option<tuple<u32, u32>>;
@@ -373,6 +397,9 @@ interface host {
         navigate: func(path: string);
         /// The part selected of the asset shown: its fragment (`cells/cursor`).
         selected: func() -> option<string>;
+        /// What this view of the asset last left for itself: a view is made again whenever what it shows changes.
+        note: func() -> option<string>;
+        leave-note: func(text: string);
         /// Select a part of the asset shown, as clicking it anywhere would.
         select: func(part: string);
     }
@@ -505,6 +532,8 @@ interface guest {
         action(tuple<string, string>),
         rename(tuple<string, string>),
         moved(tuple<string, string, content-place>),
+        /// An asset, by its path, dropped on a row that takes its kind.
+        dropped(tuple<string, string>),
     }
 
     /// A value of the declaration set, by its path (each step a key, or a list's place), or removed.
@@ -737,11 +766,11 @@ interface guest {
     /// An asset's parts, in order.
     parts: func(kind: u32, asset: borrow<asset>) -> list<part>;
     /// What is inside an asset, in order.
-    contents: func(kind: u32, asset: borrow<asset>) -> asset-contents;
+    contents: func(kind: u32, asset: borrow<asset>, project: borrow<project>) -> asset-contents;
     /// What comes of something done in the contents: why it cannot be, where it cannot.
-    content-act: func(kind: u32, asset: borrow<asset>, request: content-request) -> result<content-outcome, string>;
+    content-act: func(kind: u32, asset: borrow<asset>, project: borrow<project>, request: content-request) -> result<content-outcome, string>;
     /// A part's fields, by its fragment.
-    part-sheet-of: func(kind: u32, asset: borrow<asset>, part: string) -> option<part-sheet>;
+    part-sheet-of: func(kind: u32, asset: borrow<asset>, project: borrow<project>, part: string) -> option<part-sheet>;
     /// A type's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
     sniff: func(ty: u32, name: string, size: u64, head: list<u8>) -> option<string>;
     /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the

@@ -1,6 +1,6 @@
 [package]
-name = "pe2-viewport"
-description = "pe2.viewport, a built-in extension: what it takes to see in three dimensions"
+name = "pe2-render"
+description = "pe2.render, a built-in extension: meshes, materials, models and prefabs, and the game's renderer"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
@@ -13,4 +13,6 @@ crate-type = ["rlib", "cdylib"]
 workspace = true
 
 [dependencies]
+formats.workspace = true
 pe2-ext.workspace = true
+sha1.workspace = true

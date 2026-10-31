@@ -30,12 +30,16 @@ pub struct Textures {
     uploaded: HashMap<(String, Upscale), (Weak<Image>, egui::TextureHandle)>,
     /// The pictures drawn off the window's thread, which views ask for (`UiHost::picture`).
     pub pictures: Option<crate::pictures::Pictures>,
+    /// By asset, what a view of it left for when it is made again.
+    pub notes: HashMap<String, String>,
+    /// What a gesture in a view has made of a part so far.
+    pub live: Option<Live>,
 }
 
 impl Textures {
     /// The textures of views, with the pictures drawn for them.
     pub fn with_pictures(pictures: crate::pictures::Pictures) -> Textures {
-        Textures { uploaded: HashMap::new(), pictures: Some(pictures) }
+        Textures { uploaded: HashMap::new(), pictures: Some(pictures), notes: HashMap::new(), live: None }
     }
 
     pub fn get(&mut self, ctx: &egui::Context, texture: &Texture, upscale: Upscale) -> egui::TextureId {
@@ -75,6 +79,15 @@ impl Target<'_> {
     }
 }
 
+impl Target<'_> {
+    fn ctx(&self) -> &egui::Context {
+        match self {
+            Target::Pane(ui) | Target::Section { parent: ui, .. } => ui.ctx(),
+            Target::Child { child, .. } => child.ctx(),
+        }
+    }
+}
+
 impl Drop for Target<'_> {
     fn drop(&mut self) {
         match self {
@@ -105,8 +118,21 @@ pub struct Frame<'a> {
     pub part: Option<&'a str>,
 }
 
-/// What a view set of the asset it shows this frame: each field's new value, or none to remove it.
-pub type Sets = Vec<(String, Option<Value>)>;
+/// What a view set of the asset it shows this frame.
+#[derive(Default)]
+pub struct Sets {
+    /// Each field's new value, or none to remove it.
+    pub values: Vec<(String, Option<Value>)>,
+    /// A step of its own, never merged with the one before: a gesture ended.
+    pub apart: bool,
+}
+
+/// What a gesture has made so far of a part's fields, nothing being written yet: until the asset next changes.
+pub struct Live {
+    pub asset: String,
+    pub part: String,
+    pub fields: Vec<(String, Value)>,
+}
 
 /// A view's handle on a frame: where it draws, what it shows, what it can ask of the project.
 pub struct Host<'a> {
@@ -125,6 +151,7 @@ pub struct Host<'a> {
 enum Child {
     Row(egui::Layout),
     Indent,
+    Column,
 }
 
 impl<'a> Host<'a> {
@@ -159,6 +186,11 @@ impl<'a> Host<'a> {
             }
             Child::Indent => {
                 rect.min.x += parent.spacing().indent;
+                egui::Layout::top_down(egui::Align::Min)
+            }
+            // As tall as it needs, whatever its row is so far.
+            Child::Column => {
+                rect.set_height(parent.ctx().content_rect().height());
                 egui::Layout::top_down(egui::Align::Min)
             }
         };
@@ -308,9 +340,45 @@ impl UiHost for Host<'_> {
         self.last = None;
     }
 
+    fn editing(&self) -> Option<(String, Value)> {
+        crate::inspector::being_edited(self.target.ctx(), &self.frame.asset?.path)
+    }
+
+    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
+        let sheet = self.sheet(false);
+        let ui = self.target.ui();
+        let Some(chip) = reference.and_then(crate::inspector::reference_in) else {
+            let shown = ui.label(RichText::new(format!("Drop a {kind} here")).small().color(theme::weak()));
+            self.last = None;
+            let asset = self.frame.asset.filter(|_| self.frame.editable)?;
+            return crate::inspector::reference_filling(ui, shown.rect, &sheet, asset, kind);
+        };
+        let reference = reference?;
+        let shown = ui.scope(|ui| crate::inspector::reference_chip(ui, &sheet, chip, self.nav));
+        let rect = shown.response.rect;
+        self.last = None;
+        let asset = self.frame.asset.filter(|_| self.frame.editable)?;
+        crate::inspector::reference_dropped(ui, rect, &sheet, asset, label, reference)
+    }
+
     fn field(&mut self, key: &str, value: &Value) {
         let sheet = self.sheet(true);
-        crate::inspector::field_ui(self.target.ui(), &sheet, key, value, self.nav);
+        let ui = self.target.ui();
+        let shown = ui.scope(|ui| {
+            if let Some(reference) = crate::inspector::reference_in(value) {
+                crate::inspector::reference_chip(ui, &sheet, reference, self.nav);
+            } else {
+                crate::inspector::field_ui(ui, &sheet, key, value, self.nav);
+            }
+        });
+        let rect = shown.response.rect;
+        // What a view shows of a reference takes another, as the inspector's own fields do.
+        if self.frame.editable
+            && let Some(asset) = self.frame.asset
+            && let Some(new) = crate::inspector::reference_dropped(ui, rect, &sheet, asset, key, value)
+        {
+            self.sets.values.push((key.to_string(), Some(new)));
+        }
         self.last = None;
     }
 
@@ -350,12 +418,39 @@ impl UiHost for Host<'_> {
 
     fn set(&mut self, key: &str, value: Option<&Value>) {
         if self.frame.editable && self.frame.asset.is_some() {
-            self.sets.push((key.to_string(), value.cloned()));
+            self.sets.values.push((key.to_string(), value.cloned()));
+        }
+    }
+
+    fn set_step(&mut self, key: &str, value: Option<&Value>) {
+        self.set(key, value);
+        self.sets.apart = true;
+    }
+
+    fn live(&mut self, fields: &[(&str, Value)]) {
+        let live = self.frame.asset.zip(self.frame.part).filter(|_| !fields.is_empty()).map(|(asset, part)| Live {
+            asset: asset.path.clone(),
+            part: part.to_string(),
+            fields: fields.iter().map(|(key, value)| ((*key).to_string(), value.clone())).collect(),
+        });
+        let same = match (&live, &self.textures.live) {
+            (Some(new), Some(was)) => new.fields == was.fields && new.part == was.part && new.asset == was.asset,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.textures.live = live;
+            // The inspector may have drawn already this frame.
+            self.target.ui().ctx().request_repaint();
         }
     }
 
     fn horizontal(&mut self) -> Box<dyn UiHost + '_> {
         self.child(Child::Row(egui::Layout::left_to_right(egui::Align::Center)))
+    }
+
+    fn vertical(&mut self) -> Box<dyn UiHost + '_> {
+        self.child(Child::Column)
     }
 
     fn wrapped(&mut self) -> Box<dyn UiHost + '_> {
@@ -418,6 +513,7 @@ impl UiHost for Host<'_> {
             toggle: canvas.toggle.clone(),
             legend: canvas.legend,
             grid: canvas.grid,
+            traces: canvas.traces.clone(),
         };
         if let Some(link) = overlay_ui(ui, &overlay, self.frame.preview, self.frame.count) {
             *self.nav = Some(link);
@@ -436,6 +532,16 @@ impl UiHost for Host<'_> {
 
     fn selected(&self) -> Option<String> {
         self.frame.part.map(str::to_string)
+    }
+
+    fn note(&self) -> Option<String> {
+        self.textures.notes.get(&self.frame.asset?.path).cloned()
+    }
+
+    fn leave_note(&mut self, text: &str) {
+        if let Some(asset) = self.frame.asset {
+            self.textures.notes.insert(asset.path.clone(), text.to_string());
+        }
     }
 
     fn select(&mut self, part: &str) {

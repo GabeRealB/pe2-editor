@@ -1354,27 +1354,23 @@ impl Editor {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let mut step = None;
         ui.horizontal(|ui| {
             let hint = |command: Command| format!("{} ({})", command.title(), command.keys(&self.settings));
-            let (back, forward) = (hint(Command::Back), hint(Command::Forward));
+            let what = |command: Command, label: &str| format!("{} {label} ({})", command.title(), command.keys(&self.settings));
             let Some(ws) = &mut self.workspace else {
                 let text = if self.opening.is_some() { "Opening..." } else { "No project" };
                 ui.label(RichText::new(text).color(theme::weak()));
                 return;
             };
-            if ui
-                .add_enabled(ws.can_go_back(), egui::Button::new(icons::CARET_LEFT))
-                .on_hover_text(back)
-                .clicked()
-            {
-                ws.go_back();
-            }
-            if ui
-                .add_enabled(ws.can_go_forward(), egui::Button::new(icons::CARET_RIGHT))
-                .on_hover_text(forward)
-                .clicked()
-            {
-                ws.go_forward();
+            let done = ws.history.done().last().map(|last| what(Command::Undo, &last.label));
+            let undone = ws.history.undone().last().map(|last| what(Command::Redo, &last.label));
+            for (command, icon, step_of) in [(Command::Undo, icons::ARROW_ARC_LEFT, done), (Command::Redo, icons::ARROW_ARC_RIGHT, undone)] {
+                let enabled = step_of.is_some();
+                let tip = step_of.unwrap_or_else(|| hint(command));
+                if ui.add_enabled(enabled, egui::Button::new(icon)).on_hover_text(tip).clicked() {
+                    step = Some(command);
+                }
             }
             ui.add_space(8.0);
             if let Some(path) = ws.selected.clone() {
@@ -1393,6 +1389,9 @@ impl Editor {
                 }
             }
         });
+        if let Some(command) = step {
+            self.run(ui.ctx(), command);
+        }
     }
 
     /// The active layer's name in the status bar; the pane it asks for.

@@ -730,6 +730,11 @@ fn parse_value(text: &str) -> Option<Value> {
     toml::from_str::<Table>(&format!("v = {text}")).ok()?.remove("v")
 }
 
+/// What a field was given: one that does not parse is an error, never a removal.
+fn field_value(key: &str, text: &str) -> wasmtime::Result<Value> {
+    parse_value(text).ok_or_else(|| wasmtime::Error::msg(format!("{key}: not TOML")))
+}
+
 impl host::HostTexture for State {
     fn new(&mut self, key: String, image: types::Image) -> wasmtime::Result<Resource<HostTexture>> {
         let image = Image { width: image.width as usize, height: image.height as usize, rgba: image.rgba };
@@ -1035,6 +1040,15 @@ impl host::HostUi for State {
         Ok(())
     }
 
+    fn reference_taking(&mut self, ui: Resource<Frame>, label: String, kind: String, reference: Option<String>) -> wasmtime::Result<Option<String>> {
+        let reference = reference.and_then(|text| parse_value(&text));
+        Ok(self.frame(&ui)?.reference_taking(&label, &kind, reference.as_ref()).map(|taken| taken.to_string()))
+    }
+
+    fn editing(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<(String, String)>> {
+        Ok(self.frame(&ui)?.editing().map(|(key, value)| (key, value.to_string())))
+    }
+
     fn field(&mut self, ui: Resource<Frame>, key: String, value: String) -> wasmtime::Result<()> {
         if let Some(value) = parse_value(&value) {
             self.frame(&ui)?.field(&key, &value);
@@ -1068,12 +1082,20 @@ impl host::HostUi for State {
         Ok(self.frame(&ui)?.editable())
     }
 
+    fn set_step(&mut self, ui: Resource<Frame>, key: String, value: Option<String>) -> wasmtime::Result<()> {
+        let value = value.map(|text| field_value(&key, &text)).transpose()?;
+        self.frame(&ui)?.set_step(&key, value.as_ref());
+        Ok(())
+    }
+
+    fn live(&mut self, ui: Resource<Frame>, fields: Vec<(String, String)>) -> wasmtime::Result<()> {
+        let fields = fields.iter().map(|(key, text)| Ok((key.as_str(), field_value(key, text)?))).collect::<wasmtime::Result<Vec<_>>>()?;
+        self.frame(&ui)?.live(&fields);
+        Ok(())
+    }
+
     fn set(&mut self, ui: Resource<Frame>, key: String, value: Option<String>) -> wasmtime::Result<()> {
-        // A value that does not parse is an error, never a removal.
-        let value = match value {
-            Some(text) => Some(parse_value(&text).ok_or_else(|| wasmtime::Error::msg(format!("{key}: not TOML")))?),
-            None => None,
-        };
+        let value = value.map(|text| field_value(&key, &text)).transpose()?;
         self.frame(&ui)?.set(&key, value.as_ref());
         Ok(())
     }
@@ -1084,6 +1106,13 @@ impl host::HostUi for State {
         // dropped, and every child is dropped before its frame is taken back.
         let row = unsafe { erase_row(row) };
         self.child(row)
+    }
+
+    fn vertical(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Resource<Frame>> {
+        let column = self.frame(&ui)?.vertical();
+        // SAFETY: as `horizontal`.
+        let column = unsafe { erase_row(column) };
+        self.child(column)
     }
 
     fn wrapped(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Resource<Frame>> {
@@ -1147,6 +1176,7 @@ impl host::HostUi for State {
             toggle: canvas.toggle,
             legend: canvas.legend,
             grid: canvas.grid,
+            traces: canvas.traces.into_iter().map(|t| pe2_ext::Traced { corners: t.corners, strong: t.strong, label: t.label, link: t.link }).collect(),
         };
         self.frame(&ui)?.canvas(&canvas);
         Ok(())
@@ -1176,6 +1206,15 @@ impl host::HostUi for State {
 
     fn selected(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<String>> {
         Ok(self.frame(&ui)?.selected())
+    }
+
+    fn note(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<String>> {
+        Ok(self.frame(&ui)?.note())
+    }
+
+    fn leave_note(&mut self, ui: Resource<Frame>, text: String) -> wasmtime::Result<()> {
+        self.frame(&ui)?.leave_note(&text);
+        Ok(())
     }
 
     fn select(&mut self, ui: Resource<Frame>, part: String) -> wasmtime::Result<()> {
@@ -1256,6 +1295,29 @@ impl Runner {
 
     fn unlend(&mut self, asset: Resource<LentAsset>) {
         let _ = self.store.data_mut().table.delete(asset);
+    }
+
+    /// A call on a lent asset, with the project to ask about others.
+    fn with_asset_in<R>(
+        &mut self,
+        asset: &Asset,
+        project: &dyn Project,
+        ticks: u64,
+        call: impl AsyncFnOnce(&Accessor<State>, &g::Guest, Resource<LentAsset>, Resource<LentProject>) -> wasmtime::Result<R>,
+    ) -> Result<R> {
+        let lent = self.lend(asset)?;
+        let lent_project = match self.lend_project(project) {
+            Ok(lent_project) => lent_project,
+            Err(why) => {
+                self.unlend(lent);
+                return Err(why);
+            }
+        };
+        let (borrowed, borrowed_project) = (Resource::new_borrow(lent.rep()), Resource::new_borrow(lent_project.rep()));
+        let out = self.call(ticks, async |accessor, guest| call(accessor, guest, borrowed, borrowed_project).await);
+        self.unlend_project(lent_project);
+        self.unlend(lent);
+        out
     }
 
     /// A call on a lent asset.
@@ -1774,6 +1836,9 @@ fn icon(icon: types::Icon) -> pe2_ext::Icon {
         types::Icon::Speaker => pe2_ext::Icon::Speaker,
         types::Icon::Music => pe2_ext::Icon::Music,
         types::Icon::Package => pe2_ext::Icon::Package,
+        types::Icon::Cube => pe2_ext::Icon::Cube,
+        types::Icon::Bone => pe2_ext::Icon::Bone,
+        types::Icon::Polygon => pe2_ext::Icon::Polygon,
         types::Icon::Terminal => pe2_ext::Icon::Terminal,
         types::Icon::Text => pe2_ext::Icon::Text,
         types::Icon::Binary => pe2_ext::Icon::Binary,
@@ -1831,6 +1896,7 @@ fn content_request(request: pe2_ext::ContentRequest) -> g::ContentRequest {
     match request {
         pe2_ext::ContentRequest::Action { row, action } => g::ContentRequest::Action((row, action)),
         pe2_ext::ContentRequest::Rename { row, name } => g::ContentRequest::Rename((row, name)),
+        pe2_ext::ContentRequest::Dropped { row, asset } => g::ContentRequest::Dropped((row, asset)),
         pe2_ext::ContentRequest::Moved { row, onto, place } => {
             let place = match place {
                 pe2_ext::ContentPlace::Before => g::ContentPlace::Before,
@@ -2005,27 +2071,27 @@ fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared
         }
         if kind.contents {
             let lister = shared.clone();
-            builder = builder.contents(move |asset| {
-                let contents = lister.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_contents(a, index, lent).await));
+            builder = builder.contents(move |asset, project| {
+                let contents = lister.read(|r| r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_contents(a, index, lent, project).await));
                 contents.map_or_else(
                     |why| pe2_ext::Contents { problem: Some(format!("{why:#}")), ..pe2_ext::Contents::default() },
                     contents_of,
                 )
             });
             let shared = shared.clone();
-            builder = builder.content_act(move |asset, request| {
+            builder = builder.content_act(move |asset, project, request| {
                 let request = content_request(request);
                 let done = shared.read(|r| {
-                    r.with_asset(asset, QUICK, async |a, g, lent| g.call_content_act(a, index, lent, request.clone()).await)
+                    r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_content_act(a, index, lent, project, request.clone()).await)
                 })?;
                 content_outcome(done.map_err(|why| anyhow!(why))?)
             });
         }
         if kind.part_sheet {
             let shared = shared.clone();
-            builder = builder.part_sheet(move |asset, part| {
+            builder = builder.part_sheet(move |asset, project, part| {
                 let sheet = shared.read(|r| {
-                    r.with_asset(asset, QUICK, async |a, g, lent| g.call_part_sheet_of(a, index, lent, part.to_string()).await)
+                    r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_part_sheet_of(a, index, lent, project, part.to_string()).await)
                 });
                 let problem = |why: anyhow::Error| pe2_ext::PartSheet { problem: Some(format!("{why:#}")), ..pe2_ext::PartSheet::default() };
                 match sheet {

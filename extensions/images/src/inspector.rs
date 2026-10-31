@@ -352,7 +352,7 @@ impl View for Collections {
 }
 
 /// What comes of something done in an image's contents: the variants' rows act on them as the inspector's controls do.
-pub(crate) fn act(asset: &Asset, request: ContentRequest) -> Result<ContentOutcome> {
+pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentRequest) -> Result<ContentOutcome> {
     let shown = Shown::read(asset);
     let variant = |row: &str| row.strip_prefix("variants/").and_then(|name| shown.variants.iter().position(|v| v.title == name));
     let of_variants = |label: String, change, select| ContentOutcome {
@@ -388,6 +388,7 @@ pub(crate) fn act(asset: &Asset, request: ContentRequest) -> Result<ContentOutco
             Ok(of_variants(format!("Move {}", shown.variants[from].title), Change::Move(from, to), None))
         }
         ContentRequest::Action { action, .. } => bail!("an image has no action {action}"),
+        ContentRequest::Dropped { .. } => bail!("nothing is dropped on an image's rows"),
     }
 }
 
@@ -457,6 +458,7 @@ impl View for CellSheet {
             toggle: String::new(),
             legend: false,
             grid: None,
+            traces: Vec::new(),
         });
     }
 }

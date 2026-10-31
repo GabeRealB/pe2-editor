@@ -53,7 +53,7 @@ pe2-game = { path = "extensions/game" }
 pe2-images = { path = "extensions/images" }
 pe2-movies = { path = "extensions/movies" }
 pe2-events = { path = "extensions/events" }
-pe2-viewport = { path = "extensions/viewport" }
+pe2-render = { path = "extensions/render" }
 pe2-webgpu = { path = "crates/webgpu" }
 pe2-packages = { path = "extensions/packages" }
 pe2-str = { path = "extensions/str" }

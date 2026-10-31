@@ -1139,8 +1139,10 @@ impl Extensions {
     #[must_use]
     pub fn part(&self, asset: &index::Asset, part: &str) -> Option<Result<Image>> {
         let lent = self.lend(asset);
+        // `cells/skin@night` is that cell through another palette: not a part of its own to list.
+        let listed = part.split_once('@').map_or(part, |(listed, _)| listed);
         let output = self.kind_of(asset)?.outputs.iter().find(|o| {
-            self.makes_pictures(o) && o.members.as_ref().is_some_and(|m| m(&lent).iter().any(|(key, _)| key == part))
+            self.makes_pictures(o) && o.members.as_ref().is_some_and(|m| m(&lent).iter().any(|(key, _)| key == listed))
         })?;
         Some(self.image(asset, &format!("{}/{part}", output.name)))
     }
@@ -1153,9 +1155,9 @@ impl Extensions {
 
     /// What is inside an asset: what its kind says, else its parts, under a heading for each group of them.
     #[must_use]
-    pub fn contents(&self, asset: &index::Asset) -> pe2_ext::Contents {
+    pub fn contents(&self, index: &index::Index, asset: &index::Asset) -> pe2_ext::Contents {
         if let Some(contents) = self.kind_of(asset).and_then(|k| k.contents.as_ref()) {
-            return contents(&self.lend(asset));
+            return contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None });
         }
         pe2_ext::Contents { rows: rows_of_parts(&self.parts(asset)), ..pe2_ext::Contents::default() }
     }
@@ -1164,15 +1166,15 @@ impl Extensions {
     ///
     /// # Errors
     /// Why it cannot be, as its kind says.
-    pub fn content_act(&self, asset: &index::Asset, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
+    pub fn content_act(&self, index: &index::Index, asset: &index::Asset, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
         let act = self.kind_of(asset).and_then(|k| k.content_act.as_ref()).context("its kind does nothing with its contents")?;
-        act(&self.lend(asset), request)
+        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None }, request)
     }
 
     /// A part's fields, where its kind says what they are.
     #[must_use]
-    pub fn part_sheet(&self, asset: &index::Asset, part: &str) -> Option<pe2_ext::PartSheet> {
-        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), part)
+    pub fn part_sheet(&self, index: &index::Index, asset: &index::Asset, part: &str) -> Option<pe2_ext::PartSheet> {
+        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None }, part)
     }
 
     /// The views a kind and a role give the head of the contents pane.

@@ -96,8 +96,11 @@ fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
     let button = if heading { egui::Button::new(()).frame(false) } else { egui::Button::selectable(line.selected, ()) };
     let sense = if line.dragged { egui::Sense::click_and_drag() } else { egui::Sense::click() };
     let width = (line.right - ui.cursor().min.x).max(0.0);
-    // On the left of a row as wide as there is: all of it can be clicked.
-    (ui.add(button.left_text(text).truncate().min_size(egui::vec2(width, 0.0)).sense(sense)), toggled)
+    // On the left of a row as wide as there is: all of it can be clicked. No wider, or its buttons go off the pane.
+    let row = button.left_text(text).truncate().min_size(egui::vec2(width, 0.0)).sense(sense);
+    let size = egui::vec2(width, ui.spacing().interact_size.y);
+    let layout = *ui.layout();
+    (ui.allocate_ui_with_layout(size, layout, |ui| ui.add(row)).inner, toggled)
 }
 
 /// The icon of an action; its label where it has none.
@@ -132,7 +135,12 @@ fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Op
 }
 
 /// What a drop on a row would do, for the place of it the pointer is over.
-fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace) -> Result<String, String> {
+fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, index: &project::index::Index) -> Result<String, String> {
+    if let Dragged::Asset(path) = dragged {
+        let kind = index.assets.get(path).and_then(|asset| asset.kind.as_deref()).map(|kind| kind.rsplit('@').next().unwrap_or(kind));
+        let taken = kind.is_some_and(|kind| row.takes.iter().any(|takes| takes.strip_prefix("asset:") == Some(kind)));
+        return if taken { Ok(format!("Attach it to {}", row.label)) } else { Err(format!("{} does not take it", row.label)) };
+    }
     let Dragged::Row { asset, id, what, .. } = dragged else { return Err("Only what is inside it goes here".to_string()) };
     if asset != of {
         return Err("It stays in its asset".to_string());
@@ -150,7 +158,7 @@ fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace) -> R
 }
 
 /// A row as a place to drop on: its top and foot where it reorders, the rest where it takes something.
-fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ask: &mut Option<ContentRequest>) {
+fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, index: &project::index::Index, ask: &mut Option<ContentRequest>) {
     let (reorders, holds) = (row.drag.as_ref().is_some_and(|drag| drag.reorders), !row.takes.is_empty());
     let edge = rect.height() / if holds { 3.0 } else { 2.0 };
     let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + edge));
@@ -163,8 +171,10 @@ fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ask: 
         (false, false) => vec![],
     };
     for (rect, place) in places {
-        if let Some(Dragged::Row { id, .. }) = dnd::target(ui, rect, |dragged| says(row, of, dragged, place)) {
-            *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place });
+        match dnd::target(ui, rect, |dragged| says(row, of, dragged, place, index)) {
+            Some(Dragged::Row { id, .. }) => *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place }),
+            Some(Dragged::Asset(asset)) => *ask = Some(ContentRequest::Dropped { row: row.id.clone(), asset }),
+            _ => {}
         }
     }
 }
@@ -288,7 +298,7 @@ fn rows_ui(
             ws.content_rename = Some((asset.path.clone(), row.id.clone(), row.label.clone()));
         }
         if editable {
-            row_target(ui, inner_row.response.rect, row, &asset.path, &mut ask);
+            row_target(ui, inner_row.response.rect, row, &asset.path, &ws.index, &mut ask);
         }
     }
     if let Some((inner, look)) = chosen {
@@ -394,7 +404,7 @@ pub fn contents_ui(
     }
     stack_ui(ui, ws, &asset, layers, right);
     if let Some(request) = asked.or(ask) {
-        match ws.extensions.content_act(&asset, request) {
+        match ws.extensions.content_act(&ws.index, &asset, request) {
             Ok(outcome) => match crate::inspector::content_edit(&asset, &outcome) {
                 Ok(request) => {
                     if let Some(select) = &outcome.select {

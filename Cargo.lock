@@ -1602,8 +1602,8 @@ dependencies = [
  "pe2-images",
  "pe2-movies",
  "pe2-packages",
+ "pe2-render",
  "pe2-str",
- "pe2-viewport",
  "project",
  "toml",
 ]
@@ -3712,6 +3712,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-render"
+version = "0.1.0"
+dependencies = [
+ "formats",
+ "pe2-ext",
+ "sha1",
+]
+
+[[package]]
 name = "pe2-str"
 version = "0.1.0"
 dependencies = [
@@ -3719,13 +3728,6 @@ dependencies = [
  "formats",
  "pe2-ext",
  "sha1",
-]
-
-[[package]]
-name = "pe2-viewport"
-version = "0.1.0"
-dependencies = [
- "pe2-ext",
 ]
 
 [[package]]

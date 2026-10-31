@@ -1486,6 +1486,43 @@ pub struct Overlay {
     pub legend: bool,
     /// Lines every so many units across and down.
     pub grid: Option<(f32, f32)>,
+    /// Polygons over the pictures.
+    pub traces: Vec<pe2_ext::Traced>,
+}
+
+/// Whether a point is inside a polygon, its corners in rim order.
+fn inside(corners: &[(f32, f32)], (x, y): (f32, f32)) -> bool {
+    let mut odd = false;
+    for (at, &(ax, ay)) in corners.iter().enumerate() {
+        let (bx, by) = corners[(at + 1) % corners.len()];
+        if (ay > y) != (by > y) && x < ax + (y - ay) / (by - ay) * (bx - ax) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// The polygon at a point: the last drawn, what is selected being drawn over the rest.
+fn trace_at(traces: &[pe2_ext::Traced], at: (f32, f32)) -> Option<usize> {
+    let under = |strong: bool| traces.iter().rposition(|trace| trace.strong == strong && inside(&trace.corners, at));
+    under(true).or_else(|| under(false))
+}
+
+/// The polygons of an overlay: thin over what they lie on, what is selected filled, so that the pixels it covers show;
+/// the one under the pointer on top.
+fn traces_ui(painter: &egui::Painter, traces: &[pe2_ext::Traced], hovered: Option<usize>, origin: egui::Pos2, scale: f32) {
+    let points = |trace: &pe2_ext::Traced| trace.corners.iter().map(|&(x, y)| origin + egui::vec2(x, y) * scale).collect::<Vec<_>>();
+    let thin = egui::Stroke::new(1.0, Color32::from_white_alpha(110));
+    for trace in traces.iter().filter(|trace| !trace.strong) {
+        painter.add(egui::Shape::closed_line(points(trace), thin));
+    }
+    let strong = egui::Stroke::new(1.5, theme::accent());
+    for trace in traces.iter().filter(|trace| trace.strong) {
+        painter.add(egui::Shape::convex_polygon(points(trace), theme::accent().gamma_multiply(0.3), strong));
+    }
+    if let Some(trace) = hovered.and_then(|at| traces.get(at)) {
+        painter.add(egui::Shape::convex_polygon(points(trace), Color32::from_white_alpha(50), egui::Stroke::new(2.0, Color32::WHITE)));
+    }
 }
 
 /// An overlay drawn: each picture, a box over each named rectangle, the legend; hovering an entry of either highlights
@@ -1535,6 +1572,9 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
     if view.grid {
         grid_ui(&painter, whole, layout_size, scale);
     }
+    let pointed = response.hover_pos().map(|pointer| ((pointer - origin) / scale).to_pos2());
+    let trace = pointed.and_then(|at| trace_at(&overlay.traces, (at.x, at.y)));
+    traces_ui(&painter, &overlay.traces, trace, origin, scale);
     if show_boxes {
         let font = egui::TextStyle::Small.resolve(ui.style());
         for (i, (name, rect, highlight)) in boxes.iter().enumerate() {
@@ -1563,13 +1603,15 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
             overlay.pictures.iter().filter(|(_, rect, _, _)| rect.contains(at)).collect();
         let mut lines = vec![format!("({:.0}, {:.0})", at.x.floor(), at.y.floor())];
         lines.extend(pictures.iter().filter_map(|(_, _, label, _)| label.clone()));
+        lines.extend(trace.and_then(|trace| overlay.traces[trace].label.clone()));
         if show_boxes {
             lines.extend(under.iter().map(|&i| boxes[i].0.clone()));
         }
         if response.clicked() {
             // What is there to go to, else what is there to select: `#` and a box's name.
             let part = under.first().filter(|_| show_boxes).map(|&i| format!("#{}", boxes[i].0));
-            clicked = pictures.iter().find_map(|(_, _, _, link)| link.clone()).or(part);
+            let face = trace.and_then(|trace| overlay.traces[trace].link.clone());
+            clicked = face.or_else(|| pictures.iter().find_map(|(_, _, _, link)| link.clone())).or(part);
         }
         response.clone().on_hover_text_at_pointer(lines.join("\n"));
     }
@@ -2331,6 +2373,28 @@ fn project_settings_ui(
 
 #[cfg(test)]
 mod tests {
+    use super::{inside, trace_at};
+    use pe2_ext::Traced;
+
+    fn square(left: f32, strong: bool) -> Traced {
+        Traced { corners: vec![(left, 0.0), (left + 10.0, 0.0), (left + 10.0, 10.0), (left, 10.0)], strong, label: None, link: None }
+    }
+
+    #[test]
+    fn a_point_is_inside_a_polygon_by_its_rim() {
+        let triangle = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)];
+        assert!(inside(&triangle, (2.0, 2.0)));
+        assert!(!inside(&triangle, (8.0, 8.0)), "past the long edge");
+    }
+
+    #[test]
+    fn what_is_selected_answers_over_what_lies_above_it() {
+        let traces = [square(0.0, true), square(0.0, false), square(20.0, false)];
+        assert_eq!(trace_at(&traces, (5.0, 5.0)), Some(0));
+        assert_eq!(trace_at(&traces, (25.0, 5.0)), Some(2));
+        assert_eq!(trace_at(&traces, (15.0, 5.0)), None);
+    }
+
     use super::telling_apart;
 
     #[test]

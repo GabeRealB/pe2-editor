@@ -180,6 +180,7 @@ impl Tab {
 /// What a part's sheet shows: the table it is in, its fields and their values. Its kind's where it says, else what its table
 /// holds, by the part's fragment.
 fn part_fields(ws: &mut Workspace, asset: &Arc<Asset>, id: &str) -> (Vec<String>, Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+    let live = ws.live_fields(&asset.path, id);
     if let Some(sheet) = ws.part_sheet_of(asset, id).as_ref() {
         let mut fields = vec![];
         let mut values = vec![];
@@ -189,7 +190,8 @@ fn part_fields(ws: &mut Workspace, asset: &Arc<Asset>, id: &str) -> (Vec<String>
             field.choices.clone_from(&part.choices);
             field.absent.clone_from(&part.absent);
             fields.push(field);
-            values.push((part.key.clone(), part.value.clone().unwrap_or_else(|| "".into())));
+            let moving = live.iter().find(|(key, _)| *key == part.key).map(|(_, value)| value.clone());
+            values.push((part.key.clone(), moving.or_else(|| part.value.clone()).unwrap_or_else(|| "".into())));
         }
         return (sheet.within.clone(), fields, values);
     }
@@ -478,22 +480,27 @@ fn property_sheet(
             return;
         }
         let editable = editable && !field.is_some_and(|f| f.read_only);
-        if let Some(field) = field.filter(|f| editable && !f.choices.is_empty()) {
-            choice_ui(ui, sheet, asset, key, value, field, edit);
-            return;
-        }
-        value_ui(ui, sheet, key, value, nav);
-        if editable && reference_in(value).is_some() {
-            let name = sheet.label(key).to_lowercase();
-            let verdict = |dragged: &Dragged| match dragged {
-                Dragged::Asset(path) => takes(sheet, asset, value, path).map(|()| format!("Set {name} to it")),
-                Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
-            };
-            if let Some(Dragged::Asset(path)) = dnd::target(ui, ui.min_rect().expand(2.0), verdict)
-                && let Some(new) = sheet.index.assets.get(&path).and_then(|a| retargeted(value, a))
-            {
+        if let Some(axes) = three_numbers(value).filter(|_| editable) {
+            let id = ui.scope_id().with(("axes", &asset.path, sheet.path(key)));
+            let shown = (asset.path.as_str(), key.as_str());
+            if let Some(new) = axes_editor(ui, id, shown, value, axes) {
                 *edit = set_field(asset, &sheet.within, key, inline(&new), &sheet.label(key));
             }
+            return;
+        }
+        let chooses = field.filter(|f| editable && !f.choices.is_empty());
+        if let Some(field) = chooses {
+            choice_ui(ui, sheet, asset, key, value, field, edit);
+        } else {
+            value_ui(ui, sheet, key, value, nav);
+        }
+        if editable
+            && let Some(new) = reference_dropped(ui, ui.min_rect(), sheet, asset, key, value)
+        {
+            *edit = set_field(asset, &sheet.within, key, inline(&new), &sheet.label(key));
+        }
+        if chooses.is_some() {
+            return;
         }
         if editable && is_scalar(value) {
             let pencil = ui.add(egui::Button::new(RichText::new(icons::PENCIL_SIMPLE).small()).frame(false));
@@ -519,6 +526,30 @@ fn property_sheet(
             ui.end_row();
         }
     });
+}
+
+/// What a reference field at `rect` holds after something dropped on it, where something was: its other keys kept.
+pub fn reference_dropped(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, asset: &Asset, key: &str, value: &toml::Value) -> Option<toml::Value> {
+    reference_in(value)?;
+    let name = sheet.label(key).to_lowercase();
+    let verdict = |dragged: &Dragged| match dragged {
+        Dragged::Asset(path) => takes(sheet, asset, value, path).map(|()| format!("Set {name} to it")),
+        Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
+    };
+    let Some(Dragged::Asset(path)) = dnd::target(ui, rect.expand(2.0), verdict) else { return None };
+    sheet.index.assets.get(&path).and_then(|dropped| retargeted(value, dropped))
+}
+
+/// The uid of an asset of `kind` dropped at `rect`, where there is no reference yet to say what goes there.
+pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, holder: &Asset, kind: &str) -> Option<toml::Value> {
+    let of_kind = |asset: &Asset| asset.kind.as_deref().is_some_and(|known| known.rsplit('@').next() == Some(kind));
+    let verdict = |dragged: &Dragged| match dragged {
+        Dragged::Asset(path) if *path == holder.path => Err("It would name itself".to_string()),
+        Dragged::Asset(path) => sheet.index.assets.get(path).filter(|asset| of_kind(asset)).map(|_| format!("Fill it with this {kind}")).ok_or_else(|| format!("It takes a {kind}")),
+        Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
+    };
+    let Some(Dragged::Asset(path)) = dnd::target(ui, rect.expand(4.0), verdict) else { return None };
+    sheet.index.assets.get(&path)?.uid.clone().map(toml::Value::String)
 }
 
 /// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
@@ -608,7 +639,7 @@ fn set_field(
 /// nothing. Edits of the same field in a row merge into one step.
 fn change_field(asset: &Asset, within: &[String], key: &str, new: Option<toml_edit::Item>, label: String) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
-    let table = table_at(&mut document, within)?;
+    let table = table_made_at(&mut document, within)?;
     match new {
         Some(new) => drop(table.insert(key, new)),
         None => drop(table.remove(key)),
@@ -654,7 +685,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
 }
 
 /// The reference in a value: itself, or the one a table holds beside where it places it (`{ slot = "uid://...", at = ... }`).
-fn reference_in(value: &toml::Value) -> Option<&toml::Value> {
+pub fn reference_in(value: &toml::Value) -> Option<&toml::Value> {
     if is_reference(value) {
         return Some(value);
     }
@@ -700,12 +731,26 @@ fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &str) -> Resu
 /// The table at a path of a declaration, step by step: keys, and a list's tables by their places. Whether a step is a place
 /// is the declaration's to say: a key may look like a number, or hold a dot.
 fn table_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String]) -> Option<&'a mut dyn toml_edit::TableLike> {
+    walk_to(document, path, false)
+}
+
+/// The same, making what is missing of it: for a sheet, which says itself where a part's fields are kept.
+fn table_made_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String]) -> Option<&'a mut dyn toml_edit::TableLike> {
+    walk_to(document, path, true)
+}
+
+fn walk_to<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String], make: bool) -> Option<&'a mut dyn toml_edit::TableLike> {
     let mut steps = path.iter();
     let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
     while let Some(step) = steps.next() {
+        if make && !table.contains_key(step) {
+            table.insert(step, toml_edit::Item::Value(toml_edit::InlineTable::new().into()));
+        }
         let item = table.get_mut(step)?;
         table = if item.is_array_of_tables() {
             item.as_array_of_tables_mut()?.get_mut(steps.next()?.parse().ok()?)?
+        } else if item.is_array() {
+            item.as_array_mut()?.get_mut(steps.next()?.parse().ok()?)?.as_inline_table_mut()?
         } else {
             item.as_table_like_mut()?
         };
@@ -746,9 +791,9 @@ fn item(value: &toml::Value) -> toml_edit::Item {
 
 /// The edit making what a view set of the asset it shows: each field's new value or its removal, its declaration's
 /// layout otherwise kept, in one step; none where it changes nothing.
-pub fn set_fields(asset: &Asset, sets: &[(String, Option<toml::Value>)]) -> Option<EditRequest> {
+pub fn set_fields(asset: &Asset, sets: &crate::ext_ui::Sets) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
-    for (key, value) in sets {
+    for (key, value) in &sets.values {
         match value {
             Some(value) => {
                 document.insert(key, item(value));
@@ -761,7 +806,7 @@ pub fn set_fields(asset: &Asset, sets: &[(String, Option<toml::Value>)]) -> Opti
     if document.to_string() == asset.text() {
         return None;
     }
-    let mut keys: Vec<&str> = sets.iter().map(|(k, _)| k.as_str()).collect();
+    let mut keys: Vec<&str> = sets.values.iter().map(|(k, _)| k.as_str()).collect();
     keys.dedup();
     let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
     Some(EditRequest::Write {
@@ -769,7 +814,7 @@ pub fn set_fields(asset: &Asset, sets: &[(String, Option<toml::Value>)]) -> Opti
         file: project::index::ASSET_FILE.to_string(),
         bytes: document.to_string().into_bytes(),
         label: format!("Edit {} of {name}", keys.join(", ")),
-        merge: Some(format!("{}#{}", asset.path, keys.join(","))),
+        merge: (!sets.apart).then(|| format!("{}#{}", asset.path, keys.join(","))),
     })
 }
 
@@ -797,13 +842,7 @@ fn choice_ui(
             }
         }
     });
-    let new = chosen.and_then(|choice| match choice {
-        toml::Value::String(s) => Some(toml_edit::Value::from(s)),
-        toml::Value::Integer(n) => Some(n.into()),
-        toml::Value::Float(f) => Some(f.into()),
-        toml::Value::Boolean(b) => Some(b.into()),
-        _ => None,
-    });
+    let new = chosen.map(|choice| inline(&choice));
     let label = field.label.as_deref().unwrap_or(key);
     if remove {
         let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
@@ -821,8 +860,94 @@ fn ints(value: &toml::Value) -> Option<Vec<i64>> {
     value.as_array()?.iter().map(int).collect()
 }
 
+/// Three numbers, whole or not.
+fn three_numbers(value: &toml::Value) -> Option<[f64; 3]> {
+    #[expect(clippy::cast_precision_loss, reason = "a coordinate is far from where doubles lose it")]
+    let number = |x: &toml::Value| x.as_float().or_else(|| x.as_integer().map(|whole| whole as f64));
+    match value.as_array()?.as_slice() {
+        [x, y, z] => Some([number(x)?, number(y)?, number(z)?]),
+        _ => None,
+    }
+}
+
+const AXES: [(&str, Color32); 3] = [("X", Color32::from_rgb(232, 69, 82)), ("Y", Color32::from_rgb(122, 201, 67)), ("Z", Color32::from_rgb(66, 140, 237))];
+/// What a row of axes is high from the start: one growing as its boxes are laid out would center each lower than the last.
+const AXES_ROW: f32 = 22.0;
+
+/// A vector, by axis, in the axes' colors.
+fn axes_ui(ui: &mut egui::Ui, axes: [f64; 3]) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(AXES_ROW);
+        for ((axis, color), value) in AXES.into_iter().zip(axes) {
+            ui.label(RichText::new(axis).small().strong().color(color));
+            ui.add_sized([52.0, 16.0], egui::Label::new(RichText::new(format!("{value:.1}")).monospace()));
+        }
+    });
+}
+
+/// A vector to edit, by axis: dragged or typed, and what it comes to once that ends, whole numbers staying whole.
+fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), value: &toml::Value, axes: [f64; 3]) -> Option<toml::Value> {
+    let whole = value.as_array().is_some_and(|values| values.iter().all(toml::Value::is_integer));
+    let mut held: [f64; 3] = ui.data(|data| data.get_temp(id)).unwrap_or(axes);
+    let (mut active, mut ended) = (false, false);
+    ui.horizontal(|ui| {
+        ui.set_min_height(AXES_ROW);
+        for (at, (axis, color)) in AXES.into_iter().enumerate() {
+            ui.label(RichText::new(axis).small().strong().color(color));
+            let drag = egui::DragValue::new(&mut held[at]).speed(if whole { 1.0 } else { 0.5 }).fixed_decimals(usize::from(!whole));
+            let response = ui.add_sized([52.0, 18.0], drag);
+            active |= response.dragged() || response.has_focus();
+            ended |= response.drag_stopped() || response.lost_focus();
+        }
+    });
+    if active {
+        let frame = ui.ctx().cumulative_frame_nr();
+        let differs = held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9);
+        let moved = differs.then(|| Edited { asset: asset.to_string(), key: key.to_string(), value: vector(&held, whole), frame });
+        ui.data_mut(|data| {
+            data.insert_temp(id, held);
+            data.insert_temp(editing_id(), moved);
+        });
+    }
+    if !ended {
+        return None;
+    }
+    ui.data_mut(|data| data.remove_temp::<[f64; 3]>(id));
+    held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9).then(|| vector(&held, whole))
+}
+
+/// Three numbers as a field holds them, whole numbers staying whole.
+fn vector(held: &[f64; 3], whole: bool) -> toml::Value {
+    #[expect(clippy::cast_possible_truncation, reason = "rounded, and a coordinate is well within range")]
+    let number = |x: f64| if whole { toml::Value::Integer(x.round() as i64) } else { toml::Value::Float(x) };
+    toml::Value::Array(held.map(number).to_vec())
+}
+
+/// A vector being dragged or typed in the sheet: the inspector draws after the views, so they read last frame's.
+#[derive(Clone)]
+struct Edited {
+    asset: String,
+    key: String,
+    value: toml::Value,
+    frame: u64,
+}
+
+fn editing_id() -> egui::Id {
+    egui::Id::unique("inspector editing")
+}
+
+/// What is being edited of an asset in the sheet: what ended, or went with its pane, stops showing the frame after.
+pub fn being_edited(ctx: &egui::Context, asset: &str) -> Option<(String, toml::Value)> {
+    let edited: Edited = ctx.data(|data| data.get_temp::<Option<Edited>>(editing_id())).flatten()?;
+    (edited.asset == asset && ctx.cumulative_frame_nr().saturating_sub(edited.frame) <= 1).then_some((edited.key, edited.value))
+}
+
 /// A value by its field's meaning: a depth, a size, an offset, a rectangle, a placement, a reference, a list.
 pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value, nav: &mut Option<String>) {
+    if let Some(axes) = three_numbers(value) {
+        axes_ui(ui, axes);
+        return;
+    }
     let field = sheet.field(key);
     if let Some(absent) = field.and_then(|f| f.absent.as_ref()).filter(|_| value.as_str() == Some("")) {
         ui.label(RichText::new(absent).color(theme::weak()));
@@ -865,6 +990,9 @@ pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value
         toml::Value::Table(t) => {
             if is_reference(value) {
                 reference_chip(ui, sheet, value, nav);
+            } else if let (Some(slot), 1) = (t.get("slot"), t.len()) {
+                // Another asset, named by nothing else.
+                reference_chip(ui, sheet, slot, nav);
             } else if let (Some(slot), Some(at)) = (t.get("slot"), t.get("at")) {
                 // A placement: the VRAM slot and the offset in it.
                 reference_chip(ui, sheet, slot, nav);
@@ -1719,6 +1847,27 @@ pub fn size_text(bytes: u64) -> String {
 #[cfg(test)]
 mod path_tests {
     use super::{table_at, with_sets};
+
+    #[test]
+    fn a_part_gets_its_table_with_the_first_thing_set_in_it() {
+        let mut document: toml_edit::DocumentMut = "kind = \"prefab\"\n".parse().unwrap();
+        let table = super::table_made_at(&mut document, &steps(&["pose", "head"])).unwrap();
+        table.insert("rotation", toml_edit::value(3));
+        let read: toml::Table = document.to_string().parse().unwrap();
+        assert_eq!(read["pose"]["head"]["rotation"].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn a_set_reaches_a_table_in_an_inline_list() {
+        let text = "children = [\n    { node = \"left\" },\n    { node = \"right\" },\n]\n";
+        let path = steps(&["children", "1", "overrides"]);
+        let written = with_sets(text, &[(path.clone(), Some(toml::Value::Integer(3)))]).unwrap();
+        let read: toml::Table = written.parse().unwrap();
+        assert_eq!(read["children"][1]["overrides"].as_integer(), Some(3));
+        assert_eq!(read["children"][0].get("overrides"), None);
+        let back = with_sets(&written, &[(path, None)]).unwrap();
+        assert_eq!(back.parse::<toml::Table>().unwrap(), text.parse::<toml::Table>().unwrap());
+    }
 
     fn steps(path: &[&str]) -> Vec<String> {
         path.iter().map(|step| (*step).to_string()).collect()

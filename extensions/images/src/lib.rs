@@ -182,7 +182,7 @@ pub fn looks(asset: &Asset) -> Vec<String> {
 
 /// What is inside an image: its parts by group, a palette and a cell shown by their pictures. A cell is dropped on the palette
 /// that draws it, a variant renamed, moved and removed; a cell's name and rectangle are its source's.
-fn contents(asset: &Asset) -> Contents {
+fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
     let palette_of: HashMap<String, Option<usize>> = cells(asset).into_iter().map(|cell| (cell.name, cell.palette)).collect();
     let names = palette_names(asset);
     let has_cells = !palette_of.is_empty();
@@ -229,7 +229,7 @@ fn contents(asset: &Asset) -> Contents {
 }
 
 /// A cell's fields: its palette and depth are settings, its rectangle its source's.
-fn part_sheet(asset: &Asset, part: &str) -> Option<PartSheet> {
+fn part_sheet(asset: &Asset, _: &dyn pe2_ext::Project, part: &str) -> Option<PartSheet> {
     let name = part.strip_prefix("cells/")?;
     let (_, cell) = asset.parts("cells").into_iter().find(|(cell, _)| *cell == name)?;
     let palettes = palette_names(asset).into_iter().map(|p| (Value::String(p.clone()), p)).collect();
@@ -466,8 +466,14 @@ pub(crate) fn part_of(asset: &Asset, image: &TexelImage, part: &str) -> Option<I
         return Some(draw(asset, image, look));
     }
     if let Some(name) = part.strip_prefix("cells/") {
+        // `cells/skin@night`: through a palette of the image's other than its own.
+        let (name, through) = name.split_once('@').map_or((name, None), |(name, palette)| (name, Some(palette)));
         let cell = cells(asset).into_iter().find(|c| c.name == name)?;
-        return Some(crop(&draw(asset, image, 0), cell.rect));
+        let through = match through {
+            Some(palette) => Some((name, palette_names(asset).iter().position(|known| known == palette)?)),
+            None => None,
+        };
+        return Some(crop(&decode_texels(asset, &image.texels, &image.colors(), 0, through), cell.rect));
     }
     let colors = image.palette(part.strip_prefix("palettes/")?)?;
     Some(Image { width: colors.len(), height: 1, rgba: colors.iter().flat_map(|&c| rgba(c)).collect() })
@@ -476,14 +482,14 @@ pub(crate) fn part_of(asset: &Asset, image: &TexelImage, part: &str) -> Option<I
 /// Texels and palettes as a picture in a look (one past its looks, its first), with their image's settings.
 pub(crate) fn draw(asset: &Asset, image: &TexelImage, look: usize) -> Image {
     let look = if look < looks(asset).len() { look } else { 0 };
-    decode_texels(asset, &image.texels, &image.colors(), look)
+    decode_texels(asset, &image.texels, &image.colors(), look, None)
 }
 
 /// An image's pixels in one of its looks: a texture through its variant's palette; an atlas faintly through its first
 /// palette, and each of its cells through its own - the variant's where it gives the cell one - a deeper cell's texels
 /// taken from the same halfwords at its depth. Where no colors are extracted (an executable uploads them) or none are
 /// known, in gray.
-fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], variant: usize) -> Image {
+fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], variant: usize, through: Option<(&str, usize)>) -> Image {
     const CLEAR: [u8; 4] = [0; 4];
     let bpp = bpp(asset);
     let (width, height) = pair(asset.field("size")).unwrap_or_default();
@@ -515,7 +521,8 @@ fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], vari
     if atlas {
         let per = texels_per_halfword(bpp);
         for cell in &cells {
-            let colors = palette(overrides.get(&cell.name).copied().or(cell.palette));
+            let asked = through.filter(|(name, _)| *name == cell.name).map(|(_, palette)| palette);
+            let colors = palette(asked.or_else(|| overrides.get(&cell.name).copied()).or(cell.palette));
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
             let (sx, sy, cw, ch, dx) = (
                 cell.source.x as usize,

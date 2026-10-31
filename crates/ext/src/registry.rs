@@ -166,6 +166,9 @@ pub enum Icon {
     Speaker,
     Music,
     Package,
+    Cube,
+    Bone,
+    Polygon,
     Terminal,
     Text,
     Binary,
@@ -702,6 +705,8 @@ pub enum ContentRequest {
     Action { row: String, action: String },
     Rename { row: String, name: String },
     Moved { row: String, onto: String, place: ContentPlace },
+    /// An asset, by its path, dropped on a row whose `takes` names `asset:` and its kind.
+    Dropped { row: String, asset: String },
 }
 
 /// What comes of it: its name in the history, what it changes in the declaration, each by its path (keys, a list's place) and
@@ -735,11 +740,11 @@ pub struct PartSheet {
 }
 
 /// What is inside an asset.
-pub type ListContents = dyn Fn(&Asset) -> Contents + Send + Sync;
+pub type ListContents = dyn Fn(&Asset, &dyn crate::Project) -> Contents + Send + Sync;
 /// What comes of something done in an asset's contents.
-pub type ActOnContents = dyn Fn(&Asset, ContentRequest) -> Result<ContentOutcome> + Send + Sync;
+pub type ActOnContents = dyn Fn(&Asset, &dyn crate::Project, ContentRequest) -> Result<ContentOutcome> + Send + Sync;
 /// A part's fields, by its fragment.
-pub type SheetOfPart = dyn Fn(&Asset, &str) -> Option<PartSheet> + Send + Sync;
+pub type SheetOfPart = dyn Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync;
 
 /// A kind as registered.
 #[derive(Clone)]
@@ -1265,21 +1270,21 @@ impl KindBuilder<'_> {
 
     /// What is inside its assets, for the contents pane, where its parts by themselves do not say enough.
     #[must_use]
-    pub fn contents(mut self, contents: impl Fn(&Asset) -> Contents + Send + Sync + 'static) -> Self {
+    pub fn contents(mut self, contents: impl Fn(&Asset, &dyn crate::Project) -> Contents + Send + Sync + 'static) -> Self {
         self.def.contents = Some(Arc::new(contents));
         self
     }
 
     /// What comes of what is done to its contents: a row's action, a row renamed or dragged.
     #[must_use]
-    pub fn content_act(mut self, act: impl Fn(&Asset, ContentRequest) -> Result<ContentOutcome> + Send + Sync + 'static) -> Self {
+    pub fn content_act(mut self, act: impl Fn(&Asset, &dyn crate::Project, ContentRequest) -> Result<ContentOutcome> + Send + Sync + 'static) -> Self {
         self.def.content_act = Some(Arc::new(act));
         self
     }
 
     /// Its parts' fields, where those are not simply what their tables hold.
     #[must_use]
-    pub fn part_sheet(mut self, sheet: impl Fn(&Asset, &str) -> Option<PartSheet> + Send + Sync + 'static) -> Self {
+    pub fn part_sheet(mut self, sheet: impl Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync + 'static) -> Self {
         self.def.part_sheet = Some(Arc::new(sheet));
         self
     }

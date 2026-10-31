@@ -484,7 +484,7 @@ fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut Us
                     ui.label(RichText::new(scope).small().color(theme::weak())).on_hover_text(says);
                     if kept.is_some() {
                         let back = format!("Back to {}", setting.default);
-                        let response = ui.small_button(icons::ARROW_COUNTER_CLOCKWISE);
+                        let response = ui.small_button(icons::ARROW_ARC_LEFT);
                         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &back));
                         if response.on_hover_text(&back).clicked() {
                             next = Some(None);

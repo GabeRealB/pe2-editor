@@ -43,7 +43,7 @@ fn language(path: &Path) -> Option<&'static str> {
         "c" | "h" | "inc" | "cpp" | "hpp" => "c",
         "py" => "py",
         "rs" => "rs",
-        "toml" => "toml",
+        "toml" | "usda" => "toml",
         "json" => "json",
         "yaml" | "yml" => "yaml",
         "sh" | "bash" => "sh",

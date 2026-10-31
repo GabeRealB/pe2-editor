@@ -860,6 +860,9 @@ impl Workspace {
             self.tree = snapshot.tree;
             self.layers = snapshot.layers;
             self.refresh_editable();
+            if snapshot.all || self.textures.live.as_ref().is_some_and(|live| snapshot.changed.contains(&live.asset)) {
+                self.textures.live = None;
+            }
             if snapshot.all {
                 self.pictures.clear();
                 self.parts = Parts::default();
@@ -873,12 +876,14 @@ impl Workspace {
                 let changed = &snapshot.changed;
                 self.pictures.retain(|(image, ..), _| !changed.contains(image));
                 self.parts.forget(changed);
-                self.inspector_views.retain(|(asset, ..), _| !changed.contains(asset));
                 self.panels.clear();
-                self.views.retain(|(_, asset, _), _| !changed.contains(asset));
-                self.contents.retain(|asset, _| !changed.contains(asset));
-                self.part_sheets.retain(|(asset, _), _| !changed.contains(asset));
                 self.thumbs.forget(changed);
+                // A view shows what it refers to as well: a model what its material says.
+                let reached = reached_from(&self.index, changed);
+                self.inspector_views.retain(|(asset, ..), _| !reached.contains(asset));
+                self.views.retain(|(_, asset, _), _| !reached.contains(asset));
+                self.contents.retain(|asset, _| !reached.contains(asset));
+                self.part_sheets.retain(|(asset, _), _| !reached.contains(asset));
             }
             self.drop_lost_selection();
             // Other programs' changes taken in: the app says how many assets they changed.
@@ -1452,15 +1457,15 @@ impl Workspace {
 
     /// What is inside an asset, as its kind says.
     pub fn contents_of(&mut self, asset: &Asset) -> Arc<pe2_ext::Contents> {
-        let extensions = &self.extensions;
-        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(asset))).clone()
+        let (extensions, index) = (&self.extensions, &self.index);
+        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(index, asset))).clone()
     }
 
     /// A part's sheet, where its asset's kind says what it holds.
     pub fn part_sheet_of(&mut self, asset: &Asset, part: &str) -> Arc<Option<pe2_ext::PartSheet>> {
-        let extensions = &self.extensions;
+        let (extensions, index) = (&self.extensions, &self.index);
         let key = (asset.path.clone(), part.to_string());
-        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(asset, part))).clone()
+        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, part))).clone()
     }
 
     /// Select the part of the asset selected a fragment or a name stands for - a box knows only its name - or a row of its
@@ -1690,13 +1695,19 @@ impl Workspace {
             looks: Some(&self.variant_choice),
         };
         let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable, part: part.as_deref() };
-        let mut sets = vec![];
+        let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
         drop(host);
-        if !sets.is_empty() {
+        if !sets.values.is_empty() {
             self.view_edit = crate::inspector::set_fields(asset, &sets);
         }
+    }
+
+    /// What a gesture in a view has made so far of a part's fields, as yet unwritten.
+    pub fn live_fields(&self, asset: &str, part: &str) -> Vec<(String, toml::Value)> {
+        let live = self.textures.live.as_ref().filter(|live| live.asset == asset && live.part == part);
+        live.map_or_else(Vec::new, |live| live.fields.clone())
     }
 
     /// Show an asset's picture in its look on the host's canvas, with what its kind marks on it over it.
@@ -1729,6 +1740,7 @@ impl Workspace {
             toggle: marks.toggle.clone(),
             legend: marks.legend,
             grid: None,
+            traces: Vec::new(),
         };
         if let Some(link) = crate::panes::overlay_ui(ui, &overlay, preview, count) {
             *nav = Some(link);
@@ -1776,11 +1788,11 @@ impl Workspace {
             let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
             let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable, part: part.as_deref() };
-            let mut sets = vec![];
+            let mut sets = crate::ext_ui::Sets::default();
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
             drop(host);
-            if !sets.is_empty() {
+            if !sets.values.is_empty() {
                 self.view_edit = crate::inspector::set_fields(asset, &sets);
             }
         }
@@ -1802,8 +1814,22 @@ impl Workspace {
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };
         let frame = crate::ext_ui::Frame { asset: None, look: 0, preview, count: 1, editable: false, part: None };
-        let mut sets = vec![];
+        let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
     }
+}
+
+/// What changed, and everything that refers to it, however far off.
+fn reached_from(index: &project::index::Index, changed: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut reached = changed.clone();
+    let mut waiting: Vec<&str> = changed.iter().map(String::as_str).collect();
+    while let Some(path) = waiting.pop() {
+        for reference in index.referenced_by.get(path).into_iter().flatten() {
+            if reached.insert(reference.from.clone()) {
+                waiting.push(&reference.from);
+            }
+        }
+    }
+    reached
 }
