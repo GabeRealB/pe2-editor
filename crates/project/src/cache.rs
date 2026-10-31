@@ -75,8 +75,32 @@ pub fn make(root: &Path) -> Result<PathBuf> {
 /// # Errors
 /// The temporary file cannot be written or renamed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    // Each writer's own: two threads may be writing the same file, as two nodes making one value do.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let temporary = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_file_name(format!(".{name}.{}.{write}.tmp", std::process::id()));
     std::fs::write(&temporary, bytes).with_context(|| format!("{}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("{}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn writers_of_one_file_do_not_meet() {
+        let dir = std::env::temp_dir().join(format!("pe2-write-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("value");
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let file = file.clone();
+                std::thread::spawn(move || (0..200).try_for_each(|_| super::write_atomic(&file, b"held")))
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"held");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
