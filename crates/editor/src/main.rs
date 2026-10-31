@@ -25,6 +25,7 @@ mod drive;
 mod ext_ui;
 mod extensions_pane;
 mod external;
+mod gpu_view;
 mod graph_pane;
 mod icons;
 mod inspector;
@@ -46,7 +47,7 @@ mod yuv;
 
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 use eframe::egui;
-use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
+use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,7 +59,10 @@ fn wgpu_options() -> WgpuConfiguration {
         let default = setup.device_descriptor.clone();
         setup.device_descriptor = Arc::new(move |adapter| {
             let mut descriptor = default(adapter);
-            descriptor.required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+            // Extensions draw on this device: what the hardware has is theirs to use, the standard's optional features among it.
+            descriptor.required_limits = adapter.limits();
+            let offered = adapter.features();
+            descriptor.required_features |= wgpu::Features { features_wgpu: wgpu::FeaturesWGPU::empty(), features_webgpu: offered.features_webgpu };
             descriptor
         });
     }
@@ -119,6 +123,7 @@ fn monitors(event_loop: &mut winit::event_loop::EventLoop<eframe::UserEvent>) ->
 }
 
 fn main() -> eframe::Result {
+    project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);
     let mut agents_drive = false;
@@ -164,6 +169,7 @@ fn main() -> eframe::Result {
                 state.device.on_uncaptured_error(Arc::new(|e| eprintln!("wgpu: {e}")));
                 // The player's YCbCr frames are drawn by a pipeline of its own.
                 yuv::install(state);
+                gpu_view::install(state);
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
             let start = app::Start { project, select, show, screenshot, max_surface, agents_drive, monitors };

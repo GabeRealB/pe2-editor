@@ -15,6 +15,7 @@ pub mod bindings {
     wit_bindgen::generate!({
         world: "extension",
         path: "wit",
+        generate_all,
         pub_export_macro: true,
         export_macro_name: "export_component",
         default_bindings_module: "pe2_ext::guest::bindings",
@@ -392,6 +393,10 @@ impl UiHost for Frame<'_> {
 
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
         self.ui().image(texture.handle(), width, height);
+    }
+
+    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
+        self.ui().gpu_image(id, width, height);
     }
 
     fn reference(&mut self, reference: &Value) {

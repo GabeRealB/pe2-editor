@@ -309,6 +309,8 @@ interface host {
     /// dropped.
     resource ui {
         label: func(text: string, style: style);
+        /// A texture published through `gpu`, at this size.
+        gpu-image: func(id: u64, width: f32, height: f32);
         button: func(text: string) -> bool;
         /// A button showing an icon of the host's set, what it does said on hovering it; whether it was clicked.
         icon-button: func(icon: icon, hint: string) -> bool;
@@ -753,8 +755,28 @@ interface guest {
     start-stream: func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<generator, string>;
 }
 
-world extension {
+/// The GPU, for what shows itself in a view: the device the editor draws with, and a texture of it made known to `ui.gpu-image`.
+interface gpu {
+    use wasi:webgpu/webgpu@0.3.0-rc.2.{gpu-device, gpu-texture};
+
+    /// None where nothing draws: the command line, the MCP server.
+    device: func() -> option<gpu-device>;
+    /// What `ui.gpu-image` knows a texture by, while it is kept: publishing it again gives the same.
+    publish: func(texture: borrow<gpu-texture>) -> u64;
+    /// The window lets go of a published texture.
+    unpublish: func(id: u64);
+}
+
+/// What every host links.
+world linked {
     import host;
     import unsandboxed;
     export guest;
+}
+
+/// An extension: and the GPU, which only a host that draws links. Elsewhere calling it traps.
+world extension {
+    include linked;
+    import wasi:webgpu/webgpu@0.3.0-rc.2;
+    import gpu;
 }

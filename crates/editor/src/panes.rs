@@ -1815,6 +1815,13 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
             ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
         });
     }
+    if !ws.gpu_errors.is_empty() {
+        theme::section(ui, "GPU", |ui| {
+            for error in &ws.gpu_errors {
+                ui.label(RichText::new(error).monospace().color(ui.visuals().error_fg_color));
+            }
+        });
+    }
     if !ws.extensions.problems.is_empty() {
         theme::section(ui, "Extensions", |ui| {
             for problem in &ws.extensions.problems {

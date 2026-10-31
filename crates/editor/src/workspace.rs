@@ -200,6 +200,8 @@ pub struct Workspace {
     pub last_epoch: Option<crate::runner::Finished>,
     /// The name of an event being defined.
     pub new_event_name: String,
+    /// What the GPU said of what extensions gave it, first first.
+    pub gpu_errors: Vec<String>,
     /// The assets' settings as last applied (`project::applied`): what their outputs are made from.
     applied: Arc<project::applied::Applied>,
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
@@ -325,6 +327,9 @@ fn stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.len(), meta.modified().ok()?))
 }
+
+/// How many GPU errors are kept: an extension failing a frame says the same each frame.
+const MOST_GPU_ERRORS: usize = 8;
 
 /// What a take-in did to the workspace, as the app is told of it.
 #[derive(Default)]
@@ -527,6 +532,7 @@ impl Workspace {
             config: None,
             last_epoch: None,
             new_event_name: String::new(),
+            gpu_errors: Vec::new(),
             project,
             applied,
             history,
@@ -769,6 +775,8 @@ impl Workspace {
         }
         let ready = self.takein.poll();
         self.apply(ready);
+        self.gpu_errors.extend(pe2_webgpu::take_errors());
+        self.gpu_errors.truncate(MOST_GPU_ERRORS);
         for ended in self.runner.poll() {
             if matches!(self.outcome, Update::Nothing)
                 && let Some(said) = ended.said()

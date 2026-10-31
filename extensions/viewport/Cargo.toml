@@ -1,0 +1,16 @@
+[package]
+name = "pe2-viewport"
+description = "pe2.viewport, a built-in extension: what it takes to see in three dimensions"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A library linked into the editor, and a component built for wasm32-wasip3.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true

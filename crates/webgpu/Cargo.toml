@@ -1,0 +1,18 @@
+[package]
+name = "pe2-webgpu"
+description = "wasi:webgpu for extensions, on the device the editor draws with"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+wgpu-types = "30"
+
+[dev-dependencies]
+pastey = "0.2"

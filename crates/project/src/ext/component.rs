@@ -43,7 +43,7 @@ use super::{Loadable, Origin};
 
 mod bindings {
     wasmtime::component::bindgen!({
-        world: "extension",
+        world: "linked",
         path: "../ext/wit",
         imports: { default: trappable },
         exports: { default: async | store },
@@ -334,7 +334,7 @@ pub struct Memory {
 }
 
 /// An instance's state: its resources, WASI with nothing behind it, its limits.
-struct State {
+pub struct State {
     id: String,
     wasi: WasiCtx,
     table: ResourceTable,
@@ -992,6 +992,11 @@ impl host::HostUi for State {
         Ok(self.frame(&ui)?.chip(&text, selected))
     }
 
+    fn gpu_image(&mut self, ui: Resource<Frame>, id: u64, width: f32, height: f32) -> wasmtime::Result<()> {
+        self.frame(&ui)?.gpu_image(id, width, height);
+        Ok(())
+    }
+
     fn image(&mut self, ui: Resource<Frame>, texture: Resource<HostTexture>, width: f32, height: f32) -> wasmtime::Result<()> {
         let texture = self.table.get(&texture)?;
         let texture = pe2_ext::Texture::shared(texture.key.clone(), texture.image.clone());
@@ -1167,7 +1172,7 @@ impl host::HostUi for State {
 /// An instance of a component, with the store it runs in.
 struct Runner {
     store: Store<State>,
-    instance: bindings::Extension,
+    instance: bindings::Linked,
     runtime: Runtime,
     meter: Arc<Meter>,
     /// What the guest writes to standard error: a panic's message.
@@ -1253,7 +1258,7 @@ impl Runner {
 pub struct Shared {
     id: String,
     engine: Engine,
-    pre: bindings::ExtensionPre<State>,
+    pre: bindings::LinkedPre<State>,
     /// The readings' instance, and how many more frames unused it stays.
     reading: Mutex<Option<(Runner, u32)>>,
     /// The instance the views live in, made with the first view and dropped with the last.
@@ -2607,6 +2612,16 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
     })
 }
 
+/// What links `wasi:webgpu`, where the host draws; the project itself has no GPU.
+pub type LinkGpu = fn(&mut Linker<State>) -> wasmtime::Result<()>;
+
+static GPU: std::sync::OnceLock<LinkGpu> = std::sync::OnceLock::new();
+
+/// Say what links the GPU, before extensions are started.
+pub fn link_gpu(link: LinkGpu) {
+    let _ = GPU.set(link);
+}
+
 /// A component compiled in an engine of its own, its first instance asked who it is and what it registers - which
 /// then answers the first readings.
 fn start(name: &str, bytes: &[u8], settings: &str, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<(Arc<Shared>, About, g::Registration)> {
@@ -2614,8 +2629,13 @@ fn start(name: &str, bytes: &[u8], settings: &str, unsandboxed: Option<Arc<Unsan
     let component = compile(&engine, bytes).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
-    bindings::Extension::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
-    let pre = bindings::ExtensionPre::new(linker.instantiate_pre(&component)?)?;
+    bindings::Linked::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
+    if let Some(link) = GPU.get() {
+        link(&mut linker)?;
+    }
+    // What this host has not linked traps when called: only what draws has a GPU.
+    linker.define_unknown_imports_as_traps(&component)?;
+    let pre = bindings::LinkedPre::new(linker.instantiate_pre(&component)?)?;
     let mut shared = Shared {
         id: name.to_string(),
         engine,

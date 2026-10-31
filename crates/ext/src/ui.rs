@@ -82,6 +82,10 @@ pub trait UiHost {
     fn chip(&mut self, text: &str, selected: bool) -> bool;
     /// An image at a size, framed: a palette's swatch.
     fn image(&mut self, texture: &Texture, width: f32, height: f32);
+    /// A texture published through `gpu`, at this size.
+    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
+        let _ = (id, width, height);
+    }
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
     fn reference(&mut self, reference: &Value);
     /// A field within a row, the host's way: its label and its reading (a reference as a chip, a flag as a badge).
@@ -168,6 +172,11 @@ impl<'a> Ui<'a> {
 
     pub fn chip(&mut self, text: &str, selected: bool) -> bool {
         self.host.chip(text, selected)
+    }
+
+    /// A texture published through `gpu`, at this size.
+    pub fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
+        self.host.gpu_image(id, width, height);
     }
 
     pub fn image(&mut self, texture: &Texture, width: f32, height: f32) {

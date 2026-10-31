@@ -219,6 +219,13 @@ impl UiHost for Host<'_> {
         clicked
     }
 
+    fn gpu_image(&mut self, id: u64, width: f32, height: f32) {
+        let ui = self.target.ui();
+        let Some(native) = crate::gpu_view::texture_id(id) else { return };
+        let shown = ui.add(egui::Image::new(egui::load::SizedTexture::new(native, egui::vec2(width, height))));
+        self.last = Some(shown);
+    }
+
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
         let ui = self.target.ui();
         let id = self.textures.get(ui.ctx(), texture, Upscale::Nearest);

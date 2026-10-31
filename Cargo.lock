@@ -1278,6 +1278,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-webgpu",
  "png",
  "project",
  "serde",
@@ -1600,6 +1601,7 @@ dependencies = [
  "pe2-movies",
  "pe2-packages",
  "pe2-str",
+ "pe2-viewport",
  "project",
  "toml",
 ]
@@ -3696,6 +3698,24 @@ dependencies = [
  "formats",
  "pe2-ext",
  "sha1",
+]
+
+[[package]]
+name = "pe2-viewport"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
+name = "pe2-webgpu"
+version = "0.1.0"
+dependencies = [
+ "pastey",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wgpu",
+ "wgpu-types",
 ]
 
 [[package]]
