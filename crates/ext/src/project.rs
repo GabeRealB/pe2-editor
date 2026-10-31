@@ -14,6 +14,11 @@ pub trait Project {
     fn asset(&self, path: &str) -> Option<Asset<'_>>;
     /// The asset a reference names (`"uid://..."`, or `{ uid, path }`).
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>>;
+    /// The member of a group of variants an asset is being looked at in, where one was chosen.
+    fn chosen(&self, path: &str, group: &str) -> Option<String> {
+        let _ = (path, group);
+        None
+    }
     /// Every asset of a kind, by its qualified name or a built-in's bare one.
     fn find(&self, kind: &str) -> Vec<Asset<'_>>;
     /// The asset the user selected.

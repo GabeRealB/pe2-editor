@@ -404,7 +404,7 @@ pub fn contents_ui(
     }
     stack_ui(ui, ws, &asset, layers, right);
     if let Some(request) = asked.or(ask) {
-        match ws.extensions.content_act(&ws.index, &asset, request) {
+        match ws.extensions.content_act(&ws.index, &asset, &ws.chosen, request) {
             Ok(outcome) => match crate::inspector::content_edit(&asset, &outcome) {
                 Ok(request) => {
                     if let Some(select) = &outcome.select {

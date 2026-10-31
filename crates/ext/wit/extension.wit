@@ -252,6 +252,8 @@ interface host {
         asset: func(path: string) -> option<asset>;
         /// The asset a reference names (TOML: `"uid://..."`, or `{ uid, path }`).
         resolve: func(reference: string) -> option<asset>;
+        /// The member of a group of variants an asset is being looked at in, where one was chosen.
+        chosen: func(path: string, group: string) -> option<string>;
         find: func(kind: string) -> list<asset>;
         selection: func() -> option<asset>;
         look: func(path: string) -> u32;
@@ -402,6 +404,10 @@ interface host {
         leave-note: func(text: string);
         /// Select a part of the asset shown, as clicking it anywhere would.
         select: func(part: string);
+        /// Look at the asset shown in a member of a group of variants: everything showing it follows, nothing is written.
+        choose: func(group: string, member: string);
+        /// In a row, go on from this many points from its start, for rows that line up: past it already, go on as it is.
+        tab: func(at: f32);
     }
 
     /// The declarations, lent to an extraction session's beginning.

@@ -564,6 +564,12 @@ impl host::HostProject for State {
         self.found(project.selection())
     }
 
+    fn chosen(&mut self, project: Resource<LentProject>, path: String, group: String) -> wasmtime::Result<Option<String>> {
+        // SAFETY: as `asset`.
+        let project = unsafe { &*self.project(&project)? };
+        Ok(project.chosen(&path, &group))
+    }
+
     fn look(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<u32> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
@@ -1219,6 +1225,16 @@ impl host::HostUi for State {
 
     fn select(&mut self, ui: Resource<Frame>, part: String) -> wasmtime::Result<()> {
         self.frame(&ui)?.select(&part);
+        Ok(())
+    }
+
+    fn choose(&mut self, ui: Resource<Frame>, group: String, member: String) -> wasmtime::Result<()> {
+        self.frame(&ui)?.choose(&group, &member);
+        Ok(())
+    }
+
+    fn tab(&mut self, ui: Resource<Frame>, at: f32) -> wasmtime::Result<()> {
+        self.frame(&ui)?.tab(at);
         Ok(())
     }
 

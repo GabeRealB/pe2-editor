@@ -14,6 +14,7 @@ use crate::parts::{self, BONE};
 use crate::skeleton;
 use crate::render::{Drawn, Renderer};
 use crate::material;
+use crate::prefab;
 use crate::scene::{self, BlendedFace, Paint, Scene, upright};
 
 /// How the faces are shown.
@@ -154,7 +155,7 @@ impl ModelView {
         let [x, y, z] = numbers.map(|number| number as f32);
         let held = self.places.get(part).and_then(Option::as_ref);
         let child = ui.asset().and_then(|asset| match held {
-            Some(Place::Child(at)) => asset.array("children").get(*at).cloned(),
+            Some(Place::Fill(within)) => Some(prefab::fill_at(&asset, within).cloned().unwrap_or(Value::Table(pe2_ext::Table::new()))),
             _ => None,
         });
         let Some(Ok(scene)) = &mut self.scene else { return };
@@ -189,9 +190,9 @@ impl ModelView {
         let rounded = |at: V3| Value::Array(at.map(|x| Value::Integer(i64::from(x.round() as i32))).to_vec());
         // Adding zero takes the sign off what rounded to none: there is no turn of -0.0.
         let degrees = |rotation: &M3| Value::Array(parts::euler_degrees(rotation).map(|x| Value::Float(f64::from((x * 10.0).round() / 10.0 + 0.0))).to_vec());
-        if let Place::Child(at) = self.places.get(part)?.as_ref()? {
-            // A child's transform is over what the model's root says: what moved is the difference.
-            let child = asset.array("children").get(*at)?;
+        if let Place::Fill(within) = self.places.get(part)?.as_ref()? {
+            // What fills a part is held over what its model's root says: what moved is the difference.
+            let child = prefab::fill_at(asset, within)?;
             #[expect(clippy::cast_precision_loss, reason = "a coordinate is far from where floats lose it")]
             let was = skeleton::translation_of(child).unwrap_or_default().map(|x| x as f32);
             let by = sub(pose.translation, rest.translation);
@@ -224,25 +225,21 @@ impl ModelView {
                 Place::Joint(at) => {
                     let mut joints = asset.array("joints").to_vec();
                     set(joints.get_mut(*at)?.as_table_mut()?);
-                    ("joints", Value::Array(joints))
+                    ("joints".to_string(), Value::Array(joints))
                 }
                 Place::Pose(name) => {
                     let mut poses = asset.field("pose").and_then(Value::as_table).cloned().unwrap_or_default();
                     let mut joint = pe2_ext::Table::new();
                     set(&mut joint);
                     poses.insert(name.clone(), Value::Table(joint));
-                    ("pose", Value::Table(poses))
+                    ("pose".to_string(), Value::Table(poses))
                 }
-                Place::Child(at) => {
-                    let mut children = asset.array("children").to_vec();
-                    set(children.get_mut(*at)?.as_table_mut()?);
-                    ("children", Value::Array(children))
-                }
+                Place::Fill(within) => prefab::edited(&asset, within, set)?,
             };
-            (asset.field(key) != Some(&value)).then_some((key, value))
+            (asset.field(&key) != Some(&value)).then_some((key, value))
         });
         if let Some((key, value)) = written {
-            ui.set_step(key, Some(&value));
+            ui.set_step(&key, Some(&value));
         } else if let Some(Ok(scene)) = &mut self.scene {
             // Less than a whole unit: nothing to write, and so nothing moved.
             scene.reset_pose();
@@ -315,6 +312,7 @@ impl ModelView {
                 normals ^= ui.toggle("Normals", normals);
             }
             ui.styled("|", Style::Note);
+            prefab::bar(ui);
             orthographic ^= ui.toggle("Orthographic", orthographic);
             frame_all = ui.button("Frame");
             if parts > 1 && faces > 0 && (self.selected.is_some() || isolated) {

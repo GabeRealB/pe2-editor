@@ -1,17 +1,25 @@
 //! What a model's or a prefab's faces are drawn with, in the inspector: each material once, with its texture, however many
 //! nodes of a prefab draw with it, narrowed to what the part selected uses. A material dropped on a row fills its slot: a
-//! model's own, or a prefab's override for every node the row stands for, one alone once it is selected. An override is
-//! also where a texture of its own goes, and what Revert takes away, and what is overridden has a row of its own.
+//! model's own, or a prefab's override for every part the row stands for, one alone once it is selected. An override is
+//! also where a texture of its own goes, and what Revert takes away, and what is overridden has a row of its own. A prefab
+//! lists its parts first, as what fills them now: one on the skeleton has no row in the tree, and one stored has no node.
+
+use std::collections::BTreeMap;
 
 use pe2_ext::{Asset, Icon, Image, Project, Style, Table, Texture, Ui, Value, View};
 
 use crate::assembly::{self, Assembled, Slot};
+use crate::prefab::{self, Filled};
 use crate::material;
 use crate::material_panel::{Pictures, choices_of, with};
 use crate::parts;
 
 /// How wide and tall a slot's picture is at most.
 const THUMBNAIL: f32 = 56.0;
+/// The columns of the parts: what a name's letter takes, what is left after it, and what a model's chip takes.
+const CHARACTER: f32 = 7.5;
+const GAP: f32 = 12.0;
+const CHIP: f32 = 205.0;
 
 fn same_material(a: &Slot, b: &Slot) -> bool {
     a.name == b.name && a.material == b.material && a.node == b.node
@@ -71,17 +79,6 @@ fn overrides_with(mut all: Table, slot: &str, entry: Table) -> Table {
     all
 }
 
-/// A prefab's children with one's overrides replaced: none left, none written.
-fn children_with(mut children: Vec<Value>, at: usize, overrides: Table) -> Option<Vec<Value>> {
-    let child = children.get_mut(at)?.as_table_mut()?;
-    if overrides.is_empty() {
-        child.remove("overrides");
-    } else {
-        child.insert("overrides".to_string(), Value::Table(overrides));
-    }
-    Some(children)
-}
-
 /// A slot's texture as the material behind it holds it: what an override starts from.
 fn texture_of(project: &dyn Project, slot: &Slot) -> Option<Value> {
     let reference = slot.reference.as_ref()?;
@@ -109,45 +106,36 @@ fn filled(new: &Value) -> Value {
 }
 
 /// The fields a change of a row writes, and what they come to.
-fn written(asset: &Asset, project: &dyn Project, slots: &[&Slot], change: &Change) -> Vec<(&'static str, Option<Value>)> {
+fn written(asset: &Asset, project: &dyn Project, slots: &[&Slot], change: &Change) -> Vec<(String, Option<Value>)> {
     let name = &slots[0].name;
     if slots[0].node.is_none() {
         let Change::Material(new) = change else { return Vec::new() };
         let mut materials = asset.field("materials").and_then(Value::as_table).cloned().unwrap_or_default();
         materials.insert(name.clone(), filled(new));
-        return vec![("materials", Some(Value::Table(materials)))];
+        return vec![("materials".to_string(), Some(Value::Table(materials)))];
     }
-    let table_of = |value: Option<&Value>| value.and_then(Value::as_table).cloned().unwrap_or_default();
-    let mut root = table_of(asset.field("overrides"));
-    let mut children = asset.array("children").to_vec();
-    let (mut own, mut held) = (false, false);
+    let mut roots: BTreeMap<String, Value> = BTreeMap::new();
     for slot in slots {
         let Some((_, within)) = &slot.node else { continue };
-        let at: Option<usize> = within.get(1).and_then(|at| at.parse().ok());
-        let all = match at {
-            Some(at) => table_of(children.get(at).and_then(|child| child.get("overrides"))),
-            None => root.clone(),
-        };
-        let Some(entry) = entry_with(project, slot, table_of(all.get(name)), change) else { continue };
-        let all = overrides_with(all, name, entry);
-        let Some(at) = at else {
-            root = all;
-            own = true;
-            continue;
-        };
-        if let Some(changed) = children_with(children.clone(), at, all) {
-            children = changed;
-            held = true;
-        }
+        let Some((key, steps)) = within.split_first() else { continue };
+        let Some(root) = roots.get(key).or_else(|| asset.field(key)).cloned() else { continue };
+        let fill = steps.iter().try_fold(&root, |value, step| value.get(step));
+        let all = fill.and_then(|fill| fill.get("overrides")).and_then(Value::as_table).cloned().unwrap_or_default();
+        let Some(entry) = entry_with(project, slot, all.get(name).and_then(Value::as_table).cloned().unwrap_or_default(), change) else { continue };
+        let overrides = overrides_with(all, name, entry);
+        let Some(new) = prefab::changed(root, steps, |fill| set_overrides(fill, overrides)) else { continue };
+        roots.insert(key.clone(), new);
     }
-    let mut out = Vec::new();
-    if own {
-        out.push(("overrides", (!root.is_empty()).then_some(Value::Table(root))));
+    roots.into_iter().map(|(key, value)| (key, Some(value))).collect()
+}
+
+/// What fills a part with its overrides: none left, none written.
+fn set_overrides(fill: &mut Table, overrides: Table) {
+    if overrides.is_empty() {
+        fill.remove("overrides");
+    } else {
+        fill.insert("overrides".to_string(), Value::Table(overrides));
     }
-    if held {
-        out.push(("children", Some(Value::Array(children))));
-    }
-    out
 }
 
 /// A texture of another image holds what that image has: a cell or a palette it does not is its first. An image with no
@@ -167,10 +155,40 @@ fn fitted(ui: &Ui, texture: Value) -> Option<Value> {
 #[derive(Default)]
 pub struct Bindings {
     assembled: Option<Result<Assembled, String>>,
+    /// A prefab's parts, as what fills them now.
+    parts: Option<Vec<Filled>>,
     pictures: Pictures,
 }
 
 impl Bindings {
+    /// A prefab's parts, each with what fills it: the model dropped on one fills it.
+    fn parts(ui: &mut Ui, parts: &[Filled], assembled: &Assembled) -> Option<(Vec<String>, Value)> {
+        let widest = parts.iter().map(|part| part.part.len()).max().unwrap_or(0);
+        #[expect(clippy::cast_precision_loss, reason = "a name's length")]
+        let (name, chip) = (widest as f32 * CHARACTER + GAP, widest as f32 * CHARACTER + GAP + CHIP);
+        let mut asked = None;
+        ui.section("Parts", |ui| {
+            for part in parts {
+                ui.horizontal(|ui| {
+                    ui.styled(&part.part, Style::Normal);
+                    ui.tab(name);
+                    let model = part.fill.as_ref().and_then(|fill| fill.get("model"));
+                    if let Some(new) = ui.reference_taking("Model", "model", model) {
+                        asked = Some((part.within.clone(), new));
+                    }
+                    ui.tab(chip);
+                    let shown = assembled.slots.iter().any(|slot| slot.node.as_ref().is_some_and(|(node, _)| *node == part.part));
+                    match &part.node {
+                        Some(node) => ui.styled(&format!("on {node}"), Style::Note),
+                        None if shown => ui.styled("the skeleton's", Style::Note),
+                        None => ui.styled("stored, not shown", Style::Note),
+                    }
+                });
+            }
+        });
+        asked
+    }
+
     fn thumbnail(&mut self, ui: &mut Ui, slot: &Slot) {
         let bound = slot.drawn.as_ref().and_then(|drawn| drawn.main.as_ref());
         let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, &bound.part()).cloned());
@@ -264,6 +282,12 @@ impl View for Bindings {
         };
         let part = ui.selected().as_deref().and_then(parts::bone_of);
         let rows = rows(&assembled, part);
+        if self.parts.is_none() {
+            self.parts = prefab::filled(&asset, ui.project()).ok();
+        }
+        let listed_parts = self.parts.take().unwrap_or_default();
+        let model = if listed_parts.is_empty() { None } else { Self::parts(ui, &listed_parts, &assembled) };
+        self.parts = Some(listed_parts);
         let title = part.and_then(|part| assembled.nodes.get(part)).map_or_else(|| "Materials".to_string(), |node| format!("Materials of {}", node.name));
         let mut asked = None;
         ui.section(&title, |ui| {
@@ -281,8 +305,9 @@ impl View for Bindings {
             Some(written(&ui.asset()?, ui.project(), &slots, &change))
         });
         self.assembled = Some(Ok(assembled));
-        for (key, value) in written.into_iter().flatten() {
-            ui.set_step(key, value.as_ref());
+        let filled_part = model.and_then(|(within, new)| prefab::edited(&ui.asset()?, &within, |fill| drop(fill.insert("model".to_string(), filled(&new)))));
+        for (key, value) in written.into_iter().flatten().chain(filled_part.map(|(key, value)| (key, Some(value)))) {
+            ui.set_step(&key, value.as_ref());
         }
     }
 }
@@ -302,7 +327,7 @@ mod tests {
     }
 
     fn slot(name: &str, material: &str) -> Slot {
-        let attached = Attached { path: material.to_string(), reference: material.to_string(), child: None };
+        let attached = Attached { path: material.to_string(), reference: material.to_string() };
         Slot { name: name.to_string(), material: Some(attached), reference: None, drawn: None, node: None, overrides: None }
     }
 
@@ -364,12 +389,12 @@ mod tests {
     }
 
     #[test]
-    fn a_child_with_no_overrides_left_holds_none() {
-        let children = vec![Value::Table(table("node = 'hand'\n[overrides.x]\nmaterial = 'a'"))];
-        let cleared = children_with(children.clone(), 0, Table::new()).unwrap();
-        assert!(cleared[0].get("overrides").is_none());
-        assert_eq!(cleared[0].get("node").and_then(Value::as_str), Some("hand"));
-        let held = children_with(children, 0, table("[y]\nmaterial = 'b'")).unwrap();
-        assert!(held[0].get("overrides").and_then(|overrides| overrides.get("y")).is_some());
+    fn a_part_with_no_overrides_left_holds_none() {
+        let mut fill = table("model = 'uid://x'\n[overrides.x]\nmaterial = 'a'");
+        set_overrides(&mut fill, Table::new());
+        assert!(fill.get("overrides").is_none());
+        assert!(fill.get("model").is_some());
+        set_overrides(&mut fill, table("[y]\nmaterial = 'b'"));
+        assert!(fill["overrides"].get("y").is_some());
     }
 }

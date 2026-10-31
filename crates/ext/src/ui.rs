@@ -191,6 +191,10 @@ pub trait UiHost {
     fn leave_note(&mut self, text: &str);
     /// Select a part of the asset shown, as clicking it anywhere would.
     fn select(&mut self, part: &str);
+    /// Look at the asset shown in a member of a group of variants: everything showing it follows, nothing is written.
+    fn choose(&mut self, group: &str, member: &str);
+    /// In a row, go on from this many points from its start, for rows that line up: past it already, go on as it is.
+    fn tab(&mut self, at: f32);
     /// The asset the view shows, lent for the frame; none for a panel.
     fn asset(&self) -> Option<Asset<'_>>;
     /// The look the asset is shown in (an index into its picture's looks), as the host's look picker chose it.
@@ -398,6 +402,16 @@ impl<'a> Ui<'a> {
     /// Select a part of the asset shown: in the contents, the inspector and every view of it.
     pub fn select(&mut self, part: &str) {
         self.host.select(part);
+    }
+
+    /// Look at the asset shown in a member of a group of variants: everything showing it follows, nothing is written.
+    pub fn choose(&mut self, group: &str, member: &str) {
+        self.host.choose(group, member);
+    }
+
+    /// In a row, go on from this many points from its start, for rows that line up: past it already, go on as it is.
+    pub fn tab(&mut self, at: f32) {
+        self.host.tab(at);
     }
 
     /// The asset shown; none for a panel.

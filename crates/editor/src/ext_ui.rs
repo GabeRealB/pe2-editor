@@ -125,6 +125,8 @@ pub struct Sets {
     pub values: Vec<(String, Option<Value>)>,
     /// A step of its own, never merged with the one before: a gesture ended.
     pub apart: bool,
+    /// A member of a group of variants to look at.
+    pub choose: Option<(String, String)>,
 }
 
 /// What a gesture has made so far of a part's fields, nothing being written yet: until the asset next changes.
@@ -546,6 +548,18 @@ impl UiHost for Host<'_> {
 
     fn select(&mut self, part: &str) {
         *self.nav = Some(format!("#{part}"));
+    }
+
+    fn choose(&mut self, group: &str, member: &str) {
+        self.sets.choose = Some((group.to_string(), member.to_string()));
+    }
+
+    fn tab(&mut self, at: f32) {
+        let ui = self.target.ui();
+        let gap = ui.max_rect().left() + at - ui.cursor().left();
+        if gap > 0.0 {
+            ui.add_space(gap);
+        }
     }
 
     fn asset(&self) -> Option<pe2_ext::Asset<'_>> {

@@ -1155,9 +1155,9 @@ impl Extensions {
 
     /// What is inside an asset: what its kind says, else its parts, under a heading for each group of them.
     #[must_use]
-    pub fn contents(&self, index: &index::Index, asset: &index::Asset) -> pe2_ext::Contents {
+    pub fn contents(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen) -> pe2_ext::Contents {
         if let Some(contents) = self.kind_of(asset).and_then(|k| k.contents.as_ref()) {
-            return contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None });
+            return contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) });
         }
         pe2_ext::Contents { rows: rows_of_parts(&self.parts(asset)), ..pe2_ext::Contents::default() }
     }
@@ -1166,15 +1166,15 @@ impl Extensions {
     ///
     /// # Errors
     /// Why it cannot be, as its kind says.
-    pub fn content_act(&self, index: &index::Index, asset: &index::Asset, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
+    pub fn content_act(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
         let act = self.kind_of(asset).and_then(|k| k.content_act.as_ref()).context("its kind does nothing with its contents")?;
-        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None }, request)
+        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) }, request)
     }
 
     /// A part's fields, where its kind says what they are.
     #[must_use]
-    pub fn part_sheet(&self, index: &index::Index, asset: &index::Asset, part: &str) -> Option<pe2_ext::PartSheet> {
-        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None }, part)
+    pub fn part_sheet(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, part: &str) -> Option<pe2_ext::PartSheet> {
+        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) }, part)
     }
 
     /// The views a kind and a role give the head of the contents pane.
@@ -1493,6 +1493,9 @@ impl Extensions {
     }
 }
 
+/// By (asset, group of variants), the member chosen: what is being looked at, never written.
+pub type Chosen = HashMap<(String, String), String>;
+
 /// The project as extensions ask about it: the index, through the registry, with what the user selected and the looks
 /// chosen (the editor's; none for a tool).
 pub struct Lens<'a> {
@@ -1500,6 +1503,8 @@ pub struct Lens<'a> {
     pub extensions: &'a Extensions,
     pub selection: Option<&'a str>,
     pub looks: Option<&'a HashMap<String, usize>>,
+    /// The members of groups of variants assets are being looked at in.
+    pub chosen: Option<&'a Chosen>,
 }
 
 impl Project for Lens<'_> {
@@ -1522,6 +1527,10 @@ impl Project for Lens<'_> {
 
     fn look(&self, path: &str) -> usize {
         self.looks.and_then(|l| l.get(path).copied()).unwrap_or(0)
+    }
+
+    fn chosen(&self, path: &str, group: &str) -> Option<String> {
+        self.chosen?.get(&(path.to_string(), group.to_string())).cloned()
     }
 
     fn picture(&self, path: &str, look: usize) -> Option<Result<Image>> {
@@ -2285,7 +2294,7 @@ mod calling {
         let project = Opened::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
-        let lens = Lens { index: &index, extensions: &extensions, selection: None, looks: None };
+        let lens = Lens { index: &index, extensions: &extensions, selection: None, looks: None, chosen: None };
         let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();
         assert_eq!(answer.as_str(), Some("red 1x1"));
         assert!(lens.call("test.nowhere@service", &Value::Table(Table::new())).is_err());

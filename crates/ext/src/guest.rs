@@ -302,6 +302,10 @@ impl Project for Lens<'_> {
         self.project.look(path) as usize
     }
 
+    fn chosen(&self, path: &str, group: &str) -> Option<String> {
+        self.project.chosen(path, group)
+    }
+
     fn picture(&self, path: &str, look: usize) -> Option<crate::Result<Image>> {
         let look = u32::try_from(look).unwrap_or(u32::MAX);
         self.project.picture(path, look).map(|made| made.map(from_image).map_err(crate::Error::msg))
@@ -569,6 +573,14 @@ impl UiHost for Frame<'_> {
 
     fn select(&mut self, part: &str) {
         self.ui().select(part);
+    }
+
+    fn choose(&mut self, group: &str, member: &str) {
+        self.ui().choose(group, member);
+    }
+
+    fn tab(&mut self, at: f32) {
+        self.ui().tab(at);
     }
 
     fn asset(&self) -> Option<Asset<'_>> {

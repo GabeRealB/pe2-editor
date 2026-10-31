@@ -2,10 +2,11 @@
 //! one coordinate node for a joint and an attachment alike, so a prefab comes out as one model, a child's root hanging
 //! under the node it is attached to; posing and picking need to know nothing of how it was put together.
 
-use pe2_ext::{Asset, Project, Result, Value, anyhow};
+use pe2_ext::{Asset, Project, Result, Value, anyhow, bail};
 
 use crate::material::{self, Definition};
 use crate::mesh;
+use crate::prefab::{self, Filled};
 use crate::model::{Blend, Corner, Face, Model, Part, Shading};
 use crate::skeleton;
 
@@ -49,20 +50,19 @@ pub struct Node {
     pub place: Option<Place>,
 }
 
-/// Where a node's transform is kept: a skeleton's own, or a prefab's for what it does to a joint or a model it holds.
+/// Where a node's transform is kept: a skeleton's own, or a prefab's for what it does to a joint or to what fills a part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Place {
     Joint(usize),
     Pose(String),
-    Child(usize),
+    /// Where in the prefab what fills it is, step by step.
+    Fill(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attached {
     pub path: String,
     pub reference: String,
-    /// Where in a prefab it is attached.
-    pub child: Option<usize>,
 }
 
 /// A material slot of what was assembled.
@@ -131,7 +131,7 @@ fn slot_of(project: &dyn Project, model: &Asset, name: &str, overrides: Option<&
     };
     let held = resolved(project, model, name, Some(reference))?;
     let drawn = drawn_of(project, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
-    let attached = Attached { path: held.path().to_string(), reference: held.uid().unwrap_or_default().to_string(), child: None };
+    let attached = Attached { path: held.path().to_string(), reference: held.uid().unwrap_or_default().to_string() };
     Ok(Slot { material: Some(attached), reference: Some(reference.clone()), drawn: Some(drawn), overrides: overrides.cloned(), ..Slot::empty(name) })
 }
 
@@ -230,9 +230,63 @@ fn held(part: &mut Part, child: &Value) {
     part.rotation = std::array::from_fn(|row| std::array::from_fn(|column| cell(row, column)));
 }
 
+/// Whether what fills a part is built on a skeleton: its parts are that skeleton's joints, not something to hang on them.
+fn on_skeleton(project: &dyn Project, asset: &Asset, skeleton: &Asset, fill: &Value) -> Result<bool> {
+    let model = resolved(project, asset, "model", fill.get("model"))?;
+    let mesh = resolved(project, &model, "mesh", model.field("mesh"))?;
+    let named = mesh.field("skeleton").map(|reference| resolved(project, &mesh, "skeleton", Some(reference))).transpose()?;
+    Ok(named.is_some_and(|named| named.path() == skeleton.path()))
+}
+
+/// A part's own node, under the node it hangs on.
+fn hang(project: &dyn Project, asset: &Asset, tree: &mut Assembled, part: &Filled, on: usize) -> Result<()> {
+    let place = Some(Place::Fill(part.within.clone()));
+    let Some(fill) = &part.fill else {
+        // Open: a place to see and to move, with nothing there yet.
+        let rest = Part { parent: 0, rotation: skeleton::matrix([0.0; 3]), translation: [0; 3], vertices: Vec::new() };
+        attach(&mut tree.model, Model { parts: vec![rest], ..Model::default() }, on);
+        tree.nodes.push(Node { name: part.part.clone(), attached: None, place });
+        return Ok(());
+    };
+    let model = resolved(project, asset, "model", fill.get("model"))?;
+    let Assembled { model: mut built, mut nodes, mut slots, .. } = model_of(project, &model, fill.get("overrides"), Some((&part.part, &part.within)))?;
+    if let Some(root) = built.parts.first_mut() {
+        held(root, fill);
+    }
+    // What it hangs by is the part; a part of it deeper down keeps its own name.
+    if let Some(first) = nodes.first_mut() {
+        part.part.clone_into(&mut first.name);
+        first.attached = Some(Attached { path: model.path().to_string(), reference: model.uid().unwrap_or_default().to_string() });
+        first.place = place;
+    }
+    attach(&mut tree.model, built, on);
+    tree.nodes.append(&mut nodes);
+    tree.slots.append(&mut slots);
+    Ok(())
+}
+
 fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    let root = resolved(project, asset, "model", asset.field("model"))?;
-    let mut tree = model_of(project, &root, asset.field("overrides"), Some((leaf(root.path()), &[])))?;
+    let frame = resolved(project, asset, "skeleton", asset.field("skeleton"))?;
+    let parts = prefab::filled(asset, project)?;
+    let mut waiting: Vec<&Filled> = Vec::new();
+    let mut root = None;
+    for part in parts.iter().filter(|part| part.node.is_some() || part.within.first().is_some_and(|step| step == "groups")) {
+        let built_on = part.fill.as_ref().map(|fill| on_skeleton(project, asset, &frame, fill)).transpose()?.unwrap_or(false);
+        match (built_on, part.node.as_deref()) {
+            (true, _) if root.is_some() => bail!("{}: {} is a second model on its skeleton", asset.path(), part.part),
+            (true, _) => root = Some(part),
+            (false, Some(_)) => waiting.push(part),
+            // What is stored and hangs nowhere is the package's, and shows nowhere.
+            (false, None) => {}
+        }
+    }
+    let mut tree = match root.and_then(|part| part.fill.as_ref().map(|fill| (part, fill))) {
+        Some((part, fill)) => {
+            let model = resolved(project, asset, "model", fill.get("model"))?;
+            model_of(project, &model, fill.get("overrides"), Some((&part.part, &part.within)))?
+        }
+        None => skeleton_of(&frame)?,
+    };
     let joints: Vec<String> = tree.nodes.iter().map(|node| node.name.clone()).collect();
     for (at, node) in tree.nodes.iter_mut().enumerate() {
         // A mesh with no skeleton has its parts all under its own name: nothing to say which one is meant.
@@ -244,24 +298,20 @@ fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
         }
     }
     tree.posed = asset.parts("pose").into_iter().map(|(name, _)| name.to_string()).collect();
-    for (at, child) in asset.array("children").iter().enumerate() {
-        let name = child.get("node").and_then(Value::as_str).ok_or_else(|| anyhow!("{}: a child has no node", asset.path()))?;
-        let node = tree.nodes.iter().position(|node| node.name == name).ok_or_else(|| anyhow!("{}: no node {name}", asset.path()))?;
-        let attached = resolved(project, asset, "model", child.get("model"))?;
-        let within = ["children".to_string(), at.to_string()];
-        let Assembled { mut model, mut nodes, mut slots, .. } = model_of(project, &attached, child.get("overrides"), Some((leaf(attached.path()), &within)))?;
-        if let Some(root) = model.parts.first_mut() {
-            held(root, child);
+    // A part may hang on one that comes later.
+    while !waiting.is_empty() {
+        let before = waiting.len();
+        let mut later = Vec::new();
+        for part in waiting {
+            match tree.nodes.iter().position(|node| Some(node.name.as_str()) == part.node.as_deref()) {
+                Some(on) => hang(project, asset, &mut tree, part, on)?,
+                None => later.push(part),
+            }
         }
-        // What it hangs by is the model; a part of it deeper down keeps its own name.
-        if let Some(first) = nodes.first_mut() {
-            leaf(attached.path()).clone_into(&mut first.name);
-            first.attached = Some(Attached { path: attached.path().to_string(), reference: attached.uid().unwrap_or_default().to_string(), child: Some(at) });
-            first.place = Some(Place::Child(at));
+        if later.len() == before {
+            bail!("{}: {} hangs on nothing there is", asset.path(), later[0].part);
         }
-        attach(&mut tree.model, model, node);
-        tree.nodes.append(&mut nodes);
-        tree.slots.append(&mut slots);
+        waiting = later;
     }
     Ok(tree)
 }

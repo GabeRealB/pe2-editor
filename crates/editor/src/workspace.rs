@@ -251,6 +251,8 @@ pub struct Workspace {
     pub view_edit: Option<EditRequest>,
     /// The variant an image is shown in (an index into `variants_of`); without one, its first.
     pub variant_choice: HashMap<String, usize>,
+    /// What is being looked at of assets with groups of variants.
+    pub chosen: project::ext::Chosen,
     /// A field being edited in the inspector.
     pub field_edit: Option<FieldEdit>,
     /// The files shown as text or bytes, and which file of an asset without a picture is shown.
@@ -589,6 +591,7 @@ impl Workspace {
             panels: HashMap::new(),
             view_edit: None,
             variant_choice: HashMap::new(),
+            chosen: project::ext::Chosen::new(),
             field_edit: None,
             viewer: crate::viewer::Viewer::default(),
             viewed_file: HashMap::new(),
@@ -1344,7 +1347,7 @@ impl Workspace {
     /// It is gone, or it fails.
     pub fn run_tool(&self, name: &str) -> std::result::Result<String, String> {
         let tool = self.extensions.tools().iter().find(|t| t.name.to_string() == name).ok_or_else(|| format!("no tool {name}"))?;
-        let lens = Lens { index: &self.index, extensions: &self.extensions, selection: self.selected.as_deref(), looks: None };
+        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref(), looks: None };
         let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
         Ok(answer.to_string())
     }
@@ -1457,15 +1460,26 @@ impl Workspace {
 
     /// What is inside an asset, as its kind says.
     pub fn contents_of(&mut self, asset: &Asset) -> Arc<pe2_ext::Contents> {
-        let (extensions, index) = (&self.extensions, &self.index);
-        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(index, asset))).clone()
+        let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
+        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(index, asset, chosen))).clone()
     }
 
     /// A part's sheet, where its asset's kind says what it holds.
     pub fn part_sheet_of(&mut self, asset: &Asset, part: &str) -> Arc<Option<pe2_ext::PartSheet>> {
-        let (extensions, index) = (&self.extensions, &self.index);
+        let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
         let key = (asset.path.clone(), part.to_string());
-        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, part))).clone()
+        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, chosen, part))).clone()
+    }
+
+    /// Look at an asset in a member of a group of variants: all that shows it is made again.
+    pub fn choose_member(&mut self, path: &str, group: String, member: String) {
+        self.chosen.insert((path.to_string(), group), member);
+        self.contents.remove(path);
+        self.part_sheets.retain(|(asset, _), _| asset != path);
+        self.views.retain(|(_, asset, _), _| asset != path);
+        self.inspector_views.retain(|(asset, _), _| asset != path);
+        self.textures.live = None;
+        self.drop_lost_selection();
     }
 
     /// Select the part of the asset selected a fragment or a name stands for - a box knows only its name - or a row of its
@@ -1693,6 +1707,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
+            chosen: Some(&self.chosen),
         };
         let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable, part: part.as_deref() };
         let mut sets = crate::ext_ui::Sets::default();
@@ -1701,6 +1716,9 @@ impl Workspace {
         drop(host);
         if !sets.values.is_empty() {
             self.view_edit = crate::inspector::set_fields(asset, &sets);
+        }
+        if let Some((group, member)) = sets.choose {
+            self.choose_member(&path, group, member);
         }
     }
 
@@ -1783,6 +1801,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
+            chosen: Some(&self.chosen),
         };
         for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
@@ -1810,6 +1829,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             looks: Some(&self.variant_choice),
+            chosen: Some(&self.chosen),
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };

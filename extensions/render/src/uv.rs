@@ -10,6 +10,7 @@ use crate::assembly::{self, Assembled, Bound};
 use crate::material_panel::Pictures;
 use crate::model::Face;
 use crate::parts;
+use crate::prefab;
 
 /// What is between two textures laid out.
 const GAP: f32 = 16.0;
@@ -191,6 +192,7 @@ impl View for UvView {
         if self.drawn.as_ref().is_none_or(|(shown, _)| *shown != selected) {
             self.drawn = Some((selected, self.canvas(ui, &assembled, selected)));
         }
+        ui.wrapped(prefab::bar);
         match &self.drawn {
             Some((_, canvas)) if canvas.width > 0.0 => ui.canvas(canvas),
             _ => ui.styled("No face here has UVs", Style::Note),

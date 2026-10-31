@@ -22,6 +22,7 @@ mod materials;
 mod mesh;
 mod model;
 mod parts;
+mod prefab;
 #[cfg(target_family = "wasm")]
 mod render;
 #[cfg(any(target_family = "wasm", test))]
@@ -93,9 +94,9 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("prefab")
         .label("Prefab")
         .icon(Icon::Cube, Tint::Picture)
-        // Each is a row of the tree, with its fields there.
-        .field(Field::new("children").custom())
-        .field(Field::new("overrides").custom())
+        // Each is a row of the tree or of the Inspector's lists, with its fields there.
+        .field(Field::new("parts").custom())
+        .field(Field::new("groups").custom())
         .field(Field::new("pose").custom())
         .editor("3D", Icon::Cube, &[], |_| make_view())
         .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))

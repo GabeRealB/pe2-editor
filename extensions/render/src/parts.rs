@@ -5,6 +5,7 @@ use pe2_ext::{Asset, ContentAction, ContentOutcome, ContentRequest, ContentRow, 
 use crate::assembly::{self, Assembled, Place};
 use crate::material::{self, Definition};
 use crate::model::{Model, Shading, Source};
+use crate::prefab;
 use crate::skeleton;
 
 /// What a node's row starts with: the 3D view selects by it.
@@ -33,7 +34,12 @@ fn node_rows(assembled: &Assembled, index: usize, depth: u32, rows: &mut Vec<Con
     let (icon, tint, detail) = if node.attached.is_some() { (Icon::Package, Tint::Picture, String::new()) } else { (Icon::Bone, Tint::Structure, counted(&assembled.model, index)) };
     let mut row = ContentRow::new(&format!("{BONE}{index}"), &node.name).detail(&detail).depth(depth).icon(icon, tint);
     match &node.place {
-        Some(Place::Child(_)) => row = row.drags(ATTACHMENT).action(ContentAction::new(DETACH, "Detach").icon(Icon::Cross).on_row()),
+        Some(Place::Fill(_)) if node.attached.is_some() => {
+            row = row.drags(ATTACHMENT).takes(&[ATTACHMENT, "asset:model"]).action(ContentAction::new(DETACH, "Detach").icon(Icon::Cross).on_row());
+        }
+        Some(Place::Fill(_)) => {
+            row = row.detail("open").drags(ATTACHMENT).takes(&[ATTACHMENT, "asset:model"]).action(ContentAction::new(REMOVE, "Remove the part").icon(Icon::Cross).on_row());
+        }
         Some(Place::Pose(name)) => {
             row = row.takes(&[ATTACHMENT, "asset:model"]);
             if assembled.posed.contains(name) {
@@ -52,6 +58,7 @@ fn node_rows(assembled: &Assembled, index: usize, depth: u32, rows: &mut Vec<Con
 
 const ATTACHMENT: &str = "attachment";
 const DETACH: &str = "detach";
+const REMOVE: &str = "remove";
 const REVERT: &str = "revert";
 
 /// A material's shape: its shader's slots, and what fills each.
@@ -91,23 +98,40 @@ pub fn contents(asset: &Asset, project: &dyn Project) -> Contents {
     Contents { rows, stack: false, ..Contents::default() }
 }
 
-/// A prefab's children with one changed, or none left.
-fn children_set(children: Vec<Value>) -> Vec<(Vec<String>, Option<Value>)> {
-    vec![(vec!["children".to_string()], (!children.is_empty()).then_some(Value::Array(children)))]
-}
-
 fn node_at(assembled: &Assembled, row: &str) -> Result<usize> {
     bone_of(row).filter(|index| *index < assembled.nodes.len()).ok_or_else(|| anyhow!("{row} is no node"))
 }
 
-fn act_on_node(asset: &Asset, assembled: &Assembled, row: &str, action: &str) -> Result<ContentOutcome> {
+/// What fills a part goes, and what held it with it: the part stays, open, as the code still asks for it.
+fn detach(asset: &Asset, name: &str, within: &[String]) -> ContentOutcome {
+    let label = format!("Detach {name}");
+    if within.first().is_some_and(|step| step == "groups") {
+        return ContentOutcome { label, sets: vec![(within.to_vec(), None)], select: None };
+    }
+    let mut part = pe2_ext::Table::new();
+    if let Some(node) = prefab::fill_at(asset, within).and_then(|part| part.get("node")) {
+        part.insert("node".to_string(), node.clone());
+    }
+    ContentOutcome { label, sets: vec![(within.to_vec(), Some(Value::Table(part)))], select: None }
+}
+
+/// An open part goes, where nothing depends on it.
+fn remove(asset: &Asset, project: &dyn Project, name: &str, within: &[String]) -> Result<ContentOutcome> {
+    if prefab::filled(asset, project)?.iter().any(|part| part.node.as_deref() == Some(name)) {
+        bail!("something hangs on {name}");
+    }
+    let members = asset.parts("groups").into_iter().filter_map(|(_, members)| members.as_table()).flat_map(|members| members.values());
+    if members.into_iter().any(|member| member.get(name).is_some()) {
+        bail!("a member of a group fills {name}");
+    }
+    Ok(ContentOutcome { label: format!("Remove {name}"), sets: vec![(within.to_vec(), None)], select: None })
+}
+
+fn act_on_node(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &str, action: &str) -> Result<ContentOutcome> {
     let node = &assembled.nodes[node_at(assembled, row)?];
     match (&node.place, action) {
-        (Some(Place::Child(at)), DETACH) => {
-            let mut children = asset.array("children").to_vec();
-            children.remove(*at);
-            Ok(ContentOutcome { label: format!("Detach {}", node.name), sets: children_set(children), select: None })
-        }
+        (Some(Place::Fill(within)), DETACH) => Ok(detach(asset, &node.name, within)),
+        (Some(Place::Fill(within)), REMOVE) => remove(asset, project, &node.name, within),
         (Some(Place::Pose(name)), REVERT) => {
             let mut poses = asset.field("pose").and_then(Value::as_table).cloned().unwrap_or_default();
             poses.remove(name);
@@ -118,36 +142,48 @@ fn act_on_node(asset: &Asset, assembled: &Assembled, row: &str, action: &str) ->
     }
 }
 
-/// An attached model moved to another joint: it keeps what it holds.
-fn reattach(asset: &Asset, assembled: &Assembled, row: &str, onto: &str) -> Result<ContentOutcome> {
-    let (node, joint) = (&assembled.nodes[node_at(assembled, row)?], &assembled.nodes[node_at(assembled, onto)?]);
-    let (Some(Place::Child(at)), Some(Place::Pose(_))) = (&node.place, &joint.place) else { bail!("only an attached model moves, and onto a joint") };
-    let mut children = asset.array("children").to_vec();
-    let child = children.get_mut(*at).and_then(Value::as_table_mut).ok_or_else(|| anyhow!("no child {at}"))?;
-    child.insert("node".to_string(), joint.name.as_str().into());
-    Ok(ContentOutcome { label: format!("Attach {} to {}", node.name, joint.name), sets: children_set(children), select: None })
+/// A part moved onto another node: what fills it comes along.
+fn reattach(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &str, onto: &str) -> Result<ContentOutcome> {
+    let (node, target) = (&assembled.nodes[node_at(assembled, row)?], &assembled.nodes[node_at(assembled, onto)?]);
+    let (Some(Place::Fill(_)), Some(Place::Pose(_) | Place::Fill(_))) = (&node.place, &target.place) else { bail!("only a part moves, and onto a joint or a part") };
+    if prefab::hangs_from(&prefab::filled(asset, project)?, &target.name, &node.name) {
+        bail!("{} hangs from {}", target.name, node.name);
+    }
+    let path = vec!["parts".to_string(), node.name.clone(), "node".to_string()];
+    Ok(ContentOutcome { label: format!("Attach {} to {}", node.name, target.name), sets: vec![(path, Some(target.name.as_str().into()))], select: None })
 }
 
-/// A model from the assets, attached to a joint.
+/// A part's name from a model's, kept apart from those there are.
+fn new_part(asset: &Asset, name: &str) -> String {
+    let taken = |candidate: &str| asset.field("parts").is_some_and(|parts| parts.get(candidate).is_some());
+    let held = asset.parts("parts").len() + 1;
+    (1..=held).map(|at| if at == 1 { name.to_string() } else { format!("{name}_{at}") }).find(|candidate| !taken(candidate)).unwrap_or_else(|| name.to_string())
+}
+
+/// A model from the assets: it fills an open part, or becomes a new part on what it was dropped on.
 fn attach_model(asset: &Asset, project: &dyn Project, assembled: &Assembled, onto: &str, path: &str) -> Result<ContentOutcome> {
-    let joint = &assembled.nodes[node_at(assembled, onto)?];
+    let target = &assembled.nodes[node_at(assembled, onto)?];
     let dropped = project.asset(path).ok_or_else(|| anyhow!("{path} is not in the project"))?;
     let uid = dropped.uid().ok_or_else(|| anyhow!("{path} has no uid"))?;
-    let mut child = pe2_ext::Table::new();
-    child.insert("node".to_string(), joint.name.as_str().into());
-    child.insert("model".to_string(), reference(uid));
-    let mut children = asset.array("children").to_vec();
-    children.push(Value::Table(child));
     let name = path.rsplit('/').next().unwrap_or(path);
-    Ok(ContentOutcome { label: format!("Attach {name} to {}", joint.name), sets: children_set(children), select: None })
+    if let (Some(Place::Fill(within)), None) = (&target.place, &target.attached) {
+        let mut at = within.clone();
+        at.push("model".to_string());
+        return Ok(ContentOutcome { label: format!("Fill {} with {name}", target.name), sets: vec![(at, Some(reference(uid)))], select: None });
+    }
+    let mut part = pe2_ext::Table::new();
+    part.insert("node".to_string(), target.name.as_str().into());
+    part.insert("model".to_string(), reference(uid));
+    let at = vec!["parts".to_string(), new_part(asset, name)];
+    Ok(ContentOutcome { label: format!("Attach {name} to {}", target.name), sets: vec![(at, Some(Value::Table(part)))], select: None })
 }
 
 /// Something done in a prefab's contents.
 pub fn act(asset: &Asset, project: &dyn Project, request: ContentRequest) -> Result<ContentOutcome> {
     let assembled = assembly::assemble(project, asset)?;
     match request {
-        ContentRequest::Action { row, action } => act_on_node(asset, &assembled, &row, &action),
-        ContentRequest::Moved { row, onto, .. } => reattach(asset, &assembled, &row, &onto),
+        ContentRequest::Action { row, action } => act_on_node(asset, project, &assembled, &row, &action),
+        ContentRequest::Moved { row, onto, .. } => reattach(asset, project, &assembled, &row, &onto),
         ContentRequest::Dropped { row, asset: path } => attach_model(asset, project, &assembled, &row, &path),
         ContentRequest::Rename { .. } => bail!("its contents are not renamed"),
     }
@@ -199,21 +235,21 @@ fn node_sheet(assembled: &Assembled, asset: &Asset, index: usize) -> Option<Part
     let within = match &node.place {
         Some(Place::Joint(at)) => vec!["joints".to_string(), at.to_string()],
         Some(Place::Pose(name)) => vec!["pose".to_string(), name.clone()],
-        Some(Place::Child(at)) => {
+        Some(Place::Fill(within)) => {
             // What the prefab holds it by, not where that puts it.
-            let child = asset.array("children").get(*at)?;
-            translation = whole(skeleton::translation_of(child).unwrap_or_default());
+            let fill = prefab::fill_at(asset, within)?;
+            translation = whole(skeleton::translation_of(fill).unwrap_or_default());
             #[expect(clippy::cast_possible_truncation, reason = "what is shown of a number stored wider")]
-            let held = |key: &str, none: f64| axes(skeleton::numbers_of(child, key).unwrap_or([none; 3]).map(|x| x as f32));
+            let held = |key: &str, none: f64| axes(skeleton::numbers_of(fill, key).unwrap_or([none; 3]).map(|x| x as f32));
             (rotation, scale) = (held("rotation", 0.0), held("scale", 1.0));
-            vec!["children".to_string(), at.to_string()]
+            within.clone()
         }
         None => Vec::new(),
     };
     let moves = node.place.is_some();
     fields.push(vector("translation", "Translation", translation, moves));
     fields.push(vector("rotation", "Rotation", rotation, moves));
-    fields.push(vector("scale", "Scale", scale, matches!(node.place, Some(Place::Child(_)))));
+    fields.push(vector("scale", "Scale", scale, matches!(node.place, Some(Place::Fill(_)))));
     if !part.vertices.is_empty() {
         fields.push(field("vertices", "Vertices", i64::try_from(part.vertices.len()).ok()?));
         fields.push(field("faces", "Faces", i64::try_from(faces_of(model, index)).ok()?));
