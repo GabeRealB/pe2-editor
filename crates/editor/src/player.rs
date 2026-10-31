@@ -366,8 +366,10 @@ impl Player {
         show(ui, shown, self.texture.as_ref(), self.id, smooth);
         ui.add_space(6.0);
         controls(ui, shown, number, view);
+        // When the next item is due and not before: a movie changes far less often than a window can.
         if shown.playing.is_some() || shown.sounding.is_some() {
-            ui.ctx().request_repaint();
+            let items = (shown.at.floor() + 1.0 - shown.at).clamp(0.01, 1.0);
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(items / shown.rate.max(1.0)));
         }
     }
 }
