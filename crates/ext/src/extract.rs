@@ -1,5 +1,5 @@
 //! Extractors: how an extension makes its assets' native files from a release's discs. Extraction asks the extractor
-//! registered for an asset's kind and role, if any (the rest it writes as their slots' bytes): it begins a session
+//! registered for an asset's kind and fields, if any (the rest it writes as their slots' bytes): it begins a session
 //! with the declarations - what the extractor needs of the other assets (which file uploads a palette, where a VRAM
 //! slot is) it reads once, there - and then extracts asset after asset, reading what chunks it needs from the discs.
 
@@ -57,20 +57,20 @@ pub trait Extraction: Send {
 /// Begin a session.
 pub type Begin = dyn Fn(&dyn Declared) -> Result<Box<dyn Extraction>> + Send + Sync;
 
-/// An extractor as registered: for a kind, and for some of its roles (all of them where none is named).
+/// An extractor as registered: for a kind, and of those the assets with some fields (all of them where none is named).
 #[derive(Clone)]
 pub struct ExtractorDef {
     pub name: Name,
     pub kind: Name,
-    /// The roles it extracts, qualified; every role of the kind where empty.
-    pub roles: Vec<Name>,
+    /// The fields an asset has to declare for this to extract it.
+    pub requires: Vec<String>,
     pub begin: Arc<Begin>,
 }
 
 impl ExtractorDef {
-    /// Whether it extracts assets of this kind and role (qualified).
+    /// Whether it extracts an asset of this kind (qualified) declaring these fields.
     #[must_use]
-    pub fn takes(&self, kind: &str, role: Option<&str>) -> bool {
-        self.kind.as_str() == kind && (self.roles.is_empty() || role.is_some_and(|r| self.roles.iter().any(|n| n.as_str() == r)))
+    pub fn takes(&self, kind: &str, declares: impl Fn(&str) -> bool) -> bool {
+        self.kind.as_str() == kind && self.requires.iter().all(|field| declares(field))
     }
 }

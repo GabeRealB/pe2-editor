@@ -104,12 +104,11 @@ impl Drop for Target<'_> {
     }
 }
 
-/// What a view's frame shows: the asset (none for a panel), its look, the preview's settings, and how many views
+/// What a view's frame shows: the asset (none for a panel), the preview's settings, and how many views
 /// share the pane's height.
 #[derive(Clone, Copy)]
 pub struct Frame<'a> {
     pub asset: Option<&'a Asset>,
-    pub look: usize,
     pub preview: Preview,
     pub count: usize,
     /// Whether the asset can be edited.
@@ -125,7 +124,7 @@ pub struct Sets {
     pub values: Vec<(String, Option<Value>)>,
     /// A step of its own, never merged with the one before: a gesture ended.
     pub apart: bool,
-    /// A member of a group of variants to look at.
+    /// A member of a family to look at.
     pub choose: Option<(String, String)>,
 }
 
@@ -523,7 +522,8 @@ impl UiHost for Host<'_> {
         self.last = None;
     }
 
-    fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>> {
+    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>> {
+        let look = self.lens.index.assets.get(path).map_or(0, |asset| self.lens.extensions.look_at(asset, look));
         let drawn = self.textures.pictures.as_mut()?.get(path, look)?;
         Some(drawn.map(|image| Texture::shared(format!("{path}#{look}#picture"), image)))
     }
@@ -564,10 +564,6 @@ impl UiHost for Host<'_> {
 
     fn asset(&self) -> Option<pe2_ext::Asset<'_>> {
         self.frame.asset.map(|asset| self.lens.extensions.lend(asset))
-    }
-
-    fn look(&self) -> usize {
-        self.frame.look
     }
 
     fn project(&self) -> &dyn Project {

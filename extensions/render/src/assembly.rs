@@ -21,10 +21,10 @@ pub struct Bound {
 }
 
 impl Bound {
-    /// The part of its image that is the picture.
+    /// The output of its image that is the picture.
     #[must_use]
-    pub fn part(&self) -> String {
-        self.palette.as_ref().map_or_else(|| format!("cells/{}", self.cell), |palette| format!("cells/{}@{palette}", self.cell))
+    pub fn output(&self) -> String {
+        material::cell_address(&self.cell, self.palette.as_deref())
     }
 }
 

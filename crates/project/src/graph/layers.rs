@@ -211,7 +211,7 @@ mod tests {
     use super::{add, add_operation, connect, disconnect, free_id, place, remove, remove_operation, set_result, shift};
     use toml::Table;
 
-    const TEXT: &str = r#"# An asset bundle, written by extraction.
+    const TEXT: &str = r#"# A node, written by extraction.
 
 kind = "movie"
 
@@ -241,7 +241,7 @@ sha1 = "ab"
         assert_eq!(ops(&added), ["file", "pe2.str@stream", "output"]);
         // Above the originals, with what the declaration said.
         assert!(added.find("[[stack]]").unwrap() < added.find("[original.USA]").unwrap(), "{added}");
-        assert!(added.starts_with("# An asset bundle"), "{added}");
+        assert!(added.starts_with("# A node"), "{added}");
         assert!(added.contains("sha1 = \"ab\""), "{added}");
         let moved = shift(&added, 1, 2).unwrap();
         assert_eq!(ops(&moved), ["file", "output", "pe2.str@stream"]);

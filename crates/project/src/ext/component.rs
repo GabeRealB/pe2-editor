@@ -2,12 +2,12 @@
 //! `crates/ext/wit/extension.wit`.
 //!
 //! Loading compiles a component, in an engine of its own, instantiates it once and asks who it is (`describe`) and
-//! what it registers (`register`); what it registers becomes the same kinds, roles, fields, operations, types and
+//! what it registers (`register`); what it registers becomes the same kinds, fields, operations, types and
 //! views a linked extension's would, each callback a call into the component by its handle.
 //!
 //! A guest's memory only grows, so an instance holds the most it ever held until it is dropped: instances live by the
 //! lifetime of their job, never a timer. A job - an operation's run, a tool's run - gets an instance made for it and
-//! dropped when it returns. Readings - a family's members, a field's reading, parts, a sniff - share one instance,
+//! dropped when it returns. Readings - a family's members, a field's reading, a sniff - share one instance,
 //! reused while it is used and reclaimed after
 //! `READING_FRAMES` frames unused (the host counts frames: `frame`). Long-running jobs keep theirs: the views live in
 //! one instance, which goes when its last view closes and it answers that it may be reclaimed; an extraction session in
@@ -247,7 +247,6 @@ unsafe impl Send for LentProject {}
 pub struct LentAsset {
     source: *const (dyn Source + 'static),
     kind: Option<String>,
-    role: Option<String>,
 }
 
 // SAFETY: a lent asset is read only during the call that lent it, on the thread making the call.
@@ -383,7 +382,7 @@ impl State {
         let Some(asset) = asset else { return Ok(None) };
         // SAFETY: the project's asset outlives the call; the lent asset is taken back when the call returns.
         let source = unsafe { erase_source(asset.source()) };
-        let lent = LentAsset { source, kind: asset.kind().map(str::to_string), role: asset.role().map(str::to_string) };
+        let lent = LentAsset { source, kind: asset.kind().map(str::to_string) };
         let lent = self.table.push(lent)?;
         self.found.push(lent.rep());
         Ok(Some(lent))
@@ -419,10 +418,6 @@ impl host::HostAsset for State {
 
     fn kind(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
         Ok(self.table.get(&asset)?.kind.clone())
-    }
-
-    fn role(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
-        Ok(self.table.get(&asset)?.role.clone())
     }
 
     fn declaration(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<String> {
@@ -474,9 +469,12 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.place(&path))
     }
 
-    fn table_of(&mut self, asset: Resource<LentAsset>, path: String, address: String) -> wasmtime::Result<Result<String, String>> {
-        let told = self.lent(&asset)?.table_of(&path, &address).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
-        Ok(told.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
+    fn output_of(&mut self, asset: Resource<LentAsset>, path: String, address: String) -> wasmtime::Result<Result<types::Value, String>> {
+        let told = self.lent(&asset)?.output_of(&path, &address).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        Ok(match told {
+            Ok(value) => Ok(value_to_wit(value, &mut self.table).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?),
+            Err(e) => Err(format!("{e:#}")),
+        })
     }
 
     fn build_config(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<host::BuildConfig>> {
@@ -564,36 +562,30 @@ impl host::HostProject for State {
         self.found(project.selection())
     }
 
-    fn chosen(&mut self, project: Resource<LentProject>, path: String, group: String) -> wasmtime::Result<Option<String>> {
+    fn chosen(&mut self, project: Resource<LentProject>, path: String, family: String) -> wasmtime::Result<Option<String>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
-        Ok(project.chosen(&path, &group))
-    }
-
-    fn look(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<u32> {
-        // SAFETY: as `asset`.
-        let project = unsafe { &*self.project(&project)? };
-        Ok(u32::try_from(project.look(&path)).unwrap_or(0))
+        Ok(project.chosen(&path, &family))
     }
 
     fn picture(
         &mut self,
         project: Resource<LentProject>,
         path: String,
-        look: u32,
+        look: Option<String>,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| p.picture(&path, look as usize).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+        Ok(elsewhere(project, move |p| p.picture(&path, look.as_deref()).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
     }
 
-    fn part(
+    fn image(
         &mut self,
         project: Resource<LentProject>,
         path: String,
-        part: String,
+        address: String,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| p.part(&path, &part).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+        Ok(elsewhere(project, move |p| p.image(&path, &address).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
     }
 
     fn table(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<Option<Result<String, String>>> {
@@ -601,11 +593,6 @@ impl host::HostProject for State {
         Ok(elsewhere(project, move |p| {
             p.table(&path, &address).map(|made| made.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
         }))
-    }
-
-    fn parts(&mut self, project: Resource<LentProject>, path: String) -> wasmtime::Result<Vec<(String, String, Vec<String>)>> {
-        let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| p.parts(&path).into_iter().map(|part| (part.id, part.label, part.made_of)).collect()))
     }
 
     fn call(
@@ -1192,9 +1179,9 @@ impl host::HostUi for State {
         &mut self,
         ui: Resource<Frame>,
         path: String,
-        look: u32,
+        look: Option<String>,
     ) -> wasmtime::Result<Option<Result<(Resource<HostTexture>, u32, u32), String>>> {
-        let Some(shown) = self.frame(&ui)?.picture(&path, look as usize) else { return Ok(None) };
+        let Some(shown) = self.frame(&ui)?.picture(&path, look.as_deref()) else { return Ok(None) };
         Ok(Some(match shown {
             Ok(texture) => {
                 let (width, height) = (u32::try_from(texture.width())?, u32::try_from(texture.height())?);
@@ -1305,7 +1292,7 @@ impl Runner {
     fn lend(&mut self, asset: &Asset) -> Result<Resource<LentAsset>> {
         // SAFETY: the pointer is used only during the call it is lent for, and taken back before it returns.
         let source = unsafe { erase_source(asset.source()) };
-        let lent = LentAsset { source, kind: asset.kind().map(str::to_string), role: asset.role().map(str::to_string) };
+        let lent = LentAsset { source, kind: asset.kind().map(str::to_string) };
         Ok(self.store.data_mut().table.push(lent)?)
     }
 
@@ -1604,11 +1591,10 @@ impl View for ComponentView {
             return;
         }
         let (Some(runner), Some(state)) = (&self.runner, self.state) else { return };
-        let look = u32::try_from(ui.look()).unwrap_or(0);
         let lent = ui.asset().map(|asset| {
             // SAFETY: lent for this frame's call alone, and taken back before it returns.
             let source = unsafe { erase_source(asset.source()) };
-            LentAsset { source, kind: asset.kind().map(str::to_string), role: asset.role().map(str::to_string) }
+            LentAsset { source, kind: asset.kind().map(str::to_string) }
         });
         // SAFETY: as the asset.
         let project = unsafe { erase_project(ui.project()) };
@@ -1627,7 +1613,7 @@ impl View for ComponentView {
             );
             let out = r.call(FRAME, async |a, g| {
                 let (ui, project, asset) = borrowed;
-                g.view_state().call_show(a, state, ui, project, asset, look).await
+                g.view_state().call_show(a, state, ui, project, asset).await
             });
             // Children the view left open close before the frame is taken back, innermost first.
             let data = r.store.data_mut();
@@ -1681,7 +1667,7 @@ impl pe2_ext::Generator for ComponentGenerator {
     fn next(&mut self, call: &pe2_ext::Call<'_>, count: usize) -> Result<Vec<pe2_ext::Data>> {
         let resource = self.resource.context("closed")?;
         let node = Node::new(call.host);
-        let asset = Asset::new(&node, call.host.kind(), call.host.role());
+        let asset = Asset::new(&node, call.host.kind());
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         let made = self
             .runner
@@ -1694,7 +1680,7 @@ impl pe2_ext::Generator for ComponentGenerator {
     fn seek(&mut self, call: &pe2_ext::Call<'_>, position: u64) -> Result<bool> {
         let resource = self.resource.context("closed")?;
         let node = Node::new(call.host);
-        let asset = Asset::new(&node, call.host.kind(), call.host.role());
+        let asset = Asset::new(&node, call.host.kind());
         let moved = self
             .runner
             .with_asset(&asset, LONG, async |a, g, lent| g.generator().call_seek(a, resource, lent, position).await)?;
@@ -1758,14 +1744,10 @@ impl Drop for ComponentExtraction {
 fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shared: &Arc<Shared>) -> Result<()> {
     for extractor in extractors {
         let kind = Name::parse(&extractor.kind).with_context(|| format!("{}: not a qualified kind", extractor.kind))?;
-        let roles = extractor
-            .roles
-            .iter()
-            .map(|r| Name::parse(r).with_context(|| format!("{r}: not a qualified role")))
-            .collect::<Result<Vec<_>>>()?;
+        let requires: Vec<&str> = extractor.requires.iter().map(String::as_str).collect();
         let (shared, handle) = (shared.clone(), extractor.handle);
         let cap = shared.cap(&extractor.name);
-        let _ = registry.extractor(&extractor.name, &kind, &roles, move |declared| {
+        let _ = registry.extractor(&extractor.name, &kind, &requires, move |declared| {
             Ok(Box::new(ComponentExtraction::begin(&shared, handle, cap, declared)?) as Box<dyn Extraction>)
         });
     }
@@ -1810,14 +1792,13 @@ fn caps(id: &str, registration: &g::Registration) -> Result<std::collections::Ha
     Ok(out)
 }
 
-/// What the views' instance may take: the most any kind, role or panel with views was given, as they share it.
+/// What the views' instance may take: the most any kind or panel with views was given, as they share it.
 fn views_cap(id: &str, registration: &g::Registration, caps: &std::collections::HashMap<String, u64>) -> u64 {
     let with_views = registration
         .kinds
         .iter()
         .filter(|k| !k.views.is_empty() || !k.inspector.is_empty() || !k.editors.is_empty() || !k.contents_views.is_empty())
         .map(|k| k.name.as_str())
-        .chain(registration.roles.iter().filter(|r| !r.views.is_empty() || !r.inspector.is_empty() || !r.editors.is_empty() || !r.contents_views.is_empty()).map(|r| r.name.as_str()))
         .chain(registration.panels.iter().map(|p| p.name.as_str()));
     with_views.filter_map(|local| caps.get(&format!("{id}@{local}")).copied()).fold(MEMORY, u64::max)
 }
@@ -2019,7 +2000,6 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         registry.command(label, tool);
     }
     apply_kinds(registry, registration.kinds, shared)?;
-    apply_roles(registry, registration.roles, shared)?;
     for panel in registration.panels {
         let (shared, handle) = (shared.clone(), panel.handle);
         let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
@@ -2076,15 +2056,6 @@ fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared
         if let Some(stack) = &kind.stack {
             builder = builder.stack(stack);
         }
-        if kind.parts {
-            let shared = shared.clone();
-            builder = builder.parts(move |asset| {
-                let parts = shared
-                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_parts(a, index, lent).await))
-                    .unwrap_or_default();
-                parts.into_iter().map(|p| pe2_ext::Part { id: p.id, label: p.label, made_of: p.made_of }).collect()
-            });
-        }
         if kind.contents {
             let lister = shared.clone();
             builder = builder.contents(move |asset, project| {
@@ -2126,34 +2097,6 @@ fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared
             builder = builder.editor_def(view_def(shared, v));
         }
         for v in &kind.contents_views {
-            builder = builder.contents_view_def(view_def(shared, v));
-        }
-        let _ = builder.register();
-    }
-    Ok(())
-}
-
-/// Register a component's roles.
-fn apply_roles(registry: &mut Registry, roles: Vec<g::Role>, shared: &Arc<Shared>) -> Result<()> {
-    for role in roles {
-        let kind = Name::parse(&role.kind).with_context(|| format!("{}: not a qualified kind", role.kind))?;
-        let mut builder = registry.role(&kind, &role.name).label(&role.label);
-        if let Some(alias) = &role.alias {
-            builder = builder.alias(alias);
-        }
-        for f in role.fields {
-            builder = builder.field(field(shared, f));
-        }
-        for v in role.views {
-            builder = builder.view(&v.name, view(shared, v.handle));
-        }
-        for v in &role.inspector {
-            builder = builder.inspector_def(view_def(shared, v));
-        }
-        for v in &role.editors {
-            builder = builder.editor_def(view_def(shared, v));
-        }
-        for v in &role.contents_views {
             builder = builder.contents_view_def(view_def(shared, v));
         }
         let _ = builder.register();
@@ -2218,7 +2161,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let settings = toml::to_string(call.settings).unwrap_or_default();
                 let parameter = call.parameter_text.map(str::to_string);
                 let node = Node::new(call.host);
-                let asset = Asset::new(&node, call.host.kind(), call.host.role());
+                let asset = Asset::new(&node, call.host.kind());
                 // An instance of its own, kept while the stream is read.
                 let mut runner = shared.instantiate(cap).with_context(|| shared.id.clone())?;
                 let inputs = values_to_wit(given, &mut runner.store.data_mut().table)?;
@@ -2238,7 +2181,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             let settings = toml::to_string(call.settings).unwrap_or_default();
             let parameter = call.parameter_text.map(str::to_string);
             let node = Node::new(call.host);
-            let asset = Asset::new(&node, call.host.kind(), call.host.role());
+            let asset = Asset::new(&node, call.host.kind());
             shared.job(cap, |r| {
                 let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
                 let made = r.with_asset(&asset, shared.long(), async |a, g, lent| {
@@ -2250,7 +2193,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
     }
 }
 
-/// A node as an operation's run lends it to a component: its path, kind, role and declared settings; its files the
+/// A node as an operation's run lends it to a component: its path, kind and declared settings; its files the
 /// contents its values hold, named by their hashes.
 struct Node<'a> {
     host: &'a dyn pe2_ext::CallHost,
@@ -2320,8 +2263,8 @@ impl Source for Node<'_> {
         self.host.place(path)
     }
 
-    fn table_of(&self, path: &str, address: &str) -> Option<Result<Table>> {
-        Some(self.host.table_of(path, address))
+    fn output_of(&self, path: &str, address: &str) -> Option<Result<pe2_ext::Data>> {
+        Some(self.host.output_of(path, address))
     }
 
     fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {

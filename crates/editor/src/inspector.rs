@@ -1,5 +1,5 @@
 //! The inspector: the selected asset's declaration shown as properties, not as TOML. A header names the asset (its
-//! icon, kind and role, a thumbnail for a picture); a property sheet gives each field a readable label and its value
+//! icon and kind, a thumbnail for a picture); a property sheet gives each field a readable label and its value
 //! the form its meaning calls for - a depth, a size, a VRAM offset or rectangle, a placement, a reference as a chip
 //! that opens its asset; lists (slots, variants, parts, cells) are rows or cards with a summary, a variant with its
 //! palette's colors; the bundle's files and the originals' sha1s close it.
@@ -17,14 +17,14 @@ use crate::workspace::{EditRequest, FieldEdit, Workspace};
 use crate::{icons, theme};
 
 /// Fields the header shows, or that only extraction writes.
-const HEADER_FIELDS: [&str; 4] = ["uid", "kind", "role", "original"];
+const HEADER_FIELDS: [&str; 3] = ["uid", "kind", "original"];
 /// The width under which a sheet is one column.
 const NARROW: f32 = 300.0;
 const ROW_HEIGHT: f32 = 22.0;
 const THUMBNAIL: f32 = 64.0;
 
 /// What a value is read with: the index its references resolve in, the registry their kinds' icons come from, and the
-/// fields the asset's kind and role describe, as their extensions register them.
+/// fields the asset's kind describes, as their extensions register them.
 pub struct Sheet<'a> {
     pub index: &'a Index,
     pub extensions: &'a Extensions,
@@ -223,12 +223,15 @@ fn part_ui(
 ) {
     let Some(id) = ws.part_of(&asset.path).map(str::to_string) else { return };
     let contents = ws.contents_of(asset);
-    let row = contents.rows.iter().find(|row| row.id == id && !row.is_heading()).map(|row| row.label.clone());
-    let Some(label) = row.or_else(|| ws.extensions.parts(asset).into_iter().find(|part| part.id == id).map(|part| part.label)) else {
+    let row = contents.rows.iter().find(|row| row.id == id && !row.is_heading());
+    // A row standing for a look shows that look.
+    let output = row.and_then(|row| row.look.as_ref()).map_or_else(|| id.clone(), |look| format!("{}/{look}", project::ext::PICTURE));
+    let row = row.map(|row| row.label.clone());
+    let Some(label) = row.or_else(|| ws.extensions.addresses(asset).into_iter().find(|(address, _)| *address == id).map(|(_, label)| label)) else {
         return;
     };
     let ctx = ui.ctx().clone();
-    let picture = match ws.parts.get(&ctx, &ws.extensions, asset, &id) {
+    let picture = match ws.parts.get(&ctx, &ws.extensions, asset, &output) {
         Some(Ok(picture)) => Some((picture.texture.id(), picture.size)),
         _ => None,
     };
@@ -308,7 +311,7 @@ pub(crate) fn edit_target(ws: &Workspace, asset: &Asset) -> Result<String, Strin
     Ok(if theirs { format!("Saving overrides it in {}", layer.name) } else { format!("Saved in {}", layer.name) })
 }
 
-/// The asset's declaration (`asset.toml`) as text, to edit and save whole: refused while it is not TOML.
+/// The asset's declaration (`node.toml`) as text, to edit and save whole: refused while it is not TOML.
 fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &mut Option<EditRequest>) {
     let Some(uid) = asset.uid.clone() else { return };
     if ws.declaration_draft.as_ref().is_some_and(|(a, _)| *a != asset.path) {
@@ -333,7 +336,7 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
                     let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
                     *edit = Some(EditRequest::Write {
                         uid: uid.clone(),
-                        file: project::index::ASSET_FILE.to_string(),
+                        file: project::index::NODE_FILE.to_string(),
                         bytes: draft.clone().into_bytes(),
                         label: format!("Edit {name}'s declaration"),
                         merge: None,
@@ -386,9 +389,6 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
             ui.label(RichText::new(&asset.path).small().color(theme::weak()));
             ui.horizontal(|ui| {
                 badge(ui, asset.kind.as_deref().unwrap_or("no kind"));
-                if let Some(role) = &asset.role {
-                    badge(ui, role);
-                }
                 if let Some(uid) = &asset.uid {
                     ui.label(RichText::new(uid).monospace().small().color(theme::weak()));
                     let copy = ui.add(egui::Button::new(RichText::new("Copy").small()).frame(false));
@@ -650,7 +650,7 @@ fn change_field(asset: &Asset, within: &[String], key: &str, new: Option<toml_ed
     let place = within.join(".");
     Some(EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::ASSET_FILE.to_string(),
+        file: project::index::NODE_FILE.to_string(),
         bytes: document.to_string().into_bytes(),
         label,
         merge: Some(format!("{}#{place}.{key}", asset.path)),
@@ -677,7 +677,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
     let text = with_sets(asset.text(), &outcome.sets)?;
     Ok((text != asset.text()).then(|| EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::ASSET_FILE.to_string(),
+        file: project::index::NODE_FILE.to_string(),
         bytes: text.into_bytes(),
         label: outcome.label.clone(),
         merge: None,
@@ -692,7 +692,7 @@ pub fn reference_in(value: &toml::Value) -> Option<&toml::Value> {
     value.as_table()?.values().find(|v| is_reference(v))
 }
 
-/// A reference written as this one is, naming another asset: of a part it keeps naming that part.
+/// A reference written as this one is, naming another asset: of an output it keeps naming that output.
 fn retargeted(value: &toml::Value, asset: &Asset) -> Option<toml::Value> {
     retarget_to(value, asset.uid.as_deref()?, &asset.path)
 }
@@ -811,7 +811,7 @@ pub fn set_fields(asset: &Asset, sets: &crate::ext_ui::Sets) -> Option<EditReque
     let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
     Some(EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::ASSET_FILE.to_string(),
+        file: project::index::NODE_FILE.to_string(),
         bytes: document.to_string().into_bytes(),
         label: format!("Edit {} of {name}", keys.join(", ")),
         merge: (!sets.apart).then(|| format!("{}#{}", asset.path, keys.join(","))),
@@ -1040,9 +1040,9 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
                 Some(parent) => format!("{parent}/{name}"),
                 None => name.to_string(),
             };
-            // A part, by its fragment after the asset's name.
-            let short = match project::index::part_of(value) {
-                Some(part) => format!("{short}#{part}"),
+            // An output, after the asset's name.
+            let short = match pe2_ext::output_of(value) {
+                Some(output) => format!("{short}#{output}"),
                 None => short,
             };
             if chip(ui, icon, &short, tint).on_hover_text(&asset.path).clicked() {
@@ -1158,10 +1158,10 @@ fn row_ui(
     });
 }
 
-/// The picture of the part a reference names, where its asset's kind draws one: a strip (a palette) as a swatch,
+/// The picture of the output a reference names, where it is one: a strip (a palette) as a swatch,
 /// anything else small.
 fn part_picture(ui: &mut egui::Ui, sheet: &Sheet, parts: &mut crate::workspace::Parts, value: &toml::Value) {
-    let (Some(part), Some((uid, path))) = (project::index::part_of(value), project::index::reference(value)) else {
+    let (Some(part), Some((uid, path))) = (pe2_ext::output_of(value), project::index::reference(value)) else {
         return;
     };
     let Some(asset) = sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) else { return };
@@ -1509,7 +1509,7 @@ fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &
         graph::OUTPUT => output_settings(layer),
         graph::FILE => {
             let mut file = Field::new("file").label("File");
-            let stored = asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::ASSET_FILE);
+            let stored = asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
             file.choices = stored.map(|f| (f.name.as_str().into(), f.name.clone())).collect();
             (vec![file], vec![set("file", "")])
         }
@@ -1549,7 +1549,7 @@ struct Place<'a> {
 pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<String>) -> Option<EditRequest> {
     Some(EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
-        file: project::index::ASSET_FILE.to_string(),
+        file: project::index::NODE_FILE.to_string(),
         bytes: text.ok()?.into_bytes(),
         label,
         merge: None,
@@ -1611,7 +1611,7 @@ fn add_items(
         let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
         add(ui, "Output", "A tap: what is here, as an output of this node", table(&[("op", graph::OUTPUT), ("name", free.as_str())]));
     } else {
-        for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::ASSET_FILE) {
+        for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE) {
             add(ui, &file.name, "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
         }
         let version = asset.uid.as_ref().and_then(|uid| index.version(&format!("{}{uid}", project::index::BELOW)));

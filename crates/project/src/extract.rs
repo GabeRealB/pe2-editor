@@ -2,15 +2,15 @@
 //! alone.
 //!
 //! Each disc of the layout is found among the project's roms by its size and sha1, and its file system is held to
-//! the layout (the same files, in disc order). Every declared asset is written as a bundle, `<group>/<name>.asset/`,
-//! its `asset.toml` the declaration's own fields (its slots filled, a stream's descriptor fields, ...) without what
+//! the layout (the same files, in disc order). Every declared asset is written as a bundle, `<group>/<name>.node/`,
+//! its `node.toml` the declaration's own fields (its slots filled, a stream's descriptor fields, ...) without what
 //! only extraction reads (`from`). An asset located in a disc slot is read from it - an ISO file's bytes (a `mixed`
 //! file's as 2336-byte sectors) or the license data -, checked against its sha1 and written as `native.<format>`.
 //! An asset located in a file's chunk slot is read from its stage container - `STAGE0.HED`'s or a `STAGE<N>.CDF`'s tables
 //! give the file's place, the file asset's slots the chunk's - as the chunk's payload. The layout's discs and stages
 //! are written as bundles too; folders, groups, files and streams carry their declarations alone.
 //!
-//! An asset whose kind and role an extension extracts (`pe2.images@textures`: textures and atlases) is made by that
+//! An asset an extension extracts (`pe2.images@textures`: images with a `mode`) is made by that
 //! extractor instead: its session begins with the declarations lent (what it needs of the other assets it reads once)
 //! and then makes each asset's native files, reading the chunks it needs from the discs and checking them against the
 //! declaration. The host knows no image format.
@@ -21,11 +21,11 @@
 //!
 //! An asset whose importer writes its source (an image's `pe2.images@ora`) is written as that source alone: exported
 //! from the native files read off the disc, and imported again to check that it makes them byte for byte and gives
-//! back the settings it derives (an image's size, its cells' rectangles), which its `asset.toml` then leaves out -
+//! back the settings it derives (an image's size, its cells' rectangles), which its `node.toml` then leaves out -
 //! extraction stops at an asset whose source would not. Its import is kept in the project cache, so the project opens
 //! without importing (`imports`).
 //!
-//! A bundle's `asset.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
+//! A bundle's `node.toml` carries no uid: the layer's changeset (`<layer>.toml` beside it) lists every entry the
 //! layer holds - each asset under its declared uid, each folder and `extraction.toml` under a new one - and marks the
 //! layer read-only, extraction's alone.
 
@@ -320,11 +320,11 @@ fn uids_alone_in(value: &mut toml_edit::Value) {
         toml_edit::Value::InlineTable(table) => {
             let uid = table.get("uid").and_then(toml_edit::Value::as_str).map(str::to_string);
             let path = table.get("path").and_then(toml_edit::Value::as_str).is_some_and(|p| p.starts_with("res://"));
-            // A part of the asset, by its fragment: `uid://...#palettes/default`.
-            let part = table.get("part").and_then(toml_edit::Value::as_str).map_or_default(|p| format!("#{p}"));
+            // An output of the asset: `uid://...#palettes/default`.
+            let output = table.get("output").and_then(toml_edit::Value::as_str).map_or_default(|o| format!("#{o}"));
             if let (Some(uid), true) = (uid, path) {
                 let decor = value.decor().clone();
-                *value = toml_edit::Value::from(format!("{uid}{part}"));
+                *value = toml_edit::Value::from(format!("{uid}{output}"));
                 *value.decor_mut() = decor;
                 return;
             }
@@ -335,7 +335,7 @@ fn uids_alone_in(value: &mut toml_edit::Value) {
     }
 }
 
-/// A bundle's `asset.toml`: the declaration's own fields, then the native form's file and the originals' sha1s. An
+/// A bundle's `node.toml`: the declaration's own fields, then the native form's file and the originals' sha1s. An
 /// asset whose declaration has an `[import]` section names its native file there (`source`), not beside it, nor the
 /// format extraction names that file by.
 fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) -> Result<String> {
@@ -346,7 +346,7 @@ fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) 
         body = doc.to_string();
     }
     let mut lines =
-        vec!["# An asset bundle, written by extraction.".to_string(), String::new(), body.trim().to_string()];
+        vec!["# A node, written by extraction.".to_string(), String::new(), body.trim().to_string()];
     if let Some(native) = native.filter(|_| !imported) {
         lines.push(format!("native = {}", quote(native)));
     }
@@ -356,7 +356,7 @@ fn asset_toml(body: &str, native: Option<&str>, originals: &[(String, String)]) 
     Ok(lines.join("\n") + "\n")
 }
 
-/// A bundle's `asset.toml` with its declaration's `[import]` written out as its stack, before the originals: its source
+/// A bundle's `node.toml` with its declaration's `[import]` written out as its stack, before the originals: its source
 /// stored on top, the importer taking it where it names one (with the import's other settings), the native form as the
 /// `native` output - kept in the store, made as soon as the source changes, where the importer makes it; where none
 /// does (`native`), the stored file as it is, made when asked for.
@@ -383,7 +383,7 @@ fn stacked(toml: &str, native: bool) -> Result<String> {
     Ok(with_stack(&doc.to_string(), &stack))
 }
 
-/// A layout asset's `asset.toml`: its declaration without what only extraction reads (`at`).
+/// A layout asset's `node.toml`: its declaration without what only extraction reads (`at`).
 fn layout_toml(text: &str) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     doc.remove("at");
@@ -391,11 +391,11 @@ fn layout_toml(text: &str) -> Result<String> {
     uids_alone(doc.as_item_mut());
     let body = doc.to_string();
     let body = body.lines().skip_while(|l| l.starts_with('#') || l.is_empty()).collect::<Vec<_>>().join("\n");
-    Ok(format!("# An asset bundle, written by extraction: the layout and its slots.\n\n{body}\n"))
+    Ok(format!("# A node, written by extraction: the layout and its slots.\n\n{body}\n"))
 }
 
 fn write_bundle(layer: &Path, path: &str, files: &[(&str, &[u8])]) -> Result<()> {
-    let dir = layer.join(format!("{path}.asset"));
+    let dir = layer.join(format!("{path}.node"));
     fs::create_dir_all(&dir)?;
     for (name, bytes) in files {
         fs::write(dir.join(name), bytes).with_context(|| format!("{}", dir.join(name).display()))?;
@@ -555,7 +555,7 @@ impl crate::graph::exec::Node for Lent<'_> {
 }
 
 impl Sourcing<'_> {
-    /// A bundle's `asset.toml` with its stack written out: the import its declaration names (`stacked`), or where it
+    /// A bundle's `node.toml` with its stack written out: the import its declaration names (`stacked`), or where it
     /// names none, the stack of its kind (`KindBuilder::stack`), where that has one.
     fn stack(&self, path: &str, kind: &str, toml: String) -> Result<String> {
         let declared: toml::Table = toml.parse()?;
@@ -588,7 +588,7 @@ impl Sourcing<'_> {
         }
     }
 
-    /// An asset's `asset.toml` and files as its bundle holds them: its native files where its import is undone by
+    /// An asset's `node.toml` and files as its bundle holds them: its native files where its import is undone by
     /// none, else its import's source alone - written by the operation undoing it from the native files, imported back
     /// by its stack with the declaration less what the import derives, and compared, files and settings both; its
     /// import kept.
@@ -649,7 +649,7 @@ impl Sourcing<'_> {
     }
 }
 
-/// A bundle's `asset.toml` with a stack added, before the originals.
+/// A bundle's `node.toml` with a stack added, before the originals.
 pub(crate) fn with_stack(toml: &str, stack: &str) -> String {
     let body = toml.find("\n[original.").map_or(toml.len(), |i| i + 1);
     let (body, originals) = toml.split_at(body);
@@ -683,7 +683,7 @@ fn write_assets(
     let mut sessions: HashMap<String, Box<dyn pe2_ext::Extraction>> = HashMap::new();
     let mut written = 0;
     for (path, asset) in &decl.assets {
-        if let Some(extractor) = extensions.extractor_for(&asset.kind, asset.role.as_deref()) {
+        if let Some(extractor) = extensions.extractor_for(&asset.kind, |field| asset.table.contains_key(field)) {
             let name = extractor.name.to_string();
             if !sessions.contains_key(&name) {
                 let session = (extractor.begin)(&Declared(decl)).with_context(|| format!("{name} could not begin"))?;
@@ -702,7 +702,7 @@ fn write_assets(
             }
             let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, None, &originals)?)?;
             let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
-            let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
+            let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
             files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
             write_bundle(layer, path, &files)?;
             written += 1;
@@ -716,7 +716,7 @@ fn write_assets(
                 .filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?)))
                 .collect();
             let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, None, &originals)?)?;
-            write_bundle(layer, path, &[("asset.toml", toml.as_bytes())])?;
+            write_bundle(layer, path, &[("node.toml", toml.as_bytes())])?;
             written += 1;
             continue;
         }
@@ -756,7 +756,7 @@ fn write_assets(
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
         let toml = sourcing.stack(path, &asset.kind, asset_toml(&asset.body, native.as_ref().map(|_| name.as_str()), &originals)?)?;
-        let mut files: Vec<(&str, &[u8])> = vec![("asset.toml", toml.as_bytes())];
+        let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
         if let Some(native) = &native {
             files.push((&name, native));
         }
@@ -780,8 +780,8 @@ struct Written {
 impl Written {
     fn open(layer: &Path, path: &str, uid: &str) -> Result<Written> {
         let dir = layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX));
-        let declaration = fs::read_to_string(dir.join("asset.toml")).with_context(|| format!("{path}: its asset.toml"))?;
-        let fields = declaration.parse().with_context(|| format!("{path}: its asset.toml"))?;
+        let declaration = fs::read_to_string(dir.join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
+        let fields = declaration.parse().with_context(|| format!("{path}: its node.toml"))?;
         Ok(Written { path: path.to_string(), uid: uid.to_string(), dir, declaration, fields, sha1s: std::sync::Mutex::default() })
     }
 }
@@ -918,7 +918,7 @@ fn write_layouts(layer: &Path, decl: &Declarations, releases: &[String], discs: 
                 }
             }
             let toml = layout_toml(&layout.text)?;
-            write_bundle(layer, &format!("disc/{release}/{name}"), &[("asset.toml", toml.as_bytes())])?;
+            write_bundle(layer, &format!("disc/{release}/{name}"), &[("node.toml", toml.as_bytes())])?;
             written += 1;
         }
     }
@@ -949,7 +949,7 @@ fn write_record(layer: &Path, decl_root: &Path, releases: &[String], discs: &Dis
     Ok(())
 }
 
-/// The game layer's changeset, by real paths (a bundle's with `.asset`): every asset under its declared uid, every
+/// The game layer's changeset, by real paths (a bundle's with `.node`): every asset under its declared uid, every
 /// folder and the record under new ones, the layer read-only.
 fn write_changeset(project: &Project, layer: &str, decl: &Declarations, releases: &[String]) -> Result<()> {
     let mut changeset = Changeset { read_only: true, ..Changeset::default() };

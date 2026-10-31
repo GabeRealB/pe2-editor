@@ -34,17 +34,17 @@ use std::fmt::Write as _;
 
 use crate::texels_per_halfword;
 
-/// A reference as declarations write it: a uid and a bundle's `res://` path, and the part of it it names.
+/// A reference as declarations write it: a uid and a bundle's `res://` path, and the output of it it names.
 #[derive(Clone, Debug, Deserialize)]
 struct Reference {
     path: String,
-    part: Option<String>,
+    output: Option<String>,
 }
 
 impl Reference {
     /// The declaration path (`group/name`) it names.
     fn target(&self) -> &str {
-        self.path.trim_start_matches("res://").trim_end_matches(".asset")
+        self.path.trim_start_matches("res://").trim_end_matches(".node")
     }
 }
 
@@ -69,14 +69,16 @@ struct Location {
     #[serde(default)]
     at: Vec<At>,
     sha1: Option<String>,
+    /// Where in a package its texels are, for one the package holds rather than uploads: they are the bytes there.
+    offset: Option<usize>,
+    size: Option<usize>,
     #[serde(default)]
     palettes: BTreeMap<String, String>,
 }
 
-/// What extraction reads of a declaration: where it is per release, a file's slots, its kind and role.
+/// What extraction reads of a declaration: where it is per release and a file's slots.
 #[derive(Clone, Debug, Deserialize)]
 struct Declaration {
-    role: Option<String>,
     #[serde(default)]
     from: BTreeMap<String, Location>,
     #[serde(default)]
@@ -234,7 +236,7 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
         let mut note = |slot: &str, resource: Option<usize>, in_pages: bool, entries: &[PaletteEntry]| {
             for e in entries {
                 let source = || PaletteSource { file: path.clone(), slot: slot.to_string(), resource, in_pages };
-                let named = e.palette.as_ref().and_then(|p| Some((p.target(), p.part.as_deref()?.strip_prefix("palettes/")?)));
+                let named = e.palette.as_ref().and_then(|p| Some((p.target(), p.output.as_deref()?.strip_prefix("palettes/")?)));
                 match (named, &e.slot, e.at) {
                     (Some((image, palette)), ..) => {
                         palettes.entry((image.to_string(), palette.to_string())).or_insert_with(source);
@@ -272,6 +274,12 @@ impl Extraction for Textures {
         let (asset, table) = self.images.get(path).ok_or_else(|| anyhow!("{path}: no such image"))?;
         let loc = asset.from.get(release).ok_or_else(|| anyhow!("not in this release"))?;
         let at = loc.at.first().ok_or_else(|| anyhow!("read from nowhere"))?;
+        if let (Some(offset), Some(size)) = (loc.offset, loc.size) {
+            let inflated = formats::lzss::decode_stream(&read(discs, at)?, 0).0;
+            let held = inflated.get(offset..offset + size).ok_or_else(|| anyhow!("past the end of its package"))?;
+            check(held, loc.sha1.as_ref().ok_or_else(|| anyhow!("no texels sha1"))?, "texels")?;
+            return Ok(vec![("native.texels".to_string(), held.to_vec())]);
+        }
         let pages = codecs::texture::pages(&read(discs, at)?)?;
         let first = at.page.unwrap_or(0);
         let tex: Texture = table.clone().try_into()?;
@@ -378,12 +386,12 @@ impl Textures {
 
     /// How many stored pages an image slot's entry fills.
     fn entry_pages(&self, entry: &PageEntry) -> usize {
-        let Some((image, table)) = entry.image.as_ref().and_then(|r| self.images.get(r.target())) else { return 1 };
+        let Some((_, table)) = entry.image.as_ref().and_then(|r| self.images.get(r.target())) else { return 1 };
         let total = table
             .clone()
             .try_into::<Texture>()
             .ok()
-            .filter(|_| image.role.as_deref() == Some("texture"))
+            .filter(|_| !table.contains_key("cells"))
             .map_or(1, |t| (t.size[0] as usize).div_ceil(64 * texels_per_halfword(t.mode.bpp())).max(1));
         let from = entry.first.unwrap_or(0);
         entry.count.unwrap_or(total - from)

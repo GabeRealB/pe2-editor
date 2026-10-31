@@ -195,7 +195,7 @@ pub enum Tint {
 /// Formats a field's value for reading; none where the value is not of the form it formats.
 pub type Format = dyn Fn(&Value) -> Option<String> + Send + Sync;
 
-/// A field of a kind or a role, as the inspector shows it: its label and how its value reads.
+/// A field of a kind, as the inspector shows it: its label and how its value reads.
 #[derive(Clone)]
 pub struct Field {
     pub key: String,
@@ -296,21 +296,6 @@ pub type MakeView = dyn Fn(&Asset) -> Box<dyn View> + Send + Sync;
 /// Makes a panel's view.
 pub type MakePanel = dyn Fn() -> Box<dyn View> + Send + Sync;
 
-/// A part of an asset: what a reference names by fragment (`uid://...#palettes/default`), an output of its import or
-/// one its settings define.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Part {
-    /// Its id within the asset, its fragment: `palettes/default`, `cells/cursor`, `variants/night`.
-    pub id: String,
-    pub label: String,
-    /// The parts it is made of, where it is virtual - files of its own it has none, its settings link them (an
-    /// image's variant: the texels through a palette); empty for a part of its own.
-    pub made_of: Vec<String>,
-}
-
-/// An asset's parts, in order.
-pub type ListParts = dyn Fn(&Asset) -> Vec<Part> + Send + Sync;
-
 /// A tool's work: its arguments to its answer.
 pub type Run = dyn Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync;
 
@@ -336,7 +321,6 @@ pub struct ToolDef {
 #[derive(Clone, Default)]
 pub struct Parts {
     pub kinds: Vec<KindDef>,
-    pub roles: Vec<RoleDef>,
     pub panels: Vec<PanelDef>,
     pub tools: Vec<ToolDef>,
     /// Services: like tools, but for other extensions to call.
@@ -517,7 +501,7 @@ pub struct ContentDrag {
     pub reorders: bool,
 }
 
-/// A row of what is inside an asset. `id` is what selecting it selects, a part's fragment where it is a part; a row deeper
+/// A row of what is inside an asset. `id` is what selecting it selects, an output's address where it is one; a row deeper
 /// than the one before it is under that one, which folds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentRow {
@@ -535,7 +519,7 @@ pub struct ContentRow {
     /// How it starts, where it folds.
     pub open: bool,
     /// The look its asset is shown in once it is selected.
-    pub look: Option<u32>,
+    pub look: Option<String>,
     /// An asset's path, opened by a double-click.
     pub link: Option<String>,
     /// Offers renaming it.
@@ -628,8 +612,8 @@ impl ContentRow {
 
     /// Show its asset in this look once it is selected.
     #[must_use]
-    pub fn look(mut self, look: u32) -> ContentRow {
-        self.look = Some(look);
+    pub fn look(mut self, look: &str) -> ContentRow {
+        self.look = Some(look.to_string());
         self
     }
 
@@ -762,8 +746,7 @@ pub struct KindDef {
     pub editors: Vec<ViewDef>,
     /// Views at the head of the contents pane.
     pub contents_views: Vec<ViewDef>,
-    pub parts: Option<Arc<ListParts>>,
-    /// What is inside its assets, where that is not their parts.
+    /// What is inside its assets.
     pub contents: Option<Arc<ListContents>>,
     /// What comes of something done in its assets' contents.
     pub content_act: Option<Arc<ActOnContents>>,
@@ -792,25 +775,6 @@ impl AddedOutput<'_> {
     }
 }
 
-/// A role as registered, on a kind of its extension's or of one it requires.
-#[derive(Clone)]
-pub struct RoleDef {
-    pub name: Name,
-    pub kind: Name,
-    pub alias: Option<String>,
-    pub label: String,
-    /// Fields it adds to its kind's, or shows otherwise.
-    pub fields: Vec<Field>,
-    /// Views it adds to its kind's.
-    pub views: Vec<ViewDef>,
-    /// Inspector views it adds to its kind's.
-    pub inspector: Vec<ViewDef>,
-    /// Editors it adds to its kind's.
-    pub editors: Vec<ViewDef>,
-    /// Views it adds at the head of the contents pane.
-    pub contents_views: Vec<ViewDef>,
-}
-
 /// An operation run where an event is signaled, before what the event pulls: failing, it stops those.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookDef {
@@ -835,8 +799,8 @@ impl HookBuilder<'_> {
     }
 }
 
-/// What an extension registers, as its entry point calls it. The host checks the outcome: a role's kind must be its
-/// extension's or a dependency's, an alias a built-in's, a name registered once.
+/// What an extension registers, as its entry point calls it. The host checks the outcome: an alias must be a built-in's,
+/// a name registered once.
 pub struct Registry {
     id: String,
     parts: Parts,
@@ -899,30 +863,13 @@ impl Registry {
             inspector: vec![],
             editors: vec![],
             contents_views: vec![],
-            parts: None,
-            contents: None,
+                contents: None,
             content_act: None,
             part_sheet: None,
             outputs: vec![],
             stack: None,
         };
         KindBuilder { registry: self, def }
-    }
-
-    /// A role on `kind`, `<id>@<name>`: registered by `register` on what this returns.
-    pub fn role(&mut self, kind: &Name, name: &str) -> RoleBuilder<'_> {
-        let def = RoleDef {
-            name: Name::of(&self.id, name),
-            kind: kind.clone(),
-            alias: None,
-            label: name.to_string(),
-            fields: vec![],
-            views: vec![],
-            inspector: vec![],
-            editors: vec![],
-            contents_views: vec![],
-        };
-        RoleBuilder { registry: self, def }
     }
 
     /// A panel, `<id>@<name>`, labeled in the View menu and its tab.
@@ -962,19 +909,19 @@ impl Registry {
         TypeBuilder { registry: self, def }
     }
 
-    /// An extractor, `<id>@<name>`, making the native files of assets of `kind` (of `roles`, qualified; of every role
+    /// An extractor, `<id>@<name>`, making the native files of assets of `kind` (of those declaring all of `requires`; of every one
     /// where none is named) from the discs, its sessions begun by `begin`.
     pub fn extractor(
         &mut self,
         name: &str,
         kind: &Name,
-        roles: &[Name],
+        requires: &[&str],
         begin: impl Fn(&dyn crate::Declared) -> Result<Box<dyn crate::Extraction>> + Send + Sync + 'static,
     ) -> Name {
         let def = crate::ExtractorDef {
             name: Name::of(&self.id, name),
             kind: kind.clone(),
-            roles: roles.to_vec(),
+            requires: requires.iter().map(|field| (*field).to_string()).collect(),
             begin: Arc::new(begin),
         };
         let name = def.name.clone();
@@ -1261,14 +1208,7 @@ impl KindBuilder<'_> {
         self
     }
 
-    /// An asset's parts: what references name by fragment.
-    #[must_use]
-    pub fn parts(mut self, parts: impl Fn(&Asset) -> Vec<Part> + Send + Sync + 'static) -> Self {
-        self.def.parts = Some(Arc::new(parts));
-        self
-    }
-
-    /// What is inside its assets, for the contents pane, where its parts by themselves do not say enough.
+    /// What is inside its assets, for the contents pane.
     #[must_use]
     pub fn contents(mut self, contents: impl Fn(&Asset, &dyn crate::Project) -> Contents + Send + Sync + 'static) -> Self {
         self.def.contents = Some(Arc::new(contents));
@@ -1289,119 +1229,11 @@ impl KindBuilder<'_> {
         self
     }
 
-    /// Register it; its name, which roles name it by.
-    #[expect(clippy::must_use_candidate, reason = "a kind without roles needs no name")]
+    /// Register it; its name.
+    #[expect(clippy::must_use_candidate, reason = "a kind's name is seldom needed")]
     pub fn register(self) -> Name {
         let name = self.def.name.clone();
         self.registry.parts.kinds.push(self.def);
-        name
-    }
-}
-
-pub struct RoleBuilder<'a> {
-    registry: &'a mut Registry,
-    def: RoleDef,
-}
-
-impl RoleBuilder<'_> {
-    /// Also read where a declaration names it bare (a built-in's alone).
-    #[must_use]
-    pub fn alias(mut self, alias: &str) -> Self {
-        self.def.alias = Some(alias.to_string());
-        self
-    }
-
-    #[must_use]
-    pub fn label(mut self, label: &str) -> Self {
-        self.def.label = label.to_string();
-        self
-    }
-
-    #[must_use]
-    pub fn field(mut self, field: Field) -> Self {
-        self.def.fields.push(field);
-        self
-    }
-
-    #[must_use]
-    pub fn view(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
-        self
-    }
-
-    /// A view drawn in the inspector, after its kind's.
-    #[must_use]
-    pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
-        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
-        self
-    }
-
-    /// A view with a tab of its own in the inspector, shown for an asset with any of `fields` (with none, for every asset).
-    #[must_use]
-    pub fn inspector_tab(
-        mut self,
-        name: &str,
-        icon: Icon,
-        fields: &[&str],
-        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
-    ) -> Self {
-        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
-        self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
-        self
-    }
-
-    /// An editor of its own, beside the preview: what a document can show instead of it, for an asset with any of `fields`
-    /// (with none, for every asset). A stage's viewport is one.
-    #[must_use]
-    pub fn editor(
-        mut self,
-        name: &str,
-        icon: Icon,
-        fields: &[&str],
-        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
-    ) -> Self {
-        let tab = TabDef { icon, fields: fields.iter().map(|field| (*field).to_string()).collect() };
-        self.def.editors.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) });
-        self
-    }
-
-    /// An inspector view as a component declared it.
-    #[must_use]
-    pub fn inspector_def(mut self, view: ViewDef) -> Self {
-        self.def.inspector.push(view);
-        self
-    }
-
-    /// An editor as a component declared it.
-    #[must_use]
-    pub fn editor_def(mut self, view: ViewDef) -> Self {
-        self.def.editors.push(view);
-        self
-    }
-
-    /// A view at the head of the contents pane, over its rows: for what rows cannot say. With no rows, the pane is its own.
-    #[must_use]
-    pub fn contents_view(
-        mut self,
-        name: &str,
-        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
-    ) -> Self {
-        self.def.contents_views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
-        self
-    }
-
-    /// A contents view as a component declared it.
-    #[must_use]
-    pub fn contents_view_def(mut self, view: ViewDef) -> Self {
-        self.def.contents_views.push(view);
-        self
-    }
-
-    /// Register it; its name.
-    #[expect(clippy::must_use_candidate, reason = "a role's name is seldom needed")]
-    pub fn register(self) -> Name {
-        let name = self.def.name.clone();
-        self.registry.parts.roles.push(self.def);
         name
     }
 }

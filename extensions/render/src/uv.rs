@@ -164,7 +164,7 @@ impl UvView {
         for tile in &layout.tiles {
             let ([left, top], [width, height]) = (tile.place, tile.size);
             let rect = Rect { x: left, y: top, width, height };
-            let texture = tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, &bound.part()).cloned());
+            let texture = tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
             match texture {
                 Some(texture) => canvas.pictures.push(Placed { texture, rect, label: Some(tile.names.join(", ")), link: None }),
                 // Nothing to lie on but where it would be.

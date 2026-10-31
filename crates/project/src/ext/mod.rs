@@ -4,7 +4,7 @@
 //! Loading checks what the SDK cannot: one extension an id (a second is refused), each one's requirements met by the
 //! version loaded (`pe2.images@^0.1`), registration in dependency order, cycles refused; an extension whose
 //! requirement is missing, too old or itself disabled is disabled, and so are its dependents, each with the reason. What
-//! one registers is checked as well: a role only on its own kinds or its dependencies', an alias only from a built-in,
+//! one registers is checked as well: an alias only from a built-in,
 //! a name only once. An extension is a component the host runs (`component`), or a crate linked into the host whose
 //! entry point it calls - the built-ins' fallback while developing.
 
@@ -13,7 +13,7 @@ pub mod component;
 
 use anyhow::{Context, Result};
 use pe2_ext::{
-    Asset, Extension, Field, TypeDef, Icon, Image, KindDef, PanelDef, Project, Recognized, Registry, RoleDef, Signature,
+    Asset, Extension, Field, TypeDef, Icon, Image, KindDef, PanelDef, Project, Recognized, Registry, Signature,
     Source, Table, Tint, ToolDef, Value, ViewDef,
 };
 use std::collections::{HashMap, HashSet};
@@ -135,7 +135,7 @@ pub struct Present {
     pub contract: Option<String>,
     /// How long registering it took (compiling and instantiating a component), where it was registered.
     pub load: Option<std::time::Duration>,
-    /// What it registered, by what it is - kinds, roles, formats, importers, extractors, panels, tools, services -
+    /// What it registered, by what it is - kinds, formats, importers, extractors, panels, tools, services -
     /// each name qualified.
     pub registers: Registers,
     /// For an unsandboxed extension, its hash: what enabling it records.
@@ -282,7 +282,6 @@ pub struct Extensions {
     /// Each loaded extension's settings, by its id: as declared, with the values they took.
     pub settings: HashMap<String, Vec<(pe2_ext::Setting, toml::Value)>>,
     kinds: HashMap<String, (KindDef, usize)>,
-    roles: HashMap<String, RoleDef>,
     panels: Vec<PanelDef>,
     tools: Vec<ToolDef>,
     services: HashMap<String, ToolDef>,
@@ -301,7 +300,6 @@ pub struct Extensions {
     recognized: Mutex<HashMap<String, Vec<(usize, Recognized)>>>,
     /// Bare names declarations write, to the qualified names of the built-ins registering them.
     kind_aliases: HashMap<String, String>,
-    role_aliases: HashMap<String, String>,
     /// Who provides each service: its provider's id.
     providers: HashMap<String, String>,
     /// The streams open, by the key of the output each is: one is shared by its readers while what it read holds.
@@ -348,7 +346,7 @@ impl Extensions {
         let mut extensions = extensions;
         extensions.sort_by_key(|e| e.origin.nearness());
         let mut pending: Vec<Loadable> = vec![];
-        // Those taking a built-in's place, which name kinds and roles bare as it did.
+        // Those taking a built-in's place, which name kinds bare as it did.
         let mut standing_in: HashSet<String> = HashSet::new();
         for extension in extensions {
             if let Some(nearer) = pending.iter().find(|e| e.id == extension.id) {
@@ -476,7 +474,6 @@ impl Extensions {
         let listed = |names: Vec<&pe2_ext::Name>| names.into_iter().map(ToString::to_string).collect::<Vec<_>>();
         let registers = vec![
             ("kinds", listed(parts.kinds.iter().map(|k| &k.name).collect())),
-            ("roles", listed(parts.roles.iter().map(|r| &r.name).collect())),
             ("operations", listed(parts.ops.iter().map(|o| &o.name).collect())),
             ("types", listed(parts.types.iter().map(|t| &t.name).collect())),
             ("extractors", listed(parts.extractors.iter().map(|e| &e.name).collect())),
@@ -484,13 +481,13 @@ impl Extensions {
             ("tools", listed(parts.tools.iter().map(|t| &t.name).collect())),
             ("services", listed(parts.services.iter().map(|s| &s.name).collect())),
         ];
-        let (kinds, roles) = (parts.kinds, parts.roles);
+        let kinds = parts.kinds;
         // What it requires, a service also by its provider.
         let wanted = extension.reaches.iter().map(|r| requirement(r).0);
         let behind: Vec<String> = wanted.clone().filter_map(|r| self.providers.get(r).cloned()).collect();
         let dependencies: Vec<&str> = wanted.chain(behind.iter().map(String::as_str)).collect();
         let mut seen = HashSet::new();
-        let names = kinds.iter().map(|k| &k.name).chain(roles.iter().map(|r| &r.name));
+        let names = kinds.iter().map(|k| &k.name);
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
         let names = names.chain(parts.ops.iter().map(|o| &o.name));
         let names = names.chain(parts.types.iter().map(|t| &t.name));
@@ -498,12 +495,6 @@ impl Extensions {
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
-        }
-        for role in &roles {
-            let owner = role.kind.extension();
-            let reachable = owner == extension.id && kinds.iter().any(|k| k.name == role.kind)
-                || dependencies.contains(&owner) && self.kinds.contains_key(role.kind.as_str());
-            anyhow::ensure!(reachable, "{} is on {}, which neither it nor what it requires registers", role.name, role.kind);
         }
         let reachable = |owner: &str, known: bool| owner == extension.id && known || dependencies.contains(&owner);
         self.check_graph(&extension.id, &dependencies, (&parts.ops, &parts.types, &parts.problems), &kinds)?;
@@ -515,15 +506,10 @@ impl Extensions {
                 extractor.name,
                 extractor.kind
             );
-            for role in &extractor.roles {
-                let known = roles.iter().any(|r| r.name == *role && r.kind == extractor.kind)
-                    || self.roles.get(role.as_str()).is_some_and(|r| r.kind == extractor.kind);
-                anyhow::ensure!(known, "{} extracts {role}, which is no role of {}", extractor.name, extractor.kind);
-            }
         }
-        let aliases = kinds.iter().filter_map(|k| k.alias.as_ref()).chain(roles.iter().filter_map(|r| r.alias.as_ref()));
+        let aliases = kinds.iter().filter_map(|k| k.alias.as_ref());
         for alias in aliases {
-            anyhow::ensure!(builtin, "only a built-in extension names a kind or role bare ({alias})");
+            anyhow::ensure!(builtin, "only a built-in extension names a kind bare ({alias})");
         }
         let additions = self.additions(extension, &dependencies, parts.additions)?;
         self.check_stacks(&extension.id, &dependencies, &parts.stacks)?;
@@ -539,12 +525,6 @@ impl Extensions {
                 self.kind_aliases.insert(alias.clone(), kind.name.to_string());
             }
             self.kinds.insert(kind.name.to_string(), (kind, index));
-        }
-        for role in roles {
-            if let Some(alias) = &role.alias {
-                self.role_aliases.insert(alias.clone(), role.name.to_string());
-            }
-            self.roles.insert(role.name.to_string(), role);
         }
         self.panels.extend(parts.panels);
         self.tools.extend(parts.tools);
@@ -736,39 +716,24 @@ impl Extensions {
         self.kinds.get(self.kind_aliases.get(declared).map_or(declared, String::as_str))
     }
 
-    /// A declared kind and role, qualified as extensions see them (`image`, `atlas` to `pe2.images@image`,
-    /// `pe2.images@atlas`); none for what no extension registers.
+    /// A declared kind, qualified as extensions see it (`image` to `pe2.images@image`); none for what no extension
+    /// registers.
     #[must_use]
-    pub fn qualify(&self, kind: &str, role: Option<&str>) -> (Option<&str>, Option<&str>) {
-        let Some((kind, _)) = self.kind_named(kind) else { return (None, None) };
-        let role = role
-            .and_then(|r| self.roles.get(self.role_aliases.get(r).map_or(r, String::as_str)))
-            .filter(|r| r.kind == kind.name)
-            .map(|r| r.name.as_str());
-        (Some(kind.name.as_str()), role)
+    pub fn qualify(&self, kind: &str) -> Option<&str> {
+        self.kind_named(kind).map(|(kind, _)| kind.name.as_str())
     }
 
-    /// An asset's kind, where an extension registers it.
+    /// The kind an asset declares, where one is registered.
     #[must_use]
     pub fn kind_of(&self, asset: &index::Asset) -> Option<&KindDef> {
         self.kind_named(asset.kind.as_deref()?).map(|(kind, _)| kind)
     }
 
-    /// An asset's role, where one is registered on its kind.
-    #[must_use]
-    pub fn role_of(&self, asset: &index::Asset) -> Option<&RoleDef> {
-        let kind = self.kind_of(asset)?;
-        let declared = asset.role.as_deref()?;
-        let role = self.roles.get(self.role_aliases.get(declared).map_or(declared, String::as_str))?;
-        (role.kind == kind.name).then_some(role)
-    }
-
-    /// An asset as its extensions see it: lent, with its kind and role qualified.
+    /// An asset as its extensions see it: lent, with its kind qualified.
     #[must_use]
     pub fn lend<'a>(&'a self, asset: &'a index::Asset) -> Asset<'a> {
         let kind = self.kind_of(asset).map(|k| k.name.as_str());
-        let role = self.role_of(asset).map(|r| r.name.as_str());
-        Asset::new(asset, kind, role)
+        Asset::new(asset, kind)
     }
 
     /// A kind's icon and its tint, by the name a declaration writes.
@@ -1051,6 +1016,12 @@ impl Extensions {
         self.pictured(asset).map_or_default(|(_, members)| members.into_iter().map(|(_, label)| label).collect())
     }
 
+    /// Where a look is among an asset's looks: its first, for no look or one it does not have.
+    #[must_use]
+    pub fn look_at(&self, asset: &index::Asset, look: Option<&str>) -> usize {
+        look.and_then(|look| self.looks(asset).iter().position(|known| known == look)).unwrap_or(0)
+    }
+
     /// The address of an asset's picture in one of its looks (its first, past them).
     #[must_use]
     pub fn picture_address(&self, asset: &index::Asset, look: usize) -> Option<String> {
@@ -1096,20 +1067,18 @@ impl Extensions {
         engine.output_with(&plan, asset, graph::THUMBNAIL, first, true)
     }
 
-    /// The fields an asset's kind and role describe, the role's first.
+    /// The fields an asset's kind describes.
     #[must_use]
     pub fn fields(&self, asset: &index::Asset) -> Vec<&Field> {
-        let role = self.role_of(asset).map_or(&[][..], |r| r.fields.as_slice());
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.fields.as_slice());
-        role.iter().chain(kind).collect()
+        kind.iter().collect()
     }
 
-    /// The inspector views of an asset: its kind's, then its role's.
+    /// The inspector views of an asset: its kind's.
     #[must_use]
     pub fn inspector(&self, asset: &index::Asset) -> Vec<&ViewDef> {
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.inspector.as_slice());
-        let role = self.role_of(asset).map_or(&[][..], |r| r.inspector.as_slice());
-        kind.iter().chain(role).collect()
+        kind.iter().collect()
     }
 
     /// An asset's inspector views with a tab of their own, by their place among its inspector views: those it has what brings.
@@ -1118,48 +1087,60 @@ impl Extensions {
         self.inspector(asset).into_iter().enumerate().filter(|(_, view)| view.tab.is_some() && brought(view, asset)).collect()
     }
 
-    /// The editors its kind and role give an asset, of those it has what brings.
+    /// The editors its kind gives an asset, of those it has what brings.
     #[must_use]
     pub fn editors(&self, asset: &index::Asset) -> Vec<&ViewDef> {
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.editors.as_slice());
-        let role = self.role_of(asset).map_or(&[][..], |r| r.editors.as_slice());
-        kind.iter().chain(role).filter(|view| brought(view, asset)).collect()
+        kind.iter().filter(|view| brought(view, asset)).collect()
     }
 
-    /// The name of every editor any kind or role gives.
+    /// The name of every editor any kind gives.
     #[must_use]
     pub fn editor_names(&self) -> std::collections::BTreeSet<&str> {
         let kinds = self.kinds.values().flat_map(|(kind, _)| &kind.editors);
-        let roles = self.roles.values().flat_map(|role| &role.editors);
-        kinds.chain(roles).map(|view| view.name.as_str()).collect()
+        kinds.map(|view| view.name.as_str()).collect()
     }
 
-    /// A part of an asset as a picture (`palettes/<name>`): the member of a family of its kind's pictures keyed by it;
-    /// none where none is.
+    /// An output of an asset that is a picture, made now: `palettes/default`, `cells/skin@night` (that member through
+    /// another palette, which is no member to list); none where it has no such output.
     #[must_use]
-    pub fn part(&self, asset: &index::Asset, part: &str) -> Option<Result<Image>> {
+    pub fn output_image(&self, asset: &index::Asset, address: &str) -> Option<Result<Image>> {
+        let (name, member) = address.split_once('/').map_or((address, None), |(name, member)| (name, Some(member)));
+        let output = self.kind_of(asset)?.outputs.iter().find(|o| o.name == name && self.makes_pictures(o))?;
+        let there = match (&output.members, member) {
+            (Some(members), Some(member)) => members(&self.lend(asset)).iter().any(|(key, _)| key == listed(member)),
+            (None, None) => true,
+            _ => false,
+        };
+        there.then(|| self.image(asset, address))
+    }
+
+    /// What of an asset a reference can name, each by its address and what it reads as: its outputs, and the members of
+    /// those that are families.
+    #[must_use]
+    pub fn addresses(&self, asset: &index::Asset) -> Vec<(String, String)> {
         let lent = self.lend(asset);
-        // `cells/skin@night` is that cell through another palette: not a part of its own to list.
-        let listed = part.split_once('@').map_or(part, |(listed, _)| listed);
-        let output = self.kind_of(asset)?.outputs.iter().find(|o| {
-            self.makes_pictures(o) && o.members.as_ref().is_some_and(|m| m(&lent).iter().any(|(key, _)| key == listed))
-        })?;
-        Some(self.image(asset, &format!("{}/{part}", output.name)))
+        let kind = self.kind_of(asset);
+        let members = |name: &str| {
+            let family = kind.and_then(|kind| kind.outputs.iter().find(|o| o.name == name))?;
+            Some(family.members.as_ref()?(&lent))
+        };
+        let (plan, _) = self.plan(asset);
+        let addresses = plan.outputs.iter().flat_map(|output| {
+            if output.parameter.is_none() {
+                return vec![(output.name.clone(), output.name.clone())];
+            }
+            let listed = members(&output.name).unwrap_or_default();
+            listed.into_iter().map(|(key, label)| (format!("{}/{key}", output.name), label)).collect()
+        });
+        addresses.collect()
     }
 
-    /// An asset's parts, as its kind lists them.
-    #[must_use]
-    pub fn parts(&self, asset: &index::Asset) -> Vec<pe2_ext::Part> {
-        self.kind_of(asset).and_then(|k| k.parts.as_ref()).map_or_default(|parts| parts(&self.lend(asset)))
-    }
-
-    /// What is inside an asset: what its kind says, else its parts, under a heading for each group of them.
+    /// What is inside an asset, as its kind says.
     #[must_use]
     pub fn contents(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen) -> pe2_ext::Contents {
-        if let Some(contents) = self.kind_of(asset).and_then(|k| k.contents.as_ref()) {
-            return contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) });
-        }
-        pe2_ext::Contents { rows: rows_of_parts(&self.parts(asset)), ..pe2_ext::Contents::default() }
+        let contents = self.kind_of(asset).and_then(|k| k.contents.as_ref());
+        contents.map_or_default(|contents| contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }))
     }
 
     /// What comes of something done in an asset's contents.
@@ -1168,27 +1149,20 @@ impl Extensions {
     /// Why it cannot be, as its kind says.
     pub fn content_act(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
         let act = self.kind_of(asset).and_then(|k| k.content_act.as_ref()).context("its kind does nothing with its contents")?;
-        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) }, request)
+        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }, request)
     }
 
     /// A part's fields, where its kind says what they are.
     #[must_use]
     pub fn part_sheet(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, part: &str) -> Option<pe2_ext::PartSheet> {
-        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, looks: None, chosen: Some(chosen) }, part)
+        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }, part)
     }
 
-    /// The views a kind and a role give the head of the contents pane.
+    /// The views a kind gives the head of the contents pane.
     #[must_use]
     pub fn contents_views(&self, asset: &index::Asset) -> Vec<&ViewDef> {
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.contents_views.as_slice());
-        let role = self.role_of(asset).map_or(&[][..], |r| r.contents_views.as_slice());
-        kind.iter().chain(role).collect()
-    }
-
-    /// Whether an asset's kind lists its parts.
-    #[must_use]
-    pub fn lists_parts(&self, asset: &index::Asset) -> bool {
-        self.kind_of(asset).is_some_and(|k| k.parts.is_some())
+        kind.iter().collect()
     }
 
     /// The panels the extensions registered.
@@ -1280,11 +1254,9 @@ impl Extensions {
             call.stored(&name, type_names(known.iter().map(|(i, _)| &recognizers[*i]))).map(graph::Value::Typed)
         });
         ops.add(stored);
-        // Declared kinds and roles to the qualified names an operation is told.
+        // Declared kinds to the qualified names an operation is told.
         let mut qualified: HashMap<String, String> = self.kinds.keys().map(|k| (k.clone(), k.clone())).collect();
         qualified.extend(self.kind_aliases.iter().map(|(a, q)| (a.clone(), q.clone())));
-        qualified.extend(self.roles.keys().map(|r| (r.clone(), r.clone())));
-        qualified.extend(self.role_aliases.iter().map(|(a, q)| (a.clone(), q.clone())));
         let qualified = Arc::new(qualified);
         for (name, def) in &self.ops {
             let version = self.version_of(def.name.extension());
@@ -1326,11 +1298,11 @@ impl Extensions {
         }
     }
 
-    /// The extractor of assets of a declared kind and role (`image`, `atlas`), where an extension registers one.
+    /// The extractor of an asset of a declared kind (`image`) declaring what `declares` says, where an extension registers one.
     #[must_use]
-    pub fn extractor_for(&self, kind: &str, role: Option<&str>) -> Option<&pe2_ext::ExtractorDef> {
-        let (Some(kind), role) = self.qualify(kind, role) else { return None };
-        self.extractors.iter().find(|e| e.takes(kind, role))
+    pub fn extractor_for(&self, kind: &str, declares: impl Fn(&str) -> bool) -> Option<&pe2_ext::ExtractorDef> {
+        let kind = self.qualify(kind)?;
+        self.extractors.iter().find(|e| e.takes(kind, &declares))
     }
 
     /// The formats a file is, by signatures and sniffs: from its first bytes, read once a content.
@@ -1403,23 +1375,10 @@ fn brought(view: &ViewDef, asset: &index::Asset) -> bool {
     view.tab.as_ref().is_none_or(|tab| tab.fields.is_empty() || tab.fields.iter().any(|field| settings.contains_key(field)))
 }
 
-/// Parts as rows: a group's (`cells/` of `cells/cursor`) under its heading, those of no group as they are.
-fn rows_of_parts(parts: &[pe2_ext::Part]) -> Vec<pe2_ext::ContentRow> {
-    let mut rows = Vec::new();
-    let mut group = "";
-    for part in parts {
-        let within = part.id.split_once('/').map(|(within, _)| within);
-        if let Some(within) = within
-            && within != group
-        {
-            group = within;
-            let mut letters = within.chars();
-            let label: String = letters.next().map_or_else(String::new, |first| first.to_uppercase().chain(letters).collect());
-            rows.push(pe2_ext::ContentRow::heading(within, &label));
-        }
-        rows.push(pe2_ext::ContentRow::new(&part.id, &part.label).depth(u32::from(within.is_some())));
-    }
-    rows
+/// A member of a family, as it is listed: `skin` of `skin@night`.
+#[must_use]
+pub fn listed(member: &str) -> &str {
+    member.split_once('@').map_or(member, |(listed, _)| listed)
 }
 
 /// Whether a file's name is a pattern's: `*.png`, or the name itself.
@@ -1484,26 +1443,27 @@ impl Extensions {
         out
     }
 
-    /// The views of an asset: its kind's, then its role's.
+    /// The views of an asset: its kind's.
     #[must_use]
     pub fn views(&self, asset: &index::Asset) -> Vec<&ViewDef> {
         let kind = self.kind_of(asset).map_or(&[][..], |k| k.views.as_slice());
-        let role = self.role_of(asset).map_or(&[][..], |r| r.views.as_slice());
-        kind.iter().chain(role).collect()
+        kind.iter().collect()
     }
 }
 
-/// By (asset, group of variants), the member chosen: what is being looked at, never written.
+/// The family an asset's looks are: the output it is shown by.
+pub const PICTURE: &str = "picture";
+
+/// By (asset, family of its outputs), the member chosen: what is being looked at, never written.
 pub type Chosen = HashMap<(String, String), String>;
 
-/// The project as extensions ask about it: the index, through the registry, with what the user selected and the looks
+/// The project as extensions ask about it: the index, through the registry, with what the user selected and the members
 /// chosen (the editor's; none for a tool).
 pub struct Lens<'a> {
     pub index: &'a index::Index,
     pub extensions: &'a Extensions,
     pub selection: Option<&'a str>,
-    pub looks: Option<&'a HashMap<String, usize>>,
-    /// The members of groups of variants assets are being looked at in.
+    /// The members of families assets are being looked at in.
     pub chosen: Option<&'a Chosen>,
 }
 
@@ -1525,24 +1485,17 @@ impl Project for Lens<'_> {
         self.asset(self.selection?)
     }
 
-    fn look(&self, path: &str) -> usize {
-        self.looks.and_then(|l| l.get(path).copied()).unwrap_or(0)
+    fn chosen(&self, path: &str, family: &str) -> Option<String> {
+        self.chosen?.get(&(path.to_string(), family.to_string())).cloned()
     }
 
-    fn chosen(&self, path: &str, group: &str) -> Option<String> {
-        self.chosen?.get(&(path.to_string(), group.to_string())).cloned()
+    fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>> {
+        let asset = self.index.assets.get(path)?;
+        self.extensions.picture(asset, self.extensions.look_at(asset, look))
     }
 
-    fn picture(&self, path: &str, look: usize) -> Option<Result<Image>> {
-        self.extensions.picture(self.index.assets.get(path)?, look)
-    }
-
-    fn part(&self, path: &str, part: &str) -> Option<Result<Image>> {
-        self.extensions.part(self.index.assets.get(path)?, part)
-    }
-
-    fn parts(&self, path: &str) -> Vec<pe2_ext::Part> {
-        self.index.assets.get(path).map_or_default(|a| self.extensions.parts(a))
+    fn image(&self, path: &str, address: &str) -> Option<Result<Image>> {
+        self.extensions.output_image(self.index.assets.get(path)?, address)
     }
 
     fn table(&self, path: &str, address: &str) -> Option<Result<Table>> {
@@ -1600,12 +1553,11 @@ impl graph::exec::World for Graph<'_> {
     }
 }
 
-/// What an extension's operation is lent of its node: its path, kind and role, its declared settings (recorded as
+/// What an extension's operation is lent of its node: its path and kind, its declared settings (recorded as
 /// read when it is lent), and contents read by their hashes.
 struct Hosted<'a> {
     call: &'a graph::exec::Call<'a>,
     kind: Option<&'a str>,
-    role: Option<&'a str>,
 }
 
 impl<'a> Hosted<'a> {
@@ -1614,7 +1566,7 @@ impl<'a> Hosted<'a> {
         recorder.declaration();
         let fields = recorder.node().fields();
         let named = |key: &str| fields.get(key).and_then(Value::as_str).and_then(|n| qualified.get(n)).map(String::as_str);
-        Hosted { call, kind: named("kind"), role: named("role") }
+        Hosted { call, kind: named("kind") }
     }
 }
 
@@ -1639,7 +1591,6 @@ fn start_stream(
     let host = StreamHost {
         path: node.path().to_string(),
         kind: hosted.kind.map(str::to_string),
-        role: hosted.role.map(str::to_string),
         fields: node.fields().clone(),
         contents,
     };
@@ -1647,12 +1598,11 @@ fn start_stream(
     Ok(Box::new(Generating { generator, host, settings, parameter }))
 }
 
-/// What a stream's generator is lent between its calls: its node's path, kind, role and settings, and the contents its
+/// What a stream's generator is lent between its calls: its node's path, kind and settings, and the contents its
 /// inputs held, read where they are.
 struct StreamHost {
     path: String,
     kind: Option<String>,
-    role: Option<String>,
     fields: Table,
     contents: HashMap<String, std::path::PathBuf>,
 }
@@ -1677,10 +1627,6 @@ impl pe2_ext::CallHost for StreamHost {
 
     fn kind(&self) -> Option<&str> {
         self.kind.as_deref()
-    }
-
-    fn role(&self) -> Option<&str> {
-        self.role.as_deref()
     }
 
     fn fields(&self) -> &Table {
@@ -1749,10 +1695,6 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.kind
     }
 
-    fn role(&self) -> Option<&str> {
-        self.role
-    }
-
     fn fields(&self) -> &Table {
         self.call.recorder().node().fields()
     }
@@ -1785,12 +1727,8 @@ impl pe2_ext::CallHost for Hosted<'_> {
         self.call.place(path)
     }
 
-    fn table_of(&self, path: &str, address: &str) -> Result<Table> {
-        let value = self.call.output_of(&toml::Value::String(path.to_string()), address)?;
-        match &*value {
-            graph::Value::Table(table) => Ok(table.clone()),
-            other => anyhow::bail!("{path}: {address} is {}, no table", other.ty()),
-        }
+    fn output_of(&self, path: &str, address: &str) -> Result<graph::Value> {
+        Ok((*self.call.output_of(&toml::Value::String(path.to_string()), address)?).clone())
     }
 
     fn build_config(&self) -> Option<pe2_ext::data::BuildConfig> {
@@ -1891,31 +1829,16 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
     use super::{Extensions, Loadable, Origin, Status, satisfies};
-    use pe2_ext::{Extension, Name, Registry, Result, Setting};
+    use pe2_ext::{Extension, Registry, Result, Setting};
 
     fn images(r: &mut Registry) -> Result<()> {
-        let image = r.kind("image").alias("image").register();
-        r.role(&image, "atlas").alias("atlas").register();
+        r.kind("image").alias("image").register();
         Ok(())
     }
 
     fn fonts(r: &mut Registry) -> Result<()> {
-        r.role(&Name::parse("test.images@image").unwrap(), "font").register();
+        r.kind("font").register();
         Ok(())
-    }
-
-    fn stray(r: &mut Registry) -> Result<()> {
-        r.role(&Name::parse("test.images@image").unwrap(), "font").register();
-        Ok(())
-    }
-
-    #[test]
-    fn parts_make_rows_under_a_heading_for_each_group() {
-        let part = |id: &str, label: &str| pe2_ext::Part { id: id.to_string(), label: label.to_string(), made_of: vec![] };
-        let rows = super::rows_of_parts(&[part("texels", "Texels"), part("cells/a", "a"), part("cells/b", "b"), part("palettes/p", "p")]);
-        let read: Vec<(&str, bool, u32)> = rows.iter().map(|r| (r.id.as_str(), r.is_heading(), r.depth)).collect();
-        let expected = [("texels", false, 0), ("cells", true, 0), ("cells/a", false, 1), ("cells/b", false, 1), ("palettes", true, 0), ("palettes/p", false, 1)];
-        assert_eq!(read, expected);
     }
 
     #[test]
@@ -2125,7 +2048,6 @@ mod tests {
                 extension("test.old", "0.1.0", &["test.images@^0.3"], nothing),
                 extension("test.missing", "0.1.0", &["test.nowhere"], nothing),
                 extension("test.chained", "0.1.0", &["test.missing"], nothing),
-                extension("test.stray", "0.1.0", &[], stray),
                 extension("test.a", "0.1.0", &["test.b"], nothing),
                 extension("test.b", "0.1.0", &["test.a"], nothing),
             ],
@@ -2139,20 +2061,19 @@ mod tests {
             "test.old is disabled: it needs test.images ^0.3, and 0.2.3 is installed",
             "test.missing is disabled: it needs test.nowhere, which is not installed",
             "test.chained is disabled: it needs test.missing, which is disabled",
-            "test.stray is disabled: test.stray@font is on test.images@image",
             "test.a is disabled: its requirements form a cycle",
         ] {
             assert!(problems.contains(expected), "{expected}\n---\n{problems}");
         }
         assert_eq!(loaded.kind_aliases["image"], "test.images@image");
-        assert!(loaded.roles.contains_key("test.fonts@font"));
+        assert!(loaded.kinds.contains_key("test.fonts@font"));
     }
 
     #[test]
     fn only_builtins_alias() {
         let loaded = Extensions::load(vec![extension("mod.images", "0.1.0", &[], images)], false);
         assert_eq!(loaded.loaded, []);
-        assert!(loaded.problems[0].contains("only a built-in extension names a kind or role bare"), "{:?}", loaded.problems);
+        assert!(loaded.problems[0].contains("only a built-in extension names a kind bare"), "{:?}", loaded.problems);
     }
 
     #[test]
@@ -2180,7 +2101,7 @@ mod tests {
         let loaded = Extensions::load(vec![from(user), other], false);
         assert!(loaded.problems.iter().any(|p| p.contains("another of its id from the same place")), "{:?}", loaded.problems);
         // Taking no built-in's place, it may not name kinds bare.
-        assert!(loaded.problems.iter().any(|p| p.contains("only a built-in extension names a kind or role bare")));
+        assert!(loaded.problems.iter().any(|p| p.contains("only a built-in extension names a kind bare")));
     }
 
     #[test]
@@ -2259,7 +2180,7 @@ mod calling {
     fn scene(r: &mut Registry) -> Result<()> {
         r.service("frame", "A frame", "{}", |project: &dyn Project, _| {
             let color = project.call("test.paint@red", &Value::Table(Table::new()))?;
-            let picture = project.picture("a", 0).ok_or_else(|| anyhow!("no picture"))??;
+            let picture = project.picture("a", None).ok_or_else(|| anyhow!("no picture"))??;
             Ok(Value::String(format!("{} {}x{}", color.as_str().unwrap_or_default(), picture.width, picture.height)))
         });
         Ok(())
@@ -2274,7 +2195,7 @@ mod calling {
         let root = std::env::temp_dir().join(format!("pe2-calling-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let canvas = "kind = \"canvas\"\n\n[[stack]]\nop = \"constant\"\nvalue = {}\n";
-        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.asset/asset.toml", canvas)] {
+        for (path, text) in [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.node/node.toml", canvas)] {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
@@ -2294,7 +2215,7 @@ mod calling {
         let project = Opened::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
-        let lens = Lens { index: &index, extensions: &extensions, selection: None, looks: None, chosen: None };
+        let lens = Lens { index: &index, extensions: &extensions, selection: None, chosen: None };
         let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();
         assert_eq!(answer.as_str(), Some("red 1x1"));
         assert!(lens.call("test.nowhere@service", &Value::Table(Table::new())).is_err());

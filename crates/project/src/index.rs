@@ -1,10 +1,10 @@
 //! A project's entries as the editor sees them: its layers applied bottom to top, each by its changeset - what it
-//! creates (assets, which are bundles `<path>.asset/`, folders and plain files), and what it does to the entries below
-//! (overrides, moves, deletes). An asset comes with its `asset.toml`, its files, which assets' slots reference it,
+//! creates (assets, which are bundles `<path>.node/`, folders and plain files), and what it does to the entries below
+//! (overrides, moves, deletes). An asset comes with its `node.toml`, its files, which assets' slots reference it,
 //! and what is wrong.
 //!
 //! The index persists in the project cache's store (`store.rs`, `index.db`): for every file it read, its stamp, the
-//! hash of its content, and for an `asset.toml` what the index needs of it - its kind, role, variant names and
+//! hash of its content, and for an `node.toml` what the index needs of it - its kind, variant names and
 //! references - besides its text, which an asset parses only when its fields are asked for. Opening a project stats
 //! every file and reads again only those whose stamp changed; a file the store knows that no layer holds any more is
 //! dropped from it. A file modified no earlier than its record was made is read again whatever its stamp (git's
@@ -12,7 +12,7 @@
 //! what they touch; each writes only the rows it changed.
 //!
 //! Entries a layer holds but its changeset does not list are unlisted: where the layer can be written the index lists
-//! them, a create each with a new uid (an `asset.toml`'s own `uid`, as declarations wrote them before changesets, is
+//! them, a create each with a new uid (an `node.toml`'s own `uid`, as declarations wrote them before changesets, is
 //! kept); elsewhere they are reported.
 
 use anyhow::Result;
@@ -28,8 +28,8 @@ pub use crate::store::Stamp;
 use crate::store::{Declaration, Record, Store};
 use crate::{FILE, Layer, LayerKind, Project, uid};
 
-pub const BUNDLE_SUFFIX: &str = ".asset";
-pub const ASSET_FILE: &str = "asset.toml";
+pub const BUNDLE_SUFFIX: &str = ".node";
+pub const NODE_FILE: &str = "node.toml";
 
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
@@ -49,20 +49,19 @@ pub struct BundleFile {
     pub made_by: Option<String>,
 }
 
-/// One asset: its resolved path (`stages/akropolis/rooms/square/folder`), its uid, its `asset.toml` and its files.
-/// Its fields are parsed from the `asset.toml`'s text the first time they are asked for.
+/// One asset: its resolved path (`stages/akropolis/rooms/square/folder`), its uid, its `node.toml` and its files.
+/// Its fields are parsed from the `node.toml`'s text the first time they are asked for.
 #[derive(Clone, Debug)]
 pub struct Asset {
     pub path: String,
     pub uid: Option<String>,
     pub kind: Option<String>,
-    pub role: Option<String>,
     /// Its `variants`' names, in order.
     pub variants: Vec<String>,
     pub files: Vec<BundleFile>,
     /// The layer creating it, then those overriding it, bottom to top.
     pub layers: Vec<String>,
-    /// Why its `asset.toml` could not be parsed; its fields are then empty.
+    /// Why its `node.toml` could not be parsed; its fields are then empty.
     pub error: Option<String>,
     text: Arc<str>,
     fields: OnceLock<toml::Table>,
@@ -95,13 +94,13 @@ pub struct Imported {
 }
 
 impl Asset {
-    /// Its `asset.toml` as written.
+    /// Its `node.toml` as written.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// Its `asset.toml`'s fields; empty where it cannot be parsed.
+    /// Its `node.toml`'s fields; empty where it cannot be parsed.
     pub fn fields(&self) -> &toml::Table {
         self.fields.get_or_init(|| toml::from_str(&self.text).unwrap_or_default())
     }
@@ -130,7 +129,7 @@ pub enum Kind {
     File,
 }
 
-/// An entry of the resolved project, by its real path (a bundle's with `.asset`): what it is, its uid, the layer
+/// An entry of the resolved project, by its real path (a bundle's with `.node`): what it is, its uid, the layer
 /// creating it and the one whose content wins, and where that content is on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -245,14 +244,14 @@ pub struct Reference {
     pub slot: String,
     pub uid: String,
     pub target: String,
-    /// The part of the asset it names (`variants/night`, from `uid://...#variants/night`); none for the asset.
-    pub part: Option<String>,
+    /// The output of the asset it names (`palettes/default`, from `uid://...#palettes/default`); none for the asset itself.
+    pub output: Option<String>,
 }
 
 /// Something wrong with the project, found by the index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
-    /// An `asset.toml` that cannot be parsed: the asset is listed without its fields.
+    /// An `node.toml` that cannot be parsed: the asset is listed without its fields.
     Unreadable { asset: String, error: String },
     /// One uid created twice.
     DuplicateUid { uid: String, paths: Vec<String> },
@@ -272,8 +271,8 @@ pub enum Problem {
     Overridden { asset: String, setting: String },
     /// A part's settings the declaration has for a part its source no longer has.
     Orphan { asset: String, part: String },
-    /// A reference naming a part (`uid://...#variants/night`) its asset does not have.
-    MissingPart { asset: String, slot: String, target: String, part: String },
+    /// A reference naming an output (`uid://...#palettes/night`) its asset does not have.
+    MissingOutput { asset: String, slot: String, target: String, output: String },
     /// An `extension` asset whose component is not loaded, and why.
     Extension { asset: String, error: String },
     /// What an asset's import took otherwise than its source has it (colors matched to the nearest), as its importer
@@ -290,7 +289,7 @@ impl Problem {
             | Problem::Import { asset: path, .. }
             | Problem::Overridden { asset: path, .. }
             | Problem::Orphan { asset: path, .. }
-            | Problem::MissingPart { asset: path, .. }
+            | Problem::MissingOutput { asset: path, .. }
             | Problem::Extension { asset: path, .. }
             | Problem::Taken { asset: path, .. }
             | Problem::Conflict { path, .. }
@@ -306,7 +305,7 @@ impl Problem {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Problem::Unreadable { error, .. } => format!("asset.toml cannot be read: {error}"),
+            Problem::Unreadable { error, .. } => format!("node.toml cannot be read: {error}"),
             Problem::DuplicateUid { uid, paths } => format!("{uid} is created {} times", paths.len()),
             Problem::Conflict { layers, .. } => format!("in layers {} without a declared override", layers.join(", ")),
             Problem::Unlisted { layer, .. } => format!("not in the changeset of {layer}, which cannot be written"),
@@ -318,7 +317,7 @@ impl Problem {
                 format!("{setting} is set, but its import derives it from the source, which wins")
             }
             Problem::Orphan { part, .. } => format!("{part} has settings, but its source has no such part"),
-            Problem::MissingPart { slot, target, part, .. } => format!("{slot} names {target}#{part}, which it does not have"),
+            Problem::MissingOutput { slot, target, output, .. } => format!("{slot} names {target}#{output}, which it does not have"),
             Problem::Extension { error, .. } => format!("the extension is not loaded: {error}"),
             Problem::Taken { note, .. } => format!("its import: {note}"),
         }
@@ -338,7 +337,7 @@ impl Problem {
             | Problem::Import { .. }
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
-            | Problem::MissingPart { .. }
+            | Problem::MissingOutput { .. }
             | Problem::Taken { .. }
             | Problem::Extension { .. } => vec![],
         }
@@ -365,7 +364,7 @@ fn stamp(time: SystemTime) -> Stamp {
     time.duration_since(UNIX_EPOCH).map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()))
 }
 
-/// A file to read: its path, its stat and whether it is an `asset.toml`.
+/// A file to read: its path, its stat and whether it is an `node.toml`.
 struct Pending {
     path: PathBuf,
     size: u64,
@@ -374,7 +373,7 @@ struct Pending {
 }
 
 /// A file's record, read now; none when it vanished meanwhile. A file that cannot be parsed is a record with its
-/// error, not a failure: a user may save a half-written `asset.toml`.
+/// error, not a failure: a user may save a half-written `node.toml`.
 fn read(file: &Pending) -> Option<Record> {
     let bytes = std::fs::read(&file.path).ok()?;
     let recorded = stamp(SystemTime::now());
@@ -382,7 +381,7 @@ fn read(file: &Pending) -> Option<Record> {
     Some(Record { size: file.size, modified: file.modified, recorded, sha1: sha1_hex(&bytes), declaration })
 }
 
-/// What the index keeps of an `asset.toml`: parsed once, here, for its kind, role, uid, variant names and references.
+/// What the index keeps of an `node.toml`: parsed once, here, for its kind, uid, variant names and references.
 fn declaration(bytes: &[u8]) -> Declaration {
     let parsed: Result<toml::Table, String> = std::str::from_utf8(bytes)
         .map_err(|e| e.to_string())
@@ -392,7 +391,6 @@ fn declaration(bytes: &[u8]) -> Declaration {
         Ok(table) => {
             let string = |key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_string);
             out.kind = string("kind");
-            out.role = string("role");
             out.uid = string("uid");
             // An image's looks: its variants, keyed by name.
             out.variants = table
@@ -446,7 +444,7 @@ fn read_all(files: &[Pending]) -> Vec<Option<Record>> {
     })
 }
 
-/// What one layer's directory holds, by its real path relative to the layer (a bundle's with `.asset`): its bundles
+/// What one layer's directory holds, by its real path relative to the layer (a bundle's with `.node`): its bundles
 /// (their files by name), folders and plain files. Names starting with a dot are the tools' bookkeeping, never
 /// entries.
 #[derive(Clone, Default)]
@@ -457,7 +455,7 @@ struct Scan {
 }
 
 /// Where a layer's content is and how it is read: its directory, the resolved path it appears at (a mount point, or
-/// none), the names it leaves out, and whether it holds assets (a files layer's `.asset` folders are plain folders).
+/// none), the names it leaves out, and whether it holds assets (a files layer's `.node` folders are plain folders).
 #[derive(Clone)]
 struct Place {
     root: PathBuf,
@@ -640,7 +638,7 @@ fn bundle_files(dir: &Path) -> BTreeMap<String, PathBuf> {
     files
 }
 
-/// The asset an asset entry's real path names: without `.asset`.
+/// The asset an asset entry's real path names: without `.node`.
 fn asset_of(path: &str) -> &str {
     path.strip_suffix(BUNDLE_SUFFIX).unwrap_or(path)
 }
@@ -739,7 +737,7 @@ struct Resolution {
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
 }
 
-/// The asset a path relative to a layer's root lies in: the path up to its first `.asset` component, without the
+/// The asset a path relative to a layer's root lies in: the path up to its first `.node` component, without the
 /// suffix. None outside any bundle.
 fn bundle_of(rel: &str) -> Option<String> {
     let parts: Vec<&str> = rel.split('/').collect();
@@ -750,7 +748,7 @@ fn bundle_of(rel: &str) -> Option<String> {
 }
 
 /// The reference a value holds, if it holds one: its asset's uid, and the path it names where it names one. A
-/// reference is the asset's uid, `"uid://..."` - with a fragment naming a part of it (`#palettes/default`), which
+/// reference is the asset's uid, `"uid://..."` - with an output of it after a `#` (`#palettes/default`), which
 /// this leaves out (`part_of` gives it) -, or, as written before uids sufficed, a table of the uid and the bundle's
 /// `res://` path.
 #[must_use]
@@ -768,23 +766,12 @@ pub fn reference(value: &toml::Value) -> Option<(String, Option<String>)> {
     }
 }
 
-/// The part of an asset a reference names: its fragment (`palettes/default` of `uid://...#palettes/default`), or the
-/// `part` of a reference written with its path.
-#[must_use]
-pub fn part_of(value: &toml::Value) -> Option<&str> {
-    let part = match value {
-        toml::Value::Table(t) => t.get("part")?.as_str()?,
-        _ => value.as_str()?.strip_prefix("uid://")?.split_once('#')?.1,
-    };
-    (!part.is_empty()).then_some(part)
-}
-
 /// Every reference in a value (`reference`), named by the enclosing slot's `name` or else the field it sits in.
 fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, String, String)>) {
     match value {
         toml::Value::Table(t) => {
             if let Some((uid, path)) = reference(value) {
-                out.push((field.to_string(), uid, path.unwrap_or_default(), part_of(value).unwrap_or_default().to_string()));
+                out.push((field.to_string(), uid, path.unwrap_or_default(), pe2_ext::output_of(value).unwrap_or_default().to_string()));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
@@ -795,7 +782,7 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
         toml::Value::String(_) => {
             if let Some((uid, _)) = reference(value) {
-                out.push((field.to_string(), uid, String::new(), part_of(value).unwrap_or_default().to_string()));
+                out.push((field.to_string(), uid, String::new(), pe2_ext::output_of(value).unwrap_or_default().to_string()));
             }
         }
         _ => {}
@@ -1044,7 +1031,7 @@ impl Index {
         }
         self.assemble_assets(&paths);
         let assets: Vec<String> = paths.iter().map(|p| asset_of(p).to_string()).collect();
-        let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.part.clone());
+        let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.output.clone());
         let references_changed = assets.iter().any(|a| {
             let now: Vec<_> = self.references_from(a).iter().map(referring).collect();
             before.get(a).is_none_or(|b| b.iter().map(referring).collect::<Vec<_>>() != now)
@@ -1068,7 +1055,7 @@ impl Index {
             if let Some(record) = known(file, size, modified) {
                 self.records.insert(file.clone(), Arc::new(record));
             } else {
-                let declaration = file.file_name().is_some_and(|n| n == ASSET_FILE)
+                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
                 pending.push(Pending { path: file.clone(), size, modified, declaration });
             }
@@ -1096,7 +1083,7 @@ impl Index {
             let kept = !reported.contains(file)
                 && self.records.get(file).is_some_and(|r| r.size == size && r.modified == modified);
             if !kept {
-                let declaration = file.file_name().is_some_and(|n| n == ASSET_FILE)
+                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
                 pending.push(Pending { path: file.clone(), size, modified, declaration });
             }
@@ -1302,7 +1289,7 @@ impl Index {
             }
             for files in layer.scan.bundles.values() {
                 let declaration =
-                    files.get(ASSET_FILE).and_then(|f| self.records.get(f)).and_then(|r| r.declaration.as_ref());
+                    files.get(NODE_FILE).and_then(|f| self.records.get(f)).and_then(|r| r.declaration.as_ref());
                 for (_, uid, _, _) in declaration.map_or(&[][..], |d| d.references.as_slice()) {
                     if let Some(&j) = creator.get(uid.as_str()).filter(|&&j| j != i) {
                         out[i].entry(j).or_insert((0, 0)).1 += 1;
@@ -1464,7 +1451,7 @@ impl Index {
     /// List what writable layers hold unlisted, and follow what moved outside the editor. A listed entry gone from
     /// its path while an unlisted one holds the same content (by the hashes of the last pass) moved there, and keeps
     /// its uid; a folder follows when what it held moved under a new name. What is left gets a create, under the uid
-    /// its `asset.toml` names where it names one not taken, a new one otherwise; the changesets are written. What a
+    /// its `node.toml` names where it names one not taken, a new one otherwise; the changesets are written. What a
     /// layer holds at a path a lower layer creates is not a create (an override, or a conflict).
     fn list_unlisted(&mut self) -> Result<()> {
         let mut taken: HashSet<String> = HashSet::new();
@@ -1538,7 +1525,7 @@ impl Index {
                     .scan
                     .bundles
                     .get(&path)
-                    .and_then(|files| files.get(ASSET_FILE))
+                    .and_then(|files| files.get(NODE_FILE))
                     .and_then(|f| self.records.get(f))
                     .and_then(|r| r.declaration.as_ref()?.uid.clone())
                     .filter(|u| uid::parse(u).is_some() && !taken.contains(u));
@@ -1581,7 +1568,7 @@ impl Index {
     }
 
     /// Build the assets at these real paths from the resolved stack and the records: their uid, the winning layer's
-    /// bundle, its `asset.toml`. A path that no longer resolves to an asset loses its asset; `entries` follows the
+    /// bundle, its `node.toml`. A path that no longer resolves to an asset loses its asset; `entries` follows the
     /// whole stack.
     fn assemble(&mut self, paths: &[String]) {
         self.assemble_entries();
@@ -1625,7 +1612,6 @@ impl Index {
                 path: asset_of(path).to_string(),
                 uid: Some(node.uid.clone()),
                 kind: None,
-                role: None,
                 variants: vec![],
                 files: vec![],
                 layers: layers.map(|l| self.layers[l].name.clone()).collect(),
@@ -1637,11 +1623,10 @@ impl Index {
             };
             for (name, file) in layer.scan.bundles.get(&node.content.1).into_iter().flatten() {
                 let Some(record) = self.records.get(file) else { continue };
-                if name == ASSET_FILE
+                if name == NODE_FILE
                     && let Some(d) = &record.declaration
                 {
                     asset.kind.clone_from(&d.kind);
-                    asset.role.clone_from(&d.role);
                     asset.variants.clone_from(&d.variants);
                     asset.error.clone_from(&d.error);
                     asset.text = d.text.clone();
@@ -1674,7 +1659,6 @@ impl Index {
                 path: at.to_string(),
                 uid: Some(name.clone()),
                 kind: None,
-                role: None,
                 variants: vec![],
                 files: vec![],
                 layers: vec![below.layer.clone()],
@@ -1686,11 +1670,10 @@ impl Index {
             };
             for (file_name, file) in &below.files {
                 let Some(record) = self.records.get(file) else { continue };
-                if file_name == ASSET_FILE
+                if file_name == NODE_FILE
                     && let Some(d) = &record.declaration
                 {
                     asset.kind.clone_from(&d.kind);
-                    asset.role.clone_from(&d.role);
                     asset.text = d.text.clone();
                 }
                 asset.files.push(BundleFile {
@@ -1729,11 +1712,11 @@ impl Index {
             let declaration = asset
                 .files
                 .iter()
-                .find(|f| f.name == ASSET_FILE)
+                .find(|f| f.name == NODE_FILE)
                 .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
-            for (slot, uid, target, part) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned() {
-                let part = (!part.is_empty()).then_some(part);
-                let reference = Reference { from: asset.path.clone(), slot, uid, target, part };
+            for (slot, uid, target, output) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned() {
+                let output = (!output.is_empty()).then_some(output);
+                let reference = Reference { from: asset.path.clone(), slot, uid, target, output };
                 // The uid decides; the path is the fallback.
                 match self
                     .by_uid
@@ -1803,17 +1786,17 @@ impl Index {
         let declaration = asset
             .files
             .iter()
-            .find(|f| f.name == ASSET_FILE)
+            .find(|f| f.name == NODE_FILE)
             .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
         declaration
             .map_or(&[][..], |d| d.references.as_slice())
             .iter()
-            .map(|(slot, uid, target, part)| Reference {
+            .map(|(slot, uid, target, output)| Reference {
                 from: path.to_string(),
                 slot: slot.clone(),
                 uid: uid.clone(),
                 target: target.clone(),
-                part: (!part.is_empty()).then(|| part.clone()),
+                output: (!output.is_empty()).then(|| output.clone()),
             })
             .collect()
     }
@@ -1834,19 +1817,19 @@ mod tests {
     use crate::lock::Lock;
     use std::path::{Path, PathBuf};
 
-    /// A project of two layers, `base` and `top`, in `.layers/`; `base` holds the bundle `a` (its `asset.toml` naming
+    /// A project of two layers, `base` and `top`, in `.layers/`; `base` holds the bundle `a` (its `node.toml` naming
     /// `uid://a`, as declarations did before changesets) in the folder `g`, and `b` and `f`.
     fn project(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("pe2-index-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(&root, ".layers/base/g/a.asset/asset.toml", "uid = \"uid://a\"\nkind = \"image\"\n");
-        write(&root, ".layers/base/g/a.asset/native.texels", "texels");
-        write(&root, ".layers/base/b.asset/asset.toml", "kind = \"file\"\nslot = \"uid://a#palettes/default\"\n");
+        write(&root, ".layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nkind = \"image\"\n");
+        write(&root, ".layers/base/g/a.node/native.texels", "texels");
+        write(&root, ".layers/base/b.node/node.toml", "kind = \"file\"\nslot = \"uid://a#palettes/default\"\n");
         write(
             &root,
-            ".layers/base/f.asset/asset.toml",
-            "kind = \"file\"\nold = { uid = \"uid://a\", path = \"res://g/a.asset\" }\n",
+            ".layers/base/f.node/node.toml",
+            "kind = \"file\"\nold = { uid = \"uid://a\", path = \"res://g/a.node\" }\n",
         );
         std::fs::create_dir_all(root.join(".layers/top")).unwrap();
         root
@@ -1876,7 +1859,7 @@ mod tests {
         let root = project("lists");
         let (_, index) = open(&root);
         let base = changeset(&root, "base");
-        assert_eq!(base.entries.get("uid://a").map(String::as_str), Some("g/a.asset"));
+        assert_eq!(base.entries.get("uid://a").map(String::as_str), Some("g/a.node"));
         assert_eq!(base.entries.len(), 4, "{base:?}");
         assert_eq!(index.assets["g/a"].uid.as_deref(), Some("uid://a"));
         // By uid alone, and in the older form with a path.
@@ -1895,17 +1878,17 @@ mod tests {
         let base = changeset(&root, "base");
         let uid_of = |path: &str| base.entries.iter().find(|(_, p)| *p == path).unwrap().0.clone();
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.asset").unwrap(), to: None });
-        top.ops.insert(uid_of("b.asset"), Op::Move { to: "c.asset".into() });
-        top.ops.insert(uid_of("f.asset"), Op::Delete);
+        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.ops.insert(uid_of("b.node"), Op::Move { to: "c.node".into() });
+        top.ops.insert(uid_of("f.node"), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\n");
-        write(&root, ".layers/top/g/a.asset/native.texels", "repainted");
+        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
+        write(&root, ".layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
         assert_eq!(index.assets.keys().collect::<Vec<_>>(), ["c", "g/a"]);
         assert_eq!(index.assets["g/a"].layers, ["base", "top"]);
         assert!(index.assets["g/a"].files.iter().all(|f| f.layer == "top"));
-        assert_eq!(index.assets["c"].uid, Some(uid_of("b.asset")));
+        assert_eq!(index.assets["c"].uid, Some(uid_of("b.node")));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // What it overrides is there, a node of its own.
         let below = index.version("below:uid://a").unwrap();
@@ -1913,9 +1896,9 @@ mod tests {
         assert!(below.files.iter().all(|f| f.layer == "base"));
         assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
-        write(&root, ".layers/base/g/a.asset/native.texels", "retouched");
+        write(&root, ".layers/base/g/a.node/native.texels", "retouched");
         let (_, index) = open(&root);
-        assert_eq!(index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.asset".into() }]);
+        assert_eq!(index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.node".into() }]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1925,9 +1908,9 @@ mod tests {
         open(&root);
         let mut top = Changeset::default();
         top.entries.insert("uid://again".into(), "g".into());
-        top.entries.insert("uid://beside".into(), "g/beside.asset".into());
+        top.entries.insert("uid://beside".into(), "g/beside.node".into());
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/beside.asset/asset.toml", "kind = \"file\"\n");
+        write(&root, ".layers/top/g/beside.node/node.toml", "kind = \"file\"\n");
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
         assert!(index.assets.contains_key("g/a") && index.assets.contains_key("g/beside"));
@@ -1941,12 +1924,12 @@ mod tests {
         top.entries.insert("uid://gone".into(), "nowhere".into());
         top.ops.insert("uid://unknown".into(), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/b.asset/asset.toml", "kind = \"file\"\n");
-        write(&root, ".layers/top/new.asset/asset.toml", "kind = [unclosed\n");
+        write(&root, ".layers/top/b.node/node.toml", "kind = \"file\"\n");
+        write(&root, ".layers/top/new.node/node.toml", "kind = [unclosed\n");
         let (_, index) = open(&root);
         let has = |p: &Problem| index.problems.contains(p);
-        assert!(has(&Problem::Conflict { path: "b.asset".into(), layers: vec!["base".into(), "top".into()] }));
-        assert!(has(&Problem::Unlisted { layer: "top".into(), path: "new.asset".into() }));
+        assert!(has(&Problem::Conflict { path: "b.node".into(), layers: vec!["base".into(), "top".into()] }));
+        assert!(has(&Problem::Unlisted { layer: "top".into(), path: "new.node".into() }));
         assert!(has(&Problem::Missing { layer: "top".into(), path: "nowhere".into() }));
         assert!(has(&Problem::Unbound { layer: "top".into(), uid: "uid://unknown".into() }));
         std::fs::remove_dir_all(&root).unwrap();
@@ -1958,7 +1941,7 @@ mod tests {
         let (project, mut index) = open(&root);
         let folder = changeset(&root, "base").entries.iter().find(|(_, p)| *p == "g").unwrap().0.clone();
         // A file of a bundle changed: that bundle, its file read again.
-        let texels = write(&root, ".layers/base/g/a.asset/native.texels", "repainted");
+        let texels = write(&root, ".layers/base/g/a.node/native.texels", "repainted");
         let refreshed = index.refresh(&project, &[texels]).unwrap();
         assert_eq!(refreshed.assets.into_iter().collect::<Vec<_>>(), ["g/a"]);
         assert_eq!(index.read, 1);
@@ -1969,10 +1952,10 @@ mod tests {
         assert_eq!(changeset(&root, "base").entries.get(&folder).map(String::as_str), Some("h"));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // A bundle removed: its entry is missing until it is dropped from the changeset.
-        std::fs::remove_dir_all(root.join(".layers/base/f.asset")).unwrap();
-        index.refresh(&project, &[root.join(".layers/base/f.asset")]).unwrap();
+        std::fs::remove_dir_all(root.join(".layers/base/f.node")).unwrap();
+        index.refresh(&project, &[root.join(".layers/base/f.node")]).unwrap();
         assert!(!index.assets.contains_key("f"));
-        assert!(index.problems.contains(&Problem::Missing { layer: "base".into(), path: "f.asset".into() }));
+        assert!(index.problems.contains(&Problem::Missing { layer: "base".into(), path: "f.node".into() }));
         assert!(index.refresh(&project, &[root.join("project.toml")]).unwrap().project_file);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1984,7 +1967,7 @@ mod tests {
         let mut out = String::new();
         for (path, a) in &index.assets {
             let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
-            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.kind, a.role, a.variants, a.layers, a.error, a.text, files);
+            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.kind, a.variants, a.layers, a.error, a.text, files);
         }
         for (path, e) in index.entries.iter() {
             let _ = writeln!(out, "entry {path} {e:?}");
@@ -2014,45 +1997,45 @@ mod tests {
         };
         let base = |p: &str| root.join(".layers/base").join(p);
         // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
-        write(&root, ".layers/base/g/a.asset/native.texels", "repainted");
-        check(&mut index, &project, &[base("g/a.asset/native.texels")], "a file of a bundle", false);
-        write(&root, ".layers/base/b.asset/asset.toml", "kind = \"file\"\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
-        check(&mut index, &project, &[base("b.asset/asset.toml")], "references changed", false);
-        write(&root, ".layers/base/f.asset/asset.toml", "kind = [unclosed\n");
-        check(&mut index, &project, &[base("f.asset/asset.toml")], "an unreadable declaration", false);
-        write(&root, ".layers/base/f.asset/asset.toml", "kind = \"file\"\nold = { uid = \"uid://a\" }\n");
-        check(&mut index, &project, &[base("f.asset/asset.toml")], "readable again", false);
+        write(&root, ".layers/base/g/a.node/native.texels", "repainted");
+        check(&mut index, &project, &[base("g/a.node/native.texels")], "a file of a bundle", false);
+        write(&root, ".layers/base/b.node/node.toml", "kind = \"file\"\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
+        check(&mut index, &project, &[base("b.node/node.toml")], "references changed", false);
+        write(&root, ".layers/base/f.node/node.toml", "kind = [unclosed\n");
+        check(&mut index, &project, &[base("f.node/node.toml")], "an unreadable declaration", false);
+        write(&root, ".layers/base/f.node/node.toml", "kind = \"file\"\nold = { uid = \"uid://a\" }\n");
+        check(&mut index, &project, &[base("f.node/node.toml")], "readable again", false);
         // A file added to a bundle: its content changes, its paths stay.
-        write(&root, ".layers/base/g/a.asset/extra.bin", "more");
-        check(&mut index, &project, &[base("g/a.asset/extra.bin")], "a file added to a bundle", false);
+        write(&root, ".layers/base/g/a.node/extra.bin", "more");
+        check(&mut index, &project, &[base("g/a.node/extra.bin")], "a file added to a bundle", false);
         // Structure: a new bundle, listed in its changeset; one removed.
-        write(&root, ".layers/base/n.asset/asset.toml", "kind = \"file\"\nto = \"uid://a\"\n");
-        check(&mut index, &project, &[base("n.asset/asset.toml")], "a new bundle", true);
-        std::fs::remove_dir_all(base("n.asset")).unwrap();
-        check(&mut index, &project, &[base("n.asset")], "a bundle removed", true);
+        write(&root, ".layers/base/n.node/node.toml", "kind = \"file\"\nto = \"uid://a\"\n");
+        check(&mut index, &project, &[base("n.node/node.toml")], "a new bundle", true);
+        std::fs::remove_dir_all(base("n.node")).unwrap();
+        check(&mut index, &project, &[base("n.node")], "a bundle removed", true);
         // An override in top, then its base changed below it: stale, though only contents changed.
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.asset").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\n");
-        check(&mut index, &project, &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.asset/asset.toml")], "an override", true);
-        write(&root, ".layers/base/g/a.asset/native.texels", "retouched");
-        check(&mut index, &project, &[base("g/a.asset/native.texels")], "an override's base changed", true);
-        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\nnote = \"uid://a\"\n");
-        check(&mut index, &project, &[root.join(".layers/top/g/a.asset/asset.toml")], "the override's own content", false);
+        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
+        check(&mut index, &project, &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.node/node.toml")], "an override", true);
+        write(&root, ".layers/base/g/a.node/native.texels", "retouched");
+        check(&mut index, &project, &[base("g/a.node/native.texels")], "an override's base changed", true);
+        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\nnote = \"uid://a\"\n");
+        check(&mut index, &project, &[root.join(".layers/top/g/a.node/node.toml")], "the override's own content", false);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn mounts_a_tree_as_a_files_layer() {
         let root = project("mount");
-        // A tree outside the project, mounted at `code`: its own `.gitignore` leaves out `*.o`; `x.asset` in it is a
+        // A tree outside the project, mounted at `code`: its own `.gitignore` leaves out `*.o`; `x.node` in it is a
         // plain folder, not a bundle.
         let tree = root.with_extension("tree");
         let _ = std::fs::remove_dir_all(&tree);
         write(&tree, "main.c", "int main;");
         write(&tree, "main.o", "object");
-        write(&tree, "x.asset/asset.toml", "kind = \"file\"\n");
+        write(&tree, "x.node/node.toml", "kind = \"file\"\n");
         write(&tree, ".gitignore", "*.o\n");
         let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
         let mount = format!("[[mount]]\nat = \"code\"\npath = \"{}\"\nread_only = true\n", tree.display());
@@ -2061,7 +2044,7 @@ mod tests {
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["code", "base", "top"]);
         let mut listed: Vec<String> = changeset(&root, "code").entries.into_values().collect();
         listed.sort();
-        assert_eq!(listed, ["code", "code/main.c", "code/x.asset", "code/x.asset/asset.toml"]);
+        assert_eq!(listed, ["code", "code/main.c", "code/x.node", "code/x.node/node.toml"]);
         assert_eq!(index.entries["code/main.c"].disk, tree.join("main.c"));
         assert!(!index.assets.contains_key("code/x"));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
@@ -2074,10 +2057,10 @@ mod tests {
         let root = project("hidden");
         let (_, index) = open(&root);
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.asset").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
         top.ops.insert("uid://nothing".into(), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.asset/asset.toml", "kind = \"image\"\n");
+        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
         let (_, mut index) = open(&root);
         let info = index.layers();
         assert_eq!((info[1].overrides, info[1].deletes, info[1].problems), (1, 1, 1));

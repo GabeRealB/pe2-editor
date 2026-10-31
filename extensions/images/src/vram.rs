@@ -122,14 +122,14 @@ impl View for Vram {
                 uploads.of(project, asset);
             }
             // The pages' pictures are asked of the host below, once the project is let go of.
-            let pages: Vec<(String, usize, Rect)> =
-                uploads.pages.iter().map(|u| (u.image.clone(), project.look(&u.image), u.rect)).collect();
+            let pages: Vec<(String, Option<String>, Rect)> =
+                uploads.pages.iter().map(|u| (u.image.clone(), project.chosen(&u.image, "picture"), u.rect)).collect();
             let mut pictures = vec![];
             for upload in &uploads.palettes {
                 let key = (upload.image.clone(), upload.palette.clone());
                 let strip = self.strips.entry(key).or_insert_with(|| {
                     let asset = project.asset(&upload.image)?;
-                    let strip = crate::part_picture(&asset, &format!("palettes/{}", upload.palette))?.ok()?;
+                    let strip = crate::output_picture(&asset, &format!("palettes/{}", upload.palette))?.ok()?;
                     Some(Texture::new(format!("{}#palettes/{}#vram", upload.image, upload.palette), strip))
                 });
                 if let Some(texture) = strip {
@@ -169,7 +169,7 @@ impl View for Vram {
         let mut placed = Vec::with_capacity(pages.len() + canvas.pictures.len());
         let mut drawing = 0;
         for (image, look, rect) in pages {
-            match ui.picture(&image, look) {
+            match ui.picture(&image, look.as_deref()) {
                 Some(Ok(texture)) => placed.push(Placed { texture, rect, label: Some(image.clone()), link: Some(image) }),
                 None => drawing += 1,
                 Some(Err(_)) => {}

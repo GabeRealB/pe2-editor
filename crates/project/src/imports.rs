@@ -47,11 +47,11 @@ pub struct Imports {
     /// What attaching read of each import, and the settings it resolved to, by its output's key, with what it read:
     /// a refresh finds them here rather than on disk while that holds.
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
-    /// The parts each referenced asset has, by its path, with the hash of the settings they were listed from.
-    parts: Mutex<HashMap<String, Listed>>,
+    /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from.
+    addresses: Mutex<HashMap<String, Listed>>,
 }
 
-/// An asset's parts, with the hash of the settings they were listed from.
+/// An asset's addresses, with the hash of the settings they were listed from.
 type Listed = (String, Arc<HashSet<String>>);
 
 /// An import as attaching uses it.
@@ -94,7 +94,7 @@ impl Imports {
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), parts: Mutex::default() })
+        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), addresses: Mutex::default() })
     }
 
     /// Sweep the store of what the project's nodes no longer make, and of what nodes it no longer has made
@@ -125,7 +125,7 @@ impl Imports {
 
     /// Attach the imports of these assets alone - those a refresh changed (`Refreshed::assets`) - and of those reading
     /// their outputs (`Extensions::dependents`), the others keeping theirs: their problems made again, and those of the
-    /// references from or to them naming parts. What it costs is what changed; imports no asset makes any more are
+    /// references from or to them naming outputs. What it costs is what changed; imports no asset makes any more are
     /// removed by the next full attach.
     pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
         let mut changed = changed.clone();
@@ -172,7 +172,7 @@ impl Imports {
                 asset: asset.path.clone(),
                 error: format!("{}: {}", p.at, p.what),
             }));
-            let Some((importer, output)) = import_output(&plan) else { continue };
+            let Some((importer, output)) = import_output(&plan, extensions) else { continue };
             let plan = &plan;
             let key = engine.key(plan, asset, output, None);
             if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
@@ -225,7 +225,7 @@ impl Imports {
             problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
             asset.imported = Some(resolved);
         }
-        problems.extend(self.missing_parts(index, extensions, only));
+        problems.extend(self.missing_outputs(index, extensions, only));
         // The project's extensions not loaded, as problems of their assets.
         problems.extend(extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
             (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
@@ -236,7 +236,7 @@ impl Imports {
             | Problem::Overridden { asset, .. }
             | Problem::Orphan { asset, .. }
             | Problem::Taken { asset, .. } => !of(asset),
-            Problem::MissingPart { asset, target, .. } => !of(asset) && !of(target),
+            Problem::MissingOutput { asset, target, .. } => !of(asset) && !of(target),
             Problem::Extension { .. } => false,
             _ => true,
         });
@@ -244,35 +244,34 @@ impl Imports {
         attached
     }
 
-    /// The references naming a part their asset does not have, of the assets whose kinds list their parts: with the
-    /// settings resolved, as parts an import makes are among them. An asset's parts are listed again only when its
-    /// settings change.
-    fn missing_parts(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
-        let mut known = self.parts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// The references naming an output their asset does not have: with the settings resolved, as members an import makes
+    /// are among them. An asset's outputs are listed again only when its settings change.
+    fn missing_outputs(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
+        let mut known = self.addresses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut problems = Vec::new();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         for (target, references) in index.referenced_by.iter() {
             // Of the assets attached: the references to them, and from them.
-            let named: Vec<_> = references.iter().filter(|r| r.part.is_some() && (of(target) || of(&r.from))).collect();
-            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.lists_parts(a))
+            let named: Vec<_> = references.iter().filter(|r| r.output.is_some() && (of(target) || of(&r.from))).collect();
+            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.kind_of(a).is_some())
             else {
                 continue;
             };
             let digest = sha1_hex(asset.settings_text().as_bytes());
-            let parts = if let Some((_, parts)) = known.get(target).filter(|(d, _)| *d == digest) {
-                parts.clone()
+            let addresses = if let Some((_, addresses)) = known.get(target).filter(|(d, _)| *d == digest) {
+                addresses.clone()
             } else {
-                let parts: Arc<HashSet<String>> = Arc::new(extensions.parts(asset).into_iter().map(|p| p.id).collect());
-                known.insert(target.clone(), (digest, parts.clone()));
-                parts
+                let addresses: Arc<HashSet<String>> = Arc::new(extensions.addresses(asset).into_iter().map(|(address, _)| address).collect());
+                known.insert(target.clone(), (digest, addresses.clone()));
+                addresses
             };
             for reference in named {
-                let Some(part) = reference.part.as_ref().filter(|p| !parts.contains(*p)) else { continue };
-                problems.push(Problem::MissingPart {
+                let Some(output) = reference.output.as_ref().filter(|o| !addresses.contains(crate::ext::listed(o))) else { continue };
+                problems.push(Problem::MissingOutput {
                     asset: reference.from.clone(),
                     slot: reference.slot.clone(),
                     target: target.clone(),
-                    part: part.clone(),
+                    output: output.clone(),
                 });
             }
         }
@@ -320,9 +319,13 @@ pub fn live_nodes(index: &Index) -> HashSet<String> {
 /// What makes an asset's result - the operation its stack ends with - and the output keeping it, where its result is
 /// made: its files are then attached in its bundle's, and its derived settings resolved over its declaration's. (A
 /// result that is a stored file is seen as it is.)
-fn import_output(plan: &Plan) -> Option<(String, usize)> {
+fn import_output(plan: &Plan, extensions: &Extensions) -> Option<(String, usize)> {
     let result = plan.result.filter(|_| !plan.result_stored())?;
     let output = plan.result_output()?;
+    // A table is read by what asks for it: it has no files to attach.
+    if extensions.op(&plan.steps[result].op).is_some_and(|op| op.output == pe2_ext::Type::Table) {
+        return None;
+    }
     // What events make current is theirs: taking a project in compiles nothing.
     plan.outputs[output].events.pull.is_empty().then(|| (plan.steps[result].op.clone(), output))
 }
@@ -498,8 +501,8 @@ mod attaching {
     use crate::ext::{Extensions, Loadable};
     use crate::index::{Index, Problem};
     use crate::lock::Lock;
-    use pe2_ext::ty::{Files, Registered};
-    use pe2_ext::{Extension, File, Part, Registry, Result, Signature, Table, Typed, Value};
+    use pe2_ext::ty::{self, Files, Registered};
+    use pe2_ext::{Extension, File, Image, Registry, Result, Retain, Signature, Table, Typed, Value};
 
     /// A strip's source: a line of cell names, recognized by its name.
     struct Line;
@@ -529,16 +532,15 @@ mod attaching {
     /// A kind whose source is a line of cell names: each a cell one texel wide, its native file the source reversed.
     #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
     fn strips(r: &mut Registry) -> Result<()> {
-        let strip = r
-            .kind("strip")
-            .alias("strip")
-            .parts(|asset| {
-                asset.parts("cells").into_iter().map(|(name, _)| Part { id: format!("cells/{name}"), label: name.into(), made_of: vec![] }).collect()
-            })
-            .register();
-        let _ = strip;
         let _ = r.value_type::<Line>();
         let _ = r.value_type::<Strip>();
+        let cell = r.op("cell").input::<Strip>("native").output::<ty::Image>().parameter::<String>("name").run(|_| Ok(Image::default()));
+        let _ = r
+            .kind("strip")
+            .alias("strip")
+            .output("cells", &cell, Retain::Transient)
+            .members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
+            .register();
         let _ = r
             .op("line")
             .input::<Line>("source")
@@ -589,11 +591,11 @@ mod attaching {
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         write(
             &root,
-            ".layers/base/s.asset/asset.toml",
+            ".layers/base/s.node/node.toml",
             &format!("uid = \"uid://s\"\nkind = \"strip\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"),
         );
-        write(&root, ".layers/base/s.asset/source.txt", "a b");
-        write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\nfine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
+        write(&root, ".layers/base/s.node/source.txt", "a b");
+        write(&root, ".layers/base/r.node/node.toml", "kind = \"file\"\nfine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
         let extensions =
             Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
@@ -610,16 +612,16 @@ mod attaching {
         let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
         problems.sort();
         assert_eq!(problems.len(), 3, "{problems:?}");
-        assert!(matches!(index.problems.iter().find(|p| matches!(p, Problem::MissingPart { .. })), Some(Problem::MissingPart { part, .. }) if part == "cells/z"));
+        assert!(matches!(index.problems.iter().find(|p| matches!(p, Problem::MissingOutput { .. })), Some(Problem::MissingOutput { output, .. }) if output == "cells/z"));
         assert!(index.problems.iter().any(|p| matches!(p, Problem::Overridden { setting, .. } if setting == "size")));
         assert!(index.problems.iter().any(|p| matches!(p, Problem::Orphan { part, .. } if part == "cells.gone")));
         // Opened again: found made. The source changed: made again, its old import swept.
         let (_, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (0, 1));
-        write(&root, ".layers/base/s.asset/source.txt", "a b z");
+        write(&root, ".layers/base/s.node/source.txt", "a b z");
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept), (1, 0));
-        assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingPart { .. })));
+        assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingOutput { .. })));
         // Swept, the old import goes.
         let store = crate::graph::store::Store::at(root.join(".cache/store")).unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
@@ -651,11 +653,11 @@ mod attaching {
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         let declared = format!("kind = \"strip\"\ncells.a = {{}}\n{STACK}");
-        write(&root, ".layers/base/s.asset/asset.toml", &format!("uid = \"uid://s\"\n{declared}"));
-        write(&root, ".layers/base/s.asset/source.txt", "a b");
-        write(&root, ".layers/base/t.asset/asset.toml", &format!("uid = \"uid://t\"\n{declared}"));
-        write(&root, ".layers/base/t.asset/source.txt", "a");
-        write(&root, ".layers/base/r.asset/asset.toml", "kind = \"file\"\none = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
+        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{declared}"));
+        write(&root, ".layers/base/s.node/source.txt", "a b");
+        write(&root, ".layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
+        write(&root, ".layers/base/t.node/source.txt", "a");
+        write(&root, ".layers/base/r.node/node.toml", "kind = \"file\"\none = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
         let extensions =
             Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         let project = Project::load(&root).unwrap();
@@ -666,9 +668,9 @@ mod attaching {
         let base = |p: &str| root.join(".layers/base").join(p);
         // A source repainted (a part gone and one come), a declaration naming another part, both at once.
         for (path, text) in [
-            ("s.asset/source.txt", "a"),
-            ("t.asset/source.txt", "a b"),
-            ("r.asset/asset.toml", "kind = \"file\"\none = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
+            ("s.node/source.txt", "a"),
+            ("t.node/source.txt", "a b"),
+            ("r.node/node.toml", "kind = \"file\"\none = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
         ] {
             write(&root, &format!(".layers/base/{path}"), text);
             let refreshed = index.refresh(&project, &[base(path)]).unwrap();

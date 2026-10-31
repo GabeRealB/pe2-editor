@@ -10,7 +10,7 @@
 //!   override, if it has one, whose copy moves too), and a move back where it was below is dropped;
 //! - **resolve**: a stale override is kept (its base becomes the version below now) or given up (its copy goes); an
 //!   operation whose entry is gone below is dropped;
-//! - **write a file** of an entry (its `asset.toml`, a plain file's content): in the layer's own copy, made first -
+//! - **write a file** of an entry (its `node.toml`, a plain file's content): in the layer's own copy, made first -
 //!   in the same step - where the entry comes from below.
 //!
 //! Who may edit which layer (locks, the active layer) is the caller's to decide.
@@ -160,7 +160,7 @@ pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, pat
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
     let mut tx = history.begin(format!("New {}", name(&bundle)));
-    tx.write(&layer.disk(&bundle).join(crate::index::ASSET_FILE), declaration.as_bytes())?;
+    tx.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
     changeset.entries.insert(uid.to_string(), bundle);
     save(&mut tx, layer, &changeset)?;
     tx.commit()
@@ -206,7 +206,7 @@ pub fn override_declaration(
     }
     let shown = index.below(layer_name, uid).map_or_default(|b| target(changeset.ops.get(uid), &b.path));
     let mut tx = history.begin(format!("Override {} in {layer_name}", name(&shown)));
-    own(&mut tx, index, layer, layer_name, &mut changeset, uid, |file| file == crate::index::ASSET_FILE)?;
+    own(&mut tx, index, layer, layer_name, &mut changeset, uid, |file| file == crate::index::NODE_FILE)?;
     tx.commit()
 }
 
@@ -395,8 +395,8 @@ mod tests {
             std::fs::write(path, text).unwrap();
         };
         write("project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(".layers/base/g/a.asset/asset.toml", "kind = \"image\"\n");
-        write(".layers/base/g/a.asset/native.texels", "texels");
+        write(".layers/base/g/a.node/node.toml", "kind = \"image\"\n");
+        write(".layers/base/g/a.node/native.texels", "texels");
         write(".layers/base/n", "notes");
         std::fs::create_dir_all(root.join(".layers/top")).unwrap();
         root
@@ -436,28 +436,28 @@ mod tests {
     fn overrides_renames_and_deletes() {
         let root = project("ops");
         let mut o = open(&root);
-        let a = o.uid("g/a.asset");
+        let a = o.uid("g/a.node");
         // Override: the top's own copy wins.
         let paths = override_entry(&o.project, &o.index, "top", &a, &mut o.history).unwrap();
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base", "top"]);
-        assert!(root.join(".layers/top/g/a.asset/native.texels").exists());
+        assert!(root.join(".layers/top/g/a.node/native.texels").exists());
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         // Renamed: the move goes with the override, its copy moved too.
-        let paths = rename(&o.project, &o.index, "top", &a, "g/b.asset", &mut o.history).unwrap();
+        let paths = rename(&o.project, &o.index, "top", &a, "g/b.node", &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(o.index.assets.contains_key("g/b") && !o.index.assets.contains_key("g/a"));
-        assert!(matches!(o.op("g/b.asset"), Some(Op::Override { to: Some(_), .. })));
+        assert!(matches!(o.op("g/b.node"), Some(Op::Override { to: Some(_), .. })));
         // Renamed back: no move left.
-        let paths = rename(&o.project, &o.index, "top", &a, "g/a.asset", &mut o.history).unwrap();
+        let paths = rename(&o.project, &o.index, "top", &a, "g/a.node", &mut o.history).unwrap();
         o.refresh(&paths);
-        assert!(matches!(o.op("g/a.asset"), Some(Op::Override { to: None, .. })));
+        assert!(matches!(o.op("g/a.node"), Some(Op::Override { to: None, .. })));
         // Deleted from below: its copy goes, a delete is recorded.
         let n = o.uid("n");
         let paths = delete(&o.project, &o.index, "top", &a, &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(!o.index.assets.contains_key("g/a"));
-        assert!(!root.join(".layers/top/g/a.asset").exists());
+        assert!(!root.join(".layers/top/g/a.node").exists());
         // Everything undone: the top as it began.
         for _ in 0..4 {
             let step = o.history.undo(false).unwrap();
@@ -476,14 +476,14 @@ mod tests {
     fn writes_a_file_in_its_own_copy() {
         let root = project("write");
         let mut o = open(&root);
-        let a = o.uid("g/a.asset");
+        let a = o.uid("g/a.node");
         let text = b"kind = \"image\"\nnote = \"x\"\n";
         let paths = super::write_file(
             &o.project,
             &o.index,
             "top",
             &a,
-            "asset.toml",
+            "node.toml",
             text,
             "Edit a".into(),
             Some("a".into()),
@@ -500,7 +500,7 @@ mod tests {
             &o.index,
             "top",
             &a,
-            "asset.toml",
+            "node.toml",
             text,
             "Edit a".into(),
             Some("a".into()),
@@ -521,21 +521,21 @@ mod tests {
     fn resolves_a_stale_override() {
         let root = project("stale");
         let mut o = open(&root);
-        let a = o.uid("g/a.asset");
+        let a = o.uid("g/a.node");
         let paths = override_entry(&o.project, &o.index, "top", &a, &mut o.history).unwrap();
         o.refresh(&paths);
         // The base changes under the override: stale.
-        let texels = root.join(".layers/base/g/a.asset/native.texels");
+        let texels = root.join(".layers/base/g/a.node/native.texels");
         std::fs::write(&texels, "retouched").unwrap();
         o.refresh(&[texels]);
-        assert_eq!(o.index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.asset".into() }]);
+        assert_eq!(o.index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.node".into() }]);
         let paths = resolve(&o.project, &o.index, "top", &a, Resolution::KeepMine, &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         let paths = resolve(&o.project, &o.index, "top", &a, Resolution::TakeBase, &mut o.history).unwrap();
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
-        assert!(o.op("g/a.asset").is_none());
+        assert!(o.op("g/a.node").is_none());
         drop(o);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -543,8 +543,8 @@ mod tests {
     #[test]
     fn deletes_what_the_layer_makes() {
         let root = project("own");
-        std::fs::create_dir_all(root.join(".layers/top/mine/x.asset")).unwrap();
-        std::fs::write(root.join(".layers/top/mine/x.asset/asset.toml"), "kind = \"file\"\n").unwrap();
+        std::fs::create_dir_all(root.join(".layers/top/mine/x.node")).unwrap();
+        std::fs::write(root.join(".layers/top/mine/x.node/node.toml"), "kind = \"file\"\n").unwrap();
         let mut o = open(&root);
         let mine = o.uid("mine");
         let paths = rename(&o.project, &o.index, "top", &mine, "ours", &mut o.history).unwrap();

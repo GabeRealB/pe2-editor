@@ -1,5 +1,5 @@
-//! pe2.images: the image kind and its roles - a background (a BS picture), a texture (texels through its palettes),
-//! an atlas (texels in cells, each cell through its own palette).
+//! pe2.images: the image kind. What one is follows from what it declares: a BS picture has no `mode`, a texture does
+//! (texels through its palettes), and an atlas has `cells` as well (each through its own palette).
 //!
 //! It registers what the host shows an image by: its picture in each of its looks and its palettes as parts, its
 //! thumbnail, its fields' labels and readings, what is marked on it (an atlas's cells, a wide texture's pages), its
@@ -16,7 +16,7 @@ mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
 pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, Part, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
+use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Table, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -69,11 +69,7 @@ fn register(r: &mut Registry) -> Result<()> {
             }
         }
     });
-    let part = r.op("part").label("A part's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("id").run(|call| {
-        let part: String = call.parameter()?;
-        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no parts") };
-        part_of(&call.lend_settings(&image.derived).asset(), &image, &part).ok_or_else(|| pe2_ext::anyhow!("it has no part {part}"))
-    });
+    let (palette, cell) = part_outputs(r);
     // What is marked on it: an atlas's cells, a wide texture's pages.
     let marked = r.op("marks").label("Cells and pages").input::<NativeForm>("native").output::<ty::Marks>().run(|call| {
         Ok(match call.take::<NativeForm>(0)? {
@@ -81,6 +77,7 @@ fn register(r: &mut Registry) -> Result<()> {
             ty::Either::Second(image) => marks::of(&call.lend_settings(&image.derived).asset()),
         })
     });
+    let (placement, words, slot_rect) = build_outputs(r);
     let image = r
         .kind("image")
         .alias("image")
@@ -99,25 +96,24 @@ fn register(r: &mut Registry) -> Result<()> {
         .inspector_tab("Palettes", Icon::Palette, &["palettes", "variants"], |_| Box::new(inspector::Collections::of(inspector::Shows::Palettes)))
         .inspector_tab("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::Collections::of(inspector::Shows::Cells)))
         .editor("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::CellSheet::default()))
-        .parts(parts)
         .contents(contents)
         .content_act(inspector::act)
         .part_sheet(part_sheet)
         .contents_view("Summary", |_| Box::new(inspector::Summary))
-        // Its picture in each look; its palettes, variants and cells drawn.
+        // Its picture in each look; its palettes and cells drawn.
         .output("picture", &draw, Retain::Transient)
         .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] })
-        .output("part", &part, Retain::Transient)
-        .members(|asset| parts(asset).into_iter().map(|p| (p.id, p.label)).collect())
+        .output("palettes", &palette, Retain::Transient)
+        .members(|asset| palette_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
+        .output("cells", &cell, Retain::Transient)
+        .members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
         .output("marks", &marked, Retain::Transient)
+        .output("placement", &placement, Retain::Cache)
+        .output("words", &words, Retain::Cache)
         .register();
-    let mut roles = HashMap::new();
-    for (role, label) in [("background", "Background"), ("texture", "Texture"), ("atlas", "Atlas")] {
-        roles.insert(role, r.role(&image, role).alias(role).label(label).register());
-    }
     // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
-    let _ = r.extractor("textures", &image, &[roles["texture"].clone(), roles["atlas"].clone()], extract::begin);
-    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
+    let _ = r.extractor("textures", &image, &["mode"], extract::begin);
+    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).output("rect", &slot_rect, Retain::Cache).register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)
             .label("VRAM page grid")
@@ -128,6 +124,43 @@ fn register(r: &mut Registry) -> Result<()> {
     r.panel("vram", "VRAM", Icon::Grid, move || Box::new(vram::Vram::new(grid)));
     r.tool("palette", tools::PALETTE, tools::PALETTE_ARGUMENTS, tools::palette);
     Ok(())
+}
+
+/// A palette's and a cell's pictures.
+fn part_outputs(r: &mut Registry) -> (pe2_ext::Name, pe2_ext::Name) {
+    // A palette as a strip of its colors, and a cell where it is drawn, through a palette of its image's where one is
+    // named (`skin@night`).
+    let palette = r.op("palette_picture").label("A palette's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").run(|call| {
+        let name: String = call.parameter()?;
+        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no palettes") };
+        palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
+    });
+    let cell = r.op("cell_picture").label("A cell's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").run(|call| {
+        let name: String = call.parameter()?;
+        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no cells") };
+        cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
+    });
+    (palette, cell)
+}
+
+/// What a build reads of an image and a VRAM slot.
+fn build_outputs(r: &mut Registry) -> (pe2_ext::Name, pe2_ext::Name, pe2_ext::Name) {
+    // What draws it needs: its depth, where its page and palettes are uploaded, and its cells.
+    let placement = r.op("placement").label("Where it is uploaded").input::<NativeForm>("native").output::<ty::Table>().run(|call| {
+        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background is drawn by no face") };
+        let lent = call.lend_settings(&image.derived);
+        placement_of(call, &lent.asset())
+    });
+    // Its texels as the words of a C array.
+    let words = r.op("words").label("Its texels, as C").input::<NativeForm>("native").output::<ty::Table>().run(|call| {
+        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no texels") };
+        Ok(Table::from_iter([("words".to_string(), words_of(&image.texels)?.into())]))
+    });
+    let slot_rect = r.op("slot_rect").label("Its rectangle").output::<ty::Table>().run(|call| {
+        let rect = call.host.fields().get("rect").cloned().ok_or_else(|| pe2_ext::anyhow!("it has no rect"))?;
+        Ok(Table::from_iter([("rect".to_string(), rect)]))
+    });
+    (placement, words, slot_rect)
 }
 
 /// An image's modes: what a texel is. A native-only image's texels are read in its mode; an imported one's are
@@ -150,16 +183,16 @@ pub(crate) fn depth_of(mode: &str) -> Option<u8> {
 
 // --- the interface ------------------------------------------------------------------------------------------------
 
-/// An image's role (`texture`, `atlas`, `background`).
-#[must_use]
-pub fn role<'a>(asset: &Asset<'a>) -> Option<&'a str> {
-    asset.role_of(ID)
-}
-
 /// A texture or an atlas: an image of texels and palettes.
 #[must_use]
 pub fn is_texture(asset: &Asset) -> bool {
-    matches!(role(asset), Some("texture" | "atlas"))
+    asset.field("mode").is_some()
+}
+
+/// An atlas: texels in cells.
+#[must_use]
+pub fn is_atlas(asset: &Asset) -> bool {
+    !asset.parts("cells").is_empty()
 }
 
 /// An image's palettes by name, in the order it declares them.
@@ -173,14 +206,14 @@ pub fn palette_names(asset: &Asset) -> Vec<String> {
 pub fn looks(asset: &Asset) -> Vec<String> {
     let variants = asset.parts("variants");
     let named = variants.iter().map(|(name, _)| (*name).to_string());
-    if role(asset) == Some("atlas") && !variants.is_empty() {
+    if is_atlas(asset) && !variants.is_empty() {
         std::iter::once("default".to_string()).chain(named).collect()
     } else {
         named.collect()
     }
 }
 
-/// What is inside an image: its parts by group, a palette and a cell shown by their pictures. A cell is dropped on the palette
+/// What is inside an image, by group: a palette and a cell shown by their pictures. A cell is dropped on the palette
 /// that draws it, a variant renamed, moved and removed; a cell's name and rectangle are its source's.
 fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
     let palette_of: HashMap<String, Option<usize>> = cells(asset).into_iter().map(|cell| (cell.name, cell.palette)).collect();
@@ -189,8 +222,8 @@ fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
     let shown_looks = looks(asset);
     let mut rows = Vec::new();
     let mut group = String::new();
-    for part in parts(asset) {
-        let (within, name) = part.id.split_once('/').unwrap_or(("", part.id.as_str()));
+    for (id, label) in listed(asset) {
+        let (within, name) = id.split_once('/').unwrap_or(("", id.as_str()));
         if !within.is_empty() && within != group {
             within.clone_into(&mut group);
             let label = match within {
@@ -200,7 +233,7 @@ fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
             };
             rows.push(ContentRow::heading(within, label));
         }
-        let row = ContentRow::new(&part.id, &part.label).depth(u32::from(!within.is_empty()));
+        let row = ContentRow::new(&id, &label).depth(u32::from(!within.is_empty()));
         rows.push(match within {
             "palettes" if has_cells => row
                 .icon(Icon::Palette, Tint::Picture)
@@ -215,10 +248,7 @@ fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
             "variants" => {
                 let remove = ContentAction::new("remove", "Remove the variant").icon(Icon::Cross).on_row();
                 let row = row.icon(Icon::Image, Tint::Picture).renames().reorders("variant").action(remove);
-                match shown_looks.iter().position(|look| look == name).and_then(|at| u32::try_from(at).ok()) {
-                    Some(look) => row.look(look),
-                    None => row,
-                }
+                if shown_looks.iter().any(|look| look == name) { row.look(name) } else { row }
             }
             _ => row.icon(Icon::Image, Tint::Picture),
         });
@@ -254,38 +284,61 @@ fn part_sheet(asset: &Asset, _: &dyn pe2_ext::Project, part: &str) -> Option<Par
     })
 }
 
-/// An image's parts: its texels, its palettes, its cells, and its variants - looks made of the texels through the
-/// palettes they name, files of their own they have none.
-fn parts(asset: &Asset) -> Vec<Part> {
+/// Where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
+fn placed(call: &pe2_ext::Call, placement: &Value) -> Option<Result<[i64; 2]>> {
+    let slot = placement.get("slot")?;
+    let named = match slot {
+        Value::Table(table) => table.get("uid")?.as_str()?,
+        _ => slot.as_str()?,
+    };
+    let at = placement.get("at").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let added = |n: usize| at.get(n).and_then(Value::as_integer).unwrap_or(0);
+    Some(call.table_of(named, "rect").and_then(|table| {
+        let rect = table.get("rect").and_then(Value::as_array).ok_or_else(|| pe2_ext::anyhow!("{named} has no rect"))?;
+        let corner = |n: usize| rect.get(n).and_then(Value::as_integer).ok_or_else(|| pe2_ext::anyhow!("{named} has no corner"));
+        Ok([corner(0)? + added(0), corner(1)? + added(1)])
+    }))
+}
+
+/// What an image says of itself to what draws it.
+fn placement_of(call: &pe2_ext::Call, asset: &Asset) -> Result<Table> {
+    let at = |[x, y]: [i64; 2]| Value::Array(vec![Value::Integer(x), Value::Integer(y)]);
+    let mut made = Table::from_iter([("bits".to_string(), Value::Integer(i64::from(bpp(asset))))]);
+    if let Some(page) = asset.field("page").and_then(|page| placed(call, page)) {
+        made.insert("page".to_string(), at(page?));
+    }
+    if let Some(cells) = asset.field("cells") {
+        made.insert("cells".to_string(), cells.clone());
+    }
+    let mut palettes = Table::new();
+    for (name, palette) in asset.parts("palettes") {
+        if let Some(place) = placed(call, palette) {
+            palettes.insert(name.to_string(), at(place?));
+        }
+    }
+    made.insert("palettes".to_string(), Value::Table(palettes));
+    Ok(made)
+}
+
+/// Bytes as the `u_long`s of a C array.
+fn words_of(bytes: &[u8]) -> Result<String> {
+    let (words, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        pe2_ext::bail!("{} bytes are no words", bytes.len());
+    }
+    Ok(words.iter().map(|word| format!("{:#010X},", u32::from_le_bytes(*word))).collect::<Vec<_>>().join(" "))
+}
+
+/// What the contents of an image list, by id and label: its texels, palettes, cells and variants.
+fn listed(asset: &Asset) -> Vec<(String, String)> {
     if !is_texture(asset) {
         return vec![];
     }
-    let part = |id: String, label: &str, made_of: Vec<String>| Part { id, label: label.to_string(), made_of };
-    let mut out = vec![part("texels".into(), "Texels", vec![])];
-    let names = palette_names(asset);
-    out.extend(names.iter().map(|name| part(format!("palettes/{name}"), name, vec![])));
-    out.extend(asset.parts("cells").into_iter().map(|(name, _)| part(format!("cells/{name}"), name, vec![])));
-    let atlas = role(asset) == Some("atlas");
-    for (i, look_name) in looks(asset).iter().enumerate() {
-        if atlas && i == 0 {
-            continue;
-        }
-        let (palette, overrides) = look(asset, i);
-        let mut made_of = vec!["texels".to_string()];
-        let mut used: Vec<usize> = palette.into_iter().collect();
-        if atlas {
-            for cell in cells(asset) {
-                used.extend(overrides.get(&cell.name).copied().or(cell.palette));
-            }
-        }
-        for p in used {
-            let id = format!("palettes/{}", names[p]);
-            if !made_of.contains(&id) {
-                made_of.push(id);
-            }
-        }
-        out.push(part(format!("variants/{look_name}"), look_name, made_of));
-    }
+    let mut out = vec![("texels".to_string(), "Texels".to_string())];
+    out.extend(palette_names(asset).into_iter().map(|name| (format!("palettes/{name}"), name)));
+    out.extend(asset.parts("cells").into_iter().map(|(name, _)| (format!("cells/{name}"), name.to_string())));
+    let first = usize::from(is_atlas(asset));
+    out.extend(looks(asset).into_iter().skip(first).map(|name| (format!("variants/{name}"), name)));
     out
 }
 
@@ -295,7 +348,7 @@ fn look(asset: &Asset, variant: usize) -> (Option<usize>, HashMap<String, usize>
     let names = palette_names(asset);
     let index = |name: Option<&str>| name.and_then(|n| names.iter().position(|p| p == n));
     let variants = asset.parts("variants");
-    if role(asset) == Some("atlas") {
+    if is_atlas(asset) {
         let overrides = variant
             .checked_sub(1)
             .and_then(|v| variants.get(v)?.1.get("palettes")?.as_table().cloned())
@@ -447,36 +500,36 @@ pub(crate) fn has_picture(asset: &Asset) -> bool {
     asset.has_file(BS) || is_texture(asset) && asset.has_file(TEXELS)
 }
 
-/// A part of an image as a picture (`palettes/<name>`, `variants/<name>`, `cells/<name>`), read from its files.
-pub(crate) fn part_picture(asset: &Asset, part: &str) -> Option<Result<Image>> {
+/// A palette or a cell of an image as a picture (`palettes/<name>`, `cells/<name>`), read from its files.
+pub(crate) fn output_picture(asset: &Asset, address: &str) -> Option<Result<Image>> {
     if !is_texture(asset) {
         return None;
     }
-    match TexelImage::read(asset) {
-        Ok(image) => part_of(asset, &image, part).map(Ok),
-        Err(e) => Some(Err(e)),
+    let image = match TexelImage::read(asset) {
+        Ok(image) => image,
+        Err(e) => return Some(Err(e)),
+    };
+    if let Some(name) = address.strip_prefix("cells/") {
+        return cell_picture(asset, &image, name).map(Ok);
     }
+    palette_picture(&image, address.strip_prefix("palettes/")?).map(Ok)
 }
 
-/// A part of texels and palettes as a picture, with their image's settings: a palette as a strip of its colors, a
-/// variant in its look, a cell where it is drawn.
-pub(crate) fn part_of(asset: &Asset, image: &TexelImage, part: &str) -> Option<Image> {
-    if let Some(name) = part.strip_prefix("variants/") {
-        let look = looks(asset).iter().position(|l| l == name)?;
-        return Some(draw(asset, image, look));
-    }
-    if let Some(name) = part.strip_prefix("cells/") {
-        // `cells/skin@night`: through a palette of the image's other than its own.
-        let (name, through) = name.split_once('@').map_or((name, None), |(name, palette)| (name, Some(palette)));
-        let cell = cells(asset).into_iter().find(|c| c.name == name)?;
-        let through = match through {
-            Some(palette) => Some((name, palette_names(asset).iter().position(|known| known == palette)?)),
-            None => None,
-        };
-        return Some(crop(&decode_texels(asset, &image.texels, &image.colors(), 0, through), cell.rect));
-    }
-    let colors = image.palette(part.strip_prefix("palettes/")?)?;
+/// A palette as a strip of its colors.
+fn palette_picture(image: &TexelImage, name: &str) -> Option<Image> {
+    let colors = image.palette(name)?;
     Some(Image { width: colors.len(), height: 1, rgba: colors.iter().flat_map(|&c| rgba(c)).collect() })
+}
+
+/// A cell where it is drawn; `skin@night` through a palette of the image's other than its own.
+fn cell_picture(asset: &Asset, image: &TexelImage, name: &str) -> Option<Image> {
+    let (name, through) = name.split_once('@').map_or((name, None), |(name, palette)| (name, Some(palette)));
+    let cell = cells(asset).into_iter().find(|c| c.name == name)?;
+    let through = match through {
+        Some(palette) => Some((name, palette_names(asset).iter().position(|known| known == palette)?)),
+        None => None,
+    };
+    Some(crop(&decode_texels(asset, &image.texels, &image.colors(), 0, through), cell.rect))
 }
 
 /// Texels and palettes as a picture in a look (one past its looks, its first), with their image's settings.
@@ -623,7 +676,6 @@ mod tests {
         let fields: Table = toml::from_str(
             r#"
             kind = "image"
-            role = "atlas"
             mode = "indexed_4bpp"
             size = [2, 1]
             palettes.warm = {}
@@ -648,7 +700,7 @@ mod tests {
             ("native.cold.colors", colors(blue, blue)),
         ]);
         let lent = Lent { fields, files };
-        let asset = Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas"));
+        let asset = Asset::new(&lent, Some("pe2.images@image"));
         assert_eq!(looks(&asset), ["default", "night"]);
         assert_eq!(cells(&asset)[0].palette, Some(0));
         assert_eq!(palette_colors(&asset, 1).unwrap().unwrap(), [blue, blue]);

@@ -20,7 +20,7 @@ use crate::settings::{Preview, Upscale};
 use crate::watch::{Change, Watch};
 
 /// A node of the tree of the resolved project: its children and, where an entry has this path, that entry (its real
-/// path, a bundle's with `.asset`) and the asset it is, or that it is a plain file. An image with several variants -
+/// path, a bundle's with `.node`) and the asset it is, or that it is a plain file. An image with several variants -
 /// its other looks - is a virtual folder of them: choosing one shows the image so.
 #[derive(Default)]
 pub struct Node {
@@ -36,7 +36,12 @@ pub struct Node {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     pub image: String,
-    pub variant: usize,
+    pub look: String,
+}
+
+/// Where the look an asset is shown in is chosen.
+fn look_of(path: &str) -> (String, String) {
+    (path.to_string(), project::ext::PICTURE.to_string())
 }
 
 impl Node {
@@ -59,8 +64,8 @@ impl Node {
                     node.asset = Some(path.to_string());
                     let names = if asset.variants.is_empty() { vec![] } else { extensions.looks(asset) };
                     if names.len() > 1 {
-                        for (i, name) in names.into_iter().enumerate() {
-                            let entry = Some(Entry { image: path.to_string(), variant: i });
+                        for name in names {
+                            let entry = Some(Entry { image: path.to_string(), look: name.clone() });
                             node.children.insert(name, Node { entry, ..Node::default() });
                         }
                     }
@@ -173,7 +178,7 @@ pub struct Workspace {
     pub content_open: HashMap<(String, String), bool>,
     /// The row of the contents being renamed: the asset, the row, what is typed.
     pub content_rename: Option<(String, String, String)>,
-    /// The view an asset is shown in, where its kind and role have several.
+    /// The view an asset is shown in, where its kind has several.
     pub view_choice: HashMap<String, usize>,
     /// What the views show, uploaded.
     textures: crate::ext_ui::Textures,
@@ -227,7 +232,7 @@ pub struct Workspace {
     /// When the user's extensions folder was last looked at, which no watcher follows.
     extensions_checked: std::time::Instant,
     pub tree: Arc<Node>,
-    /// The tree's paths (an asset's without `.asset`) that can be modified, and the folders holding one: the rest is
+    /// The tree's paths (an asset's without `.node`) that can be modified, and the folders holding one: the rest is
     /// drawn dimmed.
     editable: HashSet<String>,
     pub selected: Option<String>,
@@ -243,15 +248,13 @@ pub struct Workspace {
     pictures: HashMap<(String, usize, Upscale), Picture>,
     /// Parts of pictures (palettes' strips), as the inspector shows them.
     pub parts: Parts,
-    /// The inspector views - the kinds' and roles', or the importers' - by (asset, the importer's, view).
+    /// The inspector views - the kinds', or the importers' - by (asset, the importer's, view).
     inspector_views: HashMap<(String, usize), Box<dyn pe2_ext::View>>,
     /// The panels' views, by pane.
     panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
     /// What a view set of the asset it shows this frame, for the app to make after drawing.
     pub view_edit: Option<EditRequest>,
-    /// The variant an image is shown in (an index into `variants_of`); without one, its first.
-    pub variant_choice: HashMap<String, usize>,
-    /// What is being looked at of assets with groups of variants.
+    /// The members of families of outputs assets are being looked at in: an image's look, a prefab's outfit.
     pub chosen: project::ext::Chosen,
     /// A field being edited in the inspector.
     pub field_edit: Option<FieldEdit>,
@@ -279,7 +282,7 @@ pub enum EditRequest {
     EditIn(String),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
-    /// Write a file of the entry (its `asset.toml`; empty: a plain file itself), labeled for the history; edits of one
+    /// Write a file of the entry (its `node.toml`; empty: a plain file itself), labeled for the history; edits of one
     /// merge key made in a row are one step.
     Write {
         uid: String,
@@ -375,7 +378,7 @@ impl Parts {
             return None;
         }
         if !self.shown.contains_key(&key) {
-            let Some(drawn) = extensions.part(asset, part) else {
+            let Some(drawn) = extensions.output_image(asset, part) else {
                 self.none.insert(key);
                 return None;
             };
@@ -590,7 +593,6 @@ impl Workspace {
             inspector_views: HashMap::new(),
             panels: HashMap::new(),
             view_edit: None,
-            variant_choice: HashMap::new(),
             chosen: project::ext::Chosen::new(),
             field_edit: None,
             viewer: crate::viewer::Viewer::default(),
@@ -974,7 +976,7 @@ impl Workspace {
         if let Some(part) = inner.strip_prefix('#') {
             let row = self.contents_of(&asset).rows.iter().any(|row| row.id == part && !row.is_heading());
             // A view may hold what it selected; only it could say whether that is still there.
-            return row || self.extensions.parts(&asset).iter().any(|named| named.id == part) || !self.extensions.contents_views(&asset).is_empty();
+            return row || self.extensions.addresses(&asset).iter().any(|(address, _)| address == part) || !self.extensions.contents_views(&asset).is_empty();
         }
         crate::inspector::layer_of_inner(&inner).is_none_or(|(at, op)| {
             let layer = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
@@ -1174,7 +1176,7 @@ impl Workspace {
         let text = self.applied.text(&uid)?;
         let name = path.rsplit('/').next().unwrap_or(path);
         let label = format!("Revert the settings of {name}");
-        Some(EditRequest::Write { uid, file: project::index::ASSET_FILE.to_string(), bytes: text.into_bytes(), label, merge: None })
+        Some(EditRequest::Write { uid, file: project::index::NODE_FILE.to_string(), bytes: text.into_bytes(), label, merge: None })
     }
 
     /// Make an edit in the active layer: a step of the history, the index taking it in at once. Returns what was done.
@@ -1347,7 +1349,7 @@ impl Workspace {
     /// It is gone, or it fails.
     pub fn run_tool(&self, name: &str) -> std::result::Result<String, String> {
         let tool = self.extensions.tools().iter().find(|t| t.name.to_string() == name).ok_or_else(|| format!("no tool {name}"))?;
-        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref(), looks: None };
+        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref() };
         let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
         Ok(answer.to_string())
     }
@@ -1448,7 +1450,7 @@ impl Workspace {
             label: label.clone(),
             merge: merge.clone(),
         };
-        Ok(vec![write(name, bytes), write(project::index::ASSET_FILE, declaration.into_bytes())])
+        Ok(vec![write(name, bytes), write(project::index::NODE_FILE, declaration.into_bytes())])
     }
 
     /// Whether an entry opens as a document: an asset, a container folder among them, or a plain file; a filesystem
@@ -1471,9 +1473,9 @@ impl Workspace {
         self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, chosen, part))).clone()
     }
 
-    /// Look at an asset in a member of a group of variants: all that shows it is made again.
-    pub fn choose_member(&mut self, path: &str, group: String, member: String) {
-        self.chosen.insert((path.to_string(), group), member);
+    /// Look at an asset in a member of a family: all that shows it is made again.
+    pub fn choose_member(&mut self, path: &str, family: String, member: String) {
+        self.chosen.insert((path.to_string(), family), member);
         self.contents.remove(path);
         self.part_sheets.retain(|(asset, _), _| asset != path);
         self.views.retain(|(_, asset, _), _| asset != path);
@@ -1492,7 +1494,7 @@ impl Workspace {
             return;
         }
         let is_it = |id: &str| id == name || part_name(id) == name;
-        let part = self.extensions.parts(&asset).into_iter().map(|part| part.id).find(|id| is_it(id));
+        let part = self.extensions.addresses(&asset).into_iter().map(|(address, _)| address).find(|id| is_it(id));
         let contents = self.contents_of(&asset);
         let row = || contents.rows.iter().filter(|row| !row.is_heading()).map(|row| row.id.clone()).find(|id| is_it(id));
         if let Some(id) = part.or_else(row) {
@@ -1528,25 +1530,25 @@ impl Workspace {
     /// shows the image in its first.
     pub fn choose(&mut self, entry: &Entry) {
         if self.is_chosen(entry) {
-            self.variant_choice.remove(&entry.image);
+            self.chosen.remove(&look_of(&entry.image));
             return;
         }
         if self.selected.as_deref() != Some(&entry.image) {
             self.select(entry.image.clone());
         }
-        self.variant_choice.insert(entry.image.clone(), entry.variant);
+        self.show_look(&entry.image, entry.look.clone());
     }
 
     /// Whether a virtual entry is what is shown, chosen.
     pub fn is_chosen(&self, entry: &Entry) -> bool {
-        self.selected.as_deref() == Some(&entry.image) && self.variant_choice.get(&entry.image) == Some(&entry.variant)
+        self.selected.as_deref() == Some(&entry.image) && self.chosen.get(&look_of(&entry.image)) == Some(&entry.look)
     }
 
     /// Select an asset picked in the tree: like `navigate`, but the tree does not move. Picking the selected image
     /// again shows it in its first variant.
     pub fn select(&mut self, path: String) {
         if self.selected.as_deref() == Some(&path) {
-            self.variant_choice.remove(&path);
+            self.chosen.remove(&look_of(&path));
             return;
         }
         self.navigate(path);
@@ -1585,8 +1587,13 @@ impl Workspace {
 
     /// The variant an image is shown in.
     pub fn variant(&self, path: &str) -> usize {
-        let n = self.variants_of(path).len();
-        self.variant_choice.get(path).copied().filter(|&v| v < n).unwrap_or(0)
+        let chosen = self.chosen.get(&look_of(path)).map(String::as_str);
+        self.index.assets.get(path).map_or(0, |asset| self.extensions.look_at(asset, chosen))
+    }
+
+    /// Show an image in a look. Nothing need be made again: what shows it asks for its look each time.
+    pub fn show_look(&mut self, path: &str, look: String) {
+        self.chosen.insert(look_of(path), look);
     }
 
     /// Whether an asset has a picture.
@@ -1641,7 +1648,7 @@ impl Workspace {
         out
     }
 
-    /// Show an asset's view in a pane - the one chosen, where its kind and role have several - made when first shown.
+    /// Show an asset's view in a pane - the one chosen, where its kind has several - made when first shown.
     /// `count` views share the pane's height.
     pub fn show_view(
         &mut self,
@@ -1696,7 +1703,6 @@ impl Workspace {
         nav: &mut Option<String>,
     ) {
         let path = key.1.clone();
-        let look = self.variant(&path);
         // As the inspector's own fields: an asset from below is overridden into the active layer.
         let editable = self.editable_layer().is_ok();
         let part = self.part_of(&path).map(str::to_string);
@@ -1706,10 +1712,9 @@ impl Workspace {
             index: &self.index,
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
-            looks: Some(&self.variant_choice),
             chosen: Some(&self.chosen),
         };
-        let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview, count, editable, part: part.as_deref() };
+        let frame = crate::ext_ui::Frame { asset: Some(asset), preview, count, editable, part: part.as_deref() };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1765,7 +1770,7 @@ impl Workspace {
         }
     }
 
-    /// Show an asset's inspector views - what its kind and role draw of it after the property sheet - made when first
+    /// Show an asset's inspector views - what its kind draws of it after the property sheet - made when first
     /// shown: those of a tab, or those with none.
     pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, tab: Option<usize>, nav: &mut Option<String>) {
         self.show_lent_views(ui, path, nav, |extensions, asset| {
@@ -1774,7 +1779,7 @@ impl Workspace {
         });
     }
 
-    /// Show the views a kind and a role give the head of the contents pane, made when first shown.
+    /// Show the views a kind gives the head of the contents pane, made when first shown.
     pub fn show_contents_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
         self.show_lent_views(ui, path, nav, |extensions, asset| {
             // After the inspector's, in the numbers these are kept by.
@@ -1791,7 +1796,6 @@ impl Workspace {
         nav: &mut Option<String>,
         chosen: impl for<'a> Fn(&'a Extensions, &'a Asset) -> Vec<(usize, &'a pe2_ext::ViewDef)>,
     ) {
-        let look = self.variant(path);
         // As the inspector's own fields: an asset from below is overridden into the active layer.
         let editable = self.editable_layer().is_ok();
         let part = self.part_of(path).map(str::to_string);
@@ -1800,13 +1804,12 @@ impl Workspace {
             index: &self.index,
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
-            looks: Some(&self.variant_choice),
             chosen: Some(&self.chosen),
         };
         for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
-            let frame = crate::ext_ui::Frame { asset: Some(asset), look, preview: Preview::default(), count: 1, editable, part: part.as_deref() };
+            let frame = crate::ext_ui::Frame { asset: Some(asset), preview: Preview::default(), count: 1, editable, part: part.as_deref() };
             let mut sets = crate::ext_ui::Sets::default();
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1828,12 +1831,11 @@ impl Workspace {
             index: &self.index,
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
-            looks: Some(&self.variant_choice),
             chosen: Some(&self.chosen),
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };
-        let frame = crate::ext_ui::Frame { asset: None, look: 0, preview, count: 1, editable: false, part: None };
+        let frame = crate::ext_ui::Frame { asset: None, preview, count: 1, editable: false, part: None };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));

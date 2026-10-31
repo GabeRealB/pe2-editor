@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::View;
 
-/// An asset named by its path (`stages/akropolis/rooms/cafeteria/props/puff`, with or without `res://` and `.asset`)
+/// An asset named by its path (`stages/akropolis/rooms/cafeteria/props/puff`, with or without `res://` and `.node`)
 /// or its uid (`uid://...`).
 #[derive(Deserialize, JsonSchema)]
 struct AssetArgs {
@@ -36,9 +36,6 @@ struct FindArgs {
     /// Only assets of this kind (`image`, `file`, `folder`, `vram_slot`, ...).
     #[serde(default)]
     kind: Option<String>,
-    /// Only assets of this role (`texture`, `atlas`, `background`, ...).
-    #[serde(default)]
-    role: Option<String>,
     /// Only assets under this folder (`stages/akropolis`).
     #[serde(default)]
     under: Option<String>,
@@ -66,7 +63,7 @@ struct ProblemsArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct PreviewArgs {
-    /// The image: its path or its uid; with a fragment, one of its parts (`#variants/night`, `#cells/cursor`,
+    /// The image: its path or its uid; after a `#`, one of its outputs (`#picture/night`, `#cells/cursor`,
     /// `#palettes/default`; `get_asset` lists them).
     asset: String,
     /// The look to show it in, by name (an image's variants; an atlas's `default` and its variants). Its first when
@@ -186,21 +183,21 @@ fn own() -> Vec<Tool> {
         ),
         tool::<FindArgs>(
             "find_assets",
-            "Find assets by text in their path, kind, role or folder. Returns each one's path, uid, kind and role, \
+            "Find assets by text in their path, kind or folder. Returns each one's path, uid and kind, \
              and how many matched in all.",
         ),
         tool::<FolderArgs>(
             "list_folder",
-            "The entries of a folder of the resolved project: its folders, its assets (with kind and role) and its \
+            "The entries of a folder of the resolved project: its folders, its assets (with their kinds) and its \
              plain files.",
         ),
         tool::<AssetArgs>(
             "get_asset",
-            "An asset as resolved: path, uid, kind, role, the layers creating and overriding it, its files (size, \
+            "An asset as resolved: path, uid, kind, the layers creating and overriding it, its files (size, \
              sha1, layer, the operation that made it), its looks where it has a picture, its outputs (what its stack \
              and its kind make of it, each read with get_output), its import and the imports that fit its source, \
-             and its declaration (asset.toml) as written - with the settings as resolved where its import derives \
-             some from its source - and its parts (what references name by fragment, a virtual one with the parts it \
+             and its declaration (node.toml) as written - with the settings as resolved where its import derives \
+             some from its source - and its addresses (what references name after a `#`\
              is made of).",
         ),
         tool::<AssetArgs>(
@@ -218,12 +215,12 @@ fn own() -> Vec<Tool> {
             "One of an asset's outputs (get_asset lists them), made now or found kept: a table (a movie's facts) as \
              JSON; a picture as PNG; a value of an extension's type as its files (name, size, sha1) and the settings \
              made with it; a stream (a movie's frames) as its header. A family's member by its parameter's value: \
-             `picture/default`, `part/palettes/default`."
+             `picture/default`, `palettes/default`."
         ),
         tool::<PreviewArgs>(
             "preview",
             "An image's picture as PNG - a background, a texture through a palette, an atlas with each cell through \
-             its own - in one of its looks; or one of its parts by fragment (asset#variants/night).",
+             its own - in one of its looks; or one of its outputs (asset#picture/night).",
         ),
         tool::<NoArgs>(
             "editor_selection",
@@ -331,7 +328,7 @@ pub fn read(view: &View, uri: &str) -> Result<ReadResourceResult, String> {
     Ok(ReadResourceResult::new(vec![contents]))
 }
 
-/// An asset by its path (`res://` and `.asset` allowed) or its uid.
+/// An asset by its path (`res://` and `.node` allowed) or its uid.
 fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
     let name = name.trim();
     if let Some(path) = index.by_uid.get(name) {
@@ -349,7 +346,7 @@ fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
 }
 
 fn summary(asset: &Asset) -> Value {
-    json!({ "path": asset.path, "uid": asset.uid, "kind": asset.kind, "role": asset.role })
+    json!({ "path": asset.path, "uid": asset.uid, "kind": asset.kind,  })
 }
 
 fn project(view: &View) -> Value {
@@ -397,7 +394,6 @@ fn find_assets(index: &Index, args: &FindArgs) -> Value {
         .map(|a| &**a)
         .filter(|a| text.as_ref().is_none_or(|t| a.path.to_lowercase().contains(t.as_str())))
         .filter(|a| args.kind.is_none() || a.kind == args.kind)
-        .filter(|a| args.role.is_none() || a.role == args.role)
         .filter(|a| under.as_ref().is_none_or(|u| a.path.starts_with(u.as_str())))
         .collect();
     let (offset, limit) = (args.offset.unwrap_or(0), args.limit.unwrap_or(50).min(500));
@@ -467,16 +463,10 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
     if !fits.is_empty() {
         fields.insert("imports".into(), json!(fits));
     }
-    let parts: Vec<Value> = extensions
-        .parts(asset)
-        .into_iter()
-        .map(|p| {
-            let made_of = (!p.made_of.is_empty()).then_some(p.made_of);
-            json!({ "id": p.id, "label": p.label, "made_of": made_of })
-        })
-        .collect();
-    if !parts.is_empty() {
-        fields.insert("parts".into(), json!(parts));
+    let addresses: Vec<Value> =
+        extensions.addresses(asset).into_iter().map(|(address, label)| json!({ "address": address, "label": label })).collect();
+    if !addresses.is_empty() {
+        fields.insert("addresses".into(), json!(addresses));
     }
     if let Some(error) = &asset.error {
         fields.insert("error".into(), json!(error));
@@ -502,7 +492,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .iter()
         .map(|r| {
             let resolved = index.resolve(&r.uid, &r.target).map(|a| a.path.clone());
-            json!({ "slot": r.slot, "uid": r.uid, "part": r.part, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
+            json!({ "slot": r.slot, "uid": r.uid, "output": r.output, "target": (!r.target.is_empty()).then_some(&r.target), "resolves_to": resolved })
         })
         .collect();
     let by: Vec<Value> = index
@@ -510,7 +500,7 @@ fn references(index: &Index, name: &str) -> Result<Value, String> {
         .get(&asset.path)
         .map_or(&[][..], Vec::as_slice)
         .iter()
-        .map(|r| json!({ "from": r.from, "slot": r.slot, "part": r.part }))
+        .map(|r| json!({ "from": r.from, "slot": r.slot, "output": r.output }))
         .collect();
     Ok(json!({ "path": asset.path, "references": made, "referenced_by": by }))
 }
@@ -598,17 +588,17 @@ fn get_output(index: &Index, extensions: &Extensions, args: &OutputArgs) -> Resu
 }
 
 fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result<CallToolResult, String> {
-    // A part, by its fragment: `uid://...#variants/night`, `path#cells/cursor`.
-    if let Some((name, part)) = args.asset.split_once('#') {
+    // An output: `uid://...#picture/night`, `path#cells/cursor`.
+    if let Some((name, output)) = args.asset.split_once('#') {
         let asset = asset(index, name)?;
-        let ids: Vec<String> = extensions.parts(asset).into_iter().map(|p| p.id).collect();
+        let ids: Vec<String> = extensions.addresses(asset).into_iter().map(|(address, _)| address).collect();
         let image = extensions
-            .part(asset, part)
-            .ok_or_else(|| format!("{}: no part {part} with a picture; its parts: {}", asset.path, ids.join(", ")))?
+            .output_image(asset, output)
+            .ok_or_else(|| format!("{}: no output {output} that is a picture; its outputs: {}", asset.path, ids.join(", ")))?
             .map_err(|e| format!("{e:#}"))?;
         let image = upscale(image, args.scale.unwrap_or(1).clamp(1, 8));
         let png = project::ext::png(&image).map_err(|e| format!("{e:#}"))?;
-        let caption = format!("{}#{part}: {} x {}", asset.path, image.width, image.height);
+        let caption = format!("{}#{output}: {} x {}", asset.path, image.width, image.height);
         return Ok(CallToolResult::success(vec![
             ContentBlock::text(caption),
             ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"),
@@ -665,7 +655,7 @@ fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -
     let arguments: toml::Value =
         serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
     let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());
-    let lens = Lens { index: view.index, extensions, selection, looks: None, chosen: None };
+    let lens = Lens { index: view.index, extensions, selection, chosen: None };
     let answer = (tool.run)(&lens, &arguments).map_err(|e| format!("{e:#}"))?;
     serde_json::to_value(answer).map_err(|e| e.to_string())
 }

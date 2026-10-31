@@ -500,7 +500,7 @@ impl Editor {
         }
     }
 
-    /// The new name of an entry being renamed: in its folder, a bundle keeping its `.asset`.
+    /// The new name of an entry being renamed: in its folder, a bundle keeping its `.node`.
     fn rename_dialog(&mut self, ctx: &egui::Context) {
         let Some((uid, real, name)) = &mut self.renaming else { return };
         let (mut go, mut cancel) = (false, false);

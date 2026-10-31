@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use pe2_ext::{Style, Table, Texture, Ui, Value, View};
+use pe2_ext::{Style, Texture, Ui, Value, View};
 
 use crate::material::{self, Definition, LAYER_FULL, MAIN, STRENGTH};
 
@@ -17,7 +17,7 @@ pub struct Pictures(HashMap<String, Option<Texture>>);
 impl Pictures {
     pub fn get(&mut self, ui: &Ui, image: &str, part: &str) -> Option<&Texture> {
         let key = format!("{image}#{part}");
-        self.0.entry(key.clone()).or_insert_with(|| ui.project().part(image, part)?.ok().map(|picture| Texture::new(key, picture))).as_ref()
+        self.0.entry(key.clone()).or_insert_with(|| ui.project().image(image, part)?.ok().map(|picture| Texture::new(key, picture))).as_ref()
     }
 }
 
@@ -44,12 +44,6 @@ pub fn choices_of(ui: &Ui, texture: &Value) -> Option<Choices> {
     Some(Choices { image: image.path().to_string(), cells: named(image.parts("cells")), palettes: named(image.parts("palettes")), own })
 }
 
-pub fn with(texture: &Value, key: &str, value: &str) -> Value {
-    let mut table: Table = texture.as_table().cloned().unwrap_or_default();
-    table.insert(key.to_string(), value.into());
-    Value::Table(table)
-}
-
 impl Panel {
     fn slot(&mut self, ui: &mut Ui, key: &str, texture: &Value) {
         ui.field(key, texture);
@@ -59,7 +53,7 @@ impl Panel {
         };
         let cell = material::cell_of(texture).unwrap_or_default().to_string();
         let palette = material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
-        let part = format!("cells/{cell}@{palette}");
+        let part = material::cell_address(&cell, Some(&palette));
         if let Some(picture) = self.pictures.get(ui, &choices.image, &part).cloned() {
             #[expect(clippy::cast_precision_loss, reason = "a picture is far smaller than floats lose pixels at")]
             let wide = picture.width() as f32 / picture.height().max(1) as f32;
@@ -68,11 +62,11 @@ impl Panel {
         ui.horizontal(|ui| {
             ui.label("Cell");
             if let Some(chosen) = ui.combo(&format!("{key}.cell"), &cell, &choices.cells) {
-                ui.set(key, Some(&with(texture, "cell", &choices.cells[chosen])));
+                ui.set(key, Some(&material::reading(texture, &choices.cells[chosen], material::palette_of(texture))));
             }
             ui.label("Palette");
             if let Some(chosen) = ui.combo(&format!("{key}.palette"), &palette, &choices.palettes) {
-                ui.set(key, Some(&with(texture, "palette", &choices.palettes[chosen])));
+                ui.set(key, Some(&material::reading(texture, &cell, Some(&choices.palettes[chosen]))));
             }
         });
     }

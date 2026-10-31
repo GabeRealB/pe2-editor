@@ -133,7 +133,6 @@ struct Lent<'a> {
     path: String,
     uid: Option<String>,
     kind: Option<String>,
-    role: Option<String>,
     declaration: String,
     fields: OnceCell<Table>,
 }
@@ -144,9 +143,9 @@ impl<'a> Lent<'a> {
             Held::Borrowed(asset) => *asset,
             Held::Owned(asset) => asset,
         };
-        let (path, uid, kind, role) = (resource.path(), resource.uid(), resource.kind(), resource.role());
+        let (path, uid, kind) = (resource.path(), resource.uid(), resource.kind());
         let declaration = resource.declaration();
-        Lent { handle, path, uid, kind, role, declaration, fields: OnceCell::new() }
+        Lent { handle, path, uid, kind, declaration, fields: OnceCell::new() }
     }
 
     fn borrowed(asset: &'a host::Asset) -> Lent<'a> {
@@ -161,7 +160,7 @@ impl<'a> Lent<'a> {
     }
 
     fn asset(&self) -> Asset<'_> {
-        Asset::new(self, self.kind.as_deref(), self.role.as_deref())
+        Asset::new(self, self.kind.as_deref())
     }
 }
 
@@ -224,9 +223,8 @@ impl Source for Lent<'_> {
         self.resource().place(path)
     }
 
-    fn table_of(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
-        let told = self.resource().table_of(path, address).map_err(crate::Error::msg);
-        Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
+    fn output_of(&self, path: &str, address: &str) -> Option<crate::Result<Data>> {
+        Some(self.resource().output_of(path, address).map(from_wit).map_err(crate::Error::msg))
     }
 
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
@@ -298,30 +296,21 @@ impl Project for Lens<'_> {
         self.project.selection().map(|a| self.keep(a))
     }
 
-    fn look(&self, path: &str) -> usize {
-        self.project.look(path) as usize
-    }
-
     fn chosen(&self, path: &str, group: &str) -> Option<String> {
         self.project.chosen(path, group)
     }
 
-    fn picture(&self, path: &str, look: usize) -> Option<crate::Result<Image>> {
-        let look = u32::try_from(look).unwrap_or(u32::MAX);
+    fn picture(&self, path: &str, look: Option<&str>) -> Option<crate::Result<Image>> {
         self.project.picture(path, look).map(|made| made.map(from_image).map_err(crate::Error::msg))
     }
 
-    fn part(&self, path: &str, part: &str) -> Option<crate::Result<Image>> {
-        self.project.part(path, part).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    fn image(&self, path: &str, address: &str) -> Option<crate::Result<Image>> {
+        self.project.image(path, address).map(|made| made.map(from_image).map_err(crate::Error::msg))
     }
 
     fn table(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
         let told = self.project.table(path, address)?.map_err(crate::Error::msg);
         Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
-    }
-
-    fn parts(&self, path: &str) -> Vec<crate::Part> {
-        self.project.parts(path).into_iter().map(|(id, label, made_of)| crate::Part { id, label, made_of }).collect()
     }
 
     fn call(&self, service: &str, arguments: &Value) -> crate::Result<Value> {
@@ -344,7 +333,6 @@ struct Frame<'a> {
     ui: Handle<'a>,
     project: &'a Lens<'a>,
     asset: Option<Asset<'a>>,
-    look: usize,
 }
 
 impl Frame<'_> {
@@ -356,7 +344,7 @@ impl Frame<'_> {
     }
 
     fn child(&self, ui: host::Ui) -> Box<dyn UiHost + '_> {
-        Box::new(Frame { ui: Handle::Child(ui), project: self.project, asset: self.asset, look: self.look })
+        Box::new(Frame { ui: Handle::Child(ui), project: self.project, asset: self.asset })
     }
 }
 
@@ -547,11 +535,10 @@ impl UiHost for Frame<'_> {
         });
     }
 
-    fn picture(&mut self, path: &str, look: usize) -> Option<Result<crate::Texture, String>> {
-        let look = u32::try_from(look).unwrap_or(u32::MAX);
+    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<crate::Texture, String>> {
         let shown = self.ui().picture(path, look)?;
         Some(shown.map(|(handle, width, height)| {
-            crate::Texture::from_host(format!("{path}#{look}#picture"), width as usize, height as usize, handle)
+            crate::Texture::from_host(format!("{path}#{}#picture", look.unwrap_or_default()), width as usize, height as usize, handle)
         }))
     }
 
@@ -585,10 +572,6 @@ impl UiHost for Frame<'_> {
 
     fn asset(&self) -> Option<Asset<'_>> {
         self.asset
-    }
-
-    fn look(&self) -> usize {
-        self.look
     }
 
     fn project(&self) -> &dyn Project {
@@ -641,7 +624,7 @@ fn views(list: &[ViewDef], numbered: &mut Registered) -> Vec<g::View> {
         .collect()
 }
 
-/// A kind's or role's views, each list as the host is told of it: the one order they are numbered in, whether or not the host
+/// A kind's views, each list as the host is told of it: the one order they are numbered in, whether or not the host
 /// is being told (`number`).
 fn views_in_order(lists: [&[ViewDef]; 4], numbered: &mut Registered) -> [Vec<g::View>; 4] {
     lists.map(|list| views(list, numbered))
@@ -755,15 +738,6 @@ impl g::Guest for Component {
         let field = &registered().fields[field as usize];
         let format = if brief { field.brief.as_ref() } else { field.format.as_ref() }?;
         format(&parse_value(&value)?)
-    }
-
-    fn parts(kind: u32, asset: &host::Asset) -> Vec<g::Part> {
-        let lent = Lent::borrowed(asset);
-        let parts = registered().kinds[kind as usize].parts.as_ref();
-        parts.map_or_else(Vec::new, |parts| parts(&lent.asset()))
-            .into_iter()
-            .map(|p| g::Part { id: p.id, label: p.label, made_of: p.made_of })
-            .collect()
     }
 
     fn contents(kind: u32, asset: &host::Asset, project: &host::Project) -> g::AssetContents {
@@ -885,7 +859,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         events: parts.events.clone(),
         hooks: parts.hooks.iter().map(|h| g::Hook { event: h.event.clone(), op: h.op.clone(), signals: h.signals.clone() }).collect(),
         kinds: vec![],
-        roles: vec![],
         panels: vec![],
         tools: vec![],
         services: vec![],
@@ -905,21 +878,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
     };
     for kind in &parts.kinds {
         out.kinds.push(describe_kind(kind, &mut numbered));
-    }
-    for role in &parts.roles {
-        let lists = [&role.views[..], &role.inspector, &role.editors, &role.contents_views];
-        let [role_views, inspector, editors, contents_views] = views_in_order(lists, &mut numbered);
-        out.roles.push(g::Role {
-            name: role.name.local().to_string(),
-            kind: role.kind.to_string(),
-            alias: role.alias.clone(),
-            label: role.label.clone(),
-            fields: role.fields.iter().map(|f| field(f, &mut numbered)).collect(),
-            views: role_views,
-            inspector,
-            editors,
-            contents_views,
-        });
     }
     for panel in parts.panels {
         #[expect(clippy::cast_possible_truncation, reason = "a handful of views")]
@@ -942,7 +900,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
             handle,
             name: extractor.name.local().to_string(),
             kind: extractor.kind.to_string(),
-            roles: extractor.roles.iter().map(ToString::to_string).collect(),
+            requires: extractor.requires.clone(),
         });
     }
     numbered.types = parts.types;
@@ -964,7 +922,6 @@ fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
         label: kind.label.clone(),
         icon: kind.icon.map(|(i, t)| (icon(i), tint(t))),
         fields: kind.fields.iter().map(|f| field(f, numbered)).collect(),
-        parts: kind.parts.is_some(),
         contents: kind.contents.is_some(),
         part_sheet: kind.part_sheet.is_some(),
         views: kind_views,
@@ -990,7 +947,7 @@ fn describe_output(o: &crate::OutputDef) -> g::Output {
     }
 }
 
-/// What an extension registered, numbered as describing it numbers it - kinds' fields and views, roles', panels,
+/// What an extension registered, numbered as describing it numbers it - kinds' fields and views, panels,
 /// operations' fields - without the description.
 fn number(parts: crate::registry::Parts) -> Registered {
     let mut numbered = Registered {
@@ -1008,10 +965,6 @@ fn number(parts: crate::registry::Parts) -> Registered {
     for kind in &parts.kinds {
         numbered.fields.extend(kind.fields.iter().cloned());
         views_in_order([&kind.views, &kind.inspector, &kind.editors, &kind.contents_views], &mut numbered);
-    }
-    for role in &parts.roles {
-        numbered.fields.extend(role.fields.iter().cloned());
-        views_in_order([&role.views, &role.inspector, &role.editors, &role.contents_views], &mut numbered);
     }
     numbered.views.extend(parts.panels.into_iter().map(Maker::Panel));
     for op in &parts.ops {
@@ -1097,10 +1050,6 @@ impl CallHost for NodeHost<'_> {
         self.0.kind.as_deref()
     }
 
-    fn role(&self) -> Option<&str> {
-        self.0.role.as_deref()
-    }
-
     fn fields(&self) -> &Table {
         Source::fields(self.0)
     }
@@ -1142,8 +1091,8 @@ impl CallHost for NodeHost<'_> {
         Source::place(self.0, path)
     }
 
-    fn table_of(&self, path: &str, address: &str) -> crate::Result<crate::Table> {
-        Source::table_of(self.0, path, address).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
+    fn output_of(&self, path: &str, address: &str) -> crate::Result<Data> {
+        Source::output_of(self.0, path, address).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
@@ -1350,11 +1299,11 @@ impl g::GuestViewState for ViewState {
         ViewState(RefCell::new(made))
     }
 
-    fn show(&self, ui: &host::Ui, project: &host::Project, asset: Option<&host::Asset>, look: u32) {
+    fn show(&self, ui: &host::Ui, project: &host::Project, asset: Option<&host::Asset>) {
         let shown = asset.map(Lent::borrowed);
         let lens = Lens::new(project);
         let asset = shown.as_ref().map(Lent::asset);
-        let mut frame = Frame { ui: Handle::Lent(ui), project: &lens, asset, look: look as usize };
+        let mut frame = Frame { ui: Handle::Lent(ui), project: &lens, asset };
         self.0.borrow_mut().show(&mut crate::Ui::new(&mut frame));
     }
 }

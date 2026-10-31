@@ -460,7 +460,7 @@ mod tests {
                 x.to_be_bytes()[0]
             })
             .collect();
-        let declaration = format!("kind = \"image\"\nrole = \"texture\"\nmode = \"direct_16bpp\"\nsize = [{width}, {height}]\n");
+        let declaration = format!("kind = \"image\"\nmode = \"direct_16bpp\"\nsize = [{width}, {height}]\n");
         let node = Texture { fields: declaration.parse().unwrap(), declaration };
         let native = Value::Typed(Typed {
             ty: "pe2.images@texels".into(),
@@ -495,16 +495,16 @@ mod tests {
             }
         };
         let atlas = marks(
-            "kind = \"image\"\nrole = \"atlas\"\nmode = \"indexed_8bpp\"\nsize = [16, 16]\n\
+            "kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [16, 16]\n\
              cells.a = { rect = [0, 0, 8, 16] }\ncells.b = { rect = [8, 0, 8, 16] }\n",
         );
         assert_eq!(atlas.boxes.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!((atlas.summary.as_str(), atlas.toggle.as_str(), atlas.legend), ("2 cells", "Cells", true));
-        let wide = marks("kind = \"image\"\nrole = \"texture\"\nmode = \"indexed_8bpp\"\nsize = [300, 8]\n");
+        let wide = marks("kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [300, 8]\n");
         assert_eq!(wide.boxes.len(), 3);
         assert_eq!((wide.boxes[2].rect.x, wide.boxes[2].rect.width), (256.0, 44.0));
         assert_eq!(wide.toggle, "Pages");
-        let plain = marks("kind = \"image\"\nrole = \"texture\"\nmode = \"indexed_8bpp\"\nsize = [64, 8]\n");
+        let plain = marks("kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [64, 8]\n");
         assert_eq!(plain, pe2_ext::Marks::default());
     }
 

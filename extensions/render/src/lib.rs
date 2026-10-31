@@ -6,6 +6,7 @@ use pe2_ext::{Cell, Field, Icon, Registry, Result, Style, Tint, Ui, View};
 pe2_ext::extension!("pe2.render", "0.1.0", register);
 
 mod assembly;
+mod build;
 #[cfg(any(target_family = "wasm", test))]
 #[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
 mod camera;
@@ -36,11 +37,14 @@ mod view;
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
+    let rested = build::register(r);
     let mesh = r
         .kind("mesh")
         .alias("mesh")
         .label("Mesh")
         .icon(Icon::Polygon, Tint::Picture)
+        .stack(build::MESH)
+        .output("rest", &rested, pe2_ext::Retain::Cache)
         .editor("3D", Icon::Polygon, &[], |_| make_view())
         .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)
@@ -53,6 +57,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("material")
         .label("Material")
         .icon(Icon::Palette, Tint::Picture)
+        .stack(build::MATERIAL)
         .field(Field::new("shader").label("Shader").choices(material::SHADERS.iter().map(|shader| (shader.id, shader.label))))
         .field(Field::new("surface").label("Surface").choices(material::SURFACES))
         .field(Field::new("blend").label("Blend").choices(material::BLENDS.iter().map(|(id, label, _)| (*id, *label))))
@@ -69,6 +74,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("skeleton")
         .label("Skeleton")
         .icon(Icon::Bone, Tint::Structure)
+        .stack(build::SKELETON)
         .field(Field::new("joints").custom())
         .editor("3D", Icon::Bone, &[], |_| make_view())
         .contents(parts::contents)
@@ -80,6 +86,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("model")
         .label("Model")
         .icon(Icon::Package, Tint::Picture)
+        .stack(build::MODEL)
         .field(Field::new("materials").custom())
         .editor("3D", Icon::Package, &[], |_| make_view())
         .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))

@@ -1,12 +1,12 @@
-//! The project as an extension asks about it: assets by path, by reference, by kind; what the user selected; the look
-//! an asset is shown in. The assets are lent, like any: for the frame or call that asked.
+//! The project as an extension asks about it: assets by path, by reference, by kind; what the user selected; the
+//! members of an asset's families it is being looked at in. The assets are lent, like any: for the frame or call that asked.
 //!
 //! It is also how extensions use one another, through the host: what the host understands of any asset - its picture,
-//! its parts, its facts - is answered by the extension its kind is, whichever that is; and anything else by a service
+//! its outputs, its facts - is answered by the extension its kind is, whichever that is; and anything else by a service
 //! an extension offers (`Registry::service`), called by name. Each runs in the other extension's own instance, its
 //! memory and failures its own.
 
-use crate::{Asset, Image, Part, Result, Value};
+use crate::{Asset, Image, Result, Value};
 
 /// What the host answers about the project.
 pub trait Project {
@@ -14,28 +14,25 @@ pub trait Project {
     fn asset(&self, path: &str) -> Option<Asset<'_>>;
     /// The asset a reference names (`"uid://..."`, or `{ uid, path }`).
     fn resolve(&self, reference: &Value) -> Option<Asset<'_>>;
-    /// The member of a group of variants an asset is being looked at in, where one was chosen.
-    fn chosen(&self, path: &str, group: &str) -> Option<String> {
-        let _ = (path, group);
+    /// The member of a family of an asset's outputs it is being looked at in (`picture`: its look), where one was chosen.
+    fn chosen(&self, path: &str, family: &str) -> Option<String> {
+        let _ = (path, family);
         None
     }
     /// Every asset of a kind, by its qualified name or a built-in's bare one.
     fn find(&self, kind: &str) -> Vec<Asset<'_>>;
     /// The asset the user selected.
     fn selection(&self) -> Option<Asset<'_>>;
-    /// The look an asset is shown in, as the host's look picker chose it (an index into its picture's looks).
-    fn look(&self, path: &str) -> usize;
-    /// An asset's picture in one of its looks, drawn by the extension its kind is; none where it has none.
-    fn picture(&self, path: &str, look: usize) -> Option<Result<Image>>;
-    /// A part's picture (`palettes/default`); none where it has none.
-    fn part(&self, path: &str, part: &str) -> Option<Result<Image>>;
+    /// An asset's picture in a look (its first where none is named), drawn by the extension its kind is; none where it
+    /// has none.
+    fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>>;
+    /// An output of an asset that is a picture (`palettes/default`): none where it has no such output.
+    fn image(&self, path: &str, address: &str) -> Option<Result<Image>>;
     /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
     fn table(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
         let _ = (path, address);
         None
     }
-    /// An asset's parts, as its kind lists them.
-    fn parts(&self, path: &str) -> Vec<Part>;
     /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only
     /// the services of the extensions it requires (or its own).
     ///

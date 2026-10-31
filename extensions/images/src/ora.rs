@@ -501,7 +501,6 @@ mod tests {
         let fields: Table = toml::from_str(
             r#"
             kind = "image"
-            role = "atlas"
             mode = "indexed_8bpp"
             size = [8, 2]
             palettes.warm = {}
@@ -526,7 +525,7 @@ mod tests {
 
     fn imported_with(source: &[u8], fields: Table) -> Made {
         let lent = Lent { fields, files: HashMap::new() };
-        let image = import(&Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas")), source).unwrap();
+        let image = import(&Asset::new(&lent, Some("pe2.images@image")), source).unwrap();
         // As it is stored: its files, as its type encodes them.
         let pe2_ext::Data::Typed(typed) = <crate::Texels as pe2_ext::ty::ValueType>::encode(image) else { panic!("no files") };
         let files = typed
@@ -572,7 +571,7 @@ mod tests {
 
     fn source() -> Vec<u8> {
         let lent = atlas();
-        let asset = Asset::new(&lent, Some("pe2.images@image"), Some("pe2.images@atlas"));
+        let asset = Asset::new(&lent, Some("pe2.images@image"));
         export(&asset, &crate::TexelImage::read(&asset).unwrap()).unwrap()
     }
 

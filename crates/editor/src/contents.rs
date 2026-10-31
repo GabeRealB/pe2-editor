@@ -274,7 +274,7 @@ fn rows_ui(
                 ws.content_open.insert(key.clone(), !open);
             }
             if !row.is_heading() && response.clicked() {
-                chosen = Some((inner.clone(), row.look));
+                chosen = Some((inner.clone(), row.look.clone()));
             }
             if let Some(link) = row.link.as_ref().filter(|_| response.double_clicked()) {
                 *nav = Some(link.clone());
@@ -305,7 +305,7 @@ fn rows_ui(
         let selecting = selected.as_deref() != Some(&inner);
         ws.inner = selecting.then(|| (asset.path.clone(), inner));
         if let Some(look) = look.filter(|_| selecting) {
-            ws.variant_choice.insert(asset.path.clone(), look as usize);
+            ws.show_look(&asset.path, look);
         }
     }
     ask

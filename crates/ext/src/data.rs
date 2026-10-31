@@ -421,9 +421,8 @@ pub enum Retain {
 pub trait CallHost {
     /// Its node's path.
     fn path(&self) -> &str;
-    /// Its node's kind and role, qualified.
+    /// Its node's kind, qualified.
     fn kind(&self) -> Option<&str>;
-    fn role(&self) -> Option<&str>;
     /// Its node's settings, as declared: recorded as read.
     fn fields(&self) -> &Table;
     /// A content, whole.
@@ -486,11 +485,11 @@ pub trait CallHost {
         let _ = path;
         None
     }
-    /// Another asset's output that is a table; recorded as read.
+    /// An output of another asset, by its path or a reference to it; recorded as read.
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
-    fn table_of(&self, path: &str, address: &str) -> Result<Table> {
+    fn output_of(&self, path: &str, address: &str) -> Result<Value> {
         bail!("{path}: {address}: no project to look in here")
     }
     /// The config being built; recorded as read, so what reads it is made again for another.
@@ -662,12 +661,23 @@ impl Call<'_> {
         self.host.place(path)
     }
 
-    /// Another asset's output that is a table; made again when it changes.
+    /// An output of another asset, by its path or a reference to it; what reads it is made again when it changes.
     ///
     /// # Errors
     /// The project cannot be reached from here, or it could not be made.
+    pub fn output_of(&self, path: &str, address: &str) -> Result<Value> {
+        self.host.output_of(path, address)
+    }
+
+    /// An output of another asset that is a table.
+    ///
+    /// # Errors
+    /// As `output_of`, or it is no table.
     pub fn table_of(&self, path: &str, address: &str) -> Result<Table> {
-        self.host.table_of(path, address)
+        match self.output_of(path, address)? {
+            Value::Table(table) => Ok(table),
+            other => bail!("{path}: {address} is {}, no table", other.ty()),
+        }
     }
 
     /// The config being built; made again for another.
@@ -737,10 +747,10 @@ pub struct Lent<'a> {
 }
 
 impl<'a> Lent<'a> {
-    /// As an asset of its node's kind and role.
+    /// As an asset of its node's kind.
     #[must_use]
     pub fn asset(&'a self) -> Asset<'a> {
-        Asset::new(self, self.host.kind(), self.host.role())
+        Asset::new(self, self.host.kind())
     }
 
     fn file(&self, name: &str) -> Result<&File> {

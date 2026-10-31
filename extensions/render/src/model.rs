@@ -704,11 +704,30 @@ fn commands(model: &Model, bindings: &[Binding], layered: bool, effect: u32) -> 
     Ok((groups, seam, all))
 }
 
-/// What a game stores for a model: its arrays and its record, as `decode` reads them.
+/// A part as the game's skeleton stores it.
+pub struct Bone<'a> {
+    pub rotation: &'a [[i16; 3]; 3],
+    pub translation: [i32; 3],
+    pub parent: i32,
+}
+
+/// What a game stores for a model, as the record points at it.
+pub struct Arrays<'a> {
+    pub bones: Vec<Bone<'a>>,
+    pub part_vertices: Vec<u32>,
+    pub vertices: Vec<[i16; 3]>,
+    pub normals: Vec<[i16; 3]>,
+    pub stream: Vec<u32>,
+    /// What its commands take of the primitive buffer, and the part of that before the seam.
+    pub buffer: u32,
+    pub seam: u32,
+}
+
+/// A model's arrays.
 ///
 /// # Errors
 /// A face cannot be drawn with its slot's binding, or there is no opcode for it.
-pub fn encode(model: &Model, bindings: &[Binding], address: u32) -> Result<Vec<u8>> {
+pub fn arrays<'a>(model: &'a Model, bindings: &[Binding]) -> Result<Arrays<'a>> {
     let layered = bindings.first().is_some_and(|binding| binding.reflective);
     if bindings.iter().any(|binding| binding.reflective != layered) {
         bail!("the second layer is the whole model's: every slot is reflective, or none");
@@ -718,57 +737,72 @@ pub fn encode(model: &Model, bindings: &[Binding], address: u32) -> Result<Vec<u
         bail!("an effect is the whole model's: every slot has the same one");
     }
     let (groups, seam, all) = commands(model, bindings, layered, effect)?;
+    let mut stream = Vec::new();
+    let last = groups.len() - 1;
+    for (at, group) in groups.iter().enumerate() {
+        for run in group {
+            let stride = run.elements.first().map_or(0, Vec::len);
+            stream.extend([run.op, 0, u32::try_from(run.elements.len() << 16 | stride)?]);
+            stream.extend(run.elements.iter().flatten());
+        }
+        stream.push(if at == last { STREAM_END } else { GROUP_END });
+    }
+    let bones = model.parts.iter().map(|part| Ok(Bone { rotation: &part.rotation, translation: part.translation, parent: i32::try_from(part.parent)? }));
+    Ok(Arrays {
+        bones: bones.collect::<Result<_>>()?,
+        part_vertices: model.parts.iter().map(|part| u32::try_from(part.vertices.len())).collect::<Result<_, _>>()?,
+        vertices: model.parts.iter().flat_map(|part| &part.vertices).chain(&model.loose_vertices).copied().collect(),
+        normals: model.normals.clone(),
+        stream,
+        buffer: u32::try_from(all)?,
+        seam: u32::try_from(seam)?,
+    })
+}
+
+/// What a game stores for a model: its arrays and its record, as `decode` reads them.
+///
+/// # Errors
+/// As `arrays`.
+pub fn encode(model: &Model, bindings: &[Binding], address: u32) -> Result<Vec<u8>> {
+    let arrays = arrays(model, bindings)?;
     let mut out = Vec::new();
     let u32s = |out: &mut Vec<u8>, values: &[u32]| {
         for value in values {
             out.extend_from_slice(&value.to_le_bytes());
         }
     };
-    for part in &model.parts {
-        for value in part.rotation.iter().flatten() {
+    for bone in &arrays.bones {
+        for value in bone.rotation.iter().flatten() {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&[0; 2]);
-        for value in part.translation {
+        for value in bone.translation {
             out.extend_from_slice(&value.to_le_bytes());
         }
-        out.extend_from_slice(&i32::try_from(part.parent)?.to_le_bytes());
+        out.extend_from_slice(&bone.parent.to_le_bytes());
     }
     let counts_at = out.len();
-    for part in &model.parts {
-        u32s(&mut out, &[u32::try_from(part.vertices.len())?]);
-    }
+    u32s(&mut out, &arrays.part_vertices);
     let verts_at = out.len();
-    let points = model.parts.iter().flat_map(|part| &part.vertices).chain(&model.loose_vertices);
-    for point in points {
+    for point in &arrays.vertices {
         for value in point.iter().chain(&[0]) {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
     let norms_at = out.len();
-    for normal in &model.normals {
+    for normal in &arrays.normals {
         for value in normal.iter().chain(&[0]) {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
     let stream_at = out.len();
-    let last = groups.len() - 1;
-    for (at, group) in groups.iter().enumerate() {
-        for run in group {
-            let stride = run.elements.first().map_or(0, Vec::len);
-            u32s(&mut out, &[run.op, 0, u32::try_from(run.elements.len() << 16 | stride)?]);
-            for element in &run.elements {
-                u32s(&mut out, element);
-            }
-        }
-        u32s(&mut out, &[if at == last { STREAM_END } else { GROUP_END }]);
-    }
+    u32s(&mut out, &arrays.stream);
     let address_of = |at: usize| Ok::<u32, std::num::TryFromIntError>(address.wrapping_add(u32::try_from(at)?));
     let record = [
         0,
-        u32::try_from(all)?,
-        u32::try_from(seam)?,
-        u32::try_from(model.parts.len())?,
+        arrays.buffer,
+        arrays.seam,
+        u32::try_from(arrays.bones.len())?,
         address_of(counts_at)?,
         address_of(verts_at)?,
         address_of(norms_at)?,

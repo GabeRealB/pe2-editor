@@ -140,21 +140,21 @@ mod tests {
     fn batches_changes_and_leaves_out_bookkeeping() {
         let root = std::env::temp_dir().join(format!("pe2-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("a.asset")).unwrap();
+        std::fs::create_dir_all(root.join("a.node")).unwrap();
         std::fs::create_dir_all(root.join(".cache")).unwrap();
         let watch = Watch::start(std::slice::from_ref(&root), &[], vec![root.join(".cache")], egui::Context::default())
             .unwrap();
         std::fs::write(root.join(".cache/index.json"), "{}").unwrap();
-        std::fs::write(root.join("a.asset/.asset.toml.1.tmp"), "x").unwrap();
-        let declaration = root.join("a.asset/asset.toml");
+        std::fs::write(root.join("a.node/.node.toml.1.tmp"), "x").unwrap();
+        let declaration = root.join("a.node/node.toml");
         std::fs::write(&declaration, "uid = \"uid://a\"\n").unwrap();
         let seen = collect(&watch, |seen| seen.contains(&declaration));
         assert!(seen.contains(&declaration), "{seen:?}");
         assert!(seen.iter().all(|p| !p.starts_with(root.join(".cache")) && p.extension().is_none_or(|e| e != "tmp")));
         // A rename reports both names.
-        std::fs::rename(root.join("a.asset"), root.join("b.asset")).unwrap();
-        let seen = collect(&watch, |seen| seen.contains(&root.join("b.asset")));
-        assert!(seen.contains(&root.join("a.asset")) && seen.contains(&root.join("b.asset")), "{seen:?}");
+        std::fs::rename(root.join("a.node"), root.join("b.node")).unwrap();
+        let seen = collect(&watch, |seen| seen.contains(&root.join("b.node")));
+        assert!(seen.contains(&root.join("a.node")) && seen.contains(&root.join("b.node")), "{seen:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

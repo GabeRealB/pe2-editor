@@ -1,9 +1,9 @@
 //! The extension SDK: what an extension of the editor is written against.
 //!
-//! An extension has an id (`pe2.images`), which namespaces everything it registers: its kinds and roles are named
+//! An extension has an id (`pe2.images`), which namespaces everything it registers: its kinds are named
 //! `<id>@<name>` (`pe2.images@image`), so no two extensions' names collide and every name says who owns it. It
 //! registers procedurally, from one entry point (`extension!`): a kind and what it attaches to it - its fields as the
-//! inspector shows them, its outputs, its views - roles on its own kinds or on its dependencies', and the types and
+//! inspector shows them, its outputs, its views - and the types and
 //! operations its nodes' stacks are made of (`data`).
 //!
 //! An extension is built as a WebAssembly component (`wasm32-wasip3`): `extension!` then exports it through the
@@ -36,8 +36,19 @@ pub use data::{BuildConfig, Call, CallHost, Content, File, FileWriter, Generator
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
 pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, Recipe, SheetOfPart, TabDef, 
-    Extension, Field, Format, Icon, KindBuilder, KindDef, ListParts, MakePanel, MakeView, Name, OpBuilder, PanelDef, Part, Parts,
-    Registry, RoleBuilder, RoleDef, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
+    Extension, Field, Format, Icon, KindBuilder, KindDef, MakePanel, MakeView, Name, OpBuilder, PanelDef, Parts,
+    Registry, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};
+
+/// The output of an asset a reference names: what follows its uid (`palettes/default` of
+/// `uid://...#palettes/default`), or the `output` of a reference written with its path.
+#[must_use]
+pub fn output_of(reference: &Value) -> Option<&str> {
+    let output = match reference {
+        Value::Table(table) => table.get("output")?.as_str()?,
+        _ => reference.as_str()?.strip_prefix("uid://")?.split_once('#')?.1,
+    };
+    (!output.is_empty()).then_some(output)
+}
 pub use ui::{Canvas, Cell, Marked, Modifiers, Placed, Style, Traced, Ui, UiHost, View, ViewportInput};

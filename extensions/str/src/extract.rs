@@ -54,7 +54,7 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
                     .and_then(|m| m.get("path"))
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("{file}: its entry {id} names no movie"))?;
-                let movie = path.trim_start_matches("res://").trim_end_matches(".asset").to_string();
+                let movie = path.trim_start_matches("res://").trim_end_matches(".node").to_string();
                 places.entry(movie).or_default().push(Place {
                     release: release.clone(),
                     disc: disc.clone(),

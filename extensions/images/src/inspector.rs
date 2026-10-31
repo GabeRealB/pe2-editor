@@ -4,7 +4,7 @@
 use pe2_ext::{Asset, Canvas, ContentOutcome, ContentPlace, ContentRequest, Icon, Placed, Rect, Result, Style, Table, Texture, Ui, Value, View, bail};
 use std::collections::HashMap;
 
-use crate::{palette_names, rect, role};
+use crate::{is_atlas, palette_names, rect};
 
 /// `n` of a plural noun: "1 cell", "8 cells".
 fn count_of(n: usize, plural: &str) -> String {
@@ -63,7 +63,7 @@ impl Shown {
             .collect();
         Shown {
             path: asset.path().to_string(),
-            atlas: role(asset) == Some("atlas"),
+            atlas: is_atlas(asset),
             palette_names: palette_names(asset),
             palettes,
             variants,
@@ -149,7 +149,7 @@ impl Shown {
 impl Collections {
     fn swatch_of(&mut self, asset: &Asset, palette: &str) {
         self.swatches.entry(palette.to_string()).or_insert_with(|| {
-            let strip = crate::part_picture(asset, &format!("palettes/{palette}"))?.ok()?;
+            let strip = crate::output_picture(asset, &format!("palettes/{palette}"))?.ok()?;
             Some(Texture::new(format!("{}#palettes/{palette}#swatch", asset.path()), strip))
         });
     }
@@ -419,7 +419,7 @@ pub(crate) struct CellSheet {
 impl CellSheet {
     fn picture_of(&mut self, asset: &Asset, part: &str) -> Option<(Texture, f32, f32)> {
         let picture = self.pictures.entry(part.to_string()).or_insert_with(|| {
-            let image = crate::part_picture(asset, part)?.ok()?;
+            let image = crate::output_picture(asset, part)?.ok()?;
             #[expect(clippy::cast_precision_loss, reason = "picture sizes")]
             let (width, height) = (image.width as f32, image.height as f32);
             Some((Texture::new(format!("{}#{part}#sheet", asset.path()), image), width, height))

@@ -23,7 +23,7 @@ const PATIENCE: Duration = Duration::from_secs(10);
 const INSTRUCTIONS: &str = "A Parasite Eve II project: its assets are bundles in layers stacked bottom to top (the game \
 layer extracted from the discs at the bottom, read-only), resolved into one tree by path, each asset with a uid \
 (uid://...) that references name it by. Find assets with find_assets or list_folder, read one with get_asset (its \
-declaration is its asset.toml), follow references both ways with references, see images with preview. The project \
+declaration is its node.toml), follow references both ways with references, see images with preview. The project \
 is read-only here. Where the editor has the project open, its window is served too: editor_ui reads its widgets (ids \
 to act on), editor_screenshot shows it, and - where the user lets agents use the editor - editor_act clicks, drags \
 and scrolls, editor_type types and presses keys, editor_commands lists and editor_run runs its commands, the edits these make being the editor's own, undoable in its \
@@ -126,7 +126,7 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_ {
         let mut template = ResourceTemplate::new("uid://{uid}", "asset");
-        template.description = Some("An asset's declaration (its asset.toml), by its uid.".into());
+        template.description = Some("An asset's declaration (its node.toml), by its uid.".into());
         template.mime_type = Some("application/toml".into());
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![template])))
     }

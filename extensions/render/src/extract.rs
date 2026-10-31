@@ -9,6 +9,7 @@ use formats::lzss;
 use pe2_ext::{Declared, Discs, Extraction, Made, Result, Table, Value, anyhow, bail};
 use sha1::{Digest, Sha1};
 
+use crate::build;
 use crate::material::{self, Definition};
 use crate::mesh;
 use crate::model::{Binding, Model, Placement, decode, encode};
@@ -58,7 +59,7 @@ struct Models {
 /// The path a reference names, a `slot` beside what it places or the reference alone.
 fn target(reference: &Value) -> Option<&str> {
     let reference = reference.get("slot").unwrap_or(reference);
-    reference.get("slot").unwrap_or(reference).get("path")?.as_str()?.strip_prefix("res://")?.strip_suffix(".asset")
+    reference.get("slot").unwrap_or(reference).get("path")?.as_str()?.strip_prefix("res://")?.strip_suffix(".node")
 }
 
 fn pair(value: Option<&Value>) -> Option<[i64; 2]> {
@@ -74,25 +75,32 @@ fn placed(tables: &Tables, placement: &Value) -> Option<[i64; 2]> {
     Some([x + ax, y + ay])
 }
 
+/// What an image says of itself to what draws it (`pe2.images@placement`), from the declarations.
+fn image_placement(tables: &Tables, image: &Table) -> Table {
+    let bits = match image.get("mode").and_then(Value::as_str) {
+        Some("indexed_8bpp") => 8,
+        Some("indexed_4bpp") => 4,
+        _ => 16,
+    };
+    let at = |[x, y]: [i64; 2]| Value::Array(vec![Value::Integer(x), Value::Integer(y)]);
+    let mut made = Table::from_iter([("bits".to_string(), Value::Integer(bits))]);
+    if let Some(page) = image.get("page").and_then(|page| placed(tables, page)) {
+        made.insert("page".to_string(), at(page));
+    }
+    if let Some(cells) = image.get("cells") {
+        made.insert("cells".to_string(), cells.clone());
+    }
+    let palettes = image.get("palettes").and_then(Value::as_table).into_iter().flatten();
+    let palettes = palettes.filter_map(|(name, palette)| Some((name.clone(), at(placed(tables, palette)?))));
+    made.insert("palettes".to_string(), Value::Table(palettes.collect()));
+    made
+}
+
 /// Where a material's texture is on the console: all of it follows from the image's declaration.
 fn placement(tables: &Tables, texture: &Value) -> Result<Placement> {
     let path = target(texture).ok_or_else(|| anyhow!("a texture names no image"))?;
     let image = tables.images.get(path).ok_or_else(|| anyhow!("no image {path}"))?;
-    let bits = match image.get("mode").and_then(Value::as_str) {
-        Some("indexed_8bpp") => 8,
-        Some("indexed_4bpp") => 4,
-        other => bail!("{path}: a {other:?} is no texture of a face"),
-    };
-    let cell_name = material::cell_of(texture).ok_or_else(|| anyhow!("{path}: no cell is named"))?;
-    let cell = image.get("cells").and_then(|cells| cells.get(cell_name)).ok_or_else(|| anyhow!("{path}: no cell {cell_name}"))?;
-    let palette_name = material::palette_of(texture).or_else(|| cell.get("palette").and_then(Value::as_str)).ok_or_else(|| anyhow!("{path}: no palette"))?;
-    let palette = image.get("palettes").and_then(|palettes| palettes.get(palette_name)).ok_or_else(|| anyhow!("{path}: no palette {palette_name}"))?;
-    let [x, y] = pair(cell.get("rect")).ok_or_else(|| anyhow!("{path}: {cell_name} has no place"))?;
-    let [page_x, page_y] = image.get("page").and_then(|page| placed(tables, page)).ok_or_else(|| anyhow!("{path}: no page"))?;
-    let [palette_x, palette_y] = placed(tables, palette).ok_or_else(|| anyhow!("{path}: {palette_name} is in no slot"))?;
-    let narrow = |value: i64| u16::try_from(value).map_err(|_| anyhow!("{path}: {value} is off the console's memory"));
-    let page = [narrow((page_x + x * i64::from(bits) / 16) / 64 * 64)?, narrow((page_y + y) / 256 * 256)?];
-    Ok(Placement { bits, page, palette: [narrow(palette_x)?, narrow(palette_y)?] })
+    build::placement(&image_placement(tables, image), texture).map_err(|why| anyhow!("{path}: {why:#}"))
 }
 
 fn binding(tables: &Tables, model: &Table, slot: &str) -> Result<Binding> {
@@ -210,7 +218,7 @@ mod tests {
 
     fn tables() -> Tables {
         let text = |toml: &str| toml.parse::<Table>().unwrap();
-        let slot = |name: &str| format!("{{ uid = 'uid://x', path = 'res://{name}.asset' }}");
+        let slot = |name: &str| format!("{{ uid = 'uid://x', path = 'res://{name}.node' }}");
         let image = format!(
             "mode = 'indexed_8bpp'\npage = {{ slot = {}, at = [0, 0] }}\ncells.left = {{ rect = [0, 0, 128, 256], palette = 'one' }}\ncells.right = {{ rect = [128, 0, 128, 256], palette = 'two' }}\npalettes.one = {{ slot = {}, at = [0, 0] }}\npalettes.two = {{ slot = {}, at = [0, 1] }}",
             slot("sheet"),
@@ -228,14 +236,14 @@ mod tests {
 
     #[test]
     fn a_cell_past_a_page_is_on_the_next() {
-        let texture: Table = "main = { slot = { slot = { uid = 'uid://x', path = 'res://image.asset' } }, cell = 'right' }".parse().unwrap();
+        let texture: Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/right' }".parse().unwrap();
         let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [448, 256], palette: [0, 246] });
     }
 
     #[test]
     fn a_binding_chooses_its_palette_over_its_cells() {
-        let texture: Table = "main = { slot = { slot = { uid = 'uid://x', path = 'res://image.asset' } }, cell = 'left', palette = 'two' }".parse().unwrap();
+        let texture: Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
         let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [384, 256], palette: [0, 246] });
     }

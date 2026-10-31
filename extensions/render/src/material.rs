@@ -68,20 +68,57 @@ impl Definition {
     }
 }
 
-/// What a texture slot holds: an image, by the reference a table keeps beside the cell and the palette it reads.
+/// What a texture slot holds is a reference to a cell of an image: `cells/<cell>`, or `cells/<cell>@<palette>` through a
+/// palette other than the cell's own.
+fn cell_output(texture: &Value) -> Option<&str> {
+    pe2_ext::output_of(texture)?.strip_prefix("cells/")
+}
+
 #[must_use]
 pub fn cell_of(texture: &Value) -> Option<&str> {
-    texture.get("cell").and_then(Value::as_str)
+    cell_output(texture).map(|output| output.split_once('@').map_or(output, |(cell, _)| cell))
 }
 
 #[must_use]
 pub fn palette_of(texture: &Value) -> Option<&str> {
-    texture.get("palette").and_then(Value::as_str)
+    cell_output(texture)?.split_once('@').map(|(_, palette)| palette)
+}
+
+/// The output naming a cell, through a palette where one is named.
+#[must_use]
+pub fn cell_address(cell: &str, palette: Option<&str>) -> String {
+    palette.map_or_else(|| format!("cells/{cell}"), |palette| format!("cells/{cell}@{palette}"))
+}
+
+/// A texture naming this cell through this palette, of the image it names.
+#[must_use]
+pub fn reading(texture: &Value, cell: &str, palette: Option<&str>) -> Value {
+    let output = cell_address(cell, palette);
+    if let Value::Table(table) = texture {
+        let mut table = table.clone();
+        table.insert("output".to_string(), output.into());
+        return Value::Table(table);
+    }
+    let reference = texture.as_str().unwrap_or_default();
+    let uid = reference.split_once('#').map_or(reference, |(uid, _)| uid);
+    format!("{uid}#{output}").into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_texture_names_a_cell_and_a_palette_of_its_image() {
+        let table: pe2_ext::Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
+        let written = &table["main"];
+        assert_eq!((cell_of(written), palette_of(written)), (Some("left"), Some("two")));
+        let again = reading(written, "right", None);
+        assert_eq!((cell_of(&again), palette_of(&again)), (Some("right"), None));
+        assert_eq!(again["uid"].as_str(), Some("uid://x"));
+        let extracted = Value::String("uid://x#cells/left".to_string());
+        assert_eq!(reading(&extracted, "left", Some("two")).as_str(), Some("uid://x#cells/left@two"));
+    }
 
     #[test]
     fn a_material_says_how_it_draws() {

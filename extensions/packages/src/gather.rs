@@ -3,6 +3,7 @@
 //! not found is left for the compiler to say.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 
 use pe2_ext::ty::{Registered, SourceTree};
 use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
@@ -11,6 +12,8 @@ use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
 const CORE: &str = "core";
 /// What every unit includes first, beside `core`'s public files.
 const MACROS: &str = "pe2.h";
+/// What `MACROS` includes: the values of the slots of the package being built.
+const VALUES: &str = "pe2_values.h";
 
 /// A package of the build graph: the graph has one, by name.
 pub struct Package {
@@ -52,13 +55,15 @@ struct Gathering<'a> {
     pending: Vec<Taken>,
     /// Names asked for that no package answers: the slots left open.
     open: BTreeSet<String>,
+    /// The slots what was reached declares (`PE2_BIND`).
+    bound: BTreeSet<String>,
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let path = call.host.path().to_string();
     let name = name_of(&path).to_string();
-    let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], open: BTreeSet::new() };
+    let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], bound: BTreeSet::new(), open: BTreeSet::new() };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let units = selected(call.host.fields(), &own_path, &own_files)?;
@@ -73,6 +78,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.reached.insert(name);
     gathering.take_macros()?;
     gathering.follow()?;
+    gathering.take_values()?;
     if !gathering.open.is_empty() {
         let open: Vec<&str> = gathering.open.iter().map(String::as_str).collect();
         bail!("{path} asks for {}, which no package answers", open.join(", "));
@@ -169,6 +175,12 @@ fn asked(line: &str) -> Option<Asked<'_>> {
     Some(Asked::Beside(rest.strip_prefix('"')?.split_once('"')?.0))
 }
 
+/// The slot a line declares: `PE2_BIND(name, type)`.
+fn declared_slot(line: &str) -> Option<&str> {
+    let (name, _) = line.trim_start().strip_prefix("PE2_BIND(")?.split_once(',')?;
+    Some(name.trim())
+}
+
 /// What the assembler is told to read: `.include "name"`, in assembly or in the strings of C.
 fn assembled(text: &str) -> Vec<&str> {
     let mut names = vec![];
@@ -235,6 +247,31 @@ impl Gathering<'_> {
         Ok(())
     }
 
+    /// What the slots declared hold, each a macro of what `PE2_VALUE` reads: a table's every key, as tokens. It is a
+    /// file of its own, each package having its own.
+    fn take_values(&mut self) -> Result<()> {
+        let bindings = self.call.host.fields().get("bind").cloned();
+        let mut header = String::new();
+        for name in std::mem::take(&mut self.bound) {
+            let Some(held) = bindings.as_ref().and_then(|bindings| bindings.get(&name)) else {
+                self.open.insert(name);
+                continue;
+            };
+            let target = match held {
+                Value::Table(table) => table.get("uid").and_then(Value::as_str),
+                _ => held.as_str().map(|text| text.split_once('#').map_or(text, |(uid, _)| uid)),
+            };
+            let target = target.ok_or_else(|| anyhow!("{name} is bound to no reference"))?;
+            let output = pe2_ext::output_of(held).ok_or_else(|| anyhow!("{name} is bound to no output of {target}"))?;
+            for (key, value) in self.call.table_of(target, output)? {
+                let tokens = value.as_str().map_or_else(|| value.to_string(), str::to_string);
+                let _ = writeln!(header, "#define pe2_value_{name}_{key} {tokens}");
+            }
+        }
+        self.tree.insert(VALUES.to_string(), header.into_bytes());
+        Ok(())
+    }
+
     /// Take in what is pending and everything it reaches.
     fn follow(&mut self) -> Result<()> {
         while let Some(taken) = self.pending.pop() {
@@ -245,6 +282,9 @@ impl Gathering<'_> {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             self.tree.insert(taken.place.clone(), bytes);
             for line in text.lines() {
+                if let Some(name) = declared_slot(line) {
+                    self.bound.insert(name.to_string());
+                }
                 match asked(line) {
                     Some(Asked::Package(name, inside)) => self.take_public(name, inside),
                     Some(Asked::Beside(file)) => self.take_beside(&taken, file),

@@ -3,7 +3,7 @@
 /// over it, so an extension's code is the same linked in or built as a component.
 ///
 /// Callbacks cannot cross: what an extension registers is described by `register`'s result, each callback by a handle
-/// the host calls back with (an operation's for its run, a kind's index for its outputs' members and its parts, a
+/// the host calls back with (an operation's for its run, a kind's index for its outputs' members, a
 /// field's for its readings, a view's or a panel's for its views, a tool's for its work). Settings cross as TOML (`4`,
 /// `"indexed_4bpp"`, `{ a = 1 }`); the work graph's values as `value`.
 ///
@@ -193,15 +193,14 @@ interface host {
         folder: string,
     }
 
-    use types.{image, rect, style, icon, file};
+    use types.{image, rect, style, icon, file, value};
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
         path: func() -> string;
         uid: func() -> option<string>;
-        /// Its kind and role, qualified (`pe2.images@image`), as the host resolved them.
+        /// Its kind, qualified (`pe2.images@image`), as the host resolved it.
         kind: func() -> option<string>;
-        role: func() -> option<string>;
         /// Its declaration, as written (TOML).
         declaration: func() -> string;
         has-file: func(name: string) -> bool;
@@ -228,8 +227,8 @@ interface host {
         read-entry: func(path: string) -> result<list<u8>, string>;
         /// For an operation's run: where a file or folder of the project is on disk, for what is told paths.
         place: func(path: string) -> option<string>;
-        /// For an operation's run: another asset's output that is a table (TOML), recorded as read.
-        table-of: func(path: string, address: string) -> result<string, string>;
+        /// For an operation's run: an output of another asset, by its path or a reference to it, recorded as read.
+        output-of: func(path: string, address: string) -> result<value, string>;
         /// For an operation's run: the config being built, recorded as read.
         build-config: func() -> option<build-config>;
         /// For an operation's run: the assets of a kind, each by its path with its declaration as written. What is made is made again
@@ -252,16 +251,15 @@ interface host {
         asset: func(path: string) -> option<asset>;
         /// The asset a reference names (TOML: `"uid://..."`, or `{ uid, path }`).
         resolve: func(reference: string) -> option<asset>;
-        /// The member of a group of variants an asset is being looked at in, where one was chosen.
-        chosen: func(path: string, group: string) -> option<string>;
+        /// The member of a family of an asset's outputs it is being looked at in (`picture`: its look), where one was
+        /// chosen.
+        chosen: func(path: string, family: string) -> option<string>;
         find: func(kind: string) -> list<asset>;
         selection: func() -> option<asset>;
-        look: func(path: string) -> u32;
-        /// What the host understands of any asset, answered by the extension its kind is: its picture in a look, a
-        /// part's picture, its parts (id, label, what it is made of).
-        picture: func(path: string, look: u32) -> option<result<image, string>>;
-        part: func(path: string, part: string) -> option<result<image, string>>;
-        parts: func(path: string) -> list<tuple<string, string, list<string>>>;
+        /// What the host understands of any asset, answered by the extension its kind is: its picture in a look (its
+        /// first where none is named), and any output of it that is a picture (`palettes/default`).
+        picture: func(path: string, look: option<string>) -> option<result<image, string>>;
+        image: func(path: string, address: string) -> option<result<image, string>>;
         /// An output of an asset that is a table (TOML): none where it has no such output, or why it could not be made.
         table: func(path: string, address: string) -> option<result<string, string>>;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
@@ -395,7 +393,7 @@ interface host {
         table: func(id: string, rows: list<list<cell>>) -> option<tuple<u32, u32>>;
         /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show
         /// it - with its width and height: none while it is being drawn (the view is drawn again when it is).
-        picture: func(path: string, look: u32) -> option<result<tuple<texture, u32, u32>, string>>;
+        picture: func(path: string, look: option<string>) -> option<result<tuple<texture, u32, u32>, string>>;
         navigate: func(path: string);
         /// The part selected of the asset shown: its fragment (`cells/cursor`).
         selected: func() -> option<string>;
@@ -515,7 +513,7 @@ interface guest {
         icon: option<tuple<icon, tint>>,
         picture: bool,
         open: bool,
-        look: option<u32>,
+        look: option<string>,
         link: option<string>,
         rename: bool,
         drag: option<content-drag>,
@@ -585,15 +583,14 @@ interface guest {
         %from: option<string>,
     }
 
-    /// A kind; its outputs' members and its parts called back by its index.
+    /// A kind; its outputs' members called back by its index.
     record kind {
         name: string,
         alias: option<string>,
         label: string,
         icon: option<tuple<icon, tint>>,
         fields: list<field>,
-        parts: bool,
-        /// Whether it says what is inside its assets, rather than that following from their parts.
+        /// Whether it says what is inside its assets.
         contents: bool,
         /// Whether it says what a part's fields are, rather than those being what its table holds.
         part-sheet: bool,
@@ -606,21 +603,6 @@ interface guest {
         outputs: list<output>,
         /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
         stack: option<string>,
-    }
-
-    record role {
-        name: string,
-        /// Qualified: a role may be on a dependency's kind.
-        kind: string,
-        alias: option<string>,
-        label: string,
-        fields: list<field>,
-        views: list<view>,
-        inspector: list<view>,
-        /// Editors of its own, beside the preview: each of these a document can show instead of it.
-        editors: list<view>,
-        /// Views at the head of the contents pane, over its rows: what rows cannot say.
-        contents-views: list<view>,
     }
 
     record panel {
@@ -683,13 +665,13 @@ interface guest {
         sniff: bool,
     }
 
-    /// An extractor: the native files of a kind's assets (of some of its roles, qualified; all where none) from the
+    /// An extractor: the native files of a kind's assets (of those with all of `requires`' fields) from the
     /// discs, in sessions (`extraction`).
     record extractor {
         handle: u32,
         name: string,
         kind: string,
-        roles: list<string>,
+        requires: list<string>,
     }
 
     /// Where a setting is kept: the project's (the same for everyone on it) or the user's (a preference).
@@ -727,7 +709,6 @@ interface guest {
         /// The events it declares, by name, with their labels.
         events: list<tuple<string, string>>,
         hooks: list<hook>,
-        roles: list<role>,
         panels: list<panel>,
         tools: list<tool>,
         /// Services, for other extensions: described as tools are.
@@ -753,7 +734,7 @@ interface guest {
     /// Run the extension's entry point.
     register: func() -> result<registration, string>;
 
-    /// An operation's run: lent its node as an asset - its path, kind, role and declared settings, its files the
+    /// An operation's run: lent its node as an asset - its path, kind and declared settings, its files the
     /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
     /// parameter.
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
@@ -762,15 +743,6 @@ interface guest {
     members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
-    /// A part of an asset, by its fragment; a virtual one made of others.
-    record part {
-        id: string,
-        label: string,
-        made-of: list<string>,
-    }
-
-    /// An asset's parts, in order.
-    parts: func(kind: u32, asset: borrow<asset>) -> list<part>;
     /// What is inside an asset, in order.
     contents: func(kind: u32, asset: borrow<asset>, project: borrow<project>) -> asset-contents;
     /// What comes of something done in the contents: why it cannot be, where it cannot.
@@ -797,7 +769,7 @@ interface guest {
     /// A view, kept between frames: of an asset, or a panel's (no asset).
     resource view-state {
         constructor(view: u32, asset: option<borrow<asset>>);
-        show: func(ui: borrow<ui>, project: borrow<project>, asset: option<borrow<asset>>, look: u32);
+        show: func(ui: borrow<ui>, project: borrow<project>, asset: option<borrow<asset>>);
     }
 
     /// What makes a stream's items (`start-stream`), living in an instance of its own while the stream is read: its

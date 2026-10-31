@@ -181,7 +181,7 @@ pub trait UiHost {
     fn table(&mut self, id: &str, rows: &[Vec<Cell>]) -> Option<(usize, usize)>;
     /// An asset's picture in a look as the host draws it - once, off the window's thread, shared by all that show it:
     /// none while it is being drawn (the view is drawn again when it is), or why it cannot be.
-    fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>>;
+    fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>>;
     /// Select the asset at a path, as clicking it in the tree would.
     fn navigate(&mut self, path: &str);
     /// The part selected of the asset shown: its fragment (`cells/cursor`), wherever it was selected.
@@ -197,8 +197,6 @@ pub trait UiHost {
     fn tab(&mut self, at: f32);
     /// The asset the view shows, lent for the frame; none for a panel.
     fn asset(&self) -> Option<Asset<'_>>;
-    /// The look the asset is shown in (an index into its picture's looks), as the host's look picker chose it.
-    fn look(&self) -> usize;
     fn project(&self) -> &dyn Project;
 }
 
@@ -375,7 +373,7 @@ impl<'a> Ui<'a> {
     }
 
     /// An asset's picture in a look as the host draws it: none while it is being drawn, or why it cannot be.
-    pub fn picture(&mut self, path: &str, look: usize) -> Option<Result<Texture, String>> {
+    pub fn picture(&mut self, path: &str, look: Option<&str>) -> Option<Result<Texture, String>> {
         self.host.picture(path, look)
     }
 
@@ -418,12 +416,6 @@ impl<'a> Ui<'a> {
     #[must_use]
     pub fn asset(&self) -> Option<Asset<'_>> {
         self.host.asset()
-    }
-
-    /// The look it is shown in.
-    #[must_use]
-    pub fn look(&self) -> usize {
-        self.host.look()
     }
 
     /// The project, to ask about other assets.

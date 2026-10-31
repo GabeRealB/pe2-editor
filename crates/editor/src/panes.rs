@@ -249,7 +249,7 @@ pub enum EditorKind {
     Graph,
     /// Its bundle's files, as text or bytes.
     Files,
-    /// One an extension gives its kind or role, by name.
+    /// One an extension gives its kind, by name.
     Extension(PanelName),
 }
 
@@ -1375,7 +1375,7 @@ fn files_view_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
         ui.label(RichText::new("Nothing to preview for this asset").color(theme::weak()));
         return;
     }
-    let default = asset.files.iter().find(|f| f.name != project::index::ASSET_FILE).unwrap_or(&asset.files[0]);
+    let default = asset.files.iter().find(|f| f.name != project::index::NODE_FILE).unwrap_or(&asset.files[0]);
     let mut chosen = ws.viewed_file.get(&asset.path).cloned().unwrap_or_else(|| default.name.clone());
     if !asset.files.iter().any(|f| f.name == chosen) {
         chosen.clone_from(&default.name);
@@ -1466,7 +1466,7 @@ fn variant_picker(ui: &mut egui::Ui, ws: &mut Workspace, path: &str) {
         ui.label(RichText::new(format!("{} of {}", chosen + 1, variants.len())).small().color(theme::weak()));
     });
     if choice != chosen {
-        ws.variant_choice.insert(path.to_string(), choice);
+        ws.show_look(path, variants[choice].clone());
     }
 }
 
@@ -1794,9 +1794,9 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
             ui.label(RichText::new("Nothing references this asset").color(theme::weak()));
         }
         for r in incoming {
-            // The part it names, where it names one.
-            let part = r.part.as_ref().map_or_default(|p| format!("  #{p}"));
-            let slot = RichText::new(format!("slot {}{part}", r.slot)).color(theme::weak());
+            // The output it names, where it names one.
+            let output = r.output.as_ref().map_or_default(|o| format!("  #{o}"));
+            let slot = RichText::new(format!("slot {}{output}", r.slot)).color(theme::weak());
             if theme::link_row(ui, &r.from, slot).clicked() {
                 *nav = Some(r.from.clone());
             }

@@ -1,11 +1,11 @@
 //! pe2.game: the kinds of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`, `pe2.str`) - the discs and
 //! their stages, folders and files, the files grouped, the disc's movie files (`stream`: a list of entries, each a
-//! movie in order, assembled from them; the entries are the parts the records name), the stages' records of the movies
+//! movie in order, assembled from them; the entries are the outputs the records name), the stages' records of the movies
 //! they play (`movie_slot`: a `StreamSlot`'s fields, naming its movie file's entry) and of their scenes' audio, the
 //! executable, plain text and binary data. Each kind's icon and label, and the fields read in hex: a file's sector
 //! length, a scene's sound bank mask.
 
-use pe2_ext::{Asset, Cell, Field, Icon, Part, Registry, Result, Style, Table, Tint, Ui, Value, View};
+use pe2_ext::{Asset, Cell, ContentRow, Contents, Field, Icon, Project, Registry, Result, Retain, Style, Table, Tint, Ui, Value, View, ty};
 
 pe2_ext::extension!("pe2.game", "0.1.0", register);
 
@@ -53,13 +53,23 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("sector_len").label("Sector length").format(hex))
         .register();
     // A disc's movie file: a list of entries, each a movie in order, which the stages' records name.
+    let entry = r.op("entry").label("A movie file's entry").output::<ty::Table>().parameter::<String>("id").run(|call| {
+        let id: String = call.parameter()?;
+        let lent = call.lend_settings(&Table::new());
+        let asset = lent.asset();
+        let entries = asset.parts("entries");
+        let (_, entry) = entries.iter().find(|(known, _)| **known == id).ok_or_else(|| pe2_ext::anyhow!("it has no entry {id}"))?;
+        entry.as_table().cloned().ok_or_else(|| pe2_ext::anyhow!("its entry {id} is no table"))
+    });
     r.kind("stream")
         .alias("stream")
         .label("Movie file")
         .icon(Icon::Stack, Tint::Motion)
         .stack(STREAM)
         .field(Field::new("entries").custom())
-        .parts(entries)
+        .contents(entry_rows)
+        .output("entries", &entry, Retain::Transient)
+        .members(|asset| asset.parts("entries").into_iter().map(|(id, _)| (id.to_string(), id.to_string())).collect())
         .inspector("Entries", |_| Box::new(Entries))
         .register();
     r.kind("scene_audio")
@@ -71,14 +81,11 @@ fn register(r: &mut Registry) -> Result<()> {
     Ok(())
 }
 
-/// A movie file's entries, in order: each a virtual part (`entries/<id>`) - no files of its own, the movie it names -
-/// which a stage's record names, its offset the entry's place.
-fn entries(asset: &Asset) -> Vec<Part> {
-    asset
-        .parts("entries")
-        .into_iter()
-        .map(|(id, _)| Part { id: format!("entries/{id}"), label: id.to_string(), made_of: vec![] })
-        .collect()
+/// A movie file's entries, in order, which a stage's record names (`entries/<id>`), its offset the entry's place.
+fn entry_rows(asset: &Asset, _: &dyn Project) -> Contents {
+    let rows = asset.parts("entries").into_iter().map(|(id, _)| ContentRow::new(&format!("entries/{id}"), id).depth(1));
+    let rows: Vec<ContentRow> = std::iter::once(ContentRow::heading("entries", "Entries")).chain(rows).collect();
+    Contents { rows, ..Contents::default() }
 }
 
 /// A change to a movie file's entries.

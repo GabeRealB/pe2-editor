@@ -249,7 +249,7 @@ fn add_menu(ui: &mut egui::Ui, ws: &Workspace, asset: &Asset, (at, layer): (usiz
                 // What it cannot do without, for the sheet to change.
                 match op.as_str() {
                     graph::FILE => {
-                        let stored = asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::ASSET_FILE);
+                        let stored = asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
                         table.insert("file".into(), stored.map_or("", |f| f.name.as_str()).into());
                     }
                     graph::OUTPUT => {

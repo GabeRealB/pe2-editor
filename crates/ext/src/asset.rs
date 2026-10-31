@@ -64,7 +64,7 @@ pub trait Source {
         let _ = path;
         None
     }
-    fn table_of(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
+    fn output_of(&self, path: &str, address: &str) -> Option<Result<crate::Data>> {
         let _ = (path, address);
         None
     }
@@ -77,20 +77,19 @@ pub trait Source {
     }
 }
 
-/// An asset, lent for one call: what an extension keeps of it, it copies. Its kind and role are qualified names
+/// An asset, lent for one call: what an extension keeps of it, it copies. Its kind is a qualified name
 /// (`pe2.images@image`), resolved by the host from what its declaration says.
 #[derive(Clone, Copy)]
 pub struct Asset<'a> {
     source: &'a dyn Source,
     kind: Option<&'a str>,
-    role: Option<&'a str>,
 }
 
 impl<'a> Asset<'a> {
-    /// An asset lent by the host, with the kind and role it resolved.
+    /// An asset lent by the host, with the kind it resolved.
     #[must_use]
-    pub fn new(source: &'a dyn Source, kind: Option<&'a str>, role: Option<&'a str>) -> Asset<'a> {
-        Asset { source, kind, role }
+    pub fn new(source: &'a dyn Source, kind: Option<&'a str>) -> Asset<'a> {
+        Asset { source, kind }
     }
 
     #[must_use]
@@ -107,18 +106,6 @@ impl<'a> Asset<'a> {
     #[must_use]
     pub fn kind(&self) -> Option<&'a str> {
         self.kind
-    }
-
-    /// Its role, qualified; none when it declares none, or none registered on its kind.
-    #[must_use]
-    pub fn role(&self) -> Option<&'a str> {
-        self.role
-    }
-
-    /// Its role, where the extension `id` registers it: the role's own name.
-    #[must_use]
-    pub fn role_of(&self, id: &str) -> Option<&'a str> {
-        self.role?.strip_prefix(id)?.strip_prefix('@')
     }
 
     /// A field of its declaration.

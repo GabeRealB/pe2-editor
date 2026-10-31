@@ -9,7 +9,7 @@
 //!   the file's (`from.<release>.chunks`).
 //! - The disc layout, `disc/<release>/*.toml`: one asset a file, a disc (`disk<N>`) or a stage (`stage<N>`).
 //!
-//! Every slot names the asset that fills it, `asset = { uid, path = "res://<group>/<name>.asset" }` - a part of it
+//! Every slot names the asset that fills it, `asset = { uid, path = "res://<group>/<name>.node" }` - a part of it
 //! with `part` (`part = "palettes/default"`, its fragment); loading holds every such reference to a declaration with
 //! that uid. Uids are drawn once, when an asset is first declared (`uid`).
 //!
@@ -69,7 +69,7 @@ impl Reference {
     /// The declaration path (`group/name`) it names.
     #[must_use]
     pub fn target(&self) -> &str {
-        self.path.trim_start_matches("res://").trim_end_matches(".asset")
+        self.path.trim_start_matches("res://").trim_end_matches(".node")
     }
 }
 
@@ -111,14 +111,13 @@ pub struct Location {
 pub struct Asset {
     pub uid: String,
     pub kind: String,
-    pub role: Option<String>,
     pub format: Option<String>,
     #[serde(default)]
     pub from: BTreeMap<String, Location>,
     /// A file's chunk slots, in order.
     #[serde(default)]
     pub slots: Vec<ChunkSlot>,
-    /// The declaration's own fields as TOML, without `from`: what its bundle's `asset.toml` starts with.
+    /// The declaration's own fields as TOML, without `from`: what its bundle's `node.toml` starts with.
     #[serde(skip)]
     pub body: String,
     /// The declaration as declared, `from` with it: what an extractor reads.

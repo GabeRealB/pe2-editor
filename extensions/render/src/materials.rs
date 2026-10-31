@@ -11,7 +11,7 @@ use pe2_ext::{Asset, Icon, Image, Project, Style, Table, Texture, Ui, Value, Vie
 use crate::assembly::{self, Assembled, Slot};
 use crate::prefab::{self, Filled};
 use crate::material;
-use crate::material_panel::{Pictures, choices_of, with};
+use crate::material_panel::{Pictures, choices_of};
 use crate::parts;
 
 /// How wide and tall a slot's picture is at most.
@@ -140,16 +140,14 @@ fn set_overrides(fill: &mut Table, overrides: Table) {
 
 /// A texture of another image holds what that image has: a cell or a palette it does not is its first. An image with no
 /// cells has nothing a face could read.
-fn fitted(ui: &Ui, texture: Value) -> Option<Value> {
-    let choices = choices_of(ui, &texture).filter(|choices| !choices.cells.is_empty())?;
-    let fit = |texture: Value, key: &str, held: Option<&str>, known: &[String]| match known.first() {
-        Some(first) if held.is_some_and(|held| !known.iter().any(|name| name == held)) => with(&texture, key, first),
-        _ => texture,
-    };
-    let cell = material::cell_of(&texture).map(str::to_string);
-    let palette = material::palette_of(&texture).map(str::to_string);
-    let texture = fit(texture, "cell", cell.as_deref(), &choices.cells);
-    Some(fit(texture, "palette", palette.as_deref(), &choices.palettes))
+fn fitted(ui: &Ui, texture: &Value) -> Option<Value> {
+    let choices = choices_of(ui, texture).filter(|choices| !choices.cells.is_empty())?;
+    let held = |name: &str, known: &[String]| known.iter().any(|known| known == name);
+    let cell = material::cell_of(texture).filter(|cell| held(cell, &choices.cells)).unwrap_or(&choices.cells[0]);
+    let palette = material::palette_of(texture).map(|palette| {
+        if held(palette, &choices.palettes) { palette } else { choices.palettes.first().map_or(palette, String::as_str) }
+    });
+    Some(material::reading(texture, cell, palette))
 }
 
 #[derive(Default)]
@@ -191,7 +189,7 @@ impl Bindings {
 
     fn thumbnail(&mut self, ui: &mut Ui, slot: &Slot) {
         let bound = slot.drawn.as_ref().and_then(|drawn| drawn.main.as_ref());
-        let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, &bound.part()).cloned());
+        let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
         // Nothing to show keeps the place, so that the rows' text lines up.
         let picture = picture.unwrap_or_else(|| Texture::new("no texture", Image { width: 1, height: 2, rgba: vec![0; 8] }));
         #[expect(clippy::cast_precision_loss, reason = "a picture is far smaller than floats lose pixels at")]
@@ -202,7 +200,7 @@ impl Bindings {
 
     /// The texture a node holds of its own: which image, which of its cells, through which of its palettes.
     fn own_texture(ui: &mut Ui, id: &str, texture: &Value, change: &mut Option<Change>) {
-        if let Some(new) = ui.reference_taking("Texture", "image", Some(texture)).and_then(|new| fitted(ui, new)) {
+        if let Some(new) = ui.reference_taking("Texture", "image", Some(texture)).and_then(|new| fitted(ui, &new)) {
             *change = Some(Change::Texture(new));
         }
         let Some(choices) = choices_of(ui, texture) else { return };
@@ -211,11 +209,11 @@ impl Bindings {
         ui.horizontal(|ui| {
             ui.styled("Cell", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.cell"), &cell, &choices.cells) {
-                *change = Some(Change::Texture(with(texture, "cell", &choices.cells[chosen])));
+                *change = Some(Change::Texture(material::reading(texture, &choices.cells[chosen], material::palette_of(texture))));
             }
             ui.styled("Palette", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.palette"), &palette, &choices.palettes) {
-                *change = Some(Change::Texture(with(texture, "palette", &choices.palettes[chosen])));
+                *change = Some(Change::Texture(material::reading(texture, &cell, Some(&choices.palettes[chosen]))));
             }
         });
     }

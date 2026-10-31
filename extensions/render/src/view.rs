@@ -257,7 +257,7 @@ impl ModelView {
         let mut images = Vec::new();
         for bound in drawn().flat_map(|drawn| [drawn.main.as_ref(), drawn.environment.as_ref()]).flatten() {
             if !seen.contains(&bound)
-                && let Some(Ok(image)) = project.part(&bound.image, &bound.part())
+                && let Some(Ok(image)) = project.image(&bound.image, &bound.output())
             {
                 seen.push(bound);
                 images.push(image);
