@@ -1013,6 +1013,17 @@ impl Registry {
         self.parts.tools.push(ToolDef { name, description, schema, run: Arc::new(run) });
     }
 
+    /// A test, `<id>@test.<name>`: a service a runner calls, acting through `pe2_ext::test::Editor`. What it answers is
+    /// not read: it passes unless it fails.
+    pub fn test(
+        &mut self,
+        name: &str,
+        description: &str,
+        run: impl Fn(&dyn Project, &Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Name {
+        self.service(&format!("test.{name}"), description, "{}", run)
+    }
+
     /// A service, `<id>@<name>`, other extensions call through the host (`Project::call`) - those requiring this one:
     /// what it does, its arguments as a JSON schema, its work. It runs in an instance of this extension's own.
     pub fn service(

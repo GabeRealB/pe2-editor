@@ -70,6 +70,7 @@ struct Opening {
     select: Option<String>,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "each answers for itself")]
 pub struct Editor {
     workspace: Option<Workspace>,
     /// A project being opened, off the window's thread.
@@ -133,6 +134,8 @@ pub struct Editor {
     onboarding: Option<crate::onboarding::Onboarding>,
     /// The project told "not now": this session leaves it alone.
     not_now: Option<PathBuf>,
+    /// Nobody is there to ask.
+    unattended: bool,
     /// Agents using the window, and whether this session lets them act whatever the settings say.
     drive: crate::drive::Driver,
     agents_drive: bool,
@@ -146,6 +149,8 @@ pub struct Start {
     pub max_surface: Option<u32>,
     /// Agents may act in the editor this session, whatever the settings say.
     pub agents_drive: bool,
+    /// Nobody is there: a project is not to ask anything.
+    pub unattended: bool,
     /// The monitors, in pixels of the desktop: what a window's place is judged by.
     pub monitors: Vec<egui::Rect>,
 }
@@ -256,6 +261,7 @@ impl Editor {
             max_surface: start.max_surface,
             onboarding: None,
             not_now: None,
+            unattended: start.unattended,
             drive: crate::drive::Driver::new(),
             agents_drive: start.agents_drive,
         };
@@ -322,9 +328,9 @@ impl Editor {
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
-                // A run that only looks, as a screenshot does, has nobody to ask.
+                // A run that only looks, as a screenshot does, or a test run, has nobody to ask.
                 let chosen = self.settings.active_configs.contains_key(&ws.project.root.display().to_string());
-                let asked = if self.capture.is_some() { None } else { crate::onboarding::asked(&ws, chosen) };
+                let asked = if self.capture.is_some() || self.unattended { None } else { crate::onboarding::asked(&ws, chosen) };
                 self.onboarding = asked.filter(|asked| self.not_now.as_ref() != Some(&asked.root));
                 self.workspace = Some(ws);
                 self.error = None;
@@ -1773,7 +1779,7 @@ fn automatic_zoom(ctx: &egui::Context, height: f32) -> f32 {
     (scale.max(1.0) / native).clamp(1.0, 4.0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "tests"))]
 impl Editor {
     /// What it has open.
     pub fn workspace(&mut self) -> Option<&mut Workspace> {

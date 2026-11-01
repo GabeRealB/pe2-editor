@@ -2,7 +2,6 @@
 
 use eframe::egui;
 
-use super::fixture::painting;
 use super::{Fixture, Scenario};
 use crate::icons;
 
@@ -84,20 +83,4 @@ fn an_entry_gone_from_the_disk_can_be_forgotten() {
     editor.click("Problems");
     editor.click("Forget it");
     assert_eq!(editor.problems(), [""; 0]);
-}
-
-#[test]
-fn a_file_makes_a_node_that_shows_and_undo_takes_it_away() {
-    let mut editor = Scenario::open(Fixture::rig());
-    let copy = editor.file_elsewhere("casual.ora", &painting());
-    editor.drop_file(&copy);
-    editor.click_label("New node: Texture, from layers");
-    let made = editor.workspace().selected.clone().expect("what it made is shown");
-    let asset = editor.workspace().index.assets[&made].clone();
-    let image = editor.workspace().extensions.output_image(&asset, "picture/default");
-    assert!(image.is_some_and(|image| image.is_ok()), "{:?}", editor.workspace().extensions.addresses(&asset));
-    editor.expect("page_0");
-    assert_eq!(editor.problems(), [""; 0]);
-    editor.undo();
-    assert!(!editor.assets().contains(&made), "{:?}", editor.assets());
 }

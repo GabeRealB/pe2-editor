@@ -34,6 +34,12 @@ toml_edit.workspace = true
 # The event loop is the editor's own: it is what knows the monitors (main.rs).
 winit.workspace = true
 
-[dev-dependencies]
 # Runs the editor with no window: scenarios (src/scenario).
+egui_kittest = { workspace = true, optional = true }
+
+[features]
+# `pe2-editor --test`: the tests a project takes in. A build for testing: what ships has no harness in it.
+tests = ["dep:egui_kittest"]
+
+[dev-dependencies]
 egui_kittest.workspace = true

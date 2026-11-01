@@ -1,0 +1,17 @@
+[package]
+name = "pe2-render-tests"
+description = "pe2.render.tests: tests of pe2.render, as an extension beside it that a project takes in for testing"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+# A component built for wasm32-wasip3, and never shipped.
+crate-type = ["rlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true
+pe2-test-data.workspace = true

@@ -2,11 +2,13 @@
 //! references followed both ways, pictures previewed - in panes that can be moved, split, resized and closed.
 //!
 //!     pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive] [--trust-everything]
+//!     pe2-editor PROJECT --test [--filter TEXT] [--trust-everything]      (built with the `tests` feature)
 //!
 //! `--select` opens an asset (`stages/akropolis/rooms/square/folder`), `--show` a pane (`settings`); `--screenshot`
 //! saves the window as a PNG once it has settled and exits - what scripts and checks use to see it. `--agents-drive`
 //! lets agents click, type and press keys in this session, as the Agents setting does for every one. `--trust-everything`
-//! runs every unsandboxed extension in this session, asking nothing and keeping nothing (`extensions::trust`).
+//! runs every unsandboxed extension in this session, asking nothing and keeping nothing (`extensions::trust`). `--test` runs
+//! the tests of what the project takes in for testing (`dev`), with no window, and says how they went.
 //!
 //! Under `WSLg` the editor talks X11 unless told otherwise: maximizing or resizing a window on Wayland can crash `WSLg`'s
 //! compositor, not every time, and every Linux window goes with it (the event loop ends in "Broken pipe"). It is the
@@ -43,7 +45,7 @@ mod settings;
 mod theme;
 mod pictures;
 mod runner;
-#[cfg(test)]
+#[cfg(any(test, feature = "tests"))]
 mod scenario;
 mod takein;
 mod thumbs;
@@ -164,6 +166,8 @@ fn main() -> eframe::Result {
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);
     let mut agents_drive = false;
+    #[cfg(feature = "tests")]
+    let (mut testing, mut filter) = (false, None);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--select") => select = args.next().map(|a| a.to_string_lossy().into_owned()),
@@ -171,6 +175,10 @@ fn main() -> eframe::Result {
             Some("--screenshot") => screenshot = args.next().map(PathBuf::from),
             Some("--agents-drive") => agents_drive = true,
             Some("--trust-everything") => extensions::trust::trust_everything(),
+            #[cfg(feature = "tests")]
+            Some("--test") => testing = true,
+            #[cfg(feature = "tests")]
+            Some("--filter") => filter = args.next().map(|a| a.to_string_lossy().into_owned()),
             _ => project = Some(PathBuf::from(arg)),
         }
     }
@@ -178,6 +186,11 @@ fn main() -> eframe::Result {
         let cwd = std::env::current_dir().ok()?;
         cwd.join(project::FILE).is_file().then_some(cwd)
     });
+    #[cfg(feature = "tests")]
+    if testing {
+        let root = project.unwrap_or_else(|| PathBuf::from("."));
+        std::process::exit(i32::from(!scenario::run(&root, filter.as_deref())));
+    }
     // Kept here rather than by eframe: under WSLg it would read back a place a decoration off, and a window closed filling the
     // screen would come back that size.
     let mut viewport = egui::ViewportBuilder::default().with_title("Parasite Eve II editor").with_inner_size([1400.0, 900.0]);
@@ -212,7 +225,7 @@ fn main() -> eframe::Result {
                 install_gpu(state);
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
-            let start = app::Start { project, select, show, screenshot, max_surface, agents_drive, monitors };
+            let start = app::Start { project, select, show, screenshot, max_surface, agents_drive, unattended: false, monitors };
             Ok(Box::new(app::Editor::new(cc, start)) as Box<dyn eframe::App>)
         }),
         &event_loop,

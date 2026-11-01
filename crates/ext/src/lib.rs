@@ -27,6 +27,7 @@ pub mod media;
 mod project;
 pub mod process;
 mod registry;
+pub mod test;
 mod ui;
 
 pub use anyhow::{Error, Result, anyhow, bail};

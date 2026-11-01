@@ -16,6 +16,7 @@
 //! Who may edit which layer (locks, the active layer) is the caller's to decide.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::changeset::{Changeset, Op};
@@ -160,6 +161,18 @@ pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, pat
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
     let mut tx = history.begin(format!("New {}", name(&bundle)));
+    // A folder it is the first thing in: of this step, or the index lists it and the layer's list changes under the history.
+    let mut taken = HashSet::new();
+    for (at, _) in path.match_indices('/') {
+        let folder = &path[..at];
+        if index.entries.contains_key(folder) || changeset.entries.values().any(|known| known == folder) {
+            continue;
+        }
+        let id = crate::uid::new(|id| taken.contains(&id) || index.by_uid.contains_key(&crate::uid::text(id)))?;
+        taken.insert(id);
+        tx.make_dir(&layer.disk(folder))?;
+        changeset.entries.insert(crate::uid::text(id), folder.to_string());
+    }
     tx.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
     for (name, bytes) in files {
         tx.write(&layer.disk(&bundle).join(name), bytes)?;

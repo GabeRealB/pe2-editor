@@ -150,6 +150,7 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
             Err(e) => failed.push(format!("{package}: {e:#}")),
         }
     }
+    loadable.extend(TEST_HOST.get().map(|host| host().into()));
     let mut extensions = Extensions::load_without(with_settings(loadable), true, disabled);
     extensions.problems.extend(failed);
     extensions.present.extend(unloadable);
@@ -160,8 +161,22 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
     extensions
 }
 
+/// Test mode, for this process: this extension, built into the host, is there for tests to act through, and what a project
+/// takes in for testing (`dev`) loads.
+pub fn test_mode(host: fn() -> pe2_ext::Extension) {
+    let _ = TEST_HOST.set(host);
+    component::be_patient();
+}
+
+static TEST_HOST: OnceLock<fn() -> pe2_ext::Extension> = OnceLock::new();
+
 /// Whether a project takes in an extension found here: what it holds itself, by being there; from elsewhere, as it says.
+/// What it takes in for testing, only in test mode.
 fn taken_in(manifest: &Manifest, id: &str, origin: &Origin) -> bool {
+    let dev = manifest.imported.iter().any(|imported| imported.id == id && imported.dev);
+    if dev && TEST_HOST.get().is_none() {
+        return false;
+    }
     match origin {
         Origin::User(_) | Origin::Install(_) => manifest.imported.iter().any(|imported| imported.id == id && imported.from.is_none()),
         _ => true,
@@ -542,7 +557,7 @@ mod tests {
         let bare = Manifest::default();
         assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&bare))), Some(Status::Available));
         // Taken in, in place of the built-in of its id; asked for at another version; locked to something else.
-        let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), from: None };
+        let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), dev: false, from: None };
         let locked = [(id.clone(), "another".to_string())].into();
         let manifest = Manifest { imported: vec![imported], locked };
         let extensions = super::load_without(&found, &[], &super::Kept::new(), Some(&manifest));
@@ -550,6 +565,10 @@ mod tests {
         assert_eq!(extensions.unmet.len(), 1, "{:?}", extensions.unmet);
         assert!(extensions.unmet[0].1.contains("asks for ^7.0"), "{:?}", extensions.unmet);
         assert_eq!(extensions.unlocked, std::slice::from_ref(&id));
+        // For testing, and no test mode here: as if it were not taken in.
+        let imported = Imported { id: id.clone(), dev: true, ..Imported::default() };
+        let manifest = Manifest { imported: vec![imported], ..Manifest::default() };
+        assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&manifest))), Some(Status::Available));
         // Required and found nowhere.
         let manifest = Manifest { imported: vec![Imported { id: "my.tool".to_string(), required: true, ..Imported::default() }], ..Manifest::default() };
         let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&manifest));

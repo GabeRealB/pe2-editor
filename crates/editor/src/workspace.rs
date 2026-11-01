@@ -684,6 +684,16 @@ impl Workspace {
         Ok(())
     }
 
+    /// Make a node of this declaration and these files, in the active layer: what a test works on.
+    ///
+    /// # Errors
+    /// No layer is active, or it cannot be written.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn make_node(&mut self, uid: &str, path: &str, node: (&str, &[(&str, &[u8])])) -> Result<(), String> {
+        let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
+        project::edit::create(&self.project, &self.index, &layer, uid, path, node, &mut self.history).map(drop).map_err(|e| format!("{e:#}"))
+    }
+
     /// Leave an asset out of the config in use, or take it back. It is the project's, so written in its `project.toml`, as a step.
     ///
     /// # Errors

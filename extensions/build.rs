@@ -12,7 +12,7 @@ const BUILTINS: &[(&str, &str)] =
     &[("pe2-events", "events"), ("pe2-formats", "formats"), ("pe2-game", "game"), ("pe2-images", "images"), ("pe2-movies", "movies"), ("pe2-packages", "packages"), ("pe2-str", "str"), ("pe2-render", "render")];
 
 /// Components built here too, and never embedded: what needs enabling is not shipped inside the editor.
-const SEPARATE: &[(&str, &str)] = &[("pe2-ffmpeg", "ffmpeg"), ("pe2-psx", "psx")];
+const SEPARATE: &[(&str, &str)] = &[("pe2-ffmpeg", "ffmpeg"), ("pe2-psx", "psx"), ("pe2-render-tests", "render_tests"), ("pe2-images-tests", "images_tests")];
 
 fn main() {
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
@@ -30,6 +30,7 @@ fn main() {
         workspace.join(".cargo/config.toml"),
     ];
     inputs.extend(BUILTINS.iter().chain(SEPARATE).map(|(_, folder)| here.join(folder)));
+    inputs.push(here.join("test_data"));
     for input in &inputs {
         println!("cargo::rerun-if-changed={}", input.display());
     }

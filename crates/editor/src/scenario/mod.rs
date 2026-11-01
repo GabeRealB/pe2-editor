@@ -6,11 +6,21 @@
 //! Work goes on off the window's thread, so that a harness with no repaint to make has not finished: `settle` waits until
 //! the editor says it has nothing going on.
 
+// What only the scenarios here use is left over in a build for running a project's tests.
+#[cfg_attr(not(test), allow(dead_code))]
 mod fixture;
+pub mod host;
+#[cfg(test)]
 mod inspector;
+#[cfg(test)]
 mod models;
+#[cfg(test)]
 mod nodes;
+#[cfg(test)]
 mod onboarding;
+#[cfg(test)]
+mod registered;
+#[cfg(test)]
 mod taking_in;
 
 use std::sync::Once;
@@ -43,8 +53,15 @@ fn isolate() {
         let data = folder().join("data");
         std::fs::create_dir_all(&data).expect("a data folder");
         extensions::use_data_folder(data);
+        extensions::test_mode(host::extension);
         project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
     });
+}
+
+/// Bytes as they cross as text.
+fn from_hex(text: &str) -> Result<Vec<u8>, String> {
+    let pairs = text.as_bytes().chunks(2).map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()));
+    pairs.collect::<Option<Vec<u8>>>().ok_or_else(|| "not hex".to_string())
 }
 
 /// A file dropped on the window.
@@ -61,7 +78,42 @@ impl egui::DroppedFile for Dropped {
     }
 }
 
+/// Run the tests of what a project takes in for testing, those whose names hold `filter`: whether they passed. What a test
+/// changes in the project is undone after it.
+#[must_use]
+pub fn run(root: &std::path::Path, filter: Option<&str>) -> bool {
+    isolate();
+    if !root.join(project::FILE).is_file() {
+        eprintln!("{}: no project", root.display());
+        return false;
+    }
+    let mut editor = Scenario::open_with(Fixture::given(root), None, true);
+    let mut tests = editor.workspace().extensions.tests();
+    tests.retain(|name| filter.is_none_or(|filter| name.contains(filter)));
+    for problem in editor.workspace().extensions.problems.clone() {
+        eprintln!("warning: {problem}");
+    }
+    let mut failed = 0;
+    for name in &tests {
+        let before = editor.workspace().history.done().len();
+        let result = editor.run_test(name);
+        while editor.workspace().history.done().len() > before {
+            editor.undo();
+        }
+        match result {
+            Ok(()) => println!("ok      {name}"),
+            Err(why) => {
+                failed += 1;
+                println!("FAILED  {name}\n{why}");
+            }
+        }
+    }
+    println!("{} passed, {failed} failed", tests.len() - failed);
+    failed == 0 && !tests.is_empty()
+}
+
 /// The editor at work on a fixture.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Scenario {
     harness: Harness<'static, Editor>,
     fixture: Fixture,
@@ -69,6 +121,7 @@ pub struct Scenario {
     _alone: std::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Scenario {
     /// The editor on a fixture, its project open.
     #[track_caller]
@@ -79,6 +132,12 @@ impl Scenario {
     /// The editor on a fixture, with a pane in front.
     #[track_caller]
     pub fn open_showing(fixture: Fixture, show: Option<&str>) -> Scenario {
+        Scenario::open_with(fixture, show, false)
+    }
+
+    /// The editor on a fixture; `unattended`, with nobody there to answer what a project asks.
+    #[track_caller]
+    fn open_with(fixture: Fixture, show: Option<&str>, unattended: bool) -> Scenario {
         static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // A scenario that failed says so itself: the next has nothing to do with it.
         let alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -88,7 +147,7 @@ impl Scenario {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
             }
-            let start = Start { project: Some(root), select: None, show, screenshot: None, max_surface: None, agents_drive: false, monitors: Vec::new() };
+            let start = Start { project: Some(root), select: None, show, screenshot: None, max_surface: None, agents_drive: false, unattended, monitors: Vec::new() };
             Editor::new(cc, start)
         });
         let mut scenario = Scenario { harness, fixture, _alone: alone };
@@ -181,6 +240,116 @@ impl Scenario {
         self.harness.input_mut().focused = false;
         self.harness.step();
         self.settle();
+    }
+
+    /// Run a test an extension registered: on a thread of its own, this one doing each step it asks for and drawing between.
+    ///
+    /// # Errors
+    /// It failed, and why.
+    pub fn run_test(&mut self, name: &str) -> Result<(), String> {
+        let (steps, asked) = std::sync::mpsc::channel::<host::Step>();
+        host::listen(Some(steps));
+        let ws = self.workspace();
+        let (extensions, index) = (ws.extensions.clone(), ws.index.clone());
+        let name = name.to_string();
+        let test = std::thread::spawn(move || {
+            let lens = project::ext::Lens { index: &index, extensions: &extensions, selection: None, chosen: None, revision: 0 };
+            let service = extensions.service(&name).ok_or_else(|| format!("no test {name}"))?;
+            (service.run)(&lens, &toml::Value::Table(toml::Table::new())).map(drop).map_err(|why| format!("{why:#}"))
+        });
+        let started = Instant::now();
+        while !test.is_finished() {
+            match asked.recv_timeout(Duration::from_millis(5)) {
+                Ok(step) => {
+                    let done = self.do_step(&step.name, &step.arguments);
+                    let _ = step.done.send(done);
+                }
+                Err(_) => self.harness.step(),
+            }
+            assert!(started.elapsed() < PATIENCE, "the test did not end");
+        }
+        host::listen(None);
+        test.join().map_err(|_| "the test panicked".to_string())?
+    }
+
+    /// A step a test asked for, and what it comes to.
+    fn do_step(&mut self, name: &str, arguments: &toml::Value) -> Result<toml::Value, String> {
+        use toml::Value;
+        let text = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
+        let strings = |list: Vec<String>| Value::Array(list.into_iter().map(Value::String).collect());
+        let one = |found: usize, text: &str| if found == 1 { Ok(()) } else { Err(format!("{found} things say {text:?}")) };
+        match name {
+            "show" if !self.assets().iter().any(|path| path == text) => return Err(format!("no asset {text}")),
+            "show" => self.show(text),
+            "click" => {
+                one(self.harness.query_all(By::new().label_contains(text)).count(), text)?;
+                self.click(text);
+            }
+            "click_label" => {
+                one(self.harness.query_all(By::new().label(text)).count(), text)?;
+                self.click_label(text);
+            }
+            "typing" => self.typing(text),
+            "press" => self.press(egui::Key::from_name(text).ok_or_else(|| format!("no key {text}"))?),
+            "undo" => {
+                if self.workspace().history.done().is_empty() {
+                    return Err("nothing to undo".to_string());
+                }
+                self.undo();
+            }
+            "drop_file" => {
+                let bytes = from_hex(arguments.get("bytes").and_then(Value::as_str).unwrap_or_default())?;
+                let file = self.file_elsewhere(text, &bytes);
+                self.drop_file(&file);
+            }
+            "node" => self.new_node(arguments)?,
+            "make_every_template" => return self.make_every_template().map(Value::Integer),
+            "expect" if !self.says(text) => return Err(format!("nothing says {text:?}; there is:\n{}", self.shown().join("\n"))),
+            "expect_not" if self.says(text) => return Err(format!("something says {text:?}: {:?}", self.shown().into_iter().filter(|line| line.contains(text)).collect::<Vec<_>>())),
+            "expect" | "expect_not" => {}
+            "problems" => return Ok(strings(self.problems())),
+            "assets" => return Ok(strings(self.assets())),
+            "selected" => return self.workspace().selected.clone().map(Value::String).ok_or_else(|| "nothing is selected".to_string()),
+            "pictured" => {
+                let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
+                let ws = self.workspace();
+                let asset = ws.index.assets.get(text).cloned().ok_or_else(|| format!("no asset {text}"))?;
+                return Ok(Value::Boolean(ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok())));
+            }
+            other => return Err(format!("no step {other}")),
+        }
+        Ok(Value::Boolean(true))
+    }
+
+    /// A node a test asked for, as its template makes one, in the active layer: a step of the history, so that it can go.
+    fn new_node(&mut self, arguments: &toml::Value) -> Result<(), String> {
+        let text = |key: &str| arguments.get(key).and_then(toml::Value::as_str).unwrap_or_default();
+        let (path, uid, template, file, settings) = (text("path"), text("uid"), text("template"), text("file"), text("settings"));
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, bytes) in arguments.get("files").and_then(toml::Value::as_table).into_iter().flatten() {
+            files.push((name.clone(), from_hex(bytes.as_str().unwrap_or_default())?));
+        }
+        let ws = self.workspace();
+        let found = ws.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
+        let stack = ws.extensions.stamp(found, file)?;
+        let text = project::graph::layers::settings_on_layers(&format!("{settings}\n\n{stack}")).map_err(|e| format!("{e:#}"))?;
+        let declaration = format!("uid = \"{uid}\"\n\n{text}");
+        let held: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+        ws.make_node(uid, path, (&declaration, &held))?;
+        self.settle();
+        Ok(())
+    }
+
+    /// A node of every template that needs no file: how many.
+    fn make_every_template(&mut self) -> Result<i64, String> {
+        let ws = self.workspace();
+        let made = ws.extensions.templates().filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
+        let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
+        for template in &templates {
+            self.workspace().new_node(template, None).map_err(|why| format!("{template}: {why}"))?;
+            self.settle();
+        }
+        Ok(i64::try_from(templates.len()).unwrap_or(i64::MAX))
     }
 
     /// Whether the project is asking something.

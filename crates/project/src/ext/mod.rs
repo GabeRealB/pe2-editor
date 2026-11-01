@@ -1434,6 +1434,15 @@ impl Extensions {
         self.services.get(name)
     }
 
+    /// The tests extensions registered, by name, in order.
+    #[must_use]
+    pub fn tests(&self) -> Vec<String> {
+        let mut tests: Vec<String> = self.services.values().filter(|s| s.name.local().starts_with("test.")).map(|s| s.name.to_string()).collect();
+        tests.sort();
+        tests.dedup();
+        tests
+    }
+
     /// Whether the extension `caller` may call a service: its own, or one of an extension it requires.
     #[must_use]
     pub fn may_call(&self, caller: &str, service: &str) -> bool {

@@ -1,0 +1,99 @@
+#usda 1.0
+(
+    defaultPrim = "Model"
+    metersPerUnit = 0.001
+    upAxis = "Y"
+)
+
+def Xform "Model"
+{
+    custom token[] slots = ["page_0"]
+    float xformOp:rotateX = 180
+    uniform token[] xformOpOrder = ["xformOp:rotateX"]
+
+    def SkelRoot "Rig" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
+    {
+        rel skel:skeleton = </Model/Rig/Skeleton>
+
+        def Skeleton "Skeleton"
+        {
+            uniform token[] joints = ["part0", "part1"]
+            uniform matrix4d[] bindTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))]
+            uniform matrix4d[] restTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))]
+        }
+
+        def Mesh "Mesh" (
+            prepend apiSchemas = ["SkelBindingAPI", "MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            uniform token orientation = "leftHanded"
+            point3f[] points = [(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0), (20, 0, 0)]
+            int[] faceVertexCounts = [4, 3]
+            int[] faceVertexIndices = [0, 1, 2, 3, 1, 4, 2]
+            custom float3[] sourceNormals = [(0, 0, 1)]
+            normal3f[] primvars:normals = [(0, 0, 1)] (
+                interpolation = "faceVarying"
+            )
+            int[] primvars:normalIndex = [0, 0, 0, 0, 0, 0, 0] (
+                interpolation = "faceVarying"
+            )
+            color3f[] primvars:displayColor = [(1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1)] (
+                interpolation = "faceVarying"
+            )
+            int2[] primvars:texel = [(0, 0), (7, 0), (7, 7), (0, 7), (0, 0), (7, 0), (7, 7)] (
+                interpolation = "faceVarying"
+            )
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1), (0, 0), (1, 0), (1, 1)] (
+                interpolation = "faceVarying"
+            )
+            token[] primvars:shading = ["smooth", "smooth"] (
+                interpolation = "uniform"
+            )
+            int[] primvars:part = [0, 1] (
+                interpolation = "uniform"
+            )
+            token[] primvars:colorSource = ["none", "none"] (
+                interpolation = "uniform"
+            )
+            int[] primvars:skel:jointIndices = [0, 0, 0, 0, 1] (
+                elementSize = 1
+                interpolation = "vertex"
+            )
+            float[] primvars:skel:jointWeights = [1, 1, 1, 1, 1] (
+                elementSize = 1
+                interpolation = "vertex"
+            )
+            matrix4d primvars:skel:geomBindTransform = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))
+            rel skel:skeleton = </Model/Rig/Skeleton>
+
+            def GeomSubset "material0" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform token elementType = "face"
+                uniform token familyName = "materialBind"
+                int[] indices = [0, 1]
+                rel material:binding = </Model/Materials/material0>
+            }
+        }
+    }
+
+    def "Materials"
+    {
+        def Material "material0"
+        {
+            token inputs:slot = "page_0"
+            token outputs:surface.connect = </Model/Materials/material0/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                float inputs:roughness = 1
+                token outputs:surface
+            }
+        }
+    }
+}

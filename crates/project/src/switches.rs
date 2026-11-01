@@ -52,6 +52,9 @@ pub fn import(project: &Project, imported: &Imported, history: &mut History, lab
     if imported.required {
         entry.insert("required", value(true));
     }
+    if imported.dev {
+        entry.insert("dev", value(true));
+    }
     if let Some(from) = &imported.from {
         entry.insert("from", value(from.as_str()));
     }

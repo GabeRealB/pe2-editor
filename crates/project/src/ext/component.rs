@@ -1781,6 +1781,18 @@ fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shar
 }
 
 /// A tool's or a service's work, as a job of its component with the project lent: its arguments to its answer.
+/// Tests run: a service may be one, as long as what it drives takes.
+static PATIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a service may take from now on: tests run in this process.
+pub fn be_patient() {
+    PATIENT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn patience() -> u64 {
+    if PATIENT.load(std::sync::atomic::Ordering::Relaxed) { UNSANDBOXED_LONG } else { LONG }
+}
+
 fn called(
     shared: &Arc<Shared>,
     handle: u32,
@@ -1795,7 +1807,7 @@ fn called(
             let lent = r.lend_project(project)?;
             let borrowed = Resource::new_borrow(lent.rep());
             let out = if service {
-                r.call(LONG, async |a, g| g.call_serve(a, handle, borrowed, arguments).await)
+                r.call(patience(), async |a, g| g.call_serve(a, handle, borrowed, arguments).await)
             } else {
                 r.call(LONG, async |a, g| g.call_run(a, handle, borrowed, arguments).await)
             };
