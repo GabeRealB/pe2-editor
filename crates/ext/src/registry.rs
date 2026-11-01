@@ -306,6 +306,8 @@ pub struct TemplateDef {
     /// The files it takes, by name (`*.mp4`); none, it is chosen by name alone.
     pub files: Vec<String>,
     pub stack: String,
+    /// Whether a person is offered it: what only extraction makes is not.
+    pub offered: bool,
 }
 
 impl TemplateDef {
@@ -885,6 +887,8 @@ impl Registry {
             content_act: None,
             part_sheet: None,
             stack: None,
+            takes: vec![],
+            extracted: false,
             data: false,
             values: vec![],
             extends: false,
@@ -992,7 +996,7 @@ impl Registry {
 
     /// A way to make a node of a type: `stack`, stamped into it, `{file}` standing for its file.
     pub fn template(&mut self, name: &str, node_type: &str, stack: &str) -> TemplateBuilder<'_> {
-        let def = TemplateDef { name: name.to_string(), label: name.to_string(), node_type: node_type.to_string(), files: vec![], stack: stack.to_string() };
+        let def = TemplateDef { name: name.to_string(), label: name.to_string(), node_type: node_type.to_string(), files: vec![], stack: stack.to_string(), offered: true };
         TemplateBuilder { registry: self, def: Some(def) }
     }
 
@@ -1203,6 +1207,20 @@ impl TypeBuilder<'_> {
     }
 
     /// The stack a node of the type has where its bundle states none, as `[[stack]]` tables: extraction writes it.
+    #[must_use]
+    pub fn takes(mut self, files: &[&str]) -> Self {
+        self.def.takes = files.iter().map(ToString::to_string).collect();
+        self
+    }
+
+    /// Only extraction makes these: nothing offers a new one.
+    #[must_use]
+    pub fn extracted(mut self) -> Self {
+        self.def.extracted = true;
+        self
+    }
+
+    /// The stack a node of it is made with.
     #[must_use]
     pub fn stack(mut self, toml: &str) -> Self {
         self.def.stack = Some(toml.to_string());

@@ -216,7 +216,12 @@ impl Tests {
         for name in names {
             arguments.extend(["--filter".to_string(), name.clone()]);
         }
-        arguments.extend(["--artifacts".to_string(), std::env::temp_dir().join("pe2-test-failures").display().to_string()]);
+        // What the last run left goes: only what a test still shows is of use.
+        let artifacts = std::env::temp_dir().join("pe2-test-failures");
+        if names.is_empty() {
+            let _ = std::fs::remove_dir_all(&artifacts);
+        }
+        arguments.extend(["--artifacts".to_string(), artifacts.display().to_string()]);
         self.start(ctx, runner, &arguments);
     }
 

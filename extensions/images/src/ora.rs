@@ -1,12 +1,15 @@
 //! A texture or an atlas as an `OpenRaster` source (`pe2.images@ora`): what a painting program opens, from which the
 //! stored texels and palettes are made again byte for byte.
 //!
-//! The document is the image's size and holds, topmost first:
+//! The document is the image's size, and as much again beside it for each depth of cell other than the image's, in that
+//! depth's texels: a cell of 4 bpp on a page of 8 has twice the texels of the room it takes on the page, so that there it could
+//! only overlap the next. Beside the image every texel of it can be painted, among the others of its depth. It holds, topmost
+//! first:
 //! - a hidden group `palettes`, a strip a palette (its colors in a row, one pixel each, alpha kept), named after it;
 //! - a hidden group `indices`, the texels' indices in gray (`texels`, and a group `cells` of a layer a cell of another
 //!   depth than the image's), what tells which index a texel is when a program has saved its layer in color;
-//! - a group `cells`, an atlas's cells, each a layer named after it at the place it is drawn, its texels at its own
-//!   depth through its own palette;
+//! - a group `cells`, an atlas's cells, each a layer named after it at its place among those of its depth, its texels at
+//!   its own depth through its own palette;
 //! - the layer `texels`, every texel through the first palette (at 16 bpp, its colors).
 //!
 //! Texel layers are indexed PNGs, so a palette's repeated colors cannot blur which index a texel is. A layer a program
@@ -21,7 +24,7 @@
 use codecs::ora::{self, Document, Group, Layer, Node, Pixels};
 use codecs::texture::{color, entries, gray_ramp, rgba};
 use pe2_ext::{Asset, Result, Table, Value, anyhow};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{TexelImage, bpp, cells, halfwords, palette_names, texels_per_halfword};
 
@@ -33,6 +36,21 @@ const CELLS: &str = "cells";
 const INDICES: &str = "indices";
 /// The side of the thumbnail `OpenRaster` asks for (at most 256).
 const THUMBNAIL: usize = 128;
+
+/// Where the cells of each depth lie across the document, and how wide it is. The image is at the left, at its own depth, and
+/// each other depth has a stretch of its own beside it, as wide as the image is in that depth's texels: a cell of 4 bpp on a
+/// page of 8 has twice the texels of the room it takes there, so that on the page it could only overlap the next. There it
+/// is every texel it has, where it is among the others of its depth, for a painting program to work on.
+fn regions(width: usize, bpp: u8, depths: impl Iterator<Item = u8>) -> (BTreeMap<u8, usize>, usize) {
+    let depths: BTreeSet<u8> = depths.filter(|own| *own != bpp).collect();
+    let mut places = BTreeMap::from([(bpp, 0)]);
+    let mut end = width;
+    for own in depths {
+        places.insert(own, end);
+        end += width * texels_per_halfword(own) / texels_per_halfword(bpp);
+    }
+    (places, end)
+}
 
 /// The texels of an image: a value a texel (an index, or a color at 16 bpp), row by row.
 struct Texels {
@@ -146,15 +164,11 @@ pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(png_error)?;
     let (mut cell_layers, mut cell_indices) = (Vec::new(), Vec::new());
+    let (places, document_width) = regions(width, bpp, cells(asset).iter().map(|cell| cell.bpp));
     for cell in cells(asset) {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
-        let (sx, sy, cw, ch, dx) = (
-            cell.source.x as usize,
-            cell.source.y as usize,
-            cell.source.width as usize,
-            cell.source.height as usize,
-            cell.rect.x as usize,
-        );
+        let (sx, sy, cw, ch) = (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
+        let dx = places[&cell.bpp] + sx;
         let values: Vec<u16> =
             (sy..sy + ch).flat_map(|y| (0..cw).map(move |i| (sx + i, y))).map(|(x, y)| texels.cell_texel(cell.bpp, x, y)).collect();
         let png = codecs::texture::png(cw, ch, cell.bpp, &values, &padded(palette(cell.palette), cell.bpp))
@@ -185,7 +199,7 @@ pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
         stack.push(Node::Group(Group { name: CELLS.into(), visible: true, children: cell_layers }));
     }
     stack.push(layer(TEXELS_LAYER, 0, 0, true, texels_png));
-    let document = Document { width: u32::try_from(width)?, height: u32::try_from(height)?, stack };
+    let document = Document { width: u32::try_from(document_width)?, height: u32::try_from(height)?, stack };
     let merged = crate::draw(asset, image, 0);
     let thumbnail = merged.thumbnail(THUMBNAIL);
     let merged = codecs::texture::rgba_png(merged.width, merged.height, &merged.rgba).map_err(png_error)?;
@@ -313,7 +327,6 @@ impl Matcher {
 /// The source cannot be read, lacks its texels, or a layer holds what its depth cannot.
 pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     let document = ora::read(source).map_err(|e| anyhow!("{SOURCE}: {e}"))?;
-    let (width, height) = (document.width as usize, document.height as usize);
     // Palettes, by name: a strip's colors in a row.
     let layers: Vec<&Layer> = document.group(PALETTES).map_or_default(|g| g.layers().collect());
     let strips: HashMap<&str, &Layer> = layers.iter().map(|l| (l.name.as_str(), *l)).collect();
@@ -337,12 +350,15 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
 
     // Each texel layer, bottom first: the texels, then the cells as the stack shows them.
     let base = document.layer(TEXELS_LAYER).ok_or_else(|| anyhow!("{SOURCE}: no layer {TEXELS_LAYER}"))?;
+    // The image is its texels: the document may go on beside them, for cells of other depths.
+    let picture = ora::decode_png(&base.png).map_err(|e| anyhow!("layer {TEXELS_LAYER}: {e}"))?;
+    let (width, height) = (picture.width, picture.height);
     let indices = document.group(INDICES);
     let known = indices.and_then(|g| g.layers().find(|l| l.name == TEXELS_LAYER)).map(|l| Known::read(l, bpp)).transpose()?;
     let mut painted = vec![painting(base, bpp, 0, &palette(Some(0), bpp), known.as_ref(), &mut notes)?];
     let declared: HashMap<&str, &Value> = asset.parts("cells").into_iter().collect();
     let mut settings = Table::new();
-    settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::from(document.width)), Value::Integer(i64::from(document.height))]));
+    settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(width)?), Value::Integer(i64::try_from(height)?)]));
     if !declared_mode {
         settings.insert("mode".into(), Value::String(format!("{}_{bpp}bpp", if bpp == 16 { "direct" } else { "indexed" })));
     }
@@ -351,8 +367,10 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     }
     let mut rects = Table::new();
     let cell_layers: Vec<&Layer> = document.group(CELLS).map_or_default(|g| g.layers().collect());
+    let depth_of_layer = |name: &str| declared.get(name).and_then(|c| c.get("mode")).and_then(Value::as_str).and_then(crate::depth_of).unwrap_or(bpp);
+    let (places, _) = regions(width, bpp, cell_layers.iter().map(|layer| depth_of_layer(&layer.name)));
     for layer in cell_layers.iter().rev() {
-        let own = declared.get(layer.name.as_str()).and_then(|c| c.get("mode")).and_then(Value::as_str).and_then(crate::depth_of).unwrap_or(bpp);
+        let own = depth_of_layer(&layer.name);
         let cell_palette = declared
             .get(layer.name.as_str())
             .and_then(|c| c.get("palette"))
@@ -367,8 +385,8 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
             index.map(|l| Known::read(l, own)).transpose()?
         };
         let known = if own == bpp { known.as_ref() } else { own_known.as_ref() };
-        // Its texels are counted at its own depth from where its halfwords start, which is where it is drawn.
-        let start = usize::try_from(layer.x).unwrap_or(0) * texels_per_halfword(own) / texels_per_halfword(bpp);
+        let start = usize::try_from(i64::from(layer.x) - i64::try_from(places[&own])?)
+            .map_err(|_| anyhow!("{SOURCE}: layer {} is left of where cells of {own} bpp are", layer.name))?;
         let cell = painting(layer, own, start, &palette(cell_palette, own), known, &mut notes)?;
         let rect = [start, usize::try_from(layer.y).unwrap_or(0), cell.width, cell.height];
         let rect = rect.iter().map(|&v| Value::Integer(i64::try_from(v).unwrap_or(0))).collect();
@@ -598,6 +616,43 @@ mod tests {
         assert_eq!(imported(&source()), native());
         // Saved in color by a painting program: the repeated reds keep their indices.
         assert_eq!(imported(&resaved(&source(), &|_, _, _| {})), native());
+    }
+
+    #[test]
+    fn a_cell_of_another_depth_has_every_texel_clear_of_the_others() {
+        let document = ora::read(&source()).unwrap();
+        // The image's 8 texels, then the 16 of 4 bpp they hold.
+        assert_eq!((document.width, document.height), (24, 2));
+        let place = |name: &str| {
+            let layer = document.group(super::CELLS).unwrap().layers().find(|layer| layer.name == name).unwrap();
+            let picture = ora::decode_png(&layer.png).unwrap();
+            (layer.x, layer.y, picture.width, picture.height)
+        };
+        assert_eq!(place("wide"), (4, 0, 4, 2), "of the image's depth, it is where it is drawn");
+        assert_eq!(place("small"), (8, 1, 4, 1), "of 4 bpp, it starts the stretch of its depth");
+    }
+
+    #[test]
+    fn a_cell_moved_out_of_the_stretch_of_its_depth_says_so() {
+        let moved = resaved(&source(), &|_, _, _| {});
+        let mut document = ora::read(&moved).unwrap();
+        for node in &mut document.stack {
+            if let Node::Group(group) = node
+                && group.name == super::CELLS
+            {
+                for child in &mut group.children {
+                    if let Node::Layer(layer) = child
+                        && layer.name == "small"
+                    {
+                        layer.x = 0;
+                    }
+                }
+            }
+        }
+        let lent = Lent { fields: atlas().fields, files: HashMap::new() };
+        let asset = Asset::new(&lent, Some("pe2.images@image"));
+        let Err(why) = import(&asset, &ora::write(&document, &[], &[])) else { panic!("it is out of place") };
+        assert!(why.to_string().contains("small"), "{why}");
     }
 
     #[test]

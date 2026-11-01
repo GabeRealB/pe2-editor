@@ -100,7 +100,10 @@ fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
     let row = button.left_text(text).truncate().min_size(egui::vec2(width, 0.0)).sense(sense);
     let size = egui::vec2(width, ui.spacing().interact_size.y);
     let layout = *ui.layout();
-    (ui.allocate_ui_with_layout(size, layout, |ui| ui.add(row)).inner, toggled)
+    // A row narrower than its name cuts it: all of it is on the row's hover.
+    let response = ui.allocate_ui_with_layout(size, layout, |ui| ui.add(row)).inner;
+    let said = if line.detail.is_empty() { line.label.to_string() } else { format!("{}  {}", line.label, line.detail) };
+    (if heading { response } else { response.on_hover_text(said) }, toggled)
 }
 
 /// The icon of an action; its label where it has none.

@@ -401,8 +401,10 @@ pub fn texels_per_halfword(bpp: u8) -> usize {
 /// halfwords do and is drawn at its own width - with its depth and palette.
 pub struct Cell {
     pub name: String,
+    /// Where it is in the image, in the image's texels.
     pub rect: Rect,
     pub bpp: u8,
+    /// Where it is in its own texels.
     pub source: Rect,
     pub palette: Option<usize>,
 }
@@ -420,7 +422,8 @@ pub fn cells(asset: &Asset) -> Vec<Cell> {
             let own = bpp_of(c.get("mode"), bpp);
             #[expect(clippy::cast_precision_loss, reason = "texels per halfword")]
             let scale = texels_per_halfword(bpp) as f32 / texels_per_halfword(own) as f32;
-            let rect = Rect { x: source.x * scale, ..source };
+            // What it takes of the image: its halfwords, whatever its own depth makes of them.
+            let rect = Rect { x: source.x * scale, width: source.width * scale, ..source };
             let palette = c.get("palette").and_then(Value::as_str).and_then(|p| names.iter().position(|n| n == p));
             Some(Cell { name: name.to_string(), rect, bpp: own, source, palette })
         })
@@ -527,7 +530,52 @@ fn cell_picture(asset: &Asset, image: &TexelImage, name: &str) -> Option<Image> 
         Some(palette) => Some((name, palette_names(asset).iter().position(|known| known == palette)?)),
         None => None,
     };
-    Some(crop(&decode_texels(asset, &image.texels, &image.colors(), 0, through), cell.rect))
+    Some(decode_cell(asset, &image.texels, &image.colors(), &cell, through))
+}
+
+/// A cell's pixels, each of its texels one: not cut from the image, where a cell of fewer bits a texel has less room than it
+/// has texels.
+fn decode_cell(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], cell: &Cell, through: Option<(&str, usize)>) -> Image {
+    let gray = codecs::texture::gray_ramp(cell.bpp);
+    let (_, overrides) = look(asset, 0);
+    let asked = through.filter(|(name, _)| *name == cell.name).map(|(_, palette)| palette);
+    let chosen = asked.or_else(|| overrides.get(&cell.name).copied()).or(cell.palette);
+    let palette: &[u16] = chosen.and_then(|i| colors.get(i)?.as_deref()).unwrap_or(&gray);
+    let rows = cell_rows(asset, texels, cell, palette);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
+    let width = cell.source.width as usize;
+    let height = rows.len().checked_div(width).unwrap_or(0);
+    Image { width, height, rgba: rows.concat() }
+}
+
+/// A cell's texels through a palette, row by row: a cell of another depth than its image's rebuilt from the halfwords holding
+/// it.
+fn cell_rows(asset: &Asset, texels: &[u8], cell: &Cell, palette: &[u16]) -> Vec<[u8; 4]> {
+    const CLEAR: [u8; 4] = [0; 4];
+    let bpp = bpp(asset);
+    let per = texels_per_halfword(bpp);
+    let (width, height) = pair(asset.field("size")).unwrap_or_default();
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "image sizes")]
+    let (w, h) = (width as usize, height as usize);
+    let values: Vec<u16> = if bpp == 16 { halfwords(texels) } else { texels.iter().map(|&b| u16::from(b)).collect() };
+    let at = |x: usize, y: usize| values.get(y * w + x).copied().unwrap_or(0);
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
+    let (sx, sy, cw, ch) = (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
+    let mut rows = Vec::with_capacity(cw * ch);
+    for y in sy..(sy + ch).min(h) {
+        for i in 0..cw {
+            let index = if cell.bpp == bpp {
+                at(sx + i, y)
+            } else {
+                let own = texels_per_halfword(cell.bpp);
+                let (word_x, k) = ((sx + i) / own, (sx + i) % own);
+                let word = (0..per).fold(0u16, |word, j| word | at(word_x * per + j, y) << (16 / per * j));
+                (word >> (16 / own * k)) & ((1 << (16 / own)) - 1)
+            };
+            rows.push(palette.get(usize::from(index)).map_or(CLEAR, |&c| rgba(c)));
+        }
+    }
+    rows
 }
 
 /// Texels and palettes as a picture in a look (one past its looks, its first), with their image's settings.
@@ -570,53 +618,29 @@ fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], vari
         })
         .collect();
     if atlas {
-        let per = texels_per_halfword(bpp);
         for cell in &cells {
             let asked = through.filter(|(name, _)| *name == cell.name).map(|(_, palette)| palette);
             let colors = palette(asked.or_else(|| overrides.get(&cell.name).copied()).or(cell.palette));
+            let rows = cell_rows(asset, texels, cell, colors);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
-            let (sx, sy, cw, ch, dx) = (
-                cell.source.x as usize,
-                cell.source.y as usize,
-                cell.source.width as usize,
-                cell.source.height as usize,
-                cell.rect.x as usize,
-            );
-            // A deeper cell spans more of the image's texels than it is wide: the span past its width is its own
-            // halfwords read at the image's depth, so it is left blank.
-            let span = cw * per / texels_per_halfword(cell.bpp);
-            for y in sy..(sy + ch).min(h) {
-                for x in (dx + cw)..(dx + span).min(w) {
-                    pixels[y * w + x] = CLEAR;
+            let (sy, cw, dx, span) = (cell.source.y as usize, cell.source.width as usize, cell.rect.x as usize, cell.rect.width as usize);
+            for (row, texels) in rows.chunks(cw.max(1)).enumerate() {
+                let y = sy + row;
+                if y >= h {
+                    break;
                 }
-                for i in 0..cw {
-                    let index = if cell.bpp == bpp {
-                        at(sx + i, y)
-                    } else {
-                        // The cell's texel from the halfword holding it, rebuilt from the image's texels.
-                        let own = texels_per_halfword(cell.bpp);
-                        let (word_x, k) = ((sx + i) / own, (sx + i) % own);
-                        let word = (0..per).fold(0u16, |word, j| word | at(word_x * per + j, y) << (16 / per * j));
-                        (word >> (16 / own * k)) & ((1 << (16 / own)) - 1)
-                    };
-                    if dx + i < w {
-                        pixels[y * w + dx + i] = colors.get(usize::from(index)).map_or(CLEAR, |&c| rgba(c));
+                // Each of the image's texels it takes shows the cell's nearest. A cell of more bits a texel takes more of
+                // them than it is wide: the rest is its own halfwords read at the image's depth, and left blank.
+                for x in 0..span {
+                    if dx + x < w {
+                        let i = if span < cw { x * cw / span.max(1) } else { x };
+                        pixels[y * w + dx + x] = texels.get(i).copied().unwrap_or(CLEAR);
                     }
                 }
             }
         }
     }
     Image { width: w, height: h, rgba: pixels.concat() }
-}
-
-/// A rectangle of a picture, clipped to it.
-fn crop(picture: &Image, rect: Rect) -> Image {
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "pixel coordinates")]
-    let (x, y, w, h) = (rect.x as usize, rect.y as usize, rect.width as usize, rect.height as usize);
-    let (x1, y1) = ((x + w).min(picture.width), (y + h).min(picture.height));
-    let (x, y) = (x.min(x1), y.min(y1));
-    let rgba = (y..y1).flat_map(|row| &picture.rgba[(row * picture.width + x) * 4..(row * picture.width + x1) * 4]).copied().collect();
-    Image { width: x1 - x, height: y1 - y, rgba }
 }
 
 /// A background's picture.
@@ -667,6 +691,34 @@ mod tests {
     /// ABGR1555 halfwords, as stored.
     fn colors(first: u16, second: u16) -> Vec<u8> {
         [first, second].iter().flat_map(|c| c.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn a_cell_of_fewer_bits_stays_in_the_room_it_has() {
+        // Sixteen 4 bpp texels of each of two cells, side by side in a page of 8: each has eight of the page's texels.
+        let declared = "mode = \"indexed_8bpp\"\nsize = [16, 1]\npalettes.warm = {}\npalettes.cold = {}\n\
+                        cells.left = { rect = [0, 0, 16, 1], palette = \"warm\", mode = \"indexed_4bpp\" }\n\
+                        cells.right = { rect = [16, 0, 16, 1], palette = \"cold\", mode = \"indexed_4bpp\" }\n";
+        let (red, blue) = (0x001F_u16, 0x7C00_u16);
+        let colors = |c: u16| [0u16, c].iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>();
+        let files = HashMap::from([
+            ("native.texels", vec![0x11; 16]),
+            ("native.warm.colors", colors(red)),
+            ("native.cold.colors", colors(blue)),
+        ]);
+        let lent = Lent { fields: declared.parse().unwrap(), files };
+        let asset = Asset::new(&lent, None);
+        let rects: Vec<(f32, f32)> = cells(&asset).iter().map(|cell| (cell.rect.x, cell.rect.width)).collect();
+        assert_eq!(rects, [(0.0, 8.0), (8.0, 8.0)]);
+        let image = TexelImage::read(&asset).unwrap();
+        let picture = draw(&asset, &image, 0);
+        let pixel = |x: usize| picture.rgba[x * 4..x * 4 + 4].to_vec();
+        assert_eq!(pixel(7), super::rgba(red));
+        assert_eq!(pixel(8), super::rgba(blue), "the second is not under the first");
+        // A cell alone has every texel it has, and none of its neighbor's.
+        let alone = super::cell_picture(&asset, &image, "left").unwrap();
+        assert_eq!((alone.width, alone.height), (16, 1));
+        assert!(alone.rgba.chunks(4).all(|pixel| pixel == super::rgba(red)));
     }
 
     #[test]

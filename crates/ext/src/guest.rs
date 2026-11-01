@@ -959,6 +959,8 @@ fn describe_type(handle: u32, ty: &TypeDef, numbered: &mut Registered) -> g::Val
         editors,
         contents_views,
         stack: ty.stack.clone(),
+        takes: ty.takes.clone(),
+        extracted: ty.extracted,
     }
 }
 

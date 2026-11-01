@@ -560,8 +560,9 @@ impl Extensions {
                     name: node_type.name.local().to_string(),
                     label: node_type.label.clone(),
                     node_type: node_type.name.to_string(),
-                    files: Vec::new(),
+                    files: node_type.takes.clone(),
                     stack,
+                    offered: !node_type.extracted,
                 });
             }
             if node_type.shows_nodes() {
@@ -663,7 +664,7 @@ impl Extensions {
             self.presented.extend(added.values.iter().map(|value| (value.clone(), name.clone())));
             if let Some(stack) = added.stack {
                 let (name, label, node_type) = (def.name.local().to_string(), def.label.clone(), def.name.to_string());
-                self.templates.entry(name.clone()).or_insert(pe2_ext::TemplateDef { name, label, node_type, files: Vec::new(), stack });
+                self.templates.entry(name.clone()).or_insert(pe2_ext::TemplateDef { name, label, node_type, files: Vec::new(), stack, offered: true });
             }
         }
     }
@@ -895,7 +896,7 @@ impl Extensions {
     /// # Errors
     /// It does, by an operation no extension provides.
     #[must_use]
-    pub fn recipe_for(&self, asset: &index::Asset, file: &str) -> Option<std::result::Result<String, String>> {
+    pub fn stack_for(&self, asset: &index::Asset, file: &str) -> Option<std::result::Result<String, String>> {
         let name = self.type_name(asset)?;
         let template = self.templates_for(file).into_iter().find(|template| template.node_type == name)?;
         Some(self.stamp(template, file))

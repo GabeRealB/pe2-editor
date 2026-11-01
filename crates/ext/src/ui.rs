@@ -224,7 +224,7 @@ impl<'a> Ui<'a> {
     }
 
     pub fn error(&mut self, text: &str) {
-        self.host.label(text, Style::Error);
+        self.host.label(&plain(text), Style::Error);
     }
 
     pub fn button(&mut self, text: &str) -> bool {
@@ -443,4 +443,23 @@ impl<'a> Ui<'a> {
 /// kept while the panel is open.
 pub trait View {
     fn show(&mut self, ui: &mut Ui);
+}
+
+/// What went wrong, without where in which stack and whose: `stack[5]: pe2.render: model: no mesh` is `model: no mesh`.
+fn plain(why: &str) -> String {
+    let mut said = why;
+    while let Some((_, rest)) = said.strip_prefix("stack[").and_then(|rest| rest.split_once("]: ")) {
+        said = rest.split_once(": ").map_or(rest, |(_, rest)| rest);
+    }
+    said.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn what_went_wrong_is_said_without_its_place() {
+        assert_eq!(super::plain("stack[5]: pe2.render: model: no mesh"), "model: no mesh");
+        assert_eq!(super::plain("stack[1]: pe2.packages: stack[2]: pe2.psx: not it"), "not it");
+        assert_eq!(super::plain("it failed: why"), "it failed: why");
+    }
 }

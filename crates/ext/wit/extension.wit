@@ -678,6 +678,10 @@ interface guest {
         contents-views: list<view>,
         /// The stack a node of it is made with by default (TOML `[[stack]]` tables).
         stack: option<string>,
+        /// The files that make a node of it with that stack, by name.
+        takes: list<string>,
+        /// What only extraction makes: nothing offers a new one.
+        extracted: bool,
         /// What it adds to a type of what it requires, whose qualified name is its `name`.
         extends: bool,
         /// Whether a node of it holds only what is set on it: then an operation of the type's name makes those settings.

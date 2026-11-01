@@ -23,6 +23,15 @@ fn edited(text: &str, change: impl FnOnce(&mut Vec<Value>) -> Result<()>) -> Res
     Ok(crate::extract::with_stack(&rest, &toml::to_string(&section)?))
 }
 
+/// The file a stack stores, by the name it gives it.
+#[must_use]
+pub fn stored_file(stack: &str) -> Option<String> {
+    let parsed: Table = stack.parse().ok()?;
+    let layers = parsed.get("stack")?.as_array()?;
+    let stored = layers.iter().find(|layer| layer.get("op").and_then(Value::as_str) == Some(super::FILE))?;
+    stored.get("file")?.as_str().map(str::to_string)
+}
+
 /// A declaration without its stack. What is written over the first layer is the file's, kept: with no field above it, a
 /// file's opening comment is held by that layer.
 fn without_stack(text: &str) -> Result<String> {

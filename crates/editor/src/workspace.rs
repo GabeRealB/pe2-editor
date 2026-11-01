@@ -678,13 +678,17 @@ impl Workspace {
         };
         let path = (0..=self.index.assets.len()).map(at).find(|path| !self.index.assets.contains_key(path)).unwrap_or_default();
         let stack = self.extensions.stamp(found, &name)?;
+        // A stack naming its own file has the file under that name.
+        let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
         let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id))).map_err(|e| e.to_string())?;
         let uid = project::uid::text(id);
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
         let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
         let files: Vec<(&str, &[u8])> = bytes.as_deref().map(|bytes| (name.as_str(), bytes)).into_iter().collect();
         project::edit::create(&self.project, &self.index, &layer, &uid, &path, (&declaration, &files), &mut self.history).map_err(|e| format!("{e:#}"))?;
-        self.select(path);
+        // Shown once it is taken in: until then nothing is there to open.
+        let ticket = self.take_written();
+        self.selection_after = ticket.map(|ticket| (ticket, path));
         Ok(())
     }
 
@@ -1484,7 +1488,7 @@ impl Workspace {
     /// Nothing makes this file of this asset, or it cannot be read.
     pub fn replacing(&self, asset: &Asset, file: &Path) -> std::result::Result<Vec<EditRequest>, String> {
         let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
-        let stack = self.extensions.recipe_for(asset, name).ok_or("Nothing imports it over this")??;
+        let stack = self.extensions.stack_for(asset, name).ok_or("Nothing imports it over this")??;
         let uid = asset.uid.clone().ok_or("It has no uid")?;
         let declaration = project::graph::layers::with_new_stack(asset.text(), &stack).map_err(|e| format!("{e:#}"))?;
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;

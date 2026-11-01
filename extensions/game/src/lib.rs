@@ -56,7 +56,7 @@ fn register(r: &mut Registry) -> Result<()> {
         ("movie_slot", "Movie slot", Icon::Film, Tint::Motion),
     ];
     for (name, label, icon, tint) in held {
-        r.named_type(name).alias(name).label(label).icon(icon, tint).data().register();
+        r.named_type(name).alias(name).label(label).icon(icon, tint).data().extracted().register();
     }
     // What the disc stores as files of their own, known by their names.
     let stored = [
@@ -73,6 +73,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("File")
         .icon(Icon::File, Tint::Structure)
         .data()
+        .extracted()
         .field(Field::new("sector_len").label("Sector length").format(hex))
         .register();
     // A disc's movie file: a list of entries, each a movie in order, which the stages' records name.
@@ -96,6 +97,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("stream")
         .label("Movie file")
         .data()
+        .extracted()
         .icon(Icon::Stack, Tint::Motion)
         .stack(STREAM)
         .contents(entry_rows)
@@ -105,6 +107,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("scene_audio")
         .label("Scene audio")
         .data()
+        .extracted()
         .icon(Icon::Waveform, Tint::Sound)
         .field(Field::new("sound_bank_mask").label("Sound bank mask").format(hex))
         .register();

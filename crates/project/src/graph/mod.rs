@@ -1159,8 +1159,7 @@ impl Lowering<'_> {
     }
 }
 
-/// A stack's import, as what read `[import]` before stacks reads it: the stored file on top - its source - and the
-/// operation below it, with that operation's settings.
+/// A stack's import: the stored file on top - its source - and the operation below it, with that operation's settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Import<'a> {
     pub source: &'a str,
@@ -1177,18 +1176,6 @@ pub fn import_of(fields: &Table) -> Option<Import<'_>> {
     let below = stack.get(1)?.as_table()?;
     let op = below.get("op")?.as_str().filter(|op| ![FILE, CONSTANT, OUTPUT, PREVIEW, GRAPH].contains(op))?;
     Some(Import { source, op, settings: settings_of(below, &["op"]) })
-}
-
-/// A declaration's fields as an importer reads them: with `[import]` - its importer, its source and its settings -
-/// as the stack gives them.
-#[must_use]
-pub fn with_import(fields: &Table, import: &Import<'_>) -> Table {
-    let mut fields = fields.clone();
-    let mut section = import.settings.clone();
-    section.insert("importer".into(), import.op.into());
-    section.insert("source".into(), import.source.into());
-    fields.insert("import".into(), Toml::Table(section));
-    fields
 }
 
 #[cfg(test)]

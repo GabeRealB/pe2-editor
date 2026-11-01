@@ -1318,7 +1318,7 @@ impl Editor {
     fn new_node_menu(&mut self, ui: &mut egui::Ui) {
         let Some(ws) = &self.workspace else { return };
         let mut listed: Vec<(String, String)> =
-            ws.extensions.templates().filter(|template| !template.stored()).map(|template| (template.label.clone(), template.name.clone())).collect();
+            ws.extensions.templates().filter(|template| template.offered && !template.stored()).map(|template| (template.label.clone(), template.name.clone())).collect();
         listed.sort();
         let mut chosen = None;
         ui.menu_button("New node", |ui| {
@@ -1656,21 +1656,21 @@ impl Editor {
             let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
             let missing = files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
             let name_of = |file: &PathBuf| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-            let recipe = match files.as_slice() {
+            let stack = match files.as_slice() {
                 [] => Err("No file yet".to_string()),
-                [file] => ws.extensions.recipe_for(asset, &name_of(file)).unwrap_or_else(|| Err(format!("Nothing imports it over {name}"))),
+                [file] => ws.extensions.stack_for(asset, &name_of(file)).unwrap_or_else(|| Err(format!("Nothing imports it over {name}"))),
                 _ => Err("One file replaces an asset's source".to_string()),
             };
             ui.horizontal(|ui| {
-                let can = recipe.is_ok() && missing.is_none();
+                let can = stack.is_ok() && missing.is_none();
                 let button = ui.add_enabled(can, egui::Button::new(format!("Replace the source of {name}")));
-                let button = button.on_disabled_hover_text(recipe.clone().err().or_else(|| missing.clone()).unwrap_or_default());
+                let button = button.on_disabled_hover_text(stack.clone().err().or_else(|| missing.clone()).unwrap_or_default());
                 replace = button.clicked();
                 let can = !files.is_empty() && missing.is_none();
                 add = ui.add_enabled(can, egui::Button::new(format!("Add to {name}"))).clicked();
                 cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
             });
-            if let Some(why) = missing.or(recipe.err()) {
+            if let Some(why) = missing.or(stack.err()) {
                 ui.label(RichText::new(why).small().color(theme::weak()));
             }
         });

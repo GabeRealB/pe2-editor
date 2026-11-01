@@ -226,6 +226,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .of(Usd::NAME)
         .icon(Icon::Polygon, Tint::Picture)
         .stack(MESH)
+        .takes(&["*.usda"])
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))

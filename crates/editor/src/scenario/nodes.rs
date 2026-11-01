@@ -21,6 +21,9 @@ fn new_node_offers_what_needs_no_file() {
     editor.expect("Skeleton");
     editor.expect_not("Mesh");
     editor.expect_not("from a video file");
+    editor.expect_not("Disc");
+    editor.expect_not("Stage");
+    editor.expect("Package");
     editor.escape();
 }
 

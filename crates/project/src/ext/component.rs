@@ -2074,6 +2074,11 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
         for f in node_type.fields {
             builder = builder.field(field(shared, f));
         }
+        if node_type.extracted {
+            builder = builder.extracted();
+        }
+        let takes: Vec<&str> = node_type.takes.iter().map(String::as_str).collect();
+        builder = builder.takes(&takes);
         if let Some(stack) = &node_type.stack {
             builder = builder.stack(stack);
         }

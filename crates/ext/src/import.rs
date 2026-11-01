@@ -57,6 +57,10 @@ pub struct TypeDef {
     pub part_sheet: Option<Arc<SheetOfPart>>,
     /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
     pub stack: Option<String>,
+    /// The files that make a node of it with that stack, by name (`*.usda`): the stack stores them under its own names.
+    pub takes: Vec<String>,
+    /// What only extraction makes: a person has no use for a new one.
+    pub extracted: bool,
     /// A node of it holds only what is set on it: an operation of its name makes those settings, of this type.
     pub data: bool,
     /// The value types a node making one is of this type, by their qualified names: a picture stored as `texels` or as

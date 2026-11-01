@@ -860,6 +860,18 @@ impl Gathering<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Option_, value_of};
+
+    #[test]
+    fn a_string_option_is_a_string_to_the_compiler() {
+        let def = Option_ { ty: "string".to_string(), members: Vec::new(), at: "here".to_string(), label: String::new(), order: 0 };
+        let fields: toml::Table = "option.title = 'a \"name\"'".parse().unwrap();
+        assert_eq!(value_of("title", &def, &fields).unwrap().as_deref(), Some("\"a \\\"name\\\"\""));
+        assert_eq!(value_of("other", &def, &fields).unwrap(), None);
+        let wrong: toml::Table = "option.title = 3".parse().unwrap();
+        assert!(value_of("title", &def, &wrong).is_err());
+    }
+
     use super::label_in;
 
     #[test]
