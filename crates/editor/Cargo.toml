@@ -33,7 +33,3 @@ toml.workspace = true
 toml_edit.workspace = true
 # The event loop is the editor's own: it is what knows the monitors (main.rs).
 winit.workspace = true
-
-# The GPU's use, as Windows counts it (gpu_stats.rs).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
