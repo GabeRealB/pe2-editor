@@ -13,10 +13,11 @@ use crate::dnd::{self, Dragged};
 use crate::workspace::{EditRequest, Workspace};
 use crate::{icons, theme};
 
-/// How far a row within another is set in.
-const INDENT: f32 = 14.0;
+/// How far a row within another is set in: the width a tree takes off its names is what matters in a pane this narrow, and
+/// a guide says what the indent alone would have to.
+const INDENT: f32 = 8.0;
 /// What a row's arrow takes, or leaves where it has none, so that names at a depth line up.
-const ARROW: f32 = 16.0;
+const ARROW: f32 = 12.0;
 /// A button on a row.
 const ROW_BUTTON: f32 = 24.0;
 /// A row's picture, at most this high and twice as wide.
@@ -59,8 +60,23 @@ impl Line<'_> {
     }
 }
 
+/// A line down a row for each row it is within, joining up with the rows above and below it.
+fn guides(ui: &egui::Ui, depth: u32) {
+    let left = ui.cursor().min.x;
+    let (top, height) = (ui.cursor().min.y, ui.spacing().interact_size.y);
+    let reach = ui.spacing().item_spacing.y;
+    let stroke = egui::Stroke::new(1.0, theme::weak().gamma_multiply(0.25));
+    for at in 0..depth {
+        #[expect(clippy::cast_precision_loss, reason = "a tree's depth")]
+        let x = left + INDENT * at as f32 + ARROW / 2.0;
+        ui.painter().vline(ui.painter().round_to_pixel_center(x), egui::Rangef::new(top, top + height + reach), stroke);
+    }
+}
+
 /// Draw a row in a horizontal layout: its response, and whether its arrow was clicked.
 fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
+    let gap = std::mem::replace(&mut ui.spacing_mut().item_spacing.x, 0.0);
+    guides(ui, line.depth);
     #[expect(clippy::cast_precision_loss, reason = "a tree's depth")]
     ui.add_space(INDENT * line.depth as f32);
     let toggled = line.fold.is_some_and(|open| {
@@ -102,6 +118,7 @@ fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
     let layout = *ui.layout();
     // A row narrower than its name cuts it: all of it is on the row's hover.
     let response = ui.allocate_ui_with_layout(size, layout, |ui| ui.add(row)).inner;
+    ui.spacing_mut().item_spacing.x = gap;
     let said = if line.detail.is_empty() { line.label.to_string() } else { format!("{}  {}", line.label, line.detail) };
     (if heading { response } else { response.on_hover_text(said) }, toggled)
 }
