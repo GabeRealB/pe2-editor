@@ -1164,6 +1164,10 @@ impl Extensions {
                 let family = self.ops.get(&output.op).is_some_and(|def| def.parameter.is_some());
                 // Of a family, what it is first shown as: the first member it lists.
                 let first = output.members.as_ref().filter(|_| tapped && family).and_then(|members| members(&self.lend(asset)).into_iter().next());
+                // A family with nothing in it yet has nothing to show.
+                if tapped && family && first.is_none() {
+                    continue;
+                }
                 let address = first.map_or_else(|| output.name.clone(), |(member, _)| format!("{}/{member}", output.name));
                 found.push(Preview { output: address, ty: output.ty.clone(), viewer, tapped });
             }

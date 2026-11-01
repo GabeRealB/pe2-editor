@@ -14,15 +14,24 @@ fn edited(text: &str, change: impl FnOnce(&mut Vec<Value>) -> Result<()>) -> Res
     let fields: Table = toml::from_str(text).context("its declaration")?;
     let mut layers = fields.get("stack").and_then(Value::as_array).cloned().unwrap_or_default();
     change(&mut layers)?;
-    let mut document: toml_edit::DocumentMut = text.parse().context("its declaration")?;
-    document.remove("stack");
-    let rest = document.to_string();
+    let rest = without_stack(text)?;
     if layers.is_empty() {
         return Ok(rest);
     }
     let mut section = Table::new();
     section.insert("stack".into(), Value::Array(layers));
     Ok(crate::extract::with_stack(&rest, &toml::to_string(&section)?))
+}
+
+/// A declaration without its stack. What is written over the first layer is the file's, kept: with no field above it, a
+/// file's opening comment is held by that layer.
+fn without_stack(text: &str) -> Result<String> {
+    let mut document: toml_edit::DocumentMut = text.parse().context("its declaration")?;
+    let opening = document.get("stack").and_then(toml_edit::Item::as_array_of_tables).and_then(|layers| layers.iter().next());
+    let opening = opening.and_then(|layer| layer.decor().prefix()).and_then(toml_edit::RawString::as_str).unwrap_or_default().to_string();
+    document.remove("stack");
+    let rest = document.to_string();
+    Ok(if opening.trim().is_empty() || !document.is_empty() { rest } else { format!("{opening}{rest}") })
 }
 
 /// The layer a setting belongs on: the first operation of the node's own before anything is taken from it, else its stored
@@ -104,12 +113,11 @@ pub fn settings_on_layers(text: &str) -> Result<String> {
 pub fn with_new_stack(text: &str, stack: &str) -> Result<String> {
     let fields: Table = toml::from_str(text).context("its declaration")?;
     let settings = super::with_settings(fields.clone());
-    let mut document: toml_edit::DocumentMut = text.parse().context("its declaration")?;
-    document.remove("stack");
-    let rest: Table = toml::from_str(&document.to_string()).context("its declaration")?;
+    let bare = without_stack(text)?;
+    let rest: Table = toml::from_str(&bare).context("its declaration")?;
     let held = settings.iter().filter(|(key, _)| !matches!(key.as_str(), "stack" | "original") && !rest.contains_key(*key));
     let mut lines = toml::to_string(&held.map(|(key, value)| (key.clone(), value.clone())).collect::<Table>()).context("its settings")?;
-    lines.push_str(&document.to_string());
+    lines.push_str(&bare);
     settings_on_layers(&crate::extract::with_stack(&lines, stack))
 }
 
@@ -338,6 +346,14 @@ sha1 = "ab"
         assert_eq!(settings["mode"].as_str(), Some("indexed_4bpp"));
         assert!(!settings.contains_key("name") && !settings.contains_key("file"));
         assert!(!crate::graph::shape(&settings).contains("mode"));
+    }
+
+    #[test]
+    fn an_opening_comment_outlives_a_stack_edit() {
+        let text = "# Who made this.\n\n[[stack]]\nop = \"file\"\nfile = \"a\"\n";
+        let edited = super::add(text, 1, Table::from_iter([("op".to_string(), toml::Value::from("output")), ("name".to_string(), toml::Value::from("native"))])).unwrap();
+        assert!(edited.starts_with("# Who made this."), "{edited}");
+        assert!(edited.contains("name = \"native\""), "{edited}");
     }
 
     #[test]

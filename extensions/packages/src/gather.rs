@@ -43,6 +43,11 @@ impl Package {
         strings(&self.fields, "public")
     }
 
+    /// Whether a file is one of its.
+    fn owns(&self, file: &str) -> bool {
+        file.strip_prefix(self.path.as_str()).is_some_and(|inside| inside.starts_with('/'))
+    }
+
     /// A public file by its path within what it makes public.
     fn public(&self, inside: &str) -> Option<String> {
         let folders = strings(&self.fields, "public");
@@ -214,7 +219,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     let packages = packages(call)?;
     let own = packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let public: Vec<String> = strings(&own.fields, "public").iter().map(|folder| format!("{path}/{folder}/")).collect();
-    let mut walk = Walk { call, own, name: &name, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
+    let mut walk = Walk { call, own, packages: &packages, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
     // As a compile reads them, then whatever only dependents read.
     let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
     for file in units.iter().chain(own.files.iter().filter(|file| is_source(file))) {
@@ -238,7 +243,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
 struct Walk<'a> {
     call: &'a Call<'a>,
     own: &'a Package,
-    name: &'a str,
+    packages: &'a HashMap<String, Package>,
     public: Vec<String>,
     seen: BTreeSet<String>,
     label: String,
@@ -254,7 +259,9 @@ impl Walk<'_> {
         }
         let bytes = self.call.read_entry(file)?;
         let text = String::from_utf8_lossy(&bytes);
-        let in_public = self.public.iter().any(|folder| file.starts_with(folder.as_str()));
+        // What it reads of a dependency it reads as its own: a slot a header there declares is filled here.
+        let its_own = self.own.owns(file);
+        let in_public = !its_own || self.public.iter().any(|folder| file.starts_with(folder.as_str()));
         let entered = self.label.clone();
         let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, beside(line)?))).peekable();
         for found in scan::uses(&text) {
@@ -265,14 +272,17 @@ impl Walk<'_> {
             self.options.read(&found, &format!("{file}:{}", found.line));
             match found.args.as_slice() {
                 [label] if found.name == "PE2_EDITOR_LABEL" => self.label = label_in(label).unwrap_or_default(),
-                [package, inside] if found.name == "PE2_INCLUDE" && *package == self.name => {
-                    if let Some(entry) = self.own.public(inside) {
+                [package, inside] if found.name == "PE2_INCLUDE" => {
+                    if let Some(entry) = self.packages.get(*package).and_then(|package| package.public(inside)) {
                         self.file(&entry)?;
                     }
                 }
                 _ => {}
             }
-            self.slots.read(&found, in_public, &self.label, self.order);
+            // What a dependency depends on is its own to say.
+            if its_own || found.name != "PE2_INCLUDE" {
+                self.slots.read(&found, in_public, &self.label, self.order);
+            }
             self.options.place(&found, &self.label, self.order);
         }
         for (_, beside) in includes {
@@ -284,7 +294,8 @@ impl Walk<'_> {
 
     fn beside(&mut self, from: &str, file: &str) -> Result<()> {
         let entry = normal(&format!("{}/{file}", folder_of(from)));
-        if self.own.files.contains(&entry) { self.file(&entry) } else { Ok(()) }
+        let held = self.packages.values().any(|package| package.owns(from) && package.files.contains(&entry));
+        if held { self.file(&entry) } else { Ok(()) }
     }
 }
 

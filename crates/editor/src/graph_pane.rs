@@ -252,7 +252,7 @@ fn add_menu(ui: &mut egui::Ui, ws: &Workspace, asset: &Asset, (at, layer): (usiz
                         let stored = asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
                         table.insert("file".into(), stored.map_or("", |f| f.name.as_str()).into());
                     }
-                    graph::OUTPUT => {
+                    graph::OUTPUT | graph::PREVIEW => {
                         table.insert("name".into(), id.as_str().into());
                     }
                     _ => {}

@@ -306,6 +306,16 @@ pub struct TemplateDef {
     pub stack: String,
 }
 
+impl TemplateDef {
+    /// Whether a node of it holds a stored file: it cannot be made with nothing, a file having to come from somewhere.
+    #[must_use]
+    pub fn stored(&self) -> bool {
+        let parsed: Option<Table> = self.stack.parse().ok();
+        let layers = parsed.as_ref().and_then(|stack| stack.get("stack")).and_then(Value::as_array);
+        self.stack.contains("{file}") || layers.is_some_and(|layers| layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some("file")))
+    }
+}
+
 /// Makes a view of an asset.
 pub type MakeView = dyn Fn(&Asset) -> Box<dyn View> + Send + Sync;
 

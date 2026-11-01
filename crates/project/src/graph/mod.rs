@@ -339,6 +339,7 @@ impl Default for Ops {
         let signal = Type::Named(SIGNAL_TYPE.to_string());
         let wires = |name: &str| Port { name: name.to_string(), ty: signal.clone(), many: true };
         ops.add(OpDef::new(OUTPUT, "Output", "1").input(port("value", Type::Any)).input(wires("pull")).input(wires("listen")));
+        ops.add(OpDef::new(PREVIEW, "Preview", "1").input(port("value", Type::Any)));
         ops.add(OpDef::new(EVENT, "Event", "1").makes(signal.clone(), |_| anyhow::bail!("an event is no value")));
         ops.add(OpDef::new(SIGNAL, "Signal", "1").input(wires("when")));
         for gate in GATES {
@@ -1139,6 +1140,10 @@ impl Lowering<'_> {
         }
         if name == OUTPUT {
             self.output(op, inputs[0][0], at, &inputs[1..]);
+            return None;
+        }
+        if name == PREVIEW {
+            self.preview(op, inputs[0][0], at);
             return None;
         }
         if name == SIGNAL {

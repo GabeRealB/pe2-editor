@@ -1302,7 +1302,7 @@ impl Editor {
     fn new_node_menu(&mut self, ui: &mut egui::Ui) {
         let Some(ws) = &self.workspace else { return };
         let mut listed: Vec<(String, String)> =
-            ws.extensions.templates().filter(|template| !template.stack.contains("{file}")).map(|template| (template.label.clone(), template.name.clone())).collect();
+            ws.extensions.templates().filter(|template| !template.stored()).map(|template| (template.label.clone(), template.name.clone())).collect();
         listed.sort();
         let mut chosen = None;
         ui.menu_button("New node", |ui| {

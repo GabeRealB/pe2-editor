@@ -334,12 +334,20 @@ fn stack_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, layers: &[Valu
         }
     };
     let op_of = |layer: &Value| layer.get("op").and_then(Value::as_str).unwrap_or_default().to_string();
+    let taken = |op: &str| matches!(op, graph::OUTPUT | graph::PREVIEW);
     for (at, layer) in layers.iter().enumerate() {
         let inner = format!("stack.{at}");
         let name = op_of(layer);
+        // What is taken from a layer is said on its row; the Stack tab has each of them.
+        if taken(&name) && at > 0 {
+            continue;
+        }
         let icon = if name == graph::GRAPH { icons::TREE_STRUCTURE } else { icons::STACK_SIMPLE };
         let label = label_of(ws, &name);
-        let row = Line::plain(right, 0, selected.as_deref() == Some(&inner), icon, &label, detail_of(layer));
+        let outputs = layers[at + 1..].iter().take_while(|below| taken(&op_of(below)));
+        let details: Vec<&str> = std::iter::once(detail_of(layer)).chain(outputs.map(detail_of)).filter(|d| !d.is_empty()).collect();
+        let details = details.join(", ");
+        let row = Line::plain(right, 0, selected.as_deref() == Some(&inner), icon, &label, &details);
         let clicked = ui.horizontal(|ui| line(ui, &row).0.clicked()).inner;
         pick(clicked, inner.clone());
         let Some(ops) = layer.get("ops").and_then(Value::as_table) else { continue };

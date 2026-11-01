@@ -103,7 +103,7 @@ fn build(call: &mut Call) -> Result<Typed> {
 /// What a tool said of the tree it was given, said of the files they are.
 fn in_project<T>(result: Result<T>, scratch: &Path, path: &str) -> Result<T> {
     let tree = scratch.join("tree").display().to_string();
-    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}/self/"), &format!("{path}/")).replace(&format!("{tree}/pkg/"), "packages/")))
+    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}/self/"), &format!("{path}/")).replace(&format!("{tree}/pkg/"), "packages/").replace(&format!("{tree}/"), "")))
 }
 
 /// What the units come to with `PE2_INCLUDE` and the options expanded and the other `PE2_*` macros left as they are written, for
@@ -126,9 +126,20 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
     let _ = fs::remove_dir_all(&scratch);
     let path = call.host.path().to_string();
     let unset = sources.settings.get("unset").and_then(Value::as_array).map_or_else(Vec::new, |names| names.iter().filter_map(Value::as_str).collect());
-    let made = made.map_err(|e| if unset.is_empty() { e } else { e.context(format!("no value on this package: {}", unset.join(", "))) });
-    sources.files.extend(in_project(made, &scratch, &path)?);
+    sources.files.extend(in_project(made, &scratch, &path).map_err(|e| no_value(e, &unset))?);
     Ok(sources)
+}
+
+/// A failure of an option with no value, said of the line asking for it: the compiler names the header defining it.
+fn no_value(error: pe2_ext::Error, unset: &[&str]) -> pe2_ext::Error {
+    let said = format!("{error:#}");
+    let Some(name) = unset.iter().find(|name| said.contains(&format!("pe2_unset_{name}"))) else { return error };
+    let asked = said.lines().filter_map(|line| line.split_once(": note: in expansion of macro")).find(|(_, by)| by.contains("PE2_OPTION"));
+    let at = asked.and_then(|(place, _)| place.rsplit_once(':')).map(|(line, _)| line);
+    match at {
+        Some(at) => anyhow!("{at}: {name} has no value on this package"),
+        None => error.context(format!("{name} has no value on this package")),
+    }
 }
 
 /// What was gathered, on disk for the tools to read.
@@ -211,4 +222,18 @@ fn link(address: u32, script: &Path, published: &[PathBuf], objects: &[PathBuf],
     let image = scratch.join(format!("{name}.pe2pkg"));
     run("mips-linux-gnu-objcopy", &["-O".into(), "binary".into(), "-j".into(), ".image".into(), text(&linked), text(&image)])?;
     Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use pe2_ext::anyhow;
+
+    #[test]
+    fn an_option_with_no_value_is_told_at_the_line_asking() {
+        let said = "exit status: 1: In file included from pe2.h:29,\npe2_options.h:1:26: error: division by zero in #if\n\
+                    1 | #define pe2_option_foo (0/pe2_unset_foo)\n\
+                    packages/title/src/title.c:4:5: note: in expansion of macro \u{2018}PE2_OPTION\u{2019}\n";
+        assert_eq!(super::no_value(anyhow!("{said}"), &["bar", "foo"]).to_string(), "packages/title/src/title.c:4: foo has no value on this package");
+        assert_eq!(super::no_value(anyhow!("other"), &["foo"]).to_string(), "other");
+    }
 }

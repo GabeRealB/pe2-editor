@@ -169,7 +169,7 @@ impl Imports {
                 report("Attaching what the importers made", i, total);
             }
             let (plan, wrong) = extensions.plan(asset);
-            stacks.extend(wrong.into_iter().map(|p| Problem::Import {
+            stacks.extend(wrong.into_iter().map(|p| Problem::Stack {
                 asset: asset.path.clone(),
                 error: format!("{}: {}", p.at, p.what),
             }));
@@ -234,6 +234,7 @@ impl Imports {
         }));
         index.problems.retain(|p| match p {
             Problem::Import { asset, .. }
+            | Problem::Stack { asset, .. }
             | Problem::Overridden { asset, .. }
             | Problem::Orphan { asset, .. }
             | Problem::Taken { asset, .. } => !of(asset),

@@ -611,7 +611,7 @@ fn field_editor(
     }
     if escape {
         *field_edit = None;
-    } else if (enter || response.lost_focus())
+    } else if (enter || response.lost_focus() || pressed_away(ui, &response))
         && let Ok(new) = parsed
     {
         *field_edit = None;
@@ -907,6 +907,12 @@ fn axes_ui(ui: &mut egui::Ui, axes: [f64; 3]) {
     });
 }
 
+/// Whether the pointer went down outside a field being typed in. That press may select something else, and the sheet then
+/// draws no such field to find it lost focus, so what was typed is taken now.
+fn pressed_away(ui: &egui::Ui, field: &egui::Response) -> bool {
+    field.has_focus() && !field.contains_pointer() && ui.input(|i| i.pointer.any_pressed())
+}
+
 /// A vector to edit, by axis: dragged or typed, and what it comes to once that ends, whole numbers staying whole.
 fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), value: &toml::Value, axes: [f64; 3]) -> Option<toml::Value> {
     let whole = value.as_array().is_some_and(|values| values.iter().all(toml::Value::is_integer));
@@ -919,7 +925,7 @@ fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), valu
             let drag = egui::DragValue::new(&mut held[at]).speed(if whole { 1.0 } else { 0.5 }).fixed_decimals(usize::from(!whole));
             let response = ui.add_sized([52.0, 18.0], drag);
             active |= response.dragged() || response.has_focus();
-            ended |= response.drag_stopped() || response.lost_focus();
+            ended |= response.drag_stopped() || response.lost_focus() || pressed_away(ui, &response);
         }
     });
     if active {
@@ -935,6 +941,11 @@ fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), valu
         return None;
     }
     ui.data_mut(|data| data.remove_temp::<[f64; 3]>(id));
+    // Escape leaves it as it was: what was typed reached the numbers as it was typed.
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|data| data.insert_temp::<Option<Edited>>(editing_id(), None));
+        return None;
+    }
     held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9).then(|| vector(&held, whole))
 }
 
@@ -1236,7 +1247,8 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut 
     let ops = ws.extensions.operations();
     let tail = ws.extensions.tail(asset);
     let (plan, _) = project::graph::Plan::of(asset.fields(), &ops, &tail);
-    let made = plan.outputs.iter().filter(|o| !o.preview && plan.steps[o.from].op != project::graph::SETTINGS);
+    let asked = |name: &str| tail.iter().any(|conversion| conversion.name == name);
+    let made = plan.outputs.iter().filter(|o| !o.preview && !asked(&o.name));
     let outputs: Vec<&str> = made.map(|o| o.name.as_str()).collect();
     // And what reads them, made again with them.
     let dependents = ws.extensions.dependents(&ws.index, &std::iter::once(asset.path.clone()).collect());
@@ -1673,13 +1685,18 @@ fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: 
         ui.label(ops.get(op).map_or(op, |def| def.label.as_str()));
         ui.label(RichText::new(op).small().color(theme::weak()));
     });
-    let settings: Vec<String> =
-        layer.as_table().into_iter().flatten().filter(|(k, _)| k.as_str() != "op").map(|(k, v)| format!("{k} = {v}")).collect();
+    let own = layer.as_table().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "op" | "id"));
+    let wire = |value: &toml::Value| value.get("from").and_then(toml::Value::as_str).map(str::to_string);
+    let (wires, settings): (Vec<_>, Vec<_>) = own.partition(|(_, value)| wire(value).is_some());
+    let mut said: Vec<String> = wires.iter().filter_map(|(port, value)| Some(format!("{port} from {}", wire(value)?))).collect();
     if !settings.is_empty() {
+        said.push(format!("{} setting{}", settings.len(), if settings.len() == 1 { "" } else { "s" }));
+    }
+    if !said.is_empty() {
         ui.end_row();
         ui.label("");
         ui.label("");
-        ui.label(RichText::new(settings.join("   ")).monospace().small().color(theme::weak()));
+        ui.label(RichText::new(said.join("  ·  ")).small().color(theme::weak()));
     }
 }
 

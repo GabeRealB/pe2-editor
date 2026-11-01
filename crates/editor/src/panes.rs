@@ -259,7 +259,8 @@ impl EditorKind {
     /// Its icon on a document of an entry: an extension's editor says its own.
     pub fn icon(self, ws: &Workspace, path: &str) -> &'static str {
         match self {
-            EditorKind::Preview | EditorKind::Tap(_) => icons::IMAGE,
+            EditorKind::Preview => icons::IMAGE,
+            EditorKind::Tap(_) => icons::EYE,
             EditorKind::Graph => icons::TREE_STRUCTURE,
             EditorKind::Files => icons::FILE_TEXT,
             EditorKind::Extension(name) => ws
@@ -595,7 +596,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                         crate::inspector::inspector_ui(ui, ws, subject, nav, &settings.tools, message, edit);
                     }
                     PaneKind::References => references_ui(ui, ws, subject, nav),
-                    PaneKind::Problems => problems_ui(ui, ws, nav),
+                    PaneKind::Problems => problems_ui(ui, ws, nav, edit),
                     PaneKind::Project => project_ui(ui, ws, nav),
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
@@ -1855,7 +1856,7 @@ fn outgoing_refs<'a>(ws: &'a Workspace, field: &str, value: &toml::Value) -> Vec
 
 /// What the index finds wrong, each with the assets it is about; the references that resolve to nothing; whether the
 /// layers are watched and agents can connect.
-fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
     if let Some(e) = &ws.watch_error {
         theme::section(ui, "Watching", |ui| {
             ui.label(RichText::new(e).color(ui.visuals().warn_fg_color));
@@ -1926,6 +1927,14 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
                     });
                 }
                 ui.label(RichText::new(problem.describe()).color(theme::weak()));
+                // An entry gone from the active layer: left listed until it is said to be gone, as its path may come back.
+                if let project::index::Problem::Missing { layer, path } = problem
+                    && ws.editable_layer().is_ok_and(|active| active.name == *layer)
+                    && let Some(uid) = ws.index.listed(layer, path)
+                    && ui.small_button("Forget it").on_hover_text("Take it out of the layer's list (an undoable step)").clicked()
+                {
+                    *edit = Some(EditRequest::Delete(uid.to_string()));
+                }
                 ui.add_space(4.0);
             });
         }

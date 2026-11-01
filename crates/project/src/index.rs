@@ -281,6 +281,8 @@ pub enum Problem {
     Stale { layer: String, path: String },
     /// An asset whose import failed: it has no native files.
     Import { asset: String, error: String },
+    /// A stack that cannot run as it is written.
+    Stack { asset: String, error: String },
     /// A setting the declaration gives that the asset's import derives from its source, which wins.
     Overridden { asset: String, setting: String },
     /// A part's settings the declaration has for a part its source no longer has.
@@ -301,6 +303,7 @@ impl Problem {
         match self {
             Problem::Unreadable { asset: path, .. }
             | Problem::Import { asset: path, .. }
+            | Problem::Stack { asset: path, .. }
             | Problem::Overridden { asset: path, .. }
             | Problem::Orphan { asset: path, .. }
             | Problem::MissingOutput { asset: path, .. }
@@ -327,6 +330,7 @@ impl Problem {
             Problem::Unbound { layer, uid } => format!("{layer} acts on {uid}, which no layer below creates"),
             Problem::Stale { layer, .. } => format!("{layer}'s override was made from another version of it"),
             Problem::Import { error, .. } => format!("its import failed: {error}"),
+            Problem::Stack { error, .. } => format!("its stack: {error}"),
             Problem::Overridden { setting, .. } => {
                 format!("{setting} is set, but its import derives it from the source, which wins")
             }
@@ -349,6 +353,7 @@ impl Problem {
             Problem::Unreadable { .. }
             | Problem::DuplicateUid { .. }
             | Problem::Import { .. }
+            | Problem::Stack { .. }
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
             | Problem::MissingOutput { .. }
@@ -1461,6 +1466,13 @@ impl Index {
                 held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect()
             })
             .collect());
+    }
+
+    /// The uid a layer lists an entry under, by its path in the layer.
+    #[must_use]
+    pub fn listed(&self, layer: &str, path: &str) -> Option<&str> {
+        let layer = self.layers.iter().find(|known| known.name == layer)?;
+        layer.changeset.entries.iter().find(|(_, listed)| *listed == path).map(|(uid, _)| uid.as_str())
     }
 
     /// List what writable layers hold unlisted, and follow what moved outside the editor. A listed entry gone from
