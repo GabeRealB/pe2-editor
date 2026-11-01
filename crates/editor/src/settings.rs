@@ -199,7 +199,7 @@ pub struct WindowState {
 
 /// Where the settings live: the editor's per-user storage directory.
 pub fn path() -> Option<PathBuf> {
-    eframe::storage_dir(APP_ID).map(|d| d.join(FILE))
+    extensions::data_folder().map(|d| d.join(FILE))
 }
 
 impl EditorSettings {

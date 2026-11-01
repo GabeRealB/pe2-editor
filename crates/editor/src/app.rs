@@ -1738,6 +1738,29 @@ fn automatic_zoom(ctx: &egui::Context, height: f32) -> f32 {
     (scale.max(1.0) / native).clamp(1.0, 4.0)
 }
 
+#[cfg(test)]
+impl Editor {
+    /// What it has open.
+    pub fn workspace(&mut self) -> Option<&mut Workspace> {
+        self.workspace.as_mut()
+    }
+
+    /// Whether something it set going has yet to show.
+    pub fn busy(&self) -> bool {
+        self.opening.is_some() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.in_epoch())
+    }
+
+    /// Undo the last step.
+    pub fn undo(&mut self) -> bool {
+        self.step(false, false)
+    }
+
+    /// Why opening failed, or something went wrong since.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
 impl eframe::App for Editor {
     /// What is behind the panes, which paint none of their own: eframe's is see-through, and comes out by what is under it.
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {

@@ -314,12 +314,15 @@ impl Matcher {
 pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     let document = ora::read(source).map_err(|e| anyhow!("{SOURCE}: {e}"))?;
     let (width, height) = (document.width as usize, document.height as usize);
-    let bpp = bpp(asset);
-    let names = palette_names(asset);
-
     // Palettes, by name: a strip's colors in a row.
-    let strips: HashMap<&str, &Layer> =
-        document.group(PALETTES).map_or_default(|g| g.layers().map(|l| (l.name.as_str(), l)).collect());
+    let layers: Vec<&Layer> = document.group(PALETTES).map_or_default(|g| g.layers().collect());
+    let strips: HashMap<&str, &Layer> = layers.iter().map(|l| (l.name.as_str(), *l)).collect();
+    // A node saying nothing of them takes what the file has: a new one from a file says nothing yet.
+    let declared_mode = asset.field("mode").is_some();
+    let bpp = if declared_mode { bpp(asset) } else { depth_of_strips(&layers) };
+    let declared_palettes = palette_names(asset);
+    let found_palettes = declared_palettes.is_empty();
+    let names = if found_palettes { layers.iter().map(|l| l.name.clone()).collect() } else { declared_palettes };
     let mut colors: Vec<Option<Vec<u16>>> = Vec::with_capacity(names.len());
     let mut notes = Vec::new();
     for name in &names {
@@ -340,6 +343,12 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     let declared: HashMap<&str, &Value> = asset.parts("cells").into_iter().collect();
     let mut settings = Table::new();
     settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::from(document.width)), Value::Integer(i64::from(document.height))]));
+    if !declared_mode {
+        settings.insert("mode".into(), Value::String(format!("{}_{bpp}bpp", if bpp == 16 { "direct" } else { "indexed" })));
+    }
+    if found_palettes && !names.is_empty() {
+        settings.insert("palettes".into(), Value::Table(names.iter().map(|name| (name.clone(), Value::Table(Table::new()))).collect()));
+    }
     let mut rects = Table::new();
     let cell_layers: Vec<&Layer> = document.group(CELLS).map_or_default(|g| g.layers().collect());
     for layer in cell_layers.iter().rev() {
@@ -348,7 +357,8 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
             .get(layer.name.as_str())
             .and_then(|c| c.get("palette"))
             .and_then(Value::as_str)
-            .and_then(|p| names.iter().position(|n| n == p));
+            .and_then(|p| names.iter().position(|n| n == p))
+            .or(found_palettes.then_some(0));
         // A cell of the image's depth is known by the texels' indices, one of another by its own.
         let own_known = if own == bpp {
             None
@@ -383,6 +393,15 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     }
     let palettes = names.into_iter().zip(colors).collect();
     Ok(TexelImage { width, height, bpp, texels: texels.stored(), palettes, derived: settings, notes })
+}
+
+/// The depth a file's palettes are for: the colors a strip holds, and with no palette, direct color.
+fn depth_of_strips(strips: &[&Layer]) -> u8 {
+    match strips.iter().filter_map(|strip| ora::decode_png(&strip.png).ok()).map(|strip| strip.width).max() {
+        None => 16,
+        Some(colors) if colors <= 16 => 4,
+        Some(_) => 8,
+    }
 }
 
 /// A texel layer's values at their places: where its texels start (at its own depth), and which it repainted - those

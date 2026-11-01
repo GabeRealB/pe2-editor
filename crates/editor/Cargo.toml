@@ -33,3 +33,7 @@ toml.workspace = true
 toml_edit.workspace = true
 # The event loop is the editor's own: it is what knows the monitors (main.rs).
 winit.workspace = true
+
+[dev-dependencies]
+# Runs the editor with no window: scenarios (src/scenario).
+egui_kittest.workspace = true

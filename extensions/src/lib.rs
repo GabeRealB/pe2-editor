@@ -310,6 +310,9 @@ pub fn user_folder() -> Option<PathBuf> {
 /// roaming application data on Windows.
 #[must_use]
 pub fn data_folder() -> Option<PathBuf> {
+    if let Some(folder) = DATA_FOLDER.get() {
+        return Some(folder.clone());
+    }
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("pe2-editor").join("data"))
     } else if cfg!(target_os = "macos") {
@@ -322,6 +325,13 @@ pub fn data_folder() -> Option<PathBuf> {
             .map(|p| p.join("pe2-editor"))
     }
 }
+
+/// In place of the user's data folder, for this process: what runs the editor in tests keeps away from the real one.
+pub fn use_data_folder(folder: PathBuf) {
+    let _ = DATA_FOLDER.set(folder);
+}
+
+static DATA_FOLDER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The extensions folder beside the editor.
 #[must_use]

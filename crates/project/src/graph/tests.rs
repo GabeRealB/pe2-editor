@@ -195,6 +195,19 @@ fn a_stack_lowers_to_a_chain_with_taps() {
 }
 
 #[test]
+fn a_graph_layer_holds_a_preview() {
+    let declaration = "[[stack]]\nop = \"graph\"\nresult = \"a\"\nops.a = { op = \"file\", file = \"a.txt\" }\n\
+                       ops.size = { op = \"t.count\", from = { in = \"a\" } }\n\
+                       ops.shown = { op = \"preview\", name = \"look\", from = { value = \"size\" } }\n";
+    let fields: toml::Table = declaration.parse().unwrap();
+    let mut ops = ops();
+    ops.viewers = std::sync::Arc::new(vec![Type::Table]);
+    let (plan, wrong) = Plan::of(&fields, &ops, &[]);
+    assert_eq!(wrong, []);
+    assert!(plan.outputs.iter().any(|output| output.name == "look" && output.preview));
+}
+
+#[test]
 fn what_is_wrong_with_a_stack() {
     assert_eq!(problems("[[stack]]\nop = \"t.upper\""), ["stack[0]: its `in` is connected to nothing"]);
     assert_eq!(

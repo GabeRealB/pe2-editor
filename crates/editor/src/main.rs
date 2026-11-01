@@ -41,6 +41,8 @@ mod settings;
 mod theme;
 mod pictures;
 mod runner;
+#[cfg(test)]
+mod scenario;
 mod takein;
 mod thumbs;
 mod upscale;
@@ -145,6 +147,16 @@ fn monitors(event_loop: &mut winit::event_loop::EventLoop<eframe::UserEvent>) ->
     }
 }
 
+/// What the editor draws with, on its device.
+fn install_gpu(state: &eframe::egui_wgpu::RenderState) {
+    // wgpu panics on an error nobody handles; a surface that cannot be configured (a window larger than the device
+    // allows) then ends the editor. Log instead: the frame is lost, not the program.
+    state.device.on_uncaptured_error(Arc::new(|e| eprintln!("wgpu: {e}")));
+    // The player's YCbCr frames are drawn by a pipeline of its own.
+    yuv::install(state);
+    gpu_view::install(state);
+}
+
 fn main() -> eframe::Result {
     project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
     let mut args = std::env::args_os().skip(1);
@@ -194,12 +206,7 @@ fn main() -> eframe::Result {
             if let Some(state) = &cc.wgpu_render_state {
                 let adapter = state.adapter.get_info();
                 perf::note_renderer(format!("{} ({:?})", adapter.name, adapter.backend), adapter.vendor);
-                // wgpu panics on an error nobody handles; a surface that cannot be configured (a window larger than
-                // the device allows) then ends the editor. Log instead: the frame is lost, not the program.
-                state.device.on_uncaptured_error(Arc::new(|e| eprintln!("wgpu: {e}")));
-                // The player's YCbCr frames are drawn by a pipeline of its own.
-                yuv::install(state);
-                gpu_view::install(state);
+                install_gpu(state);
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
             let start = app::Start { project, select, show, screenshot, max_surface, agents_drive, monitors };

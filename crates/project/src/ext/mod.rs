@@ -316,8 +316,8 @@ pub struct Extensions {
     ops: HashMap<String, pe2_ext::OpDef>,
     /// The operations as the work graph runs them, made once loaded.
     graph_ops: std::sync::OnceLock<graph::Ops>,
-    /// The store outputs asked for in passing read and keep, once the project is open.
-    store: std::sync::OnceLock<graph::store::Store>,
+    /// The store outputs asked for in passing read and keep: the open project's, as these outlive it (`extensions::loaded`).
+    store: std::sync::RwLock<Option<graph::store::Store>>,
     extractors: Vec<pe2_ext::ExtractorDef>,
     /// The components of the extensions loaded, by id.
     components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
@@ -1110,14 +1110,14 @@ impl Extensions {
     /// keeps (`keep_in`), keeping what it is asked to.
     #[must_use]
     pub fn engine(&self) -> graph::exec::Engine {
-        let mut engine = graph::exec::Engine::new(self.operations(), self.store.get().cloned());
+        let mut engine = graph::exec::Engine::new(self.operations(), self.store.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
         engine.config.clone_from(&self.config.read().unwrap_or_else(std::sync::PoisonError::into_inner));
         engine
     }
 
-    /// The store outputs are kept in, for what is asked in passing: the project's, once it is open.
+    /// The store outputs are kept in, for what is asked in passing: that of the project opened, and of the next one.
     pub fn keep_in(&self, store: graph::store::Store) {
-        let _ = self.store.set(store);
+        *self.store.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
     }
 
     /// The config what is made from now on is made for, with the assets left out of it.
@@ -1163,11 +1163,12 @@ impl Extensions {
                 let tapped = found.iter().any(|known| known.viewer.map(|v| &v.name) == viewer.map(|v| &v.name) && known.ty.is_stream() == output.ty.is_stream());
                 let family = self.ops.get(&output.op).is_some_and(|def| def.parameter.is_some());
                 // Of a family, what it is first shown as: the first member it lists.
-                let first = output.members.as_ref().filter(|_| tapped && family).and_then(|members| members(&self.lend(asset)).into_iter().next());
-                // A family with nothing in it yet has nothing to show.
-                if tapped && family && first.is_none() {
+                let listed = output.members.as_ref().filter(|_| tapped && family).map(|members| members(&self.lend(asset)));
+                // A family listing nothing yet has nothing to show. One with no list is told what to show when asked.
+                if listed.as_ref().is_some_and(Vec::is_empty) {
                     continue;
                 }
+                let first = listed.and_then(|members| members.into_iter().next());
                 let address = first.map_or_else(|| output.name.clone(), |(member, _)| format!("{}/{member}", output.name));
                 found.push(Preview { output: address, ty: output.ty.clone(), viewer, tapped });
             }
