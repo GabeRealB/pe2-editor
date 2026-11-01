@@ -2505,7 +2505,7 @@ pub fn load(path: &Path) -> Result<Loadable> {
 
 /// Who a component is, as `extension!` writes it into the section the host reads without running it
 /// (`pe2-extension`, in its core module): its id, version, dependencies and what it runs as.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct About {
     pub id: String,
     pub version: String,

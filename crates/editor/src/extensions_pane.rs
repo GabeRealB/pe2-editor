@@ -116,7 +116,7 @@ fn requirement(text: &str) -> (&str, Option<&str>) {
 fn status_color(ui: &egui::Ui, status: Option<&Status>) -> Color32 {
     match status {
         Some(Status::Loaded) => theme::accent(),
-        Some(Status::Disabled | Status::NotEnabled { .. } | Status::Replaced(_)) => theme::weak(),
+        Some(Status::Disabled | Status::NotEnabled { .. } | Status::Replaced(_) | Status::Available) => theme::weak(),
         Some(Status::Refused(_)) => ui.visuals().error_fg_color,
         None => ui.visuals().warn_fg_color,
     }
@@ -128,6 +128,7 @@ fn status_text(status: &Status) -> &'static str {
         Status::Disabled => "left off by the project",
         Status::NotEnabled { changed: false } => "not enabled",
         Status::NotEnabled { changed: true } => "not the one you enabled",
+        Status::Available => "available, not taken in",
         Status::Refused(_) => "not loaded",
         Status::Replaced(_) => "replaced",
     }
@@ -575,6 +576,18 @@ fn setting_input(ui: &mut egui::Ui, id: (&str, &str), label: &str, setting: &Set
 /// For an unsandboxed extension: enabling it, which is the user's and no project's. Until then nothing of it runs.
 fn unsandboxed_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
     let Some(trust) = &p.trust else { return };
+    // Where it is says it may run: there is nothing of its own to switch.
+    if let Some(allowed) = extensions::trust::allowed_by(&p.origin) {
+        ui.label(allowed.said());
+        if let extensions::trust::Allowed::Place(place) = &allowed
+            && ui.button("Stop trusting it").on_hover_text("For you, on this computer").clicked()
+            && let Err(e) = extensions::trust::distrust_place(place)
+        {
+            *message = Some(format!("{}: {e}", place.display()));
+        }
+        ui.add_space(6.0);
+        return;
+    }
     let enable = matches!(p.status, Status::NotEnabled { .. });
     if enable {
         ui.label("This extension runs outside the sandbox: it and the programs it starts can read and change your files and reach the network. Enable it only if you trust where it came from.");
@@ -632,10 +645,49 @@ fn dependencies_ui(ui: &mut egui::Ui, p: &Present, present: &[Present], state: &
     });
 }
 
+/// Taking an extension from outside the project in, or letting it go: whether there is nothing more to say of it.
+fn taking_in_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, message: &mut Option<String>) -> bool {
+    let imported = ws.project.manifest.imported.iter().find(|imported| imported.id == p.id).cloned();
+    // One of its id may be in effect, a built-in, and this in the user's folder to take its place.
+    let waiting = present.iter().find(|q| q.id == p.id && q.status == Status::Available);
+    let change = if let Some(waiting) = waiting {
+        if p.status != Status::Available {
+            ui.label(RichText::new(format!("{} {} is {}", waiting.id, waiting.version, status_text(&waiting.status))).color(theme::weak()));
+        }
+        let take = ui.button("Take it into the project").on_hover_text("It is listed in project.toml, for everyone on the project");
+        take.clicked().then(|| {
+            let wanted = project::Imported { id: p.id.clone(), version: Some(accepted(&waiting.version)), ..project::Imported::default() };
+            project::switches::import(&ws.project, &wanted, &mut ws.history, format!("Take {} in", p.id))
+        })
+    } else if let Some(imported) = imported.as_ref().filter(|_| !matches!(p.origin, Origin::Project { .. })) {
+        ui.label(RichText::new(if imported.required { "The project requires it" } else { "Taken in by the project" }).color(theme::weak()));
+        ui.button("Let it go").on_hover_text("It stops being listed in project.toml").clicked().then(|| {
+            project::switches::remove(&ws.project, &p.id, &mut ws.history, format!("Let {} go", p.id))
+        })
+    } else {
+        None
+    };
+    if let Some(written) = change {
+        *message = Some(match written {
+            Ok(()) => format!("{}: the project opens again with its extensions", p.id),
+            Err(e) => format!("project.toml: {e:#}"),
+        });
+    }
+    p.status == Status::Available
+}
+
+/// The versions a project accepts of what it takes in at this one.
+fn accepted(version: &str) -> String {
+    format!("^{}", version.rsplit_once('.').map_or(version, |(line, _)| line))
+}
+
 /// The switch: on or off for the project, saying first what goes with it.
 fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, state: &mut State, message: &mut Option<String>) {
     // Not enabled, it is not this project's to turn on.
     if matches!(p.status, Status::NotEnabled { .. }) {
+        return;
+    }
+    if taking_in_ui(ui, ws, present, p, message) {
         return;
     }
     let disabled: BTreeSet<String> = ws.project.disabled_extensions.iter().cloned().collect();

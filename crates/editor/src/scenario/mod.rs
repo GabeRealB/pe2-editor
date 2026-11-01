@@ -10,6 +10,7 @@ mod fixture;
 mod inspector;
 mod models;
 mod nodes;
+mod taking_in;
 
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -71,15 +72,22 @@ impl Scenario {
     /// The editor on a fixture, its project open.
     #[track_caller]
     pub fn open(fixture: Fixture) -> Scenario {
+        Scenario::open_showing(fixture, None)
+    }
+
+    /// The editor on a fixture, with a pane in front.
+    #[track_caller]
+    pub fn open_showing(fixture: Fixture, show: Option<&str>) -> Scenario {
         static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // A scenario that failed says so itself: the next has nothing to do with it.
         let alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture.root().to_path_buf();
+        let show = show.map(str::to_string);
         let harness = Harness::builder().with_size(SIZE).wgpu().build_eframe(move |cc| {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
             }
-            let start = Start { project: Some(root), select: None, show: None, screenshot: None, max_surface: None, agents_drive: false, monitors: Vec::new() };
+            let start = Start { project: Some(root), select: None, show, screenshot: None, max_surface: None, agents_drive: false, monitors: Vec::new() };
             Editor::new(cc, start)
         });
         let mut scenario = Scenario { harness, fixture, _alone: alone };
@@ -174,6 +182,11 @@ impl Scenario {
         self.settle();
     }
 
+    /// What the project's `project.toml` says.
+    pub fn project_file(&self) -> String {
+        std::fs::read_to_string(self.fixture.root().join(project::FILE)).expect("a project file")
+    }
+
     /// The assets the project has, by path.
     pub fn assets(&mut self) -> Vec<String> {
         self.workspace().index.assets.keys().cloned().collect()
@@ -200,8 +213,8 @@ impl Scenario {
 
     /// Everything the window says.
     fn shown(&self) -> Vec<String> {
-        let all = self.harness.query_all(By::new().predicate(|node| node.label().is_some()).include_labels());
-        all.filter_map(|node| node.accesskit_node().label()).collect()
+        let all = self.harness.query_all(By::new().predicate(|_| true).include_labels());
+        all.filter_map(|node| node.accesskit_node().label().or_else(|| node.accesskit_node().value())).filter(|text| !text.trim().is_empty()).collect()
     }
 
     /// Whether something says this.

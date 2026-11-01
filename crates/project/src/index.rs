@@ -281,6 +281,10 @@ pub enum Problem {
     Stale { layer: String, path: String },
     /// An asset whose import failed: it has no native files.
     Import { asset: String, error: String },
+    /// An extension the project requires and does not have.
+    Required { id: String, why: String },
+    /// An extension from outside the project that is no longer what it took in.
+    Unlocked { id: String },
     /// A stack that cannot run as it is written.
     Stack { asset: String, error: String },
     /// A setting the declaration gives that the asset's import derives from its source, which wins.
@@ -304,6 +308,8 @@ impl Problem {
             Problem::Unreadable { asset: path, .. }
             | Problem::Import { asset: path, .. }
             | Problem::Stack { asset: path, .. }
+            | Problem::Required { id: path, .. }
+            | Problem::Unlocked { id: path }
             | Problem::Overridden { asset: path, .. }
             | Problem::Orphan { asset: path, .. }
             | Problem::MissingOutput { asset: path, .. }
@@ -331,6 +337,8 @@ impl Problem {
             Problem::Stale { layer, .. } => format!("{layer}'s override was made from another version of it"),
             Problem::Import { error, .. } => format!("its import failed: {error}"),
             Problem::Stack { error, .. } => format!("its stack: {error}"),
+            Problem::Required { why, .. } => format!("the project requires it: {why}"),
+            Problem::Unlocked { .. } => "it is not what the project took in".to_string(),
             Problem::Overridden { setting, .. } => {
                 format!("{setting} is set, but its import derives it from the source, which wins")
             }
@@ -354,6 +362,8 @@ impl Problem {
             | Problem::DuplicateUid { .. }
             | Problem::Import { .. }
             | Problem::Stack { .. }
+            | Problem::Required { .. }
+            | Problem::Unlocked { .. }
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
             | Problem::MissingOutput { .. }
@@ -365,7 +375,7 @@ impl Problem {
     /// Whether the build can go on with it: an override made from an older base still applies.
     #[must_use]
     pub fn is_warning(&self) -> bool {
-        matches!(self, Problem::Stale { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::Taken { .. })
+        matches!(self, Problem::Stale { .. } | Problem::Unlocked { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::Taken { .. })
     }
 }
 

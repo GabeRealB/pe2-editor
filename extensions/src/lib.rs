@@ -5,7 +5,7 @@
 //! The same crates are linked in too: `PE2_EXTENSIONS=linked` runs them in the host instead of their components, to
 //! step through one in a debugger or compare the two.
 
-use project::Project;
+use project::{Imported, Manifest, Project};
 use project::ext::component::Unsandboxed;
 use project::ext::{EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
 use project::index::Index;
@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use toml::{Table, Value};
 use std::sync::{Arc, Mutex, OnceLock};
+
+pub mod trust;
 
 include!(concat!(env!("OUT_DIR"), "/components.rs"));
 
@@ -31,7 +33,7 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
 #[must_use]
 pub fn load() -> Extensions {
-    load_without(&[], &[], &Kept::new())
+    load_without(&[], &[], &Kept::new(), None)
 }
 
 /// The settings kept for extensions, by id: each a table by scope (`{ project = { ... }, user = { ... } }`).
@@ -52,7 +54,7 @@ pub struct Found {
 /// Load the components found - the project's first, then the user's: one of an id takes the place of those after it -
 /// and the built-ins, but those a project leaves off (`disabled`, by id) and those requiring them.
 #[must_use]
-pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extensions {
+pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest: Option<&Manifest>) -> Extensions {
     let with_settings = |mut loadable: Vec<Loadable>| {
         for l in &mut loadable {
             l.settings = kept.get(&l.id).cloned().unwrap_or_default();
@@ -77,12 +79,17 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
             if let Some(why) = about.as_ref().and_then(|a| unsandboxed::elsewhere(&a.platforms)) {
                 return Err(why);
             }
+            // What is kept apart from a project is for it to take in.
+            if let Some(about) = about.as_ref().filter(|about| manifest.is_some_and(|m| !taken_in(m, &about.id, &found.origin))) {
+                unloadable.push(available(about.clone(), found, &bytes));
+                return Ok(None);
+            }
             let name = found.origin.said();
-            // Unsandboxed, it runs only as the user enabled it; until then, it is read for who it is.
+            // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
             let held = match about.filter(|a| a.unsandboxed) {
                 Some(about) => {
                     let trust = unsandboxed::trust(&found.file, found.folder.as_deref()).map_err(|e| format!("{e:#}"))?;
-                    if !enabled.contains_key(&trust) {
+                    if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
                         unloadable.push(not_enabled(about, found, &bytes, trust, &enabled));
                         return Ok(None);
                     }
@@ -140,7 +147,88 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept) -> Extens
     let mut extensions = Extensions::load_without(with_settings(loadable), true, disabled);
     extensions.problems.extend(failed);
     extensions.present.extend(unloadable);
+    if let Some(manifest) = manifest {
+        extensions.unmet = unmet(manifest, &extensions.present);
+        extensions.unlocked = unlocked(manifest, found);
+    }
     extensions
+}
+
+/// Whether a project takes in an extension found here: what it holds itself, by being there; from elsewhere, as it says.
+fn taken_in(manifest: &Manifest, id: &str, origin: &Origin) -> bool {
+    match origin {
+        Origin::User(_) | Origin::Install(_) => manifest.imported.iter().any(|imported| imported.id == id && imported.from.is_none()),
+        _ => true,
+    }
+}
+
+/// What a project requires and does not have, and why.
+fn unmet(manifest: &Manifest, present: &[Present]) -> Vec<(String, String)> {
+    let required = manifest.imported.iter().filter(|imported| imported.required);
+    let why = |imported: &Imported| {
+        let found = present.iter().find(|p| p.id == imported.id && !matches!(p.status, Status::Replaced(_) | Status::Available));
+        let Some(found) = found else { return Some("it was not found".to_string()) };
+        match &found.status {
+            Status::Loaded => match &imported.version {
+                Some(version) if !project::ext::satisfies(&found.version, version) => Some(format!("it is {}, and it asks for {version}", found.version)),
+                _ => None,
+            },
+            Status::Disabled => Some("the project leaves it off".to_string()),
+            Status::NotEnabled { .. } => Some("it runs outside the sandbox and is not trusted".to_string()),
+            Status::Refused(why) => Some(why.clone()),
+            Status::Replaced(_) | Status::Available => None,
+        }
+    };
+    required.filter_map(|imported| Some((imported.id.clone(), why(imported)?))).collect()
+}
+
+/// What is no longer what the project took in, of what it took in from outside itself.
+fn unlocked(manifest: &Manifest, found: &[Found]) -> Vec<String> {
+    let differs = |(id, locked): (&String, &String)| {
+        let now = found.iter().find_map(|found| {
+            let bytes = std::fs::read(&found.file).ok()?;
+            let about = component::about(&bytes)?;
+            (about.id == *id && !matches!(found.origin, Origin::Project { .. })).then(|| unsandboxed::trust(&found.file, found.folder.as_deref()).ok())?
+        });
+        now.is_some_and(|now| now != *locked).then(|| id.clone())
+    };
+    manifest.locked.iter().filter_map(differs).collect()
+}
+
+/// What each extension from outside a project is now, by id, as `extensions.lock` keeps it.
+#[must_use]
+pub fn locked(project: &Project, index: Option<&Index>) -> BTreeMap<String, String> {
+    let found = found(project, index);
+    let of = |found: &Found| {
+        if matches!(found.origin, Origin::Project { .. }) {
+            return None;
+        }
+        let about = component::about(&std::fs::read(&found.file).ok()?)?;
+        taken_in(&project.manifest, &about.id, &found.origin).then_some(())?;
+        project.manifest.imported.iter().any(|imported| imported.id == about.id).then_some(())?;
+        Some((about.id, unsandboxed::trust(&found.file, found.folder.as_deref()).ok()?))
+    };
+    found.iter().filter_map(of).collect()
+}
+
+/// An extension the project has not taken in, as it is shown: read without running anything.
+fn available(about: component::About, found: &Found, bytes: &[u8]) -> Present {
+    Present {
+        status: Status::Available,
+        id: about.id,
+        version: about.version,
+        origin: found.origin.clone(),
+        requires: about.requires,
+        weak: about.weak,
+        optional: about.optional,
+        provides: about.provides,
+        linked: vec![],
+        size: Some(bytes.len()),
+        contract: component::contract(bytes),
+        load: None,
+        registers: vec![],
+        trust: None,
+    }
 }
 
 /// An unsandboxed extension not run, as it is shown: who it says it is, read without running anything.
@@ -163,17 +251,11 @@ fn not_enabled(about: component::About, found: &Found, bytes: &[u8], trust: Stri
     }
 }
 
-/// The file holding what the user enabled.
-fn enabled_file() -> Option<PathBuf> {
-    Some(data_folder()?.join("unsandboxed.toml"))
-}
-
 /// The unsandboxed extensions the user enabled: each one's hash, with its id. They live with the user, never in a
 /// project.
 #[must_use]
 pub fn enabled_unsandboxed() -> BTreeMap<String, String> {
-    let text = enabled_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
-    let table: Table = toml::from_str(&text).unwrap_or_default();
+    let table = trust::read();
     let Some(Value::Table(enabled)) = table.get("enabled") else { return BTreeMap::new() };
     enabled.iter().filter_map(|(trust, id)| Some((trust.clone(), id.as_str()?.to_string()))).collect()
 }
@@ -183,31 +265,27 @@ pub fn enabled_unsandboxed() -> BTreeMap<String, String> {
 /// # Errors
 /// What is enabled could not be written.
 pub fn set_unsandboxed_enabled(trust: &str, id: &str, on: bool) -> std::io::Result<()> {
-    let file = enabled_file().ok_or_else(|| std::io::Error::other("no data folder"))?;
     let mut enabled = enabled_unsandboxed();
     enabled.retain(|_, of| of != id);
     if on {
         enabled.insert(trust.to_string(), id.to_string());
     }
-    let mut table = Table::new();
+    let mut table = trust::read();
     table.insert("enabled".into(), Value::Table(enabled.into_iter().map(|(t, id)| (t, Value::String(id))).collect()));
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(file, toml::to_string(&table).unwrap_or_default())
+    trust::write(&table)
 }
 
 /// The built-ins, loaded once a process.
 #[must_use]
 pub fn shared() -> Arc<Extensions> {
-    loaded(&[], &[], &Kept::new())
+    loaded(&[], &[], &Kept::new(), None)
 }
 
 /// The extensions as a project has them: its own (`extension` assets, where the index is given), the user's, the
 /// built-ins, but those it leaves off - loaded once a process for each such set, so a changed component loads again.
 #[must_use]
 pub fn for_project(project: &Project, index: Option<&Index>) -> Arc<Extensions> {
-    loaded(&found(index), &project.disabled_extensions, &kept(project))
+    loaded(&found(project, index), &project.disabled_extensions, &kept(project), Some(&project.manifest))
 }
 
 /// The settings kept for a project's extensions: its own (`[extensions."<id>"]` in `project.toml`) and the user's (the
@@ -241,15 +319,23 @@ pub fn user_settings() -> BTreeMap<String, Table> {
         .collect()
 }
 
+/// The components a project takes in from places of its own choosing.
+#[must_use]
+pub fn imported_components(project: &Project) -> Vec<Found> {
+    let placed = project.manifest.imported.iter().filter_map(|imported| Some(project.imported_from(imported.from.as_ref()?)));
+    placed.filter_map(|place| component_at(place, Origin::Component)).collect()
+}
+
 /// The components found beside the built-ins: the project's (where the index is given), the user's, those beside the
 /// editor. Two findings differ where a component came, went or changed, or what the user enabled did: the extensions
 /// are loaded again.
 #[must_use]
-pub fn found(index: Option<&Index>) -> Vec<Found> {
+pub fn found(project: &Project, index: Option<&Index>) -> Vec<Found> {
     let mut found = index.map_or_default(project_components);
+    found.extend(imported_components(project));
     found.extend(user_components());
     found.extend(install_components());
-    let enabled = enabled_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    let enabled = trust::file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
     for found in &mut found {
         found.stamp.push_str(&enabled);
     }
@@ -257,7 +343,7 @@ pub fn found(index: Option<&Index>) -> Vec<Found> {
 }
 
 /// What a set of extensions is loaded for: the components found, the ids left off and the settings kept (as TOML).
-type Key = (Vec<Found>, Vec<String>, String);
+type Key = (Vec<Found>, Vec<String>, String, Option<Manifest>);
 
 /// The sets loaded, by what for.
 type Sets = Vec<(Key, Arc<Extensions>)>;
@@ -265,17 +351,17 @@ type Sets = Vec<(Key, Arc<Extensions>)>;
 /// The sets loaded lately, newest last: one a component replaces is dropped in time, its engines with it.
 const KEPT: usize = 4;
 
-fn loaded(found: &[Found], disabled: &[String], kept: &Kept) -> Arc<Extensions> {
+fn loaded(found: &[Found], disabled: &[String], kept: &Kept, manifest: Option<&Manifest>) -> Arc<Extensions> {
     static LOADED: OnceLock<Mutex<Sets>> = OnceLock::new();
     let mut disabled = disabled.to_vec();
     disabled.sort_unstable();
     disabled.dedup();
-    let key = (found.to_vec(), disabled, toml::to_string(kept).unwrap_or_default());
+    let key = (found.to_vec(), disabled, toml::to_string(kept).unwrap_or_default(), manifest.cloned());
     let loaded = LOADED.get_or_init(Mutex::default);
     let mut loaded = loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let extensions = match loaded.iter().position(|(k, _)| *k == key) {
         Some(at) => loaded.remove(at).1,
-        None => Arc::new(load_without(&key.0, &key.1, kept)),
+        None => Arc::new(load_without(&key.0, &key.1, kept, manifest)),
     };
     loaded.push((key, extensions.clone()));
     if loaded.len() > KEPT {
@@ -358,18 +444,18 @@ fn folder_stamp(folder: &std::path::Path) -> String {
 fn components_in(folder: &std::path::Path, origin: fn(PathBuf) -> Origin) -> Vec<Found> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
     entries.sort();
-    entries
-        .into_iter()
-        .filter_map(|entry| {
-            if entry.is_dir() {
-                let file = entry.join(EXTENSION_COMPONENT);
-                let stamp = folder_stamp(&entry);
-                return file.is_file().then(|| Found { origin: origin(file.clone()), file, folder: Some(entry), stamp });
-            }
-            let wasm = entry.extension().is_some_and(|e| e == "wasm");
-            wasm.then(|| Found { origin: origin(entry.clone()), stamp: file_stamp(&entry), file: entry, folder: None })
-        })
-        .collect()
+    entries.into_iter().filter_map(|entry| component_at(entry, origin)).collect()
+}
+
+/// The component at a place: a `*.wasm`, or a folder holding an `extension.wasm` and what it ships.
+fn component_at(entry: PathBuf, origin: fn(PathBuf) -> Origin) -> Option<Found> {
+    if entry.is_dir() {
+        let file = entry.join(EXTENSION_COMPONENT);
+        let stamp = folder_stamp(&entry);
+        return file.is_file().then(|| Found { origin: origin(file.clone()), file, folder: Some(entry), stamp });
+    }
+    let wasm = entry.extension().is_some_and(|e| e == "wasm");
+    wasm.then(|| Found { origin: origin(entry.clone()), stamp: file_stamp(&entry), file: entry, folder: None })
 }
 
 /// The components in the user's folder.
@@ -419,6 +505,50 @@ mod tests {
         }
         let refused = component::load_bytes("older", &older, project::ext::Origin::Builtin).err().expect("refused");
         assert!(format!("{refused:#}").contains("rebuild it with this editor's SDK"), "{refused:#}");
+    }
+
+    /// A built-in's component, as a file in a folder of its own, found as being in a user's extensions.
+    fn users(id: &str, name: &str) -> (std::path::PathBuf, super::Found) {
+        let dir = std::env::temp_dir().join(format!("pe2-ext-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = COMPONENTS.iter().find(|(package, _)| *package == id).expect("a built-in").1;
+        let file = dir.join("x.wasm");
+        std::fs::write(&file, bytes).unwrap();
+        let found = super::Found { origin: super::Origin::User(file.clone()), file, folder: None, stamp: String::new() };
+        (dir, found)
+    }
+
+    #[test]
+    fn what_is_kept_apart_loads_only_as_a_project_takes_it_in() {
+        use project::{Imported, Manifest};
+        use project::ext::{Origin, Status};
+        let (dir, found) = users("pe2-events", "takes");
+        let id = component::about(&std::fs::read(&found.file).unwrap()).unwrap().id;
+        let status = |extensions: &project::ext::Extensions| {
+            let user = |p: &&project::ext::Present| matches!(p.origin, Origin::User(_));
+            extensions.present.iter().find(user).map(|p| p.status.clone())
+        };
+        let found = [found];
+        // No project: what is the user's is there.
+        assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), None)), Some(Status::Loaded));
+        // Not taken in.
+        let bare = Manifest::default();
+        assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&bare))), Some(Status::Available));
+        // Taken in, in place of the built-in of its id; asked for at another version; locked to something else.
+        let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), from: None };
+        let locked = [(id.clone(), "another".to_string())].into();
+        let manifest = Manifest { imported: vec![imported], locked };
+        let extensions = super::load_without(&found, &[], &super::Kept::new(), Some(&manifest));
+        assert_eq!(status(&extensions), Some(Status::Loaded));
+        assert_eq!(extensions.unmet.len(), 1, "{:?}", extensions.unmet);
+        assert!(extensions.unmet[0].1.contains("asks for ^7.0"), "{:?}", extensions.unmet);
+        assert_eq!(extensions.unlocked, std::slice::from_ref(&id));
+        // Required and found nowhere.
+        let manifest = Manifest { imported: vec![Imported { id: "my.tool".to_string(), required: true, ..Imported::default() }], ..Manifest::default() };
+        let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&manifest));
+        assert_eq!(extensions.unmet, [("my.tool".to_string(), "it was not found".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A texture lent as a node: its declaration alone.

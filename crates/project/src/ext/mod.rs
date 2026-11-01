@@ -237,6 +237,8 @@ pub enum Status {
     /// An unsandboxed extension the user has not enabled, or - `changed` - that is no longer what they enabled: nothing
     /// of it was run.
     NotEnabled { changed: bool },
+    /// Found where extensions are kept, and not taken in by the project (`[[extension]]`).
+    Available,
     /// Not loaded: one of its id from a nearer place (the project before the user's folder before the built-ins) takes
     /// its place, named.
     Replaced(String),
@@ -297,6 +299,10 @@ pub struct Extensions {
     pub loaded: Vec<Loaded>,
     /// Every extension present, in the order found, loaded or not.
     pub present: Vec<Present>,
+    /// What the project requires and does not have, by id, and why.
+    pub unmet: Vec<(String, String)>,
+    /// What is no longer what the project took in, by id.
+    pub unlocked: Vec<String>,
     /// What was refused or disabled, and why.
     pub problems: Vec<String>,
     /// Each loaded extension's settings, by its id: as declared, with the values they took.
@@ -339,7 +345,8 @@ pub(crate) fn semver(text: &str) -> Option<(u64, u64, u64)> {
 
 /// Whether `version` meets a caret requirement (`^0.1`, `0.1.2`): at least it, and the same major (the same minor
 /// below 1.0).
-pub(crate) fn satisfies(version: &str, requirement: &str) -> bool {
+#[must_use]
+pub fn satisfies(version: &str, requirement: &str) -> bool {
     let (Some(have), Some(want)) = (semver(version), semver(requirement.trim_start_matches('^'))) else {
         return false;
     };

@@ -3,9 +3,9 @@
 //! WASI and may launch programs (the contract's `unsandboxed`): those it ships, or whatever it finds on the system. What
 //! uses it depends on it and calls its operations and services as any extension's, not knowing what is behind them.
 //!
-//! Where it is makes no difference, as none of it runs until the user enables it. It is read for who it is, and its
-//! component not even instantiated. What is enabled is this extension by its hash (`trust`), kept with the user and
-//! never in a project, so a project cannot enable what it brings, and one that changes is asked about again.
+//! None of it runs until the user trusts it: it is read for who it is, and its component not even instantiated. What is
+//! enabled is this extension by its hash (`trust`), or the place it is in, kept with the user and never in a project, so
+//! a project cannot enable what it brings. One enabled by its hash that changes is asked about again.
 //!
 //! An extension may be a component alone, or a folder holding `extension.wasm` and what it ships. A program it launches
 //! by a relative name is looked for in `<platform>/` of its folder, then its folder, then on the system: one component

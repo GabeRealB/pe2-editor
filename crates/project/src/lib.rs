@@ -38,6 +38,9 @@ struct ProjectFile {
     mount: Vec<MountFile>,
     #[serde(default)]
     extensions: ExtensionsFile,
+    /// What it uses from outside itself: `[[extension]]`.
+    #[serde(default)]
+    extension: Vec<Imported>,
     /// The builds it can be: `[config.<name>]`.
     #[serde(default)]
     config: std::collections::BTreeMap<String, ConfigFile>,
@@ -74,6 +77,34 @@ struct BuildFile {
     #[serde(default)]
     links: build::Links,
 }
+
+/// An extension a project has taken in: `[[extension]]`. One held in the project (an `extension` asset) is taken in by being
+/// there, and is listed only to say more of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Imported {
+    pub id: String,
+    /// The versions it accepts: `^0.1`.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Without it, the project is not whole.
+    #[serde(default)]
+    pub required: bool,
+    /// Where it is, as written: a folder or a component, relative to the project, or `res://`. None: the user's own
+    /// extensions, or those beside the editor.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// What a project says it uses and what it found them to be: all that decides which extensions it loads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Manifest {
+    pub imported: Vec<Imported>,
+    /// What each from outside the project was when taken in, by id: `extensions.lock`.
+    pub locked: std::collections::BTreeMap<String, String>,
+}
+
+/// The file beside `project.toml` holding what each extension from outside the project was.
+pub const EXTENSIONS_LOCK: &str = "extensions.lock";
 
 /// `[extensions]`: the extensions the project leaves off.
 #[derive(Default, Deserialize)]
@@ -199,6 +230,8 @@ pub struct Project {
     pub mounts: Vec<Mount>,
     /// The extensions it leaves off, by id (`[extensions] disabled`): everyone on it reads its assets the same way.
     pub disabled_extensions: Vec<String>,
+    /// What it uses of extensions from outside itself.
+    pub manifest: Manifest,
     /// Its extensions' settings, by id (`[extensions."<id>"]`): the same for everyone on it.
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
     /// The builds it can be, by name, in order.
@@ -279,6 +312,8 @@ impl Project {
             });
         }
         let disabled_extensions = file.extensions.disabled;
+        let locked = std::fs::read_to_string(root.join(EXTENSIONS_LOCK)).ok().and_then(|text| toml::from_str(&text).ok());
+        let manifest = Manifest { imported: file.extension, locked: locked.unwrap_or_default() };
         let extension_settings = file
             .extensions
             .settings
@@ -290,7 +325,16 @@ impl Project {
             .collect();
         let links = file.build.links;
         let configs = file.config.into_iter().map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled }).collect();
-        Ok(Project { root, game, layers, mounts, disabled_extensions, extension_settings, configs, links })
+        Ok(Project { root, game, layers, mounts, disabled_extensions, manifest, extension_settings, configs, links })
+    }
+
+    /// Where an extension taken in from a place is: `from` of `[[extension]]`.
+    #[must_use]
+    pub fn imported_from(&self, from: &str) -> PathBuf {
+        if from.starts_with("res://") {
+            return self.resolve(from).unwrap_or_else(|_| PathBuf::from(from));
+        }
+        self.root.join(from)
     }
 
     /// A `res://` path's place on disk, through the mounts (the longest mount point first).

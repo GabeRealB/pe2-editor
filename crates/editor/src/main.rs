@@ -1,11 +1,12 @@
 //! `pe2-editor`: the project editor. For now it browses: the project's assets as a tree, an asset's fields and slots,
 //! references followed both ways, pictures previewed - in panes that can be moved, split, resized and closed.
 //!
-//!     pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive]
+//!     pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive] [--trust-everything]
 //!
 //! `--select` opens an asset (`stages/akropolis/rooms/square/folder`), `--show` a pane (`settings`); `--screenshot`
 //! saves the window as a PNG once it has settled and exits - what scripts and checks use to see it. `--agents-drive`
-//! lets agents click, type and press keys in this session, as the Agents setting does for every one.
+//! lets agents click, type and press keys in this session, as the Agents setting does for every one. `--trust-everything`
+//! runs every unsandboxed extension in this session, asking nothing and keeping nothing (`extensions::trust`).
 //!
 //! Under `WSLg` the editor talks X11 unless told otherwise: maximizing or resizing a window on Wayland can crash `WSLg`'s
 //! compositor, not every time, and every Linux window goes with it (the event loop ends in "Broken pipe"). It is the
@@ -168,6 +169,7 @@ fn main() -> eframe::Result {
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--screenshot") => screenshot = args.next().map(PathBuf::from),
             Some("--agents-drive") => agents_drive = true,
+            Some("--trust-everything") => extensions::trust::trust_everything(),
             _ => project = Some(PathBuf::from(arg)),
         }
     }

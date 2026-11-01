@@ -467,7 +467,7 @@ impl Workspace {
         // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
         // Its own (`extension` assets) and the user's before the built-ins.
         report("Loading the extensions", 0, 0);
-        let extensions_found = extensions::found(Some(&index));
+        let extensions_found = extensions::found(&project, Some(&index));
         let extensions = extensions::for_project(&project, Some(&index));
         // What they are asked in passing reads and keeps what the project's store holds.
         extensions.keep_in(kept);
@@ -790,7 +790,7 @@ impl Workspace {
         // The user's extensions folder, looked at each second.
         if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
             self.extensions_checked = std::time::Instant::now();
-            if extensions::found(Some(&self.index)) != self.extensions_found {
+            if extensions::found(&self.project, Some(&self.index)) != self.extensions_found {
                 return Update::Reopen("an extension changed");
             }
         }

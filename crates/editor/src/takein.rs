@@ -229,7 +229,7 @@ impl Worker {
             return self.snapshot(ticket, refreshed.assets, all, Some("project.toml changed"), None);
         }
         // An `extension` asset came, went or changed.
-        if extensions::found(Some(&self.index)) != self.found {
+        if extensions::found(&self.project, Some(&self.index)) != self.found {
             return self.snapshot(ticket, refreshed.assets, all, Some("an extension changed"), None);
         }
         // The assets the refresh assembled again: their changed declarations noted, their settings as applied given

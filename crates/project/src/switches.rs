@@ -1,12 +1,15 @@
 //! What a project says of its extensions in `project.toml`: those it leaves off (`[extensions] disabled`, a list of
 //! ids) and their project settings (`[extensions."<id>"]`). Each is written in place (the file's comments and layout
 //! kept) as a step of the project's history, so it can be undone. The editor opens the project again when
-//! `project.toml` changes, loading its extensions as it now says.
+//! `project.toml` changes, loading its extensions as it now says. What it takes in from outside itself is `[[extension]]`,
+//! with what each was beside it in `extensions.lock`.
+
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use toml_edit::{Array, Item, Table, value};
+use toml_edit::{Array, ArrayOfTables, Item, Table, value};
 
-use crate::Project;
+use crate::{Imported, Project};
 use crate::history::History;
 use crate::stack::{read, write};
 
@@ -33,6 +36,57 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
         }
     }
     write(&project.root, &document, history, label)
+}
+
+/// Take an extension in, or say more of one taken in: what is said of it replaces what was.
+///
+/// # Errors
+/// `project.toml` cannot be read or written.
+pub fn import(project: &Project, imported: &Imported, history: &mut History, label: String) -> Result<()> {
+    let mut document = read(&project.root)?;
+    let mut entry = Table::new();
+    entry.insert("id", value(imported.id.as_str()));
+    if let Some(version) = &imported.version {
+        entry.insert("version", value(version.as_str()));
+    }
+    if imported.required {
+        entry.insert("required", value(true));
+    }
+    if let Some(from) = &imported.from {
+        entry.insert("from", value(from.as_str()));
+    }
+    let entries = document.entry("extension").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+    let entries = entries.as_array_of_tables_mut().context("extension is not [[extension]]")?;
+    let known = entries.iter().position(|known| known.get("id").and_then(Item::as_str) == Some(imported.id.as_str()));
+    match known {
+        Some(at) => *entries.get_mut(at).context("what was just found")? = entry,
+        None => entries.push(entry),
+    }
+    write(&project.root, &document, history, label)
+}
+
+/// Let go of an extension taken in. What the project holds itself goes by deleting it.
+///
+/// # Errors
+/// `project.toml` cannot be read or written.
+pub fn remove(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
+    let mut document = read(&project.root)?;
+    if let Some(entries) = document.get_mut("extension").and_then(Item::as_array_of_tables_mut) {
+        entries.retain(|known| known.get("id").and_then(Item::as_str) != Some(id));
+        if entries.is_empty() {
+            document.remove("extension");
+        }
+    }
+    write(&project.root, &document, history, label)
+}
+
+/// Write what each extension from outside the project is.
+///
+/// # Errors
+/// It cannot be written.
+pub fn write_lock(project: &Project, locked: &BTreeMap<String, String>) -> Result<()> {
+    let text = format!("# What each extension from outside the project was when it was taken in.\n\n{}", toml::to_string(locked)?);
+    crate::cache::write_atomic(&project.root.join(crate::EXTENSIONS_LOCK), text.as_bytes())
 }
 
 /// Keep a project setting of an extension, or (`None`) go back to its default.
@@ -81,8 +135,8 @@ pub fn set_setting(
 
 #[cfg(test)]
 mod tests {
-    use super::{set_disabled, set_setting};
-    use crate::Project;
+    use super::{import, remove, set_disabled, set_setting, write_lock};
+    use crate::{Imported, Project};
     use crate::cache::Cache;
     use crate::history::History;
     use crate::lock::Lock;
@@ -113,6 +167,35 @@ mod tests {
             history.undo(false).unwrap();
         }
         assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text);
+        drop(lock);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_extension_is_taken_in_said_more_of_and_let_go() {
+        let root = std::env::temp_dir().join(format!("pe2-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let text = "# the project\n[[layer]]\nname = \"base\"\n";
+        std::fs::write(root.join("project.toml"), text).unwrap();
+        let project = Project::load(&root).unwrap();
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let tool = Imported { id: "my.tool".to_string(), version: Some("^0.1".to_string()), ..Imported::default() };
+        import(&project, &tool, &mut history, "take".into()).unwrap();
+        let other = Imported { id: "my.other".to_string(), from: Some("../other".to_string()), ..Imported::default() };
+        import(&project, &other, &mut history, "take".into()).unwrap();
+        import(&project, &Imported { required: true, ..tool.clone() }, &mut history, "require".into()).unwrap();
+        write_lock(&project, &[("my.other".to_string(), "abc".to_string())].into()).unwrap();
+        let read = Project::load(&root).unwrap();
+        assert_eq!(read.manifest.imported.len(), 2);
+        assert!(read.manifest.imported[0].required);
+        assert_eq!(read.manifest.imported[1].from.as_deref(), Some("../other"));
+        assert_eq!(read.manifest.locked["my.other"], "abc");
+        assert_eq!(read.imported_from("../other"), root.join("../other"));
+        remove(&read, "my.tool", &mut history, "go".into()).unwrap();
+        remove(&read, "my.other", &mut history, "go".into()).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text, "nothing is left of it");
         drop(lock);
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -227,11 +227,7 @@ impl Imports {
             asset.imported = Some(resolved);
         }
         problems.extend(self.missing_outputs(index, extensions, only));
-        // The project's extensions not loaded, as problems of their assets.
-        problems.extend(extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
-            (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
-            _ => None,
-        }));
+        problems.extend(extension_problems(extensions));
         index.problems.retain(|p| match p {
             Problem::Import { asset, .. }
             | Problem::Stack { asset, .. }
@@ -239,7 +235,7 @@ impl Imports {
             | Problem::Orphan { asset, .. }
             | Problem::Taken { asset, .. } => !of(asset),
             Problem::MissingOutput { asset, target, .. } => !of(asset) && !of(target),
-            Problem::Extension { .. } => false,
+            Problem::Extension { .. } | Problem::Required { .. } | Problem::Unlocked { .. } => false,
             _ => true,
         });
         index.problems.extend(problems);
@@ -310,6 +306,18 @@ impl Imports {
         let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
         Ok((made, trace.reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
     }
+}
+
+/// What is wrong with a project's extensions: those it holds not loaded, as problems of their assets, what it requires and
+/// does not have, and what is no longer what it took in.
+fn extension_problems(extensions: &Extensions) -> Vec<Problem> {
+    let refused = extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
+        (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
+        _ => None,
+    });
+    let unmet = extensions.unmet.iter().map(|(id, why)| Problem::Required { id: id.clone(), why: why.clone() });
+    let unlocked = extensions.unlocked.iter().map(|id| Problem::Unlocked { id: id.clone() });
+    refused.chain(unmet).chain(unlocked).collect()
 }
 
 /// The project's nodes, as traces name them: what the store keeps for others goes in a sweep.

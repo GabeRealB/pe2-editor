@@ -1491,6 +1491,11 @@ impl Editor {
                     ui.separator();
                 }
                 if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
+                    if extensions::trust::trusts_everything() {
+                        ui.label(RichText::new("trusting every extension").small().color(ui.visuals().warn_fg_color))
+                            .on_hover_text("This run was started with --trust-everything: unsandboxed extensions run unasked");
+                        ui.separator();
+                    }
                     let recent = self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED);
                     let (text, color) = if recent {
                         ("an agent is using the editor", ui.visuals().warn_fg_color)
