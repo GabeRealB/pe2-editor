@@ -1788,7 +1788,7 @@ impl Editor {
 
     /// Whether something it set going has yet to show.
     pub fn busy(&self) -> bool {
-        self.opening.is_some() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.in_epoch())
+        self.opening.is_some() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.in_epoch() || ws.tests.running())
     }
 
     /// Undo the last step.

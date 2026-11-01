@@ -67,6 +67,8 @@ pub enum PaneKind {
     Layer,
     History,
     Extensions,
+    /// The tests of what the project has.
+    Tests,
     Events,
     Panel(PanelName),
 }
@@ -89,6 +91,7 @@ enum StoredKind {
     History,
     Extensions,
     Events,
+    Tests,
     Panel(PanelName),
 }
 
@@ -109,6 +112,7 @@ impl From<StoredKind> for PaneKind {
             StoredKind::History => PaneKind::History,
             StoredKind::Extensions => PaneKind::Extensions,
             StoredKind::Events => PaneKind::Events,
+            StoredKind::Tests => PaneKind::Tests,
             StoredKind::Panel(name) => PaneKind::Panel(name),
         }
     }
@@ -116,7 +120,7 @@ impl From<StoredKind> for PaneKind {
 
 impl PaneKind {
     /// The editor's own panes, in the View menu's order; the extensions' panels follow them (`with_panels`).
-    pub const ALL: [PaneKind; 13] = [
+    pub const ALL: [PaneKind; 14] = [
         PaneKind::Assets,
         PaneKind::Document,
         PaneKind::Contents,
@@ -128,6 +132,7 @@ impl PaneKind {
         PaneKind::History,
         PaneKind::Project,
         PaneKind::Extensions,
+        PaneKind::Tests,
         PaneKind::Events,
         PaneKind::Settings,
     ];
@@ -158,6 +163,7 @@ impl PaneKind {
             PaneKind::Layer => icons::GIT_DIFF,
             PaneKind::History => icons::CLOCK_COUNTER_CLOCKWISE,
             PaneKind::Extensions => icons::PLUGS_CONNECTED,
+            PaneKind::Tests => icons::CHECK_CIRCLE,
             PaneKind::Events => icons::TREE_STRUCTURE,
             PaneKind::Panel(name) => {
                 extensions::shared().panel(name.as_str()).and_then(|p| p.icon).map_or(icons::SQUARES_FOUR, icons::glyph)
@@ -201,6 +207,7 @@ impl PaneKind {
             PaneKind::Layer => "Layer",
             PaneKind::History => "History",
             PaneKind::Extensions => "Extensions",
+            PaneKind::Tests => "Tests",
             PaneKind::Events => "Events",
             PaneKind::Panel(name) => {
                 return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
@@ -602,6 +609,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
                     PaneKind::History => history_ui(ui, ws, steps),
                     PaneKind::Events => crate::events_pane::events_ui(ui, ws, nav, message),
+                    PaneKind::Tests => crate::tests_pane::tests_ui(ui, ws),
                     PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
                     PaneKind::Settings => {}
                 }

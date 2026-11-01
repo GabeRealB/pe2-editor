@@ -89,9 +89,6 @@ pub struct Imported {
     /// Without it, the project is not whole.
     #[serde(default)]
     pub required: bool,
-    /// For testing: loaded only in test mode.
-    #[serde(default)]
-    pub dev: bool,
     /// Where it is, as written: a folder or a component, relative to the project, or `res://`. None: the user's own
     /// extensions, or those beside the editor.
     #[serde(default)]

@@ -20,9 +20,13 @@ mod nodes;
 mod onboarding;
 #[cfg(test)]
 mod registered;
+pub mod suite;
 #[cfg(test)]
 mod taking_in;
+#[cfg(all(test, unix))]
+mod tests_pane;
 
+use std::fmt::Write as _;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -78,10 +82,10 @@ impl egui::DroppedFile for Dropped {
     }
 }
 
-/// Run the tests of what a project takes in for testing, those whose names hold `filter`: whether they passed. What a test
-/// changes in the project is undone after it.
+/// Run the tests of the extensions a project has, those whose names hold one of `filters`, in the project: whether they passed.
+/// What a test changes is undone after it.
 #[must_use]
-pub fn run(root: &std::path::Path, filter: Option<&str>) -> bool {
+pub fn run(root: &std::path::Path, filters: &[String]) -> bool {
     isolate();
     if !root.join(project::FILE).is_file() {
         eprintln!("{}: no project", root.display());
@@ -89,7 +93,7 @@ pub fn run(root: &std::path::Path, filter: Option<&str>) -> bool {
     }
     let mut editor = Scenario::open_with(Fixture::given(root), None, true);
     let mut tests = editor.workspace().extensions.tests();
-    tests.retain(|name| filter.is_none_or(|filter| name.contains(filter)));
+    tests.retain(|name| suite::wanted(name, filters));
     for problem in editor.workspace().extensions.problems.clone() {
         eprintln!("warning: {problem}");
     }
@@ -112,6 +116,49 @@ pub fn run(root: &std::path::Path, filter: Option<&str>) -> bool {
     failed == 0 && !tests.is_empty()
 }
 
+/// `pe2-test-runner`: what the process exits with.
+#[must_use]
+pub fn main() -> i32 {
+    let mut args = std::env::args_os().skip(1).peekable();
+    let (mut project, mut folders, mut filters, mut built) = (None, Vec::new(), Vec::new(), false);
+    let mut out = suite::Out::default();
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--project") => project = args.next().map(std::path::PathBuf::from),
+            Some("--built") => built = true,
+            Some("--suites") => {
+                while let Some(folder) = args.next_if(|arg| !arg.to_string_lossy().starts_with("--")) {
+                    folders.push(std::path::PathBuf::from(folder));
+                }
+            }
+            Some("--filter") => filters.extend(args.next().map(|text| text.to_string_lossy().into_owned())),
+            Some("--list") => out.list = true,
+            Some("--json") => out.json = true,
+            Some("--artifacts") => out.artifacts = args.next().map(std::path::PathBuf::from),
+            Some("--trust-everything") => extensions::trust::trust_everything(),
+            _ => {
+                eprintln!("{}: not something this takes", arg.to_string_lossy());
+                return 2;
+            }
+        }
+    }
+    if let Some(root) = project {
+        return i32::from(!run(&root, &filters));
+    }
+    let mut suites = if built || folders.is_empty() { suite::built() } else { Vec::new() };
+    match suite::in_folders(&folders) {
+        Ok(found) => suites.extend(found),
+        Err(why) => {
+            eprintln!("{why}");
+            return 2;
+        }
+    }
+    if out.list {
+        return i32::from(!suite::list(&suites, &out));
+    }
+    i32::from(!suite::run(&suites, &filters, &out).passed())
+}
+
 /// The editor at work on a fixture.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct Scenario {
@@ -125,12 +172,14 @@ pub struct Scenario {
 impl Scenario {
     /// The editor on a fixture, its project open.
     #[track_caller]
+    #[must_use]
     pub fn open(fixture: Fixture) -> Scenario {
         Scenario::open_showing(fixture, None)
     }
 
     /// The editor on a fixture, with a pane in front.
     #[track_caller]
+    #[must_use]
     pub fn open_showing(fixture: Fixture, show: Option<&str>) -> Scenario {
         Scenario::open_with(fixture, show, false)
     }
@@ -252,6 +301,7 @@ impl Scenario {
         let ws = self.workspace();
         let (extensions, index) = (ws.extensions.clone(), ws.index.clone());
         let name = name.to_string();
+        let running = name.clone();
         let test = std::thread::spawn(move || {
             let lens = project::ext::Lens { index: &index, extensions: &extensions, selection: None, chosen: None, revision: 0 };
             let service = extensions.service(&name).ok_or_else(|| format!("no test {name}"))?;
@@ -261,7 +311,7 @@ impl Scenario {
         while !test.is_finished() {
             match asked.recv_timeout(Duration::from_millis(5)) {
                 Ok(step) => {
-                    let done = self.do_step(&step.name, &step.arguments);
+                    let done = self.do_step(&running, &step.name, &step.arguments);
                     let _ = step.done.send(done);
                 }
                 Err(_) => self.harness.step(),
@@ -273,24 +323,30 @@ impl Scenario {
     }
 
     /// A step a test asked for, and what it comes to.
-    fn do_step(&mut self, name: &str, arguments: &toml::Value) -> Result<toml::Value, String> {
+    fn do_step(&mut self, test: &str, name: &str, arguments: &toml::Value) -> Result<toml::Value, String> {
         use toml::Value;
-        let text = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
+        let said = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
+        if name == "data" {
+            return self.data_of(test, said).map(|bytes| Value::String(bytes.iter().fold(String::new(), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })));
+        }
         let strings = |list: Vec<String>| Value::Array(list.into_iter().map(Value::String).collect());
-        let one = |found: usize, text: &str| if found == 1 { Ok(()) } else { Err(format!("{found} things say {text:?}")) };
+        let one = |found: usize, said: &str| if found == 1 { Ok(()) } else { Err(format!("{found} things say {said:?}")) };
         match name {
-            "show" if !self.assets().iter().any(|path| path == text) => return Err(format!("no asset {text}")),
-            "show" => self.show(text),
+            "show" if !self.assets().iter().any(|path| path == said) => return Err(format!("no asset {said}")),
+            "show" => self.show(said),
             "click" => {
-                one(self.harness.query_all(By::new().label_contains(text)).count(), text)?;
-                self.click(text);
+                one(self.harness.query_all(By::new().label_contains(said)).count(), said)?;
+                self.click(said);
             }
             "click_label" => {
-                one(self.harness.query_all(By::new().label(text)).count(), text)?;
-                self.click_label(text);
+                one(self.harness.query_all(By::new().label(said)).count(), said)?;
+                self.click_label(said);
             }
-            "typing" => self.typing(text),
-            "press" => self.press(egui::Key::from_name(text).ok_or_else(|| format!("no key {text}"))?),
+            "typing" => self.typing(said),
+            "press" => self.press(egui::Key::from_name(said).ok_or_else(|| format!("no key {said}"))?),
             "undo" => {
                 if self.workspace().history.done().is_empty() {
                     return Err("nothing to undo".to_string());
@@ -299,13 +355,13 @@ impl Scenario {
             }
             "drop_file" => {
                 let bytes = from_hex(arguments.get("bytes").and_then(Value::as_str).unwrap_or_default())?;
-                let file = self.file_elsewhere(text, &bytes);
+                let file = self.file_elsewhere(said, &bytes);
                 self.drop_file(&file);
             }
             "node" => self.new_node(arguments)?,
             "make_every_template" => return self.make_every_template().map(Value::Integer),
-            "expect" if !self.says(text) => return Err(format!("nothing says {text:?}; there is:\n{}", self.shown().join("\n"))),
-            "expect_not" if self.says(text) => return Err(format!("something says {text:?}: {:?}", self.shown().into_iter().filter(|line| line.contains(text)).collect::<Vec<_>>())),
+            "expect" if !self.says(said) => return Err(format!("nothing says {said:?}; there is:\n{}", self.shown().join("\n"))),
+            "expect_not" if self.says(said) => return Err(format!("something says {said:?}: {:?}", self.shown().into_iter().filter(|line| line.contains(said)).collect::<Vec<_>>())),
             "expect" | "expect_not" => {}
             "problems" => return Ok(strings(self.problems())),
             "assets" => return Ok(strings(self.assets())),
@@ -313,12 +369,39 @@ impl Scenario {
             "pictured" => {
                 let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
                 let ws = self.workspace();
-                let asset = ws.index.assets.get(text).cloned().ok_or_else(|| format!("no asset {text}"))?;
+                let asset = ws.index.assets.get(said).cloned().ok_or_else(|| format!("no asset {said}"))?;
                 return Ok(Value::Boolean(ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok())));
             }
             other => return Err(format!("no step {other}")),
         }
         Ok(Value::Boolean(true))
+    }
+
+    /// What the window showed, kept where it can be looked at: a file of what it said, and a picture where one can be made.
+    fn keep_failure(&mut self, folder: &std::path::Path, test: &str) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        let name: String = test.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        if std::fs::create_dir_all(folder).is_err() {
+            return (None, None);
+        }
+        let said = folder.join(format!("{name}.txt"));
+        let said = std::fs::write(&said, self.shown().join("\n")).is_ok().then_some(said);
+        let picture = self.harness.render().ok().and_then(|image| {
+            let png = codecs::texture::rgba_png(image.width() as usize, image.height() as usize, image.as_raw()).ok()?;
+            let file = folder.join(format!("{name}.png"));
+            std::fs::write(&file, png).is_ok().then_some(file)
+        });
+        (said, picture)
+    }
+
+    /// A file of the `data/` folder beside a test's component.
+    fn data_of(&mut self, test: &str, name: &str) -> Result<Vec<u8>, String> {
+        let id = test.split('@').next().unwrap_or_default();
+        let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
+        let Some(project::ext::Origin::Project { file, .. } | project::ext::Origin::Component(file)) = present.map(|present| present.origin) else {
+            return Err(format!("{id} has no folder"));
+        };
+        let at = file.with_file_name("data").join(name);
+        std::fs::read(&at).map_err(|e| format!("{}: {e}", at.display()))
     }
 
     /// A node a test asked for, as its template makes one, in the active layer: a step of the history, so that it can go.
@@ -353,6 +436,7 @@ impl Scenario {
     }
 
     /// Whether the project is asking something.
+    #[must_use]
     pub fn asking(&self) -> bool {
         self.harness.state().asking()
     }
@@ -366,6 +450,7 @@ impl Scenario {
 
     /// Open the same project again, in a new session.
     #[track_caller]
+    #[must_use]
     pub fn opened_again(self) -> Scenario {
         let Scenario { harness, fixture, _alone: alone } = self;
         drop(harness);
@@ -374,6 +459,7 @@ impl Scenario {
     }
 
     /// What the project's `project.toml` says.
+    #[must_use]
     pub fn project_file(&self) -> String {
         std::fs::read_to_string(self.fixture.root().join(project::FILE)).expect("a project file")
     }
@@ -409,6 +495,7 @@ impl Scenario {
     }
 
     /// Whether something says this.
+    #[must_use]
     pub fn says(&self, text: &str) -> bool {
         self.harness.query_all(By::new().label_contains(text).include_labels()).next().is_some()
     }

@@ -21,8 +21,8 @@ members = [
     "extensions/str",
     "extensions/ffmpeg",
     "extensions/psx",
-    "extensions/render_tests",
-    "extensions/images_tests",
+    "extensions/render/tests",
+    "extensions/images/tests",
     "extensions/test_data",
 ]
 

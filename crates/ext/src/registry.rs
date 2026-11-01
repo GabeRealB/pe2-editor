@@ -51,6 +51,7 @@ macro_rules! extension {
         $(, provides = [$($provides:literal),* $(,)?])?
         $(, platforms = [$($platforms:literal),* $(,)?])?
         $(, unsandboxed = $unsandboxed:literal)?
+        $(, hashed = [$($hashed:literal),* $(,)?])?
         $(,)?) => {
         /// This extension's id.
         pub const ID: &str = $id;
@@ -86,6 +87,7 @@ macro_rules! extension {
             $($("\"", $weak, "\", ",)*)? "]\noptional = [", $($("\"", $optional, "\", ",)*)? "]\nprovides = [",
             $($("\"", $provides, "\", ",)*)? "]\nplatforms = [", $($("\"", $platforms, "\", ",)*)? "]\n"
             $(, "unsandboxed = ", $unsandboxed, "\n")?
+            $(, "hashed = [", $("\"", $hashed, "\", ",)*  "]\n")?
         );
         #[cfg(target_family = "wasm")]
         #[unsafe(link_section = "pe2-extension")]

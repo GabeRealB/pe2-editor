@@ -2533,6 +2533,9 @@ pub struct About {
     pub platforms: Vec<String>,
     #[serde(default)]
     pub unsandboxed: bool,
+    /// What of its folder counts as what it is, beside its component (`unsandboxed::trust`); empty, all of it.
+    #[serde(default)]
+    pub hashed: Vec<String>,
 }
 
 /// What a component says it is, read from its section; none where it has none (built by an older SDK).
@@ -2639,6 +2642,8 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
             register: Some(Box::new(move |registry| {
                 let settings = Value::Table(registry.stored().clone()).to_string();
                 let (shared, told, registration) = start(&name, &bytes, &settings, unsandboxed.clone())?;
+                // What counts as it is for the section alone: it is read to know the extension, before it runs.
+                let told = About { hashed: said.hashed.clone(), ..told };
                 anyhow::ensure!(told == said, "{name}: it says it is {told:?}, its section {said:?}");
                 let shared = kept.get_or_init(|| shared).clone();
                 apply(registry, registration, &shared)
@@ -2731,6 +2736,7 @@ fn start(name: &str, bytes: &[u8], settings: &str, unsandboxed: Option<Arc<Unsan
         provides: told.provides,
         platforms: told.platforms,
         unsandboxed: told.unsandboxed,
+        hashed: Vec::new(),
     };
     Ok((Arc::new(shared), about, registration))
 }

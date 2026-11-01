@@ -31,7 +31,8 @@ fn step(name: &str, arguments: &Value) -> Result<Value> {
 }
 
 /// What a test may ask for.
-const STEPS_OFFERED: [&str; 15] = [
+const STEPS_OFFERED: [&str; 16] = [
+    "data",
     "show",
     "click",
     "click_label",
@@ -58,6 +59,7 @@ fn register(r: &mut Registry) -> Result<()> {
 }
 
 /// The extension.
+#[must_use]
 pub fn extension() -> Extension {
     Extension {
         id: "pe2.test",

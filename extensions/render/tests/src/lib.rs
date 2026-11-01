@@ -6,9 +6,6 @@ use pe2_ext::{Registry, Result, Value, bail};
 
 pe2_ext::extension!("pe2.render.tests", "0.1.0", register, requires = ["pe2.render@^0.1", "pe2.test@^0.1"]);
 
-/// A square and a triangle, one on each joint, with one slot.
-const MESH: &str = include_str!("doll.usda");
-
 const JOINTS: &str = r#"joints = [
     { name = "root", translation = [0, 0, 0], rotation = [0, 0, 0] },
     { name = "hip", parent = "root", translation = [0, -100, 0], rotation = [0, 0, 0] },
@@ -18,13 +15,21 @@ const PREFAB: &str = r#"skeleton = { slot = "uid://bones" }
 parts.body = {}
 groups.outfit.plain.body = { model = { slot = "uid://body" } }"#;
 
+const RIG: &str = r#"joints = [
+    { name = "root", translation = [0, 0, 0], rotation = [0, 0, 0] },
+    { name = "pelvis", parent = "root", translation = [0, -927, 0], rotation = [0, 0, 0] },
+    { name = "waist", parent = "pelvis", translation = [0, -79, 3], rotation = [0, 0, 0] },
+]"#;
+
 /// A doll: a texture from a file, a skeleton, a mesh on it, a material, a model and a prefab holding it.
 fn doll(editor: &Editor) -> Result<()> {
     let painting = pe2_test_data::painting();
     editor.node(&NewNode { path: "doll/skin", uid: "uid://skin", template: "texture", file: "skin.ora", settings: "", files: &[("skin.ora", &painting)] })?;
     editor.node(&NewNode { path: "doll/skeleton", uid: "uid://bones", template: "skeleton", file: "", settings: JOINTS, files: &[] })?;
     let on_it = "skeleton = { slot = \"uid://bones\" }";
-    editor.node(&NewNode { path: "doll/shape", uid: "uid://shape", template: "mesh", file: "", settings: on_it, files: &[("mesh.usda", MESH.as_bytes())] })?;
+    // A square and a triangle, one on each joint, with one slot.
+    let mesh = editor.data("doll.usda")?;
+    editor.node(&NewNode { path: "doll/shape", uid: "uid://shape", template: "mesh", file: "", settings: on_it, files: &[("mesh.usda", &mesh)] })?;
     let paint = "shader = \"textured\"\nsurface = \"opaque\"\nblend = \"add\"\nmain = \"uid://skin#cells/page_0@default\"";
     editor.node(&NewNode { path: "doll/paint", uid: "uid://paint", template: "material", file: "", settings: paint, files: &[] })?;
     let body = "mesh = { slot = \"uid://shape\" }\nmaterials.page_0 = { slot = \"uid://paint\" }";
@@ -36,6 +41,7 @@ fn doll(editor: &Editor) -> Result<()> {
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.test("a_joint_selected_shows_its_translation", "Selecting a joint shows what it holds", |project, _| {
         let editor = Editor::of(project);
+        editor.node(&NewNode { path: "rig/skeleton", uid: "uid://rig", template: "skeleton", file: "", settings: RIG, files: &[] })?;
         editor.show("rig/skeleton")?;
         editor.click("pelvis")?;
         editor.expect("Translation")?;

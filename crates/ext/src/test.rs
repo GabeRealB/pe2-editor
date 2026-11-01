@@ -52,6 +52,17 @@ impl<'a> Editor<'a> {
         Ok(list.iter().filter_map(Value::as_str).map(str::to_string).collect())
     }
 
+    /// A file of the test's `data/` folder.
+    ///
+    /// # Errors
+    /// It has no such file.
+    pub fn data(&self, name: &str) -> Result<Vec<u8>> {
+        let answer = self.call("data", Table::from_iter([("text".to_string(), Value::String(name.to_string()))]))?;
+        let text = answer.as_str().ok_or_else(|| anyhow!("{name} is not there"))?;
+        let pair = |pair: &[u8]| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok());
+        text.as_bytes().chunks(2).map(pair).collect::<Option<Vec<u8>>>().ok_or_else(|| anyhow!("{name} is not there"))
+    }
+
     /// Open an asset.
     ///
     /// # Errors

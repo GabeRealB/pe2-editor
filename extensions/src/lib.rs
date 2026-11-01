@@ -30,6 +30,15 @@ pub fn built_apart(file: &str) -> Option<Vec<u8>> {
     std::fs::read(Path::new(env!("PE2_BUILT")).join(file)).ok()
 }
 
+/// The tests of the built-ins, each a `tests/` folder, as the build lays them out.
+#[must_use]
+pub fn built_suites() -> Vec<PathBuf> {
+    let entries = std::fs::read_dir(env!("PE2_SUITES")).into_iter().flatten().flatten();
+    let mut suites: Vec<PathBuf> = entries.map(|entry| entry.path().join(unsandboxed::TESTS)).filter(|tests| tests.is_dir()).collect();
+    suites.sort();
+    suites
+}
+
 /// The built-in extensions linked in.
 #[must_use]
 pub fn linked() -> Vec<pe2_ext::Extension> {
@@ -94,7 +103,7 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
             // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
             let held = match about.filter(|a| a.unsandboxed) {
                 Some(about) => {
-                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref()).map_err(|e| format!("{e:#}"))?;
+                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).map_err(|e| format!("{e:#}"))?;
                     if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
                         unloadable.push(not_enabled(about, found, &bytes, trust, &enabled));
                         return Ok(None);
@@ -161,8 +170,8 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
     extensions
 }
 
-/// Test mode, for this process: this extension, built into the host, is there for tests to act through, and what a project
-/// takes in for testing (`dev`) loads.
+/// Test mode, for this process: this extension, built into the host, is there for tests to act through, and the tests of
+/// the extensions found load with them.
 pub fn test_mode(host: fn() -> pe2_ext::Extension) {
     let _ = TEST_HOST.set(host);
     component::be_patient();
@@ -171,12 +180,7 @@ pub fn test_mode(host: fn() -> pe2_ext::Extension) {
 static TEST_HOST: OnceLock<fn() -> pe2_ext::Extension> = OnceLock::new();
 
 /// Whether a project takes in an extension found here: what it holds itself, by being there; from elsewhere, as it says.
-/// What it takes in for testing, only in test mode.
 fn taken_in(manifest: &Manifest, id: &str, origin: &Origin) -> bool {
-    let dev = manifest.imported.iter().any(|imported| imported.id == id && imported.dev);
-    if dev && TEST_HOST.get().is_none() {
-        return false;
-    }
     match origin {
         Origin::User(_) | Origin::Install(_) => manifest.imported.iter().any(|imported| imported.id == id && imported.from.is_none()),
         _ => true,
@@ -209,7 +213,7 @@ fn unlocked(manifest: &Manifest, found: &[Found]) -> Vec<String> {
         let now = found.iter().find_map(|found| {
             let bytes = std::fs::read(&found.file).ok()?;
             let about = component::about(&bytes)?;
-            (about.id == *id && !matches!(found.origin, Origin::Project { .. })).then(|| unsandboxed::trust(&found.file, found.folder.as_deref()).ok())?
+            (about.id == *id && !matches!(found.origin, Origin::Project { .. })).then(|| unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).ok())?
         });
         now.is_some_and(|now| now != *locked).then(|| id.clone())
     };
@@ -227,7 +231,8 @@ pub fn locked(project: &Project, index: Option<&Index>) -> BTreeMap<String, Stri
         let about = component::about(&std::fs::read(&found.file).ok()?)?;
         taken_in(&project.manifest, &about.id, &found.origin).then_some(())?;
         project.manifest.imported.iter().any(|imported| imported.id == about.id).then_some(())?;
-        Some((about.id, unsandboxed::trust(&found.file, found.folder.as_deref()).ok()?))
+        let hash = unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).ok()?;
+        Some((about.id, hash))
     };
     found.iter().filter_map(of).collect()
 }
@@ -340,6 +345,12 @@ pub fn user_settings() -> BTreeMap<String, Table> {
         .collect()
 }
 
+/// The tests in an extension's folder.
+fn tests_of(folder: &Path) -> Option<Found> {
+    let file = folder.join(unsandboxed::TESTS).join("tests.wasm");
+    file.is_file().then(|| Found { origin: Origin::Component(file.clone()), stamp: file_stamp(&file), folder: file.parent().map(PathBuf::from), file })
+}
+
 /// The components a project takes in from places of its own choosing.
 #[must_use]
 pub fn imported_components(project: &Project) -> Vec<Found> {
@@ -356,6 +367,11 @@ pub fn found(project: &Project, index: Option<&Index>) -> Vec<Found> {
     found.extend(imported_components(project));
     found.extend(user_components());
     found.extend(install_components());
+    // In test mode, what each carries of tests.
+    if TEST_HOST.get().is_some() {
+        let tests: Vec<Found> = found.iter().filter_map(|found| tests_of(found.folder.as_deref()?)).collect();
+        found.extend(tests);
+    }
     let enabled = trust::file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
     for found in &mut found {
         found.stamp.push_str(&enabled);
@@ -453,6 +469,14 @@ fn file_stamp(file: &std::path::Path) -> String {
     format!("{} {}", meta.map_or(0, |m| m.len()), time.map_or(0, |t| t.as_nanos()))
 }
 
+/// The stamps of what an extension's folder holds: its tests are not it.
+fn own_stamp(folder: &Path) -> String {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    entries.retain(|entry| entry.file_name().is_none_or(|name| name != unsandboxed::TESTS));
+    entries.sort();
+    entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
+}
+
 /// The stamps of what a folder holds, below it too.
 fn folder_stamp(folder: &std::path::Path) -> String {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
@@ -472,7 +496,7 @@ fn components_in(folder: &std::path::Path, origin: fn(PathBuf) -> Origin) -> Vec
 fn component_at(entry: PathBuf, origin: fn(PathBuf) -> Origin) -> Option<Found> {
     if entry.is_dir() {
         let file = entry.join(EXTENSION_COMPONENT);
-        let stamp = folder_stamp(&entry);
+        let stamp = own_stamp(&entry);
         return file.is_file().then(|| Found { origin: origin(file.clone()), file, folder: Some(entry), stamp });
     }
     let wasm = entry.extension().is_some_and(|e| e == "wasm");
@@ -557,7 +581,7 @@ mod tests {
         let bare = Manifest::default();
         assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&bare))), Some(Status::Available));
         // Taken in, in place of the built-in of its id; asked for at another version; locked to something else.
-        let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), dev: false, from: None };
+        let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), from: None };
         let locked = [(id.clone(), "another".to_string())].into();
         let manifest = Manifest { imported: vec![imported], locked };
         let extensions = super::load_without(&found, &[], &super::Kept::new(), Some(&manifest));
@@ -565,10 +589,6 @@ mod tests {
         assert_eq!(extensions.unmet.len(), 1, "{:?}", extensions.unmet);
         assert!(extensions.unmet[0].1.contains("asks for ^7.0"), "{:?}", extensions.unmet);
         assert_eq!(extensions.unlocked, std::slice::from_ref(&id));
-        // For testing, and no test mode here: as if it were not taken in.
-        let imported = Imported { id: id.clone(), dev: true, ..Imported::default() };
-        let manifest = Manifest { imported: vec![imported], ..Manifest::default() };
-        assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&manifest))), Some(Status::Available));
         // Required and found nowhere.
         let manifest = Manifest { imported: vec![Imported { id: "my.tool".to_string(), required: true, ..Imported::default() }], ..Manifest::default() };
         let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&manifest));

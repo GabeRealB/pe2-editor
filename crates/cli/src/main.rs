@@ -170,9 +170,6 @@ enum ExtensionCommand {
         /// Without it, the project is not whole
         #[arg(long)]
         required: bool,
-        /// For testing: it loads only in test mode
-        #[arg(long)]
-        dev: bool,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -341,7 +338,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                 println!("{} {}  {}{status}  ({})", present.id, present.version, if required { "required, " } else { "" }, present.origin.said());
             }
         }
-        ExtensionCommand::Add { what, required, dev, .. } => {
+        ExtensionCommand::Add { what, required, .. } => {
             // A place, or who is available.
             let place = p.imported_from(&what);
             let at = (place.exists() || what.starts_with("res://")).then_some(&place);
@@ -354,7 +351,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                 project::ext::component::About { id: found.id.clone(), version: found.version.clone(), ..Default::default() }
             };
             let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
-            let imported = project::Imported { id: about.id.clone(), version: Some(format!("^{line}")), required, dev, from: at.map(|_| what.clone()) };
+            let imported = project::Imported { id: about.id.clone(), version: Some(format!("^{line}")), required, from: at.map(|_| what.clone()) };
             project::switches::import(&p, &imported, &mut history, format!("Take {} in", about.id))?;
             let p = project::Project::load(&project)?;
             project::switches::write_lock(&p, &extensions::locked(&p, Some(&index)))?;

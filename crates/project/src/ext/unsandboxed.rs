@@ -53,21 +53,29 @@ fn files_in(folder: &Path, within: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -
     Ok(())
 }
 
-/// The hash of an extension whole, what the user enables and what it makes is kept by: its component, or of one in a
-/// folder everything there, so a new program is another extension.
+/// What of an extension's folder never counts as it: its tests, which what ships may not have.
+pub const TESTS: &str = "tests";
+
+/// The hash of an extension, what the user enables and what a project locks: its component, or of one in a folder of its own
+/// everything there but its tests, so that a new program is another extension. `hashed`, what the extension says counts,
+/// narrows that to its component and those: a hint that the rest may change without its being another extension.
 ///
 /// # Errors
 /// What it holds cannot be read.
-pub fn trust(file: &Path, folder: Option<&Path>) -> Result<String> {
+pub fn trust(file: &Path, folder: Option<&Path>, hashed: &[String]) -> Result<String> {
     let Some(folder) = folder else { return crate::extract::sha1_file(file).with_context(|| file.display().to_string()) };
     let mut files = Vec::new();
     files_in(folder, Path::new(""), &mut files)?;
-    let mut hashes = String::new();
-    for (name, path) in files {
+    let counts = |name: &Path| {
+        let component = file.file_name().is_some_and(|own| name.as_os_str() == own);
+        component || if hashed.is_empty() { !name.starts_with(TESTS) } else { hashed.iter().any(|listed| name.starts_with(listed)) }
+    };
+    let mut listing = String::new();
+    for (name, path) in files.into_iter().filter(|(name, _)| counts(name)) {
         let sha1 = crate::extract::sha1_file(&path).with_context(|| path.display().to_string())?;
-        let _ = writeln!(hashes, "{} {sha1}", name.display());
+        let _ = writeln!(listing, "{} {sha1}", name.display());
     }
-    Ok(crate::extract::sha1_hex(hashes.as_bytes()))
+    Ok(crate::extract::sha1_hex(listing.as_bytes()))
 }
 
 #[cfg(test)]
@@ -95,15 +103,15 @@ mod tests {
     fn what_is_enabled_is_all_it_ships() {
         let dir = folder("trust");
         let component = dir.join("extension.wasm");
-        let whole = trust(&component, Some(&dir)).unwrap();
-        assert_eq!(trust(&component, Some(&dir)).unwrap(), whole);
+        let whole = trust(&component, Some(&dir), &[]).unwrap();
+        assert_eq!(trust(&component, Some(&dir), &[]).unwrap(), whole);
         // A program it ships, changed: another extension to the user, and what it made is made again.
         std::fs::write(dir.join("bin/tool"), b"another tool").unwrap();
-        assert_ne!(trust(&component, Some(&dir)).unwrap(), whole);
+        assert_ne!(trust(&component, Some(&dir), &[]).unwrap(), whole);
         // Moved, too.
-        let changed = trust(&component, Some(&dir)).unwrap();
+        let changed = trust(&component, Some(&dir), &[]).unwrap();
         std::fs::rename(dir.join("bin/tool"), dir.join("tool")).unwrap();
-        assert_ne!(trust(&component, Some(&dir)).unwrap(), changed);
+        assert_ne!(trust(&component, Some(&dir), &[]).unwrap(), changed);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -119,5 +127,30 @@ mod tests {
         std::fs::write(dir.join(platform()).join("tool"), b"this platform's").unwrap();
         assert_eq!(program(Some(&dir), "tool"), dir.join(platform()).join("tool"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tests_are_not_the_extension_and_it_may_say_what_is() {
+        let dir = std::env::temp_dir().join(format!("pe2-hashed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        let component = dir.join("extension.wasm");
+        std::fs::write(&component, "component").unwrap();
+        std::fs::write(dir.join("tools/program"), "one").unwrap();
+        std::fs::write(dir.join("readme"), "one").unwrap();
+        let whole = trust(&component, Some(&dir), &[]).unwrap();
+        // Tests come and go.
+        std::fs::write(dir.join("tests/tests.wasm"), "tests").unwrap();
+        assert_eq!(trust(&component, Some(&dir), &[]).unwrap(), whole);
+        // What it says counts does, and the rest does not.
+        let tools = ["tools".to_string()];
+        let said = trust(&component, Some(&dir), &tools).unwrap();
+        std::fs::write(dir.join("readme"), "two").unwrap();
+        assert_eq!(trust(&component, Some(&dir), &tools).unwrap(), said);
+        assert_ne!(trust(&component, Some(&dir), &[]).unwrap(), whole);
+        std::fs::write(dir.join("tools/program"), "two").unwrap();
+        assert_ne!(trust(&component, Some(&dir), &tools).unwrap(), said);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -14,7 +14,7 @@ use pe2_ext::{Call, File, Registry, Result, Table, Typed, Value, anyhow, bail};
 /// The target this is, as a config names it.
 const TARGET: &str = "psx";
 
-pe2_ext::extension!("pe2.psx", "0.1.0", register, requires = ["pe2.packages@^0.1"], provides = ["package-target@1.0.0"], unsandboxed = true);
+pe2_ext::extension!("pe2.psx", "0.1.0", register, requires = ["pe2.packages@^0.1"], provides = ["package-target@1.0.0"], unsandboxed = true, hashed = ["linux-x86_64"]);
 
 /// The places a package loads into, by the names packages give them.
 const SLOTS: [(&str, u32); 12] = [

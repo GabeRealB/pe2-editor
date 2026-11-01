@@ -4,6 +4,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use super::suite::Suite;
+
 /// The layer fixtures write to.
 const LAYER: &str = "base";
 
@@ -83,20 +85,60 @@ impl Fixture {
         fixture
     }
 
-    /// The rig, with a test extension taken in for testing.
+    /// A project of what a suite declares, holding its tests.
     #[must_use]
-    pub fn tested() -> Fixture {
-        let rig = Fixture::rig();
-        let mut manifest = format!("[[layer]]\nname = \"{LAYER}\"\n");
-        let mut tested = rig;
-        for (id, name) in [("pe2.render.tests", "render"), ("pe2.images.tests", "images")] {
-            let _ = writeln!(manifest, "\n[[extension]]\nid = \"{id}\"\ndev = true");
-            let bytes = extensions::built_apart(&format!("pe2_{name}_tests.wasm")).expect("built with the others");
-            let at = format!("tests/{name}");
-            tested = tested.node(&at, "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n").bytes(&at, "extension.wasm", &bytes);
+    pub fn for_suite(suite: &Suite) -> Fixture {
+        const COMPONENT: &str = "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n";
+        let declared = &suite.declared;
+        let fixture = Fixture::new();
+        let layers: Vec<&str> = if declared.layers.is_empty() { vec![LAYER] } else { declared.layers.iter().map(String::as_str).collect() };
+        let mut file = String::new();
+        for layer in &layers {
+            let _ = writeln!(file, "[[layer]]\nname = \"{layer}\"\n");
+            std::fs::create_dir_all(fixture.root.join(".layers").join(layer)).expect("a layer");
         }
-        tested.write("project.toml", &manifest);
-        tested
+        for config in &declared.configs {
+            let _ = writeln!(file, "[config.{config}]\n");
+        }
+        if !declared.disabled.is_empty() {
+            let _ = writeln!(file, "[extensions]\ndisabled = {:?}\n", declared.disabled);
+        }
+        fixture.write("project.toml", &file);
+        let bundle = |name: &str| fixture.root.join(format!(".layers/{}/{name}.node", layers[0]));
+        // What it tests with, and the tests with their data.
+        for id in &declared.take {
+            let bytes = extensions::built_apart(&format!("{}.wasm", id.replace('.', "_"))).unwrap_or_else(|| panic!("{id} was not built"));
+            let at = bundle(&format!("extensions/{id}"));
+            std::fs::create_dir_all(&at).expect("a bundle");
+            std::fs::write(at.join("extension.wasm"), bytes).expect("a component");
+            std::fs::write(at.join("node.toml"), COMPONENT).expect("a declaration");
+        }
+        let at = bundle(&format!("tests/{}", suite.name));
+        std::fs::create_dir_all(at.join("data")).expect("a bundle");
+        std::fs::copy(suite.folder.join("tests.wasm"), at.join("extension.wasm")).expect("its tests");
+        std::fs::write(at.join("node.toml"), COMPONENT).expect("a declaration");
+        for entry in std::fs::read_dir(suite.folder.join("data")).into_iter().flatten().flatten() {
+            std::fs::copy(entry.path(), at.join("data").join(entry.file_name())).expect("its data");
+        }
+        if declared.trust {
+            extensions::trust::trust(&fixture.root, std::slice::from_ref(&fixture.root)).expect("what is trusted");
+        }
+        fixture
+    }
+
+    /// An extension of the project's own carrying tests.
+    #[must_use]
+    pub fn with_tests() -> Fixture {
+        let component = extensions::built_apart("pe2_psx.wasm").expect("built with the others");
+        let tests = extensions::built_apart("pe2_render_tests.wasm").expect("built with the others");
+        let suite = extensions::built_suites().into_iter().find(|suite| suite.ends_with("render/tests")).expect("built with the others");
+        let at = "extensions/psx";
+        let fixture = Fixture::new()
+            .node(at, "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n")
+            .bytes(at, "extension.wasm", &component)
+            .bytes(at, "tests/tests.wasm", &tests);
+        let data = std::fs::read(suite.join("data/doll.usda")).expect("its data");
+        fixture.bytes(at, "tests/data/doll.usda", &data)
     }
 
     /// A project of two configs.
@@ -147,6 +189,7 @@ retain = "cache"
         rig
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }

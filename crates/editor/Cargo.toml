@@ -5,9 +5,18 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[lib]
+name = "editor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pe2-editor"
 path = "src/main.rs"
+
+[[bin]]
+name = "pe2-test-runner"
+path = "src/test_runner.rs"
+required-features = ["tests"]
 
 [lints]
 workspace = true
@@ -38,7 +47,7 @@ winit.workspace = true
 egui_kittest = { workspace = true, optional = true }
 
 [features]
-# `pe2-editor --test`: the tests a project takes in. A build for testing: what ships has no harness in it.
+# `pe2-test-runner`, a build for testing: what ships has no harness in it.
 tests = ["dep:egui_kittest"]
 
 [dev-dependencies]

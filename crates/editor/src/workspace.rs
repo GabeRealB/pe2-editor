@@ -148,6 +148,8 @@ pub struct Workspace {
     pub layers: Vec<LayerInfo>,
     /// What was done this session, to undo and redo.
     pub history: History,
+    /// The Tests pane's: what is known of tests, and what is running.
+    pub tests: crate::tests_pane::Tests,
     /// The tree's thumbnails, kept in the project's store.
     pub thumbs: crate::thumbs::Thumbs,
     /// The extensions, and what they register: the types' icons, fields, pictures, thumbnails and views.
@@ -508,6 +510,7 @@ impl Workspace {
     }
 
     /// The workspace of a project opened (`prepare`): its worker started, its index shown.
+    #[expect(clippy::too_many_lines, reason = "what it holds, one line each")]
     pub fn from_opened(opened: Opened) -> Workspace {
         let Opened {
             project,
@@ -548,6 +551,7 @@ impl Workspace {
             project,
             applied,
             history,
+            tests: crate::tests_pane::Tests::default(),
             thumbs,
             graph_ask: None,
             asset_folder: String::new(),
