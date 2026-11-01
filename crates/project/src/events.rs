@@ -86,6 +86,8 @@ pub struct Trigger {
 pub struct Outcome {
     pub signaled: Vec<String>,
     pub failed: Option<String>,
+    /// What what was made says of itself, though it was made.
+    pub notes: Vec<String>,
     /// It made something now, not finding it kept.
     pub made: bool,
 }
@@ -104,6 +106,8 @@ pub struct Report {
     /// What actually made something, by asset and output.
     pub made: Vec<(String, String)>,
     pub failed: Vec<(String, String)>,
+    /// What what was made says of itself, by asset.
+    pub notes: Vec<(String, String)>,
     /// Pulls left stale by what ran after them: wired backwards, or changed while it ran.
     pub stale: Vec<(String, String)>,
     pub cancelled: bool,
@@ -197,6 +201,7 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
         for (t, outcome) in batch.into_iter().zip(outcomes) {
             let trigger = &triggers[t];
             let (asset, output) = label(&trigger.action);
+            report.notes.extend(outcome.notes.iter().map(|note| (asset.clone(), note.clone())));
             if let Some(why) = outcome.failed {
                 report.failed.push((asset, why));
                 if matches!(trigger.action, Action::Hook { .. }) {
@@ -274,7 +279,7 @@ mod tests {
             self.ran.lock().unwrap().push(name.clone());
             let failed = self.failing.contains(&name).then(|| "no".to_string());
             let signaled = self.emits.get(&name).cloned().unwrap_or_default();
-            Outcome { signaled, failed, made: true }
+            Outcome { signaled, failed, notes: Vec::new(), made: true }
         }
 
         fn is_stale(&self, _: &Action) -> bool {

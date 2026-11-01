@@ -349,7 +349,8 @@ impl UiHost for Host<'_> {
         let sheet = self.sheet(false);
         let ui = self.target.ui();
         let Some(chip) = reference.and_then(crate::inspector::reference_in) else {
-            let shown = ui.label(RichText::new(format!("Drop a {kind} here")).small().color(theme::weak()));
+            let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            let shown = ui.label(RichText::new(format!("Drop {article} {kind} here")).small().color(theme::weak()));
             self.last = None;
             let asset = self.frame.asset.filter(|_| self.frame.editable)?;
             return crate::inspector::reference_filling(ui, shown.rect, &sheet, asset, kind);
@@ -390,8 +391,11 @@ impl UiHost for Host<'_> {
     }
 
     fn text_edit(&mut self, id: &str, text: &mut String) -> bool {
-        let edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(120.0);
-        let response = self.target.ui().add_enabled(self.frame.editable, edit);
+        let ui = self.target.ui();
+        // On a section's background a field has to stand out as a dropdown does.
+        let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+        let edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(120.0).background_color(fill);
+        let response = ui.add_enabled(self.frame.editable, edit);
         let committed = response.lost_focus();
         self.last = Some(response);
         committed

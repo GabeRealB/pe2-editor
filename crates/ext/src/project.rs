@@ -28,6 +28,14 @@ pub trait Project {
     fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>>;
     /// An output of an asset that is a picture (`palettes/default`): none where it has no such output.
     fn image(&self, path: &str, address: &str) -> Option<Result<Image>>;
+    /// The target of the config in use.
+    fn target(&self) -> Option<String> {
+        None
+    }
+    /// What changes each time changes are taken in: what is read of plain files may be out of date once it has.
+    fn revision(&self) -> u64 {
+        0
+    }
     /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
     fn table(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
         let _ = (path, address);

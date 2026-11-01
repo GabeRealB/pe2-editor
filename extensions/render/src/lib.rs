@@ -1,12 +1,15 @@
 //! pe2.render: meshes, materials, models and prefabs, and the game's renderer. A mesh is read from a run of a package (`extract`) and decoded from there (`model`). What is drawn is the extension's: its 3D view
 //! renders on the editor's device through `wasi:webgpu`, in the document a model opens in, at the size that document is; what is in a model shows in the panes as any asset's parts.
 
-use pe2_ext::{Cell, Field, Icon, Registry, Result, Style, Tint, Ui, View};
+use pe2_ext::tokens::{VALUE, link};
+use pe2_ext::ty::{self, Files, Registered};
+use pe2_ext::{Asset, Cell, Field, Icon, Name, Registry, Result, Signature, Style, Table, Tint, Ui, Value, View};
 
 pe2_ext::extension!("pe2.render", "0.1.0", register);
 
+pub(crate) use pe2_model::{material, mesh, model, skeleton};
+
 mod assembly;
-mod build;
 #[cfg(any(target_family = "wasm", test))]
 #[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
 mod camera;
@@ -17,11 +20,8 @@ mod gizmo;
 #[cfg(any(target_family = "wasm", test))]
 #[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
 mod math;
-mod material;
 mod material_panel;
 mod materials;
-mod mesh;
-mod model;
 mod parts;
 mod prefab;
 #[cfg(target_family = "wasm")]
@@ -29,22 +29,62 @@ mod render;
 #[cfg(any(target_family = "wasm", test))]
 #[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
 mod scene;
-mod skeleton;
-mod usda;
 mod uv;
 #[cfg(target_family = "wasm")]
 mod view;
 
+/// A mesh, in USD's text form.
+pub struct Usd;
+
+impl Registered for Usd {
+    const NAME: &str = "pe2.render@usd";
+    const LABEL: &str = "USD text";
+
+    fn signatures() -> Vec<Signature> {
+        vec![Signature::Name(mesh::FILE.into())]
+    }
+}
+
+impl Files for Usd {}
+
+/// A mesh's stack: its file.
+const MESH: &str = "[[stack]]\nop = \"file\"\nfile = \"mesh.usda\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
+
+/// A skeleton's joints by name, in order.
+fn joint_names(asset: &Asset) -> Vec<String> {
+    let joints = asset.field("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    joints.iter().filter_map(|joint| joint.get("name")?.as_str()).map(str::to_string).collect()
+}
+
+/// What a sub-path goes through: a model's mesh and materials, a mesh's skeleton, a skeleton's joints, each joint its place.
+fn links(r: &mut Registry) -> (Name, Name, Name, Name) {
+    let mesh_of = r.op("mesh_of").label("Its mesh").output::<ty::Table>().run(|call| link(call.host.fields().get("mesh")));
+    let skeleton_of = r.op("skeleton_of").label("Its skeleton").output::<ty::Table>().run(|call| link(call.host.fields().get("skeleton")));
+    let material_of = r.op("material_of").label("What fills a slot").output::<ty::Table>().parameter::<String>("slot").run(|call| {
+        let slot: String = call.parameter()?;
+        link(call.host.fields().get("materials").and_then(|materials| materials.get(&slot)))
+    });
+    let joint_at = r.op("joint_at").label("A joint's place").output::<ty::Table>().parameter::<String>("joint").run(|call| {
+        let name: String = call.parameter()?;
+        let joints = call.host.fields().get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        let at = joints.iter().position(|joint| joint.get("name").and_then(Value::as_str) == Some(&name));
+        let at = at.ok_or_else(|| pe2_ext::anyhow!("it has no joint {name}"))?;
+        Ok(Table::from_iter([(VALUE.to_string(), Value::Integer(i64::try_from(at)?))]))
+    });
+    (mesh_of, skeleton_of, material_of, joint_at)
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    let rested = build::register(r);
+    let _ = r.value_type::<Usd>();
+    let (mesh_of, skeleton_of, material_of, joint_at) = links(r);
     let mesh = r
         .kind("mesh")
         .alias("mesh")
         .label("Mesh")
         .icon(Icon::Polygon, Tint::Picture)
-        .stack(build::MESH)
-        .output("rest", &rested, pe2_ext::Retain::Cache)
+        .stack(MESH)
+        .output("skeleton", &skeleton_of, pe2_ext::Retain::Transient)
         .editor("3D", Icon::Polygon, &[], |_| make_view())
         .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)
@@ -57,7 +97,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("material")
         .label("Material")
         .icon(Icon::Palette, Tint::Picture)
-        .stack(build::MATERIAL)
         .field(Field::new("shader").label("Shader").choices(material::SHADERS.iter().map(|shader| (shader.id, shader.label))))
         .field(Field::new("surface").label("Surface").choices(material::SURFACES))
         .field(Field::new("blend").label("Blend").choices(material::BLENDS.iter().map(|(id, label, _)| (*id, *label))))
@@ -74,8 +113,9 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("skeleton")
         .label("Skeleton")
         .icon(Icon::Bone, Tint::Structure)
-        .stack(build::SKELETON)
         .field(Field::new("joints").custom())
+        .output("joints", &joint_at, pe2_ext::Retain::Transient)
+        .members(|asset| joint_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
         .editor("3D", Icon::Bone, &[], |_| make_view())
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
@@ -86,8 +126,10 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("model")
         .label("Model")
         .icon(Icon::Package, Tint::Picture)
-        .stack(build::MODEL)
         .field(Field::new("materials").custom())
+        .output("mesh", &mesh_of, pe2_ext::Retain::Transient)
+        .output("materials", &material_of, pe2_ext::Retain::Transient)
+        .members(|asset| asset.parts("materials").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
         .editor("3D", Icon::Package, &[], |_| make_view())
         .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)

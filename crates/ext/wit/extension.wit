@@ -191,6 +191,8 @@ interface host {
         release: option<string>,
         target: option<string>,
         folder: string,
+        /// What every config of the project says, as `key=value`.
+        known: list<string>,
     }
 
     use types.{image, rect, style, icon, file, value};
@@ -260,6 +262,10 @@ interface host {
         /// first where none is named), and any output of it that is a picture (`palettes/default`).
         picture: func(path: string, look: option<string>) -> option<result<image, string>>;
         image: func(path: string, address: string) -> option<result<image, string>>;
+        /// The target of the config in use.
+        target: func() -> option<string>;
+        /// What changes each time changes are taken in: what is read of plain files may be out of date once it has.
+        revision: func() -> u64;
         /// An output of an asset that is a table (TOML): none where it has no such output, or why it could not be made.
         table: func(path: string, address: string) -> option<result<string, string>>;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
@@ -718,6 +724,8 @@ interface guest {
         extractors: list<extractor>,
         /// Outputs it adds to kinds of what it requires, by the kind's qualified name.
         additions: list<tuple<string, output>>,
+        /// Inspector tabs it adds to kinds of what it requires, by the kind's qualified name.
+        tabs: list<tuple<string, view>>,
         /// The stacks it gives kinds of what it requires that have none, by the kind's qualified name (TOML).
         stacks: list<tuple<string, string>>,
         /// What files replace assets of kinds, with what.

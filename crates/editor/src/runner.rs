@@ -71,7 +71,7 @@ fn same(job: &Job, next: &Job) -> bool {
 
 fn text(report: &Report) -> mcp::Reply {
     let mut lines: Vec<String> = report.made.iter().map(|(asset, output)| format!("{asset}: {output}")).collect();
-    let failed = report.failed.iter().map(|(asset, why)| format!("{asset}: {why}"));
+    let failed = report.failed.iter().chain(&report.notes).map(|(asset, why)| format!("{asset}: {why}"));
     let stale = report.stale.iter().map(|(asset, output)| format!("{asset}: {output} is stale: what it reads changed after it ran"));
     lines.extend(failed.chain(stale));
     let answer = lines.join("\n");

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use pe2_ext::events::Build;
 use pe2_ext::process::spawn;
 use pe2_ext::ty::{self, Files, Registered, SourceTree};
-use pe2_ext::{Call, Registry, Result, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Call, File, Registry, Result, Table, Typed, Value, anyhow, bail};
 
 /// The target this is, as a config names it.
 const TARGET: &str = "psx";
@@ -52,6 +52,7 @@ impl Files for Package {}
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Package>();
+    let _ = r.op("preprocess").label("First pass").input::<SourceTree>("sources").output::<SourceTree>().run(first_pass);
     let _ = r.op("compile").label("Compile and link").input::<SourceTree>("sources").output::<ty::File<Package>>().run(build);
     let _ = r.op("flags").label("What a language server is told").output::<ty::Table>().run(flags);
     r.add_output("pe2.packages@package", "flags", "pe2.psx@flags", None, pe2_ext::Retain::Transient);
@@ -86,17 +87,48 @@ fn build(call: &mut Call) -> Result<Typed> {
         bail!("the config builds for {}, and this is {TARGET}", target.unwrap_or_default());
     }
     let sources = call.take::<SourceTree>(0)?;
+    let notes = sources.notes.clone();
     let scratch = PathBuf::from(format!("{}.build", call.temp()?));
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| image_of(&fields, &tree, &scratch, &name));
     let result = made.and_then(|image| {
         let kept = call.keep(&image.display().to_string(), &format!("{name}.pe2pkg"))?;
-        Ok(Typed::new(Package::NAME, vec![kept]))
+        Ok(Typed { notes: notes.clone(), ..Typed::new(Package::NAME, vec![kept]) })
     });
     let _ = fs::remove_dir_all(&scratch);
     // What a tool said of the tree it was given is said of the files they are.
+    in_project(result, &scratch, &path)
+}
+
+/// What a tool said of the tree it was given, said of the files they are.
+fn in_project<T>(result: Result<T>, scratch: &Path, path: &str) -> Result<T> {
     let tree = scratch.join("tree").display().to_string();
     result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}/self/"), &format!("{path}/")).replace(&format!("{tree}/pkg/"), "packages/")))
+}
+
+/// What the units come to with `PE2_INCLUDE` and the options expanded and the other `PE2_*` macros left as they are written, for
+/// `pe2.packages` to read: each unit beside what was gathered, under `first/`.
+fn first_pass(call: &mut Call) -> Result<Typed> {
+    let mut sources = call.take::<SourceTree>(0)?;
+    let scratch = PathBuf::from(format!("{}.first", call.temp()?));
+    fs::create_dir_all(&scratch)?;
+    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+        let mut made = vec![];
+        for unit in fs::read_to_string(tree.join("units"))?.lines() {
+            let expanded = scratch.join("expanded.i");
+            let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
+            args.extend(["-P".to_string(), "-DPE2_FIRST_PASS".to_string(), format!("-I{}", text(&tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
+            run("mips-linux-gnu-cpp", &args)?;
+            made.push(File::new(&format!("first/{unit}"), fs::read(&expanded)?));
+        }
+        Ok(made)
+    });
+    let _ = fs::remove_dir_all(&scratch);
+    let path = call.host.path().to_string();
+    let unset = sources.settings.get("unset").and_then(Value::as_array).map_or_else(Vec::new, |names| names.iter().filter_map(Value::as_str).collect());
+    let made = made.map_err(|e| if unset.is_empty() { e } else { e.context(format!("no value on this package: {}", unset.join(", "))) });
+    sources.files.extend(in_project(made, &scratch, &path)?);
+    Ok(sources)
 }
 
 /// What was gathered, on disk for the tools to read.

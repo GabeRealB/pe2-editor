@@ -1,19 +1,29 @@
-//! What a package compiles from: its sources, and what they reach, read as text. A request has to be read before a preprocessor runs, as it
-//! decides what the preprocessor is given, so this reads every `#include`, whichever branch of a conditional it is in. What is written and
-//! not found is left for the compiler to say.
+//! What a package compiles from, in two steps around a target's first pass. `gather` reads text, as what it finds decides what a
+//! preprocessor is given: every `#include`, whichever branch of a conditional it is in, and the options read, which `#if` needs. What is
+//! written and not found is left for the compiler to say. `resolve` reads what the first pass left, the live code with its other macros
+//! expanded: the slots and values a package really uses, each made only where it is read, an error being a macro that fires at the use.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
+use pe2_ext::tokens::{self, Args};
 use pe2_ext::ty::{Registered, SourceTree};
 use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
+
+use crate::{scan, tokenizers};
 
 /// The package holding what every unit includes first, and what the assembler reads.
 const CORE: &str = "core";
 /// What every unit includes first, beside `core`'s public files.
 const MACROS: &str = "pe2.h";
 /// What `MACROS` includes: the values of the slots of the package being built.
-const VALUES: &str = "pe2_values.h";
+pub const VALUES: &str = "pe2_values.h";
+/// What it includes in both passes: the options and the build config.
+pub const OPTIONS: &str = "pe2_options.h";
+/// Where a first pass leaves what it made of each unit.
+const FIRST: &str = "first/";
+/// The most a line of a macro takes: `mcpp` stops near 65,000 bytes, so a long value is a chain of macros.
+const LINE: usize = 32_000;
 
 /// A package of the build graph: the graph has one, by name.
 pub struct Package {
@@ -24,6 +34,11 @@ pub struct Package {
 }
 
 impl Package {
+    /// Whether it has anything of its own to build.
+    pub fn compiles(&self) -> bool {
+        !strings(&self.fields, "sources").is_empty()
+    }
+
     pub fn public_folders(&self) -> Vec<&str> {
         strings(&self.fields, "public")
     }
@@ -55,15 +70,17 @@ struct Gathering<'a> {
     pending: Vec<Taken>,
     /// Names asked for that no package answers: the slots left open.
     open: BTreeSet<String>,
-    /// The slots what was reached declares (`PE2_BIND`).
-    bound: BTreeSet<String>,
+    /// The slots of type `package` declared, and the files asked of a binding, where.
+    packaged: BTreeSet<String>,
+    included: Vec<(String, String)>,
+    options: Options,
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let path = call.host.path().to_string();
     let name = name_of(&path).to_string();
-    let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], bound: BTreeSet::new(), open: BTreeSet::new() };
+    let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new() };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let units = selected(call.host.fields(), &own_path, &own_files)?;
@@ -78,15 +95,23 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.reached.insert(name);
     gathering.take_macros()?;
     gathering.follow()?;
-    gathering.take_values()?;
+    if let Some((binding, at)) = gathering.included.iter().find(|(binding, _)| !gathering.packaged.contains(binding)) {
+        bail!("{at}: {binding} has no PE2_BIND({binding}, package)");
+    }
+    let header = gathering.options.header(call)?;
+    gathering.tree.insert(OPTIONS.to_string(), header.into_bytes());
     if !gathering.open.is_empty() {
         let open: Vec<&str> = gathering.open.iter().map(String::as_str).collect();
         bail!("{path} asks for {}, which no package answers", open.join(", "));
     }
     gathering.take_target_files()?;
     let mut files: Vec<File> = vec![File::new("units", listed.into_bytes())];
+    let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
-    Ok(Typed::new(SourceTree::NAME, files))
+    // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
+    let unset = gathering.options.unset(call.host.fields());
+    let settings = Table::from_iter([("unset".to_string(), Value::Array(unset.into_iter().map(Value::String).collect()))]);
+    Ok(Typed { notes, settings, ..Typed::new(SourceTree::NAME, files) })
 }
 
 fn name_of(path: &str) -> &str {
@@ -158,27 +183,10 @@ fn folder_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(folder, _)| folder)
 }
 
-/// What a line of source asks for.
-enum Asked<'a> {
-    /// `#include PE2_PACKAGE(name, path)`
-    Package(&'a str, &'a str),
-    /// `#include "path"`
-    Beside(&'a str),
-}
-
-fn asked(line: &str) -> Option<Asked<'_>> {
+/// The file a line includes beside itself: `#include "path"`.
+fn beside(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix('#')?.trim_start().strip_prefix("include")?.trim_start();
-    if let Some(args) = rest.strip_prefix("PE2_PACKAGE(") {
-        let (name, path) = args.split_once(')')?.0.split_once(',')?;
-        return Some(Asked::Package(name.trim(), path.trim()));
-    }
-    Some(Asked::Beside(rest.strip_prefix('"')?.split_once('"')?.0))
-}
-
-/// The slot a line declares: `PE2_BIND(name, type)`.
-fn declared_slot(line: &str) -> Option<&str> {
-    let (name, _) = line.trim_start().strip_prefix("PE2_BIND(")?.split_once(',')?;
-    Some(name.trim())
+    rest.strip_prefix('"')?.split_once('"').map(|(file, _)| file)
 }
 
 /// What the assembler is told to read: `.include "name"`, in assembly or in the strings of C.
@@ -197,8 +205,8 @@ fn is_source(file: &str) -> bool {
     std::path::Path::new(file).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|extension| ["c", "h", "inc"].contains(&extension))
 }
 
-/// What a package's files say, read as text: what it compiles, and what it asks for by name, each slot public where a file its dependents
-/// read names it, which then reaches them too, and private otherwise. A slot is answered by the graph's package of that name.
+/// What a package's files say, read as text: what it compiles, its slots, each with its type, the addresses read and the args given, public
+/// where a file its dependents read names it, and its options. What it is set to is its asset's, as written: a view shows that.
 pub fn reflection(call: &mut Call) -> Result<Table> {
     let call: &Call = call;
     let path = call.host.path().to_string();
@@ -206,36 +214,519 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     let packages = packages(call)?;
     let own = packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let public: Vec<String> = strings(&own.fields, "public").iter().map(|folder| format!("{path}/{folder}/")).collect();
-    let mut slots: BTreeMap<String, (bool, i64)> = BTreeMap::new();
-    for file in own.files.iter().filter(|file| is_source(file)) {
-        let in_public = public.iter().any(|folder| file.starts_with(folder.as_str()));
-        let bytes = call.read_entry(file)?;
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            if let Some(Asked::Package(asked, _)) = asked(line).filter(|asked| !matches!(asked, Asked::Package(name_asked, _) if *name_asked == name)) {
-                let slot = slots.entry(asked.to_string()).or_insert((false, 0));
-                slot.0 |= in_public;
-                slot.1 += 1;
-            }
-        }
+    let mut walk = Walk { call, own, name: &name, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
+    // As a compile reads them, then whatever only dependents read.
+    let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
+    for file in units.iter().chain(own.files.iter().filter(|file| is_source(file))) {
+        walk.label.clear();
+        walk.file(file)?;
     }
+    let Walk { slots, options, .. } = walk;
     let within = format!("{path}/");
     let fields = call.host.fields();
     let sources = if strings(fields, "sources").is_empty() { vec![] } else { selected(fields, &path, &own.files)? };
     let sources = sources.iter().map(|file| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
-    let slots = slots.into_iter().map(|(asked, (in_public, uses))| {
-        let mut slot = Table::new();
-        slot.insert("name".into(), asked.clone().into());
-        slot.insert("public".into(), in_public.into());
-        slot.insert("uses".into(), uses.into());
-        if let Some(package) = packages.get(&asked) {
-            slot.insert("package".into(), package.path.clone().into());
-        }
-        Value::Table(slot)
-    });
     let mut table = Table::new();
     table.insert("sources".into(), Value::Array(sources));
-    table.insert("slots".into(), Value::Array(slots.collect()));
+    table.insert("slots".into(), Value::Array(slots.described(&packages)));
+    table.insert("options".into(), Value::Array(options.described()));
     Ok(table)
+}
+
+/// A package's files read as a compile reads them, each once: its units in order, following what they include of it, so that what they
+/// declare comes in the order a reader of them meets it. A label holds to the end of its file, what a file includes starting under it.
+struct Walk<'a> {
+    call: &'a Call<'a>,
+    own: &'a Package,
+    name: &'a str,
+    public: Vec<String>,
+    seen: BTreeSet<String>,
+    label: String,
+    order: i64,
+    slots: Slots,
+    options: Options,
+}
+
+impl Walk<'_> {
+    fn file(&mut self, file: &str) -> Result<()> {
+        if !self.seen.insert(file.to_string()) {
+            return Ok(());
+        }
+        let bytes = self.call.read_entry(file)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let in_public = self.public.iter().any(|folder| file.starts_with(folder.as_str()));
+        let entered = self.label.clone();
+        let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, beside(line)?))).peekable();
+        for found in scan::uses(&text) {
+            while let Some((_, beside)) = includes.next_if(|(line, _)| *line < found.line) {
+                self.beside(file, beside)?;
+            }
+            self.order += 1;
+            self.options.read(&found, &format!("{file}:{}", found.line));
+            match found.args.as_slice() {
+                [label] if found.name == "PE2_EDITOR_LABEL" => self.label = label_in(label).unwrap_or_default(),
+                [package, inside] if found.name == "PE2_INCLUDE" && *package == self.name => {
+                    if let Some(entry) = self.own.public(inside) {
+                        self.file(&entry)?;
+                    }
+                }
+                _ => {}
+            }
+            self.slots.read(&found, in_public, &self.label, self.order);
+            self.options.place(&found, &self.label, self.order);
+        }
+        for (_, beside) in includes {
+            self.beside(file, beside)?;
+        }
+        self.label = entered;
+        Ok(())
+    }
+
+    fn beside(&mut self, from: &str, file: &str) -> Result<()> {
+        let entry = normal(&format!("{}/{file}", folder_of(from)));
+        if self.own.files.contains(&entry) { self.file(&entry) } else { Ok(()) }
+    }
+}
+
+/// The text of a label: a string literal.
+fn label_in(argument: &str) -> Option<String> {
+    let inner = argument.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+/// What a source says of its slots.
+#[derive(Default)]
+struct Slots {
+    /// Each by its name: its type, whether public, the addresses read and the args given.
+    held: BTreeMap<String, Slot>,
+}
+
+#[derive(Default)]
+struct Slot {
+    ty: Option<String>,
+    label: String,
+    /// Where it was first declared, among all a package's slots and options: a later declaration of it moves nothing.
+    order: i64,
+    public: bool,
+    reads: BTreeSet<Vec<String>>,
+    args: BTreeMap<(Vec<String>, String), Vec<String>>,
+}
+
+impl Slots {
+    fn read(&mut self, found: &scan::Use, public: bool, label: &str, order: i64) {
+        let Some(name) = found.args.first().filter(|name| !name.is_empty()) else { return };
+        let rest: Vec<String> = found.args[1..].iter().map(ToString::to_string).collect();
+        match found.name {
+            "PE2_BIND" => {
+                let slot = self.held.entry((*name).to_string()).or_default();
+                if slot.ty.is_none() {
+                    (slot.ty, slot.label, slot.order) = (rest.first().cloned(), label.to_string(), order);
+                }
+                slot.public |= public;
+            }
+            "PE2_INCLUDE" => {
+                let slot = self.held.entry((*name).to_string()).or_default();
+                slot.public |= public;
+                slot.reads.insert(rest);
+            }
+            "PE2_VALUE" => {
+                self.held.entry((*name).to_string()).or_default().reads.insert(rest);
+            }
+            "PE2_BIND_ARG" => {
+                if let Some(at) = rest.iter().position(|word| word.starts_with('_')) {
+                    let (path, given) = rest.split_at(at);
+                    let values = given[1..].to_vec();
+                    self.held.entry((*name).to_string()).or_default().args.insert((path.to_vec(), given[0][1..].to_string()), values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn described(self, packages: &HashMap<String, Package>) -> Vec<Value> {
+        let list = self.held.into_iter().map(|(name, slot)| {
+            let mut out = Table::new();
+            out.insert("label".into(), slot.label.clone().into());
+            out.insert("order".into(), slot.order.into());
+            out.insert("type".into(), slot.ty.clone().unwrap_or_default().into());
+            out.insert("public".into(), slot.public.into());
+            let reads = slot.reads.iter().map(|read| Value::String(read.join("/")));
+            out.insert("reads".into(), Value::Array(reads.collect()));
+            let args = slot.args.iter().map(|((path, arg), values)| {
+                let mut given = Table::new();
+                given.insert("path".into(), path.join("/").into());
+                given.insert("arg".into(), arg.clone().into());
+                given.insert("values".into(), Value::Array(values.iter().map(|value| Value::String(value.clone())).collect()));
+                Value::Table(given)
+            });
+            out.insert("args".into(), Value::Array(args.collect()));
+            if let Some(package) = packages.get(&name).filter(|_| slot.ty.as_deref() == Some("package")) {
+                out.insert("package".into(), package.path.clone().into());
+            }
+            out.insert("name".into(), name.into());
+            Value::Table(out)
+        });
+        list.collect()
+    }
+}
+
+/// An option a source defines.
+struct Option_ {
+    ty: String,
+    members: Vec<String>,
+    at: String,
+    label: String,
+    order: i64,
+}
+
+/// What sources say of options and the build config.
+#[derive(Default)]
+pub struct Options {
+    defined: BTreeMap<String, Option_>,
+    /// Each read, with where.
+    read: Vec<(String, Option<String>, String)>,
+    config: Vec<(String, Option<String>, String)>,
+    wrong: Vec<String>,
+}
+
+const CONFIG_KEYS: [&str; 3] = ["name", "release", "target"];
+/// What an option with no value is defined by, followed by its name.
+const UNSET: &str = "pe2_unset_";
+
+impl Options {
+    fn read(&mut self, found: &scan::Use, at: &str) {
+        let args = &found.args;
+        match (found.name, args.as_slice()) {
+            ("PE2_EDITOR_LABEL", [label]) if label_in(label).is_none() => self.wrong.push(format!("{at}: a label is a string literal: {label}")),
+            ("PE2_OPTION_DEF", [name, ty, members @ ..]) => {
+                let members: Vec<String> = members.iter().map(ToString::to_string).collect();
+                let def = Option_ { ty: (*ty).to_string(), members, at: at.to_string(), label: String::new(), order: 0 };
+                if !["int", "bool", "string", "enum"].contains(ty) {
+                    self.wrong.push(format!("{at}: {name}: there is no option type {ty}"));
+                }
+                // A package has one of each, wherever it is read.
+                if let Some(known) = self.defined.get(*name) {
+                    self.wrong.push(format!("{at}: {name} is defined already, at {}", known.at));
+                    return;
+                }
+                self.defined.insert((*name).to_string(), def);
+            }
+            ("PE2_OPTION", [name]) => self.read.push(((*name).to_string(), None, at.to_string())),
+            ("PE2_OPTION_IS", [name, member]) => self.read.push(((*name).to_string(), Some((*member).to_string()), at.to_string())),
+            ("PE2_CONFIG", [key]) => self.config.push(((*key).to_string(), None, at.to_string())),
+            ("PE2_CONFIG_IS", [key, value]) => self.config.push(((*key).to_string(), Some((*value).to_string()), at.to_string())),
+            _ => {}
+        }
+    }
+
+    /// Why what was read cannot be: the first thing wrong.
+    fn check(&self, fields: &Table) -> Result<()> {
+        if let Some(wrong) = self.wrong.first() {
+            bail!("{wrong}");
+        }
+        for (name, member, at) in &self.read {
+            let Some(def) = self.defined.get(name) else { bail!("{at}: {name} has no PE2_OPTION_DEF") };
+            if let Some(member) = member.as_ref().filter(|member| !def.members.contains(member)) {
+                bail!("{at}: {name} has no member {member}; it has {}", def.members.join(", "));
+            }
+        }
+        if let Some((key, _, at)) = self.config.iter().find(|(key, ..)| !CONFIG_KEYS.contains(&key.as_str())) {
+            bail!("{at}: a config has no {key}; it has {}", CONFIG_KEYS.join(", "));
+        }
+        // One not set is no problem until something evaluates it; one set wrongly is one already.
+        for (name, def) in &self.defined {
+            value_of(name, def, fields)?;
+        }
+        Ok(())
+    }
+
+    /// The options this package has no value for.
+    fn unset(&self, fields: &Table) -> Vec<String> {
+        let unset = self.defined.iter().filter(|(name, def)| matches!(value_of(name, def, fields), Ok(None)));
+        unset.map(|(name, _)| name.clone()).collect()
+    }
+
+    /// Where the editor shows an option just defined.
+    fn place(&mut self, found: &scan::Use, label: &str, order: i64) {
+        let name = found.args.first().filter(|_| found.name == "PE2_OPTION_DEF");
+        if let Some(def) = name.and_then(|name| self.defined.get_mut(*name)).filter(|def| def.order == 0) {
+            (def.label, def.order) = (label.to_string(), order);
+        }
+    }
+
+    /// What may be a mistake and may be another target's code: a value no config of the project has.
+    fn notes(&self, call: &Call) -> Vec<String> {
+        let known = call.config().map_or_else(Vec::new, |config| config.known);
+        let tested = self.config.iter().filter_map(|(key, value, at)| Some((key, value.as_ref()?, at)));
+        let unknown = tested.filter(|(key, value, _)| !known.contains(&format!("{key}={value}")));
+        unknown.map(|(key, value, at)| format!("{at}: no config of the project has {key} {value}")).collect()
+    }
+
+    /// What `pe2.h` includes in both passes.
+    fn header(&self, call: &Call) -> Result<String> {
+        let fields = call.host.fields();
+        self.check(fields)?;
+        let mut header = String::new();
+        let mut unwritten = String::new();
+        for (name, def) in &self.defined {
+            let value = value_of(name, def, fields)?;
+            // With no value it divides by zero wherever `#if` evaluates it, and only there, as a skipped branch is not; and in code it is
+            // an error wherever it is expanded. Nothing has to find out which are read: what is not expanded says nothing.
+            let unset = format!("(0/{UNSET}{name})");
+            if value.is_none() {
+                unwritten.push_str(&failing(&format!("{UNSET}{name}"), &format!("{name} has no value on this package")));
+            }
+            let _ = writeln!(header, "#define pe2_option_{name} {}", value.as_deref().unwrap_or(&unset));
+            if def.ty == "enum" {
+                for (at, member) in def.members.iter().enumerate() {
+                    let is = value.as_ref().map_or_else(|| unset.clone(), |value| i32::from(*value == at.to_string()).to_string());
+                    let _ = writeln!(header, "#define pe2_option_{name}_is_{member} {is}");
+                }
+            }
+        }
+        let config = call.config();
+        let values = [
+            ("name", config.as_ref().map(|config| config.name.clone())),
+            ("release", config.as_ref().and_then(|config| config.release.clone())),
+            ("target", config.as_ref().and_then(|config| config.target.clone())),
+        ];
+        for (key, value) in values {
+            if let Some(value) = value {
+                let _ = writeln!(header, "#define pe2_config_{key} \"{value}\"\n#define pe2_config_{key}_is_{value} 1");
+            }
+        }
+        // Past the first pass: there, an undefined name in `#if` is what divides by zero.
+        let _ = write!(header, "#ifndef PE2_FIRST_PASS\n{unwritten}#endif\n");
+        Ok(header)
+    }
+
+    fn described(self) -> Vec<Value> {
+        let read: BTreeSet<&String> = self.read.iter().map(|(name, ..)| name).collect();
+        let list = self.defined.iter().map(|(name, def)| {
+            let mut out = Table::new();
+            out.insert("label".into(), def.label.clone().into());
+            out.insert("order".into(), def.order.into());
+            out.insert("read".into(), read.contains(name).into());
+            out.insert("type".into(), def.ty.clone().into());
+            out.insert("members".into(), Value::Array(def.members.iter().map(|member| Value::String(member.clone())).collect()));
+            out.insert("name".into(), name.clone().into());
+            Value::Table(out)
+        });
+        list.collect()
+    }
+}
+
+/// An option's value for this package, as C reads it; none where it has none.
+fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>> {
+    let at = &def.at;
+    let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return Ok(None) };
+    let kind = |what: &str| anyhow!("{at}: {name} is {what}, and this package gives it {value}");
+    let read = match def.ty.as_str() {
+        "int" => value.as_integer().map(|number| number.to_string()).ok_or_else(|| kind("an int")),
+        "bool" => value.as_bool().map(|flag| i32::from(flag).to_string()).ok_or_else(|| kind("a bool")),
+        "string" => value.as_str().map(|text| format!("{text:?}")).ok_or_else(|| kind("a string")),
+        _ => {
+            let at = value.as_str().and_then(|member| def.members.iter().position(|known| known == member));
+            at.map(|at| at.to_string()).ok_or_else(|| kind("one of its members"))
+        }
+    };
+    read.map(Some)
+}
+
+/// A use of a value, read from what a first pass left.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Read {
+    binding: String,
+    path: Vec<String>,
+    derived: Option<String>,
+}
+
+impl Read {
+    fn of(args: &[&str]) -> Option<Read> {
+        let (binding, rest) = args.split_first()?;
+        let mut path: Vec<String> = rest.iter().map(ToString::to_string).collect();
+        let derived = path.last().filter(|word| word.starts_with('_')).map(|word| word[1..].to_string());
+        if derived.is_some() {
+            path.pop();
+        }
+        Some(Read { binding: (*binding).to_string(), path, derived })
+    }
+
+    /// The macro it reads, as `PE2_VALUE` pastes it.
+    fn name(&self) -> String {
+        let mut name = format!("pe2_value_{}", self.binding);
+        for word in &self.path {
+            name.push('_');
+            name.push_str(word);
+        }
+        if let Some(derived) = &self.derived {
+            let _ = write!(name, "__{derived}");
+        }
+        name
+    }
+}
+
+/// A macro firing an error where it is used: stopping at the preprocessor where that can, and on what cannot, leaving what the compiler
+/// stops on.
+fn failing(name: &str, why: &str) -> String {
+    let why = why.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("#define {name} _Pragma(\"GCC error \\\"{why}\\\"\") pe2_error_{name}\n")
+}
+
+/// A macro of any length: long ones a chain of macros, cut between tokens.
+fn defined(name: &str, tokens: &str) -> String {
+    if tokens.len() <= LINE {
+        return format!("#define {name} {tokens}\n");
+    }
+    let (mut out, mut pieces, mut rest) = (String::new(), vec![], tokens);
+    while !rest.is_empty() {
+        let cut = if rest.len() <= LINE { rest.len() } else { rest[..LINE].rfind(' ').map_or(LINE, |at| at + 1) };
+        let piece = format!("{name}_part{}", pieces.len());
+        let _ = writeln!(out, "#define {piece} {}", &rest[..cut]);
+        pieces.push(piece);
+        rest = &rest[cut..];
+    }
+    let _ = writeln!(out, "#define {name} {}", pieces.join(" "));
+    out
+}
+
+/// What a first pass left, with each binding's macros written for the compile: `pe2_values.h`.
+pub fn resolve(call: &mut Call) -> Result<Typed> {
+    let tree = call.take::<SourceTree>(0)?;
+    let call: &Call = call;
+    let (first, mut kept): (Vec<File>, Vec<File>) = tree.files.into_iter().partition(|file| file.name.starts_with(FIRST));
+    let mut slots = Slots::default();
+    let mut reads = BTreeSet::new();
+    for file in &first {
+        let bytes = call.read(file)?;
+        let text = String::from_utf8_lossy(&bytes);
+        for found in scan::uses(&text) {
+            slots.read(&found, false, "", 0);
+            if found.name == "PE2_VALUE" {
+                reads.extend(Read::of(&found.args));
+            }
+        }
+    }
+    let mut notes = tree.notes;
+    let (header, failed) = values(call, &slots, &reads);
+    notes.extend(failed);
+    kept.push(File::new(VALUES, header.into_bytes()));
+    Ok(Typed { notes, ..Typed::new(SourceTree::NAME, kept) })
+}
+
+/// What a binding holds: the reference filling it.
+fn filler(fields: &Table, name: &str) -> Option<String> {
+    pe2_ext::target_of(fields.get("bind")?.get(name)?).map(str::to_string)
+}
+
+fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>) -> (String, Vec<String>) {
+    let fields = call.host.fields();
+    let mut header = String::new();
+    let mut failed = Vec::new();
+    for (name, slot) in &slots.held {
+        let ty = slot.ty.as_deref().unwrap_or_default();
+        let wrong = if ty == "package" { None } else { slot_problem(call, fields, name, ty) };
+        failed.extend(wrong.clone());
+        header.push_str(&wrong.map_or_else(|| format!("#define pe2_bind_{name}\n"), |why| failing(&format!("pe2_bind_{name}"), &why)));
+    }
+    let mut written: BTreeMap<String, &Read> = BTreeMap::new();
+    for read in reads {
+        let name = read.name();
+        if let Some(other) = written.insert(name.clone(), read) {
+            header.push_str(&failing(&name, &format!("{other:?} and {read:?} are one name")));
+            continue;
+        }
+        header.push_str(&match tokens(call, fields, slots, read) {
+            Ok(tokens) => defined(&name, &tokens),
+            Err(why) => {
+                let why = said(&read.binding, &format!("{why:#}"));
+                let written = failing(&name, &why);
+                failed.push(why);
+                written
+            }
+        });
+    }
+    (header, failed)
+}
+
+/// What is wrong with a read, as the source's author is told it: what a tokenizer said, without where in the graph it was said.
+fn said(binding: &str, why: &str) -> String {
+    let told = why.rsplit("pe2.packages: ").next().unwrap_or(why);
+    match told.strip_prefix("it needs ") {
+        Some(arg) => format!("{binding} needs PE2_BIND_ARG({binding}, _{arg}, <value>)"),
+        None => format!("{binding}: {told}"),
+    }
+}
+
+/// Why a slot cannot be filled as it declares.
+fn slot_problem(call: &Call, fields: &Table, name: &str, ty: &str) -> Option<String> {
+    let Some(target) = filler(fields, name) else { return Some(format!("{name}: nothing fills it on this package")) };
+    let settings = match call.table_of(&target, tokenizers::SETTINGS) {
+        Ok(settings) => settings,
+        Err(why) => return Some(format!("{name}: {why:#}")),
+    };
+    let kind = settings.get("kind").and_then(Value::as_str).unwrap_or_default();
+    (kind != ty).then(|| format!("{name} is declared {ty}, and what fills it is {kind}"))
+}
+
+/// What a read comes to.
+fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<String> {
+    let slot = slots.held.get(&read.binding).filter(|slot| slot.ty.is_some()).ok_or_else(|| anyhow!("it has no PE2_BIND"))?;
+    let bound = filler(fields, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
+    let target = match walked(call, &bound, &read.path)? {
+        Reached::Node(node) => node,
+        Reached::Value(_) if read.derived.is_some() => bail!("{} is a value, and nothing is derived from it", read.path.join("/")),
+        Reached::Value(value) => return Ok(tokenizers::printed(&value)),
+    };
+    let mut args = Args::default();
+    for ((path, arg), values) in &slot.args {
+        if *path == read.path {
+            args.0.insert(arg.clone(), values.clone());
+        }
+    }
+    let output = tokenizer_of(call, &target)?;
+    let address = pe2_ext::tokens::address(read.derived.as_deref(), &args).replacen(tokens::OUTPUT, &output, 1);
+    pe2_ext::tokens::text_of(call, &call.output_of(&target, &address)?)
+}
+
+/// Where a sub-path ends.
+enum Reached {
+    Node(String),
+    Value(Value),
+}
+
+/// A sub-path followed from a node: each step an output, a family's member first, leading to another node or ending at a plain value.
+fn walked(call: &Call, from: &str, path: &[String]) -> Result<Reached> {
+    let (mut node, mut at) = (from.to_string(), 0);
+    while at < path.len() {
+        let member = path.get(at + 1).map(|member| format!("{}/{member}", path[at]));
+        let told = member.and_then(|address| Some((call.table_of(&node, &address).ok()?, 2)));
+        let (table, used) = match told {
+            Some(told) => told,
+            None => (call.table_of(&node, &path[at]).map_err(|_| anyhow!("{} has no output {}", path[..at].join("/"), path[at]))?, 1),
+        };
+        at += used;
+        if let Some(next) = table.get(tokens::NODE).and_then(Value::as_str) {
+            node = next.to_string();
+        } else if let Some(value) = table.get(tokens::VALUE).filter(|_| at == path.len()) {
+            return Ok(Reached::Value(value.clone()));
+        } else {
+            bail!("nothing goes on from {}", path[..at].join("/"));
+        }
+    }
+    Ok(Reached::Node(node))
+}
+
+/// The output making a node's tokens: the target's own, where it has one.
+fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
+    let active = call.config().and_then(|config| config.target);
+    if let Some(active) = active {
+        let own = format!("{}.{active}", tokens::OUTPUT);
+        if call.table_of(target, &format!("{}.{active}", tokens::DECLARED)).is_ok() {
+            return Ok(own);
+        }
+    }
+    call.table_of(target, tokens::DECLARED).map(|_| tokens::OUTPUT.to_string()).map_err(|_| anyhow!("it has no tokenizer"))
 }
 
 impl Gathering<'_> {
@@ -244,31 +735,6 @@ impl Gathering<'_> {
         let entry = format!("{}/{MACROS}", core.path);
         let bytes = self.call.read_entry(&entry)?;
         self.tree.insert(MACROS.to_string(), bytes);
-        Ok(())
-    }
-
-    /// What the slots declared hold, each a macro of what `PE2_VALUE` reads: a table's every key, as tokens. It is a
-    /// file of its own, each package having its own.
-    fn take_values(&mut self) -> Result<()> {
-        let bindings = self.call.host.fields().get("bind").cloned();
-        let mut header = String::new();
-        for name in std::mem::take(&mut self.bound) {
-            let Some(held) = bindings.as_ref().and_then(|bindings| bindings.get(&name)) else {
-                self.open.insert(name);
-                continue;
-            };
-            let target = match held {
-                Value::Table(table) => table.get("uid").and_then(Value::as_str),
-                _ => held.as_str().map(|text| text.split_once('#').map_or(text, |(uid, _)| uid)),
-            };
-            let target = target.ok_or_else(|| anyhow!("{name} is bound to no reference"))?;
-            let output = pe2_ext::output_of(held).ok_or_else(|| anyhow!("{name} is bound to no output of {target}"))?;
-            for (key, value) in self.call.table_of(target, output)? {
-                let tokens = value.as_str().map_or_else(|| value.to_string(), str::to_string);
-                let _ = writeln!(header, "#define pe2_value_{name}_{key} {tokens}");
-            }
-        }
-        self.tree.insert(VALUES.to_string(), header.into_bytes());
         Ok(())
     }
 
@@ -281,14 +747,23 @@ impl Gathering<'_> {
             let bytes = self.call.read_entry(&taken.entry)?;
             let text = String::from_utf8_lossy(&bytes).into_owned();
             self.tree.insert(taken.place.clone(), bytes);
-            for line in text.lines() {
-                if let Some(name) = declared_slot(line) {
-                    self.bound.insert(name.to_string());
+            for found in scan::uses(&text) {
+                let at = format!("{}:{}", taken.entry, found.line);
+                self.options.read(&found, &at);
+                match (found.name, found.args.as_slice()) {
+                    ("PE2_BIND", [name, "package"]) => {
+                        self.packaged.insert((*name).to_string());
+                    }
+                    ("PE2_INCLUDE", [name, inside]) => {
+                        self.included.push(((*name).to_string(), at));
+                        self.take_public(name, inside);
+                    }
+                    _ => {}
                 }
-                match asked(line) {
-                    Some(Asked::Package(name, inside)) => self.take_public(name, inside),
-                    Some(Asked::Beside(file)) => self.take_beside(&taken, file),
-                    None => {}
+            }
+            for line in text.lines() {
+                if let Some(file) = beside(line) {
+                    self.take_beside(&taken, file);
                 }
             }
             for name in assembled(&text) {
@@ -338,5 +813,18 @@ impl Gathering<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::label_in;
+
+    #[test]
+    fn a_label_is_a_string_literal() {
+        assert_eq!(label_in("\"Weapon stats, by level\"").as_deref(), Some("Weapon stats, by level"));
+        assert_eq!(label_in("\"\"").as_deref(), Some(""));
+        assert_eq!(label_in("\"say \\\"hi\\\"\"").as_deref(), Some("say \"hi\""));
+        assert_eq!(label_in("Face"), None);
     }
 }

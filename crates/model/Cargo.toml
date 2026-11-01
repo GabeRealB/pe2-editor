@@ -1,0 +1,12 @@
+[package]
+name = "pe2-model"
+description = "Models as the editor authors them and as the game stores them: what `pe2.render` shows, and what a build encodes"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pe2-ext.workspace = true

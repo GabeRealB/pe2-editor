@@ -8,16 +8,29 @@
 
 mod database;
 mod gather;
+mod scan;
+mod tokenizers;
 mod views;
 
 use pe2_ext::ty::{self, SourceTree};
 use pe2_ext::{Field, Icon, Registry, Result, Retain, Tint};
 
-pe2_ext::extension!("pe2.packages", "0.1.0", register);
+pe2_ext::extension!("pe2.packages", "0.1.0", register, requires = ["pe2.images@^0.1", "pe2.render@^0.1"]);
 
 /// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name.
 const STACK: &str = r#"[[stack]]
 op = "pe2.packages@gather"
+
+[[stack]]
+op = "package-target@preprocess"
+
+[[stack]]
+op = "pe2.packages@resolve"
+
+[[stack]]
+op = "output"
+name = "resolved"
+retain = "transient"
 
 [[stack]]
 op = "package-target@compile"
@@ -42,6 +55,18 @@ op = "pe2.packages@database"
 [stack.ops.overlay]
 op = "pe2.packages@overlay"
 
+[stack.ops.server_values]
+op = "pe2.packages@server_values"
+
+[stack.ops.pe2_server]
+op = "output"
+name = "pe2_server"
+retain = "cache"
+pull = ["pe2.events@build", "pe2.events@files-changed", "pe2.events@config-changed", "pe2.events@project-opened"]
+listen = ["pe2.events@clean"]
+deploy = "build/{config}/virtual/pe2_server.h"
+from = { value = "server_values" }
+
 [stack.ops.compile_commands]
 op = "output"
 name = "compile_commands"
@@ -64,10 +89,14 @@ from = { value = "overlay" }
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<SourceTree>();
+    let _ = r.value_type::<ty::Tokens>();
     let _ = r.op("gather").label("Sources").output::<ty::File<SourceTree>>().run(gather::gather);
+    let _ = r.op("resolve").label("Slots and values").input::<SourceTree>("sources").output::<SourceTree>().run(gather::resolve);
+    tokenizers::register(r);
     let reflection = r.op("reflect").label("What it asks for").output::<ty::Table>().run(gather::reflection);
     let _ = r.op("database").label("Compile database").output::<ty::Bytes>().run(database::database);
     let _ = r.op("overlay").label("Include overlay").output::<ty::Bytes>().run(database::overlay);
+    let _ = r.op("server_values").label("Values for a language server").output::<ty::Bytes>().run(database::server_values);
     r.kind("compile-database").alias("compile-database").label("Compile database").icon(Icon::File, Tint::Code).stack(DATABASE_STACK).register();
     r.kind("package")
         .alias("package")
@@ -77,10 +106,12 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("sources").label("Sources"))
         .field(Field::new("public").label("Public"))
         .field(Field::new("target").label("Targets"))
+        .field(Field::new("bind").custom())
+        .field(Field::new("option").custom())
         .stack(STACK)
         .output("reflection", &reflection, Retain::Cache)
         .contents_view("Slots", |_| Box::new(views::Slots::default()))
-        .inspector_tab("Slots", Icon::Grid, &["public"], |_| Box::new(views::Slots::sheet()))
+        .inspector_tab("Slots", Icon::Grid, &[], |_| Box::new(views::Slots::sheet()))
         .register();
     Ok(())
 }

@@ -3,9 +3,9 @@
 //! something also writes that code. What a shader cannot say stays in the mesh: whether a face takes light is whether
 //! it has normals, and one material mixes faces that do with faces that do not.
 
-use pe2_ext::Value;
+use pe2_ext::{Result, Table, Value, anyhow, bail};
 
-use crate::model::Blend;
+use crate::model::{Binding, Blend, Placement};
 
 /// A way of drawing, by the textures it takes.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,9 +104,80 @@ pub fn reading(texture: &Value, cell: &str, palette: Option<&str>) -> Value {
     format!("{uid}#{output}").into()
 }
 
+/// A pair of numbers.
+fn pair(value: Option<&Value>) -> Option<[i64; 2]> {
+    let values = value?.as_array()?;
+    Some([values.first()?.as_integer()?, values.get(1)?.as_integer()?])
+}
+
+/// What an image says of itself to what draws it: its depth, where its page and palettes are uploaded, and its cells; `placed`
+/// says where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
+#[must_use]
+pub fn image_placement(image: &Table, placed: impl Fn(&Value) -> Option<[i64; 2]>) -> Table {
+    let bits = match image.get("mode").and_then(Value::as_str) {
+        Some("indexed_8bpp") => 8,
+        Some("indexed_4bpp") => 4,
+        _ => 16,
+    };
+    let at = |[x, y]: [i64; 2]| Value::Array(vec![Value::Integer(x), Value::Integer(y)]);
+    let mut made = Table::from_iter([("bits".to_string(), Value::Integer(bits))]);
+    if let Some(page) = image.get("page").and_then(&placed) {
+        made.insert("page".to_string(), at(page));
+    }
+    if let Some(cells) = image.get("cells") {
+        made.insert("cells".to_string(), cells.clone());
+    }
+    let palettes = image.get("palettes").and_then(Value::as_table).into_iter().flatten();
+    let palettes = palettes.filter_map(|(name, palette)| Some((name.clone(), at(placed(palette)?))));
+    made.insert("palettes".to_string(), Value::Table(palettes.collect()));
+    made
+}
+
+/// Where a material's texture is on the console, from what its image says of itself.
+///
+/// # Errors
+/// It names what the image does not hold, or what the console cannot draw.
+pub fn placement(image: &Table, texture: &Value) -> Result<Placement> {
+    let bits = image.get("bits").and_then(Value::as_integer).ok_or_else(|| anyhow!("it has no depth"))?;
+    if !matches!(bits, 4 | 8) {
+        bail!("a {bits} bit image is no texture of a face");
+    }
+    let name = cell_of(texture).ok_or_else(|| anyhow!("no cell is named"))?;
+    let cell = image.get("cells").and_then(|cells| cells.get(name)).ok_or_else(|| anyhow!("no cell {name}"))?;
+    let palette = palette_of(texture).or_else(|| cell.get("palette").and_then(Value::as_str));
+    let palette = palette.ok_or_else(|| anyhow!("{name} has no palette"))?;
+    let colors = pair(image.get("palettes").and_then(|palettes| palettes.get(palette))).ok_or_else(|| anyhow!("{palette} is in no slot"))?;
+    let [x, y] = pair(cell.get("rect")).ok_or_else(|| anyhow!("{name} has no place"))?;
+    let [page_x, page_y] = pair(image.get("page")).ok_or_else(|| anyhow!("no page"))?;
+    let narrow = |value: i64| u16::try_from(value).map_err(|_| anyhow!("{value} is off the console's memory"));
+    let page = [narrow((page_x + x * bits / 16) / 64 * 64)?, narrow((page_y + y) / 256 * 256)?];
+    Ok(Placement { bits: u8::try_from(bits)?, page, palette: [narrow(colors[0])?, narrow(colors[1])?] })
+}
+
+/// A material as a slot of a model draws it, its texture placed by `place`.
+///
+/// # Errors
+/// As what `place` says.
+pub fn binding(fields: &Table, place: impl Fn(&Value) -> Result<Placement>) -> Result<Binding> {
+    let read = Definition::read(|key| fields.get(key));
+    let texture = if read.shader.textures.is_empty() {
+        None
+    } else {
+        Some(place(fields.get(MAIN).ok_or_else(|| anyhow!("it has no texture"))?)?)
+    };
+    Ok(Binding { texture, transparent: read.transparent, blend: read.blend, reflective: read.shader.reflective, effect: read.effect })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_texture_is_placed_by_what_its_image_says() {
+        let image: Table = "bits = 8\npage = [384, 256]\ncells.right = { rect = [128, 0, 128, 256], palette = 'one' }\npalettes.one = [0, 245]\npalettes.two = [0, 246]".parse().unwrap();
+        let texture = Value::String("uid://x#cells/right@two".to_string());
+        assert_eq!(placement(&image, &texture).unwrap(), Placement { bits: 8, page: [448, 256], palette: [0, 246] });
+    }
 
     #[test]
     fn a_texture_names_a_cell_and_a_palette_of_its_image() {

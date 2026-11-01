@@ -512,6 +512,10 @@ impl Extensions {
             anyhow::ensure!(builtin, "only a built-in extension names a kind bare ({alias})");
         }
         let additions = self.additions(extension, &dependencies, parts.additions)?;
+        for (kind, tab) in &parts.tabs {
+            let owner = kind.split_once('@').map_or("", |(owner, _)| owner);
+            anyhow::ensure!(dependencies.contains(&owner) && self.kinds.contains_key(kind), "{} adds a tab {} to {kind}, which it does not require", extension.id, tab.name);
+        }
         self.check_stacks(&extension.id, &dependencies, &parts.stacks)?;
         let index = self.loaded.len();
         if let Some(component) = &extension.component {
@@ -547,6 +551,11 @@ impl Extensions {
             self.ops.insert(op.name.to_string(), op);
         }
         self.add_to_kinds(additions, parts.stacks);
+        for (kind, tab) in parts.tabs {
+            if let Some((def, _)) = self.kinds.get_mut(&kind) {
+                def.inspector.push(tab);
+            }
+        }
         self.add_declared(parts.events, parts.hooks, parts.recipes, parts.commands);
         self.types.extend(parts.types.into_iter().map(|t| (t.name.to_string(), t)));
         self.extractors.extend(parts.extractors);
@@ -1140,7 +1149,7 @@ impl Extensions {
     #[must_use]
     pub fn contents(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen) -> pe2_ext::Contents {
         let contents = self.kind_of(asset).and_then(|k| k.contents.as_ref());
-        contents.map_or_default(|contents| contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }))
+        contents.map_or_default(|contents| contents(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen), revision: 0 }))
     }
 
     /// What comes of something done in an asset's contents.
@@ -1149,13 +1158,13 @@ impl Extensions {
     /// Why it cannot be, as its kind says.
     pub fn content_act(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, request: pe2_ext::ContentRequest) -> Result<pe2_ext::ContentOutcome> {
         let act = self.kind_of(asset).and_then(|k| k.content_act.as_ref()).context("its kind does nothing with its contents")?;
-        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }, request)
+        act(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen), revision: 0 }, request)
     }
 
     /// A part's fields, where its kind says what they are.
     #[must_use]
     pub fn part_sheet(&self, index: &index::Index, asset: &index::Asset, chosen: &Chosen, part: &str) -> Option<pe2_ext::PartSheet> {
-        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen) }, part)
+        self.kind_of(asset)?.part_sheet.as_ref()?(&self.lend(asset), &Lens { index, extensions: self, selection: None, chosen: Some(chosen), revision: 0 }, part)
     }
 
     /// The views a kind gives the head of the contents pane.
@@ -1465,6 +1474,8 @@ pub struct Lens<'a> {
     pub selection: Option<&'a str>,
     /// The members of families assets are being looked at in.
     pub chosen: Option<&'a Chosen>,
+    /// Which taking in of changes this is as of.
+    pub revision: u64,
 }
 
 impl Project for Lens<'_> {
@@ -1496,6 +1507,14 @@ impl Project for Lens<'_> {
 
     fn image(&self, path: &str, address: &str) -> Option<Result<Image>> {
         self.extensions.output_image(self.index.assets.get(path)?, address)
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn target(&self) -> Option<String> {
+        self.extensions.config.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()?.target.clone()
     }
 
     fn table(&self, path: &str, address: &str) -> Option<Result<Table>> {
@@ -2215,7 +2234,7 @@ mod calling {
         let project = Opened::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
-        let lens = Lens { index: &index, extensions: &extensions, selection: None, chosen: None };
+        let lens = Lens { index: &index, extensions: &extensions, selection: None, revision: 0, chosen: None };
         let answer = lens.call("test.scene@frame", &Value::Table(Table::new())).unwrap();
         assert_eq!(answer.as_str(), Some("red 1x1"));
         assert!(lens.call("test.nowhere@service", &Value::Table(Table::new())).is_err());

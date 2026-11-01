@@ -15,4 +15,5 @@ workspace = true
 [dependencies]
 formats.workspace = true
 pe2-ext.workspace = true
+pe2-model.workspace = true
 sha1.workspace = true

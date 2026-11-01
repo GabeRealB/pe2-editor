@@ -92,7 +92,11 @@ fn named(action: &Action) -> String {
 #[must_use]
 pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
     let folder = project.root.join("build").join(&config.name);
-    BuildConfig { name: config.name.clone(), release: config.release.clone(), target: config.target.clone(), folder: folder.display().to_string() }
+    let said = |config: &Config| {
+        [Some(("name", config.name.clone())), config.release.clone().map(|v| ("release", v)), config.target.clone().map(|v| ("target", v))]
+    };
+    let known = project.configs.iter().flat_map(said).flatten().map(|(key, value)| format!("{key}={value}")).collect();
+    BuildConfig { name: config.name.clone(), release: config.release.clone(), target: config.target.clone(), folder: folder.display().to_string(), known }
 }
 
 /// An epoch's effects on a project.
@@ -164,6 +168,9 @@ impl Site<'_> {
         let made = self.extensions.output(&self.engine, self.index, found, output, true);
         let deployed = made.and_then(|given| {
             let value = given.value.as_deref().context("no value")?;
+            if let Value::Typed(typed) = value {
+                outcome.notes.clone_from(&typed.notes);
+            }
             if !events.deploy.is_empty() {
                 self.deploy(&events.deploy, value)?;
             }

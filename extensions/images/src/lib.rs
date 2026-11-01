@@ -16,7 +16,7 @@ mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
 pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Table, Tint, Typed, Value};
+use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
@@ -77,7 +77,6 @@ fn register(r: &mut Registry) -> Result<()> {
             ty::Either::Second(image) => marks::of(&call.lend_settings(&image.derived).asset()),
         })
     });
-    let (placement, words, slot_rect) = build_outputs(r);
     let image = r
         .kind("image")
         .alias("image")
@@ -108,12 +107,10 @@ fn register(r: &mut Registry) -> Result<()> {
         .output("cells", &cell, Retain::Transient)
         .members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
         .output("marks", &marked, Retain::Transient)
-        .output("placement", &placement, Retain::Cache)
-        .output("words", &words, Retain::Cache)
         .register();
     // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
     let _ = r.extractor("textures", &image, &["mode"], extract::begin);
-    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).output("rect", &slot_rect, Retain::Cache).register();
+    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)
             .label("VRAM page grid")
@@ -141,26 +138,6 @@ fn part_outputs(r: &mut Registry) -> (pe2_ext::Name, pe2_ext::Name) {
         cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
     });
     (palette, cell)
-}
-
-/// What a build reads of an image and a VRAM slot.
-fn build_outputs(r: &mut Registry) -> (pe2_ext::Name, pe2_ext::Name, pe2_ext::Name) {
-    // What draws it needs: its depth, where its page and palettes are uploaded, and its cells.
-    let placement = r.op("placement").label("Where it is uploaded").input::<NativeForm>("native").output::<ty::Table>().run(|call| {
-        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background is drawn by no face") };
-        let lent = call.lend_settings(&image.derived);
-        placement_of(call, &lent.asset())
-    });
-    // Its texels as the words of a C array.
-    let words = r.op("words").label("Its texels, as C").input::<NativeForm>("native").output::<ty::Table>().run(|call| {
-        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no texels") };
-        Ok(Table::from_iter([("words".to_string(), words_of(&image.texels)?.into())]))
-    });
-    let slot_rect = r.op("slot_rect").label("Its rectangle").output::<ty::Table>().run(|call| {
-        let rect = call.host.fields().get("rect").cloned().ok_or_else(|| pe2_ext::anyhow!("it has no rect"))?;
-        Ok(Table::from_iter([("rect".to_string(), rect)]))
-    });
-    (placement, words, slot_rect)
 }
 
 /// An image's modes: what a texel is. A native-only image's texels are read in its mode; an imported one's are
@@ -282,51 +259,6 @@ fn part_sheet(asset: &Asset, _: &dyn pe2_ext::Project, part: &str) -> Option<Par
         ],
         problem: None,
     })
-}
-
-/// Where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
-fn placed(call: &pe2_ext::Call, placement: &Value) -> Option<Result<[i64; 2]>> {
-    let slot = placement.get("slot")?;
-    let named = match slot {
-        Value::Table(table) => table.get("uid")?.as_str()?,
-        _ => slot.as_str()?,
-    };
-    let at = placement.get("at").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    let added = |n: usize| at.get(n).and_then(Value::as_integer).unwrap_or(0);
-    Some(call.table_of(named, "rect").and_then(|table| {
-        let rect = table.get("rect").and_then(Value::as_array).ok_or_else(|| pe2_ext::anyhow!("{named} has no rect"))?;
-        let corner = |n: usize| rect.get(n).and_then(Value::as_integer).ok_or_else(|| pe2_ext::anyhow!("{named} has no corner"));
-        Ok([corner(0)? + added(0), corner(1)? + added(1)])
-    }))
-}
-
-/// What an image says of itself to what draws it.
-fn placement_of(call: &pe2_ext::Call, asset: &Asset) -> Result<Table> {
-    let at = |[x, y]: [i64; 2]| Value::Array(vec![Value::Integer(x), Value::Integer(y)]);
-    let mut made = Table::from_iter([("bits".to_string(), Value::Integer(i64::from(bpp(asset))))]);
-    if let Some(page) = asset.field("page").and_then(|page| placed(call, page)) {
-        made.insert("page".to_string(), at(page?));
-    }
-    if let Some(cells) = asset.field("cells") {
-        made.insert("cells".to_string(), cells.clone());
-    }
-    let mut palettes = Table::new();
-    for (name, palette) in asset.parts("palettes") {
-        if let Some(place) = placed(call, palette) {
-            palettes.insert(name.to_string(), at(place?));
-        }
-    }
-    made.insert("palettes".to_string(), Value::Table(palettes));
-    Ok(made)
-}
-
-/// Bytes as the `u_long`s of a C array.
-fn words_of(bytes: &[u8]) -> Result<String> {
-    let (words, rest) = bytes.as_chunks::<4>();
-    if !rest.is_empty() {
-        pe2_ext::bail!("{} bytes are no words", bytes.len());
-    }
-    Ok(words.iter().map(|word| format!("{:#010X},", u32::from_le_bytes(*word))).collect::<Vec<_>>().join(" "))
 }
 
 /// What the contents of an image list, by id and label: its texels, palettes, cells and variants.

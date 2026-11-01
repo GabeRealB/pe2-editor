@@ -215,6 +215,9 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
         for (asset, output) in &report.made {
             println!("{asset}: {output}");
         }
+        for (asset, note) in &report.notes {
+            eprintln!("{asset}: warning: {note}");
+        }
         for (asset, output) in &report.stale {
             eprintln!("{asset}: {output} is stale: what it reads changed after it ran");
         }

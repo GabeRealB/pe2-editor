@@ -15,6 +15,7 @@
 mod asset;
 pub mod data;
 pub mod events;
+pub mod tokens;
 pub mod ty;
 mod extract;
 #[cfg(target_family = "wasm")]
@@ -40,6 +41,18 @@ pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentActio
     Registry, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};
+
+/// What a reference names, as a host call asks for it: a uid or a path, whatever holds it (`{ slot = ... }`), without its output.
+#[must_use]
+pub fn target_of(reference: &Value) -> Option<&str> {
+    let reference = reference.get("slot").unwrap_or(reference);
+    let reference = reference.get("slot").unwrap_or(reference);
+    match reference {
+        Value::String(text) => Some(text.split_once('#').map_or(text.as_str(), |(uid, _)| uid)),
+        Value::Table(table) => table.get("uid")?.as_str(),
+        _ => None,
+    }
+}
 
 /// The output of an asset a reference names: what follows its uid (`palettes/default` of
 /// `uid://...#palettes/default`), or the `output` of a reference written with its path.

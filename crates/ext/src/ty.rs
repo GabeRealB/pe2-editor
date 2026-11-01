@@ -61,6 +61,21 @@ impl Registered for SourceTree {
 
 impl Files for SourceTree {}
 
+/// What a value is in the language a package is written in: the text of a tokenizer (`crate::tokens`).
+pub struct Tokens;
+
+impl Tokens {
+    /// The one file it is.
+    pub const FILE: &'static str = "tokens";
+}
+
+impl Registered for Tokens {
+    const NAME: &'static str = "pe2.packages@tokens";
+    const LABEL: &'static str = "Tokens";
+}
+
+impl Files for Tokens {}
+
 /// A registered type whose value is kept as its files - its encoding - read when asked, by reference.
 pub trait Files: Registered<Value = Typed> {}
 

@@ -332,6 +332,8 @@ pub struct Parts {
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Outputs it adds to a kind it requires, by the kind's name.
     pub additions: Vec<(String, OutputDef)>,
+    /// Inspector tabs given to kinds of what it requires, by the kind's qualified name.
+    pub tabs: Vec<(String, ViewDef)>,
     /// The events it declares, by name, with their labels.
     pub events: Vec<(String, String)>,
     /// What it runs where an event is signaled.
@@ -1001,6 +1003,17 @@ impl Registry {
         let at = self.parts.additions.len();
         self.parts.additions.push((kind.to_string(), output));
         AddedOutput { output: &mut self.parts.additions[at].1 }
+    }
+
+    /// Add a tab to the inspector of a kind of an extension this one depends on.
+    pub fn add_inspector_tab(&mut self, kind: &str, name: &str, icon: Icon, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) {
+        let tab = TabDef { icon, fields: Vec::new() };
+        self.parts.tabs.push((kind.to_string(), ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) }));
+    }
+
+    /// A tab as a component's registration describes it.
+    pub fn add_inspector_tab_def(&mut self, kind: &str, view: ViewDef) {
+        self.parts.tabs.push((kind.to_string(), view));
     }
 
     /// Give a kind of an extension this one depends on the stack its nodes have where their bundles state none: a form

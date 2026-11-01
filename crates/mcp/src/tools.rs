@@ -655,7 +655,7 @@ fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -
     let arguments: toml::Value =
         serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
     let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());
-    let lens = Lens { index: view.index, extensions, selection, chosen: None };
+    let lens = Lens { index: view.index, extensions, selection, chosen: None, revision: 0 };
     let answer = (tool.run)(&lens, &arguments).map_err(|e| format!("{e:#}"))?;
     serde_json::to_value(answer).map_err(|e| e.to_string())
 }

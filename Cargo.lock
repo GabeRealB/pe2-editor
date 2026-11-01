@@ -3689,6 +3689,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-model"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
 name = "pe2-movies"
 version = "0.1.0"
 dependencies = [
@@ -3700,6 +3707,7 @@ name = "pe2-packages"
 version = "0.1.0"
 dependencies = [
  "pe2-ext",
+ "pe2-model",
  "serde_json",
  "toml",
 ]
@@ -3717,6 +3725,7 @@ version = "0.1.0"
 dependencies = [
  "formats",
  "pe2-ext",
+ "pe2-model",
  "sha1",
 ]
 

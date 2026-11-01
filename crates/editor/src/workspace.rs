@@ -212,6 +212,8 @@ pub struct Workspace {
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
     /// setting), before an agent is answered, or on View > Refresh.
     pending: BTreeSet<PathBuf>,
+    /// How many times changes were taken in: what a view read of plain files may be out of date once it moves.
+    revision: u64,
     /// Whether the window had focus at the last frame.
     focused: bool,
     /// What the editor wrote lately, each path with its stamp then: the watcher's report of it is the editor's own
@@ -574,6 +576,7 @@ impl Workspace {
             extensions_checked: std::time::Instant::now(),
             takein,
             pending: BTreeSet::new(),
+            revision: 0,
             focused: true,
             own: Vec::new(),
             external: (0, 0),
@@ -853,6 +856,7 @@ impl Workspace {
                 self.outcome = Update::Reopen(why);
             }
             self.index = snapshot.index;
+            self.revision += 1;
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
             }
@@ -1349,7 +1353,7 @@ impl Workspace {
     /// It is gone, or it fails.
     pub fn run_tool(&self, name: &str) -> std::result::Result<String, String> {
         let tool = self.extensions.tools().iter().find(|t| t.name.to_string() == name).ok_or_else(|| format!("no tool {name}"))?;
-        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref() };
+        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref(), revision: self.revision };
         let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
         Ok(answer.to_string())
     }
@@ -1713,6 +1717,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
+            revision: self.revision,
         };
         let frame = crate::ext_ui::Frame { asset: Some(asset), preview, count, editable, part: part.as_deref() };
         let mut sets = crate::ext_ui::Sets::default();
@@ -1805,6 +1810,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
+            revision: self.revision,
         };
         for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
@@ -1832,6 +1838,7 @@ impl Workspace {
             extensions: &self.extensions,
             selection: self.selected.as_deref(),
             chosen: Some(&self.chosen),
+            revision: self.revision,
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };

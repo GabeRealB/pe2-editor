@@ -479,7 +479,7 @@ impl host::HostAsset for State {
 
     fn build_config(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<host::BuildConfig>> {
         let told = self.lent(&asset)?.build_config();
-        Ok(told.map(|c| host::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder }))
+        Ok(told.map(|c| host::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder, known: c.known }))
     }
 
     fn assets_of(&mut self, asset: Resource<LentAsset>, kind: String) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
@@ -576,6 +576,18 @@ impl host::HostProject for State {
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
         Ok(elsewhere(project, move |p| p.picture(&path, look.as_deref()).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+    }
+
+    fn target(&mut self, project: Resource<LentProject>) -> wasmtime::Result<Option<String>> {
+        // SAFETY: as `asset`.
+        let project = unsafe { &*self.project(&project)? };
+        Ok(project.target())
+    }
+
+    fn revision(&mut self, project: Resource<LentProject>) -> wasmtime::Result<u64> {
+        // SAFETY: as `asset`.
+        let project = unsafe { &*self.project(&project)? };
+        Ok(project.revision())
     }
 
     fn image(
@@ -1984,6 +1996,9 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
         let _ = registry.setting(setting(s)?);
     }
     add_outputs(registry, &registration.additions, registration.kinds.len(), shared)?;
+    for (kind, tab) in &registration.tabs {
+        registry.add_inspector_tab_def(kind, view_def(shared, tab));
+    }
     for (name, label) in &registration.events {
         registry.add_event(name, label);
     }

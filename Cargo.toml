@@ -6,6 +6,7 @@ members = [
     "crates/formats",
     "crates/codecs",
     "crates/ext",
+    "crates/model",
     "crates/project",
     "crates/webgpu",
     "crates/mcp",
@@ -37,6 +38,7 @@ pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 formats = { path = "crates/formats" }
+pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }

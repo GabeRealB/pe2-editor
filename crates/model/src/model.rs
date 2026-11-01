@@ -514,6 +514,24 @@ pub struct Binding {
     pub effect: u32,
 }
 
+impl Placement {
+    /// Its palette, as the GPU is told it.
+    #[must_use]
+    pub fn clut(&self) -> u32 {
+        u32::from(self.palette[0] / 16) | u32::from(self.palette[1]) << 6
+    }
+}
+
+impl Binding {
+    /// Its texture page, as the GPU is told it.
+    #[must_use]
+    pub fn tpage(&self) -> Option<u32> {
+        let placement = self.texture?;
+        let [x, y] = placement.page;
+        Some(u32::from(x / 64) | u32::from(y / 256) << 4 | (self.blend as u32) << 5 | u32::from(placement.bits == 8) << 7)
+    }
+}
+
 /// A run of one opcode, as it is being written.
 struct Run {
     op: u32,
@@ -619,9 +637,7 @@ fn element_words(base: u32, kind: Kind, face: &Face, corners: &[Corner], binding
     }
     if kind.textured {
         let placement = binding.texture.ok_or_else(|| anyhow!("a face with coordinates, in a slot with no texture"))?;
-        let [x, y] = placement.page;
-        let page = u32::from(x / 64) | u32::from(y / 256) << 4 | (binding.blend as u32) << 5 | u32::from(placement.bits == 8) << 7;
-        let clut = u32::from(placement.palette[0] / 16) | u32::from(placement.palette[1]) << 6;
+        let (page, clut) = (binding.tpage().unwrap_or(0), placement.clut());
         let uv = |at: usize| corners.get(at).and_then(|corner| corner.uv).map_or(0, |[u, v]| u32::from(u) | u32::from(v) << 8);
         words.extend([uv(0) | clut << 16, uv(1) | page << 16, uv(2) | uv(3) << 16]);
     }

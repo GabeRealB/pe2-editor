@@ -837,6 +837,8 @@ pub struct BuildConfig {
     pub release: Option<String>,
     pub target: Option<String>,
     pub folder: String,
+    /// What every config of the project says, as `key=value`: what a source may test for.
+    pub known: Vec<String>,
 }
 
 /// An operation as registered.

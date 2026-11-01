@@ -228,7 +228,7 @@ impl Source for Lent<'_> {
     }
 
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
-        self.resource().build_config().map(|c| crate::data::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder })
+        self.resource().build_config().map(|c| crate::data::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder, known: c.known })
     }
 
     fn keep(&self, path: &str, name: &str) -> Option<crate::Result<crate::File>> {
@@ -302,6 +302,14 @@ impl Project for Lens<'_> {
 
     fn picture(&self, path: &str, look: Option<&str>) -> Option<crate::Result<Image>> {
         self.project.picture(path, look).map(|made| made.map(from_image).map_err(crate::Error::msg))
+    }
+
+    fn target(&self) -> Option<String> {
+        self.project.target()
+    }
+
+    fn revision(&self) -> u64 {
+        self.project.revision()
     }
 
     fn image(&self, path: &str, address: &str) -> Option<crate::Result<Image>> {
@@ -866,6 +874,7 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         types: vec![],
         extractors: vec![],
         additions: parts.additions.iter().map(|(kind, output)| (kind.clone(), describe_output(output))).collect(),
+        tabs: vec![],
         stacks: parts.stacks.clone(),
         commands: parts.commands.iter().map(|c| (c.label.clone(), c.tool.local().to_string())).collect(),
         recipes: parts
@@ -890,6 +899,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         });
         numbered.views.push(Maker::Panel(panel));
     }
+    // Numbered after the panels, as `number` numbers them.
+    out.tabs = parts.tabs.iter().filter_map(|(kind, view)| Some((kind.clone(), views(std::slice::from_ref(view), &mut numbered).pop()?))).collect();
     numbered.tools = calls(parts.tools, &mut out.tools);
     numbered.services = calls(parts.services, &mut out.services);
     imports(&parts.types, &parts.ops, &mut out, &mut numbered);
@@ -967,6 +978,7 @@ fn number(parts: crate::registry::Parts) -> Registered {
         views_in_order([&kind.views, &kind.inspector, &kind.editors, &kind.contents_views], &mut numbered);
     }
     numbered.views.extend(parts.panels.into_iter().map(Maker::Panel));
+    numbered.views.extend(parts.tabs.into_iter().map(|(_, view)| Maker::Asset(view)));
     for op in &parts.ops {
         numbered.fields.extend(op.fields.iter().cloned());
     }
