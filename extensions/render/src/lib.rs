@@ -331,10 +331,14 @@ impl View for Summary {
     fn show(&mut self, ui: &mut Ui) {
         if self.lines.is_none() {
             let Some(asset) = ui.asset() else { return };
-            match assembly::assemble(ui.project(), &asset) {
-                Ok(assembled) => self.lines = Some(parts::summary(&assembled.model)),
-                Err(why) => {
-                    ui.error(&format!("{why:#}"));
+            match assembly::requested(ui.project(), &asset) {
+                assembly::Scene::Ready(assembled) => self.lines = Some(parts::summary(&assembled.model)),
+                assembly::Scene::Waiting(waited) => {
+                    assembly::say_waiting(ui, waited);
+                    return;
+                }
+                assembly::Scene::Failed(why) => {
+                    ui.error(&why);
                     return;
                 }
             }

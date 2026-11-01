@@ -1848,7 +1848,7 @@ impl Editor {
 
     /// Whether something it set going has yet to show.
     pub fn busy(&self) -> bool {
-        self.opening.is_some() || !self.deferred.is_empty() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.watch_is_starting() || ws.in_epoch() || ws.tests.running())
+        self.opening.is_some() || !self.deferred.is_empty() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.watch_is_starting() || ws.requests_busy() || ws.in_epoch() || ws.tests.running())
     }
 
     /// Undo the last step.

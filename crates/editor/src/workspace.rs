@@ -158,6 +158,9 @@ pub struct Workspace {
     store: project::graph::store::Store,
     /// The ticket of attaching the imports of the project as opened.
     attaching: u64,
+    /// What views ask without waiting, and how many were answered when what was said meanwhile was last dropped.
+    outputs: Arc<project::ext::requests::Requests>,
+    requests_seen: u64,
     /// Events that came before what the importers made was attached: an epoch works from the project as last taken in,
     /// which they need whole. That it opened is the first.
     held_events: Vec<Signaled>,
@@ -566,6 +569,9 @@ impl Workspace {
         // The worker takes the index from here; the UI shows a snapshot of it.
         let shown = Arc::new(index.clone());
         let pictures = crate::pictures::Pictures::start(shown.clone(), extensions.clone());
+        let outputs = project::ext::requests::Requests::start(shown.clone());
+        outputs.set_extensions(&extensions);
+        extensions.serve_requests(Some(outputs.clone()));
         let cache_dir = cache.dir.clone();
         let mut takein = crate::takein::TakeIn::start(crate::takein::Worker {
             project: project.clone(),
@@ -604,6 +610,8 @@ impl Workspace {
             extensions,
             store,
             attaching,
+            outputs,
+            requests_seen: 0,
             held_events: vec![(vec![ProjectOpened::NAME.to_string()], None, None)],
             views: HashMap::new(),
             contents: HashMap::new(),
@@ -662,6 +670,10 @@ impl Workspace {
     /// Start watching the layers, once: every change on disk is then brought in by `update`. Asked each frame: what
     /// has started since is told of the window, and an event waits for the project to have what it is about.
     pub fn watch(&mut self, ctx: &egui::Context) {
+        if !self.outputs.wakes() {
+            let ctx = ctx.clone();
+            self.outputs.wake_by(move |after| ctx.request_repaint_after(after));
+        }
         self.takein.wake(ctx);
         self.runner.wake(ctx);
         if let Some(pictures) = &self.textures.pictures {
@@ -713,6 +725,12 @@ impl Workspace {
         self.views.len()
     }
 
+    /// Whether an output is on its way to a view.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn requests_busy(&self) -> bool {
+        self.outputs.busy()
+    }
+
     /// Whether the layers are yet to be watched.
     #[cfg(any(test, feature = "tests"))]
     pub fn watch_is_starting(&self) -> bool {
@@ -748,6 +766,8 @@ impl Workspace {
     /// Leave the project. What takes a moment to finish - what the worker is on, an epoch, letting go of the index - is
     /// handed back, to finish away from the window.
     pub fn leave(self) -> Leaving {
+        // The extensions outlive a project in what is loaded: what it was asked should not.
+        self.extensions.serve_requests(None);
         Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock }
     }
 
@@ -939,6 +959,13 @@ impl Workspace {
                 self.takein.reload("an extension changed", false);
             }
         }
+        // What said it was waiting for an output is out of date once that is there.
+        let answered = self.outputs.finished();
+        if answered != self.requests_seen {
+            self.requests_seen = answered;
+            self.contents.clear();
+            self.part_sheets.clear();
+        }
         // What the editor wrote (an edit, a step, a setting of the project): taken in at once.
         self.take_written();
         self.own.retain(|(_, _, at)| at.elapsed() < Duration::from_secs(30));
@@ -1046,6 +1073,7 @@ impl Workspace {
                 }
                 pictures.set_index(self.index.clone());
             }
+            self.outputs.set_index(self.index.clone());
             crate::aside::drop_later(before);
             self.layers = snapshot.layers;
             self.refresh_editable();
@@ -1061,6 +1089,7 @@ impl Workspace {
                 self.contents.clear();
                 self.part_sheets.clear();
                 self.thumbs.clear();
+                self.outputs.clear();
             } else if !snapshot.changed.is_empty() {
                 let changed = &snapshot.changed;
                 self.pictures.retain(|(image, ..), _| !changed.contains(image));
@@ -1073,6 +1102,7 @@ impl Workspace {
                 self.views.retain(|(_, asset, _), _| !reached.contains(asset));
                 self.contents.retain(|asset, _| !reached.contains(asset));
                 self.part_sheets.retain(|(asset, _), _| !reached.contains(asset));
+                self.outputs.forget(&|asset| reached.contains(asset));
             }
             self.drop_lost_selection();
             // Other programs' changes taken in: the app says how many assets they changed.
@@ -1119,6 +1149,9 @@ impl Workspace {
             return;
         }
         self.thumbs = crate::thumbs::Thumbs::start(extensions.clone(), self.store.clone());
+        self.extensions.serve_requests(None);
+        self.outputs.set_extensions(&extensions);
+        extensions.serve_requests(Some(self.outputs.clone()));
         let pictures = crate::pictures::Pictures::start(self.index.clone(), extensions.clone());
         crate::aside::drop_later(self.textures.pictures.replace(pictures));
         self.extensions = extensions;

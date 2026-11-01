@@ -5,7 +5,7 @@
 //! It is what a node's `scene` output is, so that what reads it reads a value: `scene` makes it from what the graph
 //! holds, read as any operation reads other nodes, and `assemble` asks for it.
 
-use pe2_ext::{Asset, Call, Data, File, Project, Result, Source, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Asset, Call, Data, File, Project, Requested, Result, Source, Style, Table, Typed, Ui, Value, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -449,11 +449,40 @@ fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
 /// # Errors
 /// It has no such output, or it could not be made.
 pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    let chosen: Vec<String> = prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
-    let chosen = if chosen.is_empty() { NONE_CHOSEN.to_string() } else { chosen.join(",") };
-    let address = format!("scene/{chosen}");
+    let address = scene_address(project, asset);
     let bytes = project.bytes(asset.path(), &address).ok_or_else(|| anyhow!("{}: it shows nothing in 3D", asset.path()))??;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// A scene as a frame can ask for it, not waiting for it to be made.
+pub enum Scene {
+    Ready(Box<Assembled>),
+    /// On its way, for so many milliseconds.
+    Waiting(u32),
+    Failed(String),
+}
+
+/// What `assemble` gives, without waiting: a view shows what it has meanwhile, and is shown again when this is there.
+pub fn requested(project: &dyn Project, asset: &Asset) -> Scene {
+    match project.request(asset.path(), &scene_address(project, asset)) {
+        Requested::Ready(bytes) => serde_json::from_slice(&bytes).map_or_else(|why| Scene::Failed(why.to_string()), |made| Scene::Ready(Box::new(made))),
+        Requested::Pending { waited } => Scene::Waiting(waited),
+        Requested::Failed(why) => Scene::Failed(why),
+    }
+}
+
+/// What a view says while it waits: nothing at first, as most are there before anyone could read it.
+pub fn say_waiting(ui: &mut Ui, waited: u32) {
+    const SAY_AFTER: u32 = 100;
+    if waited >= SAY_AFTER {
+        ui.styled("Making what it shows...", Style::Note);
+    }
+}
+
+fn scene_address(project: &dyn Project, asset: &Asset) -> String {
+    let chosen: Vec<String> = prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
+    let chosen = if chosen.is_empty() { NONE_CHOSEN.to_string() } else { chosen.join(",") };
+    format!("scene/{chosen}")
 }
 
 #[cfg(test)]

@@ -600,6 +600,15 @@ impl host::HostProject for State {
         Ok(elsewhere(project, move |p| p.bytes(&path, &address).map(|made| made.map_err(|e| format!("{e:#}")))))
     }
 
+    fn request(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<host::Requested> {
+        let project = self.project(&project)?;
+        Ok(match elsewhere(project, move |p| p.request(&path, &address)) {
+            pe2_ext::Requested::Ready(bytes) => host::Requested::Ready(bytes),
+            pe2_ext::Requested::Pending { waited } => host::Requested::Pending(waited),
+            pe2_ext::Requested::Failed(why) => host::Requested::Failed(why),
+        })
+    }
+
     fn call(
         &mut self,
         project: Resource<LentProject>,

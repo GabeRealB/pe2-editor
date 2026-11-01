@@ -111,15 +111,23 @@ fn pressed_primary(input: &ViewportInput) -> bool {
 }
 
 impl ModelView {
-    fn load(&mut self, ui: &Ui) {
+    fn load(&mut self, ui: &mut Ui) {
         if self.scene.is_some() {
             return;
         }
         let Some(asset) = ui.asset() else { return };
-        let scene = assembly::assemble(ui.project(), &asset).map_err(|e| format!("{e:#}")).map(|assembled| {
-            self.places = assembled.nodes.iter().map(|node| node.place.clone()).collect();
-            self.pictured(ui, assembled)
-        });
+        let scene = match assembly::requested(ui.project(), &asset) {
+            assembly::Scene::Ready(assembled) => {
+                let assembled = *assembled;
+                self.places = assembled.nodes.iter().map(|node| node.place.clone()).collect();
+                Ok(self.pictured(ui, assembled))
+            }
+            assembly::Scene::Failed(why) => Err(why),
+            assembly::Scene::Waiting(waited) => {
+                assembly::say_waiting(ui, waited);
+                return;
+            }
+        };
         // An edit makes the view again: what it looked at, and how, stay.
         let kept = ui.note().and_then(|note| self.resume(&note));
         if let (None, Ok(scene)) = (kept, &scene) {

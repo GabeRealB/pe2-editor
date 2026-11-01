@@ -178,7 +178,18 @@ impl UvView {
 
 impl View for UvView {
     fn show(&mut self, ui: &mut Ui) {
-        let assembled = self.assembled.take().or_else(|| ui.asset().map(|asset| assembly::assemble(ui.project(), &asset).map_err(|why| format!("{why:#}"))));
+        let assembled = match (self.assembled.take(), ui.asset()) {
+            (Some(assembled), _) => Some(assembled),
+            (None, None) => None,
+            (None, Some(asset)) => match assembly::requested(ui.project(), &asset) {
+                assembly::Scene::Ready(assembled) => Some(Ok(*assembled)),
+                assembly::Scene::Failed(why) => Some(Err(why)),
+                assembly::Scene::Waiting(waited) => {
+                    assembly::say_waiting(ui, waited);
+                    return;
+                }
+            },
+        };
         let assembled = match assembled {
             Some(Ok(assembled)) => assembled,
             Some(Err(why)) => {

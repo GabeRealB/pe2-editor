@@ -10,6 +10,7 @@
 
 pub mod unsandboxed;
 pub mod component;
+pub mod requests;
 
 use anyhow::{Context, Result};
 use pe2_ext::{
@@ -324,6 +325,8 @@ pub struct Extensions {
     graph_ops: std::sync::OnceLock<graph::Ops>,
     /// The store outputs asked for in passing read and keep: the open project's, as these outlive it (`extensions::loaded`).
     store: std::sync::RwLock<Option<graph::store::Store>>,
+    /// What is asked without waiting.
+    requests: RwLock<Option<Arc<dyn requests::Asking>>>,
     extractors: Vec<pe2_ext::ExtractorDef>,
     /// The components of the extensions loaded, by id.
     components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
@@ -1123,6 +1126,15 @@ impl Extensions {
         engine
     }
 
+    /// What is asked without waiting, for what shows the project open; none where nothing does.
+    pub fn serve_requests(&self, requests: Option<Arc<dyn requests::Asking>>) {
+        *self.requests.write().unwrap_or_else(std::sync::PoisonError::into_inner) = requests;
+    }
+
+    fn requests(&self) -> Option<Arc<dyn requests::Asking>> {
+        self.requests.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     /// The store outputs are kept in, for what is asked in passing: that of the project opened, and of the next one.
     pub fn keep_in(&self, store: graph::store::Store) {
         *self.store.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
@@ -1797,7 +1809,22 @@ impl Project for Lens<'_> {
 
     fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
         let asset = self.index.assets.get(path)?;
+        let requests = self.extensions.requests();
+        if let Some(kept) = requests.as_ref().and_then(|requests| requests.kept(path, address)) {
+            return Some(Ok(kept.to_vec()));
+        }
         Some(self.extensions.bytes(self.index, asset, address))
+    }
+
+    fn request(&self, path: &str, address: &str) -> pe2_ext::Requested {
+        match self.extensions.requests() {
+            Some(requests) => requests.request(path, address),
+            None => match self.bytes(path, address) {
+                Some(Ok(bytes)) => pe2_ext::Requested::Ready(bytes),
+                Some(Err(why)) => pe2_ext::Requested::Failed(format!("{why:#}")),
+                None => pe2_ext::Requested::Failed(format!("{path} has no {address}")),
+            },
+        }
     }
 
     fn call(&self, service: &str, arguments: &Value) -> Result<Value> {

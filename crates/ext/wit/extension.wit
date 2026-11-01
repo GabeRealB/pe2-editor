@@ -249,6 +249,13 @@ interface host {
         finish: func() -> result<file, string>;
     }
 
+    /// An output asked for: there, on its way for so many milliseconds, or why it cannot be.
+    variant requested {
+        ready(list<u8>),
+        pending(u32),
+        failed(string),
+    }
+
     /// The project, lent for a call: what an extension asks about other assets. The assets it returns are lent for
     /// the same call.
     resource project {
@@ -273,6 +280,9 @@ interface host {
         /// An output of an asset that is one file, whole, made from its settings as they are written: what a viewer
         /// shows of what is being edited. None where it has no such output, or why it could not be made.
         bytes: func(path: string, address: string) -> option<result<list<u8>, string>>;
+        /// What `bytes` gives, without waiting for it: for a frame, as how long an output takes is what it reads. What is on
+        /// its way is shown again when it is there.
+        request: func(path: string, address: string) -> requested;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
         /// the services of the extensions this one requires, or its own.
         call: func(service: string, arguments: string) -> result<string, string>;

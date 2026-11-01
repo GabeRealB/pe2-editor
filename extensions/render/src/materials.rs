@@ -269,7 +269,17 @@ impl Bindings {
 impl View for Bindings {
     fn show(&mut self, ui: &mut Ui) {
         let Some(asset) = ui.asset() else { return };
-        let assembled = self.assembled.take().unwrap_or_else(|| assembly::assemble(ui.project(), &asset).map_err(|why| format!("{why:#}")));
+        let assembled = match self.assembled.take() {
+            Some(assembled) => assembled,
+            None => match assembly::requested(ui.project(), &asset) {
+                assembly::Scene::Ready(assembled) => Ok(*assembled),
+                assembly::Scene::Failed(why) => Err(why),
+                assembly::Scene::Waiting(waited) => {
+                    assembly::say_waiting(ui, waited);
+                    return;
+                }
+            },
+        };
         let assembled = match assembled {
             Ok(assembled) => assembled,
             Err(why) => {

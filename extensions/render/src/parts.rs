@@ -85,9 +85,11 @@ pub fn contents(asset: &Asset, project: &dyn Project) -> Contents {
     if is_material(asset) {
         return material_contents(asset);
     }
-    let assembled = match assembly::assemble(project, asset) {
-        Ok(assembled) => assembled,
-        Err(why) => return Contents { problem: Some(format!("{why:#}")), stack: false, ..Contents::default() },
+    let assembled = match assembly::requested(project, asset) {
+        assembly::Scene::Ready(assembled) => assembled,
+        assembly::Scene::Failed(why) => return Contents { problem: Some(why), stack: false, ..Contents::default() },
+        // Asked again when it is there: what is said now is not kept.
+        assembly::Scene::Waiting(_) => return Contents { stack: false, ..Contents::default() },
     };
     let mut rows = vec![ContentRow::heading("hierarchy", "Hierarchy")];
     for (index, part) in assembled.model.parts.iter().enumerate() {
@@ -259,7 +261,7 @@ fn node_sheet(assembled: &Assembled, asset: &Asset, index: usize) -> Option<Part
 
 /// What a part says of itself in the inspector.
 pub fn part_sheet(asset: &Asset, project: &dyn Project, part: &str) -> Option<PartSheet> {
-    let assembled = assembly::assemble(project, asset).ok()?;
+    let assembly::Scene::Ready(assembled) = assembly::requested(project, asset) else { return None };
     node_sheet(&assembled, asset, bone_of(part)?)
 }
 

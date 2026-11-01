@@ -8,6 +8,16 @@
 
 use crate::{Asset, Image, Result, Value};
 
+/// An output asked for without waiting (`Project::request`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Requested {
+    Ready(Vec<u8>),
+    /// On its way, for so many milliseconds.
+    Pending { waited: u32 },
+    /// Why it cannot be.
+    Failed(String),
+}
+
 /// What the host answers about the project.
 pub trait Project {
     /// The asset at a resolved path.
@@ -46,6 +56,15 @@ pub trait Project {
     fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
         let _ = (path, address);
         None
+    }
+    /// What `bytes` gives, without waiting for it: for a frame, as how long an output takes is what it reads. What is on its
+    /// way is shown again when it is there. Where nothing can make it on the side, it is made here.
+    fn request(&self, path: &str, address: &str) -> Requested {
+        match self.bytes(path, address) {
+            Some(Ok(bytes)) => Requested::Ready(bytes),
+            Some(Err(why)) => Requested::Failed(format!("{why:#}")),
+            None => Requested::Failed(format!("{path} has no {address}")),
+        }
     }
     /// A service an extension offers (`pe2.images@palette`): its answer to these arguments. A component calls only
     /// the services of the extensions it requires (or its own).

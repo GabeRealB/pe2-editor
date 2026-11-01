@@ -327,6 +327,14 @@ impl Project for Lens<'_> {
         Some(self.project.bytes(path, address)?.map_err(crate::Error::msg))
     }
 
+    fn request(&self, path: &str, address: &str) -> crate::Requested {
+        match self.project.request(path, address) {
+            host::Requested::Ready(bytes) => crate::Requested::Ready(bytes),
+            host::Requested::Pending(waited) => crate::Requested::Pending { waited },
+            host::Requested::Failed(why) => crate::Requested::Failed(why),
+        }
+    }
+
     fn call(&self, service: &str, arguments: &Value) -> crate::Result<Value> {
         let answer = self.project.call(service, &value_text(arguments)).map_err(crate::Error::msg)?;
         parse_value(&answer).ok_or_else(|| crate::anyhow!("{service}: its answer is not TOML"))
