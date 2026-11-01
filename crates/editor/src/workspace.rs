@@ -199,6 +199,8 @@ pub struct Workspace {
     watch: Option<Watch>,
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
+    /// The watcher being started, off the window's thread.
+    watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
     /// The agents' link, started with the watcher; their requests, answered between frames.
     link: Option<mcp::link::Listener>,
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
@@ -447,6 +449,14 @@ pub struct Opened {
     tree: Arc<Node>,
 }
 
+/// What a project being left has yet to finish. Dropped in this order: what writes first, the lock on all it writes last.
+pub struct Leaving {
+    _takein: crate::takein::TakeIn,
+    _runner: crate::runner::Runner,
+    _index: Arc<Index>,
+    _lock: Lock,
+}
+
 /// An event asked for: the events, the config, and who waits for what became of it.
 type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
 
@@ -608,6 +618,7 @@ impl Workspace {
             lock,
             cache_dir,
             watch: None,
+            watch_starting: None,
             watch_error: None,
             link: None,
             requests: None,
@@ -661,7 +672,19 @@ impl Workspace {
                 self.signal_all(roots, config, reply);
             }
         }
-        if self.watch.is_some() || self.watch_error.is_some() {
+        if let Some(starting) = &self.watch_starting
+            && let Ok(started) = starting.try_recv()
+        {
+            self.watch_starting = None;
+            match started {
+                Ok(watch) => self.watch = Some(watch),
+                Err(why) => self.watch_error = Some(why),
+            }
+        }
+        if self.link.is_none() && self.link_error.is_none() {
+            self.serve(ctx);
+        }
+        if self.watch.is_some() || self.watch_error.is_some() || self.watch_starting.is_some() {
             return;
         }
         let root = &self.project.root;
@@ -672,13 +695,28 @@ impl Workspace {
         shallow.push(root.clone());
         shallow.dedup();
         let ignore = vec![self.cache_dir.clone(), root.join("roms"), root.join("build")];
-        match Watch::start(&roots, &shallow, ignore, ctx.clone()) {
-            Ok(watch) => self.watch = Some(watch),
-            Err(e) => self.watch_error = Some(format!("the layers are not watched: {e}")),
+        // Reading every folder of a project to watch it takes more than a frame has.
+        let (ctx, (started, starting)) = (ctx.clone(), mpsc::channel());
+        let start = move || {
+            let watch = Watch::start(&roots, &shallow, ignore, ctx.clone()).map_err(|e| format!("the layers are not watched: {e}"));
+            let _ = started.send(watch);
+            ctx.request_repaint();
+        };
+        if std::thread::Builder::new().name("watch".into()).spawn(start).is_ok() {
+            self.watch_starting = Some(starting);
         }
-        if self.link.is_none() && self.link_error.is_none() {
-            self.serve(ctx);
-        }
+    }
+
+    /// How many views are alive: what going on as it is keeps.
+    #[cfg(test)]
+    pub fn views_alive(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Whether the layers are yet to be watched.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn watch_is_starting(&self) -> bool {
+        self.watch_starting.is_some()
     }
 
     /// Whether what the importers made is attached: until it is, the project shows without their outputs.
@@ -693,7 +731,35 @@ impl Workspace {
 
     /// Read the project again, as this changed: it goes on showing until the new one is ready.
     pub fn reload(&mut self, why: &'static str) {
-        self.takein.reload(why);
+        self.takein.reload(why, false);
+    }
+
+    /// Read the project again, its files too, as someone asked.
+    pub fn reload_whole(&mut self) {
+        self.takein.reload("Reload", true);
+    }
+
+    /// While the project is being read or attached, the ticket of the last job asked: what would have to wait for it is
+    /// better done after, the window going on, than waited for.
+    pub fn reading_until(&self) -> Option<u64> {
+        (self.takein.stage().is_some() || !self.attached()).then(|| self.takein.issued())
+    }
+
+    /// Leave the project. What takes a moment to finish - what the worker is on, an epoch, letting go of the index - is
+    /// handed back, to finish away from the window.
+    pub fn leave(self) -> Leaving {
+        Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock }
+    }
+
+    /// Have the worker read until what is returned goes.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn hold_worker(&mut self) -> mpsc::Sender<()> {
+        self.takein.hold()
+    }
+
+    /// Whether what this ticket asked is done.
+    pub fn covers(&self, ticket: u64) -> bool {
+        self.takein.covers(ticket)
     }
 
     /// Signal an event: an epoch begins, on the project as last taken in, for the config in use.
@@ -870,7 +936,7 @@ impl Workspace {
             if found != self.extensions_found {
                 // Asked once: what it is taken for is what was found then, read again or not.
                 self.extensions_found = found;
-                self.takein.reload("an extension changed");
+                self.takein.reload("an extension changed", false);
             }
         }
         // What the editor wrote (an edit, a step, a setting of the project): taken in at once.
@@ -966,10 +1032,10 @@ impl Workspace {
             if let Some(said) = snapshot.said {
                 self.outcome = Update::Said(said);
             }
-            self.index = snapshot.index;
+            let before = (std::mem::replace(&mut self.index, snapshot.index), std::mem::replace(&mut self.tree, snapshot.tree));
             self.revision += 1;
             if let Some(reloaded) = snapshot.reloaded {
-                self.take_up(reloaded);
+                self.take_up(reloaded, snapshot.all);
             }
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
@@ -980,7 +1046,7 @@ impl Workspace {
                 }
                 pictures.set_index(self.index.clone());
             }
-            self.tree = snapshot.tree;
+            crate::aside::drop_later(before);
             self.layers = snapshot.layers;
             self.refresh_editable();
             if snapshot.all || self.textures.live.as_ref().is_some_and(|live| snapshot.changed.contains(&live.asset)) {
@@ -1038,7 +1104,7 @@ impl Workspace {
 
     /// Go on with the project as it was read again: what works for the extensions starts anew with the new ones, and what
     /// was showing is shown by them.
-    fn take_up(&mut self, reloaded: crate::takein::Reloaded) {
+    fn take_up(&mut self, reloaded: crate::takein::Reloaded, all: bool) {
         let crate::takein::Reloaded { project, extensions, found, why } = reloaded;
         let places = |project: &Project| project.layers.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
         if places(&project) != places(&self.project) {
@@ -1047,15 +1113,20 @@ impl Workspace {
         self.runner.restart(project.clone(), extensions.clone());
         self.project = project;
         self.extensions_found = found;
+        self.outcome = Update::Reloaded(why);
+        // What came of it is what was showing: it goes on.
+        if Arc::ptr_eq(&extensions, &self.extensions) && !all {
+            return;
+        }
         self.thumbs = crate::thumbs::Thumbs::start(extensions.clone(), self.store.clone());
-        self.textures.pictures = Some(crate::pictures::Pictures::start(self.index.clone(), extensions.clone()));
+        let pictures = crate::pictures::Pictures::start(self.index.clone(), extensions.clone());
+        crate::aside::drop_later(self.textures.pictures.replace(pictures));
         self.extensions = extensions;
         self.players.clear();
         self.played.clear();
         self.view_edit = None;
         self.field_edit = None;
         self.signal(ProjectOpened::NAME);
-        self.outcome = Update::Reloaded(why);
     }
 
     /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. Its
@@ -1431,12 +1502,9 @@ impl Workspace {
     ///
     /// # Errors
     /// The name is not one a layer may take, or it cannot be written.
-    pub fn add_layer(&mut self, name: &str, kind: project::LayerKind) -> Result<()> {
+    pub fn add_layer(&mut self, name: &str, kind: project::LayerKind) -> Result<u64> {
         project::stack::add(&self.project, name, kind, &mut self.history)?;
-        // Asked for here so that what comes next finds it there.
-        self.take_written();
-        self.settle();
-        Ok(())
+        Ok(self.take_written().unwrap_or_else(|| self.takein.issued()))
     }
 
     /// Where an override of an entry (by uid) goes: the active layer (none), or - code (an entry of a files layer)

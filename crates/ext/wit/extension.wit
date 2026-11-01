@@ -651,6 +651,40 @@ interface guest {
         members: bool,
         /// Its outputs after the first: each by name, with its type.
         also: list<tuple<string, string>>,
+        /// Whether it says what it reads before it runs: `prepare-op`, called back by the operation.
+        prepares: bool,
+    }
+
+    /// An output of another node an operation will read: by the node's path or a reference to it, and its address.
+    record need {
+        node: string,
+        address: string,
+    }
+
+    /// Where a micro op's value comes from: an earlier micro op's, or what the operation it splits was given at a port -
+    /// of a file-holding value only the files named, each a whole name or a folder ending in `/`, where any are named.
+    record micro-input {
+        micro: option<u32>,
+        port: u32,
+        files: list<string>,
+    }
+
+    /// A piece of an operation's work: another operation of its extension, run with these settings (TOML) and values by
+    /// port. Its `label` tells it from the others and stays the same between runs; one kept is made once for what it
+    /// takes and reads.
+    record micro {
+        op: string,
+        label: string,
+        settings: string,
+        ports: list<list<micro-input>>,
+        keep: bool,
+    }
+
+    /// What an operation says before it runs: what it will read, made first; and, where it splits, the micro ops doing
+    /// its work in its place, each after those it takes from, the last one's value its own.
+    record prepared {
+        needs: list<need>,
+        micros: list<micro>,
     }
 
     /// A type of the extension's own: with a recognizer - signatures, a sniff called back by its handle, a media type
@@ -762,6 +796,10 @@ interface guest {
     /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
     /// parameter.
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
+    /// What an operation's run will read, given what its run is given. Asked again once that is made, as long as it asks for
+    /// more: what it read is there to read, and anything else is noted as asked for, and fails. Its reads are its run's, so
+    /// that an operation reads only what this said.
+    prepare-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<prepared, string>;
     /// A family's members, of an asset: each by its parameter's value, with a label. An added output goes by its place
     /// after the types, as `type`.
     members: func(op: u32, asset: borrow<asset>) -> list<tuple<string, string>>;

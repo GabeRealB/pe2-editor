@@ -214,4 +214,48 @@ impl<'a> Editor<'a> {
         let answer = self.call("pictured", Table::from_iter([("text".to_string(), text(path)), ("address".to_string(), text(address))]))?;
         Ok(answer.as_bool().unwrap_or(false))
     }
+
+    /// Ask to override an entry, as a layer's button does: an entry of a files layer asks which layer first.
+    ///
+    /// # Errors
+    /// There is no such entry.
+    pub fn override_entry(&self, path: &str) -> Result<()> {
+        self.step("override_entry", path)
+    }
+
+    /// Hold the worker as though it were reading the project, until `release_reading`. What waits for that waits, as long
+    /// as this lasts: nothing else lets a test find the editor at this moment, and one that never lets go hangs it.
+    ///
+    /// # Errors
+    /// It is held already.
+    pub fn hold_reading(&self) -> Result<()> {
+        self.step("hold_reading", "")
+    }
+
+    /// Let the worker go, and wait for what was waiting.
+    ///
+    /// # Errors
+    /// It is not held.
+    pub fn release_reading(&self) -> Result<()> {
+        self.step("release_reading", "")
+    }
+
+    /// A node of this declaration, whatever it says: nothing checks that a template would make it.
+    ///
+    /// # Errors
+    /// It cannot be written.
+    pub fn declare(&self, path: &str, uid: &str, declaration: &str) -> Result<()> {
+        let arguments = [("text", path), ("uid", uid), ("declaration", declaration)];
+        self.call("declare", arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect()).map(drop)
+    }
+
+    /// Make an output of a node, as a view asking for it does, nothing kept: what went wrong, if anything did.
+    ///
+    /// # Errors
+    /// There is no such node.
+    pub fn made(&self, path: &str, address: &str) -> Result<Option<String>> {
+        let arguments = [("text", path), ("address", address)];
+        let answer = self.call("made", arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect())?;
+        Ok(answer.as_str().filter(|why| !why.is_empty()).map(str::to_string))
+    }
 }

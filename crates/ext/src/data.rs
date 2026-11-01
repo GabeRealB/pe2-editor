@@ -424,7 +424,8 @@ pub enum Retain {
     Cache,
     /// In the project's build directory.
     Build,
-    /// Not at all: handed to whoever asked, what it read kept.
+    /// For the run making it: an epoch, or an attach, gives it to whoever asks while what it read holds, and forgets it
+    /// when it ends. Asked for outside a run, it is made for whoever asks.
     Transient,
 }
 
@@ -916,8 +917,80 @@ pub struct OpDef {
     /// Its outputs after the first, by name.
     pub also: Vec<(String, Type)>,
     pub run: Arc<RunOp>,
+    /// What it will read, said before it runs (`OpBuilder::prepare`). What says nothing reads nothing of other nodes.
+    pub prepare: Option<Arc<PrepareOp>>,
     /// For a stream operation (its output a `stream<T>`): how it is opened.
     pub start: Option<Arc<StartStream>>,
+}
+
+/// What says what an operation will read.
+pub type PrepareOp = dyn Fn(&mut Call<'_>) -> Result<Prepared> + Send + Sync;
+
+/// An output of another node an operation will read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Need {
+    /// The node, by its path or a reference to it.
+    pub node: String,
+    pub address: String,
+}
+
+impl Need {
+    #[must_use]
+    pub fn new(node: &str, address: &str) -> Need {
+        Need { node: node.to_string(), address: address.to_string() }
+    }
+}
+
+/// Where a micro op's value comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicroInput {
+    /// An earlier micro op's value, by its place; otherwise what the operation was given at `port`.
+    pub micro: Option<u32>,
+    pub port: u32,
+    /// Of a value holding files, only these: each a whole name, or a folder ending in `/`. None: all of it.
+    pub files: Vec<String>,
+}
+
+impl MicroInput {
+    /// What the operation was given at a port.
+    #[must_use]
+    pub fn port(port: u32) -> MicroInput {
+        MicroInput { micro: None, port, files: Vec::new() }
+    }
+
+    /// An earlier micro op's value.
+    #[must_use]
+    pub fn micro(at: usize) -> MicroInput {
+        MicroInput { micro: u32::try_from(at).ok(), port: 0, files: Vec::new() }
+    }
+
+    /// Only these of its files.
+    #[must_use]
+    pub fn only(mut self, files: &[&str]) -> MicroInput {
+        self.files = files.iter().map(ToString::to_string).collect();
+        self
+    }
+}
+
+/// A piece of an operation's work: another operation of its extension.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Micro {
+    pub op: String,
+    /// What tells it from the others: the same between runs.
+    pub label: String,
+    pub settings: Table,
+    pub ports: Vec<Vec<MicroInput>>,
+    /// Kept, and made once for what it takes and reads.
+    pub keep: bool,
+}
+
+/// What an operation says before it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prepared {
+    /// What it will read: made first, with no instance of it held meanwhile.
+    pub needs: Vec<Need>,
+    /// Where it splits, what does its work in its place, each taking from those before it. The last one's value is its.
+    pub micros: Vec<Micro>,
 }
 
 /// A family's members: each by the value of its parameter, with a label.

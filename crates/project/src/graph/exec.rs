@@ -218,6 +218,15 @@ thread_local! {
 }
 
 impl<'a> Reach<'a> {
+    /// What an output is known by, of a node by its reference.
+    ///
+    /// # Errors
+    /// No node is so named.
+    pub fn key(&self, reference: &toml::Value, address: &str) -> Result<String> {
+        let (node, _) = self.world.node(reference).with_context(|| format!("{reference}: no such node"))?;
+        Ok(format!("{}#{address}", id(node)))
+    }
+
     /// Another node's output, by its reference and its address: made, or found kept, in the world; with its hash.
     ///
     /// # Errors
@@ -310,10 +319,71 @@ pub struct Call<'a> {
     reach: Option<Reach<'a>>,
     /// Where the stored contents of other nodes' outputs read in its evaluation are.
     others: &'a Others,
+    /// What it may read of other nodes, where it is held to that.
+    needs: Option<&'a Needs>,
 }
+
+/// What an operation said it reads, made before it ran, by `<node>#<address>`; and what it asked for that was not.
+#[derive(Default)]
+pub struct Needs {
+    made: Mutex<HashMap<String, std::result::Result<Got, String>>>,
+    asked: Mutex<Vec<(toml::Value, String)>>,
+}
+
+/// An output of another node, read.
+#[derive(Clone)]
+struct Got {
+    read: String,
+    value: Arc<Value>,
+    hash: String,
+}
+
+/// How many rounds an operation may ask for more before it is taken to be going in circles.
+const MOST_ROUNDS: usize = 4096;
 
 /// Where stored contents of other nodes' outputs are, by hash.
 type Others = Mutex<HashMap<String, std::path::PathBuf>>;
+
+/// Another node's output, made or found kept, and its stored contents found: where its node has them, or - its node having
+/// them nowhere a path names - kept in the store.
+fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, address: &str) -> Result<Got> {
+    let (read, given, node) = reach.output(reference, address)?;
+    let value = given.value.with_context(|| format!("{read}: made nothing"))?;
+    let mut stored = Vec::new();
+    stored_contents(&value, &mut stored);
+    let mut others = others.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for sha1 in stored {
+        let path = match (reach.engine.store(), node.content_path(&sha1)) {
+            (_, Some(path)) => path,
+            // What a node's own output made is in no file of its: the store has it already.
+            (Some(store), None) if store.blob_path(&sha1).exists() => store.blob_path(&sha1),
+            (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1),
+            (None, None) => continue,
+        };
+        others.insert(sha1, path);
+    }
+    Ok(Got { read, value, hash: given.hash })
+}
+
+/// This work on another thread, what this one was making going with it: a node reading itself is found across threads too.
+fn making_as(chain: &[String], work: impl FnOnce() -> Result<Got>) -> Result<Got> {
+    let own = MAKING.with(|making| std::mem::replace(&mut *making.borrow_mut(), chain.to_vec()));
+    let done = work();
+    MAKING.with(|making| *making.borrow_mut() = own);
+    done
+}
+
+/// A value with only these of its files: each a whole name, or a folder ending in `/`.
+fn only_files(input: &Input, files: &[String]) -> std::result::Result<Input, String> {
+    if files.is_empty() {
+        return Ok(input.clone());
+    }
+    let Value::Typed(typed) = input.value() else { return Err(format!("it holds no files: {}", input.value().ty())) };
+    let wanted = |name: &str| files.iter().any(|file| name == file || (file.ends_with('/') && name.starts_with(file.as_str())));
+    let mut typed = typed.clone();
+    typed.files.retain(|file| wanted(&file.name));
+    Ok(Input(Arc::new(Value::Typed(typed))))
+}
 
 impl<'a> Call<'a> {
     /// The value given to a port taking one.
@@ -375,25 +445,24 @@ impl<'a> Call<'a> {
     /// Nothing beyond its node is reachable here, or the output cannot be made.
     pub fn output_of(&self, reference: &toml::Value, address: &str) -> Result<Arc<Value>> {
         let reach = self.reach.context("no other node is reachable here")?;
-        let (read, given, node) = reach.output(reference, address)?;
-        let value = given.value.with_context(|| format!("{read}: made nothing"))?;
-        // Its stored contents are found where its node has them, or - its node having them nowhere a path names -
-        // kept in the store.
-        let mut stored = Vec::new();
-        stored_contents(&value, &mut stored);
-        let mut others = self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for sha1 in stored {
-            let path = match (reach.engine.store(), node.content_path(&sha1)) {
-                (_, Some(path)) => path,
-                // What a node's own output made is in no file of its: the store has it already.
-                (Some(store), None) if store.blob_path(&sha1).exists() => store.blob_path(&sha1),
-                (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1),
-                (None, None) => continue,
-            };
-            others.insert(sha1, path);
-        }
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outputs.insert(read, given.hash);
-        Ok(value)
+        let got = match self.needs {
+            None => fetch(reach, self.others, reference, address)?,
+            Some(needs) => {
+                let key = reach.key(reference, address)?;
+                let made = needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned();
+                match made {
+                    Some(Ok(got)) => got,
+                    Some(Err(why)) => anyhow::bail!("{why}"),
+                    None => {
+                        let mut asked = needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        asked.push((reference.clone(), address.to_string()));
+                        anyhow::bail!("{key}: it did not say it reads this");
+                    }
+                }
+            }
+        };
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outputs.insert(got.read, got.hash);
+        Ok(got.value)
     }
 
     /// The plain files under a folder of the project, recorded as read.
@@ -682,7 +751,16 @@ pub fn evaluate(
     (made, reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// `making_as`, for a value made.
+fn making_made(chain: &[String], work: impl FnOnce() -> Made) -> Made {
+    let own = MAKING.with(|making| std::mem::replace(&mut *making.borrow_mut(), chain.to_vec()));
+    let done = work();
+    MAKING.with(|making| *making.borrow_mut() = own);
+    done
+}
+
 /// What an evaluation runs with.
+#[derive(Clone, Copy)]
 struct Evaluation<'a> {
     plan: &'a Plan,
     ops: &'a Ops,
@@ -760,7 +838,7 @@ impl Evaluation<'_> {
             let Some(start) = def.start.as_ref() else { return fail(format!("`{}` makes nothing", step.op)) };
             // A stream, for what takes it from here: opened, and read in turn.
             let others = self.others;
-            let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others };
+            let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: None };
             return match start(&mut call) {
                 Ok(producer) => {
                     let stream = super::stream::Stream::open(producer);
@@ -787,7 +865,19 @@ impl Evaluation<'_> {
             }
         }
         let others = self.others;
-        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others };
+        let needs = Needs::default();
+        let mut micros = Vec::new();
+        if let Some(prepare) = &def.prepare {
+            match self.prepared(&**prepare, step, &inputs, parameter, recorder, &needs) {
+                Ok(split) => micros = split,
+                Err(e) => return fail(format!("{e:#}")),
+            }
+        }
+        if !micros.is_empty() {
+            return self.split(step, &inputs, &micros, parameter);
+        }
+        let held = def.strict.then_some(&needs);
+        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: held };
         let value = match run(&mut call) {
             Ok(value) => value,
             Err(e) => return fail(format!("{e:#}")),
@@ -798,6 +888,152 @@ impl Evaluation<'_> {
             return fail(format!("`{}` made {}, not {ty}", step.op, value.ty()));
         }
         Ok(Arc::new(value))
+    }
+
+    /// What an operation says before it runs, asked until it asks for nothing new, what it asks for made in between: no
+    /// instance of it is held meanwhile, so that however far what it reads goes on, it holds one. Its micro ops, where it
+    /// splits. What failed to be made is left for its read to say, as it may be what it wanted to know.
+    fn prepared(
+        &self,
+        prepare: &super::Prepare,
+        step: &super::Step,
+        inputs: &[Vec<Input>],
+        parameter: Option<&str>,
+        recorder: Recorder<'_>,
+        needs: &Needs,
+    ) -> Result<Vec<pe2_ext::Micro>> {
+        for _ in 0..MOST_ROUNDS {
+            let others = self.others;
+            let mut call = Call { inputs: inputs.to_vec(), settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: Some(needs) };
+            let prepared = prepare(&mut call);
+            let mut asked = std::mem::take(&mut *needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            if let Ok(prepared) = &prepared {
+                asked.extend(prepared.needs.iter().map(|need| (toml::Value::String(need.node.clone()), need.address.clone())));
+            }
+            let new = self.reach.map_or_else(Vec::new, |reach| {
+                let held = needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut new: Vec<(String, toml::Value, String)> = Vec::new();
+                for (reference, address) in asked {
+                    let Ok(key) = reach.key(&reference, &address) else { continue };
+                    if !held.contains_key(&key) && !new.iter().any(|(known, ..)| *known == key) {
+                        new.push((key, reference, address));
+                    }
+                }
+                new
+            });
+            if new.is_empty() {
+                return prepared.map(|prepared| prepared.micros);
+            }
+            let chain = MAKING.with(|making| making.borrow().clone());
+            let others = self.others;
+            let reach = self.reach.context("no other node is reachable here")?;
+            let made = crate::parallel(&new, |(key, reference, address)| {
+                (key.clone(), making_as(&chain, || fetch(reach, others, reference, address)).map_err(|e| format!("{e:#}")))
+            });
+            needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(made);
+        }
+        anyhow::bail!("it asks for more each time it is asked: {MOST_ROUNDS} rounds")
+    }
+
+    /// An operation's work in micro ops, each once those it takes from are made, those with nothing between them at the same
+    /// time. What the last one makes is what it makes.
+    fn split(&self, step: &super::Step, inputs: &[Vec<Input>], micros: &[pe2_ext::Micro], parameter: Option<&str>) -> Made {
+        let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
+        let after = |micro: &pe2_ext::Micro| micro.ports.iter().flatten().filter_map(|from| from.micro).map(|at| at as usize).collect::<Vec<_>>();
+        let mut rounds: Vec<Vec<usize>> = Vec::new();
+        let mut round_of = vec![0; micros.len()];
+        for (at, micro) in micros.iter().enumerate() {
+            let deps = after(micro);
+            if let Some(later) = deps.iter().find(|from| **from >= at) {
+                return Err(Arc::from(format!("{}: {} takes from {later}, which comes after it", step.at, micro.label)));
+            }
+            let round = deps.iter().map(|from| round_of[*from] + 1).max().unwrap_or(0);
+            round_of[at] = round;
+            if rounds.len() <= round {
+                rounds.resize_with(round + 1, Vec::new);
+            }
+            rounds[round].push(at);
+        }
+        let mut made: Vec<Option<Made>> = vec![None; micros.len()];
+        let chain = MAKING.with(|making| making.borrow().clone());
+        for round in rounds {
+            let done = crate::parallel(&round, |at| {
+                let micro = &micros[*at];
+                let value = making_made(&chain, || self.micro(extension, step, micro, inputs, &made, parameter));
+                (*at, value)
+            });
+            for (at, value) in done {
+                made[at] = Some(value);
+            }
+        }
+        made.pop().flatten().unwrap_or_else(|| Err("not made".into()))
+    }
+
+    /// A micro op: found kept where what it takes is the same and what it read still holds, else run, reading what it says
+    /// it reads as an operation does.
+    fn micro(
+        &self,
+        extension: &str,
+        step: &super::Step,
+        micro: &pe2_ext::Micro,
+        given: &[Vec<Input>],
+        made: &[Option<Made>],
+        parameter: Option<&str>,
+    ) -> Made {
+        let at = format!("{}: {}", step.at, micro.label);
+        let fail = |what: String| -> Made { Err(Arc::from(format!("{at}: {what}"))) };
+        let mut ports = Vec::with_capacity(micro.ports.len());
+        for port in &micro.ports {
+            let mut values = Vec::with_capacity(port.len());
+            for from in port {
+                let found: Vec<Input> = match from.micro {
+                    Some(earlier) => match made.get(earlier as usize).and_then(Option::as_ref) {
+                        Some(Ok(value)) => vec![Input(Arc::clone(value))],
+                        Some(Err(why)) => return Err(Arc::clone(why)),
+                        None => return fail(format!("it takes from {earlier}, which is not made")),
+                    },
+                    None => given.get(from.port as usize).cloned().unwrap_or_default(),
+                };
+                for value in &found {
+                    match only_files(value, &from.files) {
+                        Ok(value) => values.push(value),
+                        Err(why) => return fail(why),
+                    }
+                }
+            }
+            ports.push(values);
+        }
+        let op = format!("{extension}@{}", micro.op);
+        let version = self.ops.get(&op).map_or("?", |def| def.version.as_str());
+        let settings = toml::to_string(&micro.settings).unwrap_or_default();
+        let taken: Vec<String> = ports.iter().flatten().map(|input| super::hash(input.value())).collect();
+        let text = format!("{VALUES}\n{}\n{op}@{version}\n{}\n{settings}\n{taken:?}\n{parameter:?}", id(self.node), micro.label);
+        let key = crate::extract::sha1_hex(text.as_bytes());
+        let store = self.store.filter(|_| micro.keep);
+        if let Some(store) = store
+            && let Some(trace) = store.trace(&key).filter(|trace| trace.reads.hold(self.node, self.reach))
+            && let Ok(value) = store.get(&trace.value)
+        {
+            self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&trace.reads);
+            return Ok(Arc::new(value));
+        }
+        let reads = Mutex::new(Reads::default());
+        let own = Evaluation { reads: &reads, ..*self };
+        let piece = super::Step { op, settings: micro.settings.clone(), inputs: Vec::new(), ty: pe2_ext::Type::Any, at };
+        let value = own.step(&piece, ports, parameter, Recorder { node: self.node, reads: &reads })?;
+        let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = store {
+            let hash = super::hash(&value);
+            let keep = store.put(&hash, &value, &|sha1| self.node.read_content(sha1).ok()).and_then(|()| {
+                let trace = Trace { value: hash, reads: reads.clone(), node: id(self.node).to_string(), output: format!("micro/{}", micro.label) };
+                store.put_trace(&key, &trace)
+            });
+            if let Err(why) = keep {
+                return Err(Arc::from(format!("{}: {why:#}", piece.at)));
+            }
+        }
+        self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&reads);
+        Ok(value)
     }
 
     /// A value as one file, its content kept in the store where it was in memory (and there is one).
@@ -820,12 +1056,17 @@ impl Evaluation<'_> {
 /// What kept values hold: raised when that changes, so that none kept before is taken for one made now.
 const VALUES: u32 = 3;
 
+/// A transient output as a run remembers it: its value, its hash and what it read.
+type Remembered = (Arc<Value>, String, Reads);
+
 /// Evaluates nodes' outputs, keeping those retained in the project's store.
 pub struct Engine {
     pub ops: Ops,
     store: Option<Store>,
     /// The config being built.
     pub config: Option<pe2_ext::data::BuildConfig>,
+    /// What is made for a run alone, where this is one, by its key: the value, its hash and what it read.
+    run: Option<Mutex<HashMap<String, Remembered>>>,
 }
 
 /// An output as the engine gives it: its value, where it was made or read now, its hash, and what it read - by which
@@ -842,7 +1083,15 @@ impl Engine {
     /// An engine keeping retained outputs in a store; none keeps nothing.
     #[must_use]
     pub fn new(ops: Ops, store: Option<Store>) -> Engine {
-        Engine { ops, store, config: None }
+        Engine { ops, store, config: None, run: None }
+    }
+
+    /// This engine for one run, an epoch or an attach, and dropped with it: what is transient lasts it, so that those reading
+    /// it share one. An engine kept for longer has no run to know its end by, and makes it for each.
+    #[must_use]
+    pub fn for_a_run(mut self) -> Engine {
+        self.run = Some(Mutex::default());
+        self
     }
 
     #[must_use]
@@ -917,10 +1166,21 @@ impl Engine {
                 return Ok(Given { value, hash: trace.value, kept: true, reads: trace.reads });
             }
         }
+        let remembered = self.run.as_ref().filter(|_| !retained).map(|run| (run, self.key(plan, node, output, parameter)));
+        if let Some((run, key)) = &remembered {
+            let held = run.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned();
+            // Those of a run can change under it: a later round makes again what an earlier one read.
+            if let Some((value, hash, reads)) = held.filter(|(.., reads)| reads.hold(node, reach)) {
+                return Ok(Given { value: Some(value), hash, kept: false, reads });
+            }
+        }
         let known = self.known(reach, plan, node, output);
         let (mut made, reads) = evaluate(plan, &self.ops, node, &[(output, parameter)], &known, (self.store.as_ref(), reach));
         let value = made.pop().unwrap_or_else(|| Err("not made".into())).map_err(|e| anyhow!("{e}"))?;
         let hash = super::hash(&value);
+        if let Some((run, key)) = remembered {
+            run.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (value.clone(), hash.clone(), reads.clone()));
+        }
         if retained && let Some(store) = &self.store {
             store.put(&hash, &value, &|sha1| node.read_content(sha1).ok())?;
             let trace = Trace { value: hash.clone(), reads: reads.clone(), node: id(node).to_string(), output: address.to_string() };
@@ -956,7 +1216,7 @@ impl Engine {
             inputs.push(values.into_iter().map(|v| v.map(Input).map_err(|e| anyhow!("{e}"))).collect::<Result<Vec<_>>>()?);
         }
         let recorder = Recorder { node, reads: &reads };
-        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store.as_ref(), reach, others: &others };
+        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store.as_ref(), reach, others: &others, needs: None };
         let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()))?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok((producer, reads, self.key(plan, node, output, parameter)))
@@ -982,7 +1242,7 @@ impl Engine {
         let inputs = inputs.into_iter().map(|port| port.into_iter().map(|v| Input(Arc::new(v))).collect()).collect();
         let recorder = Recorder { node, reads: &reads };
         let others = &Mutex::default();
-        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach, others };
+        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach, others, needs: None };
         run(&mut call)
     }
 

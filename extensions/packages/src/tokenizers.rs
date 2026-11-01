@@ -203,17 +203,20 @@ fn image_height(call: &Call, _: &Args) -> Result<String> {
 
 pub fn register(r: &mut Registry) {
     r.tokenizer(&["pe2.render@model"])
+        .follows()
         .whole(Yields::Definition("TmdSource"), &["symbol"], model_whole)
         .derived("buffer", Yields::IntLiteral, &[], model_buffer)
         .derived("seam", Yields::IntLiteral, &[], model_seam)
         .register();
     // A prefab's member is a model, as the prefab holds it.
     r.tokenizer(&["pe2.render@prefab"])
+        .follows()
         .whole(Yields::Definition("TmdSource"), &["symbol", "member"], member_whole)
         .derived("buffer", Yields::IntLiteral, &["member"], member_buffer)
         .derived("seam", Yields::IntLiteral, &["member"], member_seam)
         .register();
     r.tokenizer(&["pe2.render@material"])
+        .follows()
         .derived("tpage", Yields::IntLiteral, &[], material_tpage)
         .derived("clut", Yields::IntLiteral, &[], material_clut)
         .register();

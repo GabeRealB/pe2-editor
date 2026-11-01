@@ -744,6 +744,25 @@ impl g::Guest for Component {
         (def.run)(&mut call).map(to_wit).map_err(|e| format!("{e:#}"))
     }
 
+    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
+    async fn prepare_op(
+        op: u32,
+        node: &host::Asset,
+        inputs: Vec<Vec<types::Value>>,
+        settings: String,
+        parameter: Option<String>,
+    ) -> Result<g::Prepared, String> {
+        let def = registered().ops.get(op as usize).ok_or("no such operation")?;
+        let prepare = def.prepare.as_ref().ok_or("it says nothing before it runs")?;
+        let lent = Lent::borrowed(node);
+        let settings: Table = toml::from_str(&settings).unwrap_or_default();
+        let inputs: Vec<Vec<Data>> = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
+        let host = NodeHost(&lent);
+        let carried = crate::Call::carried_by(&inputs);
+        let mut call = crate::Call { inputs, settings: &settings, made: std::cell::RefCell::default(), carried, parameter_text: parameter.as_deref(), host: &host };
+        prepare(&mut call).map(prepared_to_wit).map_err(|e| format!("{e:#}"))
+    }
+
     fn members(op: u32, asset: &host::Asset) -> Vec<(String, String)> {
         let lent = Lent::borrowed(asset);
         let members = registered().ops.get(op as usize).and_then(|op| op.members.as_ref());
@@ -1038,7 +1057,24 @@ fn imports(ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) 
             provides: op.provides.as_ref().map(describe_provides),
             members: op.members.is_some(),
             also: op.also.iter().map(|(name, ty)| (name.clone(), ty.to_string())).collect(),
+            prepares: op.prepare.is_some(),
         });
+    }
+}
+
+/// What an operation said before it runs, as the contract carries it.
+fn prepared_to_wit(prepared: crate::Prepared) -> g::Prepared {
+    let input = |from: crate::MicroInput| g::MicroInput { micro: from.micro, port: from.port, files: from.files };
+    let micro = |micro: crate::Micro| g::Micro {
+        op: micro.op,
+        label: micro.label,
+        settings: toml::to_string(&micro.settings).unwrap_or_default(),
+        ports: micro.ports.into_iter().map(|port| port.into_iter().map(input).collect()).collect(),
+        keep: micro.keep,
+    };
+    g::Prepared {
+        needs: prepared.needs.into_iter().map(|need| g::Need { node: need.node, address: need.address }).collect(),
+        micros: prepared.micros.into_iter().map(micro).collect(),
     }
 }
 

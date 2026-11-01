@@ -61,6 +61,12 @@ struct Capture {
     pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// What was asked while the project was being read, done once it has been.
+enum Deferred {
+    Edit(EditRequest),
+    Step { redo: bool, force: bool },
+}
+
 /// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
 struct Opening {
     dir: PathBuf,
@@ -74,6 +80,8 @@ struct Opening {
 #[expect(clippy::struct_excessive_bools, reason = "each answers for itself")]
 pub struct Editor {
     workspace: Option<Workspace>,
+    /// What waits for the job of its ticket, in the order it was asked.
+    deferred: Vec<(u64, Deferred)>,
     /// A project being opened, off the window's thread.
     opening: Option<Opening>,
     /// The window's context: what a project being opened wakes.
@@ -218,6 +226,7 @@ impl Editor {
         let project = start.project.or(last);
         let mut editor = Editor {
             workspace: None,
+            deferred: Vec::new(),
             opening: None,
             ctx: cc.egui_ctx.clone(),
             layouts: Layouts {
@@ -286,8 +295,10 @@ impl Editor {
 
     /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
     fn open(&mut self, dir: &Path) {
-        // The project open now lets go of its lock first: opening it again must find it free.
-        self.workspace = None;
+        // The project open now lets go of its lock first: opening it again must find it free. It finishes what it is on to
+        // do that, on the thread opening the next.
+        let leaving = self.workspace.take().map(Workspace::leave);
+        self.deferred.clear();
         let progress: Arc<std::sync::Mutex<(String, usize, usize)>> = Arc::default();
         let (done, ready) = std::sync::mpsc::channel();
         let (dir_owned, said, ctx) = (dir.to_path_buf(), progress.clone(), self.ctx.clone());
@@ -298,6 +309,8 @@ impl Editor {
                 }
                 ctx.request_repaint();
             };
+            report("Closing the project", 0, 0);
+            drop(leaving);
             let _ = done.send(Workspace::prepare(&dir_owned, &report));
             ctx.request_repaint();
         });
@@ -362,7 +375,20 @@ impl Editor {
         Some(panes::OpeningShown { name, stage, fraction })
     }
 
-    /// Bring in what changed on disk; open the project again when its `project.toml` changed, keeping the selection.
+    /// What was asked while the project was being read, in order, once it has been.
+    fn do_deferred(&mut self) {
+        let Some(ws) = &self.workspace else { return };
+        let ready = self.deferred.iter().take_while(|(ticket, _)| ws.covers(*ticket)).count();
+        let ready: Vec<_> = self.deferred.drain(..ready).collect();
+        for (_, deferred) in ready {
+            match deferred {
+                Deferred::Edit(request) => self.edit(&request),
+                Deferred::Step { redo, force } => drop(self.step(redo, force)),
+            }
+        }
+    }
+
+    /// Bring in what changed on disk; read the project again when its `project.toml` changed, keeping what is showing.
     fn follow_disk(&mut self, ctx: &egui::Context) {
         let Some(ws) = &mut self.workspace else { return };
         // The config in use, as what events set off reads it.
@@ -390,6 +416,10 @@ impl Editor {
     /// Undo the last step, or redo; forced over files changed outside the editor. Blocked by such files, it asks.
     fn step(&mut self, redo: bool, force: bool) -> bool {
         let Some(ws) = &mut self.workspace else { return false };
+        if let Some(ticket) = ws.reading_until() {
+            self.deferred.push((ticket, Deferred::Step { redo, force }));
+            return true;
+        }
         let verb = if redo { "Redo" } else { "Undo" };
         match ws.step(redo, force) {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
@@ -424,6 +454,10 @@ impl Editor {
             return;
         }
         let Some(ws) = &mut self.workspace else { return };
+        if let Some(ticket) = ws.reading_until() {
+            self.deferred.push((ticket, Deferred::Edit(request.clone())));
+            return;
+        }
         if let EditRequest::EditIn(uid) = request {
             self.message = Some(match ws.edit_in(uid, &self.settings.tools) {
                 Ok(done) => done,
@@ -506,7 +540,8 @@ impl Editor {
             self.choosing = None;
             let added = self.workspace.as_mut().map(|ws| ws.add_layer(&name, project::LayerKind::Files));
             match added {
-                Some(Ok(())) => self.edit(&EditRequest::OverrideIn(uid, name)),
+                // The layer has to be there: the project is read again with it first.
+                Some(Ok(ticket)) => self.deferred.push((ticket, Deferred::Edit(EditRequest::OverrideIn(uid, name)))),
                 Some(Err(e)) => self.message = Some(format!("{e:#}")),
                 None => {}
             }
@@ -703,7 +738,7 @@ impl Editor {
             }
             Command::ReloadProject => {
                 if let Some(ws) = &mut self.workspace {
-                    ws.reload("Reload");
+                    ws.reload_whole();
                 }
             }
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -1788,6 +1823,24 @@ impl Editor {
         self.workspace.as_mut()
     }
 
+    /// Ask for an edit, as a pane does.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn ask(&mut self, request: &EditRequest) {
+        self.edit(request);
+    }
+
+    /// Open a project, as the menu does.
+    #[cfg(test)]
+    pub fn open_project(&mut self, dir: &Path) {
+        self.open(dir);
+    }
+
+    /// Whether something asked waits for the project to be read.
+    #[cfg(test)]
+    pub fn is_deferring(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
     /// Whether a project is being opened.
     pub fn is_opening(&self) -> bool {
         self.opening.is_some()
@@ -1795,7 +1848,7 @@ impl Editor {
 
     /// Whether something it set going has yet to show.
     pub fn busy(&self) -> bool {
-        self.opening.is_some() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.in_epoch() || ws.tests.running())
+        self.opening.is_some() || !self.deferred.is_empty() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.watch_is_starting() || ws.in_epoch() || ws.tests.running())
     }
 
     /// Undo the last step.
@@ -1840,6 +1893,7 @@ impl eframe::App for Editor {
         self.capture(&ctx);
         self.opened();
         self.follow_disk(&ctx);
+        self.do_deferred();
         // What an agent sees of the window is the project whole.
         if let Some(ws) = self.workspace.as_mut().filter(|ws| ws.attached()) {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));

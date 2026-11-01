@@ -120,6 +120,8 @@ pub struct Tokenizer<'a> {
     values: Vec<String>,
     target: Option<String>,
     entries: Vec<Entry>,
+    /// Its entries read other nodes as they go.
+    follows: bool,
 }
 
 impl Tokenizer<'_> {
@@ -127,6 +129,13 @@ impl Tokenizer<'_> {
     #[must_use]
     pub fn target(mut self, target: &str) -> Self {
         self.target = Some(target.to_string());
+        self
+    }
+
+    /// Its entries read other nodes, following what they find: what they read is found by running them.
+    #[must_use]
+    pub fn follows(mut self) -> Self {
+        self.follows = true;
         self
     }
 
@@ -146,21 +155,23 @@ impl Tokenizer<'_> {
 
     /// Register it.
     pub fn register(self) {
-        let Tokenizer { registry, values, target, entries } = self;
+        let Tokenizer { registry, values, target, entries, follows } = self;
         let local = values.first().and_then(|value| value.rsplit('@').next()).unwrap_or_default().to_string();
         let suffix = target.as_ref().map_or_else(String::new, |target| format!("_{target}"));
         let declared = declaration(&entries);
         let held = entries.clone();
         let names = |name: &str| target.as_ref().map_or_else(|| name.to_string(), |target| format!("{name}.{target}"));
         let taken: Vec<&str> = values.iter().map(String::as_str).collect();
-        let _ = registry
+        let op = registry
             .op(&format!("tokens_{local}{suffix}"))
             .label("Tokens")
             .takes("value", &taken)
             .output::<ty::Tokens>()
             .parameter::<String>("address")
             .provides(&names(OUTPUT))
-            .keeps(Retain::Cache)
+            .keeps(Retain::Cache);
+        let op = if follows { op.prepared_by_running() } else { op };
+        let _ = op
             .run(move |call| {
                 let asked: String = call.parameter()?;
                 let (name, args) = parsed(&asked);
@@ -207,7 +218,7 @@ fn declaration(entries: &[Entry]) -> Table {
 impl Registry {
     /// A tokenizer of values of these types, which this extension's dependencies register.
     pub fn tokenizer(&mut self, values: &[&str]) -> Tokenizer<'_> {
-        Tokenizer { registry: self, values: values.iter().map(|value| (*value).to_string()).collect(), target: None, entries: Vec::new() }
+        Tokenizer { registry: self, values: values.iter().map(|value| (*value).to_string()).collect(), target: None, entries: Vec::new(), follows: false }
     }
 }
 

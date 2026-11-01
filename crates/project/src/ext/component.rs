@@ -11,8 +11,8 @@
 //! reused while it is used and reclaimed after
 //! `READING_FRAMES` frames unused (the host counts frames: `frame`). Long-running jobs keep theirs: the views live in
 //! one instance, which goes when its last view closes and it answers that it may be reclaimed; an extraction session in
-//! one of its own, which goes with the session. Each engine pools its instances' slots, so making one is cheap and
-//! dropping one returns its memory. An instance that traps is dropped, not reused.
+//! one of its own, which goes with the session. Making one is cheap and dropping one returns its memory. An instance that
+//! traps is dropped, not reused.
 //!
 //! What a call lends - an asset, a frame's UI - the host keeps by pointer in the instance's resource table for the
 //! call alone, and takes back before the call returns; a row a view opens is closed before its frame is drawn on again.
@@ -79,35 +79,18 @@ const UNSANDBOXED_LONG: u64 = 360_000;
 const EXTRACTION: u64 = 6000;
 /// An instance's memory, at most, unless its extension declares more for its job (`Registry::memory`).
 const MEMORY: u64 = 256 << 20;
-/// The most any job may be given: a 32-bit memory's whole range, which a pooled slot reserves anyway.
+/// The most any job may be given: a 32-bit memory's whole range.
 const MOST_MEMORY: u64 = 4 << 30;
 /// A reading instance grown past this after a call is dropped, not kept: its memory goes back, as a guest's never
 /// shrinks.
 const RESIDENT: usize = 64 << 20;
 /// How many frames a reading instance stays unused before it is reclaimed.
 const READING_FRAMES: u32 = 60;
-/// How many instances of an extension live at once, at most: its readings', its jobs', its views'.
-const SLOTS: u32 = 16;
-/// What a slot keeps of its memory when its instance goes, to be reset rather than faulted in again by the next.
-const KEEP_RESIDENT: usize = 4 << 20;
-
-/// An extension's engine, deterministic - NaNs canonical, relaxed SIMD deterministic, an epoch for deadlines - with a
-/// pooling allocator of its own: its slots reserved up front (address space, not memory), at most `SLOTS` instances
-/// of it at once, an instance's memory decommitted to the component's image when it goes and its slot kept warm, so
-/// making one is cheap and dropping one gives its memory back.
+/// An extension's engine, deterministic - NaNs canonical, relaxed SIMD deterministic, an epoch for deadlines. Instances are
+/// made as they are asked for and let go of whole: how many there are is what is running, and no limit stands in for that.
+/// A memory starts as a copy-on-write view of the component's image, which is what makes one cheap.
 fn new_engine() -> Result<Engine> {
-    let mut pooling = wasmtime::PoolingAllocationConfig::default();
-    pooling
-        .total_component_instances(SLOTS)
-        .total_core_instances(SLOTS * 8)
-        .total_memories(SLOTS * 2)
-        .total_tables(SLOTS * 8)
-        .total_stacks(SLOTS)
-        .max_memory_size(usize::try_from(MOST_MEMORY).unwrap_or(usize::MAX))
-        .linear_memory_keep_resident(KEEP_RESIDENT)
-        .max_unused_warm_slots(4);
     let mut config = Config::new();
-    config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling));
     config.wasm_component_model_async(true);
     config.epoch_interruption(true);
     config.cranelift_nan_canonicalization(true);
@@ -1404,40 +1387,8 @@ impl Shared {
         if self.unsandboxed.is_some() { UNSANDBOXED_LONG } else { LONG }
     }
 
-    /// A new instance for a job that may take `cap` bytes; its extension registers when a call first needs it. Where
-    /// its engine's slots are all taken, room is made - the readings' instance reclaimed, a long-running one asked - and
-    /// it is tried once more.
+    /// A new instance for a job that may take `cap` bytes; its extension registers when a call first needs it.
     fn instantiate(&self, cap: u64) -> Result<Runner> {
-        match self.instance(cap) {
-            Ok(runner) => Ok(runner),
-            Err(_) if self.make_room() => self.instance(cap),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Room for an instance: the readings' instance reclaimed whatever its frames, and the views' asked whether it may
-    /// go where no view lives in it. Whether any went.
-    fn make_room(&self) -> bool {
-        let mut made = false;
-        if let Ok(mut reading) = self.reading.try_lock() {
-            made |= reading.take().is_some();
-        }
-        if self.open_views.load(Ordering::Relaxed) == 0
-            && let Ok(mut views) = self.views.try_lock()
-            && let Some(runner) = views.as_ref()
-        {
-            let reclaimable = runner.try_lock().ok().is_none_or(|mut r| {
-                r.call(QUICK, async |a, g| g.call_reclaimable(a).await).unwrap_or(true)
-            });
-            if reclaimable {
-                *views = None;
-                made = true;
-            }
-        }
-        made
-    }
-
-    fn instance(&self, cap: u64) -> Result<Runner> {
         let stderr = MemoryOutputPipe::new(64 << 10);
         let mut wasi = WasiCtx::builder();
         wasi.stderr(stderr.clone());
@@ -2168,6 +2119,21 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             });
         }
         let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
+        if op.prepares {
+            let shared = shared.clone();
+            builder = builder.prepare(move |call| {
+                let given = call.inputs.clone();
+                let settings = toml::to_string(call.settings).unwrap_or_default();
+                let parameter = call.parameter_text.map(str::to_string);
+                let node = Node::new(call.host);
+                let asset = Asset::new(&node, call.host.node_type());
+                let prepared = shared.job(cap, |r| {
+                    let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
+                    r.with_asset(&asset, shared.long(), async |a, g, lent| g.call_prepare_op(a, handle, lent, inputs, settings, parameter).await)
+                })?;
+                prepared.map(prepared_from_wit).map_err(|e| anyhow!(e))
+            });
+        }
         if op.output.starts_with("stream<") {
             let _ = builder.streams_described(move |call| {
                 let given = std::mem::take(&mut call.inputs);
@@ -2299,6 +2265,22 @@ impl Source for Node<'_> {
 
     fn path_of(&self, name: &str) -> Option<String> {
         self.host.path_of(&Node::content(name))
+    }
+}
+
+/// What an operation said before it runs, as the contract carried it.
+fn prepared_from_wit(prepared: g::Prepared) -> pe2_ext::Prepared {
+    let input = |from: g::MicroInput| pe2_ext::MicroInput { micro: from.micro, port: from.port, files: from.files };
+    let micro = |micro: g::Micro| pe2_ext::Micro {
+        op: micro.op,
+        label: micro.label,
+        settings: toml::from_str(&micro.settings).unwrap_or_default(),
+        ports: micro.ports.into_iter().map(|port| port.into_iter().map(input).collect()).collect(),
+        keep: micro.keep,
+    };
+    pe2_ext::Prepared {
+        needs: prepared.needs.into_iter().map(|need| pe2_ext::Need { node: need.node, address: need.address }).collect(),
+        micros: prepared.micros.into_iter().map(micro).collect(),
     }
 }
 

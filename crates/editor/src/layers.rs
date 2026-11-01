@@ -76,7 +76,7 @@ impl Action {
             }
             Action::Add(name, files) => {
                 let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
-                ws.add_layer(&name, kind).map(|()| {
+                ws.add_layer(&name, kind).map(|_| {
                     state.new_layer = None;
                     Some(format!("{name} added at the top of the stack"))
                 })

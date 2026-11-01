@@ -242,7 +242,7 @@ impl Effects for Site<'_> {
 pub fn epoch(project: &Project, index: &Index, extensions: &Extensions, wiring: &Wiring, config: &Config, roots: &[String], cancel: &AtomicBool) -> Report {
     extensions.set_config(Some(build_config(project, config)), &config.disabled);
     let config = build_config(project, config);
-    let site = Site { project, index, extensions, config: &config, engine: extensions.engine() };
+    let site = Site { project, index, extensions, config: &config, engine: extensions.engine().for_a_run() };
     schedule(&wiring.triggers, roots, &site, cancel)
 }
 

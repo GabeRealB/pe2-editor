@@ -16,8 +16,8 @@
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use toml::{Table, Value};
 
 use crate::cache::Cache;
@@ -49,10 +49,30 @@ pub struct Imports {
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from.
     addresses: Mutex<HashMap<String, Listed>>,
+    /// Set when what is attaching is no longer wanted.
+    stop: Arc<AtomicBool>,
 }
 
 /// An asset's addresses, with the hash of the settings they were listed from.
 type Listed = (String, Arc<HashSet<String>>);
+
+/// What there is of an asset's import, found without making anything.
+enum Import {
+    /// As it was last attached, what it read still holding.
+    Held(Arc<Known>),
+    /// Kept in the store.
+    Kept(Reads, Arc<Known>),
+    /// Kept, and not as an import can be.
+    Unread(anyhow::Error),
+    /// To be made.
+    ToMake { importer: String, plan: Plan, output: usize },
+}
+
+/// What attaching found of an asset: what is wrong with its stack, and its import by its output's key.
+struct Look {
+    wrong: Vec<graph::Problem>,
+    import: Option<(String, Import)>,
+}
 
 /// An import as attaching uses it.
 struct Known {
@@ -95,7 +115,7 @@ impl Imports {
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), addresses: Mutex::default() })
+        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), addresses: Mutex::default(), stop: Arc::default() })
     }
 
     /// Sweep the store of what the project's nodes no longer make, and of what nodes it no longer has made
@@ -108,7 +128,18 @@ impl Imports {
     /// The engine imports are made by: the extensions' operations, keeping in the store.
     #[must_use]
     pub fn engine(&self, extensions: &Extensions) -> Engine {
-        Engine::new(extensions.operations(), Some(self.store.clone()))
+        Engine::new(extensions.operations(), Some(self.store.clone())).for_a_run()
+    }
+
+    /// What stops an attach going on: set, it gives up where it is, which leaves the index it was given without imports
+    /// and is for when nobody will look at that.
+    #[must_use]
+    pub fn stopper(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Give every asset whose importer makes files what its import made, made now where it is not yet: the files take
@@ -154,41 +185,50 @@ impl Imports {
         }
         let engine = self.engine(extensions);
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
-        let mut stacks: Vec<Problem> = Vec::new();
         let assets: Vec<&Asset> = match only {
             None => index.assets.values().map(|a| &**a).collect(),
             Some(only) => only.iter().filter_map(|p| index.assets.get(p).map(|a| &**a)).collect(),
         };
-        let total = assets.len();
+        report("Attaching what the importers made", 0, assets.len());
         // What an import reads of other nodes, made in the index as it is.
         let world = crate::ext::Graph { index: &*index, extensions, written: false };
         let reach = graph::exec::Reach { engine: &engine, world: &world };
-        for (i, asset) in assets.into_iter().enumerate() {
-            if i % 256 == 0 {
-                report("Attaching what the importers made", i, total);
-            }
-            let (plan, wrong) = extensions.plan(asset);
-            stacks.extend(wrong.into_iter().map(|p| Problem::Stack {
-                asset: asset.path.clone(),
-                error: format!("{}: {}", p.at, p.what),
-            }));
-            let Some((importer, output)) = import_output(&plan, extensions) else { continue };
-            let plan = &plan;
-            let key = engine.key(plan, asset, output, None);
-            if let Some((_, import)) = known.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
-                attached.kept += 1;
-                found.push((asset.path.clone(), key, import.clone()));
-                continue;
-            }
-            match self.import(asset, extensions, reach, (importer, plan, output), &key) {
+        // Each asset's by itself, at the same time, as all of it only reads.
+        let held = &*known;
+        let looked = crate::parallel(&assets, |asset| (!self.stopping()).then(|| self.look(asset, extensions, reach, held)));
+        let mut made = self.make(&world, &assets, &looked, extensions, reach, report);
+        let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
+        let mut stacks: Vec<Problem> = Vec::new();
+        let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
+        if self.stopping() {
+            return attached;
+        }
+        for (at, (asset, look)) in assets.into_iter().zip(looked).enumerate() {
+            let Some(look) = look else { return attached };
+            let wrong = |p: graph::Problem| Problem::Stack { asset: asset.path.clone(), error: format!("{}: {}", p.at, p.what) };
+            stacks.extend(look.wrong.into_iter().map(wrong));
+            let Some((key, import)) = look.import else { continue };
+            let done = match import {
+                Import::Held(import) => {
+                    attached.kept += 1;
+                    found.push((asset.path.clone(), key, import));
+                    continue;
+                }
+                Import::Kept(reads, import) => Ok((false, reads, import)),
+                Import::Unread(why) => Err(why),
+                Import::ToMake { .. } => match made.remove(&at) {
+                    Some(done) => done,
+                    None => return attached,
+                },
+            };
+            match done {
                 Ok((made, reads, import)) => {
                     if made {
                         attached.made += 1;
                     } else {
                         attached.kept += 1;
                     }
-                    known.insert(key.clone(), (reads, import.clone()));
+                    new.push((key.clone(), (reads, import.clone())));
                     found.push((asset.path.clone(), key, import));
                 }
                 Err(e) => attached.failed.push((asset.path.clone(), format!("{e:#}"))),
@@ -198,34 +238,12 @@ impl Imports {
             let live: HashSet<&String> = found.iter().map(|(_, key, _)| key).collect();
             known.retain(|key, _| live.contains(key));
         }
+        known.extend(new);
         drop(known);
         let mut problems: Vec<Problem> =
             attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
         problems.extend(stacks);
-        for (path, _, import) in found {
-            let Some(asset) = index.assets.get_mut(&path).map(Arc::make_mut) else { continue };
-            let layer = source_file(asset).map_or_default(|f| f.layer.clone());
-            asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
-            for (name, blob) in &import.files {
-                asset.files.push(BundleFile {
-                    path: self.store.blob_path(&blob.sha1),
-                    name: name.clone(),
-                    size: blob.size,
-                    modified: (0, 0),
-                    layer: layer.clone(),
-                    sha1: blob.sha1.clone(),
-                    made_by: Some(import.importer.clone()),
-                });
-            }
-            let resolved = import.resolved(asset);
-            problems.extend(resolved.overridden.iter().map(|setting| Problem::Overridden {
-                asset: path.clone(),
-                setting: setting.clone(),
-            }));
-            problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
-            problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
-            asset.imported = Some(resolved);
-        }
+        problems.extend(self.give(index, found));
         problems.extend(self.missing_outputs(index, extensions, only));
         problems.extend(extension_problems(extensions));
         index.problems.retain(|p| match p {
@@ -242,40 +260,79 @@ impl Imports {
         attached
     }
 
+    /// What each asset's import comes to, given it: what they make among its files, and its settings resolved. Worked out
+    /// at the same time, as that only reads. Returns what is wrong with them.
+    fn give(&self, index: &mut Index, found: Vec<(String, String, Arc<Known>)>) -> Vec<Problem> {
+        let mut problems = Vec::new();
+        let resolved = crate::parallel(&found, |(path, _, import)| {
+            let asset = index.assets.get(path)?;
+            Some((source_file(asset).map_or_default(|f| f.layer.clone()), import.resolved(asset)))
+        });
+        for ((path, _, import), resolved) in found.into_iter().zip(resolved) {
+            let Some((layer, resolved)) = resolved else { continue };
+            let Some(asset) = index.assets.get_mut(&path).map(Arc::make_mut) else { continue };
+            asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
+            for (name, blob) in &import.files {
+                asset.files.push(BundleFile {
+                    path: self.store.blob_path(&blob.sha1),
+                    name: name.clone(),
+                    size: blob.size,
+                    modified: (0, 0),
+                    layer: layer.clone(),
+                    sha1: blob.sha1.clone(),
+                    made_by: Some(import.importer.clone()),
+                });
+            }
+            problems.extend(resolved.overridden.iter().map(|setting| Problem::Overridden {
+                asset: path.clone(),
+                setting: setting.clone(),
+            }));
+            problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
+            problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
+            asset.imported = Some(resolved);
+        }
+        problems
+    }
+
     /// The references naming an output their asset does not have: with the settings resolved, as members an import makes
     /// are among them. An asset's outputs are listed again only when its settings change.
     fn missing_outputs(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
         let mut known = self.addresses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut problems = Vec::new();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
-        for (target, references) in index.referenced_by.iter() {
+        let targets: Vec<_> = index.referenced_by.iter().collect();
+        // Each by itself, listed where its settings changed.
+        let held = &*known;
+        let listed = crate::parallel(&targets, |(target, references)| {
             // Of the assets attached: the references to them, and from them.
             let named: Vec<_> = references.iter().filter(|r| r.output.is_some() && (of(target) || of(&r.from))).collect();
-            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())
-            else {
-                continue;
-            };
+            let asset = index.assets.get(*target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())?;
             // Of what it makes, what is named: listing the members of the rest would be asking its extension for nothing.
             let mut families: Vec<&str> = named.iter().filter_map(|r| r.output.as_deref()?.split('/').next()).collect();
             families.sort_unstable();
             families.dedup();
             let digest = sha1_hex(format!("{}\n{}", families.join(" "), asset.settings_text()).as_bytes());
-            let addresses = if let Some((_, addresses)) = known.get(target).filter(|(d, _)| *d == digest) {
-                addresses.clone()
-            } else {
-                let addresses: Arc<HashSet<String>> = Arc::new(extensions.addresses_of(asset, Some(&families)).into_iter().map(|(address, _)| address).collect());
-                known.insert(target.clone(), (digest, addresses.clone()));
-                addresses
-            };
-            for reference in named {
-                let Some(output) = reference.output.as_ref().filter(|o| !addresses.contains(crate::ext::listed(o))) else { continue };
-                problems.push(Problem::MissingOutput {
-                    asset: reference.from.clone(),
-                    slot: reference.slot.clone(),
-                    target: target.clone(),
-                    output: output.clone(),
-                });
-            }
+            let addresses = held.get(*target).filter(|(d, _)| *d == digest).map_or_else(
+                || Arc::new(extensions.addresses_of(asset, Some(&families)).into_iter().map(|(address, _)| address).collect::<HashSet<_>>()),
+                |(_, addresses)| addresses.clone(),
+            );
+            let problems: Vec<Problem> = named
+                .into_iter()
+                .filter_map(|reference| {
+                    let output = reference.output.as_ref().filter(|o| !addresses.contains(crate::ext::listed(o)))?;
+                    Some(Problem::MissingOutput {
+                        asset: reference.from.clone(),
+                        slot: reference.slot.clone(),
+                        target: (*target).clone(),
+                        output: output.clone(),
+                    })
+                })
+                .collect();
+            Some(((*target).clone(), digest, addresses, problems))
+        });
+        let mut problems = Vec::new();
+        for (target, digest, addresses, missing) in listed.into_iter().flatten() {
+            known.insert(target, (digest, addresses));
+            problems.extend(missing);
         }
         problems
     }
@@ -283,8 +340,64 @@ impl Imports {
 }
 
 impl Imports {
-    /// An asset's import: found kept where its trace holds, else made now - whether it was made, what it read, and
-    /// what attaching uses of it.
+    /// What there is of an asset's import without making anything.
+    fn look(&self, asset: &Asset, extensions: &Extensions, reach: graph::exec::Reach<'_>, held: &HashMap<String, (Reads, Arc<Known>)>) -> Look {
+        let (plan, wrong) = extensions.plan(asset);
+        let Some((importer, output)) = import_output(&plan, extensions) else { return Look { wrong, import: None } };
+        let key = reach.engine.key(&plan, asset, output, None);
+        if let Some((_, import)) = held.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
+            return Look { wrong, import: Some((key, Import::Held(import.clone()))) };
+        }
+        let kept = reach.engine.kept_in(Some(reach), &plan, asset, output, None);
+        let kept = kept.and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
+        let import = match kept {
+            Some((kept, trace)) => match known_of(extensions, importer, kept, trace.reads) {
+                Ok((reads, import)) => Import::Kept(reads, import),
+                Err(why) => Import::Unread(why),
+            },
+            None => Import::ToMake { importer, plan, output },
+        };
+        Look { wrong, import: Some((key, import)) }
+    }
+
+    /// The imports nothing holds, by their asset's place among those looked at: each after what its declaration refers to,
+    /// so that what it reads is kept when it asks and it holds one instance, not one for each node down the line. Those with
+    /// nothing between them at the same time, as many as their extensions take (`component::JOBS`).
+    fn make(
+        &self,
+        world: &crate::ext::Graph<'_>,
+        assets: &[&Asset],
+        looked: &[Option<Look>],
+        extensions: &Extensions,
+        reach: graph::exec::Reach<'_>,
+        report: &Report<'_>,
+    ) -> HashMap<usize, Result<(bool, Reads, Arc<Known>)>> {
+        let to_make: Vec<_> = looked
+            .iter()
+            .enumerate()
+            .filter_map(|(at, look)| match &look.as_ref()?.import {
+                Some((key, Import::ToMake { importer, plan, output })) => Some((at, key, importer, plan, *output)),
+                _ => None,
+            })
+            .collect();
+        let mut made = HashMap::new();
+        if to_make.is_empty() {
+            return made;
+        }
+        report("Making what the importers make", 0, to_make.len());
+        let paths: Vec<&str> = to_make.iter().map(|(at, ..)| assets[*at].path.as_str()).collect();
+        for level in in_order(world.index, &paths) {
+            let level: Vec<_> = level.into_iter().map(|at| to_make[at]).collect();
+            let done = crate::parallel(&level, |(at, key, importer, plan, output)| {
+                (!self.stopping()).then(|| (*at, self.import(assets[*at], extensions, reach, ((*importer).clone(), plan, *output), key)))
+            });
+            made.extend(done.into_iter().flatten());
+        }
+        made
+    }
+
+    /// An asset's import, found kept since it was looked for or made now: whether it was made, what it read, and what
+    /// attaching uses of it.
     fn import(
         &self,
         asset: &Asset,
@@ -293,23 +406,43 @@ impl Imports {
         (importer, plan, output): (String, &Plan, usize),
         key: &str,
     ) -> Result<(bool, Reads, Arc<Known>)> {
-        // Found kept and readable as this store reads values, else made now.
-        let engine = reach.engine;
-        let found = engine.kept_in(Some(reach), plan, asset, output, None).and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
-        let (made, (kept, trace)) = if let Some(found) = found {
-            (false, found)
-        } else {
-            engine.output_in(Some(reach), plan, asset, &plan.outputs[output].name, None, true)?;
-            let trace = self.store.trace(key).context("its import was not kept")?;
-            (true, (self.store.describe(&trace.value).context("its import was not kept")?, trace))
-        };
-        let Kept::Typed { files, settings, notes, .. } = kept else {
-            anyhow::bail!("its import is kept as something else than an extension's type");
-        };
-        let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
-        let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
-        Ok((made, trace.reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
+        reach.engine.output_in(Some(reach), plan, asset, &plan.outputs[output].name, None, true)?;
+        let trace = self.store.trace(key).context("its import was not kept")?;
+        let kept = self.store.describe(&trace.value).context("its import was not kept")?;
+        let (reads, import) = known_of(extensions, importer, kept, trace.reads)?;
+        Ok((true, reads, import))
     }
+
+}
+
+/// These nodes in rounds, by their places, each round after those holding what its nodes refer to. Nodes referring to each
+/// other in a circle go last: what they make of it is theirs to say.
+fn in_order(index: &Index, paths: &[&str]) -> Vec<Vec<usize>> {
+    let places: HashMap<&str, usize> = paths.iter().enumerate().map(|(at, path)| (*path, at)).collect();
+    let reads = |at: usize| index.references_from(paths[at]).into_iter().filter_map(|r| places.get(index.resolve(&r.uid, &r.target)?.path.as_str()).copied());
+    let mut waiting: Vec<(usize, HashSet<usize>)> = (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();
+    let mut rounds = Vec::new();
+    while !waiting.is_empty() {
+        let (free, rest): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, on)| on.is_empty());
+        if free.is_empty() {
+            rounds.push(rest.into_iter().map(|(at, _)| at).collect());
+            break;
+        }
+        let done: HashSet<usize> = free.iter().map(|(at, _)| *at).collect();
+        waiting = rest.into_iter().map(|(at, on)| (at, on.difference(&done).copied().collect())).collect();
+        rounds.push(free.into_iter().map(|(at, _)| at).collect());
+    }
+    rounds
+}
+
+/// What attaching uses of an import as it was kept.
+fn known_of(extensions: &Extensions, importer: String, kept: Kept, reads: Reads) -> Result<(Reads, Arc<Known>)> {
+    let Kept::Typed { files, settings, notes, .. } = kept else {
+        anyhow::bail!("its import is kept as something else than an extension's type");
+    };
+    let derives = extensions.op(&importer).map_or_default(|op| op.derives.clone());
+    let files: Vec<(String, Blob)> = files.into_iter().map(|f| (f.name, f.blob)).collect();
+    Ok((reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
 }
 
 /// What is wrong with a project's extensions: those it holds not loaded, as problems of their assets, what it requires and
@@ -557,6 +690,7 @@ mod attaching {
 
     impl Files for Strip {}
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
     /// A type whose source is a line of cell names: each a cell one texel wide, its native file the source reversed.
     #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -604,6 +738,254 @@ mod attaching {
         let mut index = Index::open(&project, &cache).unwrap();
         let attached = Imports::open(&cache).unwrap().attach(&mut index, extensions);
         (index, attached)
+    }
+
+    /// How many of `reading`'s runs are going on inside each other on this thread, and the most there have been.
+    static DEEPEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
+    fn links(r: &mut Registry) -> Result<()> {
+        let _ = r.value_type::<Strip>();
+        let next_of = |call: &pe2_ext::Call<'_>| call.settings.get("next").and_then(Value::as_str).map(str::to_string);
+        let reads = move |call: &mut pe2_ext::Call<'_>| Ok(pe2_ext::Prepared { needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, "native")).collect(), micros: Vec::new() });
+        let _ = r.op("link").output::<Strip>().prepare(reads).run(|call| {
+            let depth = DEPTH.with(|depth| {
+                depth.set(depth.get() + 1);
+                depth.get()
+            });
+            DEEPEST.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
+            let next = call.settings.get("next").and_then(Value::as_str).map(str::to_string);
+            let read = next.map(|next| call.output_of(&next, "native")).transpose();
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+            read?;
+            Ok(Typed { ty: Strip::NAME.into(), files: vec![File::new("native.bin", b"a".to_vec())], ..Typed::default() })
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn what_a_node_reads_is_made_before_it() {
+        const COUNT: usize = 24;
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        // Named last first, so that the order they are found in is the wrong one.
+        for at in 0..COUNT {
+            let next = if at + 1 == COUNT { String::new() } else { format!("next = \"uid://n{}\"\n", at + 1) };
+            let stack = format!("[[stack]]\nop = \"test.strips@link\"\n{next}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n");
+            write(&root, &format!(".layers/base/n{at:02}.node/node.toml"), &format!("uid = \"uid://n{at}\"\n\n{stack}"));
+        }
+        let extensions = Extensions::load(
+            vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: links })],
+            true,
+        );
+        assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        let (_, attached) = open(&root, &extensions);
+        assert_eq!((attached.made, attached.failed.len()), (COUNT, 0), "{:?}", attached.failed);
+        assert_eq!(DEEPEST.load(std::sync::atomic::Ordering::SeqCst), 1, "each found what it reads made");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Runs of `counted`, of the tests below, by the node: they run at once, so each counts its own.
+    static RUNS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn runs_of(prefix: &str) -> usize {
+        RUNS.lock().unwrap().iter().filter(|run| run.starts_with(prefix)).count()
+    }
+
+    /// A project of a layer of these nodes, with the extension of `stages`.
+    fn staged(name: &str, nodes: &[(&str, String)]) -> (PathBuf, Extensions) {
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        for (path, declaration) in nodes {
+            write(&root, &format!(".layers/base/{path}.node/node.toml"), declaration);
+        }
+        let extension = Extension { id: "test.staged", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: stages };
+        let extensions = Extensions::load(vec![Loadable::from(extension)], true);
+        assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        (root, extensions)
+    }
+
+    /// A node of one layer of `test.staged`, with what is set on it, kept or not.
+    fn staged_node(op: &str, settings: &str, retain: &str) -> String {
+        format!("[[stack]]\nop = \"test.staged@{op}\"\n{settings}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"{retain}\"\n")
+    }
+
+    fn one_table(key: &str, value: &str) -> Table {
+        Table::from_iter([(key.to_string(), Value::String(value.to_string()))])
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
+    fn stages(r: &mut Registry) -> Result<()> {
+        // Counts its runs, by what it is given to count by.
+        let _ = r.op("counted").output::<ty::Table>().run(|call| {
+            RUNS.lock().unwrap().push(call.settings.get("as").and_then(Value::as_str).unwrap_or_default().to_string());
+            Ok(call.settings.clone())
+        });
+        // Reads what the setting names, and what that says comes next: known only once the first is made.
+        let _ = r.op("hops").output::<ty::Table>().prepared_by_running().run(|call| {
+            let first = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+            let found = call.table_of(&first, "native")?;
+            let next = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
+            call.table_of(&next, "native")
+        });
+        // Reads each of its `reads`, a list of nodes.
+        let list = |call: &pe2_ext::Call<'_>| -> Vec<String> {
+            call.settings.get("reads").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+        };
+        let _ = r
+            .op("reader")
+            .output::<ty::Table>()
+            .prepare(move |call| Ok(pe2_ext::Prepared { needs: list(call).iter().map(|node| pe2_ext::Need::new(node, "native")).collect(), micros: Vec::new() }))
+            .run(move |call| {
+                for node in list(call) {
+                    call.table_of(&node, "native")?;
+                }
+                Ok(Table::new())
+            });
+        // A piece, as what it is given says, counted.
+        let _ = r.op("piece").output::<ty::Table>().run(|call| {
+            let name = call.settings.get("name").and_then(Value::as_str).unwrap_or_default();
+            RUNS.lock().unwrap().push(format!("piece {name}"));
+            Ok(one_table("made", name))
+        });
+        // What the pieces came to, in their order.
+        let _ = r.op("join").input::<ty::Table>("pieces").output::<ty::Table>().run(|call| {
+            let mut names = String::new();
+            for piece in call.take_all::<ty::Table>(0)? {
+                names.push_str(piece.get("made").and_then(Value::as_str).unwrap_or_default());
+            }
+            Ok(one_table("joined", &names))
+        });
+        // A piece for each of its `pieces`, then those joined.
+        let _ = r
+            .op("whole")
+            .output::<ty::Table>()
+            .prepare(|call| {
+                let names: Vec<String> = call.settings.get("pieces").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let mut micros: Vec<pe2_ext::Micro> = names
+                    .iter()
+                    .map(|name| pe2_ext::Micro { op: "piece".into(), label: name.clone(), settings: one_table("name", name), ports: vec![], keep: true })
+                    .collect();
+                let pieces = (0..names.len()).map(pe2_ext::MicroInput::micro).collect();
+                micros.push(pe2_ext::Micro { op: "join".into(), label: "join".into(), ports: vec![pieces], ..pe2_ext::Micro::default() });
+                Ok(pe2_ext::Prepared { needs: Vec::new(), micros })
+            })
+            .run(|_| anyhow::bail!("it is done by its micro ops"));
+        Ok(())
+    }
+
+    fn opened(root: &Path) -> (Lock, Cache, Index) {
+        let project = Project::load(root).unwrap();
+        let lock = Lock::try_acquire(root, "a test").unwrap();
+        let cache = Cache::open(&project, &lock).unwrap();
+        let index = Index::open(&project, &cache).unwrap();
+        (lock, cache, index)
+    }
+
+    #[test]
+    fn what_is_transient_lasts_the_run_and_no_longer() {
+        let shared = staged_node("counted", "as = \"lasting\"", "transient");
+        let reads = "reads = [\"shared\"]";
+        let nodes = [("shared", shared), ("a", staged_node("reader", reads, "transient")), ("b", staged_node("reader", reads, "transient"))];
+        let (root, extensions) = staged("lasting", &nodes);
+        let (_lock, cache, index) = opened(&root);
+        let make = |engine: &crate::graph::exec::Engine, at: &str| extensions.output(engine, &index, &index.assets[at], "native", true).unwrap();
+        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let run = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone())).for_a_run();
+        drop((make(&run, "a"), make(&run, "b")));
+        assert_eq!(runs_of("lasting"), 1, "one run shares it");
+        drop(make(&run, "a"));
+        assert_eq!(runs_of("lasting"), 1);
+        // Outside a run, it is made for each.
+        let passing = crate::graph::exec::Engine::new(extensions.operations(), Some(store));
+        drop((make(&passing, "a"), make(&passing, "b")));
+        assert_eq!(runs_of("lasting"), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_can_name_what_the_last_one_found() {
+        let nodes = [
+            ("hop", staged_node("hops", "first = \"one\"", "transient")),
+            ("one", staged_node("counted", "next = \"two\"", "transient")),
+            ("two", staged_node("counted", "arrived = \"yes\"", "transient")),
+        ];
+        let (root, extensions) = staged("hops", &nodes);
+        let (_lock, cache, index) = opened(&root);
+        let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(crate::graph::store::Store::open(&cache).unwrap()));
+        let given = extensions.output(&engine, &index, &index.assets["hop"], "native", true).unwrap();
+        let value = format!("{:?}", given.value.unwrap());
+        assert!(value.contains("arrived"), "{value}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_circle_of_reads_is_said_rather_than_followed() {
+        let nodes = [("a", staged_node("reader", "reads = [\"b\", \"c\"]", "transient")), ("b", staged_node("reader", "reads = [\"a\"]", "transient")), ("c", staged_node("reader", "reads = [\"a\"]", "transient"))];
+        let (root, extensions) = staged("circle", &nodes);
+        let (_lock, cache, index) = opened(&root);
+        let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(crate::graph::store::Store::open(&cache).unwrap()));
+        let why = extensions.output(&engine, &index, &index.assets["a"], "native", true).err().expect("a circle");
+        assert!(format!("{why:#}").contains("reads, through others, itself"), "{why:#}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_split_keeps_its_pieces_and_makes_only_what_changed() {
+        let settings = |pieces: &str| staged_node("whole", &format!("pieces = [{pieces}]"), "transient");
+        let (root, extensions) = staged("split", &[("whole", settings("\"s1\", \"s2\", \"s3\""))]);
+        let (_lock, cache, index) = opened(&root);
+        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let make = |index: &Index| {
+            let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
+            let value = extensions.output(&engine, index, &index.assets["whole"], "native", true).unwrap().value.unwrap();
+            format!("{value:?}")
+        };
+        let first = make(&index);
+        assert!(first.contains("s1s2s3"), "in their order: {first}");
+        assert_eq!(runs_of("piece s"), 3);
+        drop(make(&index));
+        assert_eq!(runs_of("piece s"), 3, "kept");
+        // One more piece: only it is made.
+        write(&root, ".layers/base/whole.node/node.toml", &settings("\"s1\", \"s2\", \"s3\", \"s4\""));
+        let project = Project::load(&root).unwrap();
+        let again = Index::open(&project, &cache).unwrap();
+        assert!(make(&again).contains("s1s2s3s4"));
+        assert_eq!(runs_of("piece s"), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn what_is_worked_out_at_once_comes_back_in_its_order() {
+        let items: Vec<usize> = (0..500).collect();
+        assert_eq!(crate::parallel(&items, |item| item * 2), items.iter().map(|item| item * 2).collect::<Vec<_>>());
+        assert_eq!(crate::parallel(&[] as &[usize], |item| *item), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn an_attach_nobody_wants_gives_up_without_making_anything() {
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-stopped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
+        write(&root, ".layers/base/s.node/source.txt", "a b");
+        let extensions =
+            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        let project = Project::load(&root).unwrap();
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let cache = Cache::open(&project, &lock).unwrap();
+        let mut index = Index::open(&project, &cache).unwrap();
+        let imports = Imports::open(&cache).unwrap();
+        imports.stopper().store(true, std::sync::atomic::Ordering::Relaxed);
+        let attached = imports.attach(&mut index, &extensions);
+        assert_eq!((attached.made, attached.kept, attached.failed.len()), (0, 0, 0));
+        assert!(index.assets["s"].files.iter().all(|file| file.made_by.is_none()), "nothing was made");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A strip's stack: its source through the importer, kept as its native form.

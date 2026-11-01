@@ -100,12 +100,12 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<SourceTree>();
     let _ = r.value_type::<ty::Tokens>();
     let _ = r.op("gather").label("Sources").takes("package", &[PACKAGE]).output::<ty::File<SourceTree>>().run(gather::gather);
-    let _ = r.op("resolve").label("Slots and values").input::<SourceTree>("sources").output::<SourceTree>().run(gather::resolve);
+    let _ = r.op("resolve").label("Slots and values").input::<SourceTree>("sources").output::<SourceTree>().prepared_by_running().run(gather::resolve);
     tokenizers::register(r);
     let _ = r.op("reflect").label("What it asks for").takes("package", &[PACKAGE]).output::<ty::Table>().provides("reflection").keeps(Retain::Cache).run(gather::reflection);
-    let _ = r.op("database").label("Compile database").output::<ty::Bytes>().run(database::database);
+    let _ = r.op("database").label("Compile database").output::<ty::Bytes>().prepare(database::database_reads).run(database::database);
     let _ = r.op("overlay").label("Include overlay").output::<ty::Bytes>().run(database::overlay);
-    let _ = r.op("server_values").label("Values for a language server").output::<ty::Bytes>().run(database::server_values);
+    let _ = r.op("server_values").label("Values for a language server").output::<ty::Bytes>().prepare(database::server_values_reads).run(database::server_values);
     r.named_type("compile-database").alias("compile-database").label("Compile database").data().icon(Icon::File, Tint::Code).stack(DATABASE_STACK).register();
     r.named_type("package")
         .alias("package")

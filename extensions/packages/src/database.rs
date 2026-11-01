@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use pe2_ext::{Call, Data, File, Result, Typed, Value, anyhow};
+use pe2_ext::{Call, Data, File, Need, Prepared, Result, Typed, Value, anyhow};
 use serde_json::json;
 
 use crate::gather::{Package, packages};
@@ -34,6 +34,22 @@ pub fn overlay(call: &mut Call) -> Result<Typed> {
         }
     }
     file("overlay.yaml", &json!({ "version": 0, "case-sensitive": "true", "fallthrough": "true", "roots": roots }))
+}
+
+/// What `server_values` reads: what every package that compiles resolved to.
+pub fn server_values_reads(call: &mut Call) -> Result<Prepared> {
+    let compiling = sorted(call)?.into_iter().filter(|(_, package)| package.compiles());
+    Ok(Prepared { needs: compiling.map(|(_, package)| Need::new(&package.path, "resolved")).collect(), micros: Vec::new() })
+}
+
+/// What `database` reads: of every package, what its target tells a language server and what it asks for.
+pub fn database_reads(call: &mut Call) -> Result<Prepared> {
+    let mut needs = Vec::new();
+    for (_, package) in sorted(call)? {
+        needs.push(Need::new(&package.path, "flags"));
+        needs.push(Need::new(&package.path, "reflection"));
+    }
+    Ok(Prepared { needs, micros: Vec::new() })
 }
 
 /// What a language server reads for `PE2_VALUE`: every package's values, each behind its own define, as one server reads them all.

@@ -182,7 +182,49 @@ pub enum LayerKind {
     Files,
 }
 
-#[derive(Clone)]
+/// Threads lent to `parallel` now, whoever asks: how many jobs run at once, as one number however it nests.
+static LENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many threads `parallel` lends at most: half the processors, the rest for the window and what it asks.
+fn most_lent() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+    std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores / 2).clamp(1, 8)
+}
+
+/// Each of these worked out at the same time, each result in its item's place, by this thread and as many more as there
+/// are to lend: none, where others have them all, and it does them alone. So what is parallel within what is parallel adds
+/// no threads, and waits for nothing.
+pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // What one edit changed is one asset, and is not worth a thread.
+    if items.len() < 2 {
+        return items.iter().map(work).collect();
+    }
+    let wanted = (items.len() - 1).min(most_lent());
+    let taken = LENT.fetch_add(wanted, Ordering::AcqRel);
+    let lent = wanted.min(most_lent().saturating_sub(taken));
+    LENT.fetch_sub(wanted - lent, Ordering::AcqRel);
+    let next = AtomicUsize::new(0);
+    let worker = || {
+        let mut done = Vec::new();
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some(item) = items.get(at) else { return done };
+            done.push((at, work(item)));
+        }
+    };
+    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..lent).map(|_| scope.spawn(worker)).collect();
+        let own = worker();
+        let rest = threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+        own.into_iter().chain(rest.flatten()).collect()
+    });
+    LENT.fetch_sub(lent, Ordering::AcqRel);
+    done.sort_unstable_by_key(|(at, _)| *at);
+    done.into_iter().map(|(_, result)| result).collect()
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Layer {
     pub name: String,
     pub kind: LayerKind,

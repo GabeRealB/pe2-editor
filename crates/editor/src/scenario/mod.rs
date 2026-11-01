@@ -166,6 +166,8 @@ pub fn main() -> i32 {
 pub struct Scenario {
     harness: Harness<'static, Editor>,
     fixture: Fixture,
+    /// What lets the worker go, where it is held (`hold_reading`).
+    held: Option<std::sync::mpsc::Sender<()>>,
     /// One at a time: a process has one set of extensions, keeping what they make in the project open.
     _alone: std::sync::MutexGuard<'static, ()>,
 }
@@ -201,15 +203,76 @@ impl Scenario {
             let start = Start { project: Some(root), select: None, show, screenshot: None, max_surface: None, agents_drive: false, unattended, monitors: Vec::new() };
             Editor::new(cc, start)
         });
-        let mut scenario = Scenario { harness, fixture, _alone: alone };
+        let mut scenario = Scenario { harness, fixture, held: None, _alone: alone };
         scenario.settle();
         assert!(scenario.harness.state_mut().workspace().is_some(), "the project did not open: {:?}", scenario.harness.state().error());
         scenario
     }
 
-    /// Frames until the editor has nothing going on.
+    /// Have the worker read until `release_reading`, as though the project were being read. What is asked meanwhile waits.
+    ///
+    /// # Errors
+    /// It is held already.
+    pub fn hold_reading(&mut self) -> Result<(), String> {
+        if self.held.is_some() {
+            return Err("it is held already".to_string());
+        }
+        self.held = Some(self.workspace().hold_worker());
+        Ok(())
+    }
+
+    /// Let the worker go, and let what waited for it finish.
+    ///
+    /// # Errors
+    /// It is not held.
+    pub fn release_reading(&mut self) -> Result<(), String> {
+        self.held.take().ok_or("it is not held")?;
+        self.settle();
+        Ok(())
+    }
+
+    /// Make an output of a node, as a view asking for it does, nothing kept: what went wrong, or nothing.
+    ///
+    /// # Errors
+    /// There is no such node.
+    pub fn made(&mut self, path: &str, address: &str) -> Result<String, String> {
+        let ws = self.workspace();
+        let asset = ws.index.assets.get(path).cloned().ok_or_else(|| format!("no asset {path}"))?;
+        let engine = project::graph::exec::Engine::new(ws.extensions.operations(), None);
+        let made = ws.extensions.output(&engine, &ws.index, &asset, address, false);
+        Ok(made.err().map_or_else(String::new, |why| format!("{why:#}")))
+    }
+
+    /// Ask to override the entry at this path, as a layer's button does.
+    ///
+    /// # Errors
+    /// There is no such entry.
+    pub fn override_entry(&mut self, path: &str) -> Result<(), String> {
+        let uid = self.workspace().index.entries.get(path).map(|entry| entry.uid.clone()).ok_or_else(|| format!("no entry {path}"))?;
+        self.harness.state_mut().ask(&crate::workspace::EditRequest::Override(uid));
+        self.settle();
+        Ok(())
+    }
+
+    /// Type into the field showing this hint.
+    #[track_caller]
+    pub fn type_into(&mut self, hint: &str, text: &str) {
+        let inputs = self.harness.query_all(By::new().role(egui::accesskit::Role::TextInput));
+        let field = inputs.into_iter().find(|input| input.accesskit_node().placeholder() == Some(hint));
+        field.unwrap_or_else(|| panic!("no field hinting {hint:?}")).click();
+        self.settle();
+        self.typing(text);
+    }
+
+    /// Frames until the editor has nothing going on: a few, while the worker is held, as it would never be.
     #[track_caller]
     pub fn settle(&mut self) {
+        if self.held.is_some() {
+            for _ in 0..QUIET {
+                self.harness.step();
+            }
+            return;
+        }
         let started = Instant::now();
         let mut quiet = 0;
         while quiet < QUIET {
@@ -374,6 +437,18 @@ impl Scenario {
             "problems" => return Ok(strings(self.problems())),
             "assets" => return Ok(strings(self.assets())),
             "selected" => return self.workspace().selected.clone().map(Value::String).ok_or_else(|| "nothing is selected".to_string()),
+            "override_entry" => self.override_entry(said)?,
+            "declare" => {
+                let given = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or_default();
+                self.workspace().make_node(given("uid"), said, (given("declaration"), &[]))?;
+                self.settle();
+            }
+            "made" => {
+                let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
+                return self.made(said, address).map(Value::String);
+            }
+            "hold_reading" => self.hold_reading()?,
+            "release_reading" => self.release_reading()?,
             "pictured" => {
                 let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
                 let ws = self.workspace();
@@ -464,7 +539,7 @@ impl Scenario {
     /// The project, its session over.
     #[must_use]
     pub fn into_fixture(self) -> Fixture {
-        let Scenario { harness, fixture, _alone: alone } = self;
+        let Scenario { harness, fixture, _alone: alone, .. } = self;
         drop(harness);
         drop(alone);
         fixture
@@ -552,6 +627,12 @@ impl Scenario {
     pub fn drop_file(&mut self, file: &std::path::Path) {
         self.harness.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(file.to_path_buf())));
         self.settle();
+    }
+
+    /// The harness's editor, for what a scenario does that no click does.
+    #[cfg(test)]
+    pub fn editor(&mut self) -> &mut crate::app::Editor {
+        self.harness.state_mut()
     }
 
     /// Undo the last step.

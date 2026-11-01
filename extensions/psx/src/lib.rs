@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use pe2_ext::events::Build;
 use pe2_ext::process::spawn;
 use pe2_ext::ty::{self, Files, Registered, SourceTree};
-use pe2_ext::{Call, File, Registry, Result, Table, Typed, Value, anyhow, bail};
+use pe2_ext::{Call, File, Micro, MicroInput, Prepared, Registry, Result, Table, Typed, Value, anyhow, bail};
 
 /// The target this is, as a config names it.
 const TARGET: &str = "psx";
@@ -49,11 +49,26 @@ impl Registered for Package {
 
 impl Files for Package {}
 
+/// A compiled unit, on its way to being linked.
+pub struct Object;
+
+impl Registered for Object {
+    const NAME: &str = "pe2.psx@compiled_unit";
+    const LABEL: &str = "Compiled unit";
+}
+
+impl Files for Object {}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Package>();
+    let _ = r.value_type::<Object>();
     let _ = r.op("preprocess").label("First pass").input::<SourceTree>("sources").output::<SourceTree>().run(first_pass);
-    let _ = r.op("compile").label("Compile and link").input::<SourceTree>("sources").output::<ty::File<Package>>().run(build);
+    let _ = r.op("expand").label("Expand the units").input::<SourceTree>("sources").output::<SourceTree>().run(expand);
+    let _ = r.op("object").label("Compile a unit").input::<SourceTree>("expanded").input::<SourceTree>("core").output::<ty::File<Object>>().run(object);
+    let _ = r.op("link").label("Link").input::<SourceTree>("sources").inputs::<ty::File<Object>>("objects").output::<ty::File<Package>>().run(link_image);
+    // Its work is its micro ops', each unit kept by what it comes to expanded, so that a file changed compiles what it reaches.
+    let _ = r.op("compile").label("Compile and link").input::<SourceTree>("sources").output::<ty::File<Package>>().prepare(split_build).run(|_| bail!("it is done by its micro ops"));
     let _ = r.op("flags").label("What a language server is told").takes("package", &["pe2.packages@package"]).output::<ty::Table>().provides("flags").run(flags);
     let _ = r.extend("pe2.packages@package").of(Package::NAME).register();
     let _ = r.on::<Build>(check_tools);
@@ -78,19 +93,124 @@ fn flags(_: &mut Call) -> Result<Table> {
     Ok(table)
 }
 
-fn build(call: &mut Call) -> Result<Typed> {
-    let path = call.host.path().to_string();
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-    let fields = call.given();
+/// Where expanded units say they come from: the same wherever they were expanded, so that a unit is known by what it says.
+const TREE: &str = "tree";
+
+/// What a package is built by: its units expanded, each compiled by what that came to, and those linked.
+fn split_build(call: &mut Call) -> Result<Prepared> {
     let target = call.config().and_then(|config| config.target);
     if target.as_ref().is_some_and(|target| target != TARGET) {
         bail!("the config builds for {}, and this is {TARGET}", target.unwrap_or_default());
     }
     let sources = call.take::<SourceTree>(0)?;
-    let notes = sources.notes.clone();
-    let scratch = PathBuf::from(format!("{}.build", call.temp()?));
+    let units = sources.files.iter().find(|file| file.name == "units").ok_or_else(|| anyhow!("it names no units"))?;
+    let units = String::from_utf8(call.read(units)?)?;
+    let mut micros = vec![Micro { op: "expand".into(), label: "expand".into(), ports: vec![vec![MicroInput::port(0)]], ..Micro::default() }];
+    let mut objects = vec![];
+    for unit in units.lines() {
+        objects.push(MicroInput::micro(micros.len()));
+        micros.push(Micro {
+            op: "object".into(),
+            label: unit.to_string(),
+            settings: Table::from_iter([("unit".to_string(), Value::String(unit.to_string()))]),
+            ports: vec![vec![MicroInput::micro(0).only(&[&expanded_name(unit)])], vec![MicroInput::port(0).only(&["pkg/core/"])]],
+            keep: true,
+        });
+    }
+    micros.push(Micro { op: "link".into(), label: "link".into(), ports: vec![vec![MicroInput::port(0)], objects], ..Micro::default() });
+    Ok(Prepared { needs: Vec::new(), micros })
+}
+
+fn expanded_name(unit: &str) -> String {
+    format!("expanded/{unit}.i")
+}
+
+/// Every unit run through the preprocessor, the place it was done at taken out of what it says.
+fn expand(call: &mut Call) -> Result<Typed> {
+    let path = call.host.path().to_string();
+    let sources = call.take::<SourceTree>(0)?;
+    let scratch = PathBuf::from(format!("{}.expand", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| image_of(&fields, &tree, &scratch, &name));
+    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+        let mut made = vec![];
+        for unit in fs::read_to_string(tree.join("units"))?.lines() {
+            let expanded = scratch.join("expanded.i");
+            let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
+            args.extend([format!("-I{}", text(&tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
+            run("mips-linux-gnu-cpp", &args)?;
+            let said = replaced(&fs::read(&expanded)?, text(&tree).as_bytes(), TREE.as_bytes());
+            made.push(File::new(&expanded_name(unit), said));
+        }
+        Ok(made)
+    });
+    let _ = fs::remove_dir_all(&scratch);
+    Ok(Typed::new(SourceTree::NAME, in_project(made, &scratch, &path)?))
+}
+
+/// These bytes with one run of them put for another.
+fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(from) {
+            out.extend_from_slice(to);
+            at += from.len();
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    out
+}
+
+/// A unit compiled, from what it came to expanded and what the assembler includes.
+fn object(call: &mut Call) -> Result<Typed> {
+    let path = call.host.path().to_string();
+    let unit = call.settings.get("unit").and_then(Value::as_str).ok_or_else(|| anyhow!("it names no unit"))?.to_string();
+    let expanded = call.take::<SourceTree>(0)?;
+    let core = call.take::<SourceTree>(1)?;
+    let scratch = PathBuf::from(format!("{}.object", call.temp()?));
+    fs::create_dir_all(&scratch)?;
+    let made = write_out(call, &core, &scratch).and_then(|tree| {
+        let source = expanded.files.first().ok_or_else(|| anyhow!("{unit} was not expanded"))?;
+        let at = scratch.join("unit.i");
+        fs::write(&at, call.read(source)?)?;
+        compile(&at, &tree, &scratch)
+    });
+    let kept = made.and_then(|object| {
+        let name = Path::new(&unit).with_extension("o").file_name().map(|name| name.to_string_lossy().into_owned());
+        call.keep(&text(&object), &name.ok_or_else(|| anyhow!("{unit} has no name"))?)
+    });
+    let _ = fs::remove_dir_all(&scratch);
+    Ok(Typed::new(Object::NAME, vec![said_of(kept, &path)?]))
+}
+
+/// What a tool said of a unit expanded, said of the files it came from.
+fn said_of<T>(result: Result<T>, path: &str) -> Result<T> {
+    let tree = format!("{TREE}/");
+    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}self/"), &format!("{path}/")).replace(&format!("{tree}pkg/"), "packages/").replace(&tree, "")))
+}
+
+/// The image, from the compiled units.
+fn link_image(call: &mut Call) -> Result<Typed> {
+    let path = call.host.path().to_string();
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let fields = call.given();
+    let sources = call.take::<SourceTree>(0)?;
+    let notes = sources.notes.clone();
+    let compiled = call.take_all::<ty::File<Object>>(1)?;
+    let scratch = PathBuf::from(format!("{}.link", call.temp()?));
+    fs::create_dir_all(&scratch)?;
+    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+        let mut objects = vec![];
+        for (at, object) in compiled.iter().enumerate() {
+            let file = object.file()?;
+            let path = scratch.join(format!("{at}_{}", file.name));
+            fs::write(&path, call.read(file)?)?;
+            objects.push(path);
+        }
+        image_of(&fields, &tree, &objects, &scratch, &name)
+    });
     let result = made.and_then(|image| {
         let kept = call.keep(&image.display().to_string(), &format!("{name}.pe2pkg"))?;
         Ok(Typed { notes: notes.clone(), ..Typed::new(Package::NAME, vec![kept]) })
@@ -155,13 +275,9 @@ fn write_out(call: &Call, sources: &Typed, scratch: &Path) -> Result<PathBuf> {
     Ok(tree)
 }
 
-fn image_of(fields: &Table, tree: &Path, scratch: &Path, name: &str) -> Result<PathBuf> {
+fn image_of(fields: &Table, tree: &Path, objects: &[PathBuf], scratch: &Path, name: &str) -> Result<PathBuf> {
     let slot = fields.get("slot").and_then(Value::as_str).ok_or_else(|| anyhow!("{name} names no slot"))?;
     let (_, address) = SLOTS.iter().find(|(known, _)| *known == slot).ok_or_else(|| anyhow!("no slot {slot} on this target"))?;
-    let mut objects = vec![];
-    for unit in fs::read_to_string(tree.join("units"))?.lines() {
-        objects.push(compile(&tree.join(unit), tree, scratch)?);
-    }
     let own = tree.join("target/psx").join(name);
     let script = only_file(&own.join("link_script")).map_err(|_| anyhow!("{name} has no link_script"))?;
     let mut published = vec![];
@@ -172,7 +288,7 @@ fn image_of(fields: &Table, tree: &Path, scratch: &Path, name: &str) -> Result<P
             }
         }
     }
-    link(*address, &script, &published, &objects, scratch, name)
+    link(*address, &script, &published, objects, scratch, name)
 }
 
 /// The one file a property of a package is in.
@@ -192,14 +308,11 @@ fn run(tool: &str, args: &[String]) -> Result<()> {
     process.wait()
 }
 
-fn compile(unit: &Path, tree: &Path, scratch: &Path) -> Result<PathBuf> {
-    let stem = unit.file_stem().map(|s| s.to_string_lossy().into_owned()).ok_or_else(|| anyhow!("{} has no name", unit.display()))?;
-    let (expanded, assembly, object) = (scratch.join(format!("{stem}.i")), scratch.join(format!("{stem}.s")), scratch.join(format!("{stem}.o")));
-    let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
-    args.extend([format!("-I{}", text(tree)), "-o".to_string(), text(&expanded), text(unit)]);
-    run("mips-linux-gnu-cpp", &args)?;
+/// A unit expanded to its object: the compiler on what it comes to, then the assembler, which includes from `pkg/core`.
+fn compile(expanded: &Path, tree: &Path, scratch: &Path) -> Result<PathBuf> {
+    let (assembly, object) = (scratch.join("unit.s"), scratch.join("unit.o"));
     let mut args: Vec<String> = CC1.iter().map(ToString::to_string).collect();
-    args.extend(["-o".to_string(), text(&assembly), text(&expanded)]);
+    args.extend(["-o".to_string(), text(&assembly), text(expanded)]);
     run("cc1", &args)?;
     let mut args: Vec<String> = MASPSX.iter().map(ToString::to_string).collect();
     args.extend(["-no-pad-sections".to_string(), format!("-I{}", text(&tree.join("pkg/core"))), "-o".to_string(), text(&object), text(&assembly)]);

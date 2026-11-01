@@ -22,6 +22,7 @@
 #![recursion_limit = "256"]
 
 mod app;
+mod aside;
 mod commands;
 mod contents;
 mod dnd;

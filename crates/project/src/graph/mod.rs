@@ -12,10 +12,17 @@
 //! an operation no extension provides, a source below the top, a value of one type given to a port of another, a cycle
 //! in a graph layer, two outputs of one name are its node's problems before anything runs.
 //!
+//! An extension's operation reads of other nodes only what it said it reads, before it ran (`OpDef::prepare`): that is made
+//! first, with none of its instances held, so that what reads what reads what holds one instance however far it goes on. It
+//! can be asked again for what the last read found, and it can split into micro ops: others of its extension's operations,
+//! run in its place, each known by what it takes and read, each saying what it reads as an operation does. Those are what a
+//! layer's work is kept and shared in, as a stack only knows its layers. The host's own operations run nothing to hold.
+//!
 //! Evaluating outputs runs only the operations they reach (`exec`). Inside a node every result is transient: one taken
 //! once is moved to what takes it, one taken more is shared, read-only, until its last. Outputs are retained as their
-//! layers say: `cache` keeps them in the project's store by content (`store`), `transient` hands them to whoever asked
-//! and keeps only their trace - what they read, by hash - so a copy is known stale without the value being kept.
+//! layers say: `cache` keeps them in the project's store by content (`store`), `transient` lasts a run - an epoch, an attach -
+//! for those reading it to share, while what it read holds, and otherwise goes to whoever asked; only its trace is kept,
+//! what it read by hash, so a copy is known stale without the value being kept.
 
 pub mod exec;
 pub mod layers;
@@ -103,6 +110,9 @@ pub type Run = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Value> + Send + Syn
 /// What an operation makes, as its settings say.
 pub type OutputOf = dyn Fn(&Table) -> Option<Type> + Send + Sync;
 
+/// What says what an operation will read before it runs.
+pub type Prepare = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<pe2_ext::Prepared> + Send + Sync;
+
 /// What a stream operation does when it is opened: starts what makes its items.
 pub type Start = dyn Fn(&mut exec::Call<'_>) -> anyhow::Result<Box<dyn stream::Producer>> + Send + Sync;
 
@@ -118,6 +128,11 @@ pub struct OpDef {
     /// Its parameter's name: what reaches it is a family of it.
     pub parameter: Option<String>,
     pub run: Option<Arc<Run>>,
+    /// What it will read, said before it runs.
+    pub prepare: Option<Arc<Prepare>>,
+    /// An extension's, which reads of other nodes only what it said: what reads otherwise holds an instance while what it
+    /// reads is made. The host's own run nothing to hold.
+    pub strict: bool,
     /// For a stream operation: how it is opened.
     pub start: Option<Arc<Start>>,
     /// What it makes as its settings say, where they say: what a stored file's name or a declared type tells of it
@@ -137,7 +152,7 @@ impl OpDef {
     #[must_use]
     pub fn new(name: &str, label: &str, version: &str) -> OpDef {
         let (name, label, version) = (name.to_string(), label.to_string(), version.to_string());
-        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None, output_of: None, priority: 0, data: false, required: Vec::new(), also: Vec::new() }
+        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, prepare: None, strict: false, start: None, output_of: None, priority: 0, data: false, required: Vec::new(), also: Vec::new() }
     }
 
     /// What it makes by its settings, where they say more than `output`.

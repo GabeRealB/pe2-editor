@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use std::marker::PhantomData;
 
-use crate::data::{Call, OpDef, Port, Provides, Retain, Type};
+use crate::data::{Call, OpDef, Port, Prepared, Provides, Retain, Type};
 use crate::ty::ValueType;
 use crate::import::{Recognized, Signature, TypeDef};
 use crate::{Asset, Project, Result, Table, Value, View};
@@ -948,9 +948,10 @@ impl Registry {
             members: None,
             also: vec![],
             run: Arc::new(|_| Err(crate::anyhow!("it does nothing"))),
+            prepare: None,
             start: None,
         };
-        OpBuilder { registry: self, def, same: Vec::new(), list_of: None, out: PhantomData }
+        OpBuilder { registry: self, def, same: Vec::new(), list_of: None, by_running: false, out: PhantomData }
     }
 
 
@@ -1299,6 +1300,8 @@ pub struct OpBuilder<'a, Out = crate::ty::Any> {
     same: Vec<Vec<Option<String>>>,
     /// Its output is a list of what this port takes.
     list_of: Option<String>,
+    /// What it reads is found by running it.
+    by_running: bool,
     out: PhantomData<Out>,
 }
 
@@ -1409,9 +1412,9 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     /// What it makes (`.output::<ty::Image>()`): what `run` returns a value of.
     #[must_use]
     pub fn output<T: ValueType>(self) -> OpBuilder<'a, T> {
-        let OpBuilder { registry, mut def, same, list_of, .. } = self;
+        let OpBuilder { registry, mut def, same, list_of, by_running, .. } = self;
         def.output = T::ty();
-        OpBuilder { registry, def, same, list_of, out: PhantomData }
+        OpBuilder { registry, def, same, list_of, by_running, out: PhantomData }
     }
 
     /// Two ports taking `Any` take one type, whatever it is: given a texture first, the other takes a texture.
@@ -1522,11 +1525,36 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
         self
     }
 
+    /// What it will read of other nodes, said before it runs: all it may read, as what it does not say fails. Called again
+    /// once that is made, for as long as it asks for more, so that a read can name what the last one found.
+    #[must_use]
+    pub fn prepare(mut self, prepare: impl Fn(&mut Call<'_>) -> Result<Prepared> + Send + Sync + 'static) -> Self {
+        self.def.prepare = Some(Arc::new(prepare));
+        self
+    }
+
+    /// What it reads found by running it: each read of what is not there yet is noted and fails, it is run again once that
+    /// is made, and what came of it is left. For what reads as it goes, where saying so apart would be writing it twice; its
+    /// work up to its reads is done once a round, so it is for what is cheap until it has them.
+    #[must_use]
+    pub fn prepared_by_running(mut self) -> Self {
+        self.by_running = true;
+        self
+    }
+
     /// What it does - given its call, a value of what it makes - registered with it; its name, which a type's
     /// outputs and an inverse name it by.
     pub fn run(mut self, run: impl Fn(&mut Call<'_>) -> Result<Out::Value> + Send + Sync + 'static) -> Name {
         self.constrain();
         let also: Vec<String> = self.def.also.iter().map(|(name, _)| name.clone()).collect();
+        let run = Arc::new(run);
+        if self.by_running {
+            let run = run.clone();
+            self.def.prepare = Some(Arc::new(move |call| {
+                drop(run(call));
+                Ok(Prepared::default())
+            }));
+        }
         self.def.run = Arc::new(move |call| {
             let first = run(call).map(Out::encode)?;
             if also.is_empty() {

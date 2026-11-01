@@ -31,7 +31,7 @@ fn step(name: &str, arguments: &Value) -> Result<Value> {
 }
 
 /// What a test may ask for.
-const STEPS_OFFERED: [&str; 16] = [
+const STEPS_OFFERED: [&str; 21] = [
     "data",
     "show",
     "click",
@@ -48,6 +48,11 @@ const STEPS_OFFERED: [&str; 16] = [
     "assets",
     "selected",
     "pictured",
+    "override_entry",
+    "hold_reading",
+    "release_reading",
+    "declare",
+    "made",
 ];
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]

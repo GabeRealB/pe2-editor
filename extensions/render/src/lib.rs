@@ -204,12 +204,14 @@ fn links(r: &mut Registry) {
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
+    // The views' instance holds what they draw with (`render::Shared`), compiled once: dropped, the next view pays for it.
+    r.reclaimable(|| false);
     let _ = r.value_type::<Usd>();
     let scene_type = r.value_type::<Scene>();
     r.viewer(&scene_type, "3D", Icon::Cube, |_| make_view());
     r.viewer(&scene_type, "UV", Icon::Grid, |_| Box::new(uv::UvView::default()));
     let shown = [Usd::NAME, "pe2.render@material", "pe2.render@skeleton", MODEL, PREFAB];
-    let _ = r.op("assemble").label("What it shows").takes("node", &shown).output::<Scene>().parameter::<String>("chosen").run(assembly::scene);
+    let _ = r.op("assemble").label("What it shows").takes("node", &shown).output::<Scene>().prepared_by_running().parameter::<String>("chosen").run(assembly::scene);
     links(r);
     let _ = r
         .op("member")

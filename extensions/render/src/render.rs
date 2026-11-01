@@ -1,5 +1,7 @@
 //! Drawing a scene on the editor's device, to a texture of the size the view is given: the game's faces lit, what is drawn in the world in lines, and what is flat over all of it.
 
+use std::rc::Rc;
+
 use pe2_ext::guest::bindings::pe2::extension::gpu;
 use pe2_ext::guest::bindings::wasi::webgpu::webgpu as wg;
 
@@ -229,25 +231,84 @@ pub struct Drawn {
     pub step: f32,
 }
 
-pub struct Renderer {
+/// What no view changes and every view draws with: made once for the instance, as the views live in one, and kept while
+/// no view is open (`register`), so that a view opening draws with what is compiled already.
+struct Shared {
     device: wg::GpuDevice,
     queue: wg::GpuQueue,
     solid: wg::GpuRenderPipeline,
     solid_parts: wg::GpuRenderPipeline,
     /// In `Blend`'s order.
     blended: [wg::GpuRenderPipeline; 4],
-    vertices: [u32; 2],
-    blended_faces: Geometry,
-    runs: Vec<Run>,
     floor: wg::GpuRenderPipeline,
     lines: wg::GpuRenderPipeline,
     flat: wg::GpuRenderPipeline,
-    frame: wg::GpuBuffer,
-    group: wg::GpuBindGroup,
+    bindings: wg::GpuBindGroupLayout,
     pictures: wg::GpuBindGroupLayout,
     sampler: wg::GpuSampler,
+    /// What shows until a scene says: one white texel.
+    blank: wg::GpuTexture,
+}
+
+/// `Shared`, held in a `static`: a `thread_local!` here was found empty again at each call, the instance being the same.
+struct Held(Option<Rc<Shared>>);
+
+// SAFETY: a component instance runs on one thread, and its handles mean nothing outside it.
+unsafe impl Send for Held {}
+
+static SHARED: std::sync::Mutex<Held> = std::sync::Mutex::new(Held(None));
+
+impl Shared {
+    /// None where nothing draws.
+    fn get() -> Option<Rc<Shared>> {
+        let mut held = SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.0.is_none() {
+            held.0 = Shared::new().map(Rc::new);
+        }
+        held.0.clone()
+    }
+
+    fn new() -> Option<Shared> {
+        let device = gpu::device()?;
+        let queue = device.queue();
+        let entry = wg::GpuBindGroupLayoutEntry {
+            binding: 0,
+            visibility: wg::GpuShaderStage::VERTEX | wg::GpuShaderStage::FRAGMENT,
+            buffer: Some(wg::GpuBufferBindingLayout { type_: None, has_dynamic_offset: None, min_binding_size: None }),
+            sampler: None,
+            texture: None,
+            storage_texture: None,
+        };
+        let bindings = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: vec![entry], label: None });
+        let visible = wg::GpuShaderStage::FRAGMENT;
+        let picture_entries = vec![
+            wg::GpuBindGroupLayoutEntry { binding: 0, visibility: visible, buffer: None, sampler: None, texture: Some(wg::GpuTextureBindingLayout { sample_type: None, view_dimension: None, multisampled: None }), storage_texture: None },
+            wg::GpuBindGroupLayoutEntry { binding: 1, visibility: visible, buffer: None, sampler: Some(wg::GpuSamplerBindingLayout { type_: None }), texture: None, storage_texture: None },
+        ];
+        let pictures = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: picture_entries, label: None });
+        let layout = device.create_pipeline_layout(&wg::GpuPipelineLayoutDescriptor { bind_group_layouts: vec![Some(&bindings), Some(&pictures)], immediate_size: None, label: None });
+        let module = device.create_shader_module(&wg::GpuShaderModuleDescriptor { code: SHADER.to_string(), compilation_hints: None, label: None });
+        let (solid, lines) = (world_pipeline(&device, &layout, &module, true), world_pipeline(&device, &layout, &module, false));
+        let (floor, flat) = (floor_pipeline(&device, &layout, &module), flat_pipeline(&device, &module));
+        // Nearest, as the console samples, and nothing to show until a scene says.
+        let sampler = device.create_sampler(None);
+        let blank = upload(&device, &queue, (1, 1), &[255; 4]);
+        let blended = [Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter].map(|blend| face_pipeline(&device, &layout, &module, Some(blend)));
+        let solid_parts = face_pipeline(&device, &layout, &module, None);
+        Some(Shared { device, queue, solid, solid_parts, blended, floor, lines, flat, bindings, pictures, sampler, blank })
+    }
+}
+
+pub struct Renderer {
+    shared: Rc<Shared>,
+    vertices: [u32; 2],
+    blended_faces: Geometry,
+    runs: Vec<Run>,
+    frame: wg::GpuBuffer,
+    group: wg::GpuBindGroup,
     atlas: wg::GpuBindGroup,
-    atlas_texture: wg::GpuTexture,
+    /// What `atlas` reads, where a scene gave one.
+    atlas_texture: Option<wg::GpuTexture>,
     target: Option<Target>,
     triangles: Geometry,
     floor_quad: Geometry,
@@ -392,41 +453,17 @@ fn picture_group(device: &wg::GpuDevice, layout: &wg::GpuBindGroupLayout, sample
 impl Renderer {
     /// None where nothing draws.
     pub fn new() -> Option<Renderer> {
-        let device = gpu::device()?;
-        let queue = device.queue();
+        let shared = Shared::get()?;
+        let device = &shared.device;
         let frame = device.create_buffer(&wg::GpuBufferDescriptor { size: FRAME_SIZE, usage: wg::GpuBufferUsage::UNIFORM | wg::GpuBufferUsage::COPY_DST, mapped_at_creation: None, label: None });
-        let entry = wg::GpuBindGroupLayoutEntry {
-            binding: 0,
-            visibility: wg::GpuShaderStage::VERTEX | wg::GpuShaderStage::FRAGMENT,
-            buffer: Some(wg::GpuBufferBindingLayout { type_: None, has_dynamic_offset: None, min_binding_size: None }),
-            sampler: None,
-            texture: None,
-            storage_texture: None,
-        };
-        let bindings = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: vec![entry], label: None });
-        let visible = wg::GpuShaderStage::FRAGMENT;
-        let picture_entries = vec![
-            wg::GpuBindGroupLayoutEntry { binding: 0, visibility: visible, buffer: None, sampler: None, texture: Some(wg::GpuTextureBindingLayout { sample_type: None, view_dimension: None, multisampled: None }), storage_texture: None },
-            wg::GpuBindGroupLayoutEntry { binding: 1, visibility: visible, buffer: None, sampler: Some(wg::GpuSamplerBindingLayout { type_: None }), texture: None, storage_texture: None },
-        ];
-        let pictures = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: picture_entries, label: None });
-        let layout = device.create_pipeline_layout(&wg::GpuPipelineLayoutDescriptor { bind_group_layouts: vec![Some(&bindings), Some(&pictures)], immediate_size: None, label: None });
         let group = device.create_bind_group(&wg::GpuBindGroupDescriptor {
-            layout: &bindings,
+            layout: &shared.bindings,
             entries: vec![wg::GpuBindGroupEntry { binding: 0, resource: wg::GpuBindingResource::GpuBuffer(&frame) }],
             label: None,
         });
-        let module = device.create_shader_module(&wg::GpuShaderModuleDescriptor { code: SHADER.to_string(), compilation_hints: None, label: None });
-        let (solid, lines) = (world_pipeline(&device, &layout, &module, true), world_pipeline(&device, &layout, &module, false));
-        let (floor, flat) = (floor_pipeline(&device, &layout, &module), flat_pipeline(&device, &module));
+        let atlas = picture_group(device, &shared.pictures, &shared.sampler, &shared.blank);
         let geometry = Geometry::new;
-        // Nearest, as the console samples, and nothing to show until a scene says.
-        let sampler = device.create_sampler(None);
-        let blank = upload(&device, &queue, (1, 1), &[255; 4]);
-        let atlas = picture_group(&device, &pictures, &sampler, &blank);
-        let blended = [Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter].map(|blend| face_pipeline(&device, &layout, &module, Some(blend)));
-        let solid_parts = face_pipeline(&device, &layout, &module, None);
-        Some(Renderer { solid, solid_parts, blended, vertices: [0; 2], blended_faces: Geometry::new(), runs: Vec::new(), floor, lines, flat, frame, group, pictures, sampler, atlas, atlas_texture: blank, target: None, triangles: geometry(), floor_quad: geometry(), world_lines: geometry(), overlay: geometry(), device, queue })
+        Some(Renderer { vertices: [0; 2], blended_faces: geometry(), runs: Vec::new(), frame, group, atlas, atlas_texture: None, target: None, triangles: geometry(), floor_quad: geometry(), world_lines: geometry(), overlay: geometry(), shared })
     }
 
     /// Make sure what is drawn to is this many pixels; what the window shows it by. Whether it changed.
@@ -434,9 +471,9 @@ impl Renderer {
         if self.target.as_ref().is_some_and(|target| target.size == size) {
             return false;
         }
-        let shown = texture(&self.device, size, COLOR, 1, wg::GpuTextureUsage::RENDER_ATTACHMENT | wg::GpuTextureUsage::TEXTURE_BINDING);
-        let samples = texture(&self.device, size, COLOR, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
-        let depth = texture(&self.device, size, DEPTH, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
+        let shown = texture(&self.shared.device, size, COLOR, 1, wg::GpuTextureUsage::RENDER_ATTACHMENT | wg::GpuTextureUsage::TEXTURE_BINDING);
+        let samples = texture(&self.shared.device, size, COLOR, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
+        let depth = texture(&self.shared.device, size, DEPTH, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
         self.target = Some(Target {
             id: gpu::publish(&shown),
             color: shown.create_view(None),
@@ -454,32 +491,32 @@ impl Renderer {
 
     /// What faces with pictures read: RGBA, row by row.
     pub fn set_atlas(&mut self, size: (u32, u32), rgba: &[u8]) {
-        let texture = upload(&self.device, &self.queue, size, rgba);
-        self.atlas = picture_group(&self.device, &self.pictures, &self.sampler, &texture);
-        self.atlas_texture = texture;
+        let texture = upload(&self.shared.device, &self.shared.queue, size, rgba);
+        self.atlas = picture_group(&self.shared.device, &self.shared.pictures, &self.shared.sampler, &texture);
+        self.atlas_texture = Some(texture);
     }
 
     pub fn set_triangles(&mut self, triangles: Option<&Triangles>) {
         self.vertices = triangles.map_or([0; 2], |triangles| triangles.vertices);
-        self.triangles.write(&self.device, &self.queue, triangles.map_or(&[], |triangles| &triangles.bytes));
+        self.triangles.write(&self.shared.device, &self.shared.queue, triangles.map_or(&[], |triangles| &triangles.bytes));
     }
 
     /// What blends, in the order it is to be drawn.
     pub fn set_blended(&mut self, bytes: &[u8], runs: Vec<Run>) {
-        self.blended_faces.write(&self.device, &self.queue, bytes);
+        self.blended_faces.write(&self.shared.device, &self.shared.queue, bytes);
         self.runs = runs;
     }
 
     pub fn set_floor(&mut self, bytes: &[u8]) {
-        self.floor_quad.write(&self.device, &self.queue, bytes);
+        self.floor_quad.write(&self.shared.device, &self.shared.queue, bytes);
     }
 
     pub fn set_lines(&mut self, bytes: &[u8]) {
-        self.world_lines.write(&self.device, &self.queue, bytes);
+        self.world_lines.write(&self.shared.device, &self.shared.queue, bytes);
     }
 
     pub fn set_overlay(&mut self, bytes: &[u8]) {
-        self.overlay.write(&self.device, &self.queue, bytes);
+        self.overlay.write(&self.shared.device, &self.shared.queue, bytes);
     }
 
     pub fn draw(&self, drawn: &Drawn) {
@@ -488,8 +525,8 @@ impl Renderer {
         for value in drawn.light.into_iter().chain([drawn.step]) {
             uniform.extend_from_slice(&value.to_le_bytes());
         }
-        let _ = self.queue.write_buffer_with_copy(&self.frame, 0, &uniform, None, None);
-        let encoder = self.device.create_command_encoder(None);
+        let _ = self.shared.queue.write_buffer_with_copy(&self.frame, 0, &uniform, None, None);
+        let encoder = self.shared.device.create_command_encoder(None);
         let color = wg::GpuRenderPassColorAttachment {
             view: &target.samples,
             depth_slice: None,
@@ -522,12 +559,12 @@ impl Renderer {
         if let Some(buffer) = self.triangles.buffer.as_ref().filter(|_| self.triangles.used > 0) {
             let [opaque, solid_parts] = self.vertices;
             pass.set_vertex_buffer(0, Some(buffer), None, Some(self.triangles.used));
-            pass.set_pipeline(&self.solid);
+            pass.set_pipeline(&self.shared.solid);
             pass.draw(opaque, None, None, None);
-            pass.set_pipeline(&self.solid_parts);
+            pass.set_pipeline(&self.shared.solid_parts);
             pass.draw(solid_parts, None, Some(opaque), None);
         }
-        let layers = [(&self.lines, &self.world_lines, scene::VERTEX_SIZE), (&self.floor, &self.floor_quad, scene::VERTEX_SIZE)];
+        let layers = [(&self.shared.lines, &self.world_lines, scene::VERTEX_SIZE), (&self.shared.floor, &self.floor_quad, scene::VERTEX_SIZE)];
         for (pipeline, geometry, stride) in layers {
             draw_all(&pass, pipeline, geometry, stride);
         }
@@ -535,15 +572,15 @@ impl Renderer {
         if let Some(buffer) = self.blended_faces.buffer.as_ref().filter(|_| self.blended_faces.used > 0) {
             pass.set_vertex_buffer(0, Some(buffer), None, Some(self.blended_faces.used));
             for run in &self.runs {
-                pass.set_pipeline(&self.blended[run.blend as usize]);
+                pass.set_pipeline(&self.shared.blended[run.blend as usize]);
                 let share = share(run.blend);
                 pass.set_blend_constant(wg::GpuColor { r: share, g: share, b: share, a: share });
                 pass.draw(run.count, None, Some(run.first), None);
             }
         }
-        draw_all(&pass, &self.flat, &self.overlay, gizmo::VERTEX_SIZE);
+        draw_all(&pass, &self.shared.flat, &self.overlay, gizmo::VERTEX_SIZE);
         pass.end();
         let commands = encoder.finish(None);
-        self.queue.submit(&[&commands]);
+        self.shared.queue.submit(&[&commands]);
     }
 }

@@ -149,6 +149,16 @@ impl Fixture {
         fixture
     }
 
+    /// A project whose code sits in a files layer, under the asset layer it is edited from.
+    #[must_use]
+    pub fn code() -> Fixture {
+        let fixture = Fixture::new();
+        fixture.write("project.toml", &format!("[[layer]]\nname = \"code\"\nkind = \"files\"\n\n[[layer]]\nname = \"{LAYER}\"\n"));
+        fixture.write(&format!(".layers/{LAYER}/.keep"), "");
+        fixture.write(".layers/code/src/thing.c", "int thing;\n");
+        fixture
+    }
+
     /// A skeleton of three joints.
     #[must_use]
     pub fn rig() -> Fixture {

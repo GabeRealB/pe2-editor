@@ -5,7 +5,7 @@
 //!
 //! `schedule` is the order of it, and knows nothing of what its actions do.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::graph::Gate;
@@ -225,28 +225,17 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
     report
 }
 
-/// The most run at a time: each may hold instances of two extensions at once, and of one twice where what it reads is its own, and an extension has few to give
-/// (`component::SLOTS`), the panes' among them.
-const MOST_AT_ONCE: usize = 6;
-
-/// A batch at once, as many at a time as there are processors, up to `MOST_AT_ONCE`.
+/// A batch at once, as many at a time as there are threads to lend.
 fn run_all(triggers: &[Trigger], batch: &[usize], effects: &dyn Effects) -> Vec<Outcome> {
-    let width = std::thread::available_parallelism().map_or(1, usize::from).min(MOST_AT_ONCE);
-    let mut outcomes: BTreeMap<usize, Outcome> = BTreeMap::new();
-    for chunk in batch.chunks(width) {
-        std::thread::scope(|scope| {
-            let running: Vec<_> = chunk.iter().map(|t| (*t, scope.spawn(move || effects.run(&triggers[*t].action)))).collect();
-            for (t, thread) in running {
-                let outcome = thread.join().unwrap_or_else(|_| Outcome { failed: Some("it panicked".into()), ..Outcome::default() });
-                outcomes.insert(t, outcome);
-            }
-        });
-    }
-    batch.iter().filter_map(|t| outcomes.remove(t)).collect()
+    crate::parallel(batch, |t| {
+        let run = std::panic::AssertUnwindSafe(|| effects.run(&triggers[*t].action));
+        std::panic::catch_unwind(run).unwrap_or_else(|_| Outcome { failed: Some("it panicked".into()), ..Outcome::default() })
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     use super::*;

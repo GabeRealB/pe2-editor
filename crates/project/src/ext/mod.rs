@@ -1540,6 +1540,16 @@ impl Extensions {
                 ops.add(op.streams((**item).clone(), move |call| start_stream(call, &*start)));
                 continue;
             }
+            op.strict = true;
+            if let Some(prepare) = def.prepare.clone() {
+                op.prepare = Some(Arc::new(move |call| {
+                    let inputs = call.take_inputs();
+                    let hosted = Hosted::new(call);
+                    let carried = pe2_ext::Call::carried_by(&inputs);
+                    let mut lent = pe2_ext::Call { inputs, settings: call.settings(), made: std::cell::RefCell::default(), carried, parameter_text: call.parameter(), host: &hosted };
+                    prepare(&mut lent)
+                }));
+            }
             ops.add(op.makes(def.output.clone(), move |call| {
                 let inputs = call.take_inputs();
                 let hosted = Hosted::new(call);
