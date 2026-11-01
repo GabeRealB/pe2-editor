@@ -119,8 +119,11 @@ impl Applied {
             let applied = asset.uid.as_ref().and_then(|uid| held.get(uid));
             let now = asset.applied.as_ref().map(|a| a.text.as_str());
             if applied.map(String::as_str) != now {
+                let mut written = (**asset).clone();
+                written.applied = None;
+                let written = Arc::new(written);
                 let declaration = applied.map(|text| {
-                    Arc::new(AppliedDeclaration { fields: toml::from_str(text).unwrap_or_default(), text: text.clone() })
+                    Arc::new(AppliedDeclaration { written: written.clone(), fields: crate::graph::with_settings(toml::from_str(text).unwrap_or_default()), text: text.clone() })
                 });
                 Arc::make_mut(asset).applied = declaration;
             }

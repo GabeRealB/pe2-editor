@@ -1,4 +1,4 @@
-//! pe2.images: the image kind. What one is follows from what it declares: a BS picture has no `mode`, a texture does
+//! pe2.images: the image type. What one is follows from what it declares: a BS picture has no `mode`, a texture does
 //! (texels through its palettes), and an atlas has `cells` as well (each through its own palette).
 //!
 //! It registers what the host shows an image by: its picture in each of its looks and its palettes as parts, its
@@ -16,10 +16,13 @@ mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
 pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Retain, Setting, Signature, Tint, Typed, Value};
+use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Setting, Signature, Tint, Typed, Value};
 use std::collections::HashMap;
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
+
+/// What an image is.
+const IMAGE: &str = "pe2.images@image";
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
@@ -45,6 +48,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("OpenRaster layers")
         .input::<OpenRaster>("source")
         .output::<Texels>()
+        .also::<ty::Table>("settings")
         .derives("size")
         .derives("cells.*.rect")
         .inverse(&ora_source)
@@ -52,10 +56,20 @@ fn register(r: &mut Registry) -> Result<()> {
         .run(|call| {
             let source = call.take::<OpenRaster>(0)?;
             let bytes = call.read(source.file()?)?;
-            ora::import(&call.lend_files(&[]).asset(), &bytes)
+            // What it makes comes with what it is set to and what it derives, for what reads an image.
+            let mut image = ora::import(&call.lend_files(&[]).asset(), &bytes)?;
+            image.derived = pe2_ext::merged(call.settings, &image.derived);
+            call.make("settings", pe2_ext::Data::Table(image.derived.clone()));
+            Ok(image)
         });
     // An image in one of its looks, by name: `default`, or a variant's.
-    let draw = r.op("draw").label("Picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("look").run(|call| {
+    let _ = r.op("draw").label("Picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("look").priority(10)
+        .field(Field::new("mode").label("Mode").choices(MODES).brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))))
+        .field(Field::new("size").read_only())
+        .field(Field::new("palettes").custom())
+        .field(Field::new("cells").custom())
+        .field(Field::new("variants").custom())
+        .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] }).run(|call| {
         let look: String = call.parameter()?;
         match call.take::<NativeForm>(0)? {
             ty::Either::First(bs) => decode_bs(&call.read(bs.file()?)?),
@@ -69,29 +83,21 @@ fn register(r: &mut Registry) -> Result<()> {
             }
         }
     });
-    let (palette, cell) = part_outputs(r);
+    part_outputs(r);
     // What is marked on it: an atlas's cells, a wide texture's pages.
-    let marked = r.op("marks").label("Cells and pages").input::<NativeForm>("native").output::<ty::Marks>().run(|call| {
+    let _ = r.op("marks").label("Cells and pages").input::<NativeForm>("native").output::<ty::Marks>().run(|call| {
         Ok(match call.take::<NativeForm>(0)? {
             ty::Either::First(_) => pe2_ext::Marks::default(),
             ty::Either::Second(image) => marks::of(&call.lend_settings(&image.derived).asset()),
         })
     });
     let image = r
-        .kind("image")
+        .named_type("image")
         .alias("image")
         .label("Image")
+        .of(BsPicture::NAME)
+        .of(Texels::NAME)
         .icon(Icon::Image, Tint::Picture)
-        .field(
-            Field::new("mode")
-                .label("Mode")
-                .choices(MODES)
-                .brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))),
-        )
-        .field(Field::new("size").read_only())
-        .field(Field::new("palettes").custom())
-        .field(Field::new("cells").custom())
-        .field(Field::new("variants").custom())
         .inspector_tab("Palettes", Icon::Palette, &["palettes", "variants"], |_| Box::new(inspector::Collections::of(inspector::Shows::Palettes)))
         .inspector_tab("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::Collections::of(inspector::Shows::Cells)))
         .editor("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::CellSheet::default()))
@@ -99,18 +105,12 @@ fn register(r: &mut Registry) -> Result<()> {
         .content_act(inspector::act)
         .part_sheet(part_sheet)
         .contents_view("Summary", |_| Box::new(inspector::Summary))
-        // Its picture in each look; its palettes and cells drawn.
-        .output("picture", &draw, Retain::Transient)
-        .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] })
-        .output("palettes", &palette, Retain::Transient)
-        .members(|asset| palette_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
-        .output("cells", &cell, Retain::Transient)
-        .members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
-        .output("marks", &marked, Retain::Transient)
         .register();
+    drop(r.template("texture", IMAGE, &format!("{TEXTURE}{OFFERS}")).label("Texture, from layers").files(&["*.ora"]));
+    drop(r.template("background", IMAGE, &format!("{BACKGROUND}{OFFERS}")).label("Background picture").files(&["*.bs"]));
     // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
     let _ = r.extractor("textures", &image, &["mode"], extract::begin);
-    r.kind("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).register();
+    r.named_type("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).data().field(Field::new("rect").label("Rectangle").required()).register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)
             .label("VRAM page grid")
@@ -124,21 +124,87 @@ fn register(r: &mut Registry) -> Result<()> {
 }
 
 /// A palette's and a cell's pictures.
-fn part_outputs(r: &mut Registry) -> (pe2_ext::Name, pe2_ext::Name) {
+fn part_outputs(r: &mut Registry) {
     // A palette as a strip of its colors, and a cell where it is drawn, through a palette of its image's where one is
     // named (`skin@night`).
-    let palette = r.op("palette_picture").label("A palette's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").run(|call| {
+    let _ = r.op("palette_picture").label("A palette's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").members(|asset| palette_names(asset).into_iter().map(|name| (name.clone(), name)).collect()).run(|call| {
         let name: String = call.parameter()?;
         let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no palettes") };
         palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
     });
-    let cell = r.op("cell_picture").label("A cell's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").run(|call| {
+    let _ = r.op("cell_picture").label("A cell's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
         let name: String = call.parameter()?;
         let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no cells") };
         cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
     });
-    (palette, cell)
 }
+
+/// What an image offers, whichever way it is stored: each hanging off the layer named `image`.
+const OFFERS: &str = r#"
+[[stack]]
+op = "pe2.images@draw"
+native = { from = "image" }
+
+[[stack]]
+op = "preview"
+name = "picture"
+
+[[stack]]
+op = "pe2.images@palette_picture"
+native = { from = "image" }
+
+[[stack]]
+op = "output"
+name = "palettes"
+
+[[stack]]
+op = "pe2.images@cell_picture"
+native = { from = "image" }
+
+[[stack]]
+op = "output"
+name = "cells"
+
+[[stack]]
+op = "pe2.images@marks"
+native = { from = "image" }
+
+[[stack]]
+op = "output"
+name = "marks"
+"#;
+
+/// An image of layers, turned into what the game stores when its source changes.
+const TEXTURE: &str = r#"[[stack]]
+op = "file"
+file = "{file}"
+
+[[stack]]
+id = "image"
+op = "pe2.images@ora"
+
+[[stack]]
+op = "output"
+name = "native"
+retain = "cache"
+when = "eager"
+
+[[stack]]
+op = "output"
+name = "settings"
+value = { from = "image.settings" }
+"#;
+
+/// A picture stored as it is.
+const BACKGROUND: &str = r#"[[stack]]
+id = "image"
+op = "file"
+file = "{file}"
+
+[[stack]]
+op = "output"
+name = "native"
+"#;
 
 /// An image's modes: what a texel is. A native-only image's texels are read in its mode; an imported one's are
 /// converted to it, its palette generated or quantized to fit.
@@ -607,7 +673,6 @@ mod tests {
     fn draws_an_atlas_cell_through_its_palette_and_its_variants() {
         let fields: Table = toml::from_str(
             r#"
-            kind = "image"
             mode = "indexed_4bpp"
             size = [2, 1]
             palettes.warm = {}

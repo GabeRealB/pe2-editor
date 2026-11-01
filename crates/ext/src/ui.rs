@@ -1,6 +1,6 @@
 //! Views: an extension's own UI, in immediate mode as the editor's is. A view is one instance a pane, keeping its
 //! state between frames; every frame the host calls `show` with a `Ui` it lends for the call, and each call on it
-//! draws a widget and returns what the user did with it this frame. A view shows an asset (a kind's view, in the
+//! draws a widget and returns what the user did with it this frame. A view shows an asset (a type's view, in the
 //! preview or the inspector), or none (a panel).
 
 use crate::{Asset, Icon, Project, Rect, Texture, Value};
@@ -138,10 +138,10 @@ pub trait UiHost {
     fn request_repaint(&mut self) {}
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
     fn reference(&mut self, reference: &Value);
-    /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its other keys
+    /// The host's chip for a reference, taking an asset of `type` dropped on it: the reference that makes, its other keys
     /// kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with the dropped asset's
     /// uid. `label` says what is being set.
-    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value>;
+    fn reference_taking(&mut self, label: &str, node_type: &str, reference: Option<&Value>) -> Option<Value>;
     /// A field within a row, the host's way: its label and its reading (a reference as a chip, a flag as a badge).
     fn field(&mut self, key: &str, value: &Value);
     /// What hovering the last widget says.
@@ -153,6 +153,10 @@ pub trait UiHost {
     fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize>;
     /// Whether the asset shown can be edited: its layer is not locked, nor outside a solo.
     fn editable(&self) -> bool;
+    /// The output this view is a viewer of, by its address.
+    fn shown(&self) -> Option<String> {
+        None
+    }
     /// Set a field of the asset shown - its whole value, or none to remove it - in one undoable step with the frame's
     /// other changes. A table of parts keeps a line each.
     fn set(&mut self, key: &str, value: Option<&Value>);
@@ -271,11 +275,11 @@ impl<'a> Ui<'a> {
         self.host.reference(reference);
     }
 
-    /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its other keys
+    /// The host's chip for a reference, taking an asset of `type` dropped on it: the reference that makes, its other keys
     /// kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with the dropped asset's
     /// uid. `label` says what is being set.
-    pub fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
-        self.host.reference_taking(label, kind, reference)
+    pub fn reference_taking(&mut self, label: &str, node_type: &str, reference: Option<&Value>) -> Option<Value> {
+        self.host.reference_taking(label, node_type, reference)
     }
 
     pub fn field(&mut self, key: &str, value: &Value) {
@@ -297,6 +301,11 @@ impl<'a> Ui<'a> {
     }
 
     /// Whether the asset shown can be edited.
+    #[must_use]
+    pub fn shown(&self) -> Option<String> {
+        self.host.shown()
+    }
+
     #[must_use]
     pub fn editable(&self) -> bool {
         self.host.editable()

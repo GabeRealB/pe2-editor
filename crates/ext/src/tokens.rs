@@ -1,4 +1,4 @@
-//! Tokenizers: what a value is in the language a package is written in. One is declared for a kind, with what it makes of the
+//! Tokenizers: what a value is in the language a package is written in. One is declared for a type, with what it makes of the
 //! whole value and the derived values a target needs and no node shows (a material's `tpage`), each with what it generates
 //! and the args it reads. It is an ordinary operation, kept and traced as any, reached as the output `tokens/<address>` of a
 //! node; `tokenizer` says what it declares, without making anything. A target's own, for one target alone, overrides.
@@ -18,6 +18,9 @@ pub const DECLARED: &str = "tokenizer";
 /// What an output a sub-path goes through is: a table holding one of these, the node it leads to, or a plain value it ends at.
 pub const NODE: &str = "node";
 pub const VALUE: &str = "value";
+/// Beside `NODE`: what that node is here where that is not what the node is, and the args its tokenizer is then read with.
+pub const AS: &str = "as";
+pub const ARGS: &str = "args";
 
 /// An output leading to the node a reference names.
 ///
@@ -26,6 +29,18 @@ pub const VALUE: &str = "value";
 pub fn link(reference: Option<&Value>) -> Result<Table> {
     let target = reference.and_then(crate::target_of).ok_or_else(|| anyhow!("it names nothing there"))?;
     Ok(Table::from_iter([(NODE.to_string(), target.into())]))
+}
+
+/// An output leading on from a node as something else than it is, which its tokenizer reads by these args: a prefab's member
+/// is a model, read from the prefab.
+#[must_use]
+pub fn leads_on(node: &str, reads_as: &str, args: &[(&str, &str)]) -> Table {
+    let args = args.iter().map(|(name, value)| ((*name).to_string(), Value::String((*value).to_string())));
+    Table::from_iter([
+        (NODE.to_string(), node.into()),
+        (AS.to_string(), reads_as.into()),
+        (ARGS.to_string(), Value::Table(args.collect())),
+    ])
 }
 
 /// What an entry generates, as a person using it needs to know.
@@ -101,7 +116,8 @@ fn parsed(text: &str) -> (Option<&str>, Args) {
 /// A tokenizer being declared: `Registry::tokenizer`.
 pub struct Tokenizer<'a> {
     registry: &'a mut Registry,
-    kind: String,
+    /// The value types it tokenizes, by their qualified names; the first names it.
+    values: Vec<String>,
     target: Option<String>,
     entries: Vec<Entry>,
 }
@@ -130,26 +146,39 @@ impl Tokenizer<'_> {
 
     /// Register it.
     pub fn register(self) {
-        let Tokenizer { registry, kind, target, entries } = self;
-        let local = kind.rsplit('@').next().unwrap_or(&kind).to_string();
+        let Tokenizer { registry, values, target, entries } = self;
+        let local = values.first().and_then(|value| value.rsplit('@').next()).unwrap_or_default().to_string();
         let suffix = target.as_ref().map_or_else(String::new, |target| format!("_{target}"));
         let declared = declaration(&entries);
         let held = entries.clone();
-        let made = registry.op(&format!("tokens_{local}{suffix}")).label("Tokens").output::<ty::Tokens>().parameter::<String>("address").run(move |call| {
-            let asked: String = call.parameter()?;
-            let (name, args) = parsed(&asked);
-            let call: &Call<'_> = call;
-            let entry = held.iter().find(|entry| entry.name == name).ok_or_else(|| anyhow!("{}", unknown(&held, name)))?;
-            if let Some(missing) = entry.args.iter().find(|arg| !args.0.contains_key(**arg)) {
-                bail!("it needs {missing}");
-            }
-            let tokens = (entry.make)(call, &args)?;
-            Ok(Typed::new(ty::Tokens::NAME, vec![File::new(ty::Tokens::FILE, tokens.into_bytes())]))
-        });
-        let told = registry.op(&format!("tokenizer_{local}{suffix}")).label("What it tokenizes to").output::<ty::Table>().run(move |_| Ok(declared.clone()));
         let names = |name: &str| target.as_ref().map_or_else(|| name.to_string(), |target| format!("{name}.{target}"));
-        let _ = registry.add_output(&kind, &names(OUTPUT), &made.to_string(), None, Retain::Cache);
-        let _ = registry.add_output(&kind, &names(DECLARED), &told.to_string(), None, Retain::Transient);
+        let taken: Vec<&str> = values.iter().map(String::as_str).collect();
+        let _ = registry
+            .op(&format!("tokens_{local}{suffix}"))
+            .label("Tokens")
+            .takes("value", &taken)
+            .output::<ty::Tokens>()
+            .parameter::<String>("address")
+            .provides(&names(OUTPUT))
+            .keeps(Retain::Cache)
+            .run(move |call| {
+                let asked: String = call.parameter()?;
+                let (name, args) = parsed(&asked);
+                let call: &Call<'_> = call;
+                let entry = held.iter().find(|entry| entry.name == name).ok_or_else(|| anyhow!("{}", unknown(&held, name)))?;
+                if let Some(missing) = entry.args.iter().find(|arg| !args.0.contains_key(**arg)) {
+                    bail!("it needs {missing}");
+                }
+                let tokens = (entry.make)(call, &args)?;
+                Ok(Typed::new(ty::Tokens::NAME, vec![File::new(ty::Tokens::FILE, tokens.into_bytes())]))
+            });
+        let _ = registry
+            .op(&format!("tokenizer_{local}{suffix}"))
+            .label("What it tokenizes to")
+            .takes("value", &taken)
+            .output::<ty::Table>()
+            .provides(&names(DECLARED))
+            .run(move |_| Ok(declared.clone()));
     }
 }
 
@@ -176,9 +205,9 @@ fn declaration(entries: &[Entry]) -> Table {
 }
 
 impl Registry {
-    /// A tokenizer of nodes of a kind, which this extension's dependencies register.
-    pub fn tokenizer(&mut self, kind: &str) -> Tokenizer<'_> {
-        Tokenizer { registry: self, kind: kind.to_string(), target: None, entries: Vec::new() }
+    /// A tokenizer of values of these types, which this extension's dependencies register.
+    pub fn tokenizer(&mut self, values: &[&str]) -> Tokenizer<'_> {
+        Tokenizer { registry: self, values: values.iter().map(|value| (*value).to_string()).collect(), target: None, entries: Vec::new() }
     }
 }
 

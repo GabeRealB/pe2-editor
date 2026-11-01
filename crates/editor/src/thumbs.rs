@@ -1,4 +1,4 @@
-//! Thumbnails of the asset tree's assets: each its kind's `thumbnail/<side>` output, made on a thread of their own
+//! Thumbnails of the asset tree's assets: each its type's `thumbnail/<side>` output, made on a thread of their own
 //! through the work graph and kept in the project's store - an asset shown in the tree is asked for once, read back
 //! from the store where what it read still holds (an earlier session's), made and kept otherwise. A refreshed asset's
 //! thumbnail is forgotten and asked for again.

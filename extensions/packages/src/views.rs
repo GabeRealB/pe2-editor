@@ -238,7 +238,7 @@ impl Slots {
         if tables.is_empty() {
             return;
         }
-        let (name, kind) = (column(&tables) + GAP, 8.0 * CHARACTER);
+        let (name, of_type) = (column(&tables) + GAP, 8.0 * CHARACTER);
         let held = |field: &str| ui.asset().and_then(|asset| asset.field(field).cloned());
         let (bind, set) = (held("bind"), held("option"));
         let selected = ui.selected();
@@ -259,7 +259,7 @@ impl Slots {
                             ui.tab(name);
                             let filled = held_in(bind.as_ref(), input_name);
                             ui.styled(text(input, "type"), if filled.is_none() { Style::Error } else { Style::Note });
-                            ui.tab(name + kind);
+                            ui.tab(name + of_type);
                             if let Some(new) = ui.reference_taking(input_name, text(input, "type"), filled) {
                                 asked = Some(("bind", input_name.to_string(), new));
                             }
@@ -268,7 +268,7 @@ impl Slots {
                             ui.styled(input_name, Style::Normal);
                             ui.tab(name);
                             ui.styled(text(input, "type"), Style::Note);
-                            ui.tab(name + kind);
+                            ui.tab(name + of_type);
                             if let Some(new) = self.editor(ui, input, value) {
                                 asked = Some(("option", input_name.to_string(), new));
                             }

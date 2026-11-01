@@ -3,7 +3,7 @@
 
 use pe2_ext::tokens::{VALUE, link};
 use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Asset, Cell, Field, Icon, Name, Registry, Result, Signature, Style, Table, Tint, Ui, Value, View};
+use pe2_ext::{Asset, Cell, Field, Icon, Registry, Result, Signature, Style, Table, Tint, Ui, Value, View};
 
 pe2_ext::extension!("pe2.render", "0.1.0", register);
 
@@ -33,6 +33,10 @@ mod uv;
 #[cfg(target_family = "wasm")]
 mod view;
 
+/// What is set on a model, and on a prefab.
+const MODEL: &str = "pe2.render@model";
+const PREFAB: &str = "pe2.render@prefab";
+
 /// A mesh, in USD's text form.
 pub struct Usd;
 
@@ -47,8 +51,132 @@ impl Registered for Usd {
 
 impl Files for Usd {}
 
+/// What a viewer of a model shows: a mesh, a model with its materials filled or a prefab's models in one tree, with
+/// where each transform is kept (`assembly::Assembled`).
+pub struct Scene;
+
+impl Registered for Scene {
+    const NAME: &str = "pe2.render@scene";
+    const LABEL: &str = "Scene";
+}
+
+impl Files for Scene {}
+
 /// A mesh's stack: its file.
-const MESH: &str = "[[stack]]\nop = \"file\"\nfile = \"mesh.usda\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
+const MESH: &str = r#"[[stack]]
+id = "mesh"
+op = "file"
+file = "mesh.usda"
+
+[[stack]]
+op = "output"
+name = "native"
+retain = "cache"
+
+[[stack]]
+op = "pe2.render@skeleton_of"
+
+[[stack]]
+op = "output"
+name = "skeleton"
+
+[[stack]]
+op = "pe2.render@assemble"
+node = { from = "mesh" }
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+"#;
+
+/// A material: what is set on it, shown on a ball.
+const MATERIAL: &str = r#"[[stack]]
+id = "material"
+op = "pe2.render@material"
+
+[[stack]]
+op = "pe2.render@assemble"
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+"#;
+
+/// A skeleton: its joints, each a place.
+const SKELETON: &str = r#"[[stack]]
+id = "skeleton"
+op = "pe2.render@skeleton"
+
+[[stack]]
+op = "pe2.render@joint_at"
+
+[[stack]]
+op = "output"
+name = "joints"
+
+[[stack]]
+op = "pe2.render@assemble"
+node = { from = "skeleton" }
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+"#;
+
+/// A model: a mesh, and what fills its slots.
+const MODEL_STACK: &str = r#"[[stack]]
+id = "model"
+op = "pe2.render@model"
+
+[[stack]]
+op = "pe2.render@mesh_of"
+
+[[stack]]
+op = "output"
+name = "mesh"
+
+[[stack]]
+op = "pe2.render@material_of"
+model = { from = "model" }
+
+[[stack]]
+op = "output"
+name = "materials"
+
+[[stack]]
+op = "pe2.render@assemble"
+node = { from = "model" }
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+"#;
+
+/// A prefab: its models in one tree, and each group's members.
+const PREFAB_STACK: &str = r#"[[stack]]
+id = "prefab"
+op = "pe2.render@prefab"
+
+[[stack]]
+op = "pe2.render@assemble"
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+
+[[stack]]
+op = "pe2.render@member"
+prefab = { from = "prefab" }
+
+[[stack]]
+op = "output"
+each = "groups"
+"#;
 
 /// A skeleton's joints by name, in order.
 fn joint_names(asset: &Asset) -> Vec<String> {
@@ -57,45 +185,58 @@ fn joint_names(asset: &Asset) -> Vec<String> {
 }
 
 /// What a sub-path goes through: a model's mesh and materials, a mesh's skeleton, a skeleton's joints, each joint its place.
-fn links(r: &mut Registry) -> (Name, Name, Name, Name) {
-    let mesh_of = r.op("mesh_of").label("Its mesh").output::<ty::Table>().run(|call| link(call.host.fields().get("mesh")));
-    let skeleton_of = r.op("skeleton_of").label("Its skeleton").output::<ty::Table>().run(|call| link(call.host.fields().get("skeleton")));
-    let material_of = r.op("material_of").label("What fills a slot").output::<ty::Table>().parameter::<String>("slot").run(|call| {
+fn links(r: &mut Registry) {
+    let _ = r.op("mesh_of").label("Its mesh").takes("model", &[MODEL]).output::<ty::Table>().run(|call| link(call.given().get("mesh")));
+    let _ = r.op("skeleton_of").label("Its skeleton").takes("mesh", &[Usd::NAME]).output::<ty::Table>().run(|call| link(call.given().get("skeleton")));
+    let _ = r.op("material_of").label("What fills a slot").takes("model", &[MODEL]).output::<ty::Table>().parameter::<String>("slot").members(|asset| asset.parts("materials").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
         let slot: String = call.parameter()?;
-        link(call.host.fields().get("materials").and_then(|materials| materials.get(&slot)))
+        link(call.given().get("materials").and_then(|materials| materials.get(&slot)))
     });
-    let joint_at = r.op("joint_at").label("A joint's place").output::<ty::Table>().parameter::<String>("joint").run(|call| {
+    let _ = r.op("joint_at").label("A joint's place").takes("skeleton", &["pe2.render@skeleton"]).output::<ty::Table>().parameter::<String>("joint").members(|asset| joint_names(asset).into_iter().map(|name| (name.clone(), name)).collect()).run(|call| {
         let name: String = call.parameter()?;
-        let joints = call.host.fields().get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        let given = call.given();
+        let joints = given.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
         let at = joints.iter().position(|joint| joint.get("name").and_then(Value::as_str) == Some(&name));
         let at = at.ok_or_else(|| pe2_ext::anyhow!("it has no joint {name}"))?;
         Ok(Table::from_iter([(VALUE.to_string(), Value::Integer(i64::try_from(at)?))]))
     });
-    (mesh_of, skeleton_of, material_of, joint_at)
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Usd>();
-    let (mesh_of, skeleton_of, material_of, joint_at) = links(r);
+    let scene_type = r.value_type::<Scene>();
+    r.viewer(&scene_type, "3D", Icon::Cube, |_| make_view());
+    r.viewer(&scene_type, "UV", Icon::Grid, |_| Box::new(uv::UvView::default()));
+    let shown = [Usd::NAME, "pe2.render@material", "pe2.render@skeleton", MODEL, PREFAB];
+    let _ = r.op("assemble").label("What it shows").takes("node", &shown).output::<Scene>().parameter::<String>("chosen").run(assembly::scene);
+    links(r);
+    let _ = r
+        .op("member")
+        .label("What a member of a group fills a part with")
+        .takes("prefab", &[PREFAB])
+        .output::<ty::Table>()
+        .parameter::<String>("member")
+        .members(|asset| prefab::members(asset).into_iter().map(|address| (address.clone(), address)).collect())
+        .run(prefab::member);
     let mesh = r
-        .kind("mesh")
+        .named_type("mesh")
         .alias("mesh")
         .label("Mesh")
+        .of(Usd::NAME)
         .icon(Icon::Polygon, Tint::Picture)
         .stack(MESH)
-        .output("skeleton", &skeleton_of, pe2_ext::Retain::Transient)
-        .editor("3D", Icon::Polygon, &[], |_| make_view())
-        .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))
         .register();
     let _ = r.extractor("meshes", &mesh, &[], extract::begin);
     let material = r
-        .kind("material")
+        .named_type("material")
         .alias("material")
         .label("Material")
+        .data()
+        .stack(MATERIAL)
         .icon(Icon::Palette, Tint::Picture)
         .field(Field::new("shader").label("Shader").choices(material::SHADERS.iter().map(|shader| (shader.id, shader.label))))
         .field(Field::new("surface").label("Surface").choices(material::SURFACES))
@@ -103,35 +244,31 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new(material::EFFECT).label("Effect"))
         .field(Field::new(material::MAIN).custom())
         .field(Field::new(material::ENVIRONMENT).custom())
-        .editor("Material", Icon::Palette, &[], |_| make_view())
         .contents(parts::contents)
         .inspector("Textures", |_| Box::new(material_panel::Panel::default()))
         .register();
     let _ = r.extractor("materials", &material, &[], extract::authored);
     let skeleton = r
-        .kind("skeleton")
+        .named_type("skeleton")
         .alias("skeleton")
         .label("Skeleton")
+        .data()
+        .stack(SKELETON)
         .icon(Icon::Bone, Tint::Structure)
         .field(Field::new("joints").custom())
-        .output("joints", &joint_at, pe2_ext::Retain::Transient)
-        .members(|asset| joint_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
-        .editor("3D", Icon::Bone, &[], |_| make_view())
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .register();
     let _ = r.extractor("skeletons", &skeleton, &[], extract::authored);
     let model = r
-        .kind("model")
+        .named_type("model")
         .alias("model")
         .label("Model")
+        .data()
+        .stack(MODEL_STACK)
+        .field(Field::new("mesh").label("Mesh").required())
         .icon(Icon::Package, Tint::Picture)
         .field(Field::new("materials").custom())
-        .output("mesh", &mesh_of, pe2_ext::Retain::Transient)
-        .output("materials", &material_of, pe2_ext::Retain::Transient)
-        .members(|asset| asset.parts("materials").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
-        .editor("3D", Icon::Package, &[], |_| make_view())
-        .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .inspector("Materials", |_| Box::new(materials::Bindings::default()))
@@ -139,16 +276,17 @@ fn register(r: &mut Registry) -> Result<()> {
         .register();
     let _ = r.extractor("models", &model, &[], extract::models);
     let prefab = r
-        .kind("prefab")
+        .named_type("prefab")
         .alias("prefab")
         .label("Prefab")
+        .data()
+        .stack(PREFAB_STACK)
+        .field(Field::new("skeleton").label("Skeleton").required())
         .icon(Icon::Cube, Tint::Picture)
         // Each is a row of the tree or of the Inspector's lists, with its fields there.
         .field(Field::new("parts").custom())
         .field(Field::new("groups").custom())
         .field(Field::new("pose").custom())
-        .editor("3D", Icon::Cube, &[], |_| make_view())
-        .editor("UV", Icon::Grid, &[], |_| Box::new(uv::UvView::default()))
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .content_act(parts::act)

@@ -1,5 +1,5 @@
 //! The inspector: the selected asset's declaration shown as properties, not as TOML. A header names the asset (its
-//! icon and kind, a thumbnail for a picture); a property sheet gives each field a readable label and its value
+//! icon and type, a thumbnail for a picture); a property sheet gives each field a readable label and its value
 //! the form its meaning calls for - a depth, a size, a VRAM offset or rectangle, a placement, a reference as a chip
 //! that opens its asset; lists (slots, variants, parts, cells) are rows or cards with a summary, a variant with its
 //! palette's colors; the bundle's files and the originals' sha1s close it.
@@ -17,14 +17,14 @@ use crate::workspace::{EditRequest, FieldEdit, Workspace};
 use crate::{icons, theme};
 
 /// Fields the header shows, or that only extraction writes.
-const HEADER_FIELDS: [&str; 3] = ["uid", "kind", "original"];
+const HEADER_FIELDS: [&str; 2] = ["uid", "original"];
 /// The width under which a sheet is one column.
 const NARROW: f32 = 300.0;
 const ROW_HEIGHT: f32 = 22.0;
 const THUMBNAIL: f32 = 64.0;
 
-/// What a value is read with: the index its references resolve in, the registry their kinds' icons come from, and the
-/// fields the asset's kind describes, as their extensions register them.
+/// What a value is read with: the index its references resolve in, the registry their types' icons come from, and the
+/// fields the asset's type describes, as their extensions register them.
 pub struct Sheet<'a> {
     pub index: &'a Index,
     pub extensions: &'a Extensions,
@@ -51,7 +51,7 @@ impl Sheet<'_> {
         self.field(key).and_then(|f| f.label.clone()).unwrap_or_else(|| label_of(key))
     }
 
-    /// Drawn by its kind's inspector view, not here.
+    /// Drawn by its type's inspector view, not here.
     fn custom(&self, key: &str) -> bool {
         self.field(key).is_some_and(|f| f.custom)
     }
@@ -177,7 +177,7 @@ impl Tab {
     }
 }
 
-/// What a part's sheet shows: the table it is in, its fields and their values. Its kind's where it says, else what its table
+/// What a part's sheet shows: the table it is in, its fields and their values. Its type's where it says, else what its table
 /// holds, by the part's fragment.
 fn part_fields(ws: &mut Workspace, asset: &Arc<Asset>, id: &str) -> (Vec<String>, Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     let live = ws.live_fields(&asset.path, id);
@@ -262,7 +262,7 @@ fn part_ui(
     });
 }
 
-/// An asset's settings, by its kind's fields.
+/// An asset's settings, by its type's fields.
 fn properties_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
@@ -362,7 +362,7 @@ fn declaration_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, edit: &m
 
 fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool) {
     if compact {
-        let (icon, tint) = icons::for_kind(&ws.extensions, asset.kind.as_deref());
+        let (icon, tint) = icons::for_type(&ws.extensions, ws.extensions.type_name(asset));
         let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
         ui.horizontal(|ui| {
             ui.label(RichText::new(icon).color(tint));
@@ -371,7 +371,7 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
         return;
     }
     ui.horizontal(|ui| {
-        // Its picture, drawn off the window's thread; its kind's icon until it is, or where it has none.
+        // Its picture, drawn off the window's thread; its type's icon until it is, or where it has none.
         let ctx = ui.ctx().clone();
         let shown = ws.has_picture(&asset.path).then(|| ws.picture(&ctx, &asset.path, Upscale::Nearest)).flatten();
         if let Some(Ok(shown)) = shown {
@@ -380,7 +380,7 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
                 ui.add(egui::Image::new(egui::load::SizedTexture::new(shown.texture.id(), shown.size * scale)));
             });
         } else {
-            let (icon, tint) = icons::for_kind(&ws.extensions, asset.kind.as_deref());
+            let (icon, tint) = icons::for_type(&ws.extensions, ws.extensions.type_name(asset));
             ui.label(RichText::new(icon).size(28.0).color(tint));
         }
         ui.vertical(|ui| {
@@ -388,7 +388,7 @@ fn header_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, compact: bool
             ui.label(RichText::new(name).heading().strong());
             ui.label(RichText::new(&asset.path).small().color(theme::weak()));
             ui.horizontal(|ui| {
-                badge(ui, asset.kind.as_deref().unwrap_or("no kind"));
+                badge(ui, ws.extensions.type_label(asset).unwrap_or("no type"));
                 if let Some(uid) = &asset.uid {
                     ui.label(RichText::new(uid).monospace().small().color(theme::weak()));
                     let copy = ui.add(egui::Button::new(RichText::new("Copy").small()).frame(false));
@@ -412,7 +412,7 @@ fn config_toggle(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
     }
     let mut holds = !config.disabled.contains(&asset.path);
     let toggle = ui.checkbox(&mut holds, RichText::new(format!("In {}", config.name)).small());
-    if toggle.on_hover_text("Left out, no event reaches it and nothing finds it among its kind").changed()
+    if toggle.on_hover_text("Left out, no event reaches it and nothing finds it among its type").changed()
         && let Err(why) = ws.set_disabled(&asset.path, !holds)
     {
         ws.watch_error = Some(why);
@@ -540,12 +540,12 @@ pub fn reference_dropped(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, ass
     sheet.index.assets.get(&path).and_then(|dropped| retargeted(value, dropped))
 }
 
-/// The uid of an asset of `kind` dropped at `rect`, where there is no reference yet to say what goes there.
-pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, holder: &Asset, kind: &str) -> Option<toml::Value> {
-    let of_kind = |asset: &Asset| asset.kind.as_deref().is_some_and(|known| known.rsplit('@').next() == Some(kind));
+/// The uid of an asset of `type` dropped at `rect`, where there is no reference yet to say what goes there.
+pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, holder: &Asset, node_type: &str) -> Option<toml::Value> {
+    let of_type = |asset: &Asset| sheet.extensions.node_types_of(asset).iter().any(|known| known.name.local() == node_type);
     let verdict = |dragged: &Dragged| match dragged {
         Dragged::Asset(path) if *path == holder.path => Err("It would name itself".to_string()),
-        Dragged::Asset(path) => sheet.index.assets.get(path).filter(|asset| of_kind(asset)).map(|_| format!("Fill it with this {kind}")).ok_or_else(|| format!("It takes a {kind}")),
+        Dragged::Asset(path) => sheet.index.assets.get(path).filter(|asset| of_type(asset)).map(|_| format!("Fill it with this {node_type}")).ok_or_else(|| format!("It takes a {node_type}")),
         Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
     };
     let Some(Dragged::Asset(path)) = dnd::target(ui, rect.expand(4.0), verdict) else { return None };
@@ -639,10 +639,18 @@ fn set_field(
 /// nothing. Edits of the same field in a row merge into one step.
 fn change_field(asset: &Asset, within: &[String], key: &str, new: Option<toml_edit::Item>, label: String) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
-    let table = table_made_at(&mut document, within)?;
-    match new {
-        Some(new) => drop(table.insert(key, new)),
-        None => drop(table.remove(key)),
+    if within.is_empty() {
+        let table = project::graph::layers::settings_table(&mut document, key);
+        match new {
+            Some(new) => drop(table.insert(key, new)),
+            None => drop(table.remove(key)),
+        }
+    } else {
+        let table = table_made_at(&mut document, within)?;
+        match new {
+            Some(new) => drop(table.insert(key, new)),
+            None => drop(table.remove(key)),
+        }
     }
     if document.to_string() == asset.text() {
         return None;
@@ -662,6 +670,14 @@ fn with_sets(text: &str, sets: &[(Vec<String>, Option<toml::Value>)]) -> Result<
     let mut document = text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("The declaration does not parse: {e}"))?;
     for (path, value) in sets {
         let (key, within) = path.split_last().ok_or("It sets a value with no path")?;
+        if within.is_empty() {
+            let table = project::graph::layers::settings_table(&mut document, key);
+            match value {
+                Some(value) => drop(table.insert(key, item(value))),
+                None => drop(table.remove(key)),
+            }
+            continue;
+        }
         let table = table_at(&mut document, within).ok_or_else(|| format!("The declaration has no {}", within.join(".")))?;
         match value {
             Some(value) => drop(table.insert(key, item(value))),
@@ -714,7 +730,7 @@ fn retarget_to(value: &toml::Value, uid: &str, path: &str) -> Option<toml::Value
     Some(table.into())
 }
 
-/// What a reference field says of an asset dropped on it: it takes the kind it names now.
+/// What a reference field says of an asset dropped on it: it takes the type it names now.
 fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &str) -> Result<(), String> {
     if path == holder.path {
         return Err("It would name itself".to_string());
@@ -722,8 +738,8 @@ fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &str) -> Resu
     let held = reference_in(value).and_then(project::index::reference);
     let held = held.and_then(|(uid, path)| sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()));
     let dropped = sheet.index.assets.get(path).ok_or("It is gone")?;
-    match held.and_then(|held| held.kind.as_deref()) {
-        Some(kind) if dropped.kind.as_deref() != Some(kind) => Err(format!("It takes a {kind}")),
+    match held.and_then(|held| sheet.extensions.type_name(held)) {
+        Some(node_type) if sheet.extensions.type_name(dropped) != Some(node_type) => Err(format!("It takes a {node_type}")),
         _ => Ok(()),
     }
 }
@@ -741,7 +757,12 @@ fn table_made_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String]) 
 
 fn walk_to<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String], make: bool) -> Option<&'a mut dyn toml_edit::TableLike> {
     let mut steps = path.iter();
-    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    // What is set on the node is on a layer of its stack; a stack's own paths begin at its name.
+    let first = path.first().filter(|first| *first != "stack").map(String::as_str);
+    let mut table: &mut dyn toml_edit::TableLike = match first {
+        Some(first) => project::graph::layers::settings_table(document, first),
+        None => document.as_table_mut(),
+    };
     while let Some(step) = steps.next() {
         if make && !table.contains_key(step) {
             table.insert(step, toml_edit::Item::Value(toml_edit::InlineTable::new().into()));
@@ -794,12 +815,13 @@ fn item(value: &toml::Value) -> toml_edit::Item {
 pub fn set_fields(asset: &Asset, sets: &crate::ext_ui::Sets) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
     for (key, value) in &sets.values {
+        let table = project::graph::layers::settings_table(&mut document, key);
         match value {
             Some(value) => {
-                document.insert(key, item(value));
+                table.insert(key, item(value));
             }
             None => {
-                document.remove(key);
+                table.remove(key);
             }
         }
     }
@@ -1033,7 +1055,7 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
     let target = path.clone().unwrap_or_else(|| uid.clone());
     match sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()) {
         Some(asset) => {
-            let (icon, tint) = icons::for_kind(sheet.extensions, asset.kind.as_deref());
+            let (icon, tint) = icons::for_type(sheet.extensions, sheet.extensions.type_name(asset));
             let mut parts = asset.path.rsplit('/');
             let name = parts.next().unwrap_or_default();
             let short = match parts.next() {
@@ -1214,7 +1236,8 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut 
     let ops = ws.extensions.operations();
     let tail = ws.extensions.tail(asset);
     let (plan, _) = project::graph::Plan::of(asset.fields(), &ops, &tail);
-    let outputs: Vec<&str> = plan.outputs.iter().map(|o| o.name.as_str()).collect();
+    let made = plan.outputs.iter().filter(|o| !o.preview && plan.steps[o.from].op != project::graph::SETTINGS);
+    let outputs: Vec<&str> = made.map(|o| o.name.as_str()).collect();
     // And what reads them, made again with them.
     let dependents = ws.extensions.dependents(&ws.index, &std::iter::once(asset.path.clone()).collect());
     let others = ws.unapplied_count().saturating_sub(1);
@@ -1343,7 +1366,7 @@ fn stack_ui(
                             edit_in_button(ui, *category, home, &active, source, uid, edit);
                         }
                     }
-                    project::graph::OUTPUT => output_row(ui, layer),
+                    project::graph::OUTPUT | project::graph::PREVIEW => output_row(ui, layer),
                     project::graph::GRAPH => {
                         if graph_row(ui, layer) {
                             // What is selected within it stays, the graph opening on it.
@@ -1393,7 +1416,8 @@ fn steps_of_layer(at: usize, op: Option<&str>) -> Vec<String> {
 /// A stack's output layer: its name and how it is kept.
 fn output_row(ui: &mut egui::Ui, layer: &toml::Value) {
     let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
-    ui.label(RichText::new("Output").color(theme::weak()));
+    let preview = text("op") == Some(project::graph::PREVIEW);
+    ui.label(RichText::new(if preview { "Preview" } else { "Output" }).color(theme::weak()));
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(text("name").unwrap_or_default()).monospace());
         badge(ui, text("retain").unwrap_or("transient"));
@@ -1506,7 +1530,7 @@ fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &
     let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
     let set = |key: &str, unset: &str| (key.to_string(), layer.get(key).cloned().unwrap_or_else(|| unset.into()));
     match op {
-        graph::OUTPUT => output_settings(layer),
+        graph::OUTPUT | graph::PREVIEW => output_settings(layer),
         graph::FILE => {
             let mut file = Field::new("file").label("File");
             let stored = asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
@@ -1610,6 +1634,9 @@ fn add_items(
         let names = std::iter::once("output".to_string()).chain((2..=taken.len() + 2).map(|n| format!("output_{n}")));
         let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
         add(ui, "Output", "A tap: what is here, as an output of this node", table(&[("op", graph::OUTPUT), ("name", free.as_str())]));
+        let names = std::iter::once("preview".to_string()).chain((2..=taken.len() + 2).map(|n| format!("preview_{n}")));
+        let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
+        add(ui, "Preview", "A tap: what is here, shown in a tab of its own", table(&[("op", graph::PREVIEW), ("name", free.as_str())]));
     } else {
         for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE) {
             add(ui, &file.name, "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
@@ -1850,7 +1877,7 @@ mod path_tests {
 
     #[test]
     fn a_part_gets_its_table_with_the_first_thing_set_in_it() {
-        let mut document: toml_edit::DocumentMut = "kind = \"prefab\"\n".parse().unwrap();
+        let mut document: toml_edit::DocumentMut = "stack = [{ op = \"t.prefab\" }]\n".parse().unwrap();
         let table = super::table_made_at(&mut document, &steps(&["pose", "head"])).unwrap();
         table.insert("rotation", toml_edit::value(3));
         let read: toml::Table = document.to_string().parse().unwrap();
@@ -1943,14 +1970,14 @@ mod tests {
     fn a_problem_says_where_it_is_as_the_rows_number_it() {
         assert_eq!(super::problem_place("stack[0].ops.encoded"), "Layer 0, encoded");
         assert_eq!(super::problem_place("stack[2]"), "Layer 2");
-        assert_eq!(super::problem_place("kind.outputs[3]"), "kind.outputs[3]");
+        assert_eq!(super::problem_place("type.outputs[3]"), "type.outputs[3]");
     }
 
     use super::item;
 
     #[test]
     fn a_table_of_parts_keeps_a_line_each_in_its_order() {
-        let mut document: toml_edit::DocumentMut = r#"kind = "image"
+        let mut document: toml_edit::DocumentMut = r#"type = "image"
 mode = "indexed_4bpp"
 variants.day = { palette = "warm" }
 variants.night = { palette = "cold" }

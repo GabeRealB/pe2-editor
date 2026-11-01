@@ -25,6 +25,94 @@ fn edited(text: &str, change: impl FnOnce(&mut Vec<Value>) -> Result<()>) -> Res
     Ok(crate::extract::with_stack(&rest, &toml::to_string(&section)?))
 }
 
+/// The layer a setting belongs on: the first operation of the node's own before anything is taken from it, else its stored
+/// file. What hangs off further down reads it there.
+fn home(layers: &toml_edit::ArrayOfTables) -> Option<usize> {
+    let op = |layer: &toml_edit::Table| layer.get("op").and_then(toml_edit::Item::as_str).map(str::to_string);
+    let taken = layers.iter().position(|layer| matches!(op(layer).as_deref(), Some(super::OUTPUT | super::PREVIEW)));
+    let own = layers.iter().take(taken.unwrap_or(usize::MAX)).position(|layer| op(layer).as_deref() != Some(super::FILE));
+    own.or_else(|| (!layers.is_empty()).then_some(0))
+}
+
+/// Where a declaration holds a setting: on the layer it is on, else the one it belongs on, else - there being no stack -
+/// among the declaration's own fields.
+pub fn settings_table<'a>(document: &'a mut toml_edit::DocumentMut, key: &str) -> &'a mut toml_edit::Table {
+    use toml_edit::Item;
+    let layers = document.get("stack").and_then(Item::as_array_of_tables);
+    let at = layers.and_then(|layers| {
+        layers.iter().position(|layer| layer.contains_key(key) && !matches!(key, "op" | "name" | "file")).or_else(|| home(layers))
+    });
+    let Some(at) = at else { return document.as_table_mut() };
+    let Some(layer) = document["stack"].as_array_of_tables_mut().and_then(|layers| layers.get_mut(at)) else {
+        unreachable!("it was found there")
+    };
+    layer
+}
+
+/// A table and everything in it placed by where it is now, not the document it was parsed from.
+fn unplaced(table: &mut toml_edit::Table) {
+    table.set_position(0);
+    for (_, item) in table.iter_mut() {
+        match item {
+            toml_edit::Item::Table(inner) => unplaced(inner),
+            toml_edit::Item::ArrayOfTables(tables) => tables.iter_mut().for_each(unplaced),
+            _ => {}
+        }
+    }
+}
+
+/// A declaration with its fields on the layer they belong on, leaving what is about the node as stored (`original`).
+///
+/// # Errors
+/// It is not TOML.
+pub fn settings_on_layers(text: &str) -> Result<String> {
+    use toml_edit::Item;
+    let split = text.find("\n[original.").map_or(text.len(), |at| at + 1);
+    let (declared, originals) = text.split_at(split);
+    let mut document: toml_edit::DocumentMut = declared.parse().context("its declaration")?;
+    let Some(at) = document.get("stack").and_then(Item::as_array_of_tables).and_then(home) else { return Ok(text.to_string()) };
+    let keys: Vec<String> = document.iter().map(|(key, _)| key.to_string()).filter(|key| key != "stack").collect();
+    let moved: Vec<(String, Item)> = keys.iter().filter_map(|key| Some((key.clone(), document.remove(key)?))).collect();
+    let Some(Ok(mut layers)) = document.remove("stack").map(Item::into_array_of_tables) else { return Ok(text.to_string()) };
+    if let Some(layer) = layers.get_mut(at) {
+        for (key, item) in moved {
+            layer.insert(&key, item);
+        }
+    }
+    let mut body = String::new();
+    for layer in layers.iter_mut() {
+        layer.decor_mut().clear();
+        layer.iter_mut().for_each(|(mut key, _)| key.leaf_decor_mut().clear());
+        unplaced(layer);
+        let mut single = toml_edit::ArrayOfTables::new();
+        single.push(layer.clone());
+        let mut alone = toml_edit::DocumentMut::new();
+        alone.insert("stack", Item::ArrayOfTables(single));
+        body.push_str(alone.to_string().trim());
+        body.push_str("\n\n");
+    }
+    let head: Vec<&str> = declared.lines().take_while(|line| line.starts_with('#') || line.is_empty()).collect();
+    let head = head.join("\n");
+    let originals = if originals.is_empty() { String::new() } else { format!("\n{originals}") };
+    Ok(format!("{}\n\n{}\n{originals}", head.trim(), body.trim_end()).trim_start().to_string())
+}
+
+/// A declaration with another stack in place of its own, what was set on the old one kept on the new.
+///
+/// # Errors
+/// It is not TOML, or the stack is not.
+pub fn with_new_stack(text: &str, stack: &str) -> Result<String> {
+    let fields: Table = toml::from_str(text).context("its declaration")?;
+    let settings = super::with_settings(fields.clone());
+    let mut document: toml_edit::DocumentMut = text.parse().context("its declaration")?;
+    document.remove("stack");
+    let rest: Table = toml::from_str(&document.to_string()).context("its declaration")?;
+    let held = settings.iter().filter(|(key, _)| !matches!(key.as_str(), "stack" | "original") && !rest.contains_key(*key));
+    let mut lines = toml::to_string(&held.map(|(key, value)| (key.clone(), value.clone())).collect::<Table>()).context("its settings")?;
+    lines.push_str(&document.to_string());
+    settings_on_layers(&crate::extract::with_stack(&lines, stack))
+}
+
 /// A layer added, to be the one at `at`.
 ///
 /// # Errors
@@ -213,7 +301,7 @@ mod tests {
 
     const TEXT: &str = r#"# A node, written by extraction.
 
-kind = "movie"
+format = "str"
 
 [[stack]]
 op = "file"
@@ -231,6 +319,48 @@ sha1 = "ab"
         let fields: Table = toml::from_str(text).unwrap();
         let layers = fields["stack"].as_array().unwrap();
         layers.iter().map(|l| l["op"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn settings_go_on_the_operation_that_reads_them() {
+        let text = "# A node.\n\nmode = \"indexed_4bpp\"\npalettes.default = { at = [0, 0] }\n\n[cells.a]\nrect = [0, 0, 1, 1]\n\n\
+                    [[stack]]\nop = \"file\"\nfile = \"source.ora\"\n\n[[stack]]\nop = \"x@ora\"\n\n\
+                    [[stack]]\nop = \"output\"\nname = \"native\"\n\n[original.USA]\nsha1 = \"ab\"\n";
+        let placed = super::settings_on_layers(text).unwrap();
+        assert!(placed.starts_with("# A node."), "{placed}");
+        let fields: Table = toml::from_str(&placed).unwrap();
+        assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["stack", "original"], "{placed}");
+        let layers = fields["stack"].as_array().unwrap();
+        assert_eq!(layers[1]["mode"].as_str(), Some("indexed_4bpp"));
+        assert!(layers[1]["cells"]["a"]["rect"].is_array() && layers[0].get("mode").is_none(), "{placed}");
+        // Read back, they are what the node is set to, and a node's plan is shared with those alike.
+        let settings = crate::graph::with_settings(fields);
+        assert_eq!(settings["mode"].as_str(), Some("indexed_4bpp"));
+        assert!(!settings.contains_key("name") && !settings.contains_key("file"));
+        assert!(!crate::graph::shape(&settings).contains("mode"));
+    }
+
+    #[test]
+    fn a_setting_stays_above_what_hangs_off() {
+        let text = "skeleton = \"uid://s\"\n\n[[stack]]\nop = \"file\"\nfile = \"a\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n\n\
+                    [[stack]]\nop = \"x@skeleton_of\"\n";
+        let fields: Table = toml::from_str(&super::settings_on_layers(text).unwrap()).unwrap();
+        assert_eq!(fields["stack"][0]["skeleton"].as_str(), Some("uid://s"));
+    }
+
+    #[test]
+    fn a_stored_file_holds_what_is_said_of_it_and_a_new_stack_takes_it_over() {
+        let text = "[[stack]]\nop = \"file\"\nfile = \"a.str\"\nformat = \"str\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
+        let mut document: toml_edit::DocumentMut = text.parse().unwrap();
+        super::settings_table(&mut document, "format").insert("format", toml_edit::value("x"));
+        super::settings_table(&mut document, "new").insert("new", toml_edit::value(1));
+        let fields: Table = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(fields["stack"][0]["format"].as_str(), Some("x"));
+        assert_eq!(fields["stack"][0]["new"].as_integer(), Some(1));
+        let replaced = super::with_new_stack(text, "[[stack]]\nop = \"x@import\"\n").unwrap();
+        let fields: Table = toml::from_str(&replaced).unwrap();
+        assert_eq!(fields["stack"][0]["op"].as_str(), Some("x@import"));
+        assert_eq!(fields["stack"][0]["format"].as_str(), Some("str"), "{replaced}");
     }
 
     #[test]
@@ -256,7 +386,7 @@ sha1 = "ab"
         assert!(back.find("[[stack]]").unwrap() < back.find("[original.USA]").unwrap(), "{back}");
     }
 
-    const GRAPH: &str = "kind = \"movie\"\n\n[[stack]]\nop = \"graph\"\n";
+    const GRAPH: &str = "[[stack]]\nop = \"graph\"\n";
 
     fn layer(text: &str) -> Table {
         let fields: Table = toml::from_str(text).unwrap();

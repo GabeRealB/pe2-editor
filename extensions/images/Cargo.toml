@@ -1,6 +1,6 @@
 [package]
 name = "pe2-images"
-description = "pe2.images, a built-in extension: the image kind - backgrounds, textures, atlases - its pictures, thumbnails, fields and view"
+description = "pe2.images, a built-in extension: the image type - backgrounds, textures, atlases - its pictures, thumbnails, fields and view"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

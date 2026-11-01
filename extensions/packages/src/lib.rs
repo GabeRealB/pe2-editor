@@ -12,13 +12,16 @@ mod scan;
 mod tokenizers;
 mod views;
 
-use pe2_ext::ty::{self, SourceTree};
+use pe2_ext::ty::{self, Registered, SourceTree};
 use pe2_ext::{Field, Icon, Registry, Result, Retain, Tint};
 
 pe2_ext::extension!("pe2.packages", "0.1.0", register, requires = ["pe2.images@^0.1", "pe2.render@^0.1"]);
 
 /// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name.
 const STACK: &str = r#"[[stack]]
+op = "pe2.packages@package"
+
+[[stack]]
 op = "pe2.packages@gather"
 
 [[stack]]
@@ -46,6 +49,9 @@ deploy = "build/{config}/"
 
 /// What a language server reads, for the config in use, wherever any of it may have changed.
 const DATABASE_STACK: &str = r#"[[stack]]
+op = "pe2.packages@compile-database"
+
+[[stack]]
 op = "graph"
 result = "above"
 
@@ -86,21 +92,26 @@ deploy = "build/{config}/overlay.yaml"
 from = { value = "overlay" }
 "#;
 
+/// What a package is, its sources and what fills its slots: what is set on it.
+const PACKAGE: &str = "pe2.packages@package";
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<SourceTree>();
     let _ = r.value_type::<ty::Tokens>();
-    let _ = r.op("gather").label("Sources").output::<ty::File<SourceTree>>().run(gather::gather);
+    let _ = r.op("gather").label("Sources").takes("package", &[PACKAGE]).output::<ty::File<SourceTree>>().run(gather::gather);
     let _ = r.op("resolve").label("Slots and values").input::<SourceTree>("sources").output::<SourceTree>().run(gather::resolve);
     tokenizers::register(r);
-    let reflection = r.op("reflect").label("What it asks for").output::<ty::Table>().run(gather::reflection);
+    let _ = r.op("reflect").label("What it asks for").takes("package", &[PACKAGE]).output::<ty::Table>().provides("reflection").keeps(Retain::Cache).run(gather::reflection);
     let _ = r.op("database").label("Compile database").output::<ty::Bytes>().run(database::database);
     let _ = r.op("overlay").label("Include overlay").output::<ty::Bytes>().run(database::overlay);
     let _ = r.op("server_values").label("Values for a language server").output::<ty::Bytes>().run(database::server_values);
-    r.kind("compile-database").alias("compile-database").label("Compile database").icon(Icon::File, Tint::Code).stack(DATABASE_STACK).register();
-    r.kind("package")
+    r.named_type("compile-database").alias("compile-database").label("Compile database").data().icon(Icon::File, Tint::Code).stack(DATABASE_STACK).register();
+    r.named_type("package")
         .alias("package")
         .label("Package")
+        .data()
+        .of(SourceTree::NAME)
         .icon(Icon::Stack, Tint::Code)
         .field(Field::new("slot").label("Slot"))
         .field(Field::new("sources").label("Sources"))
@@ -109,9 +120,10 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("bind").custom())
         .field(Field::new("option").custom())
         .stack(STACK)
-        .output("reflection", &reflection, Retain::Cache)
         .contents_view("Slots", |_| Box::new(views::Slots::default()))
         .inspector_tab("Slots", Icon::Grid, &[], |_| Box::new(views::Slots::sheet()))
         .register();
+    // A package compiling nothing: others' headers and libraries.
+    drop(r.template("library", PACKAGE, "[[stack]]\nop = \"pe2.packages@package\"\n").label("Library"));
     Ok(())
 }

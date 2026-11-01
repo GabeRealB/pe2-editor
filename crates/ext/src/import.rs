@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::registry::{ActOnContents, Field, Icon, ListContents, SheetOfPart, Tint, ViewDef};
 use crate::Name;
 
 /// How the host recognizes a type in a file without calling the extension.
@@ -26,7 +27,8 @@ pub struct Recognized {
 /// A sniff: a file's name, size and first bytes to whether it is of the type.
 pub type Sniff = dyn Fn(&str, u64, &[u8]) -> Option<Recognized> + Send + Sync;
 
-/// A type as registered.
+/// A type as registered: what a value is, recognized or not, and where it says how they show (`shows_nodes`) what a node
+/// making one is.
 #[derive(Clone)]
 pub struct TypeDef {
     pub name: Name,
@@ -36,6 +38,33 @@ pub struct TypeDef {
     /// Any one matching recognizes the file; none at all leaves it to the sniff.
     pub signatures: Vec<Signature>,
     pub sniff: Option<Arc<Sniff>>,
+    /// The bare name declarations wrote before names were qualified (`image`): a built-in's alone.
+    pub alias: Option<String>,
+    pub icon: Option<(Icon, Tint)>,
+    pub fields: Vec<Field>,
+    pub views: Vec<ViewDef>,
+    /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
+    pub inspector: Vec<ViewDef>,
+    /// Editors of its own, beside the preview.
+    pub editors: Vec<ViewDef>,
+    /// Views at the head of the contents pane.
+    pub contents_views: Vec<ViewDef>,
+    /// What is inside its assets.
+    pub contents: Option<Arc<ListContents>>,
+    /// What comes of something done in its assets' contents.
+    pub content_act: Option<Arc<ActOnContents>>,
+    /// Its parts' fields, where those are not what their tables hold.
+    pub part_sheet: Option<Arc<SheetOfPart>>,
+    /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
+    pub stack: Option<String>,
+    /// A node of it holds only what is set on it: an operation of its name makes those settings, of this type.
+    pub data: bool,
+    /// The value types a node making one is of this type, by their qualified names: a picture stored as `texels` or as
+    /// `bs_picture` is an `image`.
+    pub values: Vec<String>,
+    /// Said by an extension adding to it (`Registry::extend`), of a type of what it requires: nothing here is its label or
+    /// its icon, and where it does not know what it adds to, what it adds is not there.
+    pub extends: bool,
 }
 
 impl TypeDef {
@@ -43,5 +72,11 @@ impl TypeDef {
     #[must_use]
     pub fn recognizable(&self) -> bool {
         !self.signatures.is_empty() || self.sniff.is_some()
+    }
+
+    /// Whether a node making a value of it is one of it: it says how such a node shows, rather than only being what flows.
+    #[must_use]
+    pub fn shows_nodes(&self) -> bool {
+        self.data || self.icon.is_some() || self.alias.is_some() || !self.values.is_empty()
     }
 }

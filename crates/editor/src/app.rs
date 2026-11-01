@@ -1298,11 +1298,35 @@ impl Editor {
         self.item(ui, Command::DocumentsOnly, "Documents only");
     }
 
+    /// What a node can be made of with no file: the templates that take none.
+    fn new_node_menu(&mut self, ui: &mut egui::Ui) {
+        let Some(ws) = &self.workspace else { return };
+        let mut listed: Vec<(String, String)> =
+            ws.extensions.templates().filter(|template| !template.stack.contains("{file}")).map(|template| (template.label.clone(), template.name.clone())).collect();
+        listed.sort();
+        let mut chosen = None;
+        ui.menu_button("New node", |ui| {
+            for (label, name) in &listed {
+                if ui.button(label).clicked() {
+                    chosen = Some(name.clone());
+                    ui.close();
+                }
+            }
+        });
+        if let Some(name) = chosen
+            && let Some(ws) = &mut self.workspace
+            && let Err(why) = ws.new_node(&name, None)
+        {
+            self.error = Some(why);
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 self.item(ui, Command::OpenProject, "Open project…");
                 self.item(ui, Command::Import, "Import…");
+                self.new_node_menu(ui);
                 self.item(ui, Command::ReloadProject, "Reload project");
                 ui.separator();
                 self.item(ui, Command::Quit, "Quit");
@@ -1569,10 +1593,20 @@ impl Editor {
         let asset = ws.selected.as_ref().and_then(|path| ws.index.assets.get(path)).cloned();
         let files: Vec<PathBuf> = text.lines().filter_map(local_path).collect();
         let (mut replace, mut add, mut cancel) = (false, false, false);
+        let mut made: Option<(String, PathBuf)> = None;
         egui::Window::new("Import").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
             ui.label("Files, one a line:");
             ui.add(egui::TextEdit::multiline(text).desired_width(460.0).desired_rows(2));
             ui.add_space(4.0);
+            // A node of its own, as the templates taking it make one.
+            if let [file] = files.as_slice() {
+                let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                for template in ws.extensions.templates_for(name).into_iter().filter(|_| file.is_file()) {
+                    if ui.button(format!("New node: {}", template.label)).clicked() {
+                        made = Some((template.name.clone(), file.clone()));
+                    }
+                }
+            }
             let Some(asset) = &asset else {
                 ui.label(RichText::new("Select the asset they go into").color(theme::weak()));
                 cancel = ui.button("Cancel").clicked();
@@ -1599,6 +1633,16 @@ impl Editor {
                 ui.label(RichText::new(why).small().color(theme::weak()));
             }
         });
+        if let Some((template, file)) = made {
+            self.import = None;
+            if let Some(ws) = &mut self.workspace
+                && let Err(why) = ws.new_node(&template, Some(&file))
+            {
+                self.error = Some(why);
+            }
+            return;
+        }
+        let Some(ws) = &self.workspace else { return };
         let (Some(asset), true) = (asset, replace || add) else {
             if cancel {
                 self.import = None;

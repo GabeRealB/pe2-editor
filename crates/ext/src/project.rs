@@ -1,8 +1,8 @@
-//! The project as an extension asks about it: assets by path, by reference, by kind; what the user selected; the
+//! The project as an extension asks about it: assets by path, by reference, by type; what the user selected; the
 //! members of an asset's families it is being looked at in. The assets are lent, like any: for the frame or call that asked.
 //!
 //! It is also how extensions use one another, through the host: what the host understands of any asset - its picture,
-//! its outputs, its facts - is answered by the extension its kind is, whichever that is; and anything else by a service
+//! its outputs, its facts - is answered by the extension its type is, whichever that is; and anything else by a service
 //! an extension offers (`Registry::service`), called by name. Each runs in the other extension's own instance, its
 //! memory and failures its own.
 
@@ -19,11 +19,11 @@ pub trait Project {
         let _ = (path, family);
         None
     }
-    /// Every asset of a kind, by its qualified name or a built-in's bare one.
-    fn find(&self, kind: &str) -> Vec<Asset<'_>>;
+    /// Every asset of a type, by its qualified name or a built-in's bare one.
+    fn find(&self, node_type: &str) -> Vec<Asset<'_>>;
     /// The asset the user selected.
     fn selection(&self) -> Option<Asset<'_>>;
-    /// An asset's picture in a look (its first where none is named), drawn by the extension its kind is; none where it
+    /// An asset's picture in a look (its first where none is named), drawn by the extension its type is; none where it
     /// has none.
     fn picture(&self, path: &str, look: Option<&str>) -> Option<Result<Image>>;
     /// An output of an asset that is a picture (`palettes/default`): none where it has no such output.
@@ -38,6 +38,12 @@ pub trait Project {
     }
     /// An output of an asset that is a table: none where it has no such output, or why it could not be made.
     fn table(&self, path: &str, address: &str) -> Option<Result<crate::Table>> {
+        let _ = (path, address);
+        None
+    }
+    /// An output of an asset that is one file, whole, made from its settings as they are written: what a viewer shows
+    /// of what is being edited. None where it has no such output, or why it could not be made.
+    fn bytes(&self, path: &str, address: &str) -> Option<Result<Vec<u8>>> {
         let _ = (path, address);
         None
     }

@@ -6,7 +6,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::sync::OnceLock;
 
-use crate::{Asset, Canvas, Extension, Field, Icon, Image, KindDef, PanelDef, Project, Registry, Source, Style, Table};
+use crate::{Asset, Canvas, Extension, Field, Icon, Image, PanelDef, Project, Registry, Source, Style, Table};
 use crate::{CallHost, Content, Data, OpDef, Signature, TypeDef, Texture, Tint, ToolDef, UiHost, Value, View, ViewDef};
 
 #[doc(hidden)]
@@ -36,9 +36,8 @@ enum Maker {
     Panel(PanelDef),
 }
 
-/// What the extension registered, with its callbacks numbered: kinds by index, fields, views and tools by handle.
+/// What the extension registered, with its callbacks numbered: types by index, fields, views and tools by handle.
 struct Registered {
-    kinds: Vec<KindDef>,
     fields: Vec<Field>,
     views: Vec<Maker>,
     tools: Vec<ToolDef>,
@@ -46,8 +45,7 @@ struct Registered {
     types: Vec<TypeDef>,
     ops: Vec<OpDef>,
     extractors: Vec<crate::ExtractorDef>,
-    /// Outputs added to others' kinds.
-    additions: Vec<crate::OutputDef>,
+    /// Outputs added to others' types.
     reclaimable: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
@@ -132,7 +130,7 @@ struct Lent<'a> {
     handle: Held<'a>,
     path: String,
     uid: Option<String>,
-    kind: Option<String>,
+    node_type: Option<String>,
     declaration: String,
     fields: OnceCell<Table>,
 }
@@ -143,9 +141,9 @@ impl<'a> Lent<'a> {
             Held::Borrowed(asset) => *asset,
             Held::Owned(asset) => asset,
         };
-        let (path, uid, kind) = (resource.path(), resource.uid(), resource.kind());
+        let (path, uid, node_type) = (resource.path(), resource.uid(), resource.node_type());
         let declaration = resource.declaration();
-        Lent { handle, path, uid, kind, declaration, fields: OnceCell::new() }
+        Lent { handle, path, uid, node_type, declaration, fields: OnceCell::new() }
     }
 
     fn borrowed(asset: &'a host::Asset) -> Lent<'a> {
@@ -160,7 +158,7 @@ impl<'a> Lent<'a> {
     }
 
     fn asset(&self) -> Asset<'_> {
-        Asset::new(self, self.kind.as_deref())
+        Asset::new(self, self.node_type.as_deref())
     }
 }
 
@@ -215,8 +213,8 @@ impl Source for Lent<'_> {
         Some(self.resource().read_entry(path).map_err(crate::Error::msg))
     }
 
-    fn assets_of(&self, kind: &str) -> Option<crate::Result<Vec<(String, String)>>> {
-        Some(self.resource().assets_of(kind).map_err(crate::Error::msg))
+    fn assets_of(&self, node_type: &str) -> Option<crate::Result<Vec<(String, String)>>> {
+        Some(self.resource().assets_of(node_type).map_err(crate::Error::msg))
     }
 
     fn place(&self, path: &str) -> Option<String> {
@@ -225,6 +223,10 @@ impl Source for Lent<'_> {
 
     fn output_of(&self, path: &str, address: &str) -> Option<crate::Result<Data>> {
         Some(self.resource().output_of(path, address).map(from_wit).map_err(crate::Error::msg))
+    }
+
+    fn node_named(&self, reference: &str) -> Option<crate::NodeNamed> {
+        self.resource().node_named(reference).map(|named| crate::NodeNamed { path: named.path, uid: named.uid, types: named.types })
     }
 
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
@@ -288,8 +290,8 @@ impl Project for Lens<'_> {
         self.project.resolve(&value_text(reference)).map(|a| self.keep(a))
     }
 
-    fn find(&self, kind: &str) -> Vec<Asset<'_>> {
-        self.project.find(kind).into_iter().map(|a| self.keep(a)).collect()
+    fn find(&self, node_type: &str) -> Vec<Asset<'_>> {
+        self.project.find(node_type).into_iter().map(|a| self.keep(a)).collect()
     }
 
     fn selection(&self) -> Option<Asset<'_>> {
@@ -319,6 +321,10 @@ impl Project for Lens<'_> {
     fn table(&self, path: &str, address: &str) -> Option<crate::Result<crate::Table>> {
         let told = self.project.table(path, address)?.map_err(crate::Error::msg);
         Some(told.and_then(|text| text.parse().map_err(|e| crate::anyhow!("{path}: {e}"))))
+    }
+
+    fn bytes(&self, path: &str, address: &str) -> Option<crate::Result<Vec<u8>>> {
+        Some(self.project.bytes(path, address)?.map_err(crate::Error::msg))
     }
 
     fn call(&self, service: &str, arguments: &Value) -> crate::Result<Value> {
@@ -430,8 +436,8 @@ impl UiHost for Frame<'_> {
         self.ui().reference(&value_text(reference));
     }
 
-    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
-        let taken = self.ui().reference_taking(label, kind, reference.map(value_text).as_deref())?;
+    fn reference_taking(&mut self, label: &str, node_type: &str, reference: Option<&Value>) -> Option<Value> {
+        let taken = self.ui().reference_taking(label, node_type, reference.map(value_text).as_deref())?;
         format!("v = {taken}").parse::<Table>().ok()?.remove("v")
     }
 
@@ -457,6 +463,10 @@ impl UiHost for Frame<'_> {
 
     fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize> {
         self.ui().combo(id, selected, options).map(|i| i as usize)
+    }
+
+    fn shown(&self) -> Option<String> {
+        self.ui().shown()
     }
 
     fn editable(&self) -> bool {
@@ -600,6 +610,7 @@ fn field(f: &Field, numbered: &mut Registered) -> g::Field {
         brief: f.brief.is_some(),
         choices: f.choices.iter().map(|(v, label)| (value_text(v), label.clone())).collect(),
         read_only: f.read_only,
+        required: f.required,
         custom: f.custom,
     }
 }
@@ -632,7 +643,7 @@ fn views(list: &[ViewDef], numbered: &mut Registered) -> Vec<g::View> {
         .collect()
 }
 
-/// A kind's views, each list as the host is told of it: the one order they are numbered in, whether or not the host
+/// A type's views, each list as the host is told of it: the one order they are numbered in, whether or not the host
 /// is being told (`number`).
 fn views_in_order(lists: [&[ViewDef]; 4], numbered: &mut Registered) -> [Vec<g::View>; 4] {
     lists.map(|list| views(list, numbered))
@@ -687,11 +698,12 @@ impl g::Guest for Component {
         let start = def.start.as_ref().ok_or("it is no stream")?;
         let lent = Lent::borrowed(node);
         let settings: Table = toml::from_str(&settings).unwrap_or_default();
-        let inputs = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
+        let inputs: Vec<Vec<Data>> = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
         let host = NodeHost(&lent);
-        let mut call = crate::Call { inputs, settings: &settings, parameter_text: parameter.as_deref(), host: &host };
+        let started_with = crate::Call::carried_by(&inputs);
+        let mut call = crate::Call { inputs, settings: &settings, made: std::cell::RefCell::default(), carried: started_with.clone(), parameter_text: parameter.as_deref(), host: &host };
         let generator = start(&mut call).map_err(|e| format!("{e:#}"))?;
-        Ok(g::Generator::new(Generating { generator: RefCell::new(generator), settings, parameter }))
+        Ok(g::Generator::new(Generating { generator: RefCell::new(generator), settings, carried: started_with, parameter }))
     }
 
     fn describe() -> g::About {
@@ -725,21 +737,17 @@ impl g::Guest for Component {
         let def = registered().ops.get(op as usize).ok_or("no such operation")?;
         let lent = Lent::borrowed(node);
         let settings: Table = toml::from_str(&settings).unwrap_or_default();
-        let inputs = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
+        let inputs: Vec<Vec<Data>> = inputs.into_iter().map(|port| port.into_iter().map(from_wit).collect()).collect();
         let host = NodeHost(&lent);
-        let mut call = crate::Call { inputs, settings: &settings, parameter_text: parameter.as_deref(), host: &host };
+        let carried = crate::Call::carried_by(&inputs);
+        let mut call = crate::Call { inputs, settings: &settings, made: std::cell::RefCell::default(), carried, parameter_text: parameter.as_deref(), host: &host };
         (def.run)(&mut call).map(to_wit).map_err(|e| format!("{e:#}"))
     }
 
-    fn members(kind: u32, output: u32, asset: &host::Asset) -> Vec<(String, String)> {
+    fn members(op: u32, asset: &host::Asset) -> Vec<(String, String)> {
         let lent = Lent::borrowed(asset);
-        let registered = registered();
-        // An added output goes by its place after the kinds.
-        let output = match registered.kinds.get(kind as usize) {
-            Some(kind) => kind.outputs.get(output as usize),
-            None => (kind as usize).checked_sub(registered.kinds.len()).and_then(|at| registered.additions.get(at)),
-        };
-        output.and_then(|o| o.members.as_ref()).map_or_else(Vec::new, |members| members(&lent.asset()))
+        let members = registered().ops.get(op as usize).and_then(|op| op.members.as_ref());
+        members.map_or_else(Vec::new, |members| members(&lent.asset()))
     }
 
     fn format(field: u32, brief: bool, value: String) -> Option<String> {
@@ -748,10 +756,10 @@ impl g::Guest for Component {
         format(&parse_value(&value)?)
     }
 
-    fn contents(kind: u32, asset: &host::Asset, project: &host::Project) -> g::AssetContents {
+    fn contents(ty: u32, asset: &host::Asset, project: &host::Project) -> g::AssetContents {
         let lent = Lent::borrowed(asset);
         let around = Lens::new(project);
-        let contents = registered().kinds[kind as usize].contents.as_ref();
+        let contents = registered().types[ty as usize].contents.as_ref();
         let contents = contents.map_or_else(crate::Contents::default, |contents| contents(&lent.asset(), &around));
         g::AssetContents {
             rows: contents.rows.into_iter().map(content_row).collect(),
@@ -760,10 +768,10 @@ impl g::Guest for Component {
         }
     }
 
-    fn content_act(kind: u32, asset: &host::Asset, project: &host::Project, request: g::ContentRequest) -> Result<g::ContentOutcome, String> {
+    fn content_act(ty: u32, asset: &host::Asset, project: &host::Project, request: g::ContentRequest) -> Result<g::ContentOutcome, String> {
         let lent = Lent::borrowed(asset);
         let around = Lens::new(project);
-        let act = registered().kinds[kind as usize].content_act.as_ref().ok_or("its contents do nothing")?;
+        let act = registered().types[ty as usize].content_act.as_ref().ok_or("its contents do nothing")?;
         let request = match request {
             g::ContentRequest::Action((row, action)) => crate::ContentRequest::Action { row, action },
             g::ContentRequest::Rename((row, name)) => crate::ContentRequest::Rename { row, name },
@@ -785,10 +793,10 @@ impl g::Guest for Component {
         })
     }
 
-    fn part_sheet_of(kind: u32, asset: &host::Asset, project: &host::Project, part: String) -> Option<g::PartSheet> {
+    fn part_sheet_of(ty: u32, asset: &host::Asset, project: &host::Project, part: String) -> Option<g::PartSheet> {
         let lent = Lent::borrowed(asset);
         let around = Lens::new(project);
-        let sheet = registered().kinds[kind as usize].part_sheet.as_ref()?(&lent.asset(), &around, &part)?;
+        let sheet = registered().types[ty as usize].part_sheet.as_ref()?(&lent.asset(), &around, &part)?;
         Some(g::PartSheet {
             within: sheet.within,
             fields: sheet
@@ -849,7 +857,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
     (extension.register)(&mut registry).map_err(|e| format!("{e:#}"))?;
     let parts = registry.into_parts();
     let mut numbered = Registered {
-        kinds: vec![],
         fields: vec![],
         views: vec![],
         tools: vec![],
@@ -857,7 +864,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         types: vec![],
         ops: vec![],
         extractors: vec![],
-        additions: vec![],
         reclaimable: None,
     };
     if !describe {
@@ -866,27 +872,25 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
     let mut out = g::Registration {
         events: parts.events.clone(),
         hooks: parts.hooks.iter().map(|h| g::Hook { event: h.event.clone(), op: h.op.clone(), signals: h.signals.clone() }).collect(),
-        kinds: vec![],
         panels: vec![],
         tools: vec![],
         services: vec![],
         ops: vec![],
         types: vec![],
         extractors: vec![],
-        additions: parts.additions.iter().map(|(kind, output)| (kind.clone(), describe_output(output))).collect(),
-        tabs: vec![],
-        stacks: parts.stacks.clone(),
+        viewers: vec![],
         commands: parts.commands.iter().map(|c| (c.label.clone(), c.tool.local().to_string())).collect(),
-        recipes: parts
-            .recipes
+        templates: parts
+            .templates
             .iter()
-            .map(|r| g::Recipe { kind: r.kind.clone(), pattern: r.pattern.clone(), stack: r.stack.clone() })
+            .map(|t| g::Template { name: t.name.clone(), label: t.label.clone(), node_type: t.node_type.clone(), files: t.files.clone(), stack: t.stack.clone() })
             .collect(),
         memory: parts.memory.iter().map(|(name, bytes)| (name.to_string(), *bytes)).collect(),
         settings: parts.settings.iter().map(|(s, _)| setting(s)).collect(),
     };
-    for kind in &parts.kinds {
-        out.kinds.push(describe_kind(kind, &mut numbered));
+    for (handle, ty) in parts.types.iter().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a handful of types")]
+        out.types.push(describe_type(handle as u32, ty, &mut numbered));
     }
     for panel in parts.panels {
         #[expect(clippy::cast_possible_truncation, reason = "a handful of views")]
@@ -900,69 +904,77 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         numbered.views.push(Maker::Panel(panel));
     }
     // Numbered after the panels, as `number` numbers them.
-    out.tabs = parts.tabs.iter().filter_map(|(kind, view)| Some((kind.clone(), views(std::slice::from_ref(view), &mut numbered).pop()?))).collect();
+    out.viewers = parts.viewers.iter().filter_map(|(ty, view)| Some((ty.clone(), views(std::slice::from_ref(view), &mut numbered).pop()?))).collect();
     numbered.tools = calls(parts.tools, &mut out.tools);
     numbered.services = calls(parts.services, &mut out.services);
-    imports(&parts.types, &parts.ops, &mut out, &mut numbered);
+    imports(&parts.ops, &mut out, &mut numbered);
     for (handle, extractor) in parts.extractors.iter().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
         let handle = handle as u32;
         out.extractors.push(g::Extractor {
             handle,
             name: extractor.name.local().to_string(),
-            kind: extractor.kind.to_string(),
+            node_type: extractor.node_type.to_string(),
             requires: extractor.requires.clone(),
         });
     }
     numbered.types = parts.types;
     numbered.ops = parts.ops;
     numbered.extractors = parts.extractors;
-    numbered.additions = parts.additions.into_iter().map(|(_, output)| output).collect();
-    numbered.kinds = parts.kinds;
     numbered.reclaimable = parts.reclaimable;
     Ok((numbered, Some(out)))
 }
 
-/// A kind as the contract describes it, its fields and views numbered.
-fn describe_kind(kind: &KindDef, numbered: &mut Registered) -> g::Kind {
-    let lists = [&kind.views[..], &kind.inspector, &kind.editors, &kind.contents_views];
-    let [kind_views, inspector, editors, contents_views] = views_in_order(lists, numbered);
-    g::Kind {
-        name: kind.name.local().to_string(),
-        alias: kind.alias.clone(),
-        label: kind.label.clone(),
-        icon: kind.icon.map(|(i, t)| (icon(i), tint(t))),
-        fields: kind.fields.iter().map(|f| field(f, numbered)).collect(),
-        contents: kind.contents.is_some(),
-        part_sheet: kind.part_sheet.is_some(),
-        views: kind_views,
+/// A type as the contract describes it, its fields and views numbered.
+fn describe_type(handle: u32, ty: &TypeDef, numbered: &mut Registered) -> g::ValueType {
+    let lists = [&ty.views[..], &ty.inspector, &ty.editors, &ty.contents_views];
+    let [own_views, inspector, editors, contents_views] = views_in_order(lists, numbered);
+    let signatures = ty
+        .signatures
+        .iter()
+        .map(|s| match s {
+            #[expect(clippy::cast_possible_truncation, reason = "an offset in a file's first bytes")]
+            Signature::Bytes { offset, bytes } => g::Signature::Bytes((*offset as u32, bytes.clone())),
+            Signature::Name(name) => g::Signature::Name(name.clone()),
+            Signature::Text => g::Signature::Text,
+        })
+        .collect();
+    g::ValueType {
+        handle,
+        name: if ty.extends { ty.name.to_string() } else { ty.name.local().to_string() },
+        label: ty.label.clone(),
+        media_type: ty.media_type.clone(),
+        signatures,
+        sniff: ty.sniff.is_some(),
+        extends: ty.extends,
+        data: ty.data,
+        values: ty.values.clone(),
+        alias: ty.alias.clone(),
+        icon: ty.icon.map(|(i, t)| (icon(i), tint(t))),
+        fields: ty.fields.iter().map(|f| field(f, numbered)).collect(),
+        contents: ty.contents.is_some(),
+        part_sheet: ty.part_sheet.is_some(),
+        views: own_views,
         inspector,
         editors,
         contents_views,
-        outputs: kind.outputs.iter().map(describe_output).collect(),
-        stack: kind.stack.clone(),
+        stack: ty.stack.clone(),
     }
 }
 
-fn describe_output(o: &crate::OutputDef) -> g::Output {
-    g::Output {
-        name: o.name.clone(),
-        op: o.op.clone(),
-        retain: match o.retain {
-            crate::Retain::Cache => g::Retain::Cache,
-            crate::Retain::Build => g::Retain::Build,
-            crate::Retain::Transient => g::Retain::Transient,
-        },
-        members: o.members.is_some(),
-        from: o.from.clone(),
-    }
+fn describe_provides(provides: &crate::Provides) -> g::Provides {
+    let retain = match provides.retain {
+        crate::Retain::Cache => g::Retain::Cache,
+        crate::Retain::Build => g::Retain::Build,
+        crate::Retain::Transient => g::Retain::Transient,
+    };
+    g::Provides { name: provides.name.clone(), retain }
 }
 
-/// What an extension registered, numbered as describing it numbers it - kinds' fields and views, panels,
+/// What an extension registered, numbered as describing it numbers it - types' fields and views, panels,
 /// operations' fields - without the description.
 fn number(parts: crate::registry::Parts) -> Registered {
     let mut numbered = Registered {
-        kinds: vec![],
         fields: vec![],
         views: vec![],
         tools: vec![],
@@ -970,15 +982,14 @@ fn number(parts: crate::registry::Parts) -> Registered {
         types: vec![],
         ops: vec![],
         extractors: vec![],
-        additions: vec![],
         reclaimable: None,
     };
-    for kind in &parts.kinds {
-        numbered.fields.extend(kind.fields.iter().cloned());
-        views_in_order([&kind.views, &kind.inspector, &kind.editors, &kind.contents_views], &mut numbered);
+    for ty in &parts.types {
+        numbered.fields.extend(ty.fields.iter().cloned());
+        views_in_order([&ty.views, &ty.inspector, &ty.editors, &ty.contents_views], &mut numbered);
     }
     numbered.views.extend(parts.panels.into_iter().map(Maker::Panel));
-    numbered.views.extend(parts.tabs.into_iter().map(|(_, view)| Maker::Asset(view)));
+    numbered.views.extend(parts.viewers.into_iter().map(|(_, view)| Maker::Asset(view)));
     for op in &parts.ops {
         numbered.fields.extend(op.fields.iter().cloned());
     }
@@ -987,8 +998,6 @@ fn number(parts: crate::registry::Parts) -> Registered {
     numbered.types = parts.types;
     numbered.ops = parts.ops;
     numbered.extractors = parts.extractors;
-    numbered.additions = parts.additions.into_iter().map(|(_, output)| output).collect();
-    numbered.kinds = parts.kinds;
     numbered.reclaimable = parts.reclaimable;
     numbered
 }
@@ -1009,29 +1018,7 @@ fn calls(defs: Vec<ToolDef>, out: &mut Vec<g::Tool>) -> Vec<ToolDef> {
 }
 
 /// The types and operations registered, as the contract describes them.
-fn imports(types: &[TypeDef], ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) {
-    for (handle, ty) in types.iter().enumerate() {
-        #[expect(clippy::cast_possible_truncation, reason = "a handful of types")]
-        let handle = handle as u32;
-        let signatures = ty
-            .signatures
-            .iter()
-            .map(|s| match s {
-                #[expect(clippy::cast_possible_truncation, reason = "an offset in a file's first bytes")]
-                Signature::Bytes { offset, bytes } => g::Signature::Bytes((*offset as u32, bytes.clone())),
-                Signature::Name(name) => g::Signature::Name(name.clone()),
-                Signature::Text => g::Signature::Text,
-            })
-            .collect();
-        out.types.push(g::ValueType {
-            handle,
-            name: ty.name.local().to_string(),
-            label: ty.label.clone(),
-            media_type: ty.media_type.clone(),
-            signatures,
-            sniff: ty.sniff.is_some(),
-        });
-    }
+fn imports(ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) {
     for (handle, op) in ops.iter().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "a handful of operations")]
         let handle = handle as u32;
@@ -1046,6 +1033,9 @@ fn imports(types: &[TypeDef], ops: &[OpDef], out: &mut g::Registration, numbered
             inverse: op.inverse.clone(),
             parameter: op.parameter.clone(),
             priority: op.priority,
+            provides: op.provides.as_ref().map(describe_provides),
+            members: op.members.is_some(),
+            also: op.also.iter().map(|(name, ty)| (name.clone(), ty.to_string())).collect(),
         });
     }
 }
@@ -1058,12 +1048,8 @@ impl CallHost for NodeHost<'_> {
         &self.0.path
     }
 
-    fn kind(&self) -> Option<&str> {
-        self.0.kind.as_deref()
-    }
-
-    fn fields(&self) -> &Table {
-        Source::fields(self.0)
+    fn node_type(&self) -> Option<&str> {
+        self.0.node_type.as_deref()
     }
 
     fn read(&self, content: &Content) -> crate::Result<Vec<u8>> {
@@ -1095,12 +1081,16 @@ impl CallHost for NodeHost<'_> {
         Source::read_entry(self.0, path).ok_or_else(|| crate::anyhow!("the host reads nothing here"))?
     }
 
-    fn assets_of(&self, kind: &str) -> crate::Result<Vec<(String, String)>> {
-        Source::assets_of(self.0, kind).ok_or_else(|| crate::anyhow!("the host finds nothing here"))?
+    fn assets_of(&self, node_type: &str) -> crate::Result<Vec<(String, String)>> {
+        Source::assets_of(self.0, node_type).ok_or_else(|| crate::anyhow!("the host finds nothing here"))?
     }
 
     fn place(&self, path: &str) -> Option<String> {
         Source::place(self.0, path)
+    }
+
+    fn node_named(&self, reference: &str) -> Option<crate::NodeNamed> {
+        Source::node_named(self.0, reference)
     }
 
     fn output_of(&self, path: &str, address: &str) -> crate::Result<Data> {
@@ -1324,6 +1314,7 @@ impl g::GuestViewState for ViewState {
 pub struct Generating {
     generator: RefCell<Box<dyn crate::Generator>>,
     settings: Table,
+    carried: Table,
     parameter: Option<String>,
 }
 
@@ -1332,7 +1323,7 @@ impl Generating {
     fn with<R>(&self, node: &host::Asset, call: impl FnOnce(&mut dyn crate::Generator, &crate::Call<'_>) -> crate::Result<R>) -> Result<R, String> {
         let lent = Lent::borrowed(node);
         let host = NodeHost(&lent);
-        let lent_call = crate::Call { inputs: vec![], settings: &self.settings, parameter_text: self.parameter.as_deref(), host: &host };
+        let lent_call = crate::Call { inputs: vec![], settings: &self.settings, made: std::cell::RefCell::default(), carried: self.carried.clone(), parameter_text: self.parameter.as_deref(), host: &host };
         call(&mut **self.generator.borrow_mut(), &lent_call).map_err(|e| format!("{e:#}"))
     }
 }
@@ -1359,8 +1350,8 @@ pub struct Extraction(RefCell<Box<dyn crate::Extraction>>);
 struct Declarations<'a>(&'a host::Declarations);
 
 impl crate::Declared for Declarations<'_> {
-    fn declarations(&self, kind: &str) -> Vec<(String, Table)> {
-        self.0.of_kind(kind).into_iter().filter_map(|(path, text)| Some((path, toml::from_str(&text).ok()?))).collect()
+    fn declarations(&self, node_type: &str) -> Vec<(String, Table)> {
+        self.0.of_type(node_type).into_iter().filter_map(|(path, text)| Some((path, toml::from_str(&text).ok()?))).collect()
     }
 }
 

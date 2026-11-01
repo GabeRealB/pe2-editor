@@ -27,7 +27,7 @@ struct Tables {
 
 impl Tables {
     fn new(declared: &dyn Declared) -> Tables {
-        let of = |kind: &str| declared.declarations(kind).into_iter().collect();
+        let of = |node_type: &str| declared.declarations(node_type).into_iter().collect();
         Tables { meshes: of("mesh"), skeletons: of("skeleton"), materials: of("material"), images: of("image"), slots: of("vram_slot") }
     }
 }

@@ -4,7 +4,7 @@
 //! does a body and both hands. Which member is shown is the host's (`Project::chosen`), never written, so that combinations
 //! are looked at, not stored. A part nothing fills is open: a place for what is chosen elsewhere, such as a weapon.
 
-use pe2_ext::{Asset, Project, Result, Style, Table, Ui, Value, anyhow, bail};
+use pe2_ext::{Asset, Call, Project, Result, Style, Table, Ui, Value, anyhow, bail};
 
 /// A part, as what fills it now.
 #[derive(Clone, Debug, PartialEq)]
@@ -38,10 +38,16 @@ pub fn member_of(members: &[String], chosen: Option<String>) -> Option<String> {
 /// What an asset's groups are.
 #[must_use]
 pub fn groups(asset: &Asset, project: &dyn Project) -> Vec<Group> {
+    groups_as(asset, |group| project.chosen(asset.path(), group))
+}
+
+/// What an asset's groups are, each member chosen as `chosen` says of the group.
+#[must_use]
+pub fn groups_as(asset: &Asset, chosen: impl Fn(&str) -> Option<String>) -> Vec<Group> {
     let Some(groups) = asset.field("groups").and_then(Value::as_table) else { return Vec::new() };
     let group = |(name, members): (&String, &Value)| {
         let members: Vec<String> = members.as_table()?.keys().cloned().collect();
-        let chosen = member_of(&members, project.chosen(asset.path(), name))?;
+        let chosen = member_of(&members, chosen(name))?;
         Some(Group { name: name.clone(), members, chosen })
     };
     groups.iter().filter_map(group).collect()
@@ -82,7 +88,45 @@ pub fn filled_from(parts: Option<&Table>, groups: Option<&Table>, shown: &[Group
 /// # Errors
 /// As `filled_from`, or its tables are not tables.
 pub fn filled(asset: &Asset, project: &dyn Project) -> Result<Vec<Filled>> {
-    filled_from(table(asset.field("parts"), "parts")?, table(asset.field("groups"), "groups")?, &groups(asset, project))
+    filled_as(asset, &groups(asset, project))
+}
+
+/// Each part of a prefab with what fills it, with these groups shown.
+///
+/// # Errors
+/// As `filled_from`, or its tables are not tables.
+pub fn filled_as(asset: &Asset, shown: &[Group]) -> Result<Vec<Filled>> {
+    filled_from(table(asset.field("parts"), "parts")?, table(asset.field("groups"), "groups")?, shown)
+}
+
+/// Every part a member of a group fills, by its address: `outfit/10300/body`.
+#[must_use]
+pub fn members(asset: &Asset) -> Vec<String> {
+    addresses(asset.field("groups").and_then(Value::as_table))
+}
+
+fn addresses(groups: Option<&Table>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (group, members) in groups.into_iter().flatten() {
+        for (member, parts) in members.as_table().into_iter().flatten() {
+            out.extend(parts.as_table().into_iter().flatten().map(|(part, _)| format!("{group}/{member}/{part}")));
+        }
+    }
+    out
+}
+
+/// What a member of a group fills a part with, as an output of the prefab: a model, as this node holds it, so that what
+/// reads it reads its overrides and pose too. A sub-path reads on from the prefab, told which (`tokens::leads_on`).
+///
+/// # Errors
+/// It has no such member, or that member does not fill the part.
+pub fn member(call: &mut Call) -> Result<Table> {
+    let asked: String = call.parameter()?;
+    let group = call.settings.get("each").and_then(Value::as_str).unwrap_or_default();
+    let address = format!("{group}/{asked}");
+    let fields = call.given();
+    address.split('/').fold(fields.get("groups"), |at, step| at?.get(step)).ok_or_else(|| anyhow!("it has no member {address}"))?;
+    Ok(pe2_ext::tokens::leads_on(call.host.path(), "model", &[("member", &address)]))
 }
 
 /// What is at a path of an asset.
@@ -193,6 +237,12 @@ mod tests {
         assert!(filled_from(twice["parts"].as_table(), twice["groups"].as_table(), &shown("a")).is_err());
         let stray = parsed("[parts]\nbody = {}\n[groups.outfit.a]\nhat = { model = 'uid://y' }");
         assert!(filled_from(stray["parts"].as_table(), stray["groups"].as_table(), &shown("a")).is_err());
+    }
+
+    #[test]
+    fn a_member_is_addressed_by_group_member_and_part() {
+        let groups: Table = "outfit.a.body = {}\noutfit.a.hand = {}\npose.b.held = {}\n".parse().unwrap();
+        assert_eq!(addresses(Some(&groups)), ["outfit/a/body", "outfit/a/hand", "pose/b/held"]);
     }
 
     #[test]

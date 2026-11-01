@@ -3,7 +3,7 @@
 //! what they say - a reference that names no declaration, a disc whose files differ from its layout, a file or chunk
 //! not where they place it, bytes that differ from their sha1.
 //!
-//! - Group files, `<group>.toml` outside `disc/`: one table an asset - its uid, kind, its own fields (a folder's or
+//! - Group files, `<group>.toml` outside `disc/`: one table an asset - its uid, type, its own fields (a folder's or
 //!   file's slots, a stream's descriptor fields, an image's palettes, ...), and per release where extraction finds it
 //!   (`from.<release>.at`), with the original bytes' sha1 where they are read whole. A file's chunks' payload sha1s are
 //!   the file's (`from.<release>.chunks`).
@@ -44,11 +44,11 @@
 //! `stages/<stage>/rooms/<room>`; Dryfield's day and night stages hold one room each as two instances, `<room>/day`
 //! and `<room>/night`, as `src/stages/dryfield` builds them.
 //!
-//! # Assets of extensions' kinds
+//! # Assets of extensions' types
 //!
-//! What a kind's declarations say beyond where an asset is - an image's mode, palettes and cells, a file's image and
+//! What a type's declarations say beyond where an asset is - an image's mode, palettes and cells, a file's image and
 //! palette slots, a VRAM slot's rectangle - is its extension's to read: extraction lends the declarations to the
-//! extractor registered for the kind (`pe2.images` for textures and atlases), and keeps of them only what it reads
+//! extractor registered for the type (`pe2.images` for textures and atlases), and keeps of them only what it reads
 //! itself (where an asset is, a file's chunk slots by name).
 
 use anyhow::{Context, Result, bail};
@@ -110,7 +110,8 @@ pub struct Location {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Asset {
     pub uid: String,
-    pub kind: String,
+    /// The template its node is made from.
+    pub template: String,
     pub format: Option<String>,
     #[serde(default)]
     pub from: BTreeMap<String, Location>,
@@ -162,7 +163,7 @@ pub struct Disc {
 /// One file of the layout: a disc or a container, parsed where extraction needs it, and its text.
 pub struct Layout {
     pub uid: String,
-    pub kind: String,
+    pub template: String,
     pub disc: Option<Disc>,
     pub at: Vec<At>,
     pub text: String,
@@ -171,7 +172,7 @@ pub struct Layout {
 #[derive(Deserialize)]
 struct LayoutHead {
     uid: String,
-    kind: String,
+    template: String,
     #[serde(default)]
     at: Vec<At>,
 }
@@ -218,7 +219,7 @@ impl Declarations {
                     .and_then(|r| r.split_once('/'))
                     .with_context(|| format!("{}: not disc/<release>/<name>.toml", path.display()))?;
                 let head: LayoutHead = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
-                let disc = if head.kind == "disc" {
+                let disc = if head.template == "disc" {
                     Some(toml::from_str::<Disc>(&text).with_context(|| format!("{}", path.display()))?)
                 } else {
                     None
@@ -226,7 +227,7 @@ impl Declarations {
                 layouts
                     .entry(release.to_string())
                     .or_default()
-                    .insert(name.to_string(), Layout { uid: head.uid, kind: head.kind, disc, at: head.at, text });
+                    .insert(name.to_string(), Layout { uid: head.uid, template: head.template, disc, at: head.at, text });
                 continue;
             }
             let doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("{}", path.display()))?;

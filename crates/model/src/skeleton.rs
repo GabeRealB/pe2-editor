@@ -34,6 +34,27 @@ pub fn numbers_of(table: &Value, key: &str) -> Option<[f64; 3]> {
     triple(table.get(key), number)
 }
 
+/// What a prefab says of a joint: it replaces what the skeleton says, as far as it goes.
+pub fn posed(part: &mut crate::model::Part, pose: &Value) {
+    part.translation = translation_of(pose).unwrap_or(part.translation);
+    if let Some(rotation) = numbers_of(pose, "rotation") {
+        part.rotation = matrix(rotation);
+    }
+}
+
+/// How a prefab holds what it attaches: over what the model's root says of itself, as a child of the node.
+pub fn held(part: &mut crate::model::Part, child: &Value) {
+    let [x, y, z] = translation_of(child).unwrap_or_default();
+    part.translation = [part.translation[0] + x, part.translation[1] + y, part.translation[2] + z];
+    let turned = numbers_of(child, "rotation").map_or([[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], matrix);
+    let scale = numbers_of(child, "scale").unwrap_or([1.0; 3]);
+    let wide = |row: &[i16; 3]| row.map(f64::from);
+    let (turned, rest) = (turned.map(|row| wide(&row)), part.rotation.map(|row| wide(&row)));
+    #[expect(clippy::cast_possible_truncation, reason = "clamped to what the game's fixed point holds")]
+    let cell = |row: usize, column: usize| ((0..3).map(|k| turned[row][k] * scale[k] * rest[k][column]).sum::<f64>() / 4096.0).clamp(-32768.0, 32767.0).round() as i16;
+    part.rotation = std::array::from_fn(|row| std::array::from_fn(|column| cell(row, column)));
+}
+
 /// Joints as a skeleton lists them: `{ name, parent, translation, rotation }`, parents first.
 ///
 /// # Errors

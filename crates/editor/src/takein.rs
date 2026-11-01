@@ -280,8 +280,9 @@ impl Worker {
     }
 }
 
-/// Whether anything is made from an asset's settings.
+/// Whether anything is made from an asset's settings: more than the settings themselves.
 fn makes_outputs(extensions: &Extensions, asset: &Asset) -> bool {
     let (ops, tail) = (extensions.operations(), extensions.tail(asset));
-    !project::graph::Plan::of(asset.fields(), &ops, &tail).0.outputs.is_empty()
+    let plan = project::graph::Plan::of(asset.fields(), &ops, &tail).0;
+    plan.outputs.iter().any(|output| plan.steps[output.from].op != project::graph::SETTINGS)
 }

@@ -2,7 +2,7 @@
 //! `crates/ext/wit/extension.wit`.
 //!
 //! Loading compiles a component, in an engine of its own, instantiates it once and asks who it is (`describe`) and
-//! what it registers (`register`); what it registers becomes the same kinds, fields, operations, types and
+//! what it registers (`register`); what it registers becomes the same types, fields, operations, types and
 //! views a linked extension's would, each callback a call into the component by its handle.
 //!
 //! A guest's memory only grows, so an instance holds the most it ever held until it is dropped: instances live by the
@@ -246,7 +246,7 @@ unsafe impl Send for LentProject {}
 /// An asset lent for a call: the host's own, by pointer.
 pub struct LentAsset {
     source: *const (dyn Source + 'static),
-    kind: Option<String>,
+    node_type: Option<String>,
 }
 
 // SAFETY: a lent asset is read only during the call that lent it, on the thread making the call.
@@ -382,7 +382,7 @@ impl State {
         let Some(asset) = asset else { return Ok(None) };
         // SAFETY: the project's asset outlives the call; the lent asset is taken back when the call returns.
         let source = unsafe { erase_source(asset.source()) };
-        let lent = LentAsset { source, kind: asset.kind().map(str::to_string) };
+        let lent = LentAsset { source, node_type: asset.node_type().map(str::to_string) };
         let lent = self.table.push(lent)?;
         self.found.push(lent.rep());
         Ok(Some(lent))
@@ -416,8 +416,8 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.uid().map(str::to_string))
     }
 
-    fn kind(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
-        Ok(self.table.get(&asset)?.kind.clone())
+    fn node_type(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<String>> {
+        Ok(self.table.get(&asset)?.node_type.clone())
     }
 
     fn declaration(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<String> {
@@ -469,6 +469,11 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.place(&path))
     }
 
+    fn node_named(&mut self, asset: Resource<LentAsset>, reference: String) -> wasmtime::Result<Option<host::NodeNamed>> {
+        let named = self.lent(&asset)?.node_named(&reference);
+        Ok(named.map(|named| host::NodeNamed { path: named.path, uid: named.uid, types: named.types }))
+    }
+
     fn output_of(&mut self, asset: Resource<LentAsset>, path: String, address: String) -> wasmtime::Result<Result<types::Value, String>> {
         let told = self.lent(&asset)?.output_of(&path, &address).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
         Ok(match told {
@@ -482,8 +487,8 @@ impl host::HostAsset for State {
         Ok(told.map(|c| host::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder, known: c.known }))
     }
 
-    fn assets_of(&mut self, asset: Resource<LentAsset>, kind: String) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
-        Ok(self.lent(&asset)?.assets_of(&kind).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    fn assets_of(&mut self, asset: Resource<LentAsset>, node_type: String) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
+        Ok(self.lent(&asset)?.assets_of(&node_type).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
     }
 
     fn temp(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Result<String, String>> {
@@ -546,11 +551,11 @@ impl host::HostProject for State {
         self.found(project.resolve(&reference))
     }
 
-    fn find(&mut self, project: Resource<LentProject>, kind: String) -> wasmtime::Result<Vec<Resource<LentAsset>>> {
+    fn find(&mut self, project: Resource<LentProject>, node_type: String) -> wasmtime::Result<Vec<Resource<LentAsset>>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
         let mut out = vec![];
-        for asset in project.find(&kind) {
+        for asset in project.find(&node_type) {
             out.extend(self.found(Some(asset))?);
         }
         Ok(out)
@@ -607,6 +612,11 @@ impl host::HostProject for State {
         }))
     }
 
+    fn bytes(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<Option<Result<Vec<u8>, String>>> {
+        let project = self.project(&project)?;
+        Ok(elsewhere(project, move |p| p.bytes(&path, &address).map(|made| made.map_err(|e| format!("{e:#}")))))
+    }
+
     fn call(
         &mut self,
         project: Resource<LentProject>,
@@ -632,11 +642,11 @@ impl host::HostProject for State {
 
 /// A value as it crosses: TOML.
 impl host::HostDeclarations for State {
-    fn of_kind(&mut self, declarations: Resource<LentDeclarations>, kind: String) -> wasmtime::Result<Vec<(String, String)>> {
+    fn of_type(&mut self, declarations: Resource<LentDeclarations>, node_type: String) -> wasmtime::Result<Vec<(String, String)>> {
         // SAFETY: lent for the call running now (`ComponentExtraction::begin`), taken back before it returns.
         let declared = unsafe { &*self.table.get(&declarations)?.declared };
         Ok(declared
-            .declarations(&kind)
+            .declarations(&node_type)
             .into_iter()
             .map(|(path, table)| (path, toml::to_string(&table).unwrap_or_default()))
             .collect())
@@ -1045,9 +1055,9 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn reference_taking(&mut self, ui: Resource<Frame>, label: String, kind: String, reference: Option<String>) -> wasmtime::Result<Option<String>> {
+    fn reference_taking(&mut self, ui: Resource<Frame>, label: String, node_type: String, reference: Option<String>) -> wasmtime::Result<Option<String>> {
         let reference = reference.and_then(|text| parse_value(&text));
-        Ok(self.frame(&ui)?.reference_taking(&label, &kind, reference.as_ref()).map(|taken| taken.to_string()))
+        Ok(self.frame(&ui)?.reference_taking(&label, &node_type, reference.as_ref()).map(|taken| taken.to_string()))
     }
 
     fn editing(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<(String, String)>> {
@@ -1081,6 +1091,10 @@ impl host::HostUi for State {
     ) -> wasmtime::Result<Option<u32>> {
         let chosen = self.frame(&ui)?.combo(&id, &selected, &options);
         Ok(chosen.and_then(|i| u32::try_from(i).ok()))
+    }
+
+    fn shown(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<String>> {
+        Ok(self.frame(&ui)?.shown())
     }
 
     fn editable(&mut self, ui: Resource<Frame>) -> wasmtime::Result<bool> {
@@ -1304,7 +1318,7 @@ impl Runner {
     fn lend(&mut self, asset: &Asset) -> Result<Resource<LentAsset>> {
         // SAFETY: the pointer is used only during the call it is lent for, and taken back before it returns.
         let source = unsafe { erase_source(asset.source()) };
-        let lent = LentAsset { source, kind: asset.kind().map(str::to_string) };
+        let lent = LentAsset { source, node_type: asset.node_type().map(str::to_string) };
         Ok(self.store.data_mut().table.push(lent)?)
     }
 
@@ -1606,7 +1620,7 @@ impl View for ComponentView {
         let lent = ui.asset().map(|asset| {
             // SAFETY: lent for this frame's call alone, and taken back before it returns.
             let source = unsafe { erase_source(asset.source()) };
-            LentAsset { source, kind: asset.kind().map(str::to_string) }
+            LentAsset { source, node_type: asset.node_type().map(str::to_string) }
         });
         // SAFETY: as the asset.
         let project = unsafe { erase_project(ui.project()) };
@@ -1679,7 +1693,7 @@ impl pe2_ext::Generator for ComponentGenerator {
     fn next(&mut self, call: &pe2_ext::Call<'_>, count: usize) -> Result<Vec<pe2_ext::Data>> {
         let resource = self.resource.context("closed")?;
         let node = Node::new(call.host);
-        let asset = Asset::new(&node, call.host.kind());
+        let asset = Asset::new(&node, call.host.node_type());
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         let made = self
             .runner
@@ -1692,7 +1706,7 @@ impl pe2_ext::Generator for ComponentGenerator {
     fn seek(&mut self, call: &pe2_ext::Call<'_>, position: u64) -> Result<bool> {
         let resource = self.resource.context("closed")?;
         let node = Node::new(call.host);
-        let asset = Asset::new(&node, call.host.kind());
+        let asset = Asset::new(&node, call.host.node_type());
         let moved = self
             .runner
             .with_asset(&asset, LONG, async |a, g, lent| g.generator().call_seek(a, resource, lent, position).await)?;
@@ -1755,11 +1769,11 @@ impl Drop for ComponentExtraction {
 /// Register a component's extractors, their sessions begun in instances of their own.
 fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shared: &Arc<Shared>) -> Result<()> {
     for extractor in extractors {
-        let kind = Name::parse(&extractor.kind).with_context(|| format!("{}: not a qualified kind", extractor.kind))?;
+        let node_type = Name::parse(&extractor.node_type).with_context(|| format!("{}: not a qualified type", extractor.node_type))?;
         let requires: Vec<&str> = extractor.requires.iter().map(String::as_str).collect();
         let (shared, handle) = (shared.clone(), extractor.handle);
         let cap = shared.cap(&extractor.name);
-        let _ = registry.extractor(&extractor.name, &kind, &requires, move |declared| {
+        let _ = registry.extractor(&extractor.name, &node_type, &requires, move |declared| {
             Ok(Box::new(ComponentExtraction::begin(&shared, handle, cap, declared)?) as Box<dyn Extraction>)
         });
     }
@@ -1804,10 +1818,10 @@ fn caps(id: &str, registration: &g::Registration) -> Result<std::collections::Ha
     Ok(out)
 }
 
-/// What the views' instance may take: the most any kind or panel with views was given, as they share it.
+/// What the views' instance may take: the most any type or panel with views was given, as they share it.
 fn views_cap(id: &str, registration: &g::Registration, caps: &std::collections::HashMap<String, u64>) -> u64 {
     let with_views = registration
-        .kinds
+        .types
         .iter()
         .filter(|k| !k.views.is_empty() || !k.inspector.is_empty() || !k.editors.is_empty() || !k.contents_views.is_empty())
         .map(|k| k.name.as_str())
@@ -1820,6 +1834,7 @@ fn field(shared: &Arc<Shared>, f: g::Field) -> Field {
     let mut out = Field::new(&f.key);
     out.label = f.label;
     out.read_only = f.read_only;
+    out.required = f.required;
     out.custom = f.custom;
     out.choices = f.choices.into_iter().filter_map(|(value, label)| Some((parse_value(&value)?, label))).collect();
     if f.format {
@@ -1968,36 +1983,13 @@ fn setting(s: g::Setting) -> Result<pe2_ext::Setting> {
     Ok(setting)
 }
 
-/// The outputs it adds to others' kinds.
-fn add_outputs(registry: &mut Registry, additions: &[(String, g::Output)], kinds: usize, shared: &Arc<Shared>) -> Result<()> {
-    for (at, (kind, output)) in additions.iter().enumerate() {
-        let retain = match output.retain {
-            g::Retain::Cache => pe2_ext::Retain::Cache,
-            g::Retain::Build => pe2_ext::Retain::Build,
-            g::Retain::Transient => pe2_ext::Retain::Transient,
-        };
-        let added = registry.add_output(kind, &output.name, &output.op, output.from.as_deref(), retain);
-        if output.members {
-            // Called back by its place after the kinds.
-            let (shared, index) = (shared.clone(), u32::try_from(kinds + at)?);
-            added.members_described(move |asset| {
-                shared
-                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, index, 0, lent).await))
-                    .unwrap_or_default()
-            });
-        }
-    }
-    Ok(())
-}
-
 fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Shared>) -> Result<()> {
     // Its settings, taken by the host as the guest took them: from the same values kept.
     for s in registration.settings {
         let _ = registry.setting(setting(s)?);
     }
-    add_outputs(registry, &registration.additions, registration.kinds.len(), shared)?;
-    for (kind, tab) in &registration.tabs {
-        registry.add_inspector_tab_def(kind, view_def(shared, tab));
+    for (ty, viewer) in &registration.viewers {
+        registry.viewer_def(ty, view_def(shared, viewer));
     }
     for (name, label) in &registration.events {
         registry.add_event(name, label);
@@ -2005,22 +1997,19 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     for hook in registration.hooks {
         registry.add_hook(pe2_ext::HookDef { event: hook.event, op: hook.op, signals: hook.signals });
     }
-    for (kind, stack) in &registration.stacks {
-        registry.add_stack(kind, stack);
-    }
-    for recipe in &registration.recipes {
-        registry.add_recipe(&recipe.kind, &recipe.pattern, &recipe.stack);
+    for template in &registration.templates {
+        let files: Vec<&str> = template.files.iter().map(String::as_str).collect();
+        drop(registry.template(&template.name, &template.node_type, &template.stack).label(&template.label).files(&files));
     }
     for (label, tool) in &registration.commands {
         registry.command(label, tool);
     }
-    apply_kinds(registry, registration.kinds, shared)?;
+    apply_types(registry, registration.types, shared);
     for panel in registration.panels {
         let (shared, handle) = (shared.clone(), panel.handle);
         let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
         registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
     }
-    apply_types(registry, registration.types, shared);
     apply_ops(registry, registration.ops, shared);
     apply_extractors(registry, registration.extractors, shared)?;
     for service in registration.services {
@@ -2034,44 +2023,49 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     Ok(())
 }
 
-/// Register a component's kinds; what they compute calls into it, by each one's place.
-fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared>) -> Result<()> {
-    for (index, kind) in kinds.into_iter().enumerate() {
-        let index = u32::try_from(index)?;
-        let mut builder = registry.kind(&kind.name).label(&kind.label);
-        if let Some(alias) = &kind.alias {
+/// Register a component's types; what they compute calls into it, by each one's place.
+fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<Shared>) {
+    for node_type in types {
+        let index = node_type.handle;
+        let builder = if node_type.extends { registry.extend(&node_type.name) } else { registry.named_type(&node_type.name) };
+        let mut builder = builder.label(&node_type.label);
+        if let Some(media_type) = &node_type.media_type {
+            builder = builder.media_type(media_type);
+        }
+        for signature in &node_type.signatures {
+            builder = match signature {
+                g::Signature::Bytes((offset, bytes)) => builder.bytes(*offset as usize, bytes),
+                g::Signature::Name(name) => builder.named(name),
+                g::Signature::Text => builder.text(),
+            };
+        }
+        if node_type.sniff {
+            let shared = shared.clone();
+            builder = builder.sniff(move |name, size, head| {
+                let (name, head) = (name.to_string(), head.to_vec());
+                let version = shared.read(|r| r.call(QUICK, async |a, g| g.call_sniff(a, index, name, size, head).await)).ok().flatten()?;
+                Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
+            });
+        }
+        if node_type.data {
+            builder = builder.data();
+        }
+        for value in &node_type.values {
+            builder = builder.of(value);
+        }
+        if let Some(alias) = &node_type.alias {
             builder = builder.alias(alias);
         }
-        if let Some((i, t)) = kind.icon {
+        if let Some((i, t)) = node_type.icon {
             builder = builder.icon(icon(i), tint(t));
         }
-        for f in kind.fields {
+        for f in node_type.fields {
             builder = builder.field(field(shared, f));
         }
-        for (o, output) in kind.outputs.into_iter().enumerate() {
-            let o = u32::try_from(o)?;
-            let retain = match output.retain {
-                g::Retain::Cache => pe2_ext::Retain::Cache,
-                g::Retain::Build => pe2_ext::Retain::Build,
-                g::Retain::Transient => pe2_ext::Retain::Transient,
-            };
-            builder = builder.output_described(&output.name, &output.op, retain);
-            if let Some(from) = &output.from {
-                builder = builder.from(from);
-            }
-            if output.members {
-                let shared = shared.clone();
-                builder = builder.members_described(move |asset| {
-                    shared
-                        .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, index, o, lent).await))
-                        .unwrap_or_default()
-                });
-            }
-        }
-        if let Some(stack) = &kind.stack {
+        if let Some(stack) = &node_type.stack {
             builder = builder.stack(stack);
         }
-        if kind.contents {
+        if node_type.contents {
             let lister = shared.clone();
             builder = builder.contents(move |asset, project| {
                 let contents = lister.read(|r| r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_contents(a, index, lent, project).await));
@@ -2089,7 +2083,7 @@ fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared
                 content_outcome(done.map_err(|why| anyhow!(why))?)
             });
         }
-        if kind.part_sheet {
+        if node_type.part_sheet {
             let shared = shared.clone();
             builder = builder.part_sheet(move |asset, project, part| {
                 let sheet = shared.read(|r| {
@@ -2102,52 +2096,23 @@ fn apply_kinds(registry: &mut Registry, kinds: Vec<g::Kind>, shared: &Arc<Shared
                 }
             });
         }
-        for v in kind.views {
+        for v in node_type.views {
             builder = builder.view(&v.name, view(shared, v.handle));
         }
-        for v in &kind.inspector {
+        for v in &node_type.inspector {
             builder = builder.inspector_def(view_def(shared, v));
         }
-        for v in &kind.editors {
+        for v in &node_type.editors {
             builder = builder.editor_def(view_def(shared, v));
         }
-        for v in &kind.contents_views {
+        for v in &node_type.contents_views {
             builder = builder.contents_view_def(view_def(shared, v));
         }
         let _ = builder.register();
     }
-    Ok(())
 }
 
 /// Register a component's types, with what recognizes them in files; their sniffs call into it.
-fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<Shared>) {
-    for format in types {
-        let mut builder = registry.type_described(&format.name).label(&format.label);
-        if let Some(media_type) = &format.media_type {
-            builder = builder.media_type(media_type);
-        }
-        for signature in &format.signatures {
-            builder = match signature {
-                g::Signature::Bytes((offset, bytes)) => builder.bytes(*offset as usize, bytes),
-                g::Signature::Name(name) => builder.named(name),
-                g::Signature::Text => builder.text(),
-            };
-        }
-        if format.sniff {
-            let (shared, handle) = (shared.clone(), format.handle);
-            builder = builder.sniff(move |name, size, head| {
-                let (name, head) = (name.to_string(), head.to_vec());
-                let version = shared
-                    .read(|r| r.call(QUICK, async |a, g| g.call_sniff(a, handle, name, size, head).await))
-                    .ok()
-                    .flatten()?;
-                Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
-            });
-        }
-        let _ = builder.register();
-    }
-}
-
 /// Register a component's types and operations, their runs calls into it: each lent its node as an asset whose files
 /// are its values' contents, named by their hashes.
 fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
@@ -2163,11 +2128,27 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
         for path in &op.derives {
             builder = builder.derives(path);
         }
+        for (name, ty) in &op.also {
+            builder = builder.also_described(name, ty);
+        }
         if let Some(inverse) = &op.inverse {
             builder = builder.inverse_described(inverse);
         }
-        if let Some((name, kind)) = &op.parameter {
-            builder = builder.parameter_described(name, kind);
+        if let Some((name, node_type)) = &op.parameter {
+            builder = builder.parameter_described(name, node_type);
+        }
+        if op.members {
+            let (shared, handle) = (shared.clone(), op.handle);
+            builder = builder.members_described(move |asset| {
+                shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, handle, lent).await)).unwrap_or_default()
+            });
+        }
+        if let Some(provides) = &op.provides {
+            builder = builder.provides(&provides.name).keeps(match provides.retain {
+                g::Retain::Cache => pe2_ext::Retain::Cache,
+                g::Retain::Build => pe2_ext::Retain::Build,
+                g::Retain::Transient => pe2_ext::Retain::Transient,
+            });
         }
         let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
         if op.output.starts_with("stream<") {
@@ -2176,7 +2157,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let settings = toml::to_string(call.settings).unwrap_or_default();
                 let parameter = call.parameter_text.map(str::to_string);
                 let node = Node::new(call.host);
-                let asset = Asset::new(&node, call.host.kind());
+                let asset = Asset::new(&node, call.host.node_type());
                 // An instance of its own, kept while the stream is read.
                 let mut runner = shared.instantiate(cap).with_context(|| shared.id.clone())?;
                 let inputs = values_to_wit(given, &mut runner.store.data_mut().table)?;
@@ -2191,12 +2172,12 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             });
             continue;
         }
-        let _ = builder.run(move |call| {
+        let _ = builder.run_described(move |call| {
             let given = std::mem::take(&mut call.inputs);
             let settings = toml::to_string(call.settings).unwrap_or_default();
             let parameter = call.parameter_text.map(str::to_string);
             let node = Node::new(call.host);
-            let asset = Asset::new(&node, call.host.kind());
+            let asset = Asset::new(&node, call.host.node_type());
             shared.job(cap, |r| {
                 let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
                 let made = r.with_asset(&asset, shared.long(), async |a, g, lent| {
@@ -2208,7 +2189,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
     }
 }
 
-/// A node as an operation's run lends it to a component: its path, kind and declared settings; its files the
+/// A node as an operation's run lends it to a component: its path, type and declared settings; its files the
 /// contents its values hold, named by their hashes.
 struct Node<'a> {
     host: &'a dyn pe2_ext::CallHost,
@@ -2217,7 +2198,7 @@ struct Node<'a> {
 
 impl<'a> Node<'a> {
     fn new(host: &'a dyn pe2_ext::CallHost) -> Node<'a> {
-        Node { host, declaration: toml::to_string(host.fields()).unwrap_or_default() }
+        Node { host, declaration: String::new() }
     }
 
     fn content(name: &str) -> pe2_ext::Content {
@@ -2235,7 +2216,8 @@ impl Source for Node<'_> {
     }
 
     fn fields(&self) -> &Table {
-        self.host.fields()
+        static NONE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+        NONE.get_or_init(Table::new)
     }
 
     fn declaration(&self) -> &str {
@@ -2278,6 +2260,10 @@ impl Source for Node<'_> {
         self.host.place(path)
     }
 
+    fn node_named(&self, reference: &str) -> Option<pe2_ext::NodeNamed> {
+        self.host.node_named(reference)
+    }
+
     fn output_of(&self, path: &str, address: &str) -> Option<Result<pe2_ext::Data>> {
         Some(self.host.output_of(path, address))
     }
@@ -2286,8 +2272,8 @@ impl Source for Node<'_> {
         self.host.build_config()
     }
 
-    fn assets_of(&self, kind: &str) -> Option<Result<Vec<(String, String)>>> {
-        Some(self.host.assets_of(kind))
+    fn assets_of(&self, node_type: &str) -> Option<Result<Vec<(String, String)>>> {
+        Some(self.host.assets_of(node_type))
     }
 
     fn keep(&self, path: &str, name: &str) -> Option<Result<pe2_ext::File>> {

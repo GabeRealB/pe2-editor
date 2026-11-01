@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use std::marker::PhantomData;
 
-use crate::data::{Call, OpDef, OutputDef, Port, Retain, Type};
+use crate::data::{Call, OpDef, Port, Provides, Retain, Type};
 use crate::ty::ValueType;
 use crate::import::{Recognized, Signature, TypeDef};
 use crate::{Asset, Project, Result, Table, Value, View};
@@ -16,7 +16,7 @@ pub struct Extension {
     /// Its version, as semver: `0.1.0`.
     pub version: &'static str,
     /// The extensions it needs, by id and the versions it accepts: `pe2.images@^0.1` (a version alone is a caret
-    /// requirement; an id alone takes any). It may extend only kinds these register. Without one, or with one
+    /// requirement; an id alone takes any). It may extend only types these register. Without one, or with one
     /// refused, left off by the project or of another version, it is refused.
     pub requires: &'static [&'static str],
     /// What it uses where a compatible one is enabled, and otherwise does without, as `optional`. Linked, turning it off
@@ -153,7 +153,7 @@ impl fmt::Display for Name {
     }
 }
 
-/// An icon of the host's set, for a kind in the tree and the inspector.
+/// An icon of the host's set, for a type in the tree and the inspector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Disc,
@@ -195,7 +195,7 @@ pub enum Tint {
 /// Formats a field's value for reading; none where the value is not of the form it formats.
 pub type Format = dyn Fn(&Value) -> Option<String> + Send + Sync;
 
-/// A field of a kind, as the inspector shows it: its label and how its value reads.
+/// A field of a type, as the inspector shows it: its label and how its value reads.
 #[derive(Clone)]
 pub struct Field {
     pub key: String,
@@ -209,10 +209,12 @@ pub struct Field {
     pub choices: Vec<(Value, String)>,
     /// Not edited in place: it describes stored data, which an edit would not change.
     pub read_only: bool,
-    /// Drawn by its kind's inspector view, not by the host's property sheet.
+    /// Drawn by its type's inspector view, not by the host's property sheet.
     pub custom: bool,
     /// How it reads when left out, which a choice can go back to; a field's value is then empty.
     pub absent: Option<String>,
+    /// It has no value of its own to fall back on: left out, what it is set on is wrong.
+    pub required: bool,
 }
 
 impl Field {
@@ -227,6 +229,7 @@ impl Field {
             read_only: false,
             custom: false,
             absent: None,
+            required: false,
         }
     }
 
@@ -262,12 +265,19 @@ impl Field {
     }
 
     #[must_use]
+    pub fn required(mut self) -> Field {
+        self.required = true;
+        self
+    }
+
+    /// Its value is not edited here.
+    #[must_use]
     pub fn read_only(mut self) -> Field {
         self.read_only = true;
         self
     }
 
-    /// Drawn by the kind's inspector view instead of the host's sheet.
+    /// Drawn by the type's inspector view instead of the host's sheet.
     #[must_use]
     pub fn custom(mut self) -> Field {
         self.custom = true;
@@ -282,11 +292,17 @@ pub struct CommandDef {
     pub tool: Name,
 }
 
-/// How a file replaces what an asset is made of: a kind's assets, the files of a name, the stack they then have.
+/// A way to make a node: its stack as it is stamped into the node, `{file}` standing for its file. A node made so holds its
+/// stack whole: what becomes of the template later is no concern of its.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Recipe {
-    pub kind: String,
-    pub pattern: String,
+pub struct TemplateDef {
+    /// By this a declaration names it, and an editor offers it.
+    pub name: String,
+    pub label: String,
+    /// The type of node it makes, qualified.
+    pub node_type: String,
+    /// The files it takes, by name (`*.mp4`); none, it is chosen by name alone.
+    pub files: Vec<String>,
     pub stack: String,
 }
 
@@ -320,7 +336,6 @@ pub struct ToolDef {
 /// What an extension registered.
 #[derive(Clone, Default)]
 pub struct Parts {
-    pub kinds: Vec<KindDef>,
     pub panels: Vec<PanelDef>,
     pub tools: Vec<ToolDef>,
     /// Services: like tools, but for other extensions to call.
@@ -330,18 +345,14 @@ pub struct Parts {
     pub extractors: Vec<crate::ExtractorDef>,
     /// Whether its instance may be reclaimed now; without, always.
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    /// Outputs it adds to a kind it requires, by the kind's name.
-    pub additions: Vec<(String, OutputDef)>,
-    /// Inspector tabs given to kinds of what it requires, by the kind's qualified name.
-    pub tabs: Vec<(String, ViewDef)>,
+    /// Viewers: what shows an output of a type in a document, by the type's name.
+    pub viewers: Vec<(String, ViewDef)>,
     /// The events it declares, by name, with their labels.
     pub events: Vec<(String, String)>,
     /// What it runs where an event is signaled.
     pub hooks: Vec<HookDef>,
-    /// Stacks it gives kinds of others that have none, by the kind's name (TOML).
-    pub stacks: Vec<(String, String)>,
-    /// What files replace assets of kinds, with what.
-    pub recipes: Vec<Recipe>,
+    /// Ways to make a node.
+    pub templates: Vec<TemplateDef>,
     /// What it offers among the editor's commands.
     pub commands: Vec<CommandDef>,
     /// The memory a job of something it registered may take, where more than the host's default, by its name.
@@ -691,7 +702,7 @@ pub enum ContentRequest {
     Action { row: String, action: String },
     Rename { row: String, name: String },
     Moved { row: String, onto: String, place: ContentPlace },
-    /// An asset, by its path, dropped on a row whose `takes` names `asset:` and its kind.
+    /// An asset, by its path, dropped on a row whose `takes` names `asset:` and its type.
     Dropped { row: String, asset: String },
 }
 
@@ -731,51 +742,6 @@ pub type ListContents = dyn Fn(&Asset, &dyn crate::Project) -> Contents + Send +
 pub type ActOnContents = dyn Fn(&Asset, &dyn crate::Project, ContentRequest) -> Result<ContentOutcome> + Send + Sync;
 /// A part's fields, by its fragment.
 pub type SheetOfPart = dyn Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync;
-
-/// A kind as registered.
-#[derive(Clone)]
-pub struct KindDef {
-    pub name: Name,
-    /// The bare name declarations wrote before names were qualified (`image`): a built-in's alone.
-    pub alias: Option<String>,
-    pub label: String,
-    pub icon: Option<(Icon, Tint)>,
-    pub fields: Vec<Field>,
-    pub views: Vec<ViewDef>,
-    /// Views drawn in the inspector, after the host's property sheet: what its custom fields hold.
-    pub inspector: Vec<ViewDef>,
-    /// Editors of its own, beside the preview.
-    pub editors: Vec<ViewDef>,
-    /// Views at the head of the contents pane.
-    pub contents_views: Vec<ViewDef>,
-    /// What is inside its assets.
-    pub contents: Option<Arc<ListContents>>,
-    /// What comes of something done in its assets' contents.
-    pub content_act: Option<Arc<ActOnContents>>,
-    /// Its parts' fields, where those are not what their tables hold.
-    pub part_sheet: Option<Arc<SheetOfPart>>,
-    /// The outputs every node of it has, made from its stack's result (`picture(look)`, `facts`).
-    pub outputs: Vec<OutputDef>,
-    /// The stack a node of it has where its bundle states none, as TOML (`[[stack]]` tables): extraction writes it.
-    pub stack: Option<String>,
-}
-
-/// An output added to another's kind.
-pub struct AddedOutput<'a> {
-    output: &'a mut OutputDef,
-}
-
-impl AddedOutput<'_> {
-    /// The members of the family it is: each by a value of its operation's parameter, with a label.
-    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) {
-        self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect());
-    }
-
-    /// The members of a family as described where values cross as text.
-    pub fn members_described(self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) {
-        self.output.members = Some(Arc::new(members));
-    }
-}
 
 /// An operation run where an event is signaled, before what the event pulls: failing, it stops those.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -853,25 +819,14 @@ impl Registry {
         &self.id
     }
 
-    /// A kind, `<id>@<name>`: registered by `register` on what this returns.
-    pub fn kind(&mut self, name: &str) -> KindBuilder<'_> {
-        let def = KindDef {
-            name: Name::of(&self.id, name),
-            alias: None,
-            label: name.to_string(),
-            icon: None,
-            fields: vec![],
-            views: vec![],
-            inspector: vec![],
-            editors: vec![],
-            contents_views: vec![],
-                contents: None,
-            content_act: None,
-            part_sheet: None,
-            outputs: vec![],
-            stack: None,
-        };
-        KindBuilder { registry: self, def }
+    /// Add to a type of an extension this one depends on, by its qualified name: its own extension can so stay free of what
+    /// is added. An output made by a `weak` or `optional` dependency not linked is not there, and nothing else changes.
+    /// Registered by `register` on what this returns.
+    pub fn extend(&mut self, name: &str) -> TypeBuilder<'_> {
+        let mut builder = self.named_type("");
+        builder.def.name = Name(name.to_string());
+        builder.def.extends = true;
+        builder
     }
 
     /// A panel, `<id>@<name>`, labeled in the View menu and its tab.
@@ -887,7 +842,7 @@ impl Registry {
             self.parts.problems.push(format!("{}: not a type of {}", T::NAME, self.id));
             return Name::of(&self.id, T::NAME);
         };
-        let mut builder = self.type_described(name.local()).label(T::LABEL);
+        let mut builder = self.named_type(name.local()).label(T::LABEL);
         if let Some(media_type) = T::MEDIA_TYPE {
             builder = builder.media_type(media_type);
         }
@@ -898,31 +853,45 @@ impl Registry {
         builder.register()
     }
 
-    /// A type as described where types cross as text (a component's registration), `<id>@<name>`: registered by
-    /// `register` on what this returns.
-    pub fn type_described(&mut self, name: &str) -> TypeBuilder<'_> {
+    /// A type, `<id>@<name>`: what flows between operations, and - where it says how they show - what a node making one, or
+    /// a value it is `of`, is. Registered by `register` on what this returns.
+    pub fn named_type(&mut self, name: &str) -> TypeBuilder<'_> {
         let def = TypeDef {
             name: Name::of(&self.id, name),
             label: name.to_string(),
             media_type: None,
             signatures: vec![],
             sniff: None,
+            alias: None,
+            icon: None,
+            fields: vec![],
+            views: vec![],
+            inspector: vec![],
+            editors: vec![],
+            contents_views: vec![],
+            contents: None,
+            content_act: None,
+            part_sheet: None,
+            stack: None,
+            data: false,
+            values: vec![],
+            extends: false,
         };
         TypeBuilder { registry: self, def }
     }
 
-    /// An extractor, `<id>@<name>`, making the native files of assets of `kind` (of those declaring all of `requires`; of every one
+    /// An extractor, `<id>@<name>`, making the native files of assets of `type` (of those declaring all of `requires`; of every one
     /// where none is named) from the discs, its sessions begun by `begin`.
     pub fn extractor(
         &mut self,
         name: &str,
-        kind: &Name,
+        node_type: &Name,
         requires: &[&str],
         begin: impl Fn(&dyn crate::Declared) -> Result<Box<dyn crate::Extraction>> + Send + Sync + 'static,
     ) -> Name {
         let def = crate::ExtractorDef {
             name: Name::of(&self.id, name),
-            kind: kind.clone(),
+            node_type: node_type.clone(),
             requires: requires.iter().map(|field| (*field).to_string()).collect(),
             begin: Arc::new(begin),
         };
@@ -938,7 +907,7 @@ impl Registry {
         self.parts.reclaimable = Some(Arc::new(reclaimable));
     }
 
-    /// How much memory a job of `of` may take - a kind's pictures, thumbnails, parts and views, an importer's
+    /// How much memory a job of `of` may take - a type's pictures, thumbnails, parts and views, an importer's
     /// imports and exports, an extractor's sessions, a tool's runs, a panel - where its default is too little (a
     /// renderer's scene, a movie's frames). The host enforces it for each instance by the job it runs (up to 4 GiB, a
     /// 32-bit memory's most).
@@ -959,6 +928,9 @@ impl Registry {
             inverse: None,
             parameter: None,
             priority: 0,
+            provides: None,
+            members: None,
+            also: vec![],
             run: Arc::new(|_| Err(crate::anyhow!("it does nothing"))),
             start: None,
         };
@@ -995,37 +967,21 @@ impl Registry {
         self.parts.events.push((name.to_string(), label.to_string()));
     }
 
-    /// Add an output to a kind of an extension this one depends on: named `name`, made by `op` of what its output `from`
-    /// makes - one before it - or of its nodes' results. A kind's own extension can so stay free of what the output needs: where that is
-    /// a `weak` or `optional` dependency not linked, the output is not there, and nothing else changes.
-    pub fn add_output(&mut self, kind: &str, name: &str, op: &str, from: Option<&str>, retain: Retain) -> AddedOutput<'_> {
-        let output = OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None, from: from.map(str::to_string) };
-        let at = self.parts.additions.len();
-        self.parts.additions.push((kind.to_string(), output));
-        AddedOutput { output: &mut self.parts.additions[at].1 }
+    /// A viewer of a type: a document's tab showing any output of it that is a preview.
+    pub fn viewer(&mut self, ty: &Name, name: &str, icon: Icon, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) {
+        let tab = Some(TabDef { icon, fields: Vec::new() });
+        self.parts.viewers.push((ty.to_string(), ViewDef { name: name.to_string(), make: Arc::new(make), tab }));
     }
 
-    /// Add a tab to the inspector of a kind of an extension this one depends on.
-    pub fn add_inspector_tab(&mut self, kind: &str, name: &str, icon: Icon, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) {
-        let tab = TabDef { icon, fields: Vec::new() };
-        self.parts.tabs.push((kind.to_string(), ViewDef { name: name.to_string(), make: Arc::new(make), tab: Some(tab) }));
+    /// A viewer as a component declared it.
+    pub fn viewer_def(&mut self, ty: &str, view: ViewDef) {
+        self.parts.viewers.push((ty.to_string(), view));
     }
 
-    /// A tab as a component's registration describes it.
-    pub fn add_inspector_tab_def(&mut self, kind: &str, view: ViewDef) {
-        self.parts.tabs.push((kind.to_string(), view));
-    }
-
-    /// Give a kind of an extension this one depends on the stack its nodes have where their bundles state none: a form
-    /// of the kind knows what a node of it is made of, as the kind need not. The first given holds.
-    pub fn add_stack(&mut self, kind: &str, stack: &str) {
-        self.parts.stacks.push((kind.to_string(), stack.to_string()));
-    }
-
-    /// Files of a name (`*.mp4`) replace what an asset of a kind is made of: the stack it then has (TOML), the file written
-    /// `{file}`.
-    pub fn add_recipe(&mut self, kind: &str, pattern: &str, stack: &str) {
-        self.parts.recipes.push(Recipe { kind: kind.to_string(), pattern: pattern.to_string(), stack: stack.to_string() });
+    /// A way to make a node of a type: `stack`, stamped into it, `{file}` standing for its file.
+    pub fn template(&mut self, name: &str, node_type: &str, stack: &str) -> TemplateBuilder<'_> {
+        let def = TemplateDef { name: name.to_string(), label: name.to_string(), node_type: node_type.to_string(), files: vec![], stack: stack.to_string() };
+        TemplateBuilder { registry: self, def: Some(def) }
     }
 
     /// A command among the editor's: a label, and a tool of this extension it runs with no arguments. It can be bound to a
@@ -1069,13 +1025,61 @@ impl Registry {
     }
 }
 
-pub struct KindBuilder<'a> {
+/// A way to make a node, being registered.
+pub struct TemplateBuilder<'a> {
     registry: &'a mut Registry,
-    def: KindDef,
+    def: Option<TemplateDef>,
 }
 
-impl KindBuilder<'_> {
-    /// Also read where a declaration names it bare: for a built-in's kinds, which declarations named before names were
+impl TemplateBuilder<'_> {
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Self {
+        if let Some(def) = &mut self.def {
+            def.label = label.to_string();
+        }
+        self
+    }
+
+    /// The files it takes, by name (`*.mp4`).
+    #[must_use]
+    pub fn files(mut self, patterns: &[&str]) -> Self {
+        if let Some(def) = &mut self.def {
+            def.files = patterns.iter().map(|pattern| (*pattern).to_string()).collect();
+        }
+        self
+    }
+}
+
+impl Drop for TemplateBuilder<'_> {
+    fn drop(&mut self) {
+        if let Some(def) = self.def.take() {
+            self.registry.parts.templates.push(def);
+        }
+    }
+}
+
+/// What is said of a type, by what registers it or by an extension adding to it (`Registry::extend`).
+pub struct TypeBuilder<'a> {
+    registry: &'a mut Registry,
+    def: TypeDef,
+}
+
+impl TypeBuilder<'_> {
+    /// A node of it holds only what is set on it: there is an operation of its name, making those settings, of this type.
+    #[must_use]
+    pub fn data(mut self) -> Self {
+        self.def.data = true;
+        self
+    }
+
+    /// A node making a value of this type, by its qualified name, is of this type.
+    #[must_use]
+    pub fn of(mut self, value: &str) -> Self {
+        self.def.values.push(value.to_string());
+        self
+    }
+
+    /// Also read where a declaration names it bare: for a built-in's types, which declarations named before names were
     /// qualified.
     #[must_use]
     pub fn alias(mut self, alias: &str) -> Self {
@@ -1107,7 +1111,7 @@ impl KindBuilder<'_> {
         self
     }
 
-    /// A view drawn in the inspector, after the property sheet: what the kind's custom fields hold.
+    /// A view drawn in the inspector, after the property sheet: what the type's custom fields hold.
     #[must_use]
     pub fn inspector(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
         self.def.inspector.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
@@ -1175,46 +1179,7 @@ impl KindBuilder<'_> {
         self
     }
 
-    /// An output every node of the kind has: `name` (`stream`, `picture`) made by the operation `op` (as its
-    /// registration named it) from the node's stack's result, kept as `retain` says - a family where the operation
-    /// has a parameter, each member addressed by a value of it (`picture/night`).
-    #[must_use]
-    pub fn output(self, name: &str, op: &Name, retain: Retain) -> Self {
-        self.output_described(name, &op.to_string(), retain)
-    }
-
-    /// An output as described where names cross as text (its operation qualified).
-    #[must_use]
-    pub fn output_described(mut self, name: &str, op: &str, retain: Retain) -> Self {
-        self.def.outputs.push(OutputDef { name: name.to_string(), op: op.to_string(), retain, members: None, from: None });
-        self
-    }
-
-    /// The members of the family the last output is: each by a value of its operation's parameter, with a label.
-    #[must_use]
-    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) -> Self {
-        self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect())
-    }
-
-    /// The members of a family as described where values cross as text.
-    #[must_use]
-    pub fn members_described(mut self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) -> Self {
-        if let Some(output) = self.def.outputs.last_mut() {
-            output.members = Some(Arc::new(members));
-        }
-        self
-    }
-
-    /// The last output is made from another output of the kind, not its nodes' result.
-    #[must_use]
-    pub fn from(mut self, output: &str) -> Self {
-        if let Some(last) = self.def.outputs.last_mut() {
-            last.from = Some(output.to_string());
-        }
-        self
-    }
-
-    /// The stack a node of the kind has where its bundle states none, as `[[stack]]` tables: extraction writes it.
+    /// The stack a node of the type has where its bundle states none, as `[[stack]]` tables: extraction writes it.
     #[must_use]
     pub fn stack(mut self, toml: &str) -> Self {
         self.def.stack = Some(toml.to_string());
@@ -1239,27 +1204,6 @@ impl KindBuilder<'_> {
     #[must_use]
     pub fn part_sheet(mut self, sheet: impl Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync + 'static) -> Self {
         self.def.part_sheet = Some(Arc::new(sheet));
-        self
-    }
-
-    /// Register it; its name.
-    #[expect(clippy::must_use_candidate, reason = "a kind's name is seldom needed")]
-    pub fn register(self) -> Name {
-        let name = self.def.name.clone();
-        self.registry.parts.kinds.push(self.def);
-        name
-    }
-}
-
-pub struct TypeBuilder<'a> {
-    registry: &'a mut Registry,
-    def: TypeDef,
-}
-
-impl TypeBuilder<'_> {
-    #[must_use]
-    pub fn label(mut self, label: &str) -> Self {
-        self.def.label = label.to_string();
         self
     }
 
@@ -1328,6 +1272,67 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     #[must_use]
     pub fn input<T: ValueType>(mut self, name: &str) -> Self {
         self.def.inputs.push(Port { name: name.to_string(), ty: T::ty(), many: false });
+        self
+    }
+
+    /// Another output, by its name, after the first: made with `Call::make` as it runs.
+    #[must_use]
+    pub fn also<T: ValueType>(mut self, name: &str) -> Self {
+        self.def.also.push((name.to_string(), T::ty()));
+        self
+    }
+
+    /// Another output as described where types cross as text.
+    #[must_use]
+    pub fn also_described(mut self, name: &str, ty: &str) -> Self {
+        let ty = self.parse(ty);
+        self.def.also.push((name.to_string(), ty));
+        self
+    }
+
+    /// A required input taking any of these types, by their qualified names.
+    #[must_use]
+    pub fn takes(mut self, name: &str, types: &[&str]) -> Self {
+        let mut any: Vec<Type> = types.iter().map(|ty| Type::Named((*ty).to_string())).collect();
+        let ty = if any.len() == 1 { any.remove(0) } else { Type::Union(any) };
+        self.def.inputs.push(Port { name: name.to_string(), ty, many: false });
+        self
+    }
+
+    /// A conversion: whoever asks a node making what this takes for this name has this make it, transient unless `keeps`
+    /// says otherwise. What a node itself offers is no conversion: it is in its stack.
+    #[must_use]
+    pub fn provides(mut self, name: &str) -> Self {
+        self.def.provides = Some(Provides { name: name.to_string(), retain: Retain::Transient });
+        self
+    }
+
+    /// How what it provides is kept.
+    #[must_use]
+    pub fn keeps(mut self, retain: Retain) -> Self {
+        if let Some(provides) = &mut self.def.provides {
+            provides.retain = retain;
+        }
+        self
+    }
+
+    /// The members of the family it makes: each by a value of its parameter, with a label.
+    #[must_use]
+    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) -> Self {
+        self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect())
+    }
+
+    /// The members of a family as described where values cross as text.
+    #[must_use]
+    pub fn members_described(mut self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) -> Self {
+        self.def.members = Some(Arc::new(members));
+        self
+    }
+
+    /// What it offers as a component declared it.
+    #[must_use]
+    pub fn provides_def(mut self, provides: Provides) -> Self {
+        self.def.provides = Some(provides);
         self
     }
 
@@ -1469,18 +1474,40 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
         self
     }
 
-    /// Its parameter as described where it crosses as text: its name and the kind of value it takes.
+    /// Its parameter as described where it crosses as text: its name and the type of value it takes.
     #[must_use]
-    pub fn parameter_described(mut self, name: &str, kind: &str) -> Self {
-        self.def.parameter = Some((name.to_string(), kind.to_string()));
+    pub fn parameter_described(mut self, name: &str, node_type: &str) -> Self {
+        self.def.parameter = Some((name.to_string(), node_type.to_string()));
         self
     }
 
-    /// What it does - given its call, a value of what it makes - registered with it; its name, which a kind's
+    /// What it does - given its call, a value of what it makes - registered with it; its name, which a type's
     /// outputs and an inverse name it by.
     pub fn run(mut self, run: impl Fn(&mut Call<'_>) -> Result<Out::Value> + Send + Sync + 'static) -> Name {
         self.constrain();
-        self.def.run = Arc::new(move |call| run(call).map(Out::encode));
+        let also: Vec<String> = self.def.also.iter().map(|(name, _)| name.clone()).collect();
+        self.def.run = Arc::new(move |call| {
+            let first = run(call).map(Out::encode)?;
+            if also.is_empty() {
+                return Ok(first);
+            }
+            let mut made = call.made.take();
+            let mut rest = Vec::with_capacity(also.len() + 1);
+            rest.push(first);
+            for name in &also {
+                rest.push(made.remove(name).ok_or_else(|| crate::anyhow!("it made no {name}"))?);
+            }
+            Ok(crate::Data::List(rest))
+        });
+        let name = self.def.name.clone();
+        self.registry.parts.ops.push(self.def);
+        name
+    }
+
+    /// Register what a component runs: it makes what it makes, several outputs already a list of them.
+    pub fn run_described(mut self, run: impl Fn(&mut Call<'_>) -> Result<crate::Data> + Send + Sync + 'static) -> Name {
+        self.constrain();
+        self.def.run = Arc::new(run);
         let name = self.def.name.clone();
         self.registry.parts.ops.push(self.def);
         name

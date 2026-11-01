@@ -2,27 +2,14 @@
 //! these (`Tokenizer::target`). What is read of other nodes is read through their `settings` and their outputs, so what is
 //! made follows what it reached, and nothing here is a node's output of its own: a model is just a model.
 
-use pe2_ext::ty::Any;
 use pe2_ext::tokens::{Args, Yields};
-use pe2_ext::{Call, Data, Registry, Result, Table, Value, anyhow, bail, ty};
+use pe2_ext::{Call, Data, Registry, Result, Table, Value, anyhow, bail};
 use pe2_model::material;
 use pe2_model::mesh;
 use pe2_model::model::{Arrays, Binding, Model, arrays};
 use pe2_model::skeleton;
 
 pub const SETTINGS: &str = "settings";
-
-/// A node's settings, with what its stack derived in their places.
-fn resolved(call: &mut Call) -> Result<Table> {
-    let given = call.take::<Any>(0)?;
-    let derived = if let Data::Typed(typed) = &given { typed.settings.clone() } else { Table::new() };
-    Ok(pe2_ext::merged(call.host.fields(), &derived))
-}
-
-#[expect(clippy::unnecessary_wraps, reason = "an operation may fail; this one does not")]
-fn plain(call: &mut Call) -> Result<Table> {
-    Ok(call.host.fields().clone())
-}
 
 /// Where a placement (`slot`, `at`) puts what it holds, in VRAM halfwords.
 fn placed(call: &Call, placement: &Value) -> Option<[i64; 2]> {
@@ -41,29 +28,57 @@ fn binding_of(call: &Call, fields: &Table) -> Result<Binding> {
     })
 }
 
-/// A mesh at rest on its skeleton, and the names of its slots.
-fn rested(call: &Call, reference: &str) -> Result<(Model, Vec<String>)> {
+/// A mesh at rest on its skeleton, the joints a prefab moves where it moves them, and the names of its slots.
+fn rested(call: &Call, reference: &str, pose: Option<&Value>) -> Result<(Model, Vec<String>)> {
     let Data::Typed(stored) = call.output_of(reference, "native")? else { bail!("{reference}: its output is no mesh") };
     let (mut model, slots) = mesh::read(&String::from_utf8(call.read(stored.file()?)?)?)?;
     if let Some(named) = call.table_of(reference, SETTINGS)?.get("skeleton").and_then(pe2_ext::target_of) {
         let table = call.table_of(named, SETTINGS)?;
-        mesh::pose(&mut model, &skeleton::parse(table.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice))?)?;
+        let joints = skeleton::parse(table.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice))?;
+        mesh::pose(&mut model, &joints)?;
+        for (part, joint) in model.parts.iter_mut().zip(&joints) {
+            if let Some(pose) = pose.and_then(|pose| pose.get(&joint.name)) {
+                skeleton::posed(part, pose);
+            }
+        }
     }
     Ok((model, slots))
 }
 
-fn model_of(call: &Call) -> Result<(Model, Vec<Binding>)> {
-    let fields = call.host.fields();
+/// A model's arrays' input: a model's settings, with what holds it over them where a prefab does.
+fn model_as(call: &Call, fields: &Table, fill: Option<&Value>, pose: Option<&Value>) -> Result<(Model, Vec<Binding>)> {
     let reference = fields.get("mesh").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("it names no mesh"))?;
-    let (model, slots) = rested(call, reference)?;
+    let (mut model, slots) = rested(call, reference, pose)?;
+    if let (Some(fill), Some(root)) = (fill, model.parts.first_mut()) {
+        skeleton::held(root, fill);
+    }
     let materials = fields.get("materials");
     let mut bindings = Vec::with_capacity(slots.len());
     for slot in &slots {
-        let filled = materials.and_then(|materials| materials.get(slot)).and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
-        let settings = call.table_of(filled, SETTINGS)?;
+        let overrides = fill.and_then(|fill| fill.get("overrides")?.get(slot));
+        let named = overrides.and_then(|overrides| overrides.get("material")).or_else(|| materials.and_then(|materials| materials.get(slot)));
+        let filled = named.and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
+        let mut settings = call.table_of(filled, SETTINGS)?;
+        for (key, value) in overrides.and_then(Value::as_table).into_iter().flatten().filter(|(key, _)| *key != "material") {
+            settings.insert(key.clone(), value.clone());
+        }
         bindings.push(binding_of(call, &settings).map_err(|why| anyhow!("{slot}: {why:#}"))?);
     }
     Ok((model, bindings))
+}
+
+fn model_of(call: &Call) -> Result<(Model, Vec<Binding>)> {
+    model_as(call, &call.given(), None, None)
+}
+
+/// What a member of a prefab's group fills a part with, as the prefab holds it: `member` is its address.
+fn member_of(call: &Call, args: &Args) -> Result<(Model, Vec<Binding>)> {
+    let member = args.one("member")?;
+    let fields = call.given();
+    let fill = member.split('/').fold(fields.get("groups"), |at, step| at?.get(step));
+    let fill = fill.ok_or_else(|| anyhow!("it has no member {member}"))?;
+    let model = fill.get("model").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{member} holds no model"))?;
+    model_as(call, &call.table_of(model, SETTINGS)?, Some(fill), fields.get("pose"))
 }
 
 /// Plain data as what goes between braces: an array in braces, a number as itself, a text as tokens. The largest words read as
@@ -129,19 +144,34 @@ fn model_seam(call: &Call, _: &Args) -> Result<String> {
     Ok(arrays(&model, &bindings)?.seam.to_string())
 }
 
+fn member_whole(call: &Call, args: &Args) -> Result<String> {
+    let (model, bindings) = member_of(call, args)?;
+    Ok(definition(args.one("symbol")?, &arrays(&model, &bindings)?))
+}
+
+fn member_buffer(call: &Call, args: &Args) -> Result<String> {
+    let (model, bindings) = member_of(call, args)?;
+    Ok(arrays(&model, &bindings)?.buffer.to_string())
+}
+
+fn member_seam(call: &Call, args: &Args) -> Result<String> {
+    let (model, bindings) = member_of(call, args)?;
+    Ok(arrays(&model, &bindings)?.seam.to_string())
+}
+
 fn material_tpage(call: &Call, _: &Args) -> Result<String> {
-    let binding = binding_of(call, call.host.fields())?;
+    let binding = binding_of(call, &call.given())?;
     binding.tpage().map(|page| format!("{page:#X}")).ok_or_else(|| anyhow!("it has no texture"))
 }
 
 fn material_clut(call: &Call, _: &Args) -> Result<String> {
-    let binding = binding_of(call, call.host.fields())?;
+    let binding = binding_of(call, &call.given())?;
     binding.texture.map(|texture| format!("{:#X}", texture.clut())).ok_or_else(|| anyhow!("it has no texture"))
 }
 
 /// An image's texels, as the words of a C array.
 fn image_words(call: &Call, _: &Args) -> Result<String> {
-    let Data::Typed(native) = call.output_of(call.host.path(), "native")? else { bail!("its output is no image") };
+    let Some(Data::Typed(native)) = call.inputs.first().and_then(|port| port.first()) else { bail!("it is given no image") };
     let texels = native.files.iter().find(|file| file.name == "native.texels").ok_or_else(|| anyhow!("it has no texels"))?;
     let bytes = call.read(texels)?;
     let (words, rest) = bytes.as_chunks::<4>();
@@ -152,14 +182,14 @@ fn image_words(call: &Call, _: &Args) -> Result<String> {
 }
 
 fn image_size(call: &Call) -> Result<[i64; 2]> {
-    let settings = call.table_of(call.host.path(), SETTINGS)?;
+    let settings = call.given();
     let pair = settings.get("size").and_then(Value::as_array).ok_or_else(|| anyhow!("it has no size"))?;
     let side = |at: usize| pair.get(at).and_then(Value::as_integer).ok_or_else(|| anyhow!("its size is no pair"));
     Ok([side(0)?, side(1)?])
 }
 
 fn image_width_words(call: &Call, _: &Args) -> Result<String> {
-    let per = match call.table_of(call.host.path(), SETTINGS)?.get("mode").and_then(Value::as_str) {
+    let per = match call.given().get("mode").and_then(Value::as_str) {
         Some("indexed_4bpp") => 4,
         Some("indexed_8bpp") => 2,
         _ => 1,
@@ -172,28 +202,28 @@ fn image_height(call: &Call, _: &Args) -> Result<String> {
 }
 
 pub fn register(r: &mut Registry) {
-    let resolved = r.op("resolved").label("Its settings, resolved").input::<Any>("result").output::<ty::Table>().run(resolved);
-    let plain = r.op("plain").label("Its settings").output::<ty::Table>().run(plain);
-    r.add_output("pe2.images@image", SETTINGS, &resolved.to_string(), None, pe2_ext::Retain::Transient);
-    for kind in ["pe2.images@vram_slot", "pe2.render@mesh", "pe2.render@skeleton", "pe2.render@material", "pe2.render@model"] {
-        r.add_output(kind, SETTINGS, &plain.to_string(), None, pe2_ext::Retain::Transient);
-    }
-    r.tokenizer("pe2.render@model")
+    r.tokenizer(&["pe2.render@model"])
         .whole(Yields::Definition("TmdSource"), &["symbol"], model_whole)
         .derived("buffer", Yields::IntLiteral, &[], model_buffer)
         .derived("seam", Yields::IntLiteral, &[], model_seam)
         .register();
-    r.tokenizer("pe2.render@material")
+    // A prefab's member is a model, as the prefab holds it.
+    r.tokenizer(&["pe2.render@prefab"])
+        .whole(Yields::Definition("TmdSource"), &["symbol", "member"], member_whole)
+        .derived("buffer", Yields::IntLiteral, &["member"], member_buffer)
+        .derived("seam", Yields::IntLiteral, &["member"], member_seam)
+        .register();
+    r.tokenizer(&["pe2.render@material"])
         .derived("tpage", Yields::IntLiteral, &[], material_tpage)
         .derived("clut", Yields::IntLiteral, &[], material_clut)
         .register();
-    r.tokenizer("pe2.images@image")
+    r.tokenizer(&["pe2.images@texels", "pe2.images@bs_picture"])
         .whole(Yields::BraceInit, &[], image_words)
         .derived("width_words", Yields::IntLiteral, &[], image_width_words)
         .derived("height", Yields::IntLiteral, &[], image_height)
         .register();
-    for kind in ["pe2.render@model", "pe2.render@material", "pe2.images@image"] {
-        r.add_inspector_tab(kind, "Tokens", pe2_ext::Icon::Text, |_| Box::new(crate::views::Tokens::default()));
+    for node_type in ["pe2.render@model", "pe2.render@material", "pe2.images@image"] {
+        let _ = r.extend(node_type).inspector_tab("Tokens", pe2_ext::Icon::Text, &[], |_| Box::new(crate::views::Tokens::default())).register();
     }
 }
 

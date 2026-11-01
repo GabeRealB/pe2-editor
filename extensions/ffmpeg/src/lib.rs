@@ -108,6 +108,9 @@ fn register(r: &mut Registry) -> Result<()> {
         .input::<ty::Stream<ty::Playback>>("frames")
         .output::<ty::File<Video>>()
         .parameter::<String>("encoding")
+        .provides("video")
+        .keeps(pe2_ext::Retain::Cache)
+        .members(|_| vec![("lossless".to_string(), "Lossless".to_string())])
         .run(|call| {
             let encoding = Encoding::parse(&call.parameter::<String>()?)?;
             let stream = call.take::<ty::Stream<ty::Playback>>(0)?;

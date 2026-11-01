@@ -1,5 +1,5 @@
-//! The contents pane: the tree inside what is shown, as Blender's outliner. For an asset that is what its kind says, its parts
-//! unless it says more, then its stack, its layers and a graph layer's operations. A kind has most of the pane: its rows' names,
+//! The contents pane: the tree inside what is shown, as Blender's outliner. For an asset that is what its type says, its parts
+//! unless it says more, then its stack, its layers and a graph layer's operations. A type has most of the pane: its rows' names,
 //! icons and pictures, how they fold, what they offer and what comes of dragging them, views at the head of the pane for what rows
 //! cannot say, and whether the stack shows at all. Selecting a row is selecting it everywhere (`Workspace::inner`).
 
@@ -119,7 +119,7 @@ fn row_buttons(ui: &mut egui::Ui, row: &ContentRow, editable: bool, ask: &mut Op
     }
 }
 
-/// A row's menu: renaming it, and what its kind offers there.
+/// A row's menu: renaming it, and what its type offers there.
 fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Option<ContentRequest>) {
     if row.rename && ui.button("Rename").clicked() {
         *rename = true;
@@ -135,10 +135,10 @@ fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Op
 }
 
 /// What a drop on a row would do, for the place of it the pointer is over.
-fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, index: &project::index::Index) -> Result<String, String> {
+fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, ws: &Workspace) -> Result<String, String> {
     if let Dragged::Asset(path) = dragged {
-        let kind = index.assets.get(path).and_then(|asset| asset.kind.as_deref()).map(|kind| kind.rsplit('@').next().unwrap_or(kind));
-        let taken = kind.is_some_and(|kind| row.takes.iter().any(|takes| takes.strip_prefix("asset:") == Some(kind)));
+        let node_type = ws.index.assets.get(path).and_then(|asset| ws.extensions.type_label(asset));
+        let taken = node_type.is_some_and(|node_type| row.takes.iter().any(|takes| takes.strip_prefix("asset:") == Some(node_type)));
         return if taken { Ok(format!("Attach it to {}", row.label)) } else { Err(format!("{} does not take it", row.label)) };
     }
     let Dragged::Row { asset, id, what, .. } = dragged else { return Err("Only what is inside it goes here".to_string()) };
@@ -158,7 +158,7 @@ fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, inde
 }
 
 /// A row as a place to drop on: its top and foot where it reorders, the rest where it takes something.
-fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, index: &project::index::Index, ask: &mut Option<ContentRequest>) {
+fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ws: &Workspace, ask: &mut Option<ContentRequest>) {
     let (reorders, holds) = (row.drag.as_ref().is_some_and(|drag| drag.reorders), !row.takes.is_empty());
     let edge = rect.height() / if holds { 3.0 } else { 2.0 };
     let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + edge));
@@ -171,7 +171,7 @@ fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, index
         (false, false) => vec![],
     };
     for (rect, place) in places {
-        match dnd::target(ui, rect, |dragged| says(row, of, dragged, place, index)) {
+        match dnd::target(ui, rect, |dragged| says(row, of, dragged, place, ws)) {
             Some(Dragged::Row { id, .. }) => *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place }),
             Some(Dragged::Asset(asset)) => *ask = Some(ContentRequest::Dropped { row: row.id.clone(), asset }),
             _ => {}
@@ -218,7 +218,7 @@ fn rename_ui(ui: &mut egui::Ui, ws: &mut Workspace, row: &ContentRow, ask: &mut 
     }
 }
 
-/// The rows a kind says are inside its asset, and what was asked of them.
+/// The rows a type says are inside its asset, and what was asked of them.
 fn rows_ui(
     ui: &mut egui::Ui,
     ws: &mut Workspace,
@@ -298,7 +298,7 @@ fn rows_ui(
             ws.content_rename = Some((asset.path.clone(), row.id.clone(), row.label.clone()));
         }
         if editable {
-            row_target(ui, inner_row.response.rect, row, &asset.path, &ws.index, &mut ask);
+            row_target(ui, inner_row.response.rect, row, &asset.path, ws, &mut ask);
         }
     }
     if let Some((inner, look)) = chosen {

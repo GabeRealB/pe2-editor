@@ -33,9 +33,9 @@ struct FindArgs {
     /// Text the asset's path contains (case-insensitive).
     #[serde(default)]
     text: Option<String>,
-    /// Only assets of this kind (`image`, `file`, `folder`, `vram_slot`, ...).
-    #[serde(default)]
-    kind: Option<String>,
+    /// Only assets of this type (`image`, `file`, `folder`, `vram_slot`, ...).
+    #[serde(default, rename = "type")]
+    node_type: Option<String>,
     /// Only assets under this folder (`stages/akropolis`).
     #[serde(default)]
     under: Option<String>,
@@ -183,19 +183,19 @@ fn own() -> Vec<Tool> {
         ),
         tool::<FindArgs>(
             "find_assets",
-            "Find assets by text in their path, kind or folder. Returns each one's path, uid and kind, \
+            "Find assets by text in their path, type or folder. Returns each one's path, uid and type, \
              and how many matched in all.",
         ),
         tool::<FolderArgs>(
             "list_folder",
-            "The entries of a folder of the resolved project: its folders, its assets (with their kinds) and its \
+            "The entries of a folder of the resolved project: its folders, its assets (with their types) and its \
              plain files.",
         ),
         tool::<AssetArgs>(
             "get_asset",
-            "An asset as resolved: path, uid, kind, the layers creating and overriding it, its files (size, \
+            "An asset as resolved: path, uid, type, the layers creating and overriding it, its files (size, \
              sha1, layer, the operation that made it), its looks where it has a picture, its outputs (what its stack \
-             and its kind make of it, each read with get_output), its import and the imports that fit its source, \
+             and its type make of it, each read with get_output), its import and the imports that fit its source, \
              and its declaration (node.toml) as written - with the settings as resolved where its import derives \
              some from its source - and its addresses (what references name after a `#`\
              is made of).",
@@ -280,8 +280,8 @@ fn own() -> Vec<Tool> {
 pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> CallToolResult {
     let result = match name {
         "project" => Ok(project(view)),
-        "find_assets" => parse(arguments).map(|a| find_assets(view.index, &a)),
-        "list_folder" => parse(arguments).map(|a: FolderArgs| list_folder(view.index, a.path.as_deref())),
+        "find_assets" => parse(arguments).map(|a| find_assets(view.index, view.extensions, &a)),
+        "list_folder" => parse(arguments).map(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref())),
         "get_asset" => parse(arguments).and_then(|a: AssetArgs| get_asset(view.index, view.extensions, &a.asset)),
         "references" => parse(arguments).and_then(|a: AssetArgs| references(view.index, &a.asset)),
         "problems" => parse(arguments).map(|a: ProblemsArgs| problems(view.index, a.limit.unwrap_or(100))),
@@ -345,8 +345,8 @@ fn asset<'a>(index: &'a Index, name: &str) -> Result<&'a Asset, String> {
     })
 }
 
-fn summary(asset: &Asset) -> Value {
-    json!({ "path": asset.path, "uid": asset.uid, "kind": asset.kind,  })
+fn summary(extensions: &Extensions, asset: &Asset) -> Value {
+    json!({ "path": asset.path, "uid": asset.uid, "type": extensions.type_name(asset) })
 }
 
 fn project(view: &View) -> Value {
@@ -358,13 +358,13 @@ fn project(view: &View) -> Value {
         .zip(&view.project.layers)
         .map(|(info, layer)| {
             let path = layer.path.strip_prefix(root).unwrap_or(&layer.path);
-            let kind = match info.kind {
+            let holds = match info.kind {
                 project::LayerKind::Assets => "assets",
                 project::LayerKind::Files => "files",
             };
             json!({
                 "name": info.name,
-                "kind": kind,
+                "kind": holds,
                 "mounted_at": (!info.at.is_empty()).then_some(&info.at),
                 "path": path.display().to_string(),
                 "read_only": info.read_only,
@@ -385,7 +385,12 @@ fn project(view: &View) -> Value {
     })
 }
 
-fn find_assets(index: &Index, args: &FindArgs) -> Value {
+/// Whether an asset is of a type, named qualified or by its own name alone.
+fn is_of(extensions: &Extensions, asset: &Asset, wanted: &str) -> bool {
+    extensions.node_types_of(asset).iter().any(|known| known.name.to_string() == wanted || known.name.local() == wanted)
+}
+
+fn find_assets(index: &Index, extensions: &Extensions, args: &FindArgs) -> Value {
     let text = args.text.as_deref().map(str::to_lowercase);
     let under = args.under.as_deref().map(|u| format!("{}/", u.trim_end_matches('/')));
     let matches: Vec<&Asset> = index
@@ -393,15 +398,15 @@ fn find_assets(index: &Index, args: &FindArgs) -> Value {
         .values()
         .map(|a| &**a)
         .filter(|a| text.as_ref().is_none_or(|t| a.path.to_lowercase().contains(t.as_str())))
-        .filter(|a| args.kind.is_none() || a.kind == args.kind)
+        .filter(|a| args.node_type.as_ref().is_none_or(|wanted| is_of(extensions, a, wanted)))
         .filter(|a| under.as_ref().is_none_or(|u| a.path.starts_with(u.as_str())))
         .collect();
     let (offset, limit) = (args.offset.unwrap_or(0), args.limit.unwrap_or(50).min(500));
-    let page: Vec<Value> = matches.iter().skip(offset).take(limit).map(|a| summary(a)).collect();
+    let page: Vec<Value> = matches.iter().skip(offset).take(limit).map(|a| summary(extensions, a)).collect();
     json!({ "total": matches.len(), "offset": offset, "assets": page })
 }
 
-fn list_folder(index: &Index, path: Option<&str>) -> Value {
+fn list_folder(index: &Index, extensions: &Extensions, path: Option<&str>) -> Value {
     let path = path.unwrap_or_default().trim_matches('/');
     let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
     let (mut folders, mut assets, mut files) = (vec![], vec![], vec![]);
@@ -416,7 +421,7 @@ fn list_folder(index: &Index, path: Option<&str>) -> Value {
             Kind::Asset => {
                 let resolved = key.strip_suffix(project::index::BUNDLE_SUFFIX).unwrap_or(key);
                 if let Some(asset) = index.assets.get(resolved) {
-                    assets.push(summary(asset));
+                    assets.push(summary(extensions, asset));
                 }
             }
         }
@@ -431,7 +436,7 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
         .iter()
         .map(|f| json!({ "name": f.name, "size": f.size, "sha1": f.sha1, "layer": f.layer, "made_by": f.made_by }))
         .collect();
-    let mut out = summary(asset);
+    let mut out = summary(extensions, asset);
     let fields = out.as_object_mut().expect("an object");
     fields.insert("layers".into(), json!(asset.layers));
     fields.insert("files".into(), json!(files));
@@ -439,7 +444,7 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
         fields.insert("looks".into(), json!(extensions.looks(asset)));
         fields.insert("has_picture".into(), json!(true));
     }
-    // What it makes: its stack's outputs and its kind's, each with how it is kept.
+    // What it makes: its stack's outputs and its type's, each with how it is kept.
     let (plan, wrong) = extensions.plan(asset);
     let outputs: Vec<Value> = plan
         .outputs
@@ -665,7 +670,7 @@ const NO_EDITOR: &str = "the editor does not have the project open";
 fn editor_selection(view: &View) -> Result<Value, String> {
     let editor = view.editor.as_ref().ok_or(NO_EDITOR)?;
     let asset = editor.selection.as_deref().and_then(|s| view.index.assets.get(s)).map(|a| &**a);
-    Ok(json!({ "selected": asset.map(summary), "look": editor.variant }))
+    Ok(json!({ "selected": asset.map(|asset| summary(view.extensions, asset)), "look": editor.variant }))
 }
 
 fn editor_show(view: &mut View, name: &str) -> Result<Value, String> {

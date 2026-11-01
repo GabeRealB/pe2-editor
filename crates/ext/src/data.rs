@@ -1,5 +1,5 @@
 //! The work graph as an extension sees it: values and their types, the operations it registers, and the outputs its
-//! kinds declare.
+//! types declare.
 //!
 //! Every value carries its type. The host's own types it shows itself - an RGBA image, a table, PCM audio, a list,
 //! `bytes` (what nothing recognizes) - and an extension's types are named (`pe2.images@indexed`) and opaque to the
@@ -363,6 +363,17 @@ impl PartialEq for StreamInput {
 }
 
 impl Value {
+    /// What comes with it: for a value of an extension's type, what was set on the layers it came through and what they
+    /// derived; for a table, what it holds.
+    #[must_use]
+    pub fn settings(&self) -> Option<&Table> {
+        match self {
+            Value::Typed(typed) => Some(&typed.settings),
+            Value::Table(table) => Some(table),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn ty(&self) -> Type {
         match self {
@@ -421,10 +432,8 @@ pub enum Retain {
 pub trait CallHost {
     /// Its node's path.
     fn path(&self) -> &str;
-    /// Its node's kind, qualified.
-    fn kind(&self) -> Option<&str>;
-    /// Its node's settings, as declared: recorded as read.
-    fn fields(&self) -> &Table;
+    /// Its node's type, qualified.
+    fn node_type(&self) -> Option<&str>;
     /// A content, whole.
     ///
     /// # Errors
@@ -473,12 +482,12 @@ pub trait CallHost {
     fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
         bail!("{}: {path}: no project to read here", self.path())
     }
-    /// The assets of a kind, each by its path with its declaration as written; recorded as read.
+    /// The assets of a type, each by its path with its declaration as written; recorded as read.
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
-        bail!("{}: {kind}: no project to look in here", self.path())
+    fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+        bail!("{}: {node_type}: no project to look in here", self.path())
     }
     /// Where a file or folder of the project is on disk, followed through links; none where it has no such place.
     fn place(&self, path: &str) -> Option<String> {
@@ -492,6 +501,11 @@ pub trait CallHost {
     fn output_of(&self, path: &str, address: &str) -> Result<Value> {
         bail!("{path}: {address}: no project to look in here")
     }
+    /// The node a reference names.
+    fn node_named(&self, reference: &str) -> Option<NodeNamed> {
+        let _ = reference;
+        None
+    }
     /// The config being built; recorded as read, so what reads it is made again for another.
     fn build_config(&self) -> Option<BuildConfig> {
         None
@@ -501,6 +515,15 @@ pub trait CallHost {
         let _ = content;
         None
     }
+}
+
+/// A node as a reference names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeNamed {
+    pub path: String,
+    pub uid: Option<String>,
+    /// What it is, each type qualified: what its stack makes, first what it comes to.
+    pub types: Vec<String>,
 }
 
 /// A file being made: appended to, then finished into its file - its content inline, or a blob the host keeps.
@@ -574,6 +597,10 @@ impl std::io::Write for Writer {
 pub struct Call<'a> {
     pub inputs: Vec<Vec<Value>>,
     pub settings: &'a Table,
+    /// What came with the value given to its first port.
+    pub carried: Table,
+    /// Its outputs after the first, as it makes them (`make`).
+    pub made: std::cell::RefCell<std::collections::BTreeMap<String, Value>>,
     pub parameter_text: Option<&'a str>,
     pub host: &'a dyn CallHost,
 }
@@ -586,6 +613,17 @@ impl Call<'_> {
     pub fn parameter<P: crate::ty::Parameter>(&self) -> Result<P> {
         let text = self.parameter_text.ok_or_else(|| anyhow!("given no parameter"))?;
         P::from_text(text)
+    }
+
+    /// Make one of its outputs after the first.
+    pub fn make(&self, output: &str, value: Value) {
+        self.made.borrow_mut().insert(output.to_string(), value);
+    }
+
+    /// What comes with these inputs: what came with the value given to the first port.
+    #[must_use]
+    pub fn carried_by(inputs: &[Vec<Value>]) -> Table {
+        inputs.first().and_then(|port| port.first()).and_then(Value::settings).cloned().unwrap_or_default()
     }
 
     /// The value given to a port taking one, as its type's (`call.take::<Indexed>(0)`; `ty::Any`, as given).
@@ -647,12 +685,12 @@ impl Call<'_> {
         self.host.read_entry(path)
     }
 
-    /// The assets of a kind, each by its path with its declaration as written; made again when any changes, or one comes or goes.
+    /// The assets of a type, each by its path with its declaration as written; made again when any changes, or one comes or goes.
     ///
     /// # Errors
     /// The project cannot be reached from here.
-    pub fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
-        self.host.assets_of(kind)
+    pub fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+        self.host.assets_of(node_type)
     }
 
     /// Where a file or folder of the project is on disk, followed through links.
@@ -667,6 +705,12 @@ impl Call<'_> {
     /// The project cannot be reached from here, or it could not be made.
     pub fn output_of(&self, path: &str, address: &str) -> Result<Value> {
         self.host.output_of(path, address)
+    }
+
+    /// The node a reference names; none where nothing is so named.
+    #[must_use]
+    pub fn node_named(&self, reference: &str) -> Option<NodeNamed> {
+        self.host.node_named(reference)
     }
 
     /// An output of another asset that is a table.
@@ -703,24 +747,30 @@ impl Call<'_> {
         }
     }
 
-    /// Lend a value of an extension's type as an asset: its files, and the node's settings with what was derived with
-    /// it in their places - what reads an asset reads them.
+    /// Lend a value of an extension's type as an asset: its files, and what came with it, what this layer sets over that.
     #[must_use]
     pub fn lend<'b>(&'b self, typed: &'b Typed) -> Lent<'b> {
-        Lent { host: self.host, files: &typed.files, fields: merged(self.host.fields(), &typed.settings) }
+        Lent { host: self.host, files: &typed.files, fields: merged(&typed.settings, self.settings) }
     }
 
-    /// Lend the node's settings with others in their places - what was derived with a value decoded - as an asset
-    /// of no files.
+    /// Lend what came with a value, what this layer sets over that, as an asset of no files.
     #[must_use]
     pub fn lend_settings(&self, derived: &Table) -> Lent<'_> {
-        Lent { host: self.host, files: &[], fields: merged(self.host.fields(), derived) }
+        Lent { host: self.host, files: &[], fields: merged(derived, self.settings) }
     }
 
-    /// Lend files as an asset, with the node's settings.
+    /// Lend files as an asset, with what the operation is set to.
     #[must_use]
     pub fn lend_files<'b>(&'b self, files: &'b [File]) -> Lent<'b> {
-        Lent { host: self.host, files, fields: self.host.fields().clone() }
+        Lent { host: self.host, files, fields: self.given() }
+    }
+
+    /// What it is set to: what is set on its own layer, over what came with the value given to its first port. A value
+    /// comes with what was set on the layers it came through and what they derived, by name, so an operation reads there
+    /// what an earlier one holds, and what it reads is what it is given.
+    #[must_use]
+    pub fn given(&self) -> Table {
+        merged(&self.carried, self.settings)
     }
 }
 
@@ -747,10 +797,10 @@ pub struct Lent<'a> {
 }
 
 impl<'a> Lent<'a> {
-    /// As an asset of its node's kind.
+    /// As an asset of its node's type.
     #[must_use]
     pub fn asset(&'a self) -> Asset<'a> {
-        Asset::new(self, self.host.kind())
+        Asset::new(self, self.host.node_type())
     }
 
     fn file(&self, name: &str) -> Result<&File> {
@@ -854,11 +904,17 @@ pub struct OpDef {
     pub derives: Vec<String>,
     /// The operation undoing it, qualified: what writes its input from what it makes.
     pub inverse: Option<String>,
-    /// Its parameter - its name, and the kind of value it takes (`name`, `number`) - which makes what reaches it a
+    /// Its parameter - its name, and the type of value it takes (`name`, `number`) - which makes what reaches it a
     /// family: each member addressed by a value of it (`picture/night`).
     pub parameter: Option<(String, String)>,
     /// Which of several operations taking a source is offered first: the highest.
     pub priority: i32,
+    /// What it makes of what it takes for whoever asks by name.
+    pub provides: Option<Provides>,
+    /// The members of what it makes, for a family.
+    pub members: Option<Arc<Members>>,
+    /// Its outputs after the first, by name.
+    pub also: Vec<(String, Type)>,
     pub run: Arc<RunOp>,
     /// For a stream operation (its output a `stream<T>`): how it is opened.
     pub start: Option<Arc<StartStream>>,
@@ -867,17 +923,33 @@ pub struct OpDef {
 /// A family's members: each by the value of its parameter, with a label.
 pub type Members = dyn Fn(&Asset) -> Vec<(String, String)> + Send + Sync;
 
-/// An output a kind declares on every node of it: made by an operation taking the node's stack's result.
+/// What an operation makes of a value of what it takes, for whoever asks a node making one by this name: a conversion, which
+/// no stack holds (`tokens`, a node's `reflection`). What a node itself offers is in its stack, a template writing it there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provides {
+    pub name: String,
+    pub retain: Retain,
+}
+
+/// An output a node has, as what lists a node's outputs reads it.
 #[derive(Clone)]
 pub struct OutputDef {
     pub name: String,
-    /// The operation, qualified: a family where it has a parameter.
+    /// What makes it, qualified: a family where that has a parameter.
     pub op: String,
+    pub ty: Type,
     pub retain: Retain,
-    /// Its members, for a family.
     pub members: Option<Arc<Members>>,
-    /// The output of its kind it is made from; none, its node's result.
+    /// Shown by a viewer of what it is; it takes part in no build.
+    pub preview: bool,
+    /// One of it for each key of this table of a node's, under that key's name; its members are listed `<key>/<member>`.
+    pub each: Option<String>,
+    /// A layer of its stack, not a conversion.
+    pub in_stack: bool,
+    /// The conversion it is made from; none, a step of its stack.
     pub from: Option<String>,
+    /// The step of its stack it is made from.
+    pub step: Option<usize>,
 }
 
 #[cfg(test)]

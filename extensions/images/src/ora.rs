@@ -500,7 +500,6 @@ mod tests {
     fn atlas() -> Lent {
         let fields: Table = toml::from_str(
             r#"
-            kind = "image"
             mode = "indexed_8bpp"
             size = [8, 2]
             palettes.warm = {}

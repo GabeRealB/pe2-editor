@@ -1,11 +1,11 @@
-//! pe2.game: the kinds of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`, `pe2.str`) - the discs and
+//! pe2.game: the types of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`, `pe2.str`) - the discs and
 //! their stages, folders and files, the files grouped, the disc's movie files (`stream`: a list of entries, each a
 //! movie in order, assembled from them; the entries are the outputs the records name), the stages' records of the movies
 //! they play (`movie_slot`: a `StreamSlot`'s fields, naming its movie file's entry) and of their scenes' audio, the
-//! executable, plain text and binary data. Each kind's icon and label, and the fields read in hex: a file's sector
+//! executable, plain text and binary data. Each type's icon and label, and the fields read in hex: a file's sector
 //! length, a scene's sound bank mask.
 
-use pe2_ext::{Asset, Cell, ContentRow, Contents, Field, Icon, Project, Registry, Result, Retain, Style, Table, Tint, Ui, Value, View, ty};
+use pe2_ext::{Asset, Cell, ContentRow, Contents, Field, Icon, Project, Registry, Result, Style, Table, Tint, Ui, Value, View, ty};
 
 pe2_ext::extension!("pe2.game", "0.1.0", register);
 
@@ -14,8 +14,15 @@ fn hex(value: &Value) -> Option<String> {
     Some(format!("0x{:X}", value.as_integer()?))
 }
 
+/// A file as the disc stores it.
+const STORED: &str = "[[stack]]\nop = \"file\"\nfile = \"{file}\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
+
 /// A movie file's stack: its entries' movies, joined in order - the file as the disc stores it.
 const STREAM: &str = r#"[[stack]]
+id = "file"
+op = "pe2.game@stream"
+
+[[stack]]
 op = "references"
 field = "entries"
 key = "movie"
@@ -29,52 +36,75 @@ name = "native.str"
 op = "output"
 name = "native"
 retain = "cache"
+
+[[stack]]
+op = "pe2.game@entry"
+file = { from = "file" }
+
+[[stack]]
+op = "output"
+name = "entries"
 "#;
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    let kinds = [
+    let held = [
         ("disc", "Disc", Icon::Disc, Tint::Structure),
         ("stage", "Stage", Icon::Stack, Tint::Structure),
         ("folder", "Folder", Icon::Folder, Tint::Structure),
         ("file_group", "File group", Icon::Grid, Tint::Structure),
         ("movie_slot", "Movie slot", Icon::Film, Tint::Motion),
-        ("executable", "Executable", Icon::Terminal, Tint::Code),
-        ("text", "Text", Icon::Text, Tint::Plain),
-        ("binary", "Binary data", Icon::Binary, Tint::Plain),
     ];
-    for (name, label, icon, tint) in kinds {
-        r.kind(name).alias(name).label(label).icon(icon, tint).register();
+    for (name, label, icon, tint) in held {
+        r.named_type(name).alias(name).label(label).icon(icon, tint).data().register();
     }
-    r.kind("file")
+    // What the disc stores as files of their own, known by their names.
+    let stored = [
+        ("executable", "Executable", Icon::Terminal, Tint::Code, "exe", "*.exe"),
+        ("text", "Text", Icon::Text, Tint::Plain, "cnf", "*.cnf"),
+        ("binary", "Binary data", Icon::Binary, Tint::Plain, "bin", "*.bin"),
+    ];
+    for (name, label, icon, tint, value, pattern) in stored {
+        let value = r.named_type(value).label(label).named(pattern).register();
+        r.named_type(name).alias(name).label(label).icon(icon, tint).of(&value.to_string()).stack(STORED).register();
+    }
+    r.named_type("file")
         .alias("file")
         .label("File")
         .icon(Icon::File, Tint::Structure)
+        .data()
         .field(Field::new("sector_len").label("Sector length").format(hex))
         .register();
     // A disc's movie file: a list of entries, each a movie in order, which the stages' records name.
-    let entry = r.op("entry").label("A movie file's entry").output::<ty::Table>().parameter::<String>("id").run(|call| {
+    let _ = r
+        .op("entry")
+        .label("A movie file's entry")
+        .takes("file", &["pe2.game@stream"])
+        .output::<ty::Table>()
+        .parameter::<String>("id")
+        .field(Field::new("entries").custom())
+        .members(|asset| asset.parts("entries").into_iter().map(|(id, _)| (id.to_string(), id.to_string())).collect())
+        .run(|call| {
         let id: String = call.parameter()?;
-        let lent = call.lend_settings(&Table::new());
+        let lent = call.lend_settings(&call.given());
         let asset = lent.asset();
         let entries = asset.parts("entries");
         let (_, entry) = entries.iter().find(|(known, _)| **known == id).ok_or_else(|| pe2_ext::anyhow!("it has no entry {id}"))?;
         entry.as_table().cloned().ok_or_else(|| pe2_ext::anyhow!("its entry {id} is no table"))
     });
-    r.kind("stream")
+    r.named_type("stream")
         .alias("stream")
         .label("Movie file")
+        .data()
         .icon(Icon::Stack, Tint::Motion)
         .stack(STREAM)
-        .field(Field::new("entries").custom())
         .contents(entry_rows)
-        .output("entries", &entry, Retain::Transient)
-        .members(|asset| asset.parts("entries").into_iter().map(|(id, _)| (id.to_string(), id.to_string())).collect())
         .inspector("Entries", |_| Box::new(Entries))
         .register();
-    r.kind("scene_audio")
+    r.named_type("scene_audio")
         .alias("scene_audio")
         .label("Scene audio")
+        .data()
         .icon(Icon::Waveform, Tint::Sound)
         .field(Field::new("sound_bank_mask").label("Sound bank mask").format(hex))
         .register();

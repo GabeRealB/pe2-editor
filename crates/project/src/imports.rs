@@ -1,7 +1,7 @@
 //! Imports: what an asset's importer makes of its source, kept in the project cache (`.cache/imports/<key>/`) and seen
 //! by every reader as the asset's own - the bundle holds the source, the native form is made from it.
 //!
-//! An import makes native files, and kind settings it derives from the source (an image's size, its cells'
+//! An import makes native files, and type settings it derives from the source (an image's size, its cells'
 //! rectangles): those its importer says it `derives`. They take the place of the declaration's - a value the
 //! declaration has there is overridden, and said to be - and the parts of a keyed table the declaration has but the
 //! source no longer does are orphaned: kept, reported, until removed or their source part returns. A part the source
@@ -77,6 +77,7 @@ impl Known {
             return resolved.clone();
         }
         let mut resolved = resolve(asset.fields(), &self.made, &self.derives);
+        fill(&mut resolved.settings, &self.made);
         resolved.notes.clone_from(&self.notes);
         let resolved = Arc::new(resolved);
         *last = Some((asset.text().to_string(), resolved.clone()));
@@ -161,7 +162,7 @@ impl Imports {
         };
         let total = assets.len();
         // What an import reads of other nodes, made in the index as it is.
-        let world = crate::ext::Graph { index: &*index, extensions };
+        let world = crate::ext::Graph { index: &*index, extensions, written: false };
         let reach = graph::exec::Reach { engine: &engine, world: &world };
         for (i, asset) in assets.into_iter().enumerate() {
             if i % 256 == 0 {
@@ -253,7 +254,7 @@ impl Imports {
         for (target, references) in index.referenced_by.iter() {
             // Of the assets attached: the references to them, and from them.
             let named: Vec<_> = references.iter().filter(|r| r.output.is_some() && (of(target) || of(&r.from))).collect();
-            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.kind_of(a).is_some())
+            let Some(asset) = index.assets.get(target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())
             else {
                 continue;
             };
@@ -322,6 +323,9 @@ pub fn live_nodes(index: &Index) -> HashSet<String> {
 fn import_output(plan: &Plan, extensions: &Extensions) -> Option<(String, usize)> {
     let result = plan.result.filter(|_| !plan.result_stored())?;
     let output = plan.result_output()?;
+    // One of several outputs is its operation's.
+    let picked = plan.steps[result].op == graph::PICK;
+    let result = if picked { *plan.steps[result].inputs.first()?.first()? } else { result };
     // A table is read by what asks for it: it has no files to attach.
     if extensions.op(&plan.steps[result].op).is_some_and(|op| op.output == pe2_ext::Type::Table) {
         return None;
@@ -353,6 +357,18 @@ pub fn resolve(declared: &Table, made: &Table, paths: &[String]) -> Imported {
         place(&mut settings, made, &steps(path), "", &mut overridden, &mut orphans);
     }
     Imported { settings, text: std::sync::OnceLock::new(), overridden, orphans, notes: vec![] }
+}
+
+/// What an import made beyond what it says it derives, under what the node says: a node reads what its import came up with,
+/// which is what lists the members of what it makes, though no declaration has them.
+fn fill(into: &mut Table, made: &Table) {
+    for (key, value) in made {
+        match (into.get_mut(key), value) {
+            (None, _) => drop(into.insert(key.clone(), value.clone())),
+            (Some(Value::Table(mine)), Value::Table(made)) => fill(mine, made),
+            _ => {}
+        }
+    }
 }
 
 fn place(
@@ -449,7 +465,7 @@ fn remove(item: &mut toml_edit::Item, steps: &[&str]) {
 mod tests {
     use super::{resolve, without_derived};
 
-    const DECLARED: &str = r#"kind = "image"
+    const DECLARED: &str = r#"type = "image"
 mode = "indexed_8bpp"
 size = [8, 2]
 cells.wide = { rect = [4, 0, 4, 2], palette = "cold" }
@@ -502,7 +518,7 @@ mod attaching {
     use crate::index::{Index, Problem};
     use crate::lock::Lock;
     use pe2_ext::ty::{self, Files, Registered};
-    use pe2_ext::{Extension, File, Image, Registry, Result, Retain, Signature, Table, Typed, Value};
+    use pe2_ext::{Extension, File, Image, Registry, Result, Signature, Table, Typed, Value};
 
     /// A strip's source: a line of cell names, recognized by its name.
     struct Line;
@@ -529,40 +545,37 @@ mod attaching {
     impl Files for Strip {}
     use std::path::{Path, PathBuf};
 
-    /// A kind whose source is a line of cell names: each a cell one texel wide, its native file the source reversed.
+    /// A type whose source is a line of cell names: each a cell one texel wide, its native file the source reversed.
     #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
     fn strips(r: &mut Registry) -> Result<()> {
         let _ = r.value_type::<Line>();
         let _ = r.value_type::<Strip>();
-        let cell = r.op("cell").input::<Strip>("native").output::<ty::Image>().parameter::<String>("name").run(|_| Ok(Image::default()));
+        let _ = r.op("cell").input::<Strip>("native").output::<ty::Image>().parameter::<String>("name").provides("cells").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|_| Ok(Image::default()));
         let _ = r
-            .kind("strip")
+            .named_type("strip")
             .alias("strip")
-            .output("cells", &cell, Retain::Transient)
-            .members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect())
+            .of(Strip::NAME)
             .register();
-        let _ = r
-            .op("line")
-            .input::<Line>("source")
-            .output::<Strip>()
-            .derives("size")
-            .derives("cells.*.rect")
-            .run(|call| {
-                let source = call.take::<Line>(0)?;
-                let source = String::from_utf8(call.read(source.file()?)?)?;
-                let names: Vec<&str> = source.split_whitespace().collect();
-                let mut cells = Table::new();
-                for (i, name) in names.iter().enumerate() {
-                    let rect = Value::Array([i, 0, 1, 1].iter().map(|&v| Value::Integer(i64::try_from(v).unwrap())).collect());
-                    cells.insert((*name).to_string(), Value::Table(Table::from_iter([("rect".to_string(), rect)])));
-                }
-                let mut settings = Table::new();
-                settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
-                settings.insert("cells".into(), Value::Table(cells));
-                let files = vec![File::new("native.bin", source.bytes().rev().collect())];
-                Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
-            });
+        let _ = r.op("line").input::<Line>("source").output::<Strip>().derives("size").derives("cells.*.rect").run(strip);
+        // The same, saying nothing of what it makes.
+        let _ = r.op("silent_line").input::<Line>("source").output::<Strip>().run(strip);
         Ok(())
+    }
+
+    fn strip(call: &mut pe2_ext::Call<'_>) -> Result<Typed> {
+        let source = call.take::<Line>(0)?;
+        let source = String::from_utf8(call.read(source.file()?)?)?;
+        let names: Vec<&str> = source.split_whitespace().collect();
+        let mut cells = Table::new();
+        for (i, name) in names.iter().enumerate() {
+            let rect = Value::Array([i, 0, 1, 1].iter().map(|&v| Value::Integer(i64::try_from(v).unwrap())).collect());
+            cells.insert((*name).to_string(), Value::Table(Table::from_iter([("rect".to_string(), rect)])));
+        }
+        let mut settings = Table::new();
+        settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
+        settings.insert("cells".into(), Value::Table(cells));
+        let files = vec![File::new("native.bin", source.bytes().rev().collect())];
+        Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
     }
 
     fn write(root: &Path, path: &str, text: &str) {
@@ -592,10 +605,10 @@ mod attaching {
         write(
             &root,
             ".layers/base/s.node/node.toml",
-            &format!("uid = \"uid://s\"\nkind = \"strip\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"),
+            &format!("uid = \"uid://s\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"),
         );
         write(&root, ".layers/base/s.node/source.txt", "a b");
-        write(&root, ".layers/base/r.node/node.toml", "kind = \"file\"\nfine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
+        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
         let extensions =
             Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
@@ -631,6 +644,29 @@ mod attaching {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn what_an_import_makes_lists_its_members_though_nothing_declares_them() {
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-silent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        let stack = STACK.replace("test.strips@line", "test.strips@silent_line");
+        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\ncells.a = {{ palette = \"warm\" }}\n{stack}"));
+        write(&root, ".layers/base/s.node/source.txt", "a b");
+        write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
+        let extensions =
+            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        let (index, _) = open(&root, &extensions);
+        let settings = index.assets["s"].settings();
+        assert_eq!(settings["cells"]["a"]["palette"].as_str(), Some("warm"));
+        assert!(settings["cells"]["a"]["rect"].is_array(), "what the node says stays, what was made joins it");
+        assert!(settings["cells"]["b"]["rect"].is_array());
+        let missing: Vec<&Problem> = index.problems.iter().filter(|p| matches!(p, Problem::MissingOutput { .. })).collect();
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(format!("{:?}", missing[0]).contains("cells/z"), "{missing:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// What an index's imports show: each asset's made files and settings, and the problems (in no order).
     fn shown(index: &Index) -> String {
         let mut out: Vec<String> = index
@@ -652,12 +688,12 @@ mod attaching {
         let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-changed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
-        let declared = format!("kind = \"strip\"\ncells.a = {{}}\n{STACK}");
+        let declared = format!("cells.a = {{}}\n{STACK}");
         write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{declared}"));
         write(&root, ".layers/base/s.node/source.txt", "a b");
         write(&root, ".layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
         write(&root, ".layers/base/t.node/source.txt", "a");
-        write(&root, ".layers/base/r.node/node.toml", "kind = \"file\"\none = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
+        write(&root, ".layers/base/r.node/node.toml", "one = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
         let extensions =
             Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
         let project = Project::load(&root).unwrap();
@@ -670,7 +706,7 @@ mod attaching {
         for (path, text) in [
             ("s.node/source.txt", "a"),
             ("t.node/source.txt", "a b"),
-            ("r.node/node.toml", "kind = \"file\"\none = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
+            ("r.node/node.toml", "one = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
         ] {
             write(&root, &format!(".layers/base/{path}"), text);
             let refreshed = index.refresh(&project, &[base(path)]).unwrap();

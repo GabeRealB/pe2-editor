@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 pe2-ext.workspace = true
+serde.workspace = true

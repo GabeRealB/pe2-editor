@@ -14,7 +14,7 @@ const RECORD_SIZE: usize = 0x24;
 const BONE_SIZE: usize = 36;
 
 /// How a face takes light.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Shading {
     Unlit,
     Flat,
@@ -100,7 +100,7 @@ fn packet(corners: usize, textured: bool) -> (usize, usize) {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Part {
     pub parent: usize,
     /// Fixed point: 4096 is one.
@@ -111,7 +111,7 @@ pub struct Part {
 }
 
 /// How a transparent face mixes with what is behind it: the GPU's four.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Blend {
     Mix,
     Add,
@@ -120,7 +120,7 @@ pub enum Blend {
 }
 
 /// How a run of faces draws.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Material {
     pub transparent: bool,
     /// The texture slot, for one that is textured.
@@ -129,14 +129,14 @@ pub struct Material {
 }
 
 /// Where a texture slot's faces look: its depth, page and palette.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Placement {
     pub bits: u8,
     pub page: [u16; 2],
     pub palette: [u16; 2],
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Corner {
     /// Among all vertices, part by part.
     pub vertex: usize,
@@ -145,7 +145,7 @@ pub struct Corner {
     pub uv: Option<[u8; 2]>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Face {
     pub material: usize,
     pub shading: Shading,
@@ -188,7 +188,7 @@ impl Face {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Model {
     pub parts: Vec<Part>,
     /// Past what the parts count. One model of 790 has any: three zeros no face uses, in its vertex array as stored.

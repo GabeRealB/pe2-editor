@@ -211,7 +211,7 @@ struct Textures {
 /// Begin a session: the images, the files and the VRAM slots declared.
 ///
 /// # Errors
-/// A declaration has not the shape its kind gives it.
+/// A declaration has not the shape its type gives it.
 pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
     let parse = |path: &str, table: Table| -> Result<Declaration> {
         Table::try_into(table).map_err(|e| anyhow!("{path}: {e}"))

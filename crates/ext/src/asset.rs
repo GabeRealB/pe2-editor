@@ -56,8 +56,8 @@ pub trait Source {
         let _ = path;
         None
     }
-    fn assets_of(&self, kind: &str) -> Option<Result<Vec<(String, String)>>> {
-        let _ = kind;
+    fn assets_of(&self, node_type: &str) -> Option<Result<Vec<(String, String)>>> {
+        let _ = node_type;
         None
     }
     fn place(&self, path: &str) -> Option<String> {
@@ -66,6 +66,10 @@ pub trait Source {
     }
     fn output_of(&self, path: &str, address: &str) -> Option<Result<crate::Data>> {
         let _ = (path, address);
+        None
+    }
+    fn node_named(&self, reference: &str) -> Option<crate::data::NodeNamed> {
+        let _ = reference;
         None
     }
     fn build_config(&self) -> Option<crate::data::BuildConfig> {
@@ -77,19 +81,19 @@ pub trait Source {
     }
 }
 
-/// An asset, lent for one call: what an extension keeps of it, it copies. Its kind is a qualified name
+/// An asset, lent for one call: what an extension keeps of it, it copies. Its type is a qualified name
 /// (`pe2.images@image`), resolved by the host from what its declaration says.
 #[derive(Clone, Copy)]
 pub struct Asset<'a> {
     source: &'a dyn Source,
-    kind: Option<&'a str>,
+    node_type: Option<&'a str>,
 }
 
 impl<'a> Asset<'a> {
-    /// An asset lent by the host, with the kind it resolved.
+    /// An asset lent by the host, with the type it resolved.
     #[must_use]
-    pub fn new(source: &'a dyn Source, kind: Option<&'a str>) -> Asset<'a> {
-        Asset { source, kind }
+    pub fn new(source: &'a dyn Source, node_type: Option<&'a str>) -> Asset<'a> {
+        Asset { source, node_type }
     }
 
     #[must_use]
@@ -102,10 +106,10 @@ impl<'a> Asset<'a> {
         self.source.uid()
     }
 
-    /// Its kind, qualified; none when no extension registers what it declares.
+    /// Its type, qualified; none when no extension registers what it declares.
     #[must_use]
-    pub fn kind(&self) -> Option<&'a str> {
-        self.kind
+    pub fn node_type(&self) -> Option<&'a str> {
+        self.node_type
     }
 
     /// A field of its declaration.

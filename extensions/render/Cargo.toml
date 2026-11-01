@@ -16,4 +16,6 @@ workspace = true
 formats.workspace = true
 pe2-ext.workspace = true
 pe2-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha1.workspace = true

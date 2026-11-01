@@ -11,7 +11,7 @@ pub enum Dragged {
     Asset(String),
     /// A layer of an asset's stack: the asset's path and its place.
     Layer(String, usize),
-    /// A row of the contents: its asset's path, its id, its label and what its kind says it is when dragged.
+    /// A row of the contents: its asset's path, its id, its label and what its type says it is when dragged.
     Row { asset: String, id: String, label: String, what: String },
 }
 

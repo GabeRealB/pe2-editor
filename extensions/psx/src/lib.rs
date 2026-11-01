@@ -54,8 +54,8 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Package>();
     let _ = r.op("preprocess").label("First pass").input::<SourceTree>("sources").output::<SourceTree>().run(first_pass);
     let _ = r.op("compile").label("Compile and link").input::<SourceTree>("sources").output::<ty::File<Package>>().run(build);
-    let _ = r.op("flags").label("What a language server is told").output::<ty::Table>().run(flags);
-    r.add_output("pe2.packages@package", "flags", "pe2.psx@flags", None, pe2_ext::Retain::Transient);
+    let _ = r.op("flags").label("What a language server is told").takes("package", &["pe2.packages@package"]).output::<ty::Table>().provides("flags").run(flags);
+    let _ = r.extend("pe2.packages@package").of(Package::NAME).register();
     let _ = r.on::<Build>(check_tools);
     Ok(())
 }
@@ -81,7 +81,7 @@ fn flags(_: &mut Call) -> Result<Table> {
 fn build(call: &mut Call) -> Result<Typed> {
     let path = call.host.path().to_string();
     let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-    let fields = call.host.fields().clone();
+    let fields = call.given();
     let target = call.config().and_then(|config| config.target);
     if target.as_ref().is_some_and(|target| target != TARGET) {
         bail!("the config builds for {}, and this is {TARGET}", target.unwrap_or_default());

@@ -163,6 +163,11 @@ impl Reads {
 /// path }`, or a path), with its plan.
 pub trait World: Sync {
     fn node(&self, reference: &toml::Value) -> Option<(&dyn Node, Plan)>;
+    /// The node a reference names, as what reads it is told.
+    fn named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
+        let (node, _) = self.node(reference)?;
+        Some(pe2_ext::NodeNamed { path: node.path().to_string(), uid: node.uid().map(str::to_string), types: Vec::new() })
+    }
     /// The plain files under a folder of the project, by their paths, in order.
     fn entries(&self, folder: &str) -> Vec<String> {
         let _ = folder;
@@ -179,18 +184,18 @@ pub trait World: Sync {
         let _ = path;
         None
     }
-    /// The assets of a kind, each by its path with its declaration as written.
-    fn assets_of(&self, kind: &str) -> Vec<(String, String)> {
-        let _ = kind;
+    /// The assets of a type, each by its path with its declaration as written.
+    fn assets_of(&self, node_type: &str) -> Vec<(String, String)> {
+        let _ = node_type;
         vec![]
     }
 }
 
-/// How a trace names a kind's assets, as no path of the project can begin.
-const KIND_READ: &str = "kind:";
+/// How a trace names a type's assets, as no path of the project can begin.
+const TYPE_READ: &str = "type:";
 
-/// The hash a kind's assets have together, what tells one changed, come or gone.
-fn kind_hash(assets: &[(String, String)]) -> String {
+/// The hash a type's assets have together, what tells one changed, come or gone.
+fn type_hash(assets: &[(String, String)]) -> String {
     let joined: Vec<String> = assets.iter().map(|(path, text)| format!("{path}\n{text}")).collect();
     list_hash(&joined)
 }
@@ -230,8 +235,8 @@ impl<'a> Reach<'a> {
 
     /// The hash a project's file or folder has now, by how a trace names it (a folder's with a `/`).
     fn entry_hash(&self, read: &str) -> Option<String> {
-        if let Some(kind) = read.strip_prefix(KIND_READ) {
-            return Some(kind_hash(&self.world.assets_of(kind)));
+        if let Some(node_type) = read.strip_prefix(TYPE_READ) {
+            return Some(type_hash(&self.world.assets_of(node_type)));
         }
         match read.strip_suffix('/') {
             Some(folder) => Some(list_hash(&self.world.entries(folder))),
@@ -360,7 +365,8 @@ impl<'a> Call<'a> {
         let size = node.file_size(name).unwrap_or_default();
         let ty = if names.is_empty() { pe2_ext::data::BYTES.to_string() } else { names.remove(0) };
         let file = File { name: name.to_string(), content: Content::Stored { sha1, size } };
-        Ok(Typed { ty, also: names, files: vec![file], ..Typed::default() })
+        // A stored file comes with what is said of it, on its layer.
+        Ok(Typed { ty, also: names, files: vec![file], settings: super::set_on(super::FILE, self.settings), ..Typed::default() })
     }
 
     /// Another node's output, by a reference to it and its address, recorded as read.
@@ -413,15 +419,21 @@ impl<'a> Call<'a> {
         Ok(bytes)
     }
 
-    /// The assets of a kind, each by its path with its declaration as written, recorded as read.
+    /// The assets of a type, each by its path with its declaration as written, recorded as read.
     ///
     /// # Errors
     /// Nothing beyond its node is reachable here.
-    pub fn assets_of(&self, kind: &str) -> Result<Vec<(String, String)>> {
-        let assets = self.reach.context("the project is not reachable here")?.world.assets_of(kind);
-        let read = format!("{KIND_READ}{kind}");
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, kind_hash(&assets));
+    pub fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
+        let assets = self.reach.context("the project is not reachable here")?.world.assets_of(node_type);
+        let read = format!("{TYPE_READ}{node_type}");
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, type_hash(&assets));
         Ok(assets)
+    }
+
+    /// The node a reference names.
+    #[must_use]
+    pub fn node_named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
+        self.reach?.world.named(reference)
     }
 
     /// Where a file or folder of the project is on disk.
@@ -780,7 +792,9 @@ impl Evaluation<'_> {
             Ok(value) => value,
             Err(e) => return fail(format!("{e:#}")),
         };
-        if let Some(ty) = def.output.as_ref().map(|t| t.bind(&bound)).filter(|t| !t.unify(&value.ty(), &mut Vec::new())) {
+        // With several, what it makes is a list of them, each checked where it is picked.
+        let one = def.output.as_ref().filter(|_| def.also.is_empty() && step.op != super::PICK);
+        if let Some(ty) = one.map(|t| t.bind(&bound)).filter(|t| !t.unify(&value.ty(), &mut Vec::new())) {
             return fail(format!("`{}` made {}, not {ty}", step.op, value.ty()));
         }
         Ok(Arc::new(value))
@@ -802,6 +816,9 @@ impl Evaluation<'_> {
         }
     }
 }
+
+/// What kept values hold: raised when that changes, so that none kept before is taken for one made now.
+const VALUES: u32 = 3;
 
 /// Evaluates nodes' outputs, keeping those retained in the project's store.
 pub struct Engine {
@@ -837,7 +854,7 @@ impl Engine {
     /// value. Two nodes making alike keep a trace each, of what each read, and share the value they made.
     #[must_use]
     pub fn key(&self, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> String {
-        let text = format!("{}\n{}\n{parameter:?}", id(node), plan.describe(output, &self.ops));
+        let text = format!("{VALUES}\n{}\n{}\n{parameter:?}", id(node), plan.describe(output, &self.ops));
         crate::extract::sha1_hex(text.as_bytes())
     }
 

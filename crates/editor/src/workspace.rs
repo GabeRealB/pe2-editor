@@ -150,7 +150,7 @@ pub struct Workspace {
     pub history: History,
     /// The tree's thumbnails, kept in the project's store.
     pub thumbs: crate::thumbs::Thumbs,
-    /// The extensions, and what they register: the kinds' icons, fields, pictures, thumbnails and views.
+    /// The extensions, and what they register: the types' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
     /// What plays in the preview: a movie, frame by frame.
     /// Asked of the graph in front.
@@ -170,15 +170,15 @@ pub struct Workspace {
     played: HashSet<crate::panes::Pane>,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
     views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
-    /// What is inside assets, as their kinds said: asked again when the asset changes, not each frame.
+    /// What is inside assets, as their types said: asked again when the asset changes, not each frame.
     contents: HashMap<String, Arc<pe2_ext::Contents>>,
-    /// Parts' sheets, as their kinds said: as `contents`.
+    /// Parts' sheets, as their types said: as `contents`.
     part_sheets: HashMap<(String, String), Arc<Option<pe2_ext::PartSheet>>>,
     /// Rows of the contents folded or unfolded by hand: by asset and row.
     pub content_open: HashMap<(String, String), bool>,
     /// The row of the contents being renamed: the asset, the row, what is typed.
     pub content_rename: Option<(String, String, String)>,
-    /// The view an asset is shown in, where its kind has several.
+    /// The view an asset is shown in, where its type has several.
     pub view_choice: HashMap<String, usize>,
     /// What the views show, uploaded.
     textures: crate::ext_ui::Textures,
@@ -250,12 +250,14 @@ pub struct Workspace {
     pictures: HashMap<(String, usize, Upscale), Picture>,
     /// Parts of pictures (palettes' strips), as the inspector shows them.
     pub parts: Parts,
-    /// The inspector views - the kinds', or the importers' - by (asset, the importer's, view).
+    /// The inspector views - the types', or the importers' - by (asset, the importer's, view).
     inspector_views: HashMap<(String, usize), Box<dyn pe2_ext::View>>,
     /// The panels' views, by pane.
     panels: HashMap<egui::Id, Box<dyn pe2_ext::View>>,
     /// What a view set of the asset it shows this frame, for the app to make after drawing.
     pub view_edit: Option<EditRequest>,
+    /// The picture a stack's preview last showed.
+    tapped: Option<Tapped>,
     /// The members of families of outputs assets are being looked at in: an image's look, a prefab's outfit.
     pub chosen: project::ext::Chosen,
     /// A field being edited in the inspector.
@@ -358,11 +360,14 @@ pub fn part_name(id: &str) -> &str {
     id.split_once('/').map_or(id, |(_, name)| name)
 }
 
-/// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its kind draws it.
+/// A stack's preview as last drawn: by asset, output and revision, or why it could not be made.
+type Tapped = ((String, String, u64), Result<egui::TextureHandle, String>);
+
+/// Parts of assets' pictures, uploaded once each: a palette's strip of colors (`palettes/<name>`), as its type draws it.
 #[derive(Default)]
 pub struct Parts {
     shown: HashMap<(String, String), Picture>,
-    /// Those its kind draws nothing of: asked once, like the others.
+    /// Those its type draws nothing of: asked once, like the others.
     none: HashSet<(String, String)>,
 }
 
@@ -373,7 +378,7 @@ impl Parts {
         self.shown.contains_key(&key) || self.none.contains(&key)
     }
 
-    /// An asset's part, uploaded; none where its kind draws no such part.
+    /// An asset's part, uploaded; none where its type draws no such part.
     pub fn get(&mut self, ctx: &egui::Context, extensions: &Extensions, asset: &Asset, part: &str) -> Option<&Picture> {
         let key = (asset.path.clone(), part.to_string());
         if self.none.contains(&key) {
@@ -596,6 +601,7 @@ impl Workspace {
             inspector_views: HashMap::new(),
             panels: HashMap::new(),
             view_edit: None,
+            tapped: None,
             chosen: project::ext::Chosen::new(),
             field_edit: None,
             viewer: crate::viewer::Viewer::default(),
@@ -647,8 +653,34 @@ impl Workspace {
         let uid = project::uid::text(id);
         let slug: String = name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let quoted = toml::Value::String(name.to_string());
-        let declaration = format!("uid = \"{uid}\"\nkind = \"event\"\nlabel = {quoted}\n");
-        project::edit::create(&self.project, &self.index, &layer, &uid, &format!("events/{slug}"), &declaration, &mut self.history).map_err(|e| format!("{e:#}"))?;
+        let declaration = format!("uid = \"{uid}\"\n\n[[stack]]\nop = \"pe2.events@event\"\nlabel = {quoted}\n");
+        project::edit::create(&self.project, &self.index, &layer, &uid, &format!("events/{slug}"), (&declaration, &[]), &mut self.history).map_err(|e| format!("{e:#}"))?;
+        Ok(())
+    }
+
+    /// Make a node of a template in the folder shown, of the active layer: with this file in it, where it takes one.
+    ///
+    /// # Errors
+    /// No layer takes it, the template does not stamp, the file cannot be read or the node cannot be written.
+    pub fn new_node(&mut self, template: &str, file: Option<&Path>) -> Result<(), String> {
+        let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
+        let found = self.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
+        let name = file.and_then(|file| file.file_name()).and_then(|name| name.to_str()).unwrap_or_default().to_string();
+        let stem = file.and_then(|file| file.file_stem()).and_then(|stem| stem.to_str()).unwrap_or(template);
+        let slug: String = stem.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        let at = |n: usize| {
+            let leaf = if n == 0 { slug.clone() } else { format!("{slug}_{n}") };
+            if self.asset_folder.is_empty() { leaf } else { format!("{}/{leaf}", self.asset_folder) }
+        };
+        let path = (0..=self.index.assets.len()).map(at).find(|path| !self.index.assets.contains_key(path)).unwrap_or_default();
+        let stack = self.extensions.stamp(found, &name)?;
+        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id))).map_err(|e| e.to_string())?;
+        let uid = project::uid::text(id);
+        let declaration = format!("uid = \"{uid}\"\n\n{stack}");
+        let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
+        let files: Vec<(&str, &[u8])> = bytes.as_deref().map(|bytes| (name.as_str(), bytes)).into_iter().collect();
+        project::edit::create(&self.project, &self.index, &layer, &uid, &path, (&declaration, &files), &mut self.history).map_err(|e| format!("{e:#}"))?;
+        self.select(path);
         Ok(())
     }
 
@@ -1296,7 +1328,7 @@ impl Workspace {
         project::stack::reorder(&self.project, &self.layers, order, &mut self.history)
     }
 
-    /// Add a new, empty layer of a kind at the top of the stack.
+    /// Add a new, empty layer of a type at the top of the stack.
     ///
     /// # Errors
     /// The name is not one a layer may take, or it cannot be written.
@@ -1432,7 +1464,7 @@ impl Workspace {
         }
     }
 
-    /// The edits that make a file the source of an asset, by its kind's recipe: the file in its bundle, and its stack.
+    /// The edits that make a file the source of an asset, by its type's recipe: the file in its bundle, and its stack.
     ///
     /// # Errors
     /// Nothing makes this file of this asset, or it cannot be read.
@@ -1440,10 +1472,7 @@ impl Workspace {
         let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
         let stack = self.extensions.recipe_for(asset, name).ok_or("Nothing imports it over this")??;
         let uid = asset.uid.clone().ok_or("It has no uid")?;
-        let mut document = asset.text().parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
-        document.remove("stack");
-        // As text, after the rest: a table inserted keeps its place in the document it came from.
-        let declaration = format!("{}\n\n{stack}", document.to_string().trim_end());
+        let declaration = project::graph::layers::with_new_stack(asset.text(), &stack).map_err(|e| format!("{e:#}"))?;
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let short = asset.path.rsplit('/').next().unwrap_or(&asset.path);
         let (label, merge) = (format!("Import {name} over {short}"), Some(format!("import {}", asset.path)));
@@ -1464,13 +1493,13 @@ impl Workspace {
         self.index.assets.contains_key(path) || self.entry_at(path).is_some_and(|(_, e)| e.kind == project::index::Kind::File)
     }
 
-    /// What is inside an asset, as its kind says.
+    /// What is inside an asset, as its type says.
     pub fn contents_of(&mut self, asset: &Asset) -> Arc<pe2_ext::Contents> {
         let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
         self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(index, asset, chosen))).clone()
     }
 
-    /// A part's sheet, where its asset's kind says what it holds.
+    /// A part's sheet, where its asset's type says what it holds.
     pub fn part_sheet_of(&mut self, asset: &Asset, part: &str) -> Arc<Option<pe2_ext::PartSheet>> {
         let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
         let key = (asset.path.clone(), part.to_string());
@@ -1618,7 +1647,7 @@ impl Workspace {
         self.pictures.get(&key)
     }
 
-    /// Whether the preview shows an asset: by its picture, or - its kind drawing none - by its kind's views.
+    /// Whether the preview shows an asset: by its picture, or - its type drawing none - by its type's views.
     pub fn has_view(&self, path: &str) -> bool {
         self.index.assets.get(path).is_some_and(|a| {
             self.extensions.has_picture(a) || (!self.extensions.shows_pictures(a) && !self.extensions.views(a).is_empty())
@@ -1652,7 +1681,7 @@ impl Workspace {
         out
     }
 
-    /// Show an asset's view in a pane - the one chosen, where its kind has several - made when first shown.
+    /// Show an asset's view in a pane - the one chosen, where its type has several - made when first shown.
     /// `count` views share the pane's height.
     pub fn show_view(
         &mut self,
@@ -1682,7 +1711,7 @@ impl Workspace {
             self.view_choice.insert(path.to_string(), chosen);
         }
         let make = views[chosen].make.clone();
-        self.draw_view(ui, (pane, path.to_string(), chosen), &*make, preview, count, nav);
+        self.draw_view(ui, (pane, path.to_string(), chosen), &*make, (preview, count), nav, None);
     }
 
     /// Show an editor an extension gives an asset, made when first shown.
@@ -1691,9 +1720,50 @@ impl Workspace {
         // After its views, in the numbers the pane keeps views by.
         let views = self.extensions.views(asset).len();
         let editors = self.extensions.editors(asset);
+        let shown = self.extensions.previews(asset);
+        let viewer = shown.iter().enumerate().find_map(|(at, shown)| Some((at, shown.viewer.filter(|def| def.name == name)?, &shown.output)));
+        if let Some((at, def, output)) = viewer {
+            let (at, make, output) = (views + editors.len() + at, def.make.clone(), output.clone());
+            self.draw_view(ui, (pane, path.to_string(), at), &*make, (preview, 1), nav, Some(&output));
+            return;
+        }
         let Some((at, def)) = editors.iter().enumerate().find(|(_, def)| def.name == name) else { return };
         let (at, make) = (views + at, def.make.clone());
-        self.draw_view(ui, (pane, path.to_string(), at), &*make, preview, 1, nav);
+        self.draw_view(ui, (pane, path.to_string(), at), &*make, (preview, 1), nav, None);
+    }
+
+    /// Show a preview an asset's stack asks for: by a viewer of what it is, else - a picture - as the host draws one.
+    pub fn show_tap(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: Option<&str>, output: &str, preview: Preview, nav: &mut Option<String>) {
+        let Some(asset) = path.and_then(|path| self.index.assets.get(path)) else { return };
+        let path = asset.path.clone();
+        let path = path.as_str();
+        let views = self.extensions.views(asset).len() + self.extensions.editors(asset).len();
+        let shown = self.extensions.previews(asset);
+        let found = shown.iter().enumerate().find(|(_, shown)| shown.tapped && shown.output == output);
+        let Some((at, shown)) = found else { return };
+        if let Some(viewer) = shown.viewer {
+            let make = viewer.make.clone();
+            self.draw_view(ui, (pane, path.to_string(), views + at), &*make, (preview, 1), nav, Some(output));
+            return;
+        }
+        let key = (path.to_string(), output.to_string(), self.revision);
+        if self.tapped.as_ref().is_none_or(|(known, _)| *known != key) {
+            let made = self.extensions.output_picture(&self.index, asset, output);
+            let made = made.map(|image| {
+                let color = egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba);
+                ui.ctx().load_texture(format!("tap {path} {output}"), color, egui::TextureOptions::NEAREST)
+            });
+            self.tapped = Some((key, made.map_err(|e| format!("{e:#}"))));
+        }
+        match self.tapped.as_ref().map(|(_, made)| made) {
+            Some(Ok(texture)) => {
+                ui.centered_and_justified(|ui| ui.add(egui::Image::new(texture).max_size(ui.available_size()).shrink_to_fit()));
+            }
+            Some(Err(why)) => {
+                ui.label(why.as_str());
+            }
+            None => {}
+        }
     }
 
     /// Show a view of an asset in a pane, made when first shown.
@@ -1702,9 +1772,9 @@ impl Workspace {
         ui: &mut egui::Ui,
         key: (egui::Id, String, usize),
         make: &pe2_ext::MakeView,
-        preview: Preview,
-        count: usize,
+        (preview, count): (Preview, usize),
         nav: &mut Option<String>,
+        shown: Option<&str>,
     ) {
         let path = key.1.clone();
         // As the inspector's own fields: an asset from below is overridden into the active layer.
@@ -1719,7 +1789,7 @@ impl Workspace {
             chosen: Some(&self.chosen),
             revision: self.revision,
         };
-        let frame = crate::ext_ui::Frame { asset: Some(asset), preview, count, editable, part: part.as_deref() };
+        let frame = crate::ext_ui::Frame { asset: Some(asset), preview, count, editable, part: part.as_deref(), shown };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1738,7 +1808,7 @@ impl Workspace {
         live.map_or_else(Vec::new, |live| live.fields.clone())
     }
 
-    /// Show an asset's picture in its look on the host's canvas, with what its kind marks on it over it.
+    /// Show an asset's picture in its look on the host's canvas, with what its type marks on it over it.
     fn show_picture(&mut self, ui: &mut egui::Ui, path: &str, preview: Preview, count: usize, nav: &mut Option<String>) {
         let look = self.variant(path);
         let Some(pictures) = self.textures.pictures.as_mut() else { return };
@@ -1775,7 +1845,7 @@ impl Workspace {
         }
     }
 
-    /// Show an asset's inspector views - what its kind draws of it after the property sheet - made when first
+    /// Show an asset's inspector views - what its type draws of it after the property sheet - made when first
     /// shown: those of a tab, or those with none.
     pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, tab: Option<usize>, nav: &mut Option<String>) {
         self.show_lent_views(ui, path, nav, |extensions, asset| {
@@ -1784,7 +1854,7 @@ impl Workspace {
         });
     }
 
-    /// Show the views a kind gives the head of the contents pane, made when first shown.
+    /// Show the views a type gives the head of the contents pane, made when first shown.
     pub fn show_contents_views(&mut self, ui: &mut egui::Ui, path: &str, nav: &mut Option<String>) {
         self.show_lent_views(ui, path, nav, |extensions, asset| {
             // After the inspector's, in the numbers these are kept by.
@@ -1815,7 +1885,7 @@ impl Workspace {
         for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
-            let frame = crate::ext_ui::Frame { asset: Some(asset), preview: Preview::default(), count: 1, editable, part: part.as_deref() };
+            let frame = crate::ext_ui::Frame { asset: Some(asset), shown: None, preview: Preview::default(), count: 1, editable, part: part.as_deref() };
             let mut sets = crate::ext_ui::Sets::default();
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -1842,7 +1912,7 @@ impl Workspace {
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };
-        let frame = crate::ext_ui::Frame { asset: None, preview, count: 1, editable: false, part: None };
+        let frame = crate::ext_ui::Frame { asset: None, preview, count: 1, editable: false, part: None, shown: None };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));

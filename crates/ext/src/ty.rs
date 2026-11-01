@@ -133,7 +133,7 @@ macro_rules! media_type {
 
 /// What an operation's parameter takes: its values, written in addresses (`picture/night`), read back.
 pub trait Parameter: Sized + 'static {
-    /// The kind of value it is, as described: `name`, `number`.
+    /// The type of value it is, as described: `name`, `number`.
     const KIND: &'static str;
     /// A value as an address writes it.
     fn to_text(&self) -> String;

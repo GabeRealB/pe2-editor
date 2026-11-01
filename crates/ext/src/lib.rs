@@ -1,8 +1,8 @@
 //! The extension SDK: what an extension of the editor is written against.
 //!
-//! An extension has an id (`pe2.images`), which namespaces everything it registers: its kinds are named
+//! An extension has an id (`pe2.images`), which namespaces everything it registers: its types are named
 //! `<id>@<name>` (`pe2.images@image`), so no two extensions' names collide and every name says who owns it. It
-//! registers procedurally, from one entry point (`extension!`): a kind and what it attaches to it - its fields as the
+//! registers procedurally, from one entry point (`extension!`): a type and what it attaches to it - its fields as the
 //! inspector shows them, its outputs, its views - and the types and
 //! operations its nodes' stacks are made of (`data`).
 //!
@@ -33,11 +33,11 @@ pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
-pub use data::{BuildConfig, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
+pub use data::{BuildConfig, NodeNamed, Provides, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, OpDef, OutputDef, Pcm, Port, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::Project;
-pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, Recipe, SheetOfPart, TabDef, 
-    Extension, Field, Format, Icon, KindBuilder, KindDef, MakePanel, MakeView, Name, OpBuilder, PanelDef, Parts,
+pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, SheetOfPart, TabDef, TemplateDef, 
+    Extension, Field, Format, Icon, MakePanel, MakeView, Name, OpBuilder, PanelDef, Parts,
     Registry, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};

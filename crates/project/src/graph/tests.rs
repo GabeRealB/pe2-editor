@@ -196,11 +196,7 @@ fn a_stack_lowers_to_a_chain_with_taps() {
 
 #[test]
 fn what_is_wrong_with_a_stack() {
-    assert_eq!(problems("[[stack]]\nop = \"t.upper\""), ["stack[0]: `t.upper` takes a value, and nothing is above it"]);
-    assert_eq!(
-        problems("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"file\"\nfile = \"b\""),
-        ["stack[1]: `file` is a source below the top: it would drop what is above it"]
-    );
+    assert_eq!(problems("[[stack]]\nop = \"t.upper\""), ["stack[0]: its `in` is connected to nothing"]);
     assert_eq!(
         problems("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"t.count\"\n[[stack]]\nop = \"t.upper\""),
         ["stack[2]: its `in` takes file, and is given table"]
@@ -210,7 +206,7 @@ fn what_is_wrong_with_a_stack() {
         problems("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\""),
         ["stack[2]: a second output named `a`"]
     );
-    assert_eq!(problems("[[stack]]\nop = \"t.join\""), ["stack[0]: `t.join` takes a value, and nothing is above it"]);
+    assert_eq!(problems("[[stack]]\nop = \"t.join\""), ["stack[0]: its `parts` is connected to nothing"]);
 }
 
 const GRAPH: &str = r#"
@@ -358,7 +354,7 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let node = Bundle::new(stack, &[("a.txt", "abc"), ("b.txt", "unread")]);
-    let tail = [Tail { name: "counted".into(), fixed: false, op: "t.count".into(), retain: Retain::Cache, from: None, settings: toml::Table::new() }];
+    let tail = [Tail { name: "counted".into(), fixed: false, op: "t.count".into(), retain: Retain::Cache, from: None, step: None, preview: false, settings: toml::Table::new() }];
     let (plan, problems) = Plan::of(&node.fields, &engine.ops, &tail);
     assert!(problems.is_empty(), "{problems:?}");
     // The kept native form is taken as made: `upper` runs once, for it, and not again for what is made of it.
@@ -623,4 +619,74 @@ from"#);
 fn a_gate_is_monotone_by_its_table() {
     let monotone: Vec<&str> = crate::graph::GATES.iter().filter(|g| g.is_monotone()).map(|g| g.name).collect();
     assert_eq!(monotone, ["and", "or"]);
+}
+
+#[test]
+fn a_preview_shows_what_a_viewer_takes_or_what_turns_into_it() {
+    let mut ops = ops();
+    ops.viewers = std::sync::Arc::new(vec![Type::Image]);
+    let raw = Type::Named("t@raw".to_string());
+    ops.add(OpDef::new("t.read", "Read", "1").input(port("in", Type::Table)).makes(raw.clone(), |_| anyhow::bail!("not run")));
+    ops.add(OpDef::new("t.draw", "Draw", "1").input(port("in", raw)).makes(Type::Image, |_| anyhow::bail!("not run")));
+    let stack = "[[stack]]\nop = \"constant\"\nvalue = {}\n\n[[stack]]\nop = \"preview\"\nname = \"shown\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"native\"\n";
+    let node = Bundle::new(stack, &[]);
+    let (plan, problems) = Plan::of(&node.fields, &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let shown = plan.outputs.iter().find(|output| output.name == "shown").unwrap();
+    assert!(shown.preview);
+    assert_eq!(plan.steps[shown.from].op, "t.draw", "turned into what a viewer takes, off to the side");
+    let native = plan.outputs.iter().find(|output| output.name == "native").unwrap();
+    assert_eq!(plan.steps[native.from].op, "constant", "what goes on down the stack is what came down it");
+    // What nothing turns into what a viewer takes is told.
+    ops.viewers = std::sync::Arc::new(vec![Type::Video]);
+    let (_, problems) = Plan::of(&node.fields, &ops, &[]);
+    assert!(problems.iter().any(|problem| problem.what.contains("nothing shows")), "{problems:?}");
+}
+
+#[test]
+fn a_layer_says_what_it_has_to() {
+    let mut ops = ops();
+    let mut held = OpDef::new("t.held", "Held", "1").makes(Type::Table, |_| anyhow::bail!("not run"));
+    held.required = vec!["rect".to_string()];
+    ops.add(held);
+    let wrong = Bundle::new("[[stack]]\nop = \"t.held\"\n", &[]);
+    let (_, problems) = Plan::of(&wrong.fields, &ops, &[]);
+    assert!(problems.iter().any(|problem| problem.what.contains("`rect`")), "{problems:?}");
+    let right = Bundle::new("[[stack]]\nop = \"t.held\"\nrect = [0, 0, 1, 1]\n", &[]);
+    assert_eq!(Plan::of(&right.fields, &ops, &[]).1, vec![]);
+}
+
+#[test]
+fn a_wire_names_a_layer_and_one_of_its_outputs() {
+    let mut ops = ops();
+    let mut pair = OpDef::new("t.pair", "Pair", "1").makes(Type::Table, |_| {
+        let one = |n: i64| Value::Table(toml::Table::from_iter([("n".to_string(), toml::Value::Integer(n))]));
+        Ok(Value::List(vec![one(1), one(2)]))
+    });
+    pair.also = vec![("second".to_string(), Type::Table)];
+    ops.add(pair);
+    ops.add(OpDef::new("t.add", "Add", "1").input(port("a", Type::Table)).input(port("b", Type::Table)).makes(Type::Table, |call| {
+        let read = |value: &Value| value.settings().and_then(|table| table.get("n")).and_then(toml::Value::as_integer).unwrap_or(0);
+        let (a, b) = (call.take(0)?, call.take(1)?);
+        Ok(Value::Table(toml::Table::from_iter([("n".to_string(), toml::Value::Integer(read(a.value()) * 10 + read(b.value())))])))
+    }));
+    let stack = "[[stack]]\nid = \"made\"\nop = \"t.pair\"\n\n\
+                 [[stack]]\nop = \"t.add\"\nb = { from = \"made.second\" }\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"sum\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"second\"\nvalue = { from = \"made.second\" }\n";
+    let node = Bundle::new(stack, &[]);
+    let engine = Engine::new(ops, None);
+    let (plan, problems) = Plan::of(&node.fields, &engine.ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    // The first port takes what is above it, the first output of the layer; the other is wired.
+    let sum = engine.output(&plan, &node, "sum", true).unwrap();
+    assert_eq!(sum.value.as_deref(), Some(&Value::Table(toml::from_str("n = 12").unwrap())));
+    let second = engine.output(&plan, &node, "second", true).unwrap();
+    assert_eq!(second.value.as_deref(), Some(&Value::Table(toml::from_str("n = 2").unwrap())));
+    // What names nothing is told, and what is left connected to nothing.
+    let wrong = Bundle::new("[[stack]]\nid = \"made\"\nop = \"t.pair\"\n\n[[stack]]\nop = \"t.add\"\nb = { from = \"made.third\" }\n", &[]);
+    assert!(Plan::of(&wrong.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("no output `third`")));
+    let open = Bundle::new("[[stack]]\nop = \"t.pair\"\n\n[[stack]]\nop = \"t.add\"\n", &[]);
+    assert!(Plan::of(&open.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("connected to nothing")));
 }

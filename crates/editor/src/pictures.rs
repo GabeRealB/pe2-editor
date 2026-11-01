@@ -1,7 +1,7 @@
-//! Pictures drawn off the window's thread: an asset's picture in a look - its kind's `picture/<look>` output, made
+//! Pictures drawn off the window's thread: an asset's picture in a look - its type's `picture/<look>` output, made
 //! through the work graph and not kept - drawn once on a few threads of their own (each a job of its extension) from
 //! the project as the last take-in left it, and shared by all that show it - the inspector's header, the preview's
-//! views, the panels. What its kind marks on it is made with it. Until one is drawn it is not there yet, and the window
+//! views, the panels. What its type marks on it is made with it. Until one is drawn it is not there yet, and the window
 //! is woken when it is. Each is kept with what it read: a take-in forgets those whose reads no longer hold.
 
 use pe2_ext::{Image, Marks};
@@ -137,7 +137,7 @@ impl Pictures {
     }
 }
 
-/// Make a picture asked for, and what its kind marks on it: a failure of those leaves the picture unmarked.
+/// Make a picture asked for, and what its type marks on it: a failure of those leaves the picture unmarked.
 fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request: &Request) -> Made {
     let index = &request.index;
     let failed = |why: String| Made { picture: Err(why), marks: None, reads: None };

@@ -77,10 +77,10 @@ fn material_contents(asset: &Asset) -> Contents {
 }
 
 fn is_material(asset: &Asset) -> bool {
-    asset.kind().and_then(|kind| kind.rsplit('@').next()) == Some("material")
+    asset.node_type().and_then(|node_type| node_type.rsplit('@').next()) == Some("material")
 }
 
-/// What every kind that shows in 3D shows here: the tree it is.
+/// What every type that shows in 3D shows here: the tree it is.
 pub fn contents(asset: &Asset, project: &dyn Project) -> Contents {
     if is_material(asset) {
         return material_contents(asset);

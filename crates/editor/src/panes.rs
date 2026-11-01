@@ -249,22 +249,24 @@ pub enum EditorKind {
     Graph,
     /// Its bundle's files, as text or bytes.
     Files,
-    /// One an extension gives its kind, by name.
+    /// One an extension gives its type, or a viewer of what it can be looked at as, by name.
     Extension(PanelName),
+    /// A preview its stack asks for, by the output's name.
+    Tap(PanelName),
 }
 
 impl EditorKind {
     /// Its icon on a document of an entry: an extension's editor says its own.
     pub fn icon(self, ws: &Workspace, path: &str) -> &'static str {
         match self {
-            EditorKind::Preview => icons::IMAGE,
+            EditorKind::Preview | EditorKind::Tap(_) => icons::IMAGE,
             EditorKind::Graph => icons::TREE_STRUCTURE,
             EditorKind::Files => icons::FILE_TEXT,
             EditorKind::Extension(name) => ws
                 .index
                 .assets
                 .get(path)
-                .and_then(|asset| ws.extensions.editors(asset).into_iter().find(|def| def.name == name.as_str())?.tab.as_ref().map(|tab| icons::glyph(tab.icon)))
+                .and_then(|asset| ws.extensions.tabs(asset).into_iter().find(|def| def.name == name.as_str())?.tab.as_ref().map(|tab| icons::glyph(tab.icon)))
                 .unwrap_or(icons::SQUARES_FOUR),
         }
     }
@@ -274,7 +276,7 @@ impl EditorKind {
             EditorKind::Preview => "Preview",
             EditorKind::Graph => "Graph",
             EditorKind::Files => "Files",
-            EditorKind::Extension(name) => name.as_str(),
+            EditorKind::Extension(name) | EditorKind::Tap(name) => name.as_str(),
         }
     }
 }
@@ -286,7 +288,17 @@ pub fn editors_of(ws: &Workspace, path: &str) -> Vec<EditorKind> {
     if crate::player::Player::plays(&ws.extensions, asset) || !ws.previews_of(asset).is_empty() {
         editors.push(EditorKind::Preview);
     }
-    // What a kind says it is edited in, before what any asset has: a model opens in 3D, not as its bytes.
+    // What it is looked at and edited in, before what any asset has: a model opens in 3D, not as its bytes.
+    for preview in ws.extensions.previews(asset) {
+        let editor = match preview.viewer {
+            Some(viewer) if !preview.tapped => EditorKind::Extension(PanelName::new(&viewer.name)),
+            _ if preview.tapped && !preview.ty.is_stream() => EditorKind::Tap(PanelName::new(&preview.output)),
+            _ => continue,
+        };
+        if !editors.contains(&editor) {
+            editors.push(editor);
+        }
+    }
     editors.extend(ws.extensions.editors(asset).into_iter().map(|def| EditorKind::Extension(PanelName::new(&def.name))));
     if !asset.files.is_empty() {
         editors.push(EditorKind::Files);
@@ -572,6 +584,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                                     ws.show_editor(ui, egui::Id::unique(pane), path, name.as_str(), settings.preview, nav);
                                 }
                             }
+                            Some(EditorKind::Tap(output)) => ws.show_tap(ui, egui::Id::unique(pane), subject, output.as_str(), settings.preview, nav),
                             Some(EditorKind::Preview) | None => preview_ui(ui, ws, pane, subject, nav, &mut settings.preview),
                         }
                     }
@@ -609,7 +622,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         {
             let name = path.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(path);
             let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path.as_str())?)));
-            let icon = asset.map_or(icons::FILE, |(ws, asset)| icons::for_kind(&ws.extensions, asset.kind.as_deref()).0);
+            let icon = asset.map_or(icons::FILE, |(ws, asset)| icons::for_type(&ws.extensions, ws.extensions.type_name(asset)).0);
             let icon = if state.editor == Some(EditorKind::Graph) { icons::TREE_STRUCTURE } else { icon };
             let others = self.states.iter().filter(|(p, _)| p.kind == PaneKind::Document).filter_map(|(_, s)| s.pinned.as_deref());
             let text = match telling_apart(path, others) {
@@ -832,7 +845,7 @@ fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<Pick>, edi
 /// The field narrowing the assets.
 fn filter_field(filter: &mut String) -> egui::TextEdit<'_> {
     egui::TextEdit::singleline(filter)
-        .hint_text(format!("{}  Filter by path or kind", icons::MAGNIFYING_GLASS))
+        .hint_text(format!("{}  Filter by path or type", icons::MAGNIFYING_GLASS))
         .desired_width(f32::INFINITY)
 }
 
@@ -987,7 +1000,7 @@ fn assets_grid_ui(ui: &mut egui::Ui, ws: &Workspace, pick: &mut Option<Pick>, ed
     });
 }
 
-/// An entry of the grid: its thumbnail, or its kind's icon, over its name.
+/// An entry of the grid: its thumbnail, or its type's icon, over its name.
 fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked: bool) -> egui::Response {
     const CELL: egui::Vec2 = egui::vec2(96.0, 88.0);
     const PICTURE: f32 = 60.0;
@@ -1008,7 +1021,7 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         image.paint_at(ui, picture);
     } else {
         let (icon, tint) = match asset {
-            Some(asset) => icons::for_kind(&ws.extensions, asset.kind.as_deref()),
+            Some(asset) => icons::for_type(&ws.extensions, ws.extensions.type_name(asset)),
             None if node.children.is_empty() => (icons::FILE, theme::weak()),
             None => (icons::FOLDER, theme::weak()),
         };
@@ -1174,10 +1187,10 @@ impl TreeView<'_> {
     ) -> Option<egui::Response> {
         let asset = node.asset.as_deref()?;
         let found = self.ws.index.assets.get(asset);
-        let kind = found.and_then(|a| a.kind.as_deref());
+        let kind = found.and_then(|a| self.ws.extensions.type_name(a));
         let dim = !self.ws.is_editable(asset);
         let selected = self.ws.selected.as_deref() == Some(asset);
-        // An asset whose kind makes thumbnails shows its own in place of its kind's icon, once it is made.
+        // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.
         let thumbnail =
             found.filter(|a| self.ws.extensions.has_thumbnail(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
         let button = match thumbnail {
@@ -1278,7 +1291,7 @@ fn entry_menu(ui: &mut egui::Ui, ws: &Workspace, real: &str) -> Option<EditReque
     request
 }
 
-/// A name after its kind's icon, the icon in the kind's tint; dimmed where it cannot be modified.
+/// A name after its type's icon, the icon in the type's tint; dimmed where it cannot be modified.
 fn labelled(
     extensions: &Extensions,
     style: &egui::Style,
@@ -1286,7 +1299,7 @@ fn labelled(
     name: &str,
     dim: bool,
 ) -> egui::text::LayoutJob {
-    let (icon, tint) = icons::for_kind(extensions, kind);
+    let (icon, tint) = icons::for_type(extensions, kind);
     icon_and_name(style, icon, tint, theme::text(), name, dim)
 }
 
@@ -1316,12 +1329,12 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
         .assets
         .values()
         .map(|a| &**a)
-        .filter(|a| a.path.to_lowercase().contains(filter) || a.kind.as_deref() == Some(filter))
+        .filter(|a| a.path.to_lowercase().contains(filter) || ws.extensions.type_label(a) == Some(filter))
         .collect();
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
     for asset in matches.iter().take(SHOWN) {
         let selected = ws.selected.as_deref() == Some(asset.path.as_str());
-        let job = labelled(&ws.extensions, ui.style(), asset.kind.as_deref(), &asset.path, !ws.is_editable(&asset.path));
+        let job = labelled(&ws.extensions, ui.style(), ws.extensions.type_name(asset), &asset.path, !ws.is_editable(&asset.path));
         let response = ui.add(egui::Button::selectable(selected, job).truncate().sense(egui::Sense::click_and_drag()));
         response.dnd_set_drag_payload(Dragged::Asset(asset.path.clone()));
         if response.clicked() {
@@ -1393,7 +1406,7 @@ fn files_view_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset) {
     }
 }
 
-/// An asset's views, by its kind's extension: its own, or those of the assets its slots hold, each under its look
+/// An asset's views, by its type's extension: its own, or those of the assets its slots hold, each under its look
 /// picker.
 fn views_ui(
     ui: &mut egui::Ui,
@@ -1947,13 +1960,13 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
     );
     ui.label(RichText::new(p.root.display().to_string()).small().color(theme::weak()));
     theme::section(ui, "Assets", |ui| {
-        let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+        let mut types = std::collections::BTreeMap::<&str, usize>::new();
         for a in ws.index.assets.values() {
-            *kinds.entry(a.kind.as_deref().unwrap_or("-")).or_default() += 1;
+            *types.entry(ws.extensions.type_label(a).unwrap_or("-")).or_default() += 1;
         }
-        egui::Grid::new("kinds").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-            for (kind, count) in kinds {
-                ui.label(kind);
+        egui::Grid::new("types").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+            for (node_type, count) in types {
+                ui.label(node_type);
                 ui.label(RichText::new(count.to_string()).color(theme::weak()));
                 ui.end_row();
             }

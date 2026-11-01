@@ -1,6 +1,6 @@
 [package]
 name = "pe2-ext"
-description = "The extension SDK: what an extension of the editor registers - asset kinds and roles, their fields, pictures, thumbnails and views - and what the host lends it"
+description = "The extension SDK: what an extension of the editor registers - asset types and roles, their fields, pictures, thumbnails and views - and what the host lends it"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

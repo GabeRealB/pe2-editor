@@ -115,6 +115,8 @@ pub struct Frame<'a> {
     pub editable: bool,
     /// The part selected of the asset: its fragment.
     pub part: Option<&'a str>,
+    /// The output it is a viewer of, for a viewer.
+    pub shown: Option<&'a str>,
 }
 
 /// What a view set of the asset it shows this frame.
@@ -175,11 +177,11 @@ impl<'a> Host<'a> {
         Sheet { index: self.lens.index, extensions: self.lens.extensions, fields, within: vec![], derived: None }
     }
 
-    fn child(&mut self, kind: Child) -> Box<dyn UiHost + '_> {
+    fn child(&mut self, node_type: Child) -> Box<dyn UiHost + '_> {
         let Host { target, lens, textures, nav, sets, frame, .. } = self;
         let parent = target.ui();
         let mut rect = parent.available_rect_before_wrap();
-        let layout = match kind {
+        let layout = match node_type {
             // A row starts one widget high, as egui's own rows do, and grows with what it holds.
             Child::Row(layout) => {
                 rect.set_height(parent.spacing().interact_size.y);
@@ -345,15 +347,15 @@ impl UiHost for Host<'_> {
         crate::inspector::being_edited(self.target.ctx(), &self.frame.asset?.path)
     }
 
-    fn reference_taking(&mut self, label: &str, kind: &str, reference: Option<&Value>) -> Option<Value> {
+    fn reference_taking(&mut self, label: &str, node_type: &str, reference: Option<&Value>) -> Option<Value> {
         let sheet = self.sheet(false);
         let ui = self.target.ui();
         let Some(chip) = reference.and_then(crate::inspector::reference_in) else {
-            let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
-            let shown = ui.label(RichText::new(format!("Drop {article} {kind} here")).small().color(theme::weak()));
+            let article = if node_type.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            let shown = ui.label(RichText::new(format!("Drop {article} {node_type} here")).small().color(theme::weak()));
             self.last = None;
             let asset = self.frame.asset.filter(|_| self.frame.editable)?;
-            return crate::inspector::reference_filling(ui, shown.rect, &sheet, asset, kind);
+            return crate::inspector::reference_filling(ui, shown.rect, &sheet, asset, node_type);
         };
         let reference = reference?;
         let shown = ui.scope(|ui| crate::inspector::reference_chip(ui, &sheet, chip, self.nav));
@@ -415,6 +417,10 @@ impl UiHost for Host<'_> {
             });
         });
         chosen
+    }
+
+    fn shown(&self) -> Option<String> {
+        self.frame.shown.map(str::to_string)
     }
 
     fn editable(&self) -> bool {

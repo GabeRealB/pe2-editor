@@ -1,5 +1,5 @@
 //! Extractors: how an extension makes its assets' native files from a release's discs. Extraction asks the extractor
-//! registered for an asset's kind and fields, if any (the rest it writes as their slots' bytes): it begins a session
+//! registered for an asset's type and fields, if any (the rest it writes as their slots' bytes): it begins a session
 //! with the declarations - what the extractor needs of the other assets (which file uploads a palette, where a VRAM
 //! slot is) it reads once, there - and then extracts asset after asset, reading what chunks it needs from the discs.
 
@@ -13,8 +13,8 @@ pub type Made = Vec<(String, Vec<u8>)>;
 /// The declarations, as extraction holds them: each the table its group file declares it by (with `from`, where
 /// extraction finds it per release).
 pub trait Declared {
-    /// Every declaration of a kind, as declared (`file`, `image`, `vram_slot`), by path, in path order.
-    fn declarations(&self, kind: &str) -> Vec<(String, Table)>;
+    /// Every declaration of a type, as declared (`file`, `image`, `vram_slot`), by path, in path order.
+    fn declarations(&self, node_type: &str) -> Vec<(String, Table)>;
 }
 
 /// A release's discs, as an extraction reads them.
@@ -45,7 +45,7 @@ pub trait Discs {
     }
 }
 
-/// An extraction session: the assets of the kind, one after another.
+/// An extraction session: the assets of the type, one after another.
 pub trait Extraction: Send {
     /// An asset's native files for one release, each checked against what its declaration says of it.
     ///
@@ -57,20 +57,20 @@ pub trait Extraction: Send {
 /// Begin a session.
 pub type Begin = dyn Fn(&dyn Declared) -> Result<Box<dyn Extraction>> + Send + Sync;
 
-/// An extractor as registered: for a kind, and of those the assets with some fields (all of them where none is named).
+/// An extractor as registered: for a type, and of those the assets with some fields (all of them where none is named).
 #[derive(Clone)]
 pub struct ExtractorDef {
     pub name: Name,
-    pub kind: Name,
+    pub node_type: Name,
     /// The fields an asset has to declare for this to extract it.
     pub requires: Vec<String>,
     pub begin: Arc<Begin>,
 }
 
 impl ExtractorDef {
-    /// Whether it extracts an asset of this kind (qualified) declaring these fields.
+    /// Whether it extracts an asset of this type (qualified) declaring these fields.
     #[must_use]
-    pub fn takes(&self, kind: &str, declares: impl Fn(&str) -> bool) -> bool {
-        self.kind.as_str() == kind && self.requires.iter().all(|field| declares(field))
+    pub fn takes(&self, node_type: &str, declares: impl Fn(&str) -> bool) -> bool {
+        self.node_type.as_str() == node_type && self.requires.iter().all(|field| declares(field))
     }
 }

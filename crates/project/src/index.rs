@@ -4,7 +4,7 @@
 //! and what is wrong.
 //!
 //! The index persists in the project cache's store (`store.rs`, `index.db`): for every file it read, its stamp, the
-//! hash of its content, and for an `node.toml` what the index needs of it - its kind, variant names and
+//! hash of its content, and for an `node.toml` what the index needs of it - its type, variant names and
 //! references - besides its text, which an asset parses only when its fields are asked for. Opening a project stats
 //! every file and reads again only those whose stamp changed; a file the store knows that no layer holds any more is
 //! dropped from it. A file modified no earlier than its record was made is read again whatever its stamp (git's
@@ -55,7 +55,8 @@ pub struct BundleFile {
 pub struct Asset {
     pub path: String,
     pub uid: Option<String>,
-    pub kind: Option<String>,
+    /// What of its stack says what it makes (`graph::shape`): nodes alike share one.
+    pub shape: Arc<str>,
     /// Its `variants`' names, in order.
     pub variants: Vec<String>,
     pub files: Vec<BundleFile>,
@@ -65,6 +66,7 @@ pub struct Asset {
     pub error: Option<String>,
     text: Arc<str>,
     fields: OnceLock<toml::Table>,
+    settings_text: OnceLock<String>,
     /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
     pub imported: Option<Arc<Imported>>,
     /// Its declaration as last applied, where it has unapplied changes (`applied`): what the work graph makes its
@@ -73,10 +75,12 @@ pub struct Asset {
 }
 
 /// A declaration as last applied: its text, and its fields.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AppliedDeclaration {
     pub text: String,
     pub fields: toml::Table,
+    /// The asset as it is written, for what follows it rather than what is applied.
+    pub written: Arc<Asset>,
 }
 
 /// An asset's settings with what its import derived from its source in their places.
@@ -94,6 +98,12 @@ pub struct Imported {
 }
 
 impl Asset {
+    /// It as it is written, where what is applied is older.
+    #[must_use]
+    pub fn written(&self) -> &Asset {
+        self.applied.as_ref().map_or(self, |applied| &applied.written)
+    }
+
     /// Its `node.toml` as written.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -102,7 +112,7 @@ impl Asset {
 
     /// Its `node.toml`'s fields; empty where it cannot be parsed.
     pub fn fields(&self) -> &toml::Table {
-        self.fields.get_or_init(|| toml::from_str(&self.text).unwrap_or_default())
+        self.fields.get_or_init(|| crate::graph::with_settings(toml::from_str(&self.text).unwrap_or_default()))
     }
 
     /// Its settings as readers see them: its fields, with what its import derived in their places.
@@ -114,10 +124,14 @@ impl Asset {
     /// Its settings as TOML.
     #[must_use]
     pub fn settings_text(&self) -> &str {
-        self.imported.as_ref().map_or_else(
-            || self.text(),
-            |i| i.text.get_or_init(|| toml::to_string(&i.settings).unwrap_or_default()).as_str(),
-        )
+        let written = |settings: &toml::Table| {
+            let settings = settings.iter().filter(|(key, _)| *key != "stack");
+            toml::to_string(&settings.map(|(key, value)| (key.clone(), value.clone())).collect::<toml::Table>()).unwrap_or_default()
+        };
+        match &self.imported {
+            Some(imported) => imported.text.get_or_init(|| written(&imported.settings)).as_str(),
+            None => self.settings_text.get_or_init(|| written(self.fields())).as_str(),
+        }
     }
 }
 
@@ -381,7 +395,7 @@ fn read(file: &Pending) -> Option<Record> {
     Some(Record { size: file.size, modified: file.modified, recorded, sha1: sha1_hex(&bytes), declaration })
 }
 
-/// What the index keeps of an `node.toml`: parsed once, here, for its kind, uid, variant names and references.
+/// What the index keeps of an `node.toml`: parsed once, here, for its type, uid, variant names and references.
 fn declaration(bytes: &[u8]) -> Declaration {
     let parsed: Result<toml::Table, String> = std::str::from_utf8(bytes)
         .map_err(|e| e.to_string())
@@ -390,10 +404,11 @@ fn declaration(bytes: &[u8]) -> Declaration {
     match parsed {
         Ok(table) => {
             let string = |key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_string);
-            out.kind = string("kind");
+            out.shape = crate::graph::shape(&table);
             out.uid = string("uid");
             // An image's looks: its variants, keyed by name.
-            out.variants = table
+            let settings = crate::graph::with_settings(table.clone());
+            out.variants = settings
                 .get("variants")
                 .and_then(toml::Value::as_table)
                 .into_iter()
@@ -1611,13 +1626,14 @@ impl Index {
             let mut asset = Asset {
                 path: asset_of(path).to_string(),
                 uid: Some(node.uid.clone()),
-                kind: None,
+                shape: Arc::from(""),
                 variants: vec![],
                 files: vec![],
                 layers: layers.map(|l| self.layers[l].name.clone()).collect(),
                 error: None,
                 text: Arc::from(""),
                 fields: OnceLock::new(),
+                settings_text: OnceLock::new(),
                 imported: None,
                 applied: None,
             };
@@ -1626,7 +1642,7 @@ impl Index {
                 if name == NODE_FILE
                     && let Some(d) = &record.declaration
                 {
-                    asset.kind.clone_from(&d.kind);
+                    asset.shape = Arc::from(d.shape.as_str());
                     asset.variants.clone_from(&d.variants);
                     asset.error.clone_from(&d.error);
                     asset.text = d.text.clone();
@@ -1658,13 +1674,14 @@ impl Index {
             let mut asset = Asset {
                 path: at.to_string(),
                 uid: Some(name.clone()),
-                kind: None,
+                shape: Arc::from(""),
                 variants: vec![],
                 files: vec![],
                 layers: vec![below.layer.clone()],
                 error: None,
                 text: Arc::from(""),
                 fields: OnceLock::new(),
+                settings_text: OnceLock::new(),
                 imported: None,
                 applied: None,
             };
@@ -1673,7 +1690,7 @@ impl Index {
                 if file_name == NODE_FILE
                     && let Some(d) = &record.declaration
                 {
-                    asset.kind.clone_from(&d.kind);
+                    asset.shape = Arc::from(d.shape.as_str());
                     asset.text = d.text.clone();
                 }
                 asset.files.push(BundleFile {
@@ -1823,13 +1840,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pe2-index-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(&root, ".layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nkind = \"image\"\n");
+        write(&root, ".layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n");
         write(&root, ".layers/base/g/a.node/native.texels", "texels");
-        write(&root, ".layers/base/b.node/node.toml", "kind = \"file\"\nslot = \"uid://a#palettes/default\"\n");
+        write(&root, ".layers/base/b.node/node.toml", "stack = [{ op = \"t.file\" }]\nslot = \"uid://a#palettes/default\"\n");
         write(
             &root,
             ".layers/base/f.node/node.toml",
-            "kind = \"file\"\nold = { uid = \"uid://a\", path = \"res://g/a.node\" }\n",
+            "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\", path = \"res://g/a.node\" }\n",
         );
         std::fs::create_dir_all(root.join(".layers/top")).unwrap();
         root
@@ -1882,7 +1899,7 @@ mod tests {
         top.ops.insert(uid_of("b.node"), Op::Move { to: "c.node".into() });
         top.ops.insert(uid_of("f.node"), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
+        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         write(&root, ".layers/top/g/a.node/native.texels", "repainted");
         let (_, index) = open(&root);
         assert_eq!(index.assets.keys().collect::<Vec<_>>(), ["c", "g/a"]);
@@ -1910,7 +1927,7 @@ mod tests {
         top.entries.insert("uid://again".into(), "g".into());
         top.entries.insert("uid://beside".into(), "g/beside.node".into());
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/beside.node/node.toml", "kind = \"file\"\n");
+        write(&root, ".layers/top/g/beside.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
         assert!(index.assets.contains_key("g/a") && index.assets.contains_key("g/beside"));
@@ -1924,7 +1941,7 @@ mod tests {
         top.entries.insert("uid://gone".into(), "nowhere".into());
         top.ops.insert("uid://unknown".into(), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/b.node/node.toml", "kind = \"file\"\n");
+        write(&root, ".layers/top/b.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         write(&root, ".layers/top/new.node/node.toml", "kind = [unclosed\n");
         let (_, index) = open(&root);
         let has = |p: &Problem| index.problems.contains(p);
@@ -1967,7 +1984,7 @@ mod tests {
         let mut out = String::new();
         for (path, a) in &index.assets {
             let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
-            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.kind, a.variants, a.layers, a.error, a.text, files);
+            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.shape, a.variants, a.layers, a.error, a.text, files);
         }
         for (path, e) in index.entries.iter() {
             let _ = writeln!(out, "entry {path} {e:?}");
@@ -1999,17 +2016,17 @@ mod tests {
         // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
         write(&root, ".layers/base/g/a.node/native.texels", "repainted");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "a file of a bundle", false);
-        write(&root, ".layers/base/b.node/node.toml", "kind = \"file\"\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
+        write(&root, ".layers/base/b.node/node.toml", "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
         check(&mut index, &project, &[base("b.node/node.toml")], "references changed", false);
         write(&root, ".layers/base/f.node/node.toml", "kind = [unclosed\n");
         check(&mut index, &project, &[base("f.node/node.toml")], "an unreadable declaration", false);
-        write(&root, ".layers/base/f.node/node.toml", "kind = \"file\"\nold = { uid = \"uid://a\" }\n");
+        write(&root, ".layers/base/f.node/node.toml", "stack = [{ op = \"t.file\" }]\nold = { uid = \"uid://a\" }\n");
         check(&mut index, &project, &[base("f.node/node.toml")], "readable again", false);
         // A file added to a bundle: its content changes, its paths stay.
         write(&root, ".layers/base/g/a.node/extra.bin", "more");
         check(&mut index, &project, &[base("g/a.node/extra.bin")], "a file added to a bundle", false);
         // Structure: a new bundle, listed in its changeset; one removed.
-        write(&root, ".layers/base/n.node/node.toml", "kind = \"file\"\nto = \"uid://a\"\n");
+        write(&root, ".layers/base/n.node/node.toml", "stack = [{ op = \"t.file\" }]\nto = \"uid://a\"\n");
         check(&mut index, &project, &[base("n.node/node.toml")], "a new bundle", true);
         std::fs::remove_dir_all(base("n.node")).unwrap();
         check(&mut index, &project, &[base("n.node")], "a bundle removed", true);
@@ -2017,11 +2034,11 @@ mod tests {
         let mut top = Changeset::default();
         top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
+        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         check(&mut index, &project, &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.node/node.toml")], "an override", true);
         write(&root, ".layers/base/g/a.node/native.texels", "retouched");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "an override's base changed", true);
-        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\nnote = \"uid://a\"\n");
+        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n");
         check(&mut index, &project, &[root.join(".layers/top/g/a.node/node.toml")], "the override's own content", false);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2035,7 +2052,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tree);
         write(&tree, "main.c", "int main;");
         write(&tree, "main.o", "object");
-        write(&tree, "x.node/node.toml", "kind = \"file\"\n");
+        write(&tree, "x.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         write(&tree, ".gitignore", "*.o\n");
         let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
         let mount = format!("[[mount]]\nat = \"code\"\npath = \"{}\"\nread_only = true\n", tree.display());
@@ -2060,7 +2077,7 @@ mod tests {
         top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
         top.ops.insert("uid://nothing".into(), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
-        write(&root, ".layers/top/g/a.node/node.toml", "kind = \"image\"\n");
+        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let (_, mut index) = open(&root);
         let info = index.layers();
         assert_eq!((info[1].overrides, info[1].deletes, info[1].problems), (1, 1, 1));

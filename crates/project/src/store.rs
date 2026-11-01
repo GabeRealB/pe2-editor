@@ -1,6 +1,6 @@
 //! The index's store: `index.db` in the project cache, an SQLite database written with Turso (SQLite in Rust). A row
 //! per file the index read - its stamp, when it was recorded, the hash of its content - and for an `node.toml` what
-//! the index needs of it without parsing it again: its kind, uid and variant names, its references (a table of
+//! the index needs of it without parsing it again: its type, uid and variant names, its references (a table of
 //! their own), its error, and its text, which an asset parses only when something asks for its fields. Opening reads
 //! the rows; a watcher batch rewrites only its own, in one transaction.
 //!
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use turso::Value;
 
 /// Raised whenever the tables change shape; a store of another version is emptied.
-const VERSION: i64 = 4;
+const VERSION: i64 = 7;
 /// Rows a write must touch to be checkpointed at once.
 const CHECKPOINT_AFTER: usize = 1000;
 
@@ -25,7 +25,8 @@ pub type Stamp = (u64, u32);
 /// What the index needs of an `node.toml` without parsing it again.
 #[derive(Clone, Debug, Default)]
 pub struct Declaration {
-    pub kind: Option<String>,
+    /// What of its stack says what it makes.
+    pub shape: String,
     /// The uid it names itself, as declarations did before changesets.
     pub uid: Option<String>,
     /// Its `variants`' names, in order.
@@ -95,7 +96,7 @@ impl Store {
                 "DROP TABLE IF EXISTS file; DROP TABLE IF EXISTS reference;
                  CREATE TABLE file (path TEXT PRIMARY KEY, size INTEGER NOT NULL, secs INTEGER NOT NULL,
                      nanos INTEGER NOT NULL, recorded_secs INTEGER NOT NULL, recorded_nanos INTEGER NOT NULL,
-                     sha1 TEXT NOT NULL, declaration INTEGER NOT NULL, kind TEXT, uid TEXT, variants TEXT,
+                     sha1 TEXT NOT NULL, declaration INTEGER NOT NULL, node_type TEXT, uid TEXT, variants TEXT,
                      error TEXT, text TEXT);
                  CREATE TABLE reference (path TEXT NOT NULL, slot TEXT NOT NULL, uid TEXT NOT NULL,
                      target TEXT NOT NULL, output TEXT NOT NULL);
@@ -128,7 +129,7 @@ impl Store {
         }
         let mut out = HashMap::new();
         let mut rows = block_on(self.conn.query(
-            "SELECT path, size, secs, nanos, recorded_secs, recorded_nanos, sha1, declaration, kind, uid,
+            "SELECT path, size, secs, nanos, recorded_secs, recorded_nanos, sha1, declaration, node_type, uid,
                  variants, error, text FROM file",
             (),
         ))?;
@@ -136,7 +137,7 @@ impl Store {
             let v: Vec<Value> = (0..13).map(|i| row.get_value(i)).collect::<turso::Result<_>>()?;
             let path = text(&v[0]).unwrap_or_default();
             let declaration = (int(&v[7]) != 0).then(|| Declaration {
-                kind: text(&v[8]),
+                shape: text(&v[8]).unwrap_or_default(),
                 uid: text(&v[9]),
                 variants: text(&v[10]).map_or_else(Vec::new, |s| s.lines().map(str::to_string).collect()),
                 references: references.remove(&path).unwrap_or_default(),
@@ -188,11 +189,11 @@ impl Store {
         let mut drop_file = block_on(self.conn.prepare("DELETE FROM file WHERE path = ?1"))?;
         let mut drop_references = block_on(self.conn.prepare("DELETE FROM reference WHERE path = ?1"))?;
         let mut put = block_on(self.conn.prepare(
-            "INSERT INTO file (path, size, secs, nanos, recorded_secs, recorded_nanos, sha1, declaration, kind,
+            "INSERT INTO file (path, size, secs, nanos, recorded_secs, recorded_nanos, sha1, declaration, node_type,
                  uid, variants, error, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT (path) DO UPDATE SET size = excluded.size, secs = excluded.secs, nanos = excluded.nanos,
                  recorded_secs = excluded.recorded_secs, recorded_nanos = excluded.recorded_nanos,
-                 sha1 = excluded.sha1, declaration = excluded.declaration, kind = excluded.kind,
+                 sha1 = excluded.sha1, declaration = excluded.declaration, node_type = excluded.node_type,
                  uid = excluded.uid, variants = excluded.variants, error = excluded.error, text = excluded.text",
         ))?;
         let mut reference =
@@ -217,7 +218,7 @@ impl Store {
                 i64::from(r.recorded.1),
                 r.sha1.as_str(),
                 i64::from(d.is_some()),
-                d.and_then(|d| d.kind.clone()),
+                d.map(|d| d.shape.clone()),
                 d.and_then(|d| d.uid.clone()),
                 d.map(|d| d.variants.join("\n")),
                 d.and_then(|d| d.error.clone()),

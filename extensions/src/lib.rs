@@ -7,7 +7,7 @@
 
 use project::Project;
 use project::ext::component::Unsandboxed;
-use project::ext::{EXTENSION_COMPONENT, EXTENSION_KIND, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
+use project::ext::{EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
 use project::index::Index;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -290,7 +290,7 @@ pub fn project_components(index: &Index) -> Vec<Found> {
     index
         .assets
         .values()
-        .filter(|a| a.kind.as_deref() == Some(EXTENSION_KIND))
+        .filter(|a| a.files.iter().any(|file| file.name == EXTENSION_COMPONENT))
         .filter_map(|a| {
             let file = a.files.iter().find(|f| f.name == EXTENSION_COMPONENT)?;
             let origin = Origin::Project { asset: a.path.clone(), file: file.path.clone() };
@@ -460,11 +460,12 @@ mod tests {
                 x.to_be_bytes()[0]
             })
             .collect();
-        let declaration = format!("kind = \"image\"\nmode = \"direct_16bpp\"\nsize = [{width}, {height}]\n");
+        let declaration = format!("mode = \"direct_16bpp\"\nsize = [{width}, {height}]\n");
         let node = Texture { fields: declaration.parse().unwrap(), declaration };
         let native = Value::Typed(Typed {
             ty: "pe2.images@texels".into(),
             files: vec![File::new("native.texels", texels)],
+            settings: node.fields.clone(),
             ..Typed::default()
         });
         let made = engine.run("pe2.images@ora_source", vec![vec![native]], &toml::Table::new(), &node).unwrap();
@@ -487,6 +488,7 @@ mod tests {
             let native = Value::Typed(Typed {
                 ty: "pe2.images@texels".into(),
                 files: vec![File::new("native.texels", vec![0; 4])],
+                settings: node.fields.clone(),
                 ..Typed::default()
             });
             match engine.run("pe2.images@marks", vec![vec![native]], &toml::Table::new(), &node).unwrap() {
@@ -495,16 +497,16 @@ mod tests {
             }
         };
         let atlas = marks(
-            "kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [16, 16]\n\
+            "mode = \"indexed_8bpp\"\nsize = [16, 16]\n\
              cells.a = { rect = [0, 0, 8, 16] }\ncells.b = { rect = [8, 0, 8, 16] }\n",
         );
         assert_eq!(atlas.boxes.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         assert_eq!((atlas.summary.as_str(), atlas.toggle.as_str(), atlas.legend), ("2 cells", "Cells", true));
-        let wide = marks("kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [300, 8]\n");
+        let wide = marks("mode = \"indexed_8bpp\"\nsize = [300, 8]\n");
         assert_eq!(wide.boxes.len(), 3);
         assert_eq!((wide.boxes[2].rect.x, wide.boxes[2].rect.width), (256.0, 44.0));
         assert_eq!(wide.toggle, "Pages");
-        let plain = marks("kind = \"image\"\nmode = \"indexed_8bpp\"\nsize = [64, 8]\n");
+        let plain = marks("mode = \"indexed_8bpp\"\nsize = [64, 8]\n");
         assert_eq!(plain, pe2_ext::Marks::default());
     }
 

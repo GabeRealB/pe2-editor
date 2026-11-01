@@ -3,7 +3,7 @@
 /// over it, so an extension's code is the same linked in or built as a component.
 ///
 /// Callbacks cannot cross: what an extension registers is described by `register`'s result, each callback by a handle
-/// the host calls back with (an operation's for its run, a kind's index for its outputs' members, a
+/// the host calls back with (an operation's for its run, a type's index for its outputs' members, a
 /// field's for its readings, a view's or a panel's for its views, a tool's for its work). Settings cross as TOML (`4`,
 /// `"indexed_4bpp"`, `{ a = 1 }`); the work graph's values as `value`.
 ///
@@ -201,8 +201,8 @@ interface host {
     resource asset {
         path: func() -> string;
         uid: func() -> option<string>;
-        /// Its kind, qualified (`pe2.images@image`), as the host resolved it.
-        kind: func() -> option<string>;
+        /// Its type, qualified (`pe2.images@image`), as the host resolved it.
+        node-type: func() -> option<string>;
         /// Its declaration, as written (TOML).
         declaration: func() -> string;
         has-file: func(name: string) -> bool;
@@ -231,11 +231,13 @@ interface host {
         place: func(path: string) -> option<string>;
         /// For an operation's run: an output of another asset, by its path or a reference to it, recorded as read.
         output-of: func(path: string, address: string) -> result<value, string>;
+        /// For an operation's run: the node a reference names, by its path and uid.
+        node-named: func(reference: string) -> option<node-named>;
         /// For an operation's run: the config being built, recorded as read.
         build-config: func() -> option<build-config>;
-        /// For an operation's run: the assets of a kind, each by its path with its declaration as written. What is made is made again
+        /// For an operation's run: the assets of a type, each by its path with its declaration as written. What is made is made again
         /// when any changes, or one comes or goes.
-        assets-of: func(kind: string) -> result<list<tuple<string, string>>, string>;
+        assets-of: func(node-type: string) -> result<list<tuple<string, string>>, string>;
     }
 
     /// A file being made, appended to a piece at a time and then finished: kept by the host as it comes - in memory
@@ -256,9 +258,9 @@ interface host {
         /// The member of a family of an asset's outputs it is being looked at in (`picture`: its look), where one was
         /// chosen.
         chosen: func(path: string, family: string) -> option<string>;
-        find: func(kind: string) -> list<asset>;
+        find: func(node-type: string) -> list<asset>;
         selection: func() -> option<asset>;
-        /// What the host understands of any asset, answered by the extension its kind is: its picture in a look (its
+        /// What the host understands of any asset, answered by the extension its type is: its picture in a look (its
         /// first where none is named), and any output of it that is a picture (`palettes/default`).
         picture: func(path: string, look: option<string>) -> option<result<image, string>>;
         image: func(path: string, address: string) -> option<result<image, string>>;
@@ -268,6 +270,9 @@ interface host {
         revision: func() -> u64;
         /// An output of an asset that is a table (TOML): none where it has no such output, or why it could not be made.
         table: func(path: string, address: string) -> option<result<string, string>>;
+        /// An output of an asset that is one file, whole, made from its settings as they are written: what a viewer
+        /// shows of what is being edited. None where it has no such output, or why it could not be made.
+        bytes: func(path: string, address: string) -> option<result<list<u8>, string>>;
         /// A service another extension offers (`pe2.images@palette`), with its arguments (TOML): its answer (TOML). Only
         /// the services of the extensions this one requires, or its own.
         call: func(service: string, arguments: string) -> result<string, string>;
@@ -276,6 +281,13 @@ interface host {
     /// An image a view shows, held by the host: made once, shown by handle every frame.
     resource texture {
         constructor(key: string, image: image);
+    }
+
+    /// A node as a reference names it: its path, its uid, and what it is, each type qualified.
+    record node-named {
+        path: string,
+        uid: option<string>,
+        types: list<string>,
     }
 
     /// A table's cell: nothing (keeping its column), text, the host's chip for a reference (TOML), an icon button
@@ -372,6 +384,8 @@ interface host {
         combo: func(id: string, selected: string, options: list<string>) -> option<u32>;
         /// Whether the asset shown can be edited.
         editable: func() -> bool;
+        /// The output this view is a viewer of, by its address; none for any other view.
+        shown: func() -> option<string>;
         /// Set a field of the asset shown (TOML), or remove it.
         set: func(key: string, value: option<string>);
         /// As `set`, a step of its own: what a gesture ended with, where `set` keeps a value being adjusted in one.
@@ -390,10 +404,10 @@ interface host {
         section: func(title: string) -> ui;
         collapsing: func(id: string, title: string, note: string) -> option<ui>;
         canvas: func(canvas: canvas);
-        /// The host's chip for a reference, taking an asset of `kind` dropped on it: the reference that makes, its
+        /// The host's chip for a reference, taking an asset of `type` dropped on it: the reference that makes, its
         /// other keys kept, in the frame it is dropped. With no reference it is a place to drop one, and answers with
         /// the dropped asset's uid. `label` says what is being set.
-        reference-taking: func(label: string, kind: string, reference: option<string>) -> option<string>;
+        reference-taking: func(label: string, node-type: string, reference: option<string>) -> option<string>;
         /// Rows of cells in aligned columns, `id` keeping its widths: the cell of a button clicked this frame (its
         /// row, its column).
         table: func(id: string, rows: list<list<cell>>) -> option<tuple<u32, u32>>;
@@ -416,8 +430,8 @@ interface host {
 
     /// The declarations, lent to an extraction session's beginning.
     resource declarations {
-        /// Every declaration of a kind (as declared: `file`, `image`, `vram_slot`), by path in path order, as TOML.
-        of-kind: func(kind: string) -> list<tuple<string, string>>;
+        /// Every declaration of a type (as declared: `file`, `image`, `vram_slot`), by path in path order, as TOML.
+        of-type: func(node-type: string) -> list<tuple<string, string>>;
     }
 
     /// A release's discs, lent for one asset's extraction.
@@ -468,6 +482,7 @@ interface guest {
         brief: bool,
         choices: list<tuple<string, string>>,
         read-only: bool,
+        required: bool,
         custom: bool,
     }
 
@@ -542,7 +557,7 @@ interface guest {
         action(tuple<string, string>),
         rename(tuple<string, string>),
         moved(tuple<string, string, content-place>),
-        /// An asset, by its path, dropped on a row that takes its kind.
+        /// An asset, by its path, dropped on a row that takes its type.
         dropped(tuple<string, string>),
     }
 
@@ -578,37 +593,10 @@ interface guest {
     /// How an output is kept: in the project's store, in its build directory, or not at all.
     enum retain { cache, build, transient }
 
-    /// An output a kind declares on every node of it: made by an operation (qualified) from the node's stack's result
-    /// - a family where the operation has a parameter, its members called back by the kind's index and the output's.
-    record output {
+    /// What an operation makes of a value of what it takes, for whoever asks a node making one by this name: a conversion, in no stack.
+    record provides {
         name: string,
-        op: string,
         retain: retain,
-        members: bool,
-        /// The output of its kind it is made from; none, its node's result.
-        %from: option<string>,
-    }
-
-    /// A kind; its outputs' members called back by its index.
-    record kind {
-        name: string,
-        alias: option<string>,
-        label: string,
-        icon: option<tuple<icon, tint>>,
-        fields: list<field>,
-        /// Whether it says what is inside its assets.
-        contents: bool,
-        /// Whether it says what a part's fields are, rather than those being what its table holds.
-        part-sheet: bool,
-        views: list<view>,
-        inspector: list<view>,
-        /// Editors of its own, beside the preview: each of these a document can show instead of it.
-        editors: list<view>,
-        /// Views at the head of the contents pane, over its rows: what rows cannot say.
-        contents-views: list<view>,
-        outputs: list<output>,
-        /// The stack a node of it has where its bundle states none (TOML `[[stack]]` tables).
-        stack: option<string>,
     }
 
     record panel {
@@ -655,9 +643,14 @@ interface guest {
         derives: list<string>,
         /// The operation undoing it, qualified.
         inverse: option<string>,
-        /// Its parameter: its name, and the kind of value it takes (`name`, `number`).
+        /// Its parameter: its name, and the type of value it takes (`name`, `number`).
         parameter: option<tuple<string, string>>,
         priority: s32,
+        provides: option<provides>,
+        /// Whether the members of what it makes are listed: called back by the operation.
+        members: bool,
+        /// Its outputs after the first: each by name, with its type.
+        also: list<tuple<string, string>>,
     }
 
     /// A type of the extension's own: with a recognizer - signatures, a sniff called back by its handle, a media type
@@ -669,14 +662,36 @@ interface guest {
         media-type: option<string>,
         signatures: list<signature>,
         sniff: bool,
+        /// How a node making one shows: where it says any of this, such a node is of this type.
+        alias: option<string>,
+        icon: option<tuple<icon, tint>>,
+        fields: list<field>,
+        /// Whether it says what is inside its assets.
+        contents: bool,
+        /// Whether it says what a part's fields are, rather than those being what its table holds.
+        part-sheet: bool,
+        views: list<view>,
+        inspector: list<view>,
+        /// Editors of its own, beside the preview: each of these a document can show instead of it.
+        editors: list<view>,
+        /// Views at the head of the contents pane, over its rows: what rows cannot say.
+        contents-views: list<view>,
+        /// The stack a node of it is made with by default (TOML `[[stack]]` tables).
+        stack: option<string>,
+        /// What it adds to a type of what it requires, whose qualified name is its `name`.
+        extends: bool,
+        /// Whether a node of it holds only what is set on it: then an operation of the type's name makes those settings.
+        data: bool,
+        /// The value types a node making one is of this type, by their qualified names.
+        values: list<string>,
     }
 
-    /// An extractor: the native files of a kind's assets (of those with all of `requires`' fields) from the
+    /// An extractor: the native files of a type's assets (of those with all of `requires`' fields) from the
     /// discs, in sessions (`extraction`).
     record extractor {
         handle: u32,
         name: string,
-        kind: string,
+        node-type: string,
         requires: list<string>,
     }
 
@@ -693,11 +708,13 @@ interface guest {
         choices: list<tuple<string, string>>,
     }
 
-    /// How a file replaces what an asset is made of: a kind's assets, the files of a name (`*.mp4`), and the stack they
-    /// then have (TOML), the file written `{file}`.
-    record recipe {
-        kind: string,
-        pattern: string,
+    /// A way to make a node: its stack as it is stamped into the node (TOML, `{file}` its file), the type of node that makes,
+    /// and the files it takes, by name (`*.mp4`).
+    record template {
+        name: string,
+        label: string,
+        node-type: string,
+        files: list<string>,
         stack: string,
     }
 
@@ -711,7 +728,6 @@ interface guest {
     }
 
     record registration {
-        kinds: list<kind>,
         /// The events it declares, by name, with their labels.
         events: list<tuple<string, string>>,
         hooks: list<hook>,
@@ -722,14 +738,10 @@ interface guest {
         ops: list<op>,
         types: list<value-type>,
         extractors: list<extractor>,
-        /// Outputs it adds to kinds of what it requires, by the kind's qualified name.
-        additions: list<tuple<string, output>>,
-        /// Inspector tabs it adds to kinds of what it requires, by the kind's qualified name.
-        tabs: list<tuple<string, view>>,
-        /// The stacks it gives kinds of what it requires that have none, by the kind's qualified name (TOML).
-        stacks: list<tuple<string, string>>,
-        /// What files replace assets of kinds, with what.
-        recipes: list<recipe>,
+        /// Viewers: each view of a document showing an output of a type, by the type's name.
+        viewers: list<tuple<string, view>>,
+        /// Ways to make a node.
+        templates: list<template>,
         /// Commands: each a label, and the tool of its own it runs, with no arguments.
         commands: list<tuple<string, string>>,
         /// The memory a job of something it registered may take, where more than the host's default: by its name
@@ -742,21 +754,21 @@ interface guest {
     /// Run the extension's entry point.
     register: func() -> result<registration, string>;
 
-    /// An operation's run: lent its node as an asset - its path, kind and declared settings, its files the
+    /// An operation's run: lent its node as an asset - its path, type and declared settings, its files the
     /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
     /// parameter.
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
     /// A family's members, of an asset: each by its parameter's value, with a label. An added output goes by its place
-    /// after the kinds, as `kind`.
-    members: func(kind: u32, output: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
+    /// after the types, as `type`.
+    members: func(op: u32, asset: borrow<asset>) -> list<tuple<string, string>>;
     /// A field's reading of a value (`brief`: within a list's row).
     format: func(field: u32, brief: bool, value: string) -> option<string>;
     /// What is inside an asset, in order.
-    contents: func(kind: u32, asset: borrow<asset>, project: borrow<project>) -> asset-contents;
+    contents: func(ty: u32, asset: borrow<asset>, project: borrow<project>) -> asset-contents;
     /// What comes of something done in the contents: why it cannot be, where it cannot.
-    content-act: func(kind: u32, asset: borrow<asset>, project: borrow<project>, request: content-request) -> result<content-outcome, string>;
+    content-act: func(ty: u32, asset: borrow<asset>, project: borrow<project>, request: content-request) -> result<content-outcome, string>;
     /// A part's fields, by its fragment.
-    part-sheet-of: func(kind: u32, asset: borrow<asset>, project: borrow<project>, part: string) -> option<part-sheet>;
+    part-sheet-of: func(ty: u32, asset: borrow<asset>, project: borrow<project>, part: string) -> option<part-sheet>;
     /// A type's sniff: a file's name, size and first bytes to its version (empty where it has none), or not this.
     sniff: func(ty: u32, name: string, size: u64, head: list<u8>) -> option<string>;
     /// Whether this instance may be reclaimed: asked before the host drops a long-running instance (its views' when the

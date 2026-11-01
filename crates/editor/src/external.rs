@@ -1,4 +1,4 @@
-//! Opening files in other applications: the tool the settings name for the file's kind, or the system's default.
+//! Opening files in other applications: the tool the settings name for the file's type, or the system's default.
 //! A form no tool reads is converted first - a BS picture to a PNG in the temporary directory.
 
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ impl Category {
         }
     }
 
-    /// The kind of tool a media type (`image/openraster`) is edited in, by its top-level type; none for what no tool
+    /// The type of tool a media type (`image/openraster`) is edited in, by its top-level type; none for what no tool
     /// of the settings takes.
     pub fn of_media_type(media_type: &str) -> Option<Category> {
         match media_type.split('/').next()? {
@@ -77,7 +77,7 @@ impl Category {
         }
     }
 
-    /// The kind of tool a file opens in, by its extension.
+    /// The type of tool a file opens in, by its extension.
     pub fn of(file: &Path) -> Category {
         match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("png" | "bs" | "pe2img" | "pe2clut" | "bmp" | "tga") => Category::Image,
@@ -157,7 +157,7 @@ fn which(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(program).is_file()))
 }
 
-/// Open a file (named `name` for whatever it is converted to) with the tool for its kind, or the system's default.
+/// Open a file (named `name` for whatever it is converted to) with the tool for its type, or the system's default.
 ///
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.

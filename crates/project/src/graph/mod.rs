@@ -6,7 +6,7 @@
 //! input is the result above and whose result goes on down. Output layers are taps: each exposes the value at its level
 //! as one of the node's outputs, under a name, and passes it on unchanged. An output reaching an operation with a
 //! parameter is a family of it, each of its outputs addressed by a value of the parameter (`picture/night`). A node's
-//! outputs are its output layers and its kind's, known without evaluating anything.
+//! outputs are its output layers and its type's, known without evaluating anything.
 //!
 //! A stack is lowered to a plan - its operations in an order each comes after those it takes from - checked as it is:
 //! an operation no extension provides, a source below the top, a value of one type given to a port of another, a cycle
@@ -123,13 +123,21 @@ pub struct OpDef {
     /// What it makes as its settings say, where they say: what a stored file's name or a declared type tells of it
     /// before anything runs, in place of `output`.
     pub output_of: Option<Arc<OutputOf>>,
+    /// Which comes first of those doing the same.
+    pub priority: i32,
+    /// It makes what is set on it, as it is: what a node holding only data is.
+    pub data: bool,
+    /// What a layer of it has to set: nothing stands in for these.
+    pub required: Vec<String>,
+    /// Its outputs after the first, by name: with any, what it makes is a list of them all, in order.
+    pub also: Vec<(String, Type)>,
 }
 
 impl OpDef {
     #[must_use]
     pub fn new(name: &str, label: &str, version: &str) -> OpDef {
         let (name, label, version) = (name.to_string(), label.to_string(), version.to_string());
-        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None, output_of: None }
+        OpDef { name, label, version, inputs: Vec::new(), output: None, parameter: None, run: None, start: None, output_of: None, priority: 0, data: false, required: Vec::new(), also: Vec::new() }
     }
 
     /// What it makes by its settings, where they say more than `output`.
@@ -185,7 +193,14 @@ pub const FILE: &str = "file";
 /// be copied: an import of a movie reads the STR it replaces.
 pub const BELOW: &str = "below";
 pub const CONSTANT: &str = "constant";
+/// What a node says of itself, whatever its stack: its output of this name, for others to read.
+pub const SETTINGS: &str = "settings";
 pub const OUTPUT: &str = "output";
+/// What comes down to it shown, by a viewer of what it is or through the operation that makes it what one shows: a tap
+/// as `output` is, taking part in no build.
+pub const PREVIEW: &str = "preview";
+/// One of the outputs of an operation with several: what a wire to it comes to.
+pub const PICK: &str = "pick";
 pub const GRAPH: &str = "graph";
 /// Other nodes' outputs, by the references a field of the node's settings holds: `field` (dotted), each item's `key`
 /// where its items are tables, and the `output` taken of each.
@@ -246,18 +261,70 @@ pub const GATES: &[Gate] = &[
 #[derive(Clone)]
 pub struct Ops {
     defs: HashMap<String, Arc<OpDef>>,
+    /// What a viewer takes: the host's own, and those extensions register.
+    pub viewers: Arc<Vec<Type>>,
+}
+
+impl Ops {
+    /// Whether a viewer takes a value of a type.
+    #[must_use]
+    pub fn viewable(&self, ty: &Type) -> bool {
+        // What is told only when it runs says nothing of what shows it.
+        let told = |ty: &Type| matches!(ty, Type::Any | Type::Var(_));
+        let open = told(ty) || matches!(ty, Type::File(inner) if told(inner));
+        !open && self.viewers.iter().any(|viewer| viewer.unify(ty, &mut Vec::new()))
+    }
+
+    /// What turns a value of a type into what a viewer takes, step by step: the fewest steps there are, each the first
+    /// by priority, then by name.
+    #[must_use]
+    pub fn conversion(&self, ty: &Type) -> Vec<(String, Arc<OpDef>)> {
+        let mut ordered: Vec<(&String, &Arc<OpDef>)> = self.defs.iter().filter(|(_, def)| def.inputs.len() == 1 && def.output.is_some()).collect();
+        ordered.sort_by_key(|(name, def)| (-def.priority, name.as_str()));
+        let mut seen = vec![ty.to_string()];
+        let mut reached = vec![(ty.clone(), Vec::new())];
+        while !reached.is_empty() {
+            let mut next = Vec::new();
+            for (from, path) in reached {
+                for (name, def) in ordered.iter().filter(|(_, def)| def.inputs[0].ty.unify(&from, &mut Vec::new())) {
+                    let made = def.output.clone().unwrap_or(Type::Any);
+                    let mut longer: Vec<(String, Arc<OpDef>)> = path.clone();
+                    longer.push(((*name).clone(), (*def).clone()));
+                    if self.viewable(&made) {
+                        return longer;
+                    }
+                    if !seen.contains(&made.to_string()) {
+                        seen.push(made.to_string());
+                        next.push((made, longer));
+                    }
+                }
+            }
+            reached = next;
+        }
+        Vec::new()
+    }
 }
 
 impl Default for Ops {
     fn default() -> Ops {
-        let mut ops = Ops { defs: HashMap::new() };
+        let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()) };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             let name = call.setting_str("file")?.to_string();
             call.stored(&name, Vec::new()).map(Value::Typed)
         }));
+        ops.add(OpDef::new(PICK, "One of its outputs", "1").input(port("made", Type::Any)).makes(Type::Any, |call| {
+            let at = call.settings().get("output").and_then(Toml::as_integer).and_then(|at| usize::try_from(at).ok()).unwrap_or(0);
+            let Value::List(mut made) = call.take(0)?.take() else { anyhow::bail!("given no outputs") };
+            anyhow::ensure!(at < made.len(), "it made {} outputs, and its output {at} is asked for", made.len());
+            Ok(made.swap_remove(at))
+        }));
         ops.add(OpDef::new(CONSTANT, "Constant", "1").makes(Type::Table, |call| {
             let value = call.settings().get("value").and_then(Toml::as_table).cloned();
             value.map(Value::Table).ok_or_else(|| anyhow::anyhow!("its `value` is not a table"))
+        }));
+        ops.add(OpDef::new(SETTINGS, "Its settings", "1").input(port("node", Type::Any)).makes(Type::Table, |call| {
+            let given = call.take(0)?;
+            Ok(Value::Table(given.value().settings().cloned().unwrap_or_default()))
         }));
         let declared = |settings: &Table| Type::parse(settings.get("type")?.as_str()?, "").ok();
         ops.add(OpDef::new(BELOW, "The version below", "1").output_of(declared).makes(Type::Any, move |call| {
@@ -369,6 +436,8 @@ pub struct Output {
     /// The step whose value it is.
     pub from: usize,
     pub retain: Retain,
+    /// Shown by a viewer of what it is; it takes part in no build.
+    pub preview: bool,
     /// Made as soon as what it reads changes, rather than when asked for.
     pub eager: bool,
     pub at: String,
@@ -399,7 +468,7 @@ pub struct Rule {
 }
 
 /// A stack lowered: its operations, each after those it takes from, its outputs, and its result - the step its stack
-/// ends with, which its kind's outputs take, and which is the node as its readers see it.
+/// ends with, which its type's outputs take, and which is the node as its readers see it.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
     pub steps: Vec<Step>,
@@ -409,10 +478,12 @@ pub struct Plan {
     /// is given. None where nothing does.
     pub above: Vec<Option<Type>>,
     pub rules: Vec<Rule>,
+    /// Outputs there is one of for each key of a table of its node's, as `(table, its step, how it is kept)`.
+    pub each: Vec<(String, usize, Retain)>,
 }
 
-/// An output a node's kind adds after its stack: made by an operation from the stack's result - or from what another
-/// of the kind's outputs is made of (`from`, its index among them) - with settings of its own.
+/// An output a node's type adds after its stack: made by an operation from the stack's result - or from what another
+/// of the type's outputs is made of (`from`, its index among them) - with settings of its own.
 #[derive(Clone, Debug)]
 pub struct Tail {
     pub name: String,
@@ -421,7 +492,10 @@ pub struct Tail {
     pub op: String,
     pub retain: Retain,
     pub from: Option<usize>,
+    /// The step of the stack it is made from, where it is not the result.
+    pub step: Option<usize>,
     pub settings: Table,
+    pub preview: bool,
 }
 
 /// How a retention is written.
@@ -432,6 +506,61 @@ pub fn retain_name(retain: Retain) -> &'static str {
         Retain::Build => "build",
         Retain::Transient => "transient",
     }
+}
+
+/// What is set on a layer, without how the stack is put together.
+#[must_use]
+pub fn set_on(op: &str, settings: &Table) -> Table {
+    let held = settings.iter().filter(|(key, value)| holds_settings(op) && !structural(op, key) && wire_of(value).is_none());
+    held.map(|(key, value)| (key.clone(), value.clone())).collect()
+}
+
+/// Whether a layer's key is no setting of its node's, but how the stack is put together.
+fn structural(op: &str, key: &str) -> bool {
+    matches!(key, "op" | "id" | "pos" | "ops" | "result")
+        || (op == FILE && key == "file")
+        || (op == REFERENCES && matches!(key, "field" | "key" | "output"))
+}
+
+/// Whether a layer holds settings of its node's: an output says how it is kept, not what its node is.
+fn holds_settings(op: &str) -> bool {
+    ![OUTPUT, PREVIEW, GRAPH, BELOW, CONCATENATE].contains(&op)
+}
+
+/// A node's declaration with the settings on its layers among its fields: what each operation is set to, as the node's
+/// settings, for whatever reads them by name. Its `stack` stays as it is.
+#[must_use]
+pub fn with_settings(mut fields: Table) -> Table {
+    let mut found = Vec::new();
+    for layer in fields.get("stack").and_then(Toml::as_array).into_iter().flatten() {
+        let op = layer.get("op").and_then(Toml::as_str).unwrap_or_default();
+        let held = layer.as_table().filter(|_| holds_settings(op)).into_iter().flatten();
+        found.extend(held.filter(|(key, value)| !structural(op, key) && wire_of(value).is_none()).map(|(key, value)| (key.clone(), value.clone())));
+    }
+    for (key, value) in found {
+        fields.entry(key).or_insert(value);
+    }
+    fields
+}
+
+/// What a layer's input is connected to, where it says: `{ from = "read.cells" }`, a layer's `id` and, of one with several,
+/// which of its outputs.
+#[must_use]
+pub fn wire_of(value: &Toml) -> Option<&Toml> {
+    let table = value.as_table().filter(|table| table.len() == 1)?;
+    table.get("from").filter(|from| from.is_str() || from.is_array())
+}
+
+/// What of a stack says what it makes: its layers without what is set on them, so that nodes alike share one plan.
+#[must_use]
+pub fn shape(fields: &Table) -> String {
+    let kept = |layer: &Toml| {
+        let held = layer.as_table().into_iter().flatten();
+        let kept = held.filter(|(key, value)| wire_of(value).is_some() || matches!(key.as_str(), "op" | "id" | "name" | "file" | "type" | "result" | "ops" | "each"));
+        Toml::Table(kept.map(|(key, value)| (key.clone(), value.clone())).collect())
+    };
+    let layers: Vec<Toml> = fields.get("stack").and_then(Toml::as_array).into_iter().flatten().map(kept).collect();
+    toml::to_string(&Table::from_iter([("stack".to_string(), Toml::Array(layers))])).unwrap_or_default()
 }
 
 /// What is wrong with a stack, where.
@@ -457,7 +586,7 @@ impl Plan {
     /// the steps and outputs that are sound, so a node keeps what it can make.
     #[must_use]
     pub fn of(declaration: &Table, ops: &Ops, tail: &[Tail]) -> (Plan, Vec<Problem>) {
-        let mut lowering = Lowering { ops, plan: Plan::default(), problems: Vec::new() };
+        let mut lowering = Lowering { ops, declaration, plan: Plan::default(), problems: Vec::new(), named: HashMap::new(), picks: HashMap::new() };
         let result = match declaration.get("stack") {
             None => None,
             Some(Toml::Array(layers)) => lowering.stack(layers),
@@ -466,12 +595,18 @@ impl Plan {
                 None
             }
         };
+        // What it is, whatever hangs off it further down: what it says is its native form, else what is set on it.
+        let native = lowering.plan.outputs.iter().find(|output| output.name == "native").map(|output| output.from);
+        let data = lowering.plan.steps.iter().position(|step| ops.get(&step.op).is_some_and(|def| def.data));
+        let result = native.or(data).or(result);
         lowering.plan.above.push(result.map(|step| lowering.plan.steps[step].ty.clone()));
         lowering.plan.result = result;
         // The node as its readers see it is its result: kept - by the stack where an output keeps it, else by the
-        // host - unless it is a stored file, which its readers see as it is, or a family (one asset is no family).
+        // host - unless it is a stored file or what is set on it, which its readers see as they are, or a family (one
+        // asset is no family).
         if let Some(result) = result
             && lowering.plan.steps[result].op != FILE
+            && !lowering.plan.result_is_data(ops)
             && lowering.plan.result_output().is_none()
             && !lowering.reaches_parameter(result)
         {
@@ -481,11 +616,11 @@ impl Plan {
             layer.insert("when".into(), "eager".into());
             lowering.output(&layer, result, "stack", &[]);
         }
-        // The kind's outputs, after the stack: a node without a result has none of them.
+        // The type's outputs, after the stack: a node without a result has none of them.
         let mut made: Vec<Option<usize>> = Vec::with_capacity(tail.len());
         for (i, output) in tail.iter().enumerate() {
-            let at = format!("kind.outputs[{i}]");
-            let from = output.from.map_or(result, |f| made.get(f).copied().flatten());
+            let at = format!("type.outputs[{i}]");
+            let from = output.from.map_or_else(|| output.step.or(result), |f| made.get(f).copied().flatten());
             let step = match (from, ops.get(&output.op).cloned()) {
                 // One that takes nothing is about the node, not what its stack makes: a stack that fails, or has nothing to make, does not take it away.
                 (_, Some(def)) if def.inputs.is_empty() => Some(lowering.step(&def, &output.op, output.settings.clone(), Vec::new(), &at)),
@@ -504,6 +639,9 @@ impl Plan {
                 }
                 layer.insert("retain".into(), retain_name(output.retain).into());
                 lowering.output(&layer, step, &at, &[]);
+                if let Some(made) = lowering.plan.outputs.last_mut().filter(|made| made.name == output.name) {
+                    made.preview = output.preview;
+                }
             }
             made.push(step);
         }
@@ -516,6 +654,12 @@ impl Plan {
     pub fn result_output(&self) -> Option<usize> {
         let result = self.result?;
         self.outputs.iter().position(|o| o.from == result && o.parameter.is_none() && o.retain == Retain::Cache)
+    }
+
+    /// Whether its result is only what is set on its node.
+    #[must_use]
+    pub fn result_is_data(&self, ops: &Ops) -> bool {
+        self.result.is_some_and(|result| ops.get(&self.steps[result].op).is_some_and(|def| def.data))
     }
 
     /// Whether its result is a stored file of its node, which readers see as it is.
@@ -580,8 +724,14 @@ impl Plan {
 
 struct Lowering<'a> {
     ops: &'a Ops,
+    /// What is set on the node, for what there is one of for each key of a table.
+    declaration: &'a Table,
     plan: Plan,
     problems: Vec<Problem>,
+    /// The layers of its stack with an `id`, by it: the step each is.
+    named: HashMap<String, usize>,
+    /// The steps picking outputs, by the step and the output.
+    picks: HashMap<(usize, usize), usize>,
 }
 
 /// A layer's or graph operation's settings: its table without the keys that place it.
@@ -597,6 +747,12 @@ impl Lowering<'_> {
     /// A step of an operation taking from `inputs` (by port): its types checked, its variables bound by what it is
     /// given; its index.
     fn step(&mut self, def: &OpDef, op: &str, settings: Table, inputs: Vec<Vec<usize>>, at: &str) -> usize {
+        // What comes to it through a value is not known here: a layer of a stack says what it is set to.
+        if at.starts_with("stack") {
+            for missing in def.required.iter().filter(|key| !settings.contains_key(*key)) {
+                self.problem(at, &format!("`{op}` has to be given `{missing}`"));
+            }
+        }
         let mut bound = Vec::new();
         for (port, from) in def.inputs.iter().zip(&inputs) {
             for &from in from {
@@ -628,11 +784,18 @@ impl Lowering<'_> {
                 continue;
             };
             match op {
-                OUTPUT => {
-                    if let Some(from) = above {
-                        self.output(layer, from, &at, &[]);
-                    } else {
-                        self.problem(&at, "is an output with nothing above it");
+                OUTPUT | PREVIEW => {
+                    let wired = layer.get("value").and_then(wire_of).and_then(Toml::as_str);
+                    let from = match wired {
+                        Some(wire) => self.wire(wire, &at),
+                        None => above,
+                    };
+                    match (from, op) {
+                        (Some(from), OUTPUT) if layer.contains_key("each") => self.each(layer, from, &at),
+                        (Some(from), OUTPUT) => self.output(layer, from, &at, &[]),
+                        (Some(from), _) => self.preview(layer, from, &at),
+                        (None, _) if wired.is_some() => {}
+                        (None, _) => self.problem(&at, &format!("is {} with nothing above it", if op == OUTPUT { "an output" } else { "a preview" })),
                     }
                 }
                 GRAPH => above = self.graph(layer, above, &at),
@@ -642,26 +805,123 @@ impl Lowering<'_> {
                         above = None;
                         continue;
                     };
-                    let inputs = if def.is_source() {
-                        if above.is_some() {
-                            self.problem(&at, &format!("`{op}` is a source below the top: it would drop what is above it"));
-                        }
-                        Vec::new()
-                    } else if def.inputs.len() > 1 {
-                        self.problem(&at, &format!("`{op}` takes {} inputs: it belongs in a graph layer", def.inputs.len()));
+                    let Some(inputs) = self.inputs_of(&def, layer, above, &at) else {
                         above = None;
                         continue;
-                    } else if let Some(from) = above {
-                        vec![vec![from]]
-                    } else {
-                        self.problem(&at, &format!("`{op}` takes a value, and nothing is above it"));
-                        continue;
                     };
-                    above = Some(self.step(&def, op, settings_of(layer, &["op"]), inputs, &at));
+                    let settings = layer.iter().filter(|(key, value)| !matches!(key.as_str(), "op" | "id") && wire_of(value).is_none());
+                    let settings = settings.map(|(key, value)| (key.clone(), value.clone())).collect();
+                    let step = self.step(&def, op, settings, inputs, &at);
+                    if let Some(id) = layer.get("id").and_then(Toml::as_str) {
+                        self.named.insert(id.to_string(), step);
+                    }
+                    above = Some(if def.also.is_empty() { step } else { self.picked(step, 0, def.output.clone().unwrap_or(Type::Any), &at) });
                 }
             }
         }
         above
+    }
+
+    /// An output for each key of a table of the node's, under that key's name, its operation told the key as `each`.
+    fn each(&mut self, layer: &Table, from: usize, at: &str) {
+        let table = layer.get("each").and_then(Toml::as_str).unwrap_or_default().to_string();
+        let keys: Vec<String> = self.declaration.get(&table).and_then(Toml::as_table).into_iter().flatten().map(|(key, _)| key.clone()).collect();
+        let retain = match layer.get("retain").and_then(Toml::as_str) {
+            Some("cache") => Retain::Cache,
+            Some("build") => Retain::Build,
+            _ => Retain::Transient,
+        };
+        self.plan.each.push((table, from, retain));
+        for key in keys {
+            let mut step = self.plan.steps[from].clone();
+            step.settings.insert("each".into(), key.clone().into());
+            self.plan.steps.push(step);
+            let mut output = layer.clone();
+            output.remove("each");
+            output.insert("name".into(), key.into());
+            self.output(&output, self.plan.steps.len() - 1, at, &[]);
+        }
+    }
+
+    /// What a layer's ports take: what they say they are connected to, or the first what is above it.
+    fn inputs_of(&mut self, def: &OpDef, layer: &Table, above: Option<usize>, at: &str) -> Option<Vec<Vec<usize>>> {
+        let mut inputs = Vec::with_capacity(def.inputs.len());
+        for (place, port) in def.inputs.iter().enumerate() {
+            let given = match layer.get(&port.name).and_then(wire_of) {
+                Some(Toml::String(wire)) => vec![self.wire(wire, at)?],
+                Some(Toml::Array(wires)) => {
+                    let wires = wires.iter().filter_map(Toml::as_str).map(|wire| self.wire(wire, at));
+                    wires.collect::<Vec<_>>().into_iter().collect::<Option<Vec<usize>>>()?
+                }
+                _ if place == 0 && above.is_some() => above.into_iter().collect(),
+                _ if port.many && place > 0 => Vec::new(),
+                _ => {
+                    self.problem(at, &format!("its `{}` is connected to nothing", port.name));
+                    return None;
+                }
+            };
+            inputs.push(given);
+        }
+        Some(inputs)
+    }
+
+    /// The step a wire comes from: a layer by its `id`, one of several outputs after a dot, the first where none is named.
+    fn wire(&mut self, wire: &str, at: &str) -> Option<usize> {
+        let (id, output) = wire.split_once('.').map_or((wire, None), |(id, output)| (id, Some(output)));
+        let Some(&step) = self.named.get(id) else {
+            self.problem(at, &format!("it takes from `{id}`, no layer above it"));
+            return None;
+        };
+        let def = self.ops.get(&self.plan.steps[step].op).cloned()?;
+        let first = def.output.clone().unwrap_or(Type::Any);
+        match output {
+            None if def.also.is_empty() => Some(step),
+            None => Some(self.picked(step, 0, first, at)),
+            Some(name) => {
+                let Some(place) = def.also.iter().position(|(known, _)| known == name) else {
+                    self.problem(at, &format!("`{id}` has no output `{name}`"));
+                    return None;
+                };
+                Some(self.picked(step, place + 1, def.also[place].1.clone(), at))
+            }
+        }
+    }
+
+    /// The step reading one of a step's outputs.
+    fn picked(&mut self, step: usize, output: usize, ty: Type, at: &str) -> usize {
+        if let Some(picked) = self.picks.get(&(step, output)) {
+            return *picked;
+        }
+        let settings = Table::from_iter([("output".to_string(), Toml::Integer(i64::try_from(output).unwrap_or(0)))]);
+        self.plan.steps.push(Step { op: PICK.to_string(), settings, inputs: vec![vec![step]], ty, at: at.to_string() });
+        let picked = self.plan.steps.len() - 1;
+        self.picks.insert((step, output), picked);
+        picked
+    }
+
+    /// What is above shown: as it is where a viewer takes it, else through the operation that makes it what one takes.
+    fn preview(&mut self, layer: &Table, from: usize, at: &str) {
+        let ty = self.plan.steps[from].ty.clone();
+        let mut shown = from;
+        if !self.ops.viewable(&ty) {
+            let steps = self.ops.conversion(&ty);
+            if steps.is_empty() {
+                self.problem(at, &format!("nothing shows {ty}"));
+                return;
+            }
+            for (op, def) in steps {
+                shown = self.step(&def, &op, Table::new(), vec![vec![shown]], at);
+            }
+        }
+        let mut output = layer.clone();
+        let taken = self.plan.outputs.iter().filter(|o| o.preview).count();
+        output.entry("name").or_insert_with(|| format!("preview_{taken}").into());
+        output.entry("retain").or_insert_with(|| retain_name(Retain::Transient).into());
+        let before = self.plan.outputs.len();
+        self.output(&output, shown, at, &[]);
+        if let Some(made) = self.plan.outputs.get_mut(before) {
+            made.preview = true;
+        }
     }
 
     /// Whether a step reaches an operation with a parameter: what it makes is a family.
@@ -769,7 +1029,7 @@ impl Lowering<'_> {
             self.problem(at, &format!("`deploy = \"{place}\"`: what is deployed goes under `build/`"));
         }
         let events = OutputEvents { pull, listen, deploy, ran: text("ran"), changed: text("changed"), failed: text("failed") };
-        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, fixed, from, retain, eager, at: at.to_string(), events });
+        self.plan.outputs.push(Output { name: name.to_string(), parameter: None, fixed, from, retain, preview: false, eager, at: at.to_string(), events });
     }
 
     /// A graph layer's operations, after those they take from (the layer above's result as `above`): its result's
@@ -910,7 +1170,7 @@ pub fn import_of(fields: &Table) -> Option<Import<'_>> {
     let top = stack.first()?.as_table()?;
     let source = top.get("file")?.as_str().filter(|_| top.get("op").and_then(Toml::as_str) == Some(FILE))?;
     let below = stack.get(1)?.as_table()?;
-    let op = below.get("op")?.as_str().filter(|op| ![FILE, CONSTANT, OUTPUT, GRAPH].contains(op))?;
+    let op = below.get("op")?.as_str().filter(|op| ![FILE, CONSTANT, OUTPUT, PREVIEW, GRAPH].contains(op))?;
     Some(Import { source, op, settings: settings_of(below, &["op"]) })
 }
 

@@ -1,8 +1,13 @@
 //! What a 3D view shows: a mesh, or a model with its materials filled, or a prefab's models in one tree. The game has
 //! one coordinate node for a joint and an attachment alike, so a prefab comes out as one model, a child's root hanging
 //! under the node it is attached to; posing and picking need to know nothing of how it was put together.
+//!
+//! It is what a node's `scene` output is, so that what reads it reads a value: `scene` makes it from what the graph
+//! holds, read as any operation reads other nodes, and `assemble` asks for it.
 
-use pe2_ext::{Asset, Project, Result, Value, anyhow, bail};
+use pe2_ext::{Asset, Call, Data, File, Project, Result, Source, Table, Typed, Value, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::material::{self, Definition};
 use crate::mesh;
@@ -11,7 +16,7 @@ use crate::model::{Blend, Corner, Face, Model, Part, Shading};
 use crate::skeleton;
 
 /// What fills a texture slot: a cell of an image, through a palette of its or the cell's own.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bound {
     pub image: String,
     pub cell: String,
@@ -29,7 +34,7 @@ impl Bound {
 }
 
 /// How a slot's faces draw, a prefab's overrides taken.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drawn {
     pub transparent: bool,
     pub blend: Blend,
@@ -41,7 +46,7 @@ pub struct Drawn {
 }
 
 /// A node of what was assembled: a part of the model, by what it is called.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
     /// The model attached here, for the root of one; a prefab's root and a joint have none.
@@ -51,7 +56,7 @@ pub struct Node {
 }
 
 /// Where a node's transform is kept: a skeleton's own, or a prefab's for what it does to a joint or to what fills a part.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Place {
     Joint(usize),
     Pose(String),
@@ -59,14 +64,14 @@ pub enum Place {
     Fill(Vec<String>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attached {
     pub path: String,
     pub reference: String,
 }
 
 /// A material slot of what was assembled.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
     pub name: String,
     /// What fills it, for a model; a mesh alone has its slots empty.
@@ -86,6 +91,7 @@ impl Slot {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Assembled {
     pub model: Model,
     /// The joints a prefab moves from where the skeleton has them.
@@ -96,17 +102,83 @@ pub struct Assembled {
     pub slots: Vec<Slot>,
 }
 
+/// What a scene is made from: the nodes it reaches, read as an operation reads them, and the member shown of each group.
+struct Nodes<'c, 'a> {
+    call: &'c Call<'a>,
+    chosen: BTreeMap<String, String>,
+}
+
+/// A node reached, by what the graph makes of it.
+struct Held<'c, 'a> {
+    call: &'c Call<'a>,
+    path: String,
+    uid: Option<String>,
+    /// What it is.
+    node_type: Option<String>,
+    settings: Table,
+}
+
+impl Held<'_, '_> {
+    fn asset(&self) -> Asset<'_> {
+        Asset::new(self, self.node_type.as_deref())
+    }
+}
+
+impl Source for Held<'_, '_> {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn uid(&self) -> Option<&str> {
+        self.uid.as_deref()
+    }
+
+    fn fields(&self) -> &Table {
+        &self.settings
+    }
+
+    fn declaration(&self) -> &'static str {
+        ""
+    }
+
+    fn has_file(&self, name: &str) -> bool {
+        self.read(name).is_ok()
+    }
+
+    /// The stored file a node makes as itself.
+    fn read(&self, _: &str) -> Result<Vec<u8>> {
+        let Data::Typed(stored) = self.call.output_of(&self.path, "native")? else { bail!("{}: it makes no file", self.path) };
+        self.call.read(stored.file()?)
+    }
+}
+
+impl<'c, 'a> Nodes<'c, 'a> {
+    /// The node a reference names.
+    fn named(&self, reference: &str) -> Result<Held<'c, 'a>> {
+        let named = self.call.node_named(reference).ok_or_else(|| anyhow!("{reference}: no such node"))?;
+        let settings = self.call.table_of(&named.path, "settings")?;
+        Ok(Held { call: self.call, path: named.path, uid: named.uid, node_type: named.types.into_iter().next(), settings })
+    }
+
+    fn shown(&self, asset: &Asset) -> Vec<prefab::Group> {
+        prefab::groups_as(asset, |group| self.chosen.get(group).cloned())
+    }
+}
+
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn resolved<'a>(project: &'a dyn Project, holder: &Asset, key: &str, reference: Option<&Value>) -> Result<Asset<'a>> {
+fn resolved<'c, 'a>(nodes: &Nodes<'c, 'a>, holder: &Asset, key: &str, reference: Option<&Value>) -> Result<Held<'c, 'a>> {
     let reference = reference.ok_or_else(|| anyhow!("{}: no {key}", holder.path()))?;
-    project.resolve(reference.get("slot").unwrap_or(reference)).ok_or_else(|| anyhow!("{}: its {key} is not in the project", holder.path()))
+    let target = pe2_ext::target_of(reference.get("slot").unwrap_or(reference));
+    let target = target.ok_or_else(|| anyhow!("{}: its {key} is no reference", holder.path()))?;
+    nodes.named(target).map_err(|_| anyhow!("{}: its {key} is not in the project", holder.path()))
 }
 
-fn bound_of(project: &dyn Project, holder: &Asset, texture: &Value) -> Result<Bound> {
-    let image = resolved(project, holder, "image", Some(texture))?;
+fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
+    let image = resolved(nodes, holder, "image", Some(texture))?;
+    let image = image.asset();
     let cell = material::cell_of(texture).ok_or_else(|| anyhow!("{}: a texture has no cell", holder.path()))?;
     let held = image.parts("cells").into_iter().find(|(name, _)| *name == cell).ok_or_else(|| anyhow!("{}: {} has no cell {cell}", holder.path(), image.path()))?;
     let rect = held.1.get("rect").and_then(Value::as_array).ok_or_else(|| anyhow!("{}: {cell} has no size", image.path()))?;
@@ -114,47 +186,50 @@ fn bound_of(project: &dyn Project, holder: &Asset, texture: &Value) -> Result<Bo
     Ok(Bound { image: image.path().to_string(), cell: cell.to_string(), palette: material::palette_of(texture).map(str::to_string), size: [side(2), side(3)] })
 }
 
-fn drawn_of<'a>(project: &dyn Project, holder: &Asset, field: impl Fn(&str) -> Option<&'a Value>) -> Result<Drawn> {
+fn drawn_of<'a>(nodes: &Nodes, holder: &Asset, field: impl Fn(&str) -> Option<&'a Value>) -> Result<Drawn> {
     let read = Definition::read(&field);
     let texture = |key: &str| {
         let taken = read.shader.textures.iter().any(|(known, _)| *known == key);
-        field(key).filter(|_| taken).map(|texture| bound_of(project, holder, texture)).transpose()
+        field(key).filter(|_| taken).map(|texture| bound_of(nodes, holder, texture)).transpose()
     };
     Ok(Drawn { transparent: read.transparent, blend: read.blend, main: texture(material::MAIN)?, environment: texture(material::ENVIRONMENT)?, strength: read.strength, effect: read.effect })
 }
 
 /// A slot of a model, with what the prefab node holding it overrides: the same keys as a material's, and `material`.
-fn slot_of(project: &dyn Project, model: &Asset, name: &str, overrides: Option<&Value>) -> Result<Slot> {
+fn slot_of(nodes: &Nodes, model: &Asset, name: &str, overrides: Option<&Value>) -> Result<Slot> {
     let of_model = model.field("materials").and_then(|materials| materials.get(name));
     let Some(reference) = overrides.and_then(|overrides| overrides.get("material")).or(of_model) else {
         return Ok(Slot::empty(name));
     };
-    let held = resolved(project, model, name, Some(reference))?;
-    let drawn = drawn_of(project, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
+    let held = resolved(nodes, model, name, Some(reference))?;
+    let held = held.asset();
+    let drawn = drawn_of(nodes, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
     let attached = Attached { path: held.path().to_string(), reference: held.uid().unwrap_or_default().to_string() };
     Ok(Slot { material: Some(attached), reference: Some(reference.clone()), drawn: Some(drawn), overrides: overrides.cloned(), ..Slot::empty(name) })
 }
 
 /// A mesh, posed by its skeleton where it has one, with its parts named.
-fn mesh_of(project: &dyn Project, mesh: &Asset) -> Result<Assembled> {
+fn mesh_of(nodes: &Nodes, mesh: &Asset) -> Result<Assembled> {
     let (mut model, names) = mesh::read(&String::from_utf8_lossy(&mesh.read(mesh::FILE)?))?;
     let slots = names.iter().map(|name| Slot::empty(name)).collect();
-    let mut nodes: Vec<Node> = (0..model.parts.len()).map(|_| Node { name: leaf(mesh.path()).to_string(), attached: None, place: None }).collect();
+    let mut shown: Vec<Node> = (0..model.parts.len()).map(|_| Node { name: leaf(mesh.path()).to_string(), attached: None, place: None }).collect();
     if mesh.field("skeleton").is_some() {
-        let skeleton = resolved(project, mesh, "skeleton", mesh.field("skeleton"))?;
+        let skeleton = resolved(nodes, mesh, "skeleton", mesh.field("skeleton"))?;
+        let skeleton = skeleton.asset();
         let joints = skeleton::of(&skeleton)?;
         mesh::pose(&mut model, &joints)?;
-        nodes = joints.into_iter().map(|joint| Node { name: joint.name, attached: None, place: None }).collect();
+        shown = joints.into_iter().map(|joint| Node { name: joint.name, attached: None, place: None }).collect();
     }
-    Ok(Assembled { posed: Vec::new(), model, nodes, slots })
+    Ok(Assembled { posed: Vec::new(), model, nodes: shown, slots })
 }
 
-fn model_of(project: &dyn Project, asset: &Asset, overrides: Option<&Value>, node: Option<(&str, &[String])>) -> Result<Assembled> {
-    let mesh = resolved(project, asset, "mesh", asset.field("mesh"))?;
-    let mut assembled = mesh_of(project, &mesh)?;
+fn model_of(nodes: &Nodes, asset: &Asset, overrides: Option<&Value>, node: Option<(&str, &[String])>) -> Result<Assembled> {
+    let mesh = resolved(nodes, asset, "mesh", asset.field("mesh"))?;
+    let mesh = mesh.asset();
+    let mut assembled = mesh_of(nodes, &mesh)?;
     for slot in &mut assembled.slots {
         let overridden = overrides.and_then(|overrides| overrides.get(&slot.name));
-        *slot = slot_of(project, asset, &slot.name, overridden)?;
+        *slot = slot_of(nodes, asset, &slot.name, overridden)?;
         slot.node = node.map(|(name, within)| (name.to_string(), within.to_vec()));
     }
     Ok(assembled)
@@ -202,44 +277,25 @@ fn ball(size: Option<[u32; 2]>) -> Model {
 }
 
 /// A material alone, on a ball.
-fn material_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    let drawn = drawn_of(project, asset, |key| asset.field(key))?;
+fn material_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
+    let drawn = drawn_of(nodes, asset, |key| asset.field(key))?;
     let model = ball(drawn.main.as_ref().map(|main| main.size));
     let slot = Slot { drawn: Some(drawn), ..Slot::empty(leaf(asset.path())) };
     Ok(Assembled { posed: Vec::new(), model, nodes: vec![Node { name: leaf(asset.path()).to_string(), attached: None, place: None }], slots: vec![slot] })
 }
 
-/// What a prefab says of a joint: it replaces what the skeleton says, as far as it goes.
-fn posed(part: &mut Part, pose: &Value) {
-    part.translation = skeleton::translation_of(pose).unwrap_or(part.translation);
-    if let Some(rotation) = skeleton::numbers_of(pose, "rotation") {
-        part.rotation = skeleton::matrix(rotation);
-    }
-}
-
-/// How a prefab holds what it attaches: over what the model's root says of itself, as a child of the node.
-fn held(part: &mut Part, child: &Value) {
-    let [x, y, z] = skeleton::translation_of(child).unwrap_or_default();
-    part.translation = [part.translation[0] + x, part.translation[1] + y, part.translation[2] + z];
-    let turned = skeleton::numbers_of(child, "rotation").map_or([[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], skeleton::matrix);
-    let scale = skeleton::numbers_of(child, "scale").unwrap_or([1.0; 3]);
-    let wide = |row: &[i16; 3]| row.map(f64::from);
-    let (turned, rest) = (turned.map(|row| wide(&row)), part.rotation.map(|row| wide(&row)));
-    #[expect(clippy::cast_possible_truncation, reason = "clamped to what the game's fixed point holds")]
-    let cell = |row: usize, column: usize| ((0..3).map(|k| turned[row][k] * scale[k] * rest[k][column]).sum::<f64>() / 4096.0).clamp(-32768.0, 32767.0).round() as i16;
-    part.rotation = std::array::from_fn(|row| std::array::from_fn(|column| cell(row, column)));
-}
-
 /// Whether what fills a part is built on a skeleton: its parts are that skeleton's joints, not something to hang on them.
-fn on_skeleton(project: &dyn Project, asset: &Asset, skeleton: &Asset, fill: &Value) -> Result<bool> {
-    let model = resolved(project, asset, "model", fill.get("model"))?;
-    let mesh = resolved(project, &model, "mesh", model.field("mesh"))?;
-    let named = mesh.field("skeleton").map(|reference| resolved(project, &mesh, "skeleton", Some(reference))).transpose()?;
-    Ok(named.is_some_and(|named| named.path() == skeleton.path()))
+fn on_skeleton(nodes: &Nodes, asset: &Asset, skeleton: &Asset, fill: &Value) -> Result<bool> {
+    let model = resolved(nodes, asset, "model", fill.get("model"))?;
+    let model = model.asset();
+    let mesh = resolved(nodes, &model, "mesh", model.field("mesh"))?;
+    let mesh = mesh.asset();
+    let named = mesh.field("skeleton").map(|reference| resolved(nodes, &mesh, "skeleton", Some(reference))).transpose()?;
+    Ok(named.is_some_and(|named| named.path == skeleton.path()))
 }
 
 /// A part's own node, under the node it hangs on.
-fn hang(project: &dyn Project, asset: &Asset, tree: &mut Assembled, part: &Filled, on: usize) -> Result<()> {
+fn hang(nodes: &Nodes, asset: &Asset, tree: &mut Assembled, part: &Filled, on: usize) -> Result<()> {
     let place = Some(Place::Fill(part.within.clone()));
     let Some(fill) = &part.fill else {
         // Open: a place to see and to move, with nothing there yet.
@@ -248,10 +304,11 @@ fn hang(project: &dyn Project, asset: &Asset, tree: &mut Assembled, part: &Fille
         tree.nodes.push(Node { name: part.part.clone(), attached: None, place });
         return Ok(());
     };
-    let model = resolved(project, asset, "model", fill.get("model"))?;
-    let Assembled { model: mut built, mut nodes, mut slots, .. } = model_of(project, &model, fill.get("overrides"), Some((&part.part, &part.within)))?;
+    let model = resolved(nodes, asset, "model", fill.get("model"))?;
+    let model = model.asset();
+    let Assembled { model: mut built, mut nodes, mut slots, .. } = model_of(nodes, &model, fill.get("overrides"), Some((&part.part, &part.within)))?;
     if let Some(root) = built.parts.first_mut() {
-        held(root, fill);
+        skeleton::held(root, fill);
     }
     // What it hangs by is the part; a part of it deeper down keeps its own name.
     if let Some(first) = nodes.first_mut() {
@@ -265,13 +322,14 @@ fn hang(project: &dyn Project, asset: &Asset, tree: &mut Assembled, part: &Fille
     Ok(())
 }
 
-fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    let frame = resolved(project, asset, "skeleton", asset.field("skeleton"))?;
-    let parts = prefab::filled(asset, project)?;
+fn prefab_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
+    let frame = resolved(nodes, asset, "skeleton", asset.field("skeleton"))?;
+    let frame = frame.asset();
+    let parts = prefab::filled_as(asset, &nodes.shown(asset))?;
     let mut waiting: Vec<&Filled> = Vec::new();
     let mut root = None;
     for part in parts.iter().filter(|part| part.node.is_some() || part.within.first().is_some_and(|step| step == "groups")) {
-        let built_on = part.fill.as_ref().map(|fill| on_skeleton(project, asset, &frame, fill)).transpose()?.unwrap_or(false);
+        let built_on = part.fill.as_ref().map(|fill| on_skeleton(nodes, asset, &frame, fill)).transpose()?.unwrap_or(false);
         match (built_on, part.node.as_deref()) {
             (true, _) if root.is_some() => bail!("{}: {} is a second model on its skeleton", asset.path(), part.part),
             (true, _) => root = Some(part),
@@ -282,8 +340,8 @@ fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
     }
     let mut tree = match root.and_then(|part| part.fill.as_ref().map(|fill| (part, fill))) {
         Some((part, fill)) => {
-            let model = resolved(project, asset, "model", fill.get("model"))?;
-            model_of(project, &model, fill.get("overrides"), Some((&part.part, &part.within)))?
+            let model = resolved(nodes, asset, "model", fill.get("model"))?;
+            model_of(nodes, &model.asset(), fill.get("overrides"), Some((&part.part, &part.within)))?
         }
         None => skeleton_of(&frame)?,
     };
@@ -293,7 +351,7 @@ fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
         if joints.iter().filter(|name| **name == node.name).count() == 1 {
             node.place = Some(Place::Pose(node.name.clone()));
             if let Some(pose) = asset.field("pose").and_then(|poses| poses.get(&node.name)) {
-                posed(&mut tree.model.parts[at], pose);
+                skeleton::posed(&mut tree.model.parts[at], pose);
             }
         }
     }
@@ -304,7 +362,7 @@ fn prefab_of(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
         let mut later = Vec::new();
         for part in waiting {
             match tree.nodes.iter().position(|node| Some(node.name.as_str()) == part.node.as_deref()) {
-                Some(on) => hang(project, asset, &mut tree, part, on)?,
+                Some(on) => hang(nodes, asset, &mut tree, part, on)?,
                 None => later.push(part),
             }
         }
@@ -346,16 +404,34 @@ pub fn attach(tree: &mut Model, mut child: Model, node: usize) {
     tree.loose_vertices.append(&mut child.loose_vertices);
 }
 
+/// What a node shows in 3D, the member `chosen` of each of its groups.
+///
 /// # Errors
 /// It is none of what shows in 3D, or something it refers to is missing or unreadable.
-pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
-    // A kind comes qualified by what registered it.
-    let mut assembled = match asset.kind().and_then(|kind| kind.rsplit('@').next()) {
-        Some("mesh") => mesh_of(project, asset),
+pub fn scene(call: &mut Call) -> Result<Typed> {
+    let chosen: String = call.parameter()?;
+    let chosen = chosen.split(',').filter_map(|pair| pair.split_once('=')).map(|(group, member)| (group.to_string(), member.to_string()));
+    let nodes = Nodes { call, chosen: chosen.collect() };
+    let own = nodes.named(call.host.path())?;
+    let assembled = built(&nodes, &own.asset())?;
+    let file = File::new(FILE, serde_json::to_vec(&assembled)?);
+    Ok(Typed::new("pe2.render@scene", vec![file]))
+}
+
+/// The file a scene is held in.
+const FILE: &str = "scene.json";
+
+/// No group chosen, as an address has to say something.
+const NONE_CHOSEN: &str = "-";
+
+fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
+    // A type comes qualified by what registered it.
+    let mut assembled = match asset.node_type().and_then(|node_type| node_type.rsplit('@').next()) {
+        Some("mesh") => mesh_of(nodes, asset),
         Some("skeleton") => skeleton_of(asset),
-        Some("material") => material_of(project, asset),
-        Some("model") => model_of(project, asset, None, None),
-        Some("prefab") => prefab_of(project, asset),
+        Some("material") => material_of(nodes, asset),
+        Some("model") => model_of(nodes, asset, None, None),
+        Some("prefab") => prefab_of(nodes, asset),
         other => Err(anyhow!("{}: a {other:?} does not show in 3D", asset.path())),
     }?;
     for (material, slot) in assembled.model.materials.iter_mut().zip(&assembled.slots) {
@@ -366,6 +442,18 @@ pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
     }
     assembled.model.effect = assembled.slots.iter().find_map(|slot| slot.drawn.as_ref()).map_or(0, |drawn| drawn.effect);
     Ok(assembled)
+}
+
+/// A node's scene, as it is being looked at: its output, the members chosen of its groups.
+///
+/// # Errors
+/// It has no such output, or it could not be made.
+pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
+    let chosen: Vec<String> = prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
+    let chosen = if chosen.is_empty() { NONE_CHOSEN.to_string() } else { chosen.join(",") };
+    let address = format!("scene/{chosen}");
+    let bytes = project.bytes(asset.path(), &address).ok_or_else(|| anyhow!("{}: it shows nothing in 3D", asset.path()))??;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]
@@ -429,9 +517,9 @@ mod tests {
     #[test]
     fn a_pose_says_as_much_as_it_says() {
         let mut moved = resting();
-        posed(&mut moved, &table("translation = [7, 8, 9]"));
+        skeleton::posed(&mut moved, &table("translation = [7, 8, 9]"));
         assert_eq!((moved.translation, moved.rotation), ([7, 8, 9], resting().rotation));
-        posed(&mut moved, &table("rotation = [0.0, 0.0, 90.0]"));
+        skeleton::posed(&mut moved, &table("rotation = [0.0, 0.0, 90.0]"));
         assert_eq!(moved.translation, [7, 8, 9]);
         assert_eq!(moved.rotation, skeleton::matrix([0.0, 0.0, 90.0]));
     }
@@ -439,7 +527,7 @@ mod tests {
     #[test]
     fn a_child_is_held_over_what_its_root_says() {
         let mut root = resting();
-        held(&mut root, &table("translation = [10, 0, 0]\nscale = [2.0, 1.0, 1.0]"));
+        skeleton::held(&mut root, &table("translation = [10, 0, 0]\nscale = [2.0, 1.0, 1.0]"));
         assert_eq!(root.translation, [11, 2, 3]);
         assert_eq!(root.rotation, [[8192, 0, 0], [0, 4096, 0], [0, 0, 4096]]);
     }
@@ -447,7 +535,7 @@ mod tests {
     #[test]
     fn a_child_with_nothing_said_stays_as_it_is() {
         let mut root = resting();
-        held(&mut root, &table("node = 'hand'"));
+        skeleton::held(&mut root, &table("node = 'hand'"));
         assert_eq!((root.translation, root.rotation), (resting().translation, resting().rotation));
     }
 }

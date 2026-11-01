@@ -12,7 +12,8 @@
 
 use formats::str::{Coding, SECTOR, SECTORS_A_SECOND, Sector};
 use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Asset, Name, Registry, Result, Retain, Signature, Table, Value, anyhow};
+use pe2_ext::media::VideoFrame;
+use pe2_ext::{Asset, Data, Image, Name, Registry, Result, Signature, Table, Value, anyhow};
 
 mod encode;
 mod extract;
@@ -20,7 +21,7 @@ mod frames;
 
 pe2_ext::extension!("pe2.str", "0.1.0", register, requires = ["pe2.movies@^0.1"], optional = ["video-container@^1"]);
 
-/// A movie's kind.
+/// A movie's type.
 const MOVIE: &str = "pe2.movies@movie";
 
 /// A movie's native file: its sectors.
@@ -45,6 +46,7 @@ impl Files for Str {}
 
 /// A movie's stack: its stored sectors.
 const STACK: &str = r#"[[stack]]
+id = "clip"
 op = "file"
 file = "native.str"
 
@@ -53,8 +55,37 @@ op = "output"
 name = "native"
 "#;
 
+/// What a movie offers: each hanging off the layer named `clip`.
+const OFFERS: &str = r#"
+[[stack]]
+op = "pe2.str@stream"
+clip = { from = "clip" }
+
+[[stack]]
+op = "output"
+name = "stream"
+
+[[stack]]
+id = "frames"
+op = "pe2.str@frames"
+clip = { from = "clip" }
+
+[[stack]]
+op = "preview"
+name = "frames"
+
+[[stack]]
+op = "pe2.str@frame"
+frames = { from = "frames" }
+
+[[stack]]
+op = "output"
+name = "frame"
+"#;
+
 /// A movie made of a video file, over the one it replaces: decoded by the service that reads video, and encoded by this.
 const IMPORT: &str = r#"[[stack]]
+id = "clip"
 op = "graph"
 result = "encoded"
 
@@ -101,20 +132,39 @@ fn register(r: &mut Registry) -> Result<()> {
         let original = call.take::<Str>(1)?;
         encode::encode(call, &stream, &original)
     });
-    r.add_stack(MOVIE, STACK);
-    for pattern in VIDEO {
-        r.add_recipe(MOVIE, pattern, IMPORT);
-    }
-    r.add_output(MOVIE, "stream", "pe2.str@stream", None, Retain::Transient);
-    r.add_output(MOVIE, "frames", "pe2.str@frames", None, Retain::Transient);
     // Shown by a frame a quarter in: the first are often black.
-    r.add_output(MOVIE, "frame", "pe2.movies@frame", Some("frames"), Retain::Transient)
-        .members(|asset| timing(asset).map(|t| (t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect());
-    // A movie's frames, as a video file in an encoding: made when it is asked for.
-    r.add_output(MOVIE, "video", "video-container@encode", Some("frames"), Retain::Cache).members(|_| vec![("lossless".to_string(), "Lossless".to_string())]);
-    let movie = Name::parse(MOVIE).ok_or_else(|| anyhow!("{MOVIE}: not a qualified kind"))?;
+    let _ = r
+        .op("frame")
+        .label("Frame")
+        .input::<ty::Stream<ty::Playback>>("frames")
+        .output::<ty::Image>()
+        .parameter::<u32>("frame")
+        .members(|asset| timing(asset).map(|t| (t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect())
+        .run(|call| {
+            let number = call.parameter::<u32>()?;
+            let frames = call.take::<ty::Stream<ty::Playback>>(0)?;
+            frames.seek(number.into());
+            let item = frames.next()?.ok_or_else(|| anyhow!("no frame {number}"))?;
+            picture(&item).ok_or_else(|| anyhow!("frame {number} has no picture"))?
+        });
+    drop(r.template("movie_from_video", MOVIE, &format!("{IMPORT}{OFFERS}")).label("Movie, from a video file").files(&VIDEO));
+    let _ = r.extend(MOVIE).of(Str::NAME).stack(&format!("{STACK}{OFFERS}")).register();
+    let movie = Name::parse(MOVIE).ok_or_else(|| anyhow!("{MOVIE}: not a qualified type"))?;
     let _ = r.extractor("clips", &movie, &[], extract::begin);
     Ok(())
+}
+
+/// An item's picture, as an image; none where it has none.
+fn picture(item: &Data) -> Option<Result<Image>> {
+    let frame = |data: &Data| if let Data::Video(frame) = data { Some(image(frame)) } else { None };
+    match item {
+        Data::List(parts) => parts.iter().find_map(frame),
+        other => frame(other),
+    }
+}
+
+fn image(frame: &VideoFrame) -> Result<Image> {
+    Ok(Image { width: frame.width as usize, height: frame.height as usize, rgba: frame.rgba()? })
 }
 
 /// The bytes of a count of sectors.

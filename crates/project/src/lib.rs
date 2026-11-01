@@ -52,7 +52,7 @@ pub struct Config {
     pub release: Option<String>,
     /// The target building it, what its `target.<name>` sections are for.
     pub target: Option<String>,
-    /// The assets left out of it, by path: no event reaches them, and looking for a kind's assets does not find them.
+    /// The assets left out of it, by path: no event reaches them, and looking for a type's assets does not find them.
     pub disabled: Vec<String>,
 }
 

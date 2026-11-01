@@ -1,4 +1,4 @@
-//! The player: an asset whose kind has a stream output (`stream<T>`) played in the preview. The stream, opened on a
+//! The player: an asset whose type has a stream output (`stream<T>`) played in the preview. The stream, opened on a
 //! thread of its own, is read by two readers of the player's: one for the picture, at the item shown, and one for the
 //! sound, half a second ahead, feeding each item's samples to the device. An item is shown by what it holds: a
 //! picture, sound, or both (a list of them): a picture as RGBA through a texture, a frame in YCbCr 4:2:0 through the
@@ -238,7 +238,7 @@ impl Player {
         shown.held = false;
     }
 
-    /// Whether an asset plays: its kind has a stream output.
+    /// Whether an asset plays: its type has a stream output.
     pub fn plays(extensions: &Extensions, asset: &project::index::Asset) -> bool {
         extensions.stream_output(asset).is_some()
     }

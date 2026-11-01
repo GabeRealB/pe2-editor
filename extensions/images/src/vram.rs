@@ -151,7 +151,7 @@ impl View for Vram {
                 Some(a) if !uploads.pages.is_empty() || !uploads.palettes.is_empty() => {
                     format!("{}: {} pages, {} palettes", a.path(), uploads.pages.len(), uploads.palettes.len())
                 }
-                Some(a) if a.kind() == Some("pe2.images@vram_slot") => a.path().to_string(),
+                Some(a) if a.node_type() == Some("pe2.images@vram_slot") => a.path().to_string(),
                 _ => "Select a texture, an atlas or a file to see what it uploads".to_string(),
             };
             let canvas = Canvas {

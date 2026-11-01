@@ -155,12 +155,15 @@ pub fn write_file(
 ///
 /// # Errors
 /// The layer holds no such uid to give, or it cannot be written.
-pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, path: &str, declaration: &str, history: &mut History) -> Result<Vec<PathBuf>> {
+pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, path: &str, (declaration, files): (&str, &[(&str, &[u8])]), history: &mut History) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
     let mut tx = history.begin(format!("New {}", name(&bundle)));
     tx.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
+    for (name, bytes) in files {
+        tx.write(&layer.disk(&bundle).join(name), bytes)?;
+    }
     changeset.entries.insert(uid.to_string(), bundle);
     save(&mut tx, layer, &changeset)?;
     tx.commit()
@@ -395,7 +398,7 @@ mod tests {
             std::fs::write(path, text).unwrap();
         };
         write("project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
-        write(".layers/base/g/a.node/node.toml", "kind = \"image\"\n");
+        write(".layers/base/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         write(".layers/base/g/a.node/native.texels", "texels");
         write(".layers/base/n", "notes");
         std::fs::create_dir_all(root.join(".layers/top")).unwrap();
@@ -477,7 +480,7 @@ mod tests {
         let root = project("write");
         let mut o = open(&root);
         let a = o.uid("g/a.node");
-        let text = b"kind = \"image\"\nnote = \"x\"\n";
+        let text = b"stack = [{ op = \"t.image\" }]\nnote = \"x\"\n";
         let paths = super::write_file(
             &o.project,
             &o.index,
@@ -494,7 +497,7 @@ mod tests {
         assert_eq!(o.index.assets["g/a"].layers, ["base", "top"]);
         assert_eq!(o.index.assets["g/a"].fields().get("note").and_then(toml::Value::as_str), Some("x"));
         // A continued edit joins the step; undone, the copy goes with it.
-        let text = b"kind = \"image\"\nnote = \"xy\"\n";
+        let text = b"stack = [{ op = \"t.image\" }]\nnote = \"xy\"\n";
         let paths = super::write_file(
             &o.project,
             &o.index,
@@ -544,7 +547,7 @@ mod tests {
     fn deletes_what_the_layer_makes() {
         let root = project("own");
         std::fs::create_dir_all(root.join(".layers/top/mine/x.node")).unwrap();
-        std::fs::write(root.join(".layers/top/mine/x.node/node.toml"), "kind = \"file\"\n").unwrap();
+        std::fs::write(root.join(".layers/top/mine/x.node/node.toml"), "stack = [{ op = \"t.file\" }]\n").unwrap();
         let mut o = open(&root);
         let mine = o.uid("mine");
         let paths = rename(&o.project, &o.index, "top", &mine, "ours", &mut o.history).unwrap();

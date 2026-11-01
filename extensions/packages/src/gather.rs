@@ -83,7 +83,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new() };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
-    let units = selected(call.host.fields(), &own_path, &own_files)?;
+    let units = selected(&call.given(), &own_path, &own_files)?;
     let within = format!("{own_path}/");
     let mut listed = String::new();
     for unit in &units {
@@ -109,9 +109,9 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
     // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
-    let unset = gathering.options.unset(call.host.fields());
+    let unset = gathering.options.unset(&call.given());
     let settings = Table::from_iter([("unset".to_string(), Value::Array(unset.into_iter().map(Value::String).collect()))]);
-    Ok(Typed { notes, settings, ..Typed::new(SourceTree::NAME, files) })
+    Ok(Typed { notes, settings: pe2_ext::merged(&call.given(), &settings), ..Typed::new(SourceTree::NAME, files) })
 }
 
 fn name_of(path: &str) -> &str {
@@ -223,7 +223,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     }
     let Walk { slots, options, .. } = walk;
     let within = format!("{path}/");
-    let fields = call.host.fields();
+    let fields = &call.given();
     let sources = if strings(fields, "sources").is_empty() { vec![] } else { selected(fields, &path, &own.files)? };
     let sources = sources.iter().map(|file| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
     let mut table = Table::new();
@@ -464,7 +464,7 @@ impl Options {
 
     /// What `pe2.h` includes in both passes.
     fn header(&self, call: &Call) -> Result<String> {
-        let fields = call.host.fields();
+        let fields = &call.given();
         self.check(fields)?;
         let mut header = String::new();
         let mut unwritten = String::new();
@@ -520,14 +520,14 @@ impl Options {
 fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>> {
     let at = &def.at;
     let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return Ok(None) };
-    let kind = |what: &str| anyhow!("{at}: {name} is {what}, and this package gives it {value}");
+    let wrong = |what: &str| anyhow!("{at}: {name} is {what}, and this package gives it {value}");
     let read = match def.ty.as_str() {
-        "int" => value.as_integer().map(|number| number.to_string()).ok_or_else(|| kind("an int")),
-        "bool" => value.as_bool().map(|flag| i32::from(flag).to_string()).ok_or_else(|| kind("a bool")),
-        "string" => value.as_str().map(|text| format!("{text:?}")).ok_or_else(|| kind("a string")),
+        "int" => value.as_integer().map(|number| number.to_string()).ok_or_else(|| wrong("an int")),
+        "bool" => value.as_bool().map(|flag| i32::from(flag).to_string()).ok_or_else(|| wrong("a bool")),
+        "string" => value.as_str().map(|text| format!("{text:?}")).ok_or_else(|| wrong("a string")),
         _ => {
             let at = value.as_str().and_then(|member| def.members.iter().position(|known| known == member));
-            at.map(|at| at.to_string()).ok_or_else(|| kind("one of its members"))
+            at.map(|at| at.to_string()).ok_or_else(|| wrong("one of its members"))
         }
     };
     read.map(Some)
@@ -611,16 +611,12 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
     let (header, failed) = values(call, &slots, &reads);
     notes.extend(failed);
     kept.push(File::new(VALUES, header.into_bytes()));
-    Ok(Typed { notes, ..Typed::new(SourceTree::NAME, kept) })
+    Ok(Typed { notes, settings: call.given(), ..Typed::new(SourceTree::NAME, kept) })
 }
 
 /// What a binding holds: the reference filling it.
-fn filler(fields: &Table, name: &str) -> Option<String> {
-    pe2_ext::target_of(fields.get("bind")?.get(name)?).map(str::to_string)
-}
-
 fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>) -> (String, Vec<String>) {
-    let fields = call.host.fields();
+    let fields = &call.given();
     let mut header = String::new();
     let mut failed = Vec::new();
     for (name, slot) in &slots.held {
@@ -660,21 +656,28 @@ fn said(binding: &str, why: &str) -> String {
 
 /// Why a slot cannot be filled as it declares.
 fn slot_problem(call: &Call, fields: &Table, name: &str, ty: &str) -> Option<String> {
-    let Some(target) = filler(fields, name) else { return Some(format!("{name}: nothing fills it on this package")) };
-    let settings = match call.table_of(&target, tokenizers::SETTINGS) {
-        Ok(settings) => settings,
+    let Some(bound) = bound(fields, name) else { return Some(format!("{name}: nothing fills it on this package")) };
+    let own = match walked(call, &bound, &[]) {
+        Ok(Reached::Node { reads_as: Some(reads_as), .. }) => reads_as,
+        Ok(Reached::Node { node, .. }) => {
+            let types = call.node_named(&node).map_or_else(Vec::new, |named| named.types);
+            if types.iter().any(|known| known.rsplit('@').next() == Some(ty)) {
+                return None;
+            }
+            types.first().and_then(|known| known.rsplit('@').next()).unwrap_or("nothing").to_string()
+        }
+        Ok(Reached::Value(_)) => "a value".to_string(),
         Err(why) => return Some(format!("{name}: {why:#}")),
     };
-    let kind = settings.get("kind").and_then(Value::as_str).unwrap_or_default();
-    (kind != ty).then(|| format!("{name} is declared {ty}, and what fills it is {kind}"))
+    (own != ty).then(|| format!("{name} is declared {ty}, and what fills it is {own}"))
 }
 
 /// What a read comes to.
 fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<String> {
     let slot = slots.held.get(&read.binding).filter(|slot| slot.ty.is_some()).ok_or_else(|| anyhow!("it has no PE2_BIND"))?;
-    let bound = filler(fields, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
-    let target = match walked(call, &bound, &read.path)? {
-        Reached::Node(node) => node,
+    let bound = bound(fields, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
+    let (target, led) = match walked(call, &bound, &read.path)? {
+        Reached::Node { node, args, .. } => (node, args),
         Reached::Value(_) if read.derived.is_some() => bail!("{} is a value, and nothing is derived from it", read.path.join("/")),
         Reached::Value(value) => return Ok(tokenizers::printed(&value)),
     };
@@ -684,37 +687,65 @@ fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<Str
             args.0.insert(arg.clone(), values.clone());
         }
     }
+    args.0.extend(led);
     let output = tokenizer_of(call, &target)?;
     let address = pe2_ext::tokens::address(read.derived.as_deref(), &args).replacen(tokens::OUTPUT, &output, 1);
     pe2_ext::tokens::text_of(call, &call.output_of(&target, &address)?)
 }
 
-/// Where a sub-path ends.
+/// What fills a slot: a node, and the output of it a reference names.
+struct Bound {
+    node: String,
+    output: Option<String>,
+}
+
+fn bound(fields: &Table, name: &str) -> Option<Bound> {
+    let reference = fields.get("bind")?.get(name)?;
+    Some(Bound { node: pe2_ext::target_of(reference)?.to_string(), output: pe2_ext::output_of(reference).map(str::to_string) })
+}
+
+/// Where a sub-path ends: a node, as what it is read here where that is not what it is, with the args it is then read by; or a
+/// plain value.
 enum Reached {
-    Node(String),
+    Node { node: String, reads_as: Option<String>, args: BTreeMap<String, Vec<String>> },
     Value(Value),
 }
 
-/// A sub-path followed from a node: each step an output, a family's member first, leading to another node or ending at a plain value.
-fn walked(call: &Call, from: &str, path: &[String]) -> Result<Reached> {
-    let (mut node, mut at) = (from.to_string(), 0);
+impl Reached {
+    fn leading_on(table: &Table, node: String) -> Reached {
+        let held = table.get(tokens::ARGS).and_then(Value::as_table).into_iter().flatten();
+        let args = held.filter_map(|(name, value)| Some((name.clone(), vec![value.as_str()?.to_string()])));
+        Reached::Node { node, reads_as: table.get(tokens::AS).and_then(Value::as_str).map(str::to_string), args: args.collect() }
+    }
+}
+
+/// A sub-path followed from what a reference names: each step an output, a family's member first, leading to another node or
+/// ending at a plain value.
+fn walked(call: &Call, from: &Bound, path: &[String]) -> Result<Reached> {
+    let (mut reached, mut at) = (Reached::Node { node: from.node.clone(), reads_as: None, args: BTreeMap::new() }, 0);
+    if let Some(output) = &from.output {
+        let table = call.table_of(&from.node, output).map_err(|_| anyhow!("{} has no output {output}", from.node))?;
+        let next = table.get(tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("nothing goes on from {output}"))?;
+        reached = Reached::leading_on(&table, next.to_string());
+    }
     while at < path.len() {
+        let Reached::Node { node, .. } = &reached else { bail!("nothing goes on from {}", path[..at].join("/")) };
         let member = path.get(at + 1).map(|member| format!("{}/{member}", path[at]));
-        let told = member.and_then(|address| Some((call.table_of(&node, &address).ok()?, 2)));
+        let told = member.and_then(|address| Some((call.table_of(node, &address).ok()?, 2)));
         let (table, used) = match told {
             Some(told) => told,
-            None => (call.table_of(&node, &path[at]).map_err(|_| anyhow!("{} has no output {}", path[..at].join("/"), path[at]))?, 1),
+            None => (call.table_of(node, &path[at]).map_err(|_| anyhow!("{} has no output {}", path[..at].join("/"), path[at]))?, 1),
         };
         at += used;
         if let Some(next) = table.get(tokens::NODE).and_then(Value::as_str) {
-            node = next.to_string();
+            reached = Reached::leading_on(&table, next.to_string());
         } else if let Some(value) = table.get(tokens::VALUE).filter(|_| at == path.len()) {
             return Ok(Reached::Value(value.clone()));
         } else {
             bail!("nothing goes on from {}", path[..at].join("/"));
         }
     }
-    Ok(Reached::Node(node))
+    Ok(reached)
 }
 
 /// The output making a node's tokens: the target's own, where it has one.
