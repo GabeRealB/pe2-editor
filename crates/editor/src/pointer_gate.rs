@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ViewportId};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
@@ -28,6 +28,8 @@ struct Held {
 pub struct PointerGate<'a> {
     app: eframe::EframeWinitApplication<'a>,
     context: Arc<OnceLock<egui::Context>>,
+    /// The main window's size, last it was told.
+    size: Option<PhysicalSize<u32>>,
     main: Option<WindowId>,
     held: Option<Held>,
     buttons: usize,
@@ -35,7 +37,26 @@ pub struct PointerGate<'a> {
 
 impl<'a> PointerGate<'a> {
     pub fn new(app: eframe::EframeWinitApplication<'a>, context: Arc<OnceLock<egui::Context>>) -> Self {
-        PointerGate { app, context, main: None, held: None, buttons: 0 }
+        PointerGate { app, context, main: None, size: None, held: None, buttons: 0 }
+    }
+
+    /// On X11 winit guesses a window's scale from the monitor the pointer is on, and on finding it to be on another scales
+    /// its size by the difference. A window filling the screen has the size the window manager gave it, and scaled it would
+    /// spill over the monitor, so it keeps that.
+    fn keep_filling(&mut self, window: WindowId, event: &mut WindowEvent) {
+        if !cfg!(target_os = "linux") || self.main != Some(window) {
+            return;
+        }
+        let filling = self.context.get().is_some_and(|context| context.input(|i| i.viewport().maximized == Some(true)));
+        match event {
+            WindowEvent::Resized(size) => self.size = Some(*size),
+            WindowEvent::ScaleFactorChanged { inner_size_writer, .. } if filling => {
+                if let Some(size) = self.size {
+                    let _ = inner_size_writer.request_inner_size(size);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Whether what is under the pointer at `position` is what egui last found under it.
@@ -88,9 +109,10 @@ impl ApplicationHandler<eframe::UserEvent> for PointerGate<'_> {
         self.app.user_event(event_loop, event);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, window: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window: WindowId, mut event: WindowEvent) {
         // The first window there is is the main one.
         self.main.get_or_insert(window);
+        self.keep_filling(window, &mut event);
         match event {
             WindowEvent::CursorMoved { device_id, position } if self.same_widget(window, position) => {
                 self.held = Some(Held { window, device_id, position, at: Instant::now() });

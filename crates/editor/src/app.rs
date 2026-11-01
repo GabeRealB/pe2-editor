@@ -882,6 +882,10 @@ impl Editor {
         }
         // Noticed first: what a window does on its way out is not a place.
         let filling = ctx.input(|i| (i.viewport().maximized == Some(true), i.viewport().fullscreen == Some(true)));
+        // Made filling the screen, it is: a platform that took no notice has it asked for below, once it has settled.
+        if filling != (false, false) {
+            self.refill = None;
+        }
         if self.refill.is_none() && self.filling != filling {
             if filling == (false, false) {
                 self.tracker.return_to(self.place);

@@ -197,8 +197,10 @@ pub fn run() -> Result {
     let mut event_loop = event_loop(x11)?;
     let monitors = monitors(&mut event_loop);
     if let Some(window) = saved.main_window.filter(|window| window.place.is_reachable(&monitors)) {
-        // Filling the screen comes after: made so, it would be on whichever monitor the platform likes.
+        // Made filling the screen, at its place so that it fills the right monitor: asked to after it is shown, it would be
+        // seen to arrive, at the wrong size for that monitor first, then at the right one, then filling it.
         viewport = viewport.with_inner_size(window.place.size).with_position(window.place.position);
+        viewport = viewport.with_maximized(window.maximized).with_fullscreen(window.fullscreen);
     }
     let options = eframe::NativeOptions {
         viewport,
