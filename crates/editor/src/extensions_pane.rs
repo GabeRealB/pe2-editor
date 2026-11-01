@@ -596,10 +596,12 @@ fn unsandboxed_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) 
         }
     }
     let label = if enable { "Enable" } else { "Disable" };
-    if ui.button(label).on_hover_text("For you, on this computer, in every project").clicked()
-        && let Err(e) = extensions::set_unsandboxed_enabled(trust, &p.id, enable)
-    {
-        *message = Some(format!("{}: {e}", p.id));
+    if ui.button(label).on_hover_text("For you, on this computer, in every project").clicked() {
+        if enable && crate::drive::agent_acting(ui.ctx()) {
+            *message = Some(format!("{}: only you can enable it, not an agent", p.id));
+        } else if let Err(e) = extensions::set_unsandboxed_enabled(trust, &p.id, enable) {
+            *message = Some(format!("{}: {e}", p.id));
+        }
     }
     ui.add_space(6.0);
 }

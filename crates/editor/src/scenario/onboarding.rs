@@ -1,0 +1,71 @@
+//! What a project asks of whoever opens it.
+
+use project::ext::Status;
+
+use super::{Fixture, Scenario};
+
+const ASKS: &str = "outside the sandbox";
+
+#[test]
+fn a_project_with_nothing_to_settle_asks_nothing() {
+    let editor = Scenario::open(Fixture::rig());
+    assert!(!editor.asking());
+}
+
+#[test]
+fn trusting_a_layer_runs_what_is_in_it() {
+    let mut editor = Scenario::open(Fixture::untrusted(false));
+    assert!(editor.asking());
+    editor.expect(ASKS);
+    editor.expect("pe2.psx");
+    assert_eq!(editor.status("pe2.psx"), Status::NotEnabled { changed: false });
+    editor.click("layer mods");
+    editor.click_label("Continue");
+    assert!(!editor.asking());
+    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    let editor = editor.opened_again();
+    assert!(!editor.asking(), "answered, it is not asked again");
+}
+
+#[test]
+fn trusting_the_whole_project_covers_its_layers() {
+    let mut editor = Scenario::open(Fixture::untrusted(false));
+    editor.click_label("Trust the whole project");
+    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+}
+
+#[test]
+fn saying_no_is_remembered_and_not_now_is_not() {
+    let mut editor = Scenario::open(Fixture::untrusted(false));
+    editor.click_label("Not now");
+    assert!(!editor.asking());
+    assert_eq!(editor.status("pe2.psx"), Status::NotEnabled { changed: false });
+    let mut editor = editor.opened_again();
+    assert!(editor.asking(), "not now is for this session");
+    editor.click_label("Continue");
+    let editor = editor.opened_again();
+    assert!(!editor.asking(), "left unticked, it is not asked again");
+}
+
+#[test]
+fn what_the_project_requires_is_asked_about_even_after_a_no() {
+    let mut editor = Scenario::open(Fixture::untrusted(true));
+    editor.expect("the project requires it");
+    editor.click_label("Continue");
+    let mut editor = editor.opened_again();
+    assert!(editor.asking(), "the project is not whole");
+    assert!(editor.problems().iter().any(|problem| problem.contains("not trusted")), "{:?}", editor.problems());
+    editor.click("layer mods");
+    editor.click_label("Continue");
+    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    assert_eq!(editor.problems(), [""; 0]);
+}
+
+#[test]
+fn a_choice_of_configs_is_asked_once() {
+    let mut editor = Scenario::open(Fixture::two_configs());
+    assert!(editor.asking());
+    editor.expect("Config");
+    editor.click_label("Continue");
+    assert!(!editor.asking());
+}

@@ -27,6 +27,18 @@ const MOST_LINES: usize = 600;
 /// The most changes an action's answer lists.
 const MOST_CHANGES: usize = 80;
 
+fn acted_id() -> egui::Id {
+    egui::Id::unique("agent acted")
+}
+
+/// How long after an agent's action a click may be its own: its press and release come over a few frames.
+const ACTING: Duration = Duration::from_secs(2);
+
+/// Whether what just happened in the window may be an agent's: what only a person may answer refuses it.
+pub fn agent_acting(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<Instant>(acted_id())).is_some_and(|at| at.elapsed() < ACTING)
+}
+
 /// What the plugin and the driver share.
 #[derive(Default)]
 struct Shared {
@@ -128,6 +140,8 @@ pub struct Driver {
     asked: Option<Instant>,
     /// When an agent last acted: the status bar says so for a while.
     pub acted: Option<Instant>,
+    /// The project is asking something only a person may answer.
+    pub asking: bool,
 }
 
 impl Driver {
@@ -140,10 +154,20 @@ impl Driver {
             commands: Vec::new(),
             asked: None,
             acted: None,
+            asking: false,
         }
     }
 
     /// Take requests that arrived.
+    /// Why an agent may not act.
+    pub fn refusal(&self) -> &'static str {
+        if self.asking {
+            "the project is asking its user something, and only they can answer: wait for them"
+        } else {
+            "the user has not let agents use the editor (its Settings, Agents, or --agents-drive)"
+        }
+    }
+
     pub fn take(&mut self, ctx: &egui::Context, requests: Vec<Request>) {
         if requests.is_empty() {
             return;
@@ -172,6 +196,9 @@ impl Driver {
             ctx.disable_accesskit();
             lock(&self.shared).tree = None;
             self.asked = None;
+        }
+        if let Some(acted) = self.acted {
+            ctx.data_mut(|d| d.insert_temp(acted_id(), acted));
         }
         let pending = std::mem::take(&mut self.pending);
         for mut pending in pending {
@@ -250,9 +277,7 @@ impl Driver {
                 })));
                 Ok(Job::Capturing { image, rect, scale: ctx.pixels_per_point() })
             }
-            "editor_act" | "editor_type" if !drive => Err(mcp::Reply::failed(
-                "the user has not let agents use the editor (its Settings, Agents, or --agents-drive)".into(),
-            )),
+            "editor_act" | "editor_type" if !drive => Err(mcp::Reply::failed(self.refusal().to_string())),
             "editor_act" => {
                 let args: mcp::ActArgs = serde_json::from_value(arguments).map_err(bad)?;
                 let batches = act(ctx, tree, &args).map_err(mcp::Reply::failed)?;

@@ -10,7 +10,7 @@ use project::ext::component::Unsandboxed;
 use project::ext::{EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
 use project::index::Index;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -22,6 +22,12 @@ include!(concat!(env!("OUT_DIR"), "/components.rs"));
 #[must_use]
 pub fn components() -> &'static [(&'static str, &'static [u8])] {
     COMPONENTS
+}
+
+/// A component built here and not embedded, by its file: what a test needs of one that has to be trusted.
+#[must_use]
+pub fn built_apart(file: &str) -> Option<Vec<u8>> {
+    std::fs::read(Path::new(env!("PE2_BUILT")).join(file)).ok()
 }
 
 /// The built-in extensions linked in.

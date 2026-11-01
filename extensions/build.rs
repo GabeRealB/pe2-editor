@@ -42,6 +42,7 @@ fn main() {
     for variable in ["CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET"] {
         cargo.env_remove(variable);
     }
+    println!("cargo::rustc-env=PE2_BUILT={}", built.join(TARGET).join("release").display());
     let status = cargo.status().expect("cargo runs");
     assert!(
         status.success(),

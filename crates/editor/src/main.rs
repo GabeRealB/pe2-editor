@@ -34,6 +34,7 @@ mod graph_pane;
 mod icons;
 mod inspector;
 mod layers;
+mod onboarding;
 mod panes;
 mod perf;
 mod player;

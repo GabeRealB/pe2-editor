@@ -68,6 +68,30 @@ impl Fixture {
         Fixture::new().node("notes", stack).stored("notes", "notes.txt")
     }
 
+    /// What runs outside the sandbox, in a layer of its own beside the first: the project has to be asked about it.
+    #[must_use]
+    pub fn untrusted(required: bool) -> Fixture {
+        let bytes = extensions::built_apart("pe2_psx.wasm").expect("built with the others");
+        let stack = "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n";
+        let fixture = Fixture::new();
+        let mut file = format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"mods\"\n");
+        if required {
+            file.push_str("\n[[extension]]\nid = \"pe2.psx\"\nrequired = true\n");
+        }
+        fixture.write("project.toml", &file);
+        fixture.write(".layers/mods/tools/psx.node/node.toml", stack);
+        std::fs::write(fixture.root.join(".layers/mods/tools/psx.node/extension.wasm"), bytes).expect("a component");
+        fixture
+    }
+
+    /// A project of two configs.
+    #[must_use]
+    pub fn two_configs() -> Fixture {
+        let fixture = Fixture::new();
+        fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n\n[config.usa]\n\n[config.japan]\n"));
+        fixture
+    }
+
     /// A skeleton of three joints.
     #[must_use]
     pub fn rig() -> Fixture {

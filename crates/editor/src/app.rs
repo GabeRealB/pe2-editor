@@ -129,6 +129,10 @@ pub struct Editor {
     capture: Option<Capture>,
     /// The device's largest surface side in pixels, which the window must not outgrow; applied once, then taken.
     max_surface: Option<u32>,
+    /// What the project opened asks of whoever opened it.
+    onboarding: Option<crate::onboarding::Onboarding>,
+    /// The project told "not now": this session leaves it alone.
+    not_now: Option<PathBuf>,
     /// Agents using the window, and whether this session lets them act whatever the settings say.
     drive: crate::drive::Driver,
     agents_drive: bool,
@@ -250,6 +254,8 @@ impl Editor {
                 pending: Arc::default(),
             }),
             max_surface: start.max_surface,
+            onboarding: None,
+            not_now: None,
             drive: crate::drive::Driver::new(),
             agents_drive: start.agents_drive,
         };
@@ -316,6 +322,10 @@ impl Editor {
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
+                // A run that only looks, as a screenshot does, has nobody to ask.
+                let chosen = self.settings.active_configs.contains_key(&ws.project.root.display().to_string());
+                let asked = if self.capture.is_some() { None } else { crate::onboarding::asked(&ws, chosen) };
+                self.onboarding = asked.filter(|asked| self.not_now.as_ref() != Some(&asked.root));
                 self.workspace = Some(ws);
                 self.error = None;
             }
@@ -810,7 +820,7 @@ impl Editor {
             let answer = if name == "editor_commands" {
                 self.commands_listed()
             } else if !drive {
-                mcp::Reply::failed("the user has not let agents use the editor (its Settings, Agents, or --agents-drive)".into())
+                mcp::Reply::failed(self.drive.refusal().to_string())
             } else {
                 match serde_json::from_value::<mcp::RunArgs>(serde_json::Value::Object(arguments)) {
                     Ok(args) => self.run_by_id(ctx, &args.command),
@@ -1591,6 +1601,26 @@ impl Editor {
         }
     }
 
+    /// What the project opened asks.
+    fn onboarding_ui(&mut self, ctx: &egui::Context) {
+        let Some(onboarding) = &mut self.onboarding else { return };
+        let Some(answer) = onboarding.ui(ctx) else { return };
+        if matches!(answer, crate::onboarding::Answer::NotNow) {
+            self.not_now = Some(onboarding.root.clone());
+        } else {
+            if let Err(e) = onboarding.apply(&answer) {
+                self.error = Some(format!("What is trusted could not be written: {e}"));
+            }
+            if !onboarding.config.is_empty()
+                && let Some(ws) = &self.workspace
+            {
+                self.settings.active_configs.insert(ws.project.root.display().to_string(), onboarding.config.clone());
+                self.signal(ConfigChanged::NAME);
+            }
+        }
+        self.onboarding = None;
+    }
+
     /// Importing files into the selected asset: from a drop or from the menu, which takes pasted paths.
     fn import_dialog(&mut self, ctx: &egui::Context) {
         let Some(text) = &mut self.import else { return };
@@ -1760,6 +1790,11 @@ impl Editor {
         self.step(false, false)
     }
 
+    /// Whether a project is asking something.
+    pub fn asking(&self) -> bool {
+        self.onboarding.is_some()
+    }
+
     /// Why opening failed, or something went wrong since.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -1795,8 +1830,11 @@ impl eframe::App for Editor {
         if let Some(ws) = &mut self.workspace {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
         }
-        self.drive.update(&ctx, self.agents_drive || self.settings.agents.drive);
-        self.agent_commands(&ctx, self.agents_drive || self.settings.agents.drive);
+        // What a project asks is for a person to answer: agents wait.
+        self.drive.asking = self.onboarding.is_some();
+        let drive = (self.agents_drive || self.settings.agents.drive) && !self.drive.asking;
+        self.drive.update(&ctx, drive);
+        self.agent_commands(&ctx, drive);
         self.note_place(&ctx);
         // A frame of the extensions' readings: one unused for long enough gives its memory back.
         if let Some(ws) = &self.workspace {
@@ -1840,6 +1878,7 @@ impl eframe::App for Editor {
         self.palette_ui(&ctx);
         self.dropped_files(&ctx);
         self.import_dialog(&ctx);
+        self.onboarding_ui(&ctx);
         self.in_use_dialog(&ctx);
         self.force_dialog(&ctx);
         self.rename_dialog(&ctx);

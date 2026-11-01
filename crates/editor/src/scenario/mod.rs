@@ -10,6 +10,7 @@ mod fixture;
 mod inspector;
 mod models;
 mod nodes;
+mod onboarding;
 mod taking_in;
 
 use std::sync::Once;
@@ -180,6 +181,27 @@ impl Scenario {
         self.harness.input_mut().focused = false;
         self.harness.step();
         self.settle();
+    }
+
+    /// Whether the project is asking something.
+    pub fn asking(&self) -> bool {
+        self.harness.state().asking()
+    }
+
+    /// What became of an extension.
+    #[track_caller]
+    pub fn status(&mut self, id: &str) -> project::ext::Status {
+        let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
+        present.unwrap_or_else(|| panic!("no extension {id}")).status
+    }
+
+    /// Open the same project again, in a new session.
+    #[track_caller]
+    pub fn opened_again(self) -> Scenario {
+        let Scenario { harness, fixture, _alone: alone } = self;
+        drop(harness);
+        drop(alone);
+        Scenario::open(fixture)
     }
 
     /// What the project's `project.toml` says.

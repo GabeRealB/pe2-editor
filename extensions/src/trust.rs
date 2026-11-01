@@ -39,6 +39,8 @@ pub struct Trusted {
     pub project: PathBuf,
     /// Real paths.
     pub places: Vec<PathBuf>,
+    /// Places the user was asked about and said no to.
+    pub declined: Vec<PathBuf>,
 }
 
 /// The file holding what the user enabled and trusts.
@@ -70,8 +72,8 @@ pub fn trusted() -> Vec<Trusted> {
     held.iter()
         .filter_map(|entry| {
             let project = entry.get("project").and_then(path)?;
-            let places = entry.get("places").and_then(Value::as_array)?.iter().filter_map(path).collect();
-            Some(Trusted { project, places })
+            let list = |key: &str| entry.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(path).collect();
+            Some(Trusted { project, places: list("places"), declined: list("declined") })
         })
         .collect()
 }
@@ -79,8 +81,12 @@ pub fn trusted() -> Vec<Trusted> {
 fn store(all: &[Trusted]) -> std::io::Result<()> {
     let text = |path: &Path| Value::String(path.display().to_string());
     let entry = |trusted: &Trusted| {
-        let places = Value::Array(trusted.places.iter().map(|place| text(place)).collect());
-        Value::Table(Table::from_iter([("project".to_string(), text(&trusted.project)), ("places".to_string(), places)]))
+        let list = |paths: &[PathBuf]| Value::Array(paths.iter().map(|place| text(place)).collect());
+        let mut entry = Table::from_iter([("project".to_string(), text(&trusted.project)), ("places".to_string(), list(&trusted.places))]);
+        if !trusted.declined.is_empty() {
+            entry.insert("declined".to_string(), list(&trusted.declined));
+        }
+        Value::Table(entry)
     };
     let mut table = read();
     table.remove("trusted");
@@ -98,13 +104,38 @@ pub fn trust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
     let project = project.canonicalize()?;
     let places = places.iter().map(|place| place.canonicalize()).collect::<std::io::Result<Vec<_>>>()?;
     let mut all = trusted();
-    let at = all.iter().position(|known| known.project == project).unwrap_or_else(|| {
-        all.push(Trusted { project: project.clone(), places: Vec::new() });
-        all.len() - 1
-    });
+    let at = entry(&mut all, &project);
     for place in places {
+        all[at].declined.retain(|declined| *declined != place);
         if !all[at].places.contains(&place) {
             all[at].places.push(place);
+        }
+    }
+    store(&all)
+}
+
+/// A project's entry, made where it has none.
+fn entry(all: &mut Vec<Trusted>, project: &Path) -> usize {
+    all.iter().position(|known| known.project == project).unwrap_or_else(|| {
+        all.push(Trusted { project: project.to_path_buf(), places: Vec::new(), declined: Vec::new() });
+        all.len() - 1
+    })
+}
+
+/// Say no to places of a project: they are not asked about again.
+///
+/// # Errors
+/// What is trusted cannot be written.
+pub fn decline(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
+    if places.is_empty() {
+        return Ok(());
+    }
+    let project = project.canonicalize()?;
+    let mut all = trusted();
+    let at = entry(&mut all, &project);
+    for place in places {
+        if !all[at].declined.contains(place) {
+            all[at].declined.push(place.clone());
         }
     }
     store(&all)
@@ -121,7 +152,7 @@ pub fn distrust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
     for known in all.iter_mut().filter(|known| known.project == project) {
         known.places.retain(|place| !places.is_empty() && !places.contains(place));
     }
-    all.retain(|known| !known.places.is_empty());
+    all.retain(|known| !known.places.is_empty() || !known.declined.is_empty());
     store(&all)
 }
 
@@ -134,7 +165,7 @@ pub fn distrust_place(place: &Path) -> std::io::Result<()> {
     for known in &mut all {
         known.places.retain(|held| held != place);
     }
-    all.retain(|known| !known.places.is_empty());
+    all.retain(|known| !known.places.is_empty() || !known.declined.is_empty());
     store(&all)
 }
 
@@ -208,7 +239,7 @@ mod tests {
     #[test]
     fn a_place_holds_what_is_really_in_it() {
         let (root, mine, theirs) = places("place");
-        let trusted = [Trusted { project: root.clone(), places: vec![mine.clone()] }];
+        let trusted = [Trusted { project: root.clone(), places: vec![mine.clone()], declined: Vec::new() }];
         let there = allowed(&in_project(mine.join("x.node/extension.wasm")), false, &trusted);
         assert_eq!(there, Some(Allowed::Place(mine.clone())));
         // Another layer, and one whose name begins alike.
