@@ -22,6 +22,8 @@ mod onboarding;
 mod registered;
 pub mod suite;
 #[cfg(test)]
+mod reading_again;
+#[cfg(test)]
 mod taking_in;
 #[cfg(all(test, unix))]
 mod tests_pane;
@@ -217,6 +219,12 @@ impl Scenario {
             assert!(started.elapsed() < PATIENCE, "the editor did not settle");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// One frame.
+    #[track_caller]
+    pub fn frame(&mut self) {
+        self.harness.step();
     }
 
     /// Open an asset, as selecting it does.
@@ -446,6 +454,11 @@ impl Scenario {
     pub fn status(&mut self, id: &str) -> project::ext::Status {
         let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
         present.unwrap_or_else(|| panic!("no extension {id}")).status
+    }
+
+    /// Whether the project is being opened, the panes waiting for it.
+    pub fn is_opening(&self) -> bool {
+        self.harness.state().is_opening()
     }
 
     /// The project, its session over.

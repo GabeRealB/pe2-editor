@@ -84,6 +84,18 @@ fn text(report: &Report) -> mcp::Reply {
 
 impl Runner {
     pub fn start(project: Project, extensions: Arc<Extensions>) -> Runner {
+        Runner::after(None, project, extensions)
+    }
+
+    /// Stop the epoch running and go on with this project and these extensions. An epoch that has yet to stop writes what
+    /// it was writing: the next one starts once it has, and the window does not wait for that.
+    pub fn restart(&mut self, project: Project, extensions: Arc<Extensions>) {
+        self.cancel();
+        self.jobs = None;
+        *self = Runner::after(self.thread.take(), project, extensions);
+    }
+
+    fn after(before: Option<JoinHandle<()>>, project: Project, extensions: Arc<Extensions>) -> Runner {
         let (jobs, queued) = mpsc::channel::<Job>();
         let (done, finished) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -93,6 +105,9 @@ impl Runner {
         let thread = std::thread::Builder::new()
             .name("epochs".into())
             .spawn(move || {
+                if let Some(before) = before {
+                    let _ = before.join();
+                }
                 let mut held: Option<Job> = None;
                 loop {
                     let Some(mut job) = held.take().or_else(|| queued.recv().ok()) else { return };

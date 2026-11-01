@@ -64,6 +64,7 @@ struct Capture {
 /// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
 struct Opening {
     dir: PathBuf,
+    began: std::time::Instant,
     progress: Arc<std::sync::Mutex<(String, usize, usize)>>,
     ready: std::sync::mpsc::Receiver<anyhow::Result<crate::workspace::Opened>>,
     /// Shown once it is open: the selection kept across a reopen, or asked on the command line.
@@ -154,6 +155,9 @@ pub struct Start {
     /// The monitors, in pixels of the desktop: what a window's place is judged by.
     pub monitors: Vec<egui::Rect>,
 }
+
+/// How long a project takes to open before the window says so over its panes.
+const CARD_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// An epoch running, in the status bar, and what stops it.
 fn epoch_status(ui: &mut egui::Ui, ws: &Workspace) {
@@ -280,13 +284,8 @@ impl Editor {
         editor
     }
 
+    /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
     fn open(&mut self, dir: &Path) {
-        self.open_keeping(dir, None);
-    }
-
-    /// Open a project, off the window's thread; with a history, the same project again, its session going on. The
-    /// panes say how far it is, and it is shown once open (`opened`).
-    fn open_keeping(&mut self, dir: &Path, history: Option<project::history::History>) {
         // The project open now lets go of its lock first: opening it again must find it free.
         self.workspace = None;
         let progress: Arc<std::sync::Mutex<(String, usize, usize)>> = Arc::default();
@@ -299,11 +298,14 @@ impl Editor {
                 }
                 ctx.request_repaint();
             };
-            let _ = done.send(Workspace::prepare(&dir_owned, history, &report));
+            let _ = done.send(Workspace::prepare(&dir_owned, &report));
             ctx.request_repaint();
         });
         match started {
-            Ok(_) => self.opening = Some(Opening { dir: dir.to_path_buf(), progress, ready, select: None }),
+            Ok(_) => {
+                let began = std::time::Instant::now();
+                self.opening = Some(Opening { dir: dir.to_path_buf(), began, progress, ready, select: None });
+            }
             Err(e) => self.error = Some(format!("{}: {e}", dir.display())),
         }
     }
@@ -328,11 +330,8 @@ impl Editor {
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
-                // A run that only looks, as a screenshot does, or a test run, has nobody to ask.
-                let chosen = self.settings.active_configs.contains_key(&ws.project.root.display().to_string());
-                let asked = if self.capture.is_some() || self.unattended { None } else { crate::onboarding::asked(&ws, chosen) };
-                self.onboarding = asked.filter(|asked| self.not_now.as_ref() != Some(&asked.root));
                 self.workspace = Some(ws);
+                self.ask_what_it_needs();
                 self.error = None;
             }
             Err(e) => {
@@ -342,6 +341,15 @@ impl Editor {
                 self.error = Some(format!("{}: {e:#}", dir.display()));
             }
         }
+    }
+
+    /// What the project has to settle, asked of whoever is there. A run that only looks, as a screenshot does, or a test
+    /// run, has nobody to ask.
+    fn ask_what_it_needs(&mut self) {
+        let Some(ws) = &self.workspace else { return };
+        let chosen = self.settings.active_configs.contains_key(&ws.project.root.display().to_string());
+        let asked = if self.capture.is_some() || self.unattended { None } else { crate::onboarding::asked(ws, chosen) };
+        self.onboarding = asked.filter(|asked| self.not_now.as_ref() != Some(&asked.root));
     }
 
     /// How far the project being opened is, as the panes show it.
@@ -369,20 +377,13 @@ impl Editor {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));
             }
             Update::Said(said) => self.message = Some(said),
-            Update::Reopen(why) => {
-                self.reopen();
-                self.message = Some(format!("{why}: the project was opened again"));
+            Update::Reloaded(why) => {
+                self.message = Some(format!("{why}: the project was read again"));
+                // A tab of what is no longer there closes.
+                let ws: &Workspace = ws;
+                self.layouts.close_documents(|path| !ws.exists(path));
+                self.ask_what_it_needs();
             }
-        }
-    }
-
-    /// Open the project again - `project.toml` changed - keeping the session's history and the selection.
-    fn reopen(&mut self) {
-        let Some(ws) = self.workspace.take() else { return };
-        let (root, selected) = (ws.project.root.clone(), ws.selected.clone());
-        self.open_keeping(&root, Some(ws.into_history()));
-        if let Some(opening) = &mut self.opening {
-            opening.select = selected;
         }
     }
 
@@ -391,7 +392,7 @@ impl Editor {
         let Some(ws) = &mut self.workspace else { return false };
         let verb = if redo { "Redo" } else { "Undo" };
         match ws.step(redo, force) {
-            // Its files taken in by the worker: a `project.toml` changed reopens the project from its snapshot.
+            // Its files taken in by the worker: a `project.toml` changed has the project read again.
             Ok(label) => {
                 self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
                 true
@@ -452,7 +453,7 @@ impl Editor {
     }
 
     /// Which files layer takes code being overridden: one of those above its own, or a new one (added, the project
-    /// opened again, then the override made in it).
+    /// read again, then the override made in it).
     fn choose_dialog(&mut self, ctx: &egui::Context) {
         let Some(choosing) = &mut self.choosing else { return };
         let (mut chosen, mut create, mut cancel) = (None, false, false);
@@ -505,11 +506,7 @@ impl Editor {
             self.choosing = None;
             let added = self.workspace.as_mut().map(|ws| ws.add_layer(&name, project::LayerKind::Files));
             match added {
-                Some(Ok(())) => {
-                    // The new layer is in project.toml: the project, opened again, has it.
-                    self.reopen();
-                    self.edit(&EditRequest::OverrideIn(uid, name));
-                }
+                Some(Ok(())) => self.edit(&EditRequest::OverrideIn(uid, name)),
                 Some(Err(e)) => self.message = Some(format!("{e:#}")),
                 None => {}
             }
@@ -705,8 +702,8 @@ impl Editor {
                 }
             }
             Command::ReloadProject => {
-                if let Some(root) = self.workspace.as_ref().map(|ws| ws.project.root.clone()) {
-                    self.open(&root);
+                if let Some(ws) = &mut self.workspace {
+                    ws.reload("Reload");
                 }
             }
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -1029,8 +1026,8 @@ impl Editor {
     }
 
     /// Signal an event of the project open.
-    fn signal(&self, event: &str) {
-        if let Some(ws) = &self.workspace {
+    fn signal(&mut self, event: &str) {
+        if let Some(ws) = &mut self.workspace {
             ws.signal(event);
         }
     }
@@ -1495,8 +1492,9 @@ impl Editor {
                 }
                 // Taking changes in, off the window's thread; or other programs' changes waiting for it.
                 epoch_status(ui, ws);
-                if ws.taking_in() {
-                    ui.label(RichText::new("taking in changes").small().color(theme::weak()));
+                let working = ws.reading().or(ws.taking_in().then(|| "taking in changes".to_string()));
+                if let Some(working) = working {
+                    ui.label(RichText::new(working).small().color(theme::weak()));
                     ui.add(egui::Spinner::new().size(10.0));
                     ui.separator();
                 } else if ws.pending() > 0 {
@@ -1743,8 +1741,8 @@ impl Editor {
     /// Advance a pending screenshot: request it once settled, close once it is saved. The main window only: eframe
     /// paints the other windows (immediate viewports) without taking screenshots of them.
     fn capture(&mut self, ctx: &egui::Context) {
-        // The window is settled only once its project is open.
-        if self.opening.is_some() {
+        // The window is settled only once its project is open, and whole.
+        if self.opening.is_some() || self.workspace.as_ref().is_some_and(|ws| !ws.attached()) {
             return;
         }
         let Some(capture) = &mut self.capture else { return };
@@ -1788,6 +1786,11 @@ impl Editor {
     /// What it has open.
     pub fn workspace(&mut self) -> Option<&mut Workspace> {
         self.workspace.as_mut()
+    }
+
+    /// Whether a project is being opened.
+    pub fn is_opening(&self) -> bool {
+        self.opening.is_some()
     }
 
     /// Whether something it set going has yet to show.
@@ -1837,7 +1840,8 @@ impl eframe::App for Editor {
         self.capture(&ctx);
         self.opened();
         self.follow_disk(&ctx);
-        if let Some(ws) = &mut self.workspace {
+        // What an agent sees of the window is the project whole.
+        if let Some(ws) = self.workspace.as_mut().filter(|ws| ws.attached()) {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
         }
         // What a project asks is for a person to answer: agents wait.
@@ -1872,7 +1876,15 @@ impl eframe::App for Editor {
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
         let reveal = self.layouts.reveal.take();
         let mut outcome = self.center(ui, &titles, reveal);
-        if let Some(opening) = self.opening_shown() {
+        // Only one that takes a while: most are done before there would be time to read it.
+        let long = self.opening.as_ref().is_some_and(|opening| {
+            let waited = opening.began.elapsed();
+            if waited < CARD_AFTER {
+                ctx.request_repaint_after(CARD_AFTER.saturating_sub(waited));
+            }
+            waited >= CARD_AFTER
+        });
+        if let Some(opening) = self.opening_shown().filter(|_| long) {
             panes::opening_ui(&ctx, &opening);
         }
         let windows = self.show_windows(&ctx, &titles, reveal);
@@ -1900,12 +1912,11 @@ impl eframe::App for Editor {
             if let Err(e) = self.settings.save() {
                 self.error = Some(format!("settings: {e}"));
             }
-            // Extensions read their user settings as they load: they are loaded again with the project.
+            // Extensions read their user settings as they load: they are loaded again with the project read again.
             let reload = self.settings.extensions != self.saved.extensions;
             self.saved = self.settings.clone();
-            if reload {
-                self.reopen();
-                self.message = Some("an extension's setting changed: the project was opened again".into());
+            if reload && let Some(ws) = &mut self.workspace {
+                ws.reload("an extension's setting changed");
             }
         }
     }

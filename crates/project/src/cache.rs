@@ -14,6 +14,7 @@ pub const DIR: &str = ".cache";
 /// Raised whenever what the cache holds changes shape.
 const SCHEMA: u32 = 2;
 
+#[derive(Clone)]
 pub struct Cache {
     pub dir: PathBuf,
 }

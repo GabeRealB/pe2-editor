@@ -516,6 +516,17 @@ pub fn opening_ui(ctx: &egui::Context, opening: &OpeningShown) {
         });
 }
 
+fn waiting_ui(ui: &mut egui::Ui) -> UiResponse {
+    ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(16.0)));
+    UiResponse::None
+}
+
+fn no_project_ui(ui: &mut egui::Ui, opening: bool) {
+    if !opening {
+        ui.centered_and_justified(|ui| ui.label(RichText::new("No project open - File, Open project").color(theme::weak())));
+    }
+}
+
 impl egui_tiles::Behavior<Pane> for Panes<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
         let pane = *pane;
@@ -532,14 +543,14 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             return UiResponse::None;
         }
         let Some(ws) = self.workspace.as_deref_mut() else {
-            // While a project opens, the panes wait blank under its card.
-            if self.opening.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("No project open - File, Open project").color(theme::weak()))
-                });
-            }
+            // While a project opens, the panes wait blank.
+            no_project_ui(ui, self.opening.is_some());
             return UiResponse::None;
         };
+        // What a document shows is what importers made: it waits for that, as the panes beside it need not.
+        if pane.kind == PaneKind::Document && !ws.attached() {
+            return waiting_ui(ui);
+        }
         if pane.kind == PaneKind::Document {
             // What it shows is found again where it went, and something can be dropped on it to open it.
             if let Some(state) = self.states.get_mut(&pane) {
@@ -1024,7 +1035,7 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
     }
     let picture = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 6.0 + PICTURE / 2.0), egui::Vec2::splat(PICTURE));
-    let thumbnail = asset.filter(|a| ws.extensions.has_thumbnail(a)).and_then(|a| ws.thumbs.get(ui.ctx(), &ws.extensions, a));
+    let thumbnail = asset.filter(|a| ws.attached() && ws.extensions.has_thumbnail(a)).and_then(|a| ws.thumbs.get(ui.ctx(), &ws.extensions, a));
     if let Some(texture) = thumbnail {
         let image = egui::Image::new((texture, egui::Vec2::splat(PICTURE))).maintain_aspect_ratio(true);
         image.paint_at(ui, picture);
@@ -1201,7 +1212,7 @@ impl TreeView<'_> {
         let selected = self.ws.selected.as_deref() == Some(asset);
         // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.
         let thumbnail =
-            found.filter(|a| self.ws.extensions.has_thumbnail(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
+            found.filter(|a| self.ws.attached() && self.ws.extensions.has_thumbnail(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
         let button = match thumbnail {
             Some(texture) => {
                 let side = ui.text_style_height(&egui::TextStyle::Body);

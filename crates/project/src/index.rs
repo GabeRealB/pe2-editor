@@ -380,7 +380,7 @@ impl Problem {
 }
 
 /// What a refresh changed: the assets whose index entry changed (added, changed or gone), and whether `project.toml`
-/// changed - the layers themselves may have, which a refresh does not follow: the project is opened again.
+/// changed - the layers themselves may have, which a refresh does not follow: the project is read again.
 #[derive(Debug, Default)]
 pub struct Refreshed {
     pub assets: BTreeSet<String>,
@@ -879,7 +879,19 @@ impl Index {
     /// As `open`.
     pub fn open_reporting(project: &Project, cache: &Cache, report: &Report<'_>) -> Result<Index> {
         report("Reading what the cache knows", 0, 0);
-        let store = Arc::new(Store::open(&cache.path(STORE))?);
+        Index::over(Arc::new(Store::open(&cache.path(STORE))?), project, report)
+    }
+
+    /// The index of the project as `project.toml` has it now, opened over this one's store, which stays open; this
+    /// one goes on answering until it is let go.
+    ///
+    /// # Errors
+    /// A layer or the store cannot be read.
+    pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
+        Index::over(self.store.clone(), project, report)
+    }
+
+    fn over(store: Arc<Store>, project: &Project, report: &Report<'_>) -> Result<Index> {
         let mut known = store.load()?;
         let mut layers = Vec::new();
         for (i, layer) in project.layers.iter().enumerate() {
@@ -928,7 +940,7 @@ impl Index {
     /// content changed are rebuilt. It costs what changed: where only contents did - the layers hold the same paths,
     /// no changeset was read again, and each content changed is its entry's winning one - the stack is not applied
     /// again, and only the changed assets are assembled and linked; otherwise the stack is applied anew.
-    /// `project.toml` is only noticed: a change to the layers themselves needs the project opened again.
+    /// `project.toml` is only noticed: a change to the layers themselves needs an index made again (`again`).
     ///
     /// # Errors
     /// A changeset cannot be read or written.

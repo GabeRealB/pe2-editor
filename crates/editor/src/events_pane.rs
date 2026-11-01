@@ -14,7 +14,8 @@ struct Row {
     asset: Option<String>,
 }
 
-fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &Workspace, nav: &mut Option<String>) {
+fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mut Option<String>) {
+    let mut signaled = None;
     let wired = ws.last_epoch.as_ref().map(|epoch| &epoch.wired);
     let fired = ws.last_epoch.as_ref().map(|epoch| &epoch.report.signaled);
     egui::Grid::new(id).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -35,11 +36,14 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &Workspace, nav: &mut Op
             let said = if count == 0 { "nothing wired".to_string() } else { format!("{count} wired") };
             ui.label(RichText::new(said).small().color(theme::weak()));
             if ui.small_button(format!("{}  Signal", icons::PLAY)).clicked() {
-                ws.signal(&row.id);
+                signaled = Some(row.id.clone());
             }
             ui.end_row();
         }
     });
+    if let Some(id) = signaled {
+        ws.signal(&id);
+    }
 }
 
 pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>, message: &mut Option<String>) {

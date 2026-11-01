@@ -7,19 +7,24 @@
 //! Every job gets a ticket, and a snapshot says the last it covers: an edit waits until the jobs before it are taken
 //! in (it reads the index), an undo shows its selection once its job is, an agent's request is answered once what was
 //! pending when it came is.
+//!
+//! What the project is made of changing - its `project.toml`, the extensions it finds - is a job like these. The project
+//! is read again here, the old one answering until a snapshot hands the new one over, so that nothing shown goes away
+//! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use project::Project;
 use project::applied::Applied;
+use project::cache::Cache;
 use project::ext::Extensions;
 use project::imports::Imports;
 use project::index::{Asset, Index, LayerInfo};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use crate::workspace::Node;
+use crate::workspace::{Loaded, Node};
 
 /// What the worker is asked.
 enum Job {
@@ -29,6 +34,19 @@ enum Job {
     Hidden(BTreeSet<String>),
     /// These assets' settings were applied (`project::applied`): their outputs made again from them.
     Applied(BTreeSet<String>),
+    /// A project just opened: what its importers made attached.
+    Attach,
+    /// The project read again, as this changed.
+    Reload(&'static str),
+}
+
+/// What a project read again has that the window takes up (`Workspace::take_up`).
+pub struct Reloaded {
+    pub project: Project,
+    pub extensions: Arc<Extensions>,
+    pub found: Vec<extensions::Found>,
+    /// What changed.
+    pub why: &'static str,
 }
 
 /// The project as a take-in left it.
@@ -43,8 +61,10 @@ pub struct Snapshot {
     /// It took in files changed, assets or not.
     pub files: bool,
     pub all: bool,
-    /// The project is to be opened again, as this changed (`project.toml`, the extensions found).
-    pub reopen: Option<&'static str>,
+    /// The project as it was read again, where it was.
+    pub reloaded: Option<Reloaded>,
+    /// Why it could not be: it goes on as it was.
+    pub said: Option<String>,
     /// What went wrong taking a change in.
     pub error: Option<String>,
 }
@@ -58,36 +78,33 @@ pub struct TakeIn {
     covered: u64,
     /// The window to wake when a snapshot is ready, once the first frame has given it.
     ctx: Arc<OnceLock<eframe::egui::Context>>,
+    /// How far a project being read again, or attached, is.
+    stage: Arc<Mutex<String>>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// What the worker owns.
-struct Worker {
-    project: Project,
-    index: Index,
-    applied: Arc<Applied>,
-    imports: Imports,
-    extensions: Arc<Extensions>,
-    found: Vec<extensions::Found>,
-    tree: Arc<Node>,
+pub struct Worker {
+    pub project: Project,
+    pub index: Index,
+    pub cache: Cache,
+    pub store: project::graph::store::Store,
+    pub applied: Arc<Applied>,
+    pub imports: Imports,
+    pub extensions: Arc<Extensions>,
+    pub found: Vec<extensions::Found>,
+    pub tree: Arc<Node>,
+    pub stage: Arc<Mutex<String>>,
 }
 
 impl TakeIn {
-    /// Start the worker on the project as opened: its index, imports attached, and tree.
-    pub fn start(
-        project: Project,
-        index: Index,
-        applied: Arc<Applied>,
-        imports: Imports,
-        extensions: Arc<Extensions>,
-        found: Vec<extensions::Found>,
-        tree: Arc<Node>,
-    ) -> TakeIn {
+    /// Start the worker on the project as opened.
+    pub fn start(mut worker: Worker) -> TakeIn {
         let (jobs, queued) = mpsc::channel::<(u64, Job)>();
         let (made, snapshots) = mpsc::channel();
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
         let wake = ctx.clone();
-        let mut worker = Worker { project, index, applied, imports, extensions, found, tree };
+        let stage = worker.stage.clone();
         let thread = std::thread::Builder::new()
             .name("take-in".into())
             .spawn(move || {
@@ -106,7 +123,7 @@ impl TakeIn {
                 }
             })
             .ok();
-        TakeIn { jobs: Some(jobs), snapshots, issued: 0, covered: 0, ctx, thread }
+        TakeIn { jobs: Some(jobs), snapshots, issued: 0, covered: 0, ctx, stage, thread }
     }
 
     /// The window to wake when a snapshot is ready.
@@ -118,6 +135,10 @@ impl TakeIn {
         self.issued += 1;
         if let Some(jobs) = &self.jobs {
             let _ = jobs.send((self.issued, job));
+        }
+        // That it is under way shows.
+        if let Some(ctx) = self.ctx.get() {
+            ctx.request_repaint();
         }
         self.issued
     }
@@ -135,6 +156,21 @@ impl TakeIn {
     /// Make these assets' outputs again from their settings as now applied; returns the job's ticket.
     pub fn applied(&mut self, paths: BTreeSet<String>) -> u64 {
         self.send(Job::Applied(paths))
+    }
+
+    /// Attach the imports of the project as opened; returns the job's ticket.
+    pub fn attach(&mut self) -> u64 {
+        self.send(Job::Attach)
+    }
+
+    /// Read the project again, as this changed; returns the job's ticket.
+    pub fn reload(&mut self, why: &'static str) -> u64 {
+        self.send(Job::Reload(why))
+    }
+
+    /// How far the project being read again or attached is, while it is.
+    pub fn stage(&self) -> Option<String> {
+        self.stage.lock().ok().map(|stage| stage.clone()).filter(|stage| !stage.is_empty())
     }
 
     /// The snapshots ready since the last poll, oldest first.
@@ -190,11 +226,14 @@ impl Worker {
         let mut paths = Vec::new();
         let mut hidden = None;
         let mut applied = BTreeSet::new();
+        let (mut attach, mut reload) = (false, None);
         for (_, job) in jobs {
             match job {
                 Job::Paths(p) => paths.extend(p),
                 Job::Hidden(names) => hidden = Some(names),
                 Job::Applied(assets) => applied.extend(assets),
+                Job::Attach => attach = true,
+                Job::Reload(why) => reload = Some(why),
             }
         }
         paths.sort();
@@ -208,13 +247,21 @@ impl Worker {
             let _ = self.imports.attach(&mut self.index, &self.extensions);
             all = true;
         }
+        if attach && !all {
+            self.attach_all();
+            self.reporter()("", 0, 0);
+            all = true;
+        }
         if !applied.is_empty() {
             // Their outputs made from their settings as now applied.
             self.applied.mark(&mut self.index, Some(&applied));
             let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &applied);
         }
         if paths.is_empty() {
-            return self.snapshot(ticket, applied, all, None, None);
+            return match reload {
+                Some(why) => self.reload(ticket, why),
+                None => self.snapshot(ticket, applied, all, None),
+            };
         }
         // What the assets were before: a declaration changed is noted unapplied, against what it was.
         let before = self.index.assets.clone();
@@ -222,15 +269,15 @@ impl Worker {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 let error = format!("the index could not follow a change: {e:#}");
-                return self.snapshot(ticket, BTreeSet::new(), all, None, Some(error));
+                return self.snapshot(ticket, BTreeSet::new(), all, Some(error));
             }
         };
         if refreshed.project_file {
-            return self.snapshot(ticket, refreshed.assets, all, Some("project.toml changed"), None);
+            return self.reload(ticket, "project.toml changed");
         }
         // An `extension` asset came, went or changed.
         if extensions::found(&self.project, Some(&self.index)) != self.found {
-            return self.snapshot(ticket, refreshed.assets, all, Some("an extension changed"), None);
+            return self.reload(ticket, "an extension changed");
         }
         // The assets the refresh assembled again: their changed declarations noted, their settings as applied given
         // them, their imports attached again; the others keep theirs.
@@ -251,7 +298,64 @@ impl Worker {
         let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
         let mut changed = refreshed.assets;
         changed.extend(applied);
-        self.snapshot(ticket, changed, all, None, None)
+        match reload {
+            Some(why) => self.reload(ticket, why),
+            None => self.snapshot(ticket, changed, all, None),
+        }
+    }
+
+    /// How far it is, for the status bar.
+    fn reporter(&self) -> impl Fn(&str, usize, usize) + use<> {
+        let stage = self.stage.clone();
+        move |said, _, _| {
+            if let Ok(mut stage) = stage.lock() {
+                said.clone_into(&mut stage);
+            }
+        }
+    }
+
+    /// What the importers made attached to every asset, and what the store keeps that nothing makes any more swept away.
+    fn attach_all(&mut self) {
+        let report = self.reporter();
+        let _ = self.imports.attach_reporting(&mut self.index, &self.extensions, &report);
+        // Aside: it reads all the store keeps.
+        let (sweeping, nodes) = (self.store.clone(), project::imports::live_nodes(&self.index));
+        let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
+            let _ = sweeping.sweep(&nodes, &std::collections::HashSet::new());
+        });
+    }
+
+    /// The project read again, as `why` changed, and handed over; where it cannot be, it goes on as it was.
+    fn reload(&mut self, ticket: u64, why: &'static str) -> Snapshot {
+        let read = self.read_again();
+        let snapshot = match read {
+            Ok(()) => {
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), true, None);
+                let (project, extensions, found) = (self.project.clone(), self.extensions.clone(), self.found.clone());
+                snapshot.reloaded = Some(Reloaded { project, extensions, found, why });
+                snapshot
+            }
+            Err(e) => {
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), false, None);
+                snapshot.said = Some(format!("{why}, and the project could not be read again: {e:#}"));
+                snapshot
+            }
+        };
+        self.reporter()("", 0, 0);
+        snapshot
+    }
+
+    fn read_again(&mut self) -> anyhow::Result<()> {
+        let report = self.reporter();
+        let project = Project::load(&self.project.root)?;
+        let index = self.index.again(&project, &report)?;
+        let loaded = Loaded::of(project, index, &self.cache, &self.store, &self.applied, &report);
+        self.project = loaded.project;
+        self.index = loaded.index;
+        self.extensions = loaded.extensions;
+        self.found = loaded.found;
+        self.attach_all();
+        Ok(())
     }
 
     /// The index as it is now, handed over: the tree built again where anything changed.
@@ -260,7 +364,6 @@ impl Worker {
         ticket: u64,
         changed: BTreeSet<String>,
         all: bool,
-        reopen: Option<&'static str>,
         error: Option<String>,
     ) -> Snapshot {
         if all || !changed.is_empty() {
@@ -273,7 +376,8 @@ impl Worker {
             layers: self.index.layers(),
             changed,
             all,
-            reopen,
+            reloaded: None,
+            said: None,
             error,
             files: false,
         }

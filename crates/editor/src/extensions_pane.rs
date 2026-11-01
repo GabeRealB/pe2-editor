@@ -681,7 +681,7 @@ fn taking_in_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &
     };
     if let Some(written) = change {
         *message = Some(match written {
-            Ok(()) => format!("{}: the project opens again with its extensions", p.id),
+            Ok(()) => format!("{}: taken in", p.id),
             Err(e) => format!("project.toml: {e:#}"),
         });
     }
@@ -732,7 +732,7 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
                 let label = format!("Turn {asked} {verb}");
                 let written = project::switches::set_disabled(&ws.project, &next, &mut ws.history, label);
                 *message = Some(match written {
-                    Ok(()) => format!("{asked} turned {verb}: the project opens again with its extensions"),
+                    Ok(()) => format!("{asked} turned {verb}"),
                     Err(e) => format!("project.toml: {e:#}"),
                 });
                 state.asked = None;

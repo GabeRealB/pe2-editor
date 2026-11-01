@@ -154,6 +154,13 @@ pub struct Workspace {
     pub thumbs: crate::thumbs::Thumbs,
     /// The extensions, and what they register: the types' icons, fields, pictures, thumbnails and views.
     pub extensions: Arc<Extensions>,
+    /// What the work graph keeps.
+    store: project::graph::store::Store,
+    /// The ticket of attaching the imports of the project as opened.
+    attaching: u64,
+    /// Events that came before what the importers made was attached: an epoch works from the project as last taken in,
+    /// which they need whole. That it opened is the first.
+    held_events: Vec<Signaled>,
     /// What plays in the preview: a movie, frame by frame.
     /// Asked of the graph in front.
     pub graph_ask: Option<GraphAsk>,
@@ -231,7 +238,7 @@ pub struct Workspace {
     outcome: Update,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
-    /// The components found beside the built-ins when the project was opened: another finding reopens it.
+    /// The components found beside the built-ins when the project was read: another finding has it read again.
     extensions_found: Vec<extensions::Found>,
     /// When the user's extensions folder was last looked at, which no watcher follows.
     extensions_checked: std::time::Instant,
@@ -349,9 +356,9 @@ pub enum Update {
     Nothing,
     /// This many assets were added, changed or removed.
     Refreshed(usize),
-    /// The project is opened again, as this changed: `project.toml` (its layers, the extensions it leaves off) or
+    /// The project was read again, as this changed: `project.toml` (its layers, the extensions it leaves off) or
     /// the extensions found (one in the project or the user's folder came, went or changed).
-    Reopen(&'static str),
+    Reloaded(&'static str),
     /// What someone asked for came to this.
     Said(String),
 }
@@ -426,7 +433,7 @@ fn show(ctx: &egui::Context, path: &str, chosen: usize, upscale: Upscale, image:
 pub struct Opened {
     project: Project,
     lock: Lock,
-    cache_dir: PathBuf,
+    cache: Cache,
     history: History,
     /// The label of an edit a crash left half done, rolled back.
     pub recovered: Option<String>,
@@ -440,62 +447,79 @@ pub struct Opened {
     tree: Arc<Node>,
 }
 
-impl Workspace {
-    /// Open the project in `dir` as far as a workspace starts from it, off the window's thread, saying how far it is;
-    /// with a history, again, keeping this session's history: a change to `project.toml` - an edit of the stack, or
-    /// its undoing - opens the project again, and must not end the session's history.
-    ///
-    /// # Errors
-    /// Its `project.toml` or its assets cannot be read, or another holds it.
-    pub fn prepare(dir: &Path, history: Option<History>, report: &project::index::Report<'_>) -> Result<Opened> {
-        report("Reading project.toml", 0, 0);
-        let project = Project::load(dir)?;
-        // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
-        let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
-        let cache = Cache::open(&project, &lock)?;
-        // The history first: a transaction a crash left half done is rolled back before the index reads the files.
-        let (history, recovered) = match history {
-            Some(history) => (history, None),
-            None => History::open(&cache)?,
-        };
-        let mut index = Index::open_reporting(&project, &cache, report)?;
-        // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
-        let store = project::graph::store::Store::open(&cache)?;
-        let (kept, sweeping) = (store.clone(), store.clone());
-        let old = cache.path("artifacts");
-        if old.exists() {
-            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
-        }
-        // The extensions as the project has them: without those it leaves off (`[extensions] disabled`).
-        // Its own (`extension` assets) and the user's before the built-ins.
+/// An event asked for: the events, the config, and who waits for what became of it.
+type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
+
+/// What is made of a project's `project.toml` and its files, and made again when either changes.
+pub struct Loaded {
+    pub project: Project,
+    pub index: Index,
+    pub extensions: Arc<Extensions>,
+    pub found: Vec<extensions::Found>,
+    layer_view: LayerView,
+}
+
+impl Loaded {
+    /// The extensions as the project has them, and the assets as the user views them and as last applied.
+    pub fn of(
+        project: Project,
+        mut index: Index,
+        cache: &Cache,
+        store: &project::graph::store::Store,
+        applied: &project::applied::Applied,
+        report: &project::index::Report<'_>,
+    ) -> Loaded {
+        // Without those it leaves off (`[extensions] disabled`). Its own (`extension` assets) and the user's before the
+        // built-ins.
         report("Loading the extensions", 0, 0);
-        let extensions_found = extensions::found(&project, Some(&index));
+        let found = extensions::found(&project, Some(&index));
         let extensions = extensions::for_project(&project, Some(&index));
         // What they are asked in passing reads and keeps what the project's store holds.
-        extensions.keep_in(kept);
+        extensions.keep_in(store.clone());
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
         // The view first: hiding layers assembles the assets again, so the imports are attached to what it shows.
         index.set_hidden(&layer_view.hidden(&index.layers()));
+        applied.mark(&mut index, None);
+        Loaded { project, index, extensions, found, layer_view }
+    }
+}
+
+impl Workspace {
+    /// Open the project in `dir` as far as a workspace starts from it, off the window's thread, saying how far it is.
+    /// What the importers made is attached after that, by the worker, the project already showing (`Job::Attach`).
+    ///
+    /// # Errors
+    /// Its `project.toml` or its assets cannot be read, or another holds it.
+    pub fn prepare(dir: &Path, report: &project::index::Report<'_>) -> Result<Opened> {
+        report("Reading project.toml", 0, 0);
+        let project = Project::load(dir)?;
+        // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
+        let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
+        let cache = Cache::open(&project, &lock)?;
+        // The history first: a transaction a crash left half done is rolled back before the index reads the files.
+        let (history, recovered) = History::open(&cache)?;
+        let index = Index::open_reporting(&project, &cache, report)?;
+        // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
+        let store = project::graph::store::Store::open(&cache)?;
+        let old = cache.path("artifacts");
+        if old.exists() {
+            std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
+        }
         // Their settings as last applied, which the work graph makes their outputs from.
         let applied = Arc::new(project::applied::Applied::open(&cache)?);
-        applied.mark(&mut index, None);
+        let Loaded { project, index, extensions, found: extensions_found, layer_view } =
+            Loaded::of(project, index, &cache, &store, &applied, report);
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
-        let _ = imports.attach_reporting(&mut index, &extensions, report);
-        // What the store keeps that nothing makes any more goes, aside: it reads all the store keeps.
-        let (sweeping, nodes) = (sweeping, project::imports::live_nodes(&index));
-        let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
-            let _ = sweeping.sweep(&nodes, &std::collections::HashSet::new());
-        });
         report("Building the tree", 0, 0);
         let tree = Arc::new(Node::build(&index, &extensions));
         Ok(Opened {
             project,
             lock,
-            cache_dir: cache.dir,
+            cache,
             history,
             recovered,
             index,
@@ -515,7 +539,7 @@ impl Workspace {
         let Opened {
             project,
             lock,
-            cache_dir,
+            cache,
             history,
             index,
             store,
@@ -527,20 +551,25 @@ impl Workspace {
             tree,
             ..
         } = opened;
-        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), store);
+        let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), store.clone());
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it.
         let shown = Arc::new(index.clone());
         let pictures = crate::pictures::Pictures::start(shown.clone(), extensions.clone());
-        let takein = crate::takein::TakeIn::start(
-            project.clone(),
+        let cache_dir = cache.dir.clone();
+        let mut takein = crate::takein::TakeIn::start(crate::takein::Worker {
+            project: project.clone(),
             index,
-            applied.clone(),
+            cache,
+            store: store.clone(),
+            applied: applied.clone(),
             imports,
-            extensions.clone(),
-            extensions_found.clone(),
-            tree.clone(),
-        );
+            extensions: extensions.clone(),
+            found: extensions_found.clone(),
+            tree: tree.clone(),
+            stage: Arc::default(),
+        });
+        let attaching = takein.attach();
         let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
         let mut workspace = Workspace {
             runner,
@@ -563,6 +592,9 @@ impl Workspace {
             players: HashMap::new(),
             played: HashSet::new(),
             extensions,
+            store,
+            attaching,
+            held_events: vec![(vec![ProjectOpened::NAME.to_string()], None, None)],
             views: HashMap::new(),
             contents: HashMap::new(),
             part_sheets: HashMap::new(),
@@ -616,15 +648,21 @@ impl Workspace {
         workspace
     }
 
-    /// Start watching the layers, once: every change on disk is then brought in by `update`.
+    /// Start watching the layers, once: every change on disk is then brought in by `update`. Asked each frame: what
+    /// has started since is told of the window, and an event waits for the project to have what it is about.
     pub fn watch(&mut self, ctx: &egui::Context) {
-        if self.watch.is_some() || self.watch_error.is_some() {
-            return;
-        }
         self.takein.wake(ctx);
         self.runner.wake(ctx);
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
+        }
+        if self.attached() {
+            for (roots, config, reply) in std::mem::take(&mut self.held_events) {
+                self.signal_all(roots, config, reply);
+            }
+        }
+        if self.watch.is_some() || self.watch_error.is_some() {
+            return;
         }
         let root = &self.project.root;
         let roots: Vec<PathBuf> = self.project.layers.iter().map(|l| l.path.clone()).collect();
@@ -638,12 +676,28 @@ impl Workspace {
             Ok(watch) => self.watch = Some(watch),
             Err(e) => self.watch_error = Some(format!("the layers are not watched: {e}")),
         }
-        self.serve(ctx);
-        self.signal(ProjectOpened::NAME);
+        if self.link.is_none() && self.link_error.is_none() {
+            self.serve(ctx);
+        }
+    }
+
+    /// Whether what the importers made is attached: until it is, the project shows without their outputs.
+    pub fn attached(&self) -> bool {
+        self.takein.covers(self.attaching)
+    }
+
+    /// How far the project being read again or attached is, while it is.
+    pub fn reading(&self) -> Option<String> {
+        self.takein.stage()
+    }
+
+    /// Read the project again, as this changed: it goes on showing until the new one is ready.
+    pub fn reload(&mut self, why: &'static str) {
+        self.takein.reload(why);
     }
 
     /// Signal an event: an epoch begins, on the project as last taken in, for the config in use.
-    pub fn signal(&self, event: &str) {
+    pub fn signal(&mut self, event: &str) {
         self.signal_all(vec![event.to_string()], None, None);
     }
 
@@ -735,7 +789,11 @@ impl Workspace {
         self.runner.busy()
     }
 
-    fn signal_all(&self, roots: Vec<String>, config: Option<project::Config>, reply: Option<mpsc::Sender<mcp::Reply>>) {
+    fn signal_all(&mut self, roots: Vec<String>, config: Option<project::Config>, reply: Option<mpsc::Sender<mcp::Reply>>) {
+        if !self.attached() {
+            self.held_events.push((roots, config, reply));
+            return;
+        }
         let Some(config) = config.or_else(|| self.config.clone()) else {
             if let Some(reply) = reply {
                 let _ = reply.send(mcp::Reply::failed("the project has no config".to_string()));
@@ -808,8 +866,11 @@ impl Workspace {
         // The user's extensions folder, looked at each second.
         if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
             self.extensions_checked = std::time::Instant::now();
-            if extensions::found(&self.project, Some(&self.index)) != self.extensions_found {
-                return Update::Reopen("an extension changed");
+            let found = extensions::found(&self.project, Some(&self.index));
+            if found != self.extensions_found {
+                // Asked once: what it is taken for is what was found then, read again or not.
+                self.extensions_found = found;
+                self.takein.reload("an extension changed");
             }
         }
         // What the editor wrote (an edit, a step, a setting of the project): taken in at once.
@@ -902,11 +963,14 @@ impl Workspace {
             if let Some(error) = snapshot.error {
                 self.watch_error = Some(error);
             }
-            if let Some(why) = snapshot.reopen {
-                self.outcome = Update::Reopen(why);
+            if let Some(said) = snapshot.said {
+                self.outcome = Update::Said(said);
             }
             self.index = snapshot.index;
             self.revision += 1;
+            if let Some(reloaded) = snapshot.reloaded {
+                self.take_up(reloaded);
+            }
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
             }
@@ -949,7 +1013,7 @@ impl Workspace {
             let (asked, told) = self.external;
             if asked > told && snapshot.ticket >= asked {
                 self.external.1 = asked;
-                if !matches!(self.outcome, Update::Reopen(_)) && !snapshot.changed.is_empty() {
+                if !matches!(self.outcome, Update::Reloaded(_)) && !snapshot.changed.is_empty() {
                     let before = if let Update::Refreshed(n) = self.outcome { n } else { 0 };
                     self.outcome = Update::Refreshed(before + snapshot.changed.len());
                 }
@@ -972,9 +1036,26 @@ impl Workspace {
         }
     }
 
-    /// Give up the workspace, keeping its history for the project opened again.
-    pub fn into_history(self) -> History {
-        self.history
+    /// Go on with the project as it was read again: what works for the extensions starts anew with the new ones, and what
+    /// was showing is shown by them.
+    fn take_up(&mut self, reloaded: crate::takein::Reloaded) {
+        let crate::takein::Reloaded { project, extensions, found, why } = reloaded;
+        let places = |project: &Project| project.layers.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        if places(&project) != places(&self.project) {
+            self.watch = None;
+        }
+        self.runner.restart(project.clone(), extensions.clone());
+        self.project = project;
+        self.extensions_found = found;
+        self.thumbs = crate::thumbs::Thumbs::start(extensions.clone(), self.store.clone());
+        self.textures.pictures = Some(crate::pictures::Pictures::start(self.index.clone(), extensions.clone()));
+        self.extensions = extensions;
+        self.players.clear();
+        self.played.clear();
+        self.view_edit = None;
+        self.field_edit = None;
+        self.signal(ProjectOpened::NAME);
+        self.outcome = Update::Reloaded(why);
     }
 
     /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. Its
@@ -1338,7 +1419,7 @@ impl Workspace {
     }
 
     /// Put the stack's own layers in this order (bottom to top), if it keeps what each needs: written to
-    /// `project.toml`, which the watcher sees and the project is opened again.
+    /// `project.toml`, which the watcher sees and the project is read again.
     ///
     /// # Errors
     /// Why the order cannot be: a layer it would put below one it needs, or `project.toml` not written.
@@ -1351,7 +1432,11 @@ impl Workspace {
     /// # Errors
     /// The name is not one a layer may take, or it cannot be written.
     pub fn add_layer(&mut self, name: &str, kind: project::LayerKind) -> Result<()> {
-        project::stack::add(&self.project, name, kind, &mut self.history)
+        project::stack::add(&self.project, name, kind, &mut self.history)?;
+        // Asked for here so that what comes next finds it there.
+        self.take_written();
+        self.settle();
+        Ok(())
     }
 
     /// Where an override of an entry (by uid) goes: the active layer (none), or - code (an entry of a files layer)
