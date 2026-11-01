@@ -381,7 +381,7 @@ fn details_ui(
         ui.label(RichText::new(why).small().color(ui.visuals().error_fg_color));
     }
     ui.add_space(6.0);
-    unsandboxed_ui(ui, p, message);
+    unsandboxed_ui(ui, ws, p, message);
     switch_ui(ui, ws, present, p, state, message);
     theme::section(ui, "About", |ui| {
         egui::Grid::new("extension about").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
@@ -574,7 +574,7 @@ fn setting_input(ui: &mut egui::Ui, id: (&str, &str), label: &str, setting: &Set
 }
 
 /// For an unsandboxed extension: enabling it, which is the user's and no project's. Until then nothing of it runs.
-fn unsandboxed_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
+fn unsandboxed_ui(ui: &mut egui::Ui, ws: &Workspace, p: &Present, message: &mut Option<String>) {
     let Some(trust) = &p.trust else { return };
     // Where it is says it may run: there is nothing of its own to switch.
     if let Some(allowed) = extensions::trust::allowed_by(&p.origin) {
@@ -601,6 +601,16 @@ fn unsandboxed_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) 
             *message = Some(format!("{}: only you can enable it, not an agent", p.id));
         } else if let Err(e) = extensions::set_unsandboxed_enabled(trust, &p.id, enable) {
             *message = Some(format!("{}: {e}", p.id));
+        }
+    }
+    // Where it is can be trusted instead, a no said when the project was opened taken back.
+    if let Some((place, label)) = crate::onboarding::file_of(p).filter(|_| enable).map(|file| crate::onboarding::place_of(ws, file))
+        && ui.button(format!("Trust {label}")).on_hover_text("What is there runs from now on: for you, on this computer").clicked()
+    {
+        if crate::drive::agent_acting(ui.ctx()) {
+            *message = Some(format!("{label}: only you can trust it, not an agent"));
+        } else if let Err(e) = extensions::trust::trust(&ws.project.root, std::slice::from_ref(&place)) {
+            *message = Some(format!("{label}: {e}"));
         }
     }
     ui.add_space(6.0);

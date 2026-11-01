@@ -255,11 +255,15 @@ impl Imports {
             else {
                 continue;
             };
-            let digest = sha1_hex(asset.settings_text().as_bytes());
+            // Of what it makes, what is named: listing the members of the rest would be asking its extension for nothing.
+            let mut families: Vec<&str> = named.iter().filter_map(|r| r.output.as_deref()?.split('/').next()).collect();
+            families.sort_unstable();
+            families.dedup();
+            let digest = sha1_hex(format!("{}\n{}", families.join(" "), asset.settings_text()).as_bytes());
             let addresses = if let Some((_, addresses)) = known.get(target).filter(|(d, _)| *d == digest) {
                 addresses.clone()
             } else {
-                let addresses: Arc<HashSet<String>> = Arc::new(extensions.addresses(asset).into_iter().map(|(address, _)| address).collect());
+                let addresses: Arc<HashSet<String>> = Arc::new(extensions.addresses_of(asset, Some(&families)).into_iter().map(|(address, _)| address).collect());
                 known.insert(target.clone(), (digest, addresses.clone()));
                 addresses
             };

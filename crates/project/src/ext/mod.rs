@@ -1365,6 +1365,12 @@ impl Extensions {
     /// those that are families.
     #[must_use]
     pub fn addresses(&self, asset: &index::Asset) -> Vec<(String, String)> {
+        self.addresses_of(asset, None)
+    }
+
+    /// `addresses`, of these outputs alone, where only they are wanted: listing a family's members asks its extension.
+    #[must_use]
+    pub fn addresses_of(&self, asset: &index::Asset, families: Option<&[&str]>) -> Vec<(String, String)> {
         let lent = self.lend(asset);
         let outputs = self.outputs_of(asset);
         let members = |name: &str| {
@@ -1382,6 +1388,9 @@ impl Extensions {
         let addresses = plan.outputs.iter().flat_map(|output| {
             if output.parameter.is_none() {
                 return vec![(output.name.clone(), output.name.clone())];
+            }
+            if families.is_some_and(|families| !families.contains(&output.name.as_str())) {
+                return Vec::new();
             }
             let listed = members(&output.name).unwrap_or_default();
             listed.into_iter().map(|(key, label)| (format!("{}/{key}", output.name), label)).collect()

@@ -448,14 +448,20 @@ impl Scenario {
         present.unwrap_or_else(|| panic!("no extension {id}")).status
     }
 
+    /// The project, its session over.
+    #[must_use]
+    pub fn into_fixture(self) -> Fixture {
+        let Scenario { harness, fixture, _alone: alone } = self;
+        drop(harness);
+        drop(alone);
+        fixture
+    }
+
     /// Open the same project again, in a new session.
     #[track_caller]
     #[must_use]
     pub fn opened_again(self) -> Scenario {
-        let Scenario { harness, fixture, _alone: alone } = self;
-        drop(harness);
-        drop(alone);
-        Scenario::open(fixture)
+        Scenario::open(self.into_fixture())
     }
 
     /// What the project's `project.toml` says.

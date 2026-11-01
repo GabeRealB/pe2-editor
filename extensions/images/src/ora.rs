@@ -23,7 +23,7 @@
 
 use codecs::ora::{self, Document, Group, Layer, Node, Pixels};
 use codecs::texture::{color, entries, gray_ramp, rgba};
-use pe2_ext::{Asset, Result, Table, Value, anyhow};
+use pe2_ext::{Asset, Image, Result, Table, Value, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{TexelImage, bpp, cells, halfwords, palette_names, texels_per_halfword};
@@ -200,11 +200,34 @@ pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
     }
     stack.push(layer(TEXELS_LAYER, 0, 0, true, texels_png));
     let document = Document { width: u32::try_from(document_width)?, height: u32::try_from(height)?, stack };
-    let merged = crate::draw(asset, image, 0);
-    let thumbnail = merged.thumbnail(THUMBNAIL);
+    let page = crate::draw(asset, image, 0);
+    let thumbnail = page.thumbnail(THUMBNAIL);
+    let merged = merged_picture(asset, image, &page, document_width, &places);
     let merged = codecs::texture::rgba_png(merged.width, merged.height, &merged.rgba).map_err(png_error)?;
     let thumbnail = codecs::texture::rgba_png(thumbnail.width, thumbnail.height, &thumbnail.rgba).map_err(png_error)?;
     Ok(ora::write(&document, &merged, &thumbnail))
+}
+
+/// The document as a viewer shows it: the image, with the cells of other depths in their stretches beside it.
+fn merged_picture(asset: &Asset, image: &TexelImage, page: &Image, width: usize, places: &BTreeMap<u8, usize>) -> Image {
+    if width == page.width {
+        return Image { width, height: page.height, rgba: page.rgba.clone() };
+    }
+    let mut rgba = vec![0; width * page.height * 4];
+    let mut paste = |picture: &Image, x: usize, y: usize| {
+        for row in 0..picture.height.min(page.height.saturating_sub(y)) {
+            let from = row * picture.width * 4;
+            let to = (y + row) * width * 4 + x * 4;
+            rgba[to..to + picture.width * 4].copy_from_slice(&picture.rgba[from..from + picture.width * 4]);
+        }
+    };
+    paste(page, 0, 0);
+    for cell in cells(asset).iter().filter(|cell| cell.bpp != image.bpp) {
+        let picture = crate::decode_cell(asset, &image.texels, &image.colors(), cell, None);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
+        paste(&picture, places[&cell.bpp] + cell.source.x as usize, cell.source.y as usize);
+    }
+    Image { width, height: page.height, rgba }
 }
 
 fn layer(name: &str, x: usize, y: usize, visible: bool, png: Vec<u8>) -> Node {
@@ -629,6 +652,10 @@ mod tests {
             (layer.x, layer.y, picture.width, picture.height)
         };
         assert_eq!(place("wide"), (4, 0, 4, 2), "of the image's depth, it is where it is drawn");
+        let bytes = source();
+        let archive = codecs::zip::Archive::new(&bytes).unwrap();
+        let merged = ora::decode_png(&archive.read("mergedimage.png").unwrap().unwrap()).unwrap();
+        assert_eq!((merged.width, merged.height), (24, 2), "what a viewer shows is the document");
         assert_eq!(place("small"), (8, 1, 4, 1), "of 4 bpp, it starts the stretch of its depth");
     }
 

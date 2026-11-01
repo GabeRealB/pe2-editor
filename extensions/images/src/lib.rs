@@ -535,7 +535,7 @@ fn cell_picture(asset: &Asset, image: &TexelImage, name: &str) -> Option<Image> 
 
 /// A cell's pixels, each of its texels one: not cut from the image, where a cell of fewer bits a texel has less room than it
 /// has texels.
-fn decode_cell(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], cell: &Cell, through: Option<(&str, usize)>) -> Image {
+pub(crate) fn decode_cell(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], cell: &Cell, through: Option<(&str, usize)>) -> Image {
     let gray = codecs::texture::gray_ramp(cell.bpp);
     let (_, overrides) = look(asset, 0);
     let asked = through.filter(|(name, _)| *name == cell.name).map(|(_, palette)| palette);

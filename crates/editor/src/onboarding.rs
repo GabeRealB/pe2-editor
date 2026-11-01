@@ -46,7 +46,7 @@ pub enum Answer {
 }
 
 /// The place an extension is in: the layer or mount holding it, else its own folder.
-fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
+pub fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
     let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let holding = ws.project.layers.iter().filter_map(|layer| Some((layer, layer.path.canonicalize().ok()?))).find(|(_, path)| real.starts_with(path));
     if let Some((layer, path)) = holding {
@@ -57,7 +57,7 @@ fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
     (folder, label)
 }
 
-fn file_of(present: &Present) -> Option<&PathBuf> {
+pub fn file_of(present: &Present) -> Option<&PathBuf> {
     match &present.origin {
         Origin::Project { file, .. } | Origin::Component(file) => Some(file),
         _ => None,

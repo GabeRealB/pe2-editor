@@ -69,3 +69,15 @@ fn a_choice_of_configs_is_asked_once() {
     editor.click_label("Continue");
     assert!(!editor.asking());
 }
+
+#[test]
+fn a_no_can_be_taken_back_in_the_extensions_pane() {
+    let mut editor = Scenario::open(Fixture::untrusted(false));
+    editor.click_label("Continue");
+    let fixture = editor.into_fixture();
+    let mut editor = Scenario::open_showing(fixture, Some("extensions"));
+    assert!(!editor.asking());
+    editor.click("pe2.psx: not enabled");
+    editor.click("Trust layer mods");
+    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+}
