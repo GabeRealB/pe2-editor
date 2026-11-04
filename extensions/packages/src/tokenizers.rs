@@ -333,6 +333,27 @@ fn group_file_id(call: &Call, args: &Args) -> Result<String> {
     Ok((group * 10_000 + id).to_string())
 }
 
+/// A stream of a file's id, as its record has it: a movie in a view's is the view, a cutscene's 100 and its place among
+/// the file's cutscenes (its movies in no view), a scene's its own.
+fn file_stream_id(call: &Call, args: &Args) -> Result<String> {
+    let name = args.one("stream")?;
+    let given = call.given();
+    let streams = given.get("streams").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut cutscenes = 0;
+    for stream in streams {
+        let integer = |key: &str| stream.get(key).and_then(Value::as_integer);
+        let movie = stream.get("type").and_then(Value::as_str) == Some("movie");
+        let id = if movie { integer("view").unwrap_or(100 + cutscenes) } else { integer("id").ok_or_else(|| anyhow!("a scene with no id"))? };
+        if stream.get("name").and_then(Value::as_str) == Some(name) {
+            return Ok(id.to_string());
+        }
+        if movie && integer("view").is_none() {
+            cutscenes += 1;
+        }
+    }
+    bail!("it has no stream {name}")
+}
+
 pub fn register(r: &mut Registry) {
     r.tokenizer(&["pe2.render@model"])
         .follows()
@@ -376,6 +397,8 @@ pub fn register(r: &mut Registry) {
         .register();
     // A file of a group, as the group reads it (`files/<name>`).
     r.tokenizer(&["pe2.game@file_group"]).follows().derived("id", Yields::IntLiteral, &["file"], group_file_id).register();
+    // A stream of a file, as the file reads it (`streams/<name>`).
+    r.tokenizer(&["pe2.game@file"]).follows().derived("id", Yields::IntLiteral, &["stream"], file_stream_id).register();
     for node_type in ["pe2.render@model", "pe2.render@material", "pe2.images@image"] {
         let _ = r.extend(node_type).inspector_tab("Tokens", pe2_ext::Icon::Text, &[], |_| Box::new(crate::views::Tokens::default())).register();
     }

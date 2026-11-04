@@ -129,7 +129,9 @@ impl View for Slots {
             }
             None => return,
         };
-        let (dependencies, slots): (Vec<Table>, Vec<Table>) = tables(&reflected, "slots").into_iter().partition(is_package);
+        // A slot kept out of the editor is filled without it: by default, by the package itself.
+        let shown = tables(&reflected, "slots").into_iter().filter(|slot| !slot.get("hidden").and_then(Value::as_bool).unwrap_or(false));
+        let (dependencies, slots): (Vec<Table>, Vec<Table>) = shown.partition(is_package);
         if self.sheet {
             self.inputs(ui, &slots, &tables(&reflected, "options"));
             detail(ui, &slots);

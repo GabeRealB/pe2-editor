@@ -112,6 +112,27 @@ op = "output"
 name = "files"
 "#;
 
+/// A file's stack: its fields, and each stream it lists as the file read as that stream (`streams/<name>`), whose id its
+/// tokenizer derives.
+const FILE: &str = r#"[[stack]]
+id = "file"
+op = "pe2.game@file"
+
+[[stack]]
+op = "pe2.game@file_stream"
+file = { from = "file" }
+
+[[stack]]
+op = "output"
+name = "streams"
+"#;
+
+/// The names of a file's streams, in its order.
+fn file_streams(asset: &Asset) -> Vec<(String, String)> {
+    let streams = asset.field("streams").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    streams.iter().filter_map(|stream| stream.get("name")?.as_str()).map(|name| (name.to_string(), name.to_string())).collect()
+}
+
 /// The names of a file group's files, in its order.
 fn group_files(asset: &Asset) -> Vec<(String, String)> {
     let files = asset.field("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
@@ -152,12 +173,25 @@ fn register(r: &mut Registry) -> Result<()> {
         let value = r.named_type(value).label(label).named(pattern).register();
         r.named_type(name).alias(name).label(label).icon(icon, tint).of(&value.to_string()).stack(STORED).register();
     }
+    // A stream of a file, as what reads it: the file again, told which, so that its id is the file's to say.
+    let _ = r
+        .op("file_stream")
+        .label("A stream of the file")
+        .takes("file", &["pe2.game@file"])
+        .output::<ty::Table>()
+        .parameter::<String>("name")
+        .members(file_streams)
+        .run(|call| {
+            let name: String = call.parameter()?;
+            Ok(pe2_ext::tokens::leads_on(call.host.path(), "file", &[("stream", &name)]))
+        });
     r.named_type("file")
         .alias("file")
         .label("File")
         .icon(Icon::File, Tint::Structure)
         .data()
         .extracted()
+        .stack(FILE)
         .field(Field::new("sector_len").label("Sector length").format(hex))
         .field(Field::new("streams").label("Streams"))
         .register();

@@ -388,6 +388,9 @@ struct Slots {
 #[derive(Default)]
 struct Slot {
     ty: Option<String>,
+    /// What it is beside its type, after it: `self`, filled where its package's declaration does not by the package built;
+    /// `hidden`, kept out of the editor.
+    attributes: BTreeSet<String>,
     label: String,
     /// Where it was first declared, among all a package's slots and options: a later declaration of it moves nothing.
     order: i64,
@@ -406,7 +409,19 @@ impl Slots {
                 if slot.ty.is_none() {
                     (slot.ty, slot.label, slot.order) = (rest.first().cloned(), label.to_string(), order);
                 }
+                slot.attributes.extend(rest.iter().skip(1).filter_map(|word| word.strip_prefix('_')).map(str::to_string));
                 slot.public |= public;
+            }
+            // What `pe2.h` expands it to, as a source reads before a first pass has: a file, and the package built.
+            "PE2_BIND_SELF" => {
+                let file = self.held.entry((*name).to_string()).or_default();
+                if file.ty.is_none() {
+                    (file.ty, file.label, file.order) = (Some("file".to_string()), label.to_string(), order);
+                }
+                file.public |= public;
+                let own = self.held.entry(SELF.to_string()).or_default();
+                own.ty.get_or_insert_with(|| "package".to_string());
+                own.attributes.extend(["self".to_string(), HIDDEN.to_string()]);
             }
             "PE2_INCLUDE" => {
                 let slot = self.held.entry((*name).to_string()).or_default();
@@ -434,6 +449,7 @@ impl Slots {
             out.insert("order".into(), slot.order.into());
             out.insert("type".into(), slot.ty.clone().unwrap_or_default().into());
             out.insert("public".into(), slot.public.into());
+            out.insert(HIDDEN.into(), slot.attributes.contains(HIDDEN).into());
             let reads = slot.reads.iter().map(|read| Value::String(read.join("/")));
             out.insert("reads".into(), Value::Array(reads.collect()));
             let args = slot.args.iter().map(|((path, arg), values)| {
@@ -719,32 +735,34 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let (first, mut kept): (Vec<File>, Vec<File>) = tree.files.into_iter().partition(|file| file.name.starts_with(FIRST));
     let mut slots = Slots::default();
-    let mut reads = BTreeSet::new();
+    let (mut reads, mut queries) = (BTreeSet::new(), BTreeSet::new());
     for file in &first {
         let bytes = call.read(file)?;
         let text = String::from_utf8_lossy(&bytes);
         for found in scan::uses(&text) {
             slots.read(&found, false, "", 0);
-            if found.name == "PE2_VALUE" {
-                reads.extend(Read::of(&found.args));
+            match found.name {
+                "PE2_VALUE" => reads.extend(Read::of(&found.args)),
+                "PE2_QUERY" => queries.extend(Query::of(&found.args)),
+                _ => {}
             }
         }
     }
     let mut notes = tree.notes;
-    let (header, failed) = values(call, &slots, &reads);
+    let (header, failed) = values(call, &slots, &reads, &queries);
     notes.extend(failed);
     kept.push(File::new(VALUES, header.into_bytes()));
     Ok(Typed { notes, settings: call.given(), ..Typed::new(SourceTree::NAME, kept) })
 }
 
 /// What a binding holds: the reference filling it.
-fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>) -> (String, Vec<String>) {
+fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet<Query>) -> (String, Vec<String>) {
     let fields = &call.given();
     let mut header = String::new();
     let mut failed = Vec::new();
     for (name, slot) in &slots.held {
         let ty = slot.ty.as_deref().unwrap_or_default();
-        let wrong = if ty == "package" { None } else { slot_problem(call, fields, name, ty) };
+        let wrong = if ty == "package" { None } else { slot_problem(call, fields, slots, name, ty) };
         failed.extend(wrong.clone());
         header.push_str(&wrong.map_or_else(|| format!("#define pe2_bind_{name}\n"), |why| failing(&format!("pe2_bind_{name}"), &why)));
     }
@@ -765,7 +783,88 @@ fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>) -> (String, Vec<St
             }
         });
     }
+    for query in queries {
+        header.push_str(&match answer(call, fields, slots, query) {
+            Ok(answer) => defined(&query.name(), answer),
+            Err(why) => {
+                let why = said(&query.binding, &format!("{why:#}"));
+                let written = failing(&query.name(), &why);
+                failed.push(why);
+                written
+            }
+        });
+    }
     (header, failed)
+}
+
+/// A question the build answers of what a slot holds: `PE2_QUERY(file, contains, self)`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Query {
+    binding: String,
+    key: String,
+    args: Vec<String>,
+}
+
+/// The keys a query asks by.
+const QUERIES: [&str; 1] = ["contains"];
+
+impl Query {
+    fn of(args: &[&str]) -> Option<Query> {
+        let [binding, key, rest @ ..] = args else { return None };
+        Some(Query { binding: (*binding).to_string(), key: (*key).to_string(), args: rest.iter().map(ToString::to_string).collect() })
+    }
+
+    /// The macro it reads, as `PE2_QUERY` pastes it.
+    fn name(&self) -> String {
+        let mut name = format!("pe2_query_{}_{}", self.binding, self.key);
+        for arg in &self.args {
+            name.push('_');
+            name.push_str(arg);
+        }
+        name
+    }
+}
+
+/// What the build says to a query, 1 or 0: `contains`, whether what a slot holds names, anywhere in it, what another holds.
+fn answer(call: &Call, fields: &Table, slots: &Slots, query: &Query) -> Result<&'static str> {
+    if !QUERIES.contains(&query.key.as_str()) {
+        bail!("there is no query {}; there is {}", query.key, QUERIES.join(", "));
+    }
+    let [other] = query.args.as_slice() else { bail!("{} takes a slot of the package", query.key) };
+    if !slots.held.contains_key(other) {
+        bail!("{} takes a slot of the package, and {other} is none", query.key);
+    }
+    let filled = |name: &str| bound(call, fields, slots, name).ok_or_else(|| anyhow!("nothing fills {name} on this package"));
+    let wanted = holder(call, &filled(other)?)?;
+    let held = call.table_of(&holder(call, &filled(&query.binding)?)?, "settings")?;
+    Ok(if names(call, &Value::Table(held), &wanted) { "1" } else { "0" })
+}
+
+/// What a slot comes to as a holder of others, by its path: a file of a group is the file's asset.
+fn holder(call: &Call, bound: &Bound) -> Result<String> {
+    let Reached::Node { node, reads_as, args } = walked(call, bound, &[])? else { bail!("it holds a value") };
+    let path = |reference: &str| call.node_named(reference).map(|named| named.path).ok_or_else(|| anyhow!("{reference} names nothing"));
+    match args.get("file").and_then(|file| file.first()).filter(|_| reads_as.as_deref() == Some("file")) {
+        Some(file) => {
+            let group = call.table_of(&node, "settings")?;
+            let files = group.get("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+            let entry = files.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(file.as_str()));
+            path(entry.and_then(|entry| entry.get("asset")).and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{node} has no file {file}"))?)
+        }
+        None => path(&node),
+    }
+}
+
+/// Whether a value names, anywhere in it, the node at a path.
+fn names(call: &Call, value: &Value, wanted: &str) -> bool {
+    if pe2_ext::target_of(value).and_then(|target| call.node_named(target)).is_some_and(|named| named.path == wanted) {
+        return true;
+    }
+    match value {
+        Value::Table(table) => table.values().any(|value| names(call, value, wanted)),
+        Value::Array(values) => values.iter().any(|value| names(call, value, wanted)),
+        _ => false,
+    }
 }
 
 /// What is wrong with a read, as the source's author is told it: what a tokenizer said, without where in the graph it was said.
@@ -778,8 +877,8 @@ fn said(binding: &str, why: &str) -> String {
 }
 
 /// Why a slot cannot be filled as it declares.
-fn slot_problem(call: &Call, fields: &Table, name: &str, ty: &str) -> Option<String> {
-    let Some(bound) = bound(fields, name) else { return Some(format!("{name}: nothing fills it on this package")) };
+fn slot_problem(call: &Call, fields: &Table, slots: &Slots, name: &str, ty: &str) -> Option<String> {
+    let Some(bound) = bound(call, fields, slots, name) else { return Some(format!("{name}: nothing fills it on this package")) };
     let own = match walked(call, &bound, &[]) {
         Ok(Reached::Node { reads_as: Some(reads_as), .. }) => reads_as,
         Ok(Reached::Node { node, .. }) => {
@@ -798,7 +897,7 @@ fn slot_problem(call: &Call, fields: &Table, name: &str, ty: &str) -> Option<Str
 /// What a read comes to.
 fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<String> {
     let slot = slots.held.get(&read.binding).filter(|slot| slot.ty.is_some()).ok_or_else(|| anyhow!("it has no PE2_BIND"))?;
-    let bound = bound(fields, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
+    let bound = bound(call, fields, slots, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
     let (target, led) = match walked(call, &bound, &read.path)? {
         Reached::Node { node, args, .. } => (node, args),
         Reached::Value(_) if read.derived.is_some() => bail!("{} is a value, and nothing is derived from it", read.path.join("/")),
@@ -816,14 +915,23 @@ fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<Str
     pe2_ext::tokens::text_of(call, &call.output_of(&target, &address)?)
 }
 
+/// The slot `PE2_BIND_SELF` fills with the package built.
+const SELF: &str = "self";
+/// What a slot kept out of the editor says of itself.
+const HIDDEN: &str = "hidden";
+
 /// What fills a slot: a node, and the output of it a reference names.
 struct Bound {
     node: String,
     output: Option<String>,
 }
 
-fn bound(fields: &Table, name: &str) -> Option<Bound> {
-    let reference = fields.get("bind")?.get(name)?;
+/// What its package's declaration fills a slot with; else, for a slot filled by default with the package built, the package.
+fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<Bound> {
+    let Some(reference) = fields.get("bind").and_then(|bind| bind.get(name)) else {
+        let own = slots.held.get(name).is_some_and(|slot| slot.attributes.contains("self"));
+        return own.then(|| Bound { node: call.host.path().to_string(), output: None });
+    };
     Some(Bound { node: pe2_ext::target_of(reference)?.to_string(), output: pe2_ext::output_of(reference).map(str::to_string) })
 }
 
