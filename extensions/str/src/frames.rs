@@ -5,11 +5,11 @@
 
 use std::collections::BTreeMap;
 
-use formats::str::{SECTOR, Sector};
+use formats::str::{Form, Sector};
 use pe2_ext::media::{AudioData, MediaBuffer, PixelFormat, SampleFormat, VideoFrame};
 use pe2_ext::{Call, Data, Generator, Result, Table, Typed, Value, anyhow};
 
-use crate::{NATIVE, chunk_at, sectors};
+use crate::{NATIVE, chunk_at, read_sectors};
 
 /// How many sectors are read at a time.
 const RANGE: u64 = 64;
@@ -18,7 +18,8 @@ const RANGE: u64 = 64;
 pub struct Frames {
     clip: Typed,
     header: Table,
-    /// The clip's sectors, and the one read next.
+    /// How the clip's sectors are stored, how many, and the one read next.
+    form: Form,
     sectors: u64,
     at: u64,
     /// The number of the stream's first frame, and the frames a second.
@@ -44,11 +45,11 @@ impl Frames {
     /// # Errors
     /// It has no sectors, or no frames.
     pub fn start(call: &Call<'_>, clip: Typed) -> Result<Frames> {
-        let (size, timing) = {
+        let ((form, sectors), timing) = {
             let lent = call.lend(&clip);
             let asset = lent.asset();
-            let size = asset.size(NATIVE).ok_or_else(|| anyhow!("{}: no {NATIVE}", asset.path()))?;
-            (size, crate::timing(&asset).ok_or_else(|| anyhow!("{}: no frames", asset.path()))?)
+            let stored = crate::stored(&asset).ok_or_else(|| anyhow!("{}: no {NATIVE}", asset.path()))?;
+            (stored, crate::timing(&asset).ok_or_else(|| anyhow!("{}: no frames", asset.path()))?)
         };
         let mut header = Table::new();
         header.insert("count".into(), Value::Integer(timing.count.into()));
@@ -59,11 +60,11 @@ impl Frames {
             if pe2_ext::media::pixel_formats().contains(&PixelFormat::Yuv420p) { PixelFormat::Yuv420p } else { PixelFormat::Rgba8888 };
         header.insert("video".into(), Value::String(format.name().into()));
         header.insert("audio".into(), Value::String(SampleFormat::S16Interleaved.name().into()));
-        let sectors = size / SECTOR as u64;
         let (first, rate) = (timing.first, timing.rate);
         Ok(Frames {
             clip,
             header,
+            form,
             sectors,
             at: 0,
             first,
@@ -80,7 +81,7 @@ impl Frames {
 
     /// Take in one sector: its sound decoded, its chunk gathered; a frame, when its last chunk comes.
     fn take(&mut self, sector: &[u8], path: &str) -> Result<Option<Data>> {
-        match Sector::raw(sector) {
+        match self.form.sector(sector) {
             Sector::Audio(coding, data) => {
                 let coding = codecs::xa::Coding::of(coding);
                 self.coding.get_or_insert(coding);
@@ -155,8 +156,8 @@ impl Generator for Frames {
         let mut items = Vec::new();
         while items.len() < count && self.at < self.sectors {
             let read = RANGE.min(self.sectors - self.at);
-            let bytes = asset.read_range(NATIVE, self.at * SECTOR as u64, sectors(read))?;
-            for sector in bytes.as_chunks::<SECTOR>().0 {
+            let bytes = read_sectors(&asset, self.form, self.at, read)?;
+            for sector in bytes.chunks_exact(self.form.size()) {
                 self.at += 1;
                 if let Some(item) = self.take(sector, &path)? {
                     items.push(item);
@@ -177,7 +178,7 @@ impl Generator for Frames {
         let (mut low, mut high) = (0, self.sectors);
         while low < high {
             let middle = u64::midpoint(low, high);
-            match chunk_at(&asset, middle) {
+            match chunk_at(&asset, self.form, middle) {
                 Some(chunk) if chunk.frame < number => low = middle + 1,
                 _ => high = middle,
             }

@@ -1,8 +1,8 @@
 //! pe2.str: movies kept as STR, the game's form. A clip of an STR stream is its run of sectors as the disc stores it -
 //! a container, interleaving MDEC video in BS frames with XA ADPCM audio - kept as `native.str`. The disc's movie files
-//! (INTER0.STR, INTER1.STR) are containers holding movies back to back (`pe2.game`'s `stream`), assembled from them; a
-//! record of a stage (`pe2.game`'s `movie_slot`) names the movie it plays. This extension extracts the movies from their
-//! containers (`extract`), says what one's stream is from a few of its sectors (`stream`): a movie is tens of
+//! (INTER0.STR, INTER1.STR) are containers holding movies with sound back to back (`pe2.game`'s `stream`), assembled
+//! from them; a movie without sound is stored in its stage, and a file lists the movies its package plays (`streams`).
+//! This extension extracts the movies from where they are (`extract`), says what one's stream is from a few of its sectors (`stream`): a movie is tens of
 //! megabytes - and decodes its video and sound to play it (`frames`), what `pe2.movies` takes a movie to be. Extraction
 //! makes no source of a movie: STR is its only truth, and what a source would hold is lossy by then. An import brings a
 //! stream to `encode`, which is held to the STR it replaces.
@@ -10,7 +10,7 @@
 //! A video file is made of that stream by what provides the `video-container` service; that dependency is optional, as
 //! a movie plays without one: without one a movie has no `video` output, nothing else changing.
 
-use formats::str::{Coding, SECTOR, SECTORS_A_SECOND, Sector};
+use formats::str::{Coding, Form, HEADER, SECTORS_A_SECOND, Sector};
 use pe2_ext::ty::{self, Files, Registered};
 use pe2_ext::media::VideoFrame;
 use pe2_ext::{Asset, Data, Image, Name, Registry, Result, Signature, Table, Value, anyhow};
@@ -167,15 +167,31 @@ fn image(frame: &VideoFrame) -> Result<Image> {
     Ok(Image { width: frame.width as usize, height: frame.height as usize, rgba: frame.rgba()? })
 }
 
-/// The bytes of a count of sectors.
-pub(crate) fn sectors(count: u64) -> usize {
-    usize::try_from(count).unwrap_or(usize::MAX).saturating_mul(SECTOR)
+/// How a movie's sectors are stored, from its first.
+pub(crate) fn form(asset: &Asset) -> Option<Form> {
+    Some(Form::of(&asset.read_range(NATIVE, 0, HEADER).ok()?))
+}
+
+/// A movie's sectors as stored: their form, and how many.
+pub(crate) fn stored(asset: &Asset) -> Option<(Form, u64)> {
+    let form = form(asset)?;
+    Some((form, asset.size(NATIVE)? / form.size() as u64))
+}
+
+/// The bytes of a count of sectors of a form.
+pub(crate) fn sectors(form: Form, count: u64) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX).saturating_mul(form.size())
+}
+
+/// Sectors of a form, read from `at`: each one's bytes.
+pub(crate) fn read_sectors(asset: &Asset, form: Form, at: u64, count: u64) -> Result<Vec<u8>> {
+    asset.read_range(NATIVE, at * form.size() as u64, sectors(form, count))
 }
 
 /// The first video sector's chunk at or after a sector, among the `LOOK` from it.
-pub(crate) fn chunk_at(asset: &Asset, at: u64) -> Option<formats::str::Chunk> {
-    let bytes = asset.read_range(NATIVE, at * SECTOR as u64, sectors(LOOK)).ok()?;
-    bytes.as_chunks::<SECTOR>().0.iter().find_map(|s| match Sector::raw(s) {
+pub(crate) fn chunk_at(asset: &Asset, form: Form, at: u64) -> Option<formats::str::Chunk> {
+    let bytes = read_sectors(asset, form, at, LOOK).ok()?;
+    bytes.chunks_exact(form.size()).find_map(|s| match form.sector(s) {
         Sector::Video(chunk, _) => Some(chunk),
         _ => None,
     })
@@ -190,11 +206,11 @@ pub(crate) struct Timing {
 
 /// How a movie plays: its frames, by the numbers its first and last carry, at the rate they fill its sectors.
 pub(crate) fn timing(asset: &Asset) -> Option<Timing> {
-    let sectors = asset.size(NATIVE)? / SECTOR as u64;
-    let first = chunk_at(asset, 0)?.frame;
+    let (form, sectors) = stored(asset)?;
+    let first = chunk_at(asset, form, 0)?.frame;
     let last = (0..LOOK.min(sectors)).find_map(|back| {
-        let bytes = asset.read_range(NATIVE, (sectors - 1 - back) * SECTOR as u64, SECTOR).ok()?;
-        match Sector::raw(&bytes) {
+        let bytes = read_sectors(asset, form, sectors - 1 - back, 1).ok()?;
+        match form.sector(&bytes) {
             Sector::Video(chunk, _) => Some(chunk.frame),
             _ => None,
         }
@@ -209,21 +225,20 @@ pub(crate) fn timing(asset: &Asset) -> Option<Timing> {
 /// number) and their size, the sectors a frame takes, and its audio.
 fn stream(asset: &Asset) -> Table {
     let mut stream = Table::new();
-    let Some(size) = asset.size(NATIVE) else { return stream };
-    let sectors = size / SECTOR as u64;
+    let Some((form, sectors)) = stored(asset) else { return stream };
     let integer = |v: u64| Value::Integer(i64::try_from(v).unwrap_or(i64::MAX));
     stream.insert("sectors".into(), integer(sectors));
     let seconds = sectors / SECTORS_A_SECOND;
     stream.insert("duration".into(), Value::String(format!("{}:{:02}", seconds / 60, seconds % 60)));
-    let read = |at: u64| asset.read_range(NATIVE, at * SECTOR as u64, SECTOR).ok();
+    let read = |at: u64| read_sectors(asset, form, at, 1).ok();
     let near = |start: u64, forward: bool| {
         (0..LOOK.min(sectors)).filter_map(move |i| if forward { Some(start + i) } else { start.checked_sub(i) })
     };
-    let first = near(0, true).filter_map(read).find_map(|s| match Sector::raw(&s) {
+    let first = near(0, true).filter_map(read).find_map(|s| match form.sector(&s) {
         Sector::Video(chunk, _) => Some(chunk),
         _ => None,
     });
-    let last = near(sectors.saturating_sub(1), false).filter_map(read).find_map(|s| match Sector::raw(&s) {
+    let last = near(sectors.saturating_sub(1), false).filter_map(read).find_map(|s| match form.sector(&s) {
         Sector::Video(chunk, _) => Some(chunk),
         _ => None,
     });
@@ -232,7 +247,7 @@ fn stream(asset: &Asset) -> Table {
         stream.insert("frame_size".into(), Value::Array(vec![integer(first.width.into()), integer(first.height.into())]));
         stream.insert("sectors_per_frame".into(), integer(first.chunks.into()));
     }
-    let audio = near(0, true).filter_map(read).find_map(|s| match Sector::raw(&s) {
+    let audio = near(0, true).filter_map(read).find_map(|s| match form.sector(&s) {
         Sector::Audio(coding, _) => Some(Coding::of(coding)),
         _ => None,
     });

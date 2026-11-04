@@ -1,11 +1,11 @@
 //! pe2.game: the types of the game's data besides its images (`pe2.images`) and movies (`pe2.movies`, `pe2.str`) - the discs and
-//! their stages, folders and files, the files grouped, the disc's movie files (`stream`: a list of entries, each a
-//! movie in order, assembled from them; the entries are the outputs the records name), the stages' records of the movies
-//! they play (`movie_slot`: a `StreamSlot`'s fields, naming its movie file's entry) and of their scenes' audio, the
-//! executable, plain text and binary data. Each type's icon and label, and the fields read in hex: a file's sector
-//! length, a scene's sound bank mask.
+//! their stages, folders and files, the files grouped, a disc's movie file (`stream`: its stages' movies with sound, in
+//! order, made from them by `inter`), the scenes' audio streams a stage stores (`scene_audio`), the executable, plain
+//! text and binary data. A file lists the streams its package plays (`streams`): each a movie or a scene's audio, by
+//! name, with what of its record does not follow from where it is. Each type's icon and label, and the fields read in
+//! hex: a file's sector length.
 
-use pe2_ext::{Asset, Cell, ContentRow, Contents, Field, Icon, Project, Registry, Result, Style, Table, Tint, Ui, Value, View, ty};
+use pe2_ext::{Asset, Call, Data, Field, Icon, Registry, Result, Table, Tint, Typed, Value, anyhow, ty};
 
 pe2_ext::extension!("pe2.game", "0.1.0", register);
 
@@ -17,34 +17,86 @@ fn hex(value: &Value) -> Option<String> {
 /// A file as the disc stores it.
 const STORED: &str = "[[stack]]\nop = \"file\"\nfile = \"{file}\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
 
-/// A movie file's stack: its entries' movies, joined in order - the file as the disc stores it.
+/// A movie file's stack: its stages' movies with sound, joined in order - the file as the disc stores it.
 const STREAM: &str = r#"[[stack]]
 id = "file"
 op = "pe2.game@stream"
 
 [[stack]]
-op = "references"
-field = "entries"
-key = "movie"
-output = "native"
-
-[[stack]]
-op = "concatenate"
-name = "native.str"
+op = "pe2.game@inter"
+file = { from = "file" }
 
 [[stack]]
 op = "output"
 name = "native"
 retain = "cache"
-
-[[stack]]
-op = "pe2.game@entry"
-file = { from = "file" }
-
-[[stack]]
-op = "output"
-name = "entries"
 "#;
+
+/// What a node's fields are, read by another's op.
+const SETTINGS: &str = "settings";
+
+/// A stage's files in its order, each once: stage 0's across its groups by id (a group's number, as many ten
+/// thousands, and the file's in it), a stage's folders in its layout's order and their files by id.
+fn stage_files(call: &Call, layout: &Table) -> Result<Vec<String>> {
+    let list = |table: &Table, key: &str| table.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let id = |v: &Value| v.get("id").and_then(Value::as_integer).unwrap_or(0);
+    let asset = |v: &Value| v.get("asset").and_then(pe2_ext::target_of).map(str::to_string);
+    let mut out: Vec<String> = Vec::new();
+    let mut take = |files: Vec<(i64, String)>| {
+        let mut files = files;
+        files.sort_by_key(|f| f.0);
+        for (_, file) in files {
+            if !out.contains(&file) {
+                out.push(file);
+            }
+        }
+    };
+    if layout.contains_key("groups") {
+        let mut files = Vec::new();
+        for group in list(layout, "groups") {
+            let node = asset(&group).ok_or_else(|| anyhow!("a group of the layout names nothing"))?;
+            for file in list(&call.table_of(&node, SETTINGS)?, "files") {
+                files.extend(asset(&file).map(|a| (id(&group) * 10_000 + id(&file), a)));
+            }
+        }
+        take(files);
+    } else {
+        for folder in list(layout, "folders") {
+            let node = asset(&folder).ok_or_else(|| anyhow!("a folder of the layout names nothing"))?;
+            take(list(&call.table_of(&node, SETTINGS)?, "files").iter().filter_map(|f| Some((id(f), asset(f)?))).collect());
+        }
+    }
+    Ok(out)
+}
+
+/// A disc's movie file: the movies with sound its stages' files play on this disc, in the stages' order - a movie
+/// entry with a volume (a movie without plays from the stage), and naming this disc where it names one.
+fn inter(call: &mut Call) -> Result<Typed> {
+    let given = call.given();
+    let disc = given.get("disc").and_then(Value::as_integer).ok_or_else(|| anyhow!("it names no disc"))?;
+    let stages = given.get("stages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut movies = Vec::new();
+    for stage in &stages {
+        let stage = pe2_ext::target_of(stage).ok_or_else(|| anyhow!("a stage names nothing"))?;
+        let layout = call.table_of(stage, SETTINGS)?;
+        for file in stage_files(call, &layout)? {
+            let fields = call.table_of(&file, SETTINGS)?;
+            for entry in fields.get("streams").and_then(Value::as_array).into_iter().flatten() {
+                let integer = |key: &str| entry.get(key).and_then(Value::as_integer);
+                let movie = entry.get("type").and_then(Value::as_str) == Some("movie");
+                if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc) {
+                    movies.push(entry.get("asset").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{file}: a stream names nothing"))?.to_string());
+                }
+            }
+        }
+    }
+    let mut writer = call.writer("native.str")?;
+    for movie in &movies {
+        let Data::Typed(native) = call.output_of(movie, "native")? else { pe2_ext::bail!("{movie}: its native is no file") };
+        std::io::Write::write_all(&mut writer, &call.read(native.file()?)?)?;
+    }
+    Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
+}
 
 /// A file group's stack: its files, each read as itself (`files/<name>`), which a list of them names.
 const FILE_GROUP: &str = r#"[[stack]]
@@ -72,7 +124,6 @@ fn register(r: &mut Registry) -> Result<()> {
         ("disc", "Disc", Icon::Disc, Tint::Structure),
         ("stage", "Stage", Icon::Stack, Tint::Structure),
         ("folder", "Folder", Icon::Folder, Tint::Structure),
-        ("movie_slot", "Movie slot", Icon::Film, Tint::Motion),
     ];
     for (name, label, icon, tint) in held {
         r.named_type(name).alias(name).label(label).icon(icon, tint).data().extracted().register();
@@ -95,6 +146,7 @@ fn register(r: &mut Registry) -> Result<()> {
         ("executable", "Executable", Icon::Terminal, Tint::Code, "exe", "*.exe"),
         ("text", "Text", Icon::Text, Tint::Plain, "cnf", "*.cnf"),
         ("binary", "Binary data", Icon::Binary, Tint::Plain, "bin", "*.bin"),
+        ("scene_audio", "Scene audio", Icon::Waveform, Tint::Sound, "mts", "*.mts"),
     ];
     for (name, label, icon, tint, value, pattern) in stored {
         let value = r.named_type(value).label(label).named(pattern).register();
@@ -107,138 +159,10 @@ fn register(r: &mut Registry) -> Result<()> {
         .data()
         .extracted()
         .field(Field::new("sector_len").label("Sector length").format(hex))
+        .field(Field::new("streams").label("Streams"))
         .register();
-    // A disc's movie file: a list of entries, each a movie in order, which the stages' records name.
-    let _ = r
-        .op("entry")
-        .label("A movie file's entry")
-        .takes("file", &["pe2.game@stream"])
-        .output::<ty::Table>()
-        .parameter::<String>("id")
-        .field(Field::new("entries").custom())
-        .members(|asset| asset.parts("entries").into_iter().map(|(id, _)| (id.to_string(), id.to_string())).collect())
-        .run(|call| {
-        let id: String = call.parameter()?;
-        let lent = call.lend_settings(&call.given());
-        let asset = lent.asset();
-        let entries = asset.parts("entries");
-        let (_, entry) = entries.iter().find(|(known, _)| **known == id).ok_or_else(|| pe2_ext::anyhow!("it has no entry {id}"))?;
-        entry.as_table().cloned().ok_or_else(|| pe2_ext::anyhow!("its entry {id} is no table"))
-    });
-    r.named_type("stream")
-        .alias("stream")
-        .label("Movie file")
-        .data()
-        .extracted()
-        .icon(Icon::Stack, Tint::Motion)
-        .stack(STREAM)
-        .contents(entry_rows)
-        .inspector("Entries", |_| Box::new(Entries))
-        .register();
-    r.named_type("scene_audio")
-        .alias("scene_audio")
-        .label("Scene audio")
-        .data()
-        .extracted()
-        .icon(Icon::Waveform, Tint::Sound)
-        .field(Field::new("sound_bank_mask").label("Sound bank mask").format(hex))
-        .register();
+    // A disc's movie file, made of its stages' movies (`inter`).
+    let _ = r.op("inter").label("Its stages' movies with sound").takes("file", &["pe2.game@stream"]).output::<ty::Bytes>().prepared_by_running().run(inter);
+    r.named_type("stream").alias("stream").label("Movie file").data().extracted().icon(Icon::Stack, Tint::Motion).stack(STREAM).register();
     Ok(())
-}
-
-/// A movie file's entries, in order, which a stage's record names (`entries/<id>`), its offset the entry's place.
-fn entry_rows(asset: &Asset, _: &dyn Project) -> Contents {
-    let rows = asset.parts("entries").into_iter().map(|(id, _)| ContentRow::new(&format!("entries/{id}"), id).depth(1));
-    let rows: Vec<ContentRow> = std::iter::once(ContentRow::heading("entries", "Entries")).chain(rows).collect();
-    Contents { rows, ..Contents::default() }
-}
-
-/// A change to a movie file's entries.
-enum Change {
-    Up(usize),
-    Down(usize),
-    Remove(usize),
-    /// A movie added at the end: its uid and path.
-    Add(String, String),
-}
-
-/// A movie file's entries, as a list: each its place, its id and its movie, and - where it can be edited - moved,
-/// removed, or a movie added at the end; a change is one step of the history, and the file is laid out again from
-/// the list (its records' offsets follow).
-struct Entries;
-
-impl View for Entries {
-    fn show(&mut self, ui: &mut Ui) {
-        let Some(list) = ui.asset().map(|a| a.parts("entries").into_iter().map(|(id, v)| (id.to_string(), v.clone())).collect::<Vec<_>>())
-        else {
-            return;
-        };
-        let movies: Vec<(String, String)> =
-            ui.project().find("movie").iter().filter_map(|m| Some((m.uid()?.to_string(), m.path().to_string()))).collect();
-        let editable = ui.editable();
-        let count = list.len();
-        let mut change = None;
-        ui.section(&format!("Entries  ·  {count}"), |ui| {
-            // A row each: its place; where it can be edited, its moves and its removal (a column each whether or not
-            // the row has it, so they line up, and before the names, so a narrow pane never hides them); its id, its
-            // movie.
-            let rows: Vec<Vec<Cell>> = list
-                .iter()
-                .enumerate()
-                .map(|(i, (id, entry))| {
-                    let mut row = vec![Cell::Text(format!("{i}"), Style::Weak)];
-                    if editable {
-                        let up = Cell::Button(Icon::CaretUp, "Move it up: it is played from an earlier place".into());
-                        let down = Cell::Button(Icon::CaretDown, "Move it down".into());
-                        row.push(if i > 0 { up } else { Cell::Empty });
-                        row.push(if i + 1 < count { down } else { Cell::Empty });
-                        row.push(Cell::Button(Icon::Cross, "Remove it: records naming it no longer resolve".into()));
-                    }
-                    row.push(Cell::Text(id.clone(), Style::Strong));
-                    row.push(entry.get("movie").map_or(Cell::Empty, |m| Cell::Reference(m.clone())));
-                    row
-                })
-                .collect();
-            change = match ui.table("entries", &rows) {
-                Some((i, 1)) => Some(Change::Up(i)),
-                Some((i, 2)) => Some(Change::Down(i)),
-                Some((i, 3)) => Some(Change::Remove(i)),
-                _ => None,
-            };
-            if editable {
-                let options: Vec<String> = movies.iter().map(|(_, path)| path.clone()).collect();
-                if let Some(chosen) = ui.combo("entries/add", "Add a movie...", &options) {
-                    change = movies.get(chosen).map(|(uid, path)| Change::Add(uid.clone(), path.clone()));
-                }
-            }
-        });
-        if let Some(change) = change {
-            let entries = changed(list, change);
-            ui.set("entries", Some(&Value::Table(entries.into_iter().collect())));
-        }
-    }
-}
-
-/// The entries after a change: an added movie's id is its room and name (`cafeteria_movie_100`), numbered where taken.
-fn changed(mut list: Vec<(String, Value)>, change: Change) -> Vec<(String, Value)> {
-    match change {
-        Change::Up(i) => list.swap(i - 1, i),
-        Change::Down(i) => list.swap(i, i + 1),
-        Change::Remove(i) => {
-            list.remove(i);
-        }
-        Change::Add(uid, path) => {
-            let base = path.split_once("/rooms/").map_or(path.as_str(), |(_, room)| room).replace("/movies/", "_").replace('/', "_");
-            let mut id = base.clone();
-            let mut n = 2;
-            while list.iter().any(|(taken, _)| *taken == id) {
-                id = format!("{base}_{n}");
-                n += 1;
-            }
-            let mut entry = Table::new();
-            entry.insert("movie".into(), Value::String(uid));
-            list.push((id, Value::Table(entry)));
-        }
-    }
-    list
 }

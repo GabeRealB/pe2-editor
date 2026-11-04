@@ -20,25 +20,28 @@
 //! ```text
 //! disc     disc/<release>/disk<N>    the license data and the ISO's files, in order (type: XA mode)
 //! stage    disc/<release>/stage<N>   bound to the disc's STAGE<N>.CDF slot (stage 0: STAGE0.HED + STAGE0.CDF) -
-//!                                    stage 0's stream slots and file groups, stages 1-5's folders, by id
+//!                                    stage 0's file groups, stages 1-5's folders, by id
 //! group    stage0/<group>            a stage 0 file group, the loader's category or an actor slot family; its file
 //!                                    slots keyed within it, the file id `group * 10000 + key`
-//! folder   <room>/folder             a stage folder: its stream slots and its file slots, by id
+//! folder   <room>/folder             a stage folder: its file slots, by id
 //! file     .../files/<name>          a file's slots in order, typed - package, image, palette, bundle, bs,
-//!                                    sound_bank, text; a `sequence` (a whole-file hMPK music image); a `trailer`
-//! stream   .../streams/<name>        a `movie_slot` or `scene_audio`: its `StreamSlot` fields by their C names; a
-//!                                    movie slot names the entry of a disc's movie file it plays (`movie`,
-//!                                    `uid://...#entries/<id>`), whose place gives its offset
-//! movie    .../movies/<name>         a clip of the discs' movie files, beside the room that first plays it; it
-//!                                    declares its sha1, and where it is follows from the entries listing it
-//! movies   movies/inter_<n>          a disc's movie file (`stream`): `entries.<id> = { movie }`, in order - movies
-//!                                    added, removed and reordered there; no bytes of its own
+//!                                    sound_bank, text; a `sequence` (a whole-file hMPK music image); and the
+//!                                    streams its package plays (`streams`), each a movie or a scene's audio by
+//!                                    name, with what of its `StreamSlot` record does not follow from where it is
+//! stream   .../streams/<name>        a scene's audio (`scene_audio`) or a movie without sound, stored in the stage
+//!                                    after its file; it declares its sha1 and its place in the stage's table
+//! movie    .../movies/<name>         a movie with sound, a clip of the discs' movie files, beside the room that
+//!                                    first plays it; it declares its sha1 and its clip on each disc
+//! movies   movies/inter_<n>          a disc's movie file (`stream`): its `disc` and its `stages`, in order; the
+//!                                    movies with sound their files play on it, in that order, make it - no bytes
+//!                                    of its own
 //! ```
 //!
 //! A slot's id is the slot's - a folder's or file's place - never part of the asset, which another slot may also hold
 //! (a stage 0 file sharing another's bytes is one file asset in two slots). What follows from the layout is not
 //! written: slots are laid out in id order, so offsets and sizes follow. Nor what follows from a bound asset: a
-//! package's load address, a chunk's size and end flag, a stream's location and what its bytes determine (a movie's
+//! package's load address, a chunk's size and end flag, a stream's location, its record's id (a cutscene's is 100
+//! plus its place among its file's cutscenes, a movie in a view's is that view) and what its bytes determine (a movie's
 //! `width` and `height`, a scene's `timing_bytes` and `resume_sector_offset`). `frame_limit` is the stream's own, an
 //! authored stop. The HED marker (control bit 15) is the container's. A stage's rooms are its folders, under
 //! `stages/<stage>/rooms/<room>`; Dryfield's day and night stages hold one room each as two instances, `<room>/day`
@@ -73,8 +76,9 @@ impl Reference {
     }
 }
 
-/// Where extraction finds an asset: a disc's slots (`disc`, `slot` or `slots`), or a place in a stage - a folder, a
-/// group, a file (`stage`, `folder` but in stage 0, `file`), a file's chunk slot (and `slot`), a stream.
+/// Where extraction finds an asset: a disc's slots (`disc`, `slot` or `slots`), a clip of a disc's movie file (and
+/// `clip`), or a place in a stage - a folder, a group, a file (`stage`, `folder` but in stage 0, `file`), a file's
+/// chunk slot (and `slot`), a stream stored in it (and `stream`).
 #[derive(Clone, Debug, Deserialize)]
 pub struct At {
     pub disc: Option<String>,
@@ -85,7 +89,10 @@ pub struct At {
     pub folder: Option<u32>,
     pub group: Option<u32>,
     pub file: Option<u32>,
-    pub stream: Option<String>,
+    /// A stream stored in the stage: its place in stage 0's or the folder's table.
+    pub stream: Option<usize>,
+    /// A movie in a disc's movie file: its place among the file's clips.
+    pub clip: Option<usize>,
     /// An image chunk slot's page.
     pub page: Option<usize>,
 }

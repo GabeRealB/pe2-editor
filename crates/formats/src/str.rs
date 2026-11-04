@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 /// An INTER file's sector: subheader, data, error correction.
 pub const SECTOR: usize = 2336;
-/// The INTER files are read at the drive's double speed: 150 sectors a second.
+/// Streams are read at the drive's double speed: 150 sectors a second.
 pub const SECTORS_A_SECOND: u64 = 150;
 /// A sector's data.
 pub const DATA: usize = 2048;
@@ -130,6 +130,41 @@ impl Sector<'_> {
     }
 }
 
+/// How a stream's sectors are stored: raw, a disc's movie file's (2336 bytes, video and audio), or data, a movie
+/// stored in a stage (2048 bytes, video alone). A data sector starts with the video magic, a raw one with its
+/// subheader, so a stream's first sector tells which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Form {
+    Raw,
+    Data,
+}
+
+impl Form {
+    /// The form of a stream, from its first bytes.
+    #[must_use]
+    pub fn of(first: &[u8]) -> Form {
+        if Chunk::of(first).is_some() { Form::Data } else { Form::Raw }
+    }
+
+    /// The bytes of one of its sectors.
+    #[must_use]
+    pub const fn size(self) -> usize {
+        match self {
+            Form::Raw => SECTOR,
+            Form::Data => DATA,
+        }
+    }
+
+    /// One of its sectors, as read.
+    #[must_use]
+    pub fn sector(self, sector: &[u8]) -> Sector<'_> {
+        match self {
+            Form::Raw => Sector::raw(sector),
+            Form::Data => Sector::data(sector),
+        }
+    }
+}
+
 /// A frame of a stream, its chunks joined.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -174,7 +209,7 @@ pub fn frames<'a>(sectors: impl IntoIterator<Item = Sector<'a>>) -> Vec<Frame> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK, DATA, MAGIC, SECTOR, SUBHEADER, Sector, frames};
+    use super::{CHUNK, Chunk, DATA, Form, MAGIC, SECTOR, SUBHEADER, Sector, frames};
 
     /// A raw video sector: chunk `index` of `chunks` of frame `frame`, filled with `fill`.
     fn video(frame: u32, index: u16, chunks: u16, size: u32, fill: u8) -> Vec<u8> {
@@ -194,6 +229,14 @@ mod tests {
             d[32 + 2..32 + 4].copy_from_slice(&0x3800u16.to_le_bytes());
         }
         s
+    }
+
+    #[test]
+    fn a_stream_says_its_form() {
+        let raw = video(1, 0, 1, 4, 0);
+        assert_eq!(Form::of(&raw), Form::Raw);
+        assert_eq!(Form::of(&raw[SUBHEADER..]), Form::Data);
+        assert!(matches!(Form::Data.sector(&raw[SUBHEADER..SUBHEADER + DATA]), Sector::Video(Chunk { frame: 1, .. }, _)));
     }
 
     #[test]

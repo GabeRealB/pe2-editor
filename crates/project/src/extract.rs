@@ -221,11 +221,19 @@ impl OpenDisc {
     }
 }
 
-/// A stage's container as extraction reads it: where it is (a disc, its CDF) and its files' offsets.
+/// A stage's container as extraction reads it: where it is (a disc, its CDF), its files' offsets, and where each stream
+/// it stores is, by its folder (none in stage 0) and its place in the table: `[start, end)`.
 struct Container {
     disc: String,
     cdf: String,
     files: HashMap<(Option<u32>, u32), u64>,
+    streams: HashMap<(Option<u32>, usize), (u64, u64)>,
+}
+
+/// Whether a stream record's data is stored in the stage: a scene's always, a movie's where it has no volume (a movie
+/// with a volume plays from the disc's movie file).
+fn stored_in_stage(record: &cdf::StreamRecord) -> bool {
+    record.kind == 2 || (record.kind == 1 && record.data[9] == 0)
 }
 
 /// The stage containers of a release, opened as assets ask for them.
@@ -245,16 +253,40 @@ impl Containers {
             let disc = discs
                 .get_mut(&(release.to_string(), disc_name.clone()))
                 .with_context(|| format!("no disc {disc_name}"))?;
+            let mut streams = HashMap::new();
             let (cdf_name, entries) = if stage == 0 {
+                // A stored stream runs to the next file.
                 let hed = disc.slot("STAGE0.HED")?;
-                ("STAGE0.CDF".to_string(), cdf::stage0_files(&hed)?)
+                let entries = cdf::stage0_files(&hed)?;
+                let end = disc.iso_file("STAGE0.CDF")?.size;
+                for (index, record) in cdf::stage0_streams(&hed)?.iter().enumerate().filter(|(_, r)| stored_in_stage(r)) {
+                    let start = u64::from(record.start) * cdf::SECTOR;
+                    let next = entries.iter().map(|e| e.offset).filter(|&o| o > start).min().unwrap_or(end);
+                    streams.insert((None, index), (start, next));
+                }
+                ("STAGE0.CDF".to_string(), entries)
             } else {
+                // A folder's stored streams run each to the next, the last to the folder's end.
                 let name = at.slots.first().cloned().with_context(|| format!("{release} stage {stage}: no CDF"))?;
-                let entries = cdf::stage_files(&mut disc.iso_file(&name)?)?;
+                let mut file = disc.iso_file(&name)?;
+                let entries = cdf::stage_files(&mut file)?;
+                for folder in cdf::stage_folders(&mut file)? {
+                    let records = cdf::folder_streams(&mut file, &folder)?;
+                    let starts: Vec<u64> = records
+                        .iter()
+                        .filter(|r| stored_in_stage(r))
+                        .map(|r| folder.offset + u64::from(r.start) * cdf::SECTOR)
+                        .collect();
+                    for (index, record) in records.iter().enumerate().filter(|(_, r)| stored_in_stage(r)) {
+                        let start = folder.offset + u64::from(record.start) * cdf::SECTOR;
+                        let next = starts.iter().copied().filter(|&s| s > start).min().unwrap_or(folder.offset + folder.size);
+                        streams.insert((Some(folder.id), index), (start, next));
+                    }
+                }
                 (name, entries)
             };
             let files = entries.into_iter().map(|e| ((e.folder, e.id), e.offset)).collect();
-            self.open.insert(key.clone(), Container { disc: disc_name, cdf: cdf_name, files });
+            self.open.insert(key.clone(), Container { disc: disc_name, cdf: cdf_name, files, streams });
         }
         Ok(&self.open[&key])
     }
@@ -289,6 +321,19 @@ fn chunk_payload(
     let chunks = cdf::chunks(&mut src, offset)?;
     let chunk = chunks.get(index).with_context(|| format!("{file_asset}: no chunk {index} on the disc"))?;
     Ok(chunk.payload(&mut src)?)
+}
+
+/// A stream stored in a stage: the `at`'s place in stage 0's or its folder's table.
+fn stream_payload(decl: &Declarations, discs: &mut Discs, containers: &mut Containers, release: &str, at: &At) -> Result<Vec<u8>> {
+    let (Some(stage), Some(index)) = (at.stage, at.stream) else { bail!("not a stored stream") };
+    let container = containers.get(decl, discs, release, stage)?;
+    let &(start, end) = container
+        .streams
+        .get(&(at.folder, index))
+        .with_context(|| format!("stage {stage} folder {:?} stores no stream {index}", at.folder))?;
+    let (disc_name, cdf_name) = (container.disc.clone(), container.cdf.clone());
+    let disc = discs.get_mut(&(release.to_string(), disc_name)).context("the container's disc")?;
+    Ok(disc.iso_file(&cdf_name)?.read_at(start, usize::try_from(end - start)?)?)
 }
 
 fn quote(s: &str) -> String {
@@ -440,6 +485,9 @@ impl pe2_ext::Discs for Reader<'_> {
             return disc.slot(&slot);
         }
         let at: At = at.clone().try_into().context("not a location")?;
+        if at.stream.is_some() {
+            return stream_payload(self.decl, self.discs, self.containers, self.release, &at);
+        }
         chunk_payload(self.decl, self.discs, self.containers, self.files, self.release, &at)
     }
 
@@ -690,8 +738,8 @@ fn write_assets(
             continue;
         }
         // A container assembled from its movies (a disc's movie file) has no bytes of its own: its stack joins its
-        // entries' movies, which `make_assembled` holds to the disc's.
-        if asset.table.contains_key("entries") && asset.template == "stream" {
+        // stages' movies, which `make_assembled` holds to the disc's.
+        if asset.template == "stream" {
             let originals: Vec<(String, String)> = releases
                 .iter()
                 .filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?)))
@@ -706,10 +754,14 @@ fn write_assets(
         for release in releases {
             let Some(loc) = asset.from.get(release) else { continue };
             for at in &loc.at {
-                if at.disc.is_none() && at.slot.is_some() {
+                if at.disc.is_none() && (at.slot.is_some() || at.stream.is_some()) {
                     let want = loc.sha1.as_deref().with_context(|| format!("{path}: {release} gives no sha1"))?;
-                    let bytes = chunk_payload(decl, discs, &mut containers, &files, release, at)
-                        .with_context(|| format!("{path}: {release}"))?;
+                    let bytes = if at.stream.is_some() {
+                        stream_payload(decl, discs, &mut containers, release, at)
+                    } else {
+                        chunk_payload(decl, discs, &mut containers, &files, release, at)
+                    }
+                    .with_context(|| format!("{path}: {release}"))?;
                     let got = sha1_hex(&bytes);
                     if got != want {
                         bail!("{path}: {release} {at:?} has sha1 {got}, the declaration {want}");
@@ -821,17 +873,26 @@ impl crate::graph::exec::Node for Written {
 /// The layer's bundles as the work graph reaches them, by uid or path: each read from disk when first asked for.
 struct Layer<'a> {
     root: &'a Path,
-    uids: HashMap<&'a str, &'a str>,
+    extensions: &'a Extensions,
+    uids: HashMap<String, String>,
     /// By path: its uid, and the node once read.
-    nodes: HashMap<&'a str, (&'a str, std::sync::OnceLock<Option<Written>>)>,
+    nodes: HashMap<String, (String, std::sync::OnceLock<Option<Written>>)>,
     ops: &'a crate::graph::Ops,
 }
 
 impl<'a> Layer<'a> {
-    fn new(root: &'a Path, decl: &'a Declarations, ops: &'a crate::graph::Ops) -> Layer<'a> {
-        let uids = decl.assets.iter().map(|(path, a)| (a.uid.as_str(), path.as_str())).collect();
-        let nodes = decl.assets.iter().map(|(path, a)| (path.as_str(), (a.uid.as_str(), std::sync::OnceLock::new()))).collect();
-        Layer { root, uids, nodes, ops }
+    /// The layer's assets, and the releases' disc layouts (`disc/<release>/<name>`), which a movie file names its
+    /// stages by.
+    fn new(root: &'a Path, decl: &Declarations, ops: &'a crate::graph::Ops, extensions: &'a Extensions) -> Layer<'a> {
+        let assets = decl.assets.iter().map(|(path, a)| (path.clone(), a.uid.clone()));
+        let layouts = decl
+            .layouts
+            .iter()
+            .flat_map(|(release, layouts)| layouts.iter().map(move |(name, l)| (format!("disc/{release}/{name}"), l.uid.clone())));
+        let all: Vec<(String, String)> = assets.chain(layouts).collect();
+        let uids = all.iter().map(|(path, uid)| (uid.clone(), path.clone())).collect();
+        let nodes = all.into_iter().map(|(path, uid)| (path, (uid, std::sync::OnceLock::new()))).collect();
+        Layer { root, extensions, uids, nodes, ops }
     }
 }
 
@@ -839,24 +900,32 @@ impl crate::graph::exec::World for Layer<'_> {
     fn node(&self, reference: &toml::Value) -> Option<(&dyn crate::graph::exec::Node, crate::graph::Plan)> {
         let path = match reference.as_str().filter(|r| !r.starts_with("uid://")) {
             Some(path) => path,
-            None => self.uids.get(crate::index::reference(reference)?.0.as_str())?,
+            None => self.uids.get(crate::index::reference(reference)?.0.as_str())?.as_str(),
         };
         let (path, (uid, slot)) = self.nodes.get_key_value(path)?;
         let node = slot.get_or_init(|| Written::open(self.root, path, uid).ok()).as_ref()?;
-        let (plan, _) = crate::graph::Plan::of(&node.fields, self.ops, &[]);
+        // Planned as the project plans it: its stack, then what its type offers beyond it (its settings among them).
+        let tail = self.extensions.tail_of_shape(&std::sync::Arc::from(crate::graph::shape(&node.fields)));
+        let (plan, _) = crate::graph::Plan::of(&node.fields, self.ops, &tail);
         Some((node as &dyn crate::graph::exec::Node, plan))
     }
 }
 
-/// Make each container assembled from its movies (a disc's movie file: its `entries`, each naming a movie) by its
-/// stack, as the project will - its entries' movies, as written, joined - holding it to the disc's file, and keeping
+/// Make each container assembled from its movies (a disc's movie file: its stages' movies with sound, in order) by its
+/// stack, as the project will - those movies, as written, joined - holding it to the disc's file, and keeping
 /// it in the store. Returns how many were made.
-fn make_assembled(layer: &Path, decl: &Declarations, releases: &[String], engine: &crate::graph::exec::Engine) -> Result<usize> {
-    let world = Layer::new(layer, decl, &engine.ops);
+fn make_assembled(
+    layer: &Path,
+    decl: &Declarations,
+    releases: &[String],
+    engine: &crate::graph::exec::Engine,
+    extensions: &Extensions,
+) -> Result<usize> {
+    let world = Layer::new(layer, decl, &engine.ops, extensions);
     let reach = crate::graph::exec::Reach { engine, world: &world };
     let mut made = 0;
     for (path, asset) in &decl.assets {
-        if asset.template != "stream" || !asset.table.contains_key("entries") {
+        if asset.template != "stream" {
             continue;
         }
         let (node, plan) =
@@ -873,7 +942,7 @@ fn make_assembled(layer: &Path, decl: &Declarations, releases: &[String], engine
         for release in releases {
             let Some(want) = asset.from.get(release).and_then(|l| l.sha1.as_deref()) else { continue };
             if got != want {
-                bail!("{path}: its movies, joined in order, have sha1 {got}; the disc's file {want}");
+                bail!("{path}: its stages' movies, joined in order, have sha1 {got}; the disc's file {want}");
             }
         }
         made += 1;
@@ -1003,7 +1072,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
     let sourcing = Sourcing { extensions, engine: Imports::open(&cache)?.engine(extensions), sources: 0 };
     let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
     let layouts = write_layouts(&layer, &decl, &releases, &discs, extensions)?;
-    make_assembled(&layer, &decl, &releases, &Imports::open(&cache)?.engine(extensions))?;
+    make_assembled(&layer, &decl, &releases, &Imports::open(&cache)?.engine(extensions), extensions)?;
     write_record(&layer, &decl_root, &releases, &discs)?;
     write_changeset(project, &game.layer, &decl, &releases)?;
     Ok(Report { layer, assets, layouts, sources })

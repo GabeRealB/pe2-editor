@@ -942,7 +942,13 @@ impl Extensions {
     /// host's thumbnail (the first picture it has, made small, kept).
     #[must_use]
     pub fn tail(&self, asset: &index::Asset) -> Vec<graph::Tail> {
-        let outputs = self.outputs_of(asset);
+        self.tail_of_shape(&asset.shape)
+    }
+
+    /// What may be asked of a node of a shape (`graph::shape`) beyond its stack, as `tail` gives an asset.
+    #[must_use]
+    pub fn tail_of_shape(&self, shape: &Arc<str>) -> Vec<graph::Tail> {
+        let outputs = self.shape_of(shape).outputs.clone();
         let conversions: Vec<&pe2_ext::OutputDef> = outputs.iter().filter(|o| !o.in_stack).collect();
         let from = |o: &pe2_ext::OutputDef| o.from.as_ref().and_then(|name| conversions.iter().position(|o| o.name == *name));
         let mut tail: Vec<graph::Tail> = conversions
