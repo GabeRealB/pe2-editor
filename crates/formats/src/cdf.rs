@@ -169,6 +169,214 @@ impl Chunk {
     }
 }
 
+/// A stream record as stored, 0x28 bytes (the game's `StreamSlot`): a movie (`kind` 1) or a scene's audio (2), its
+/// key, where its data is, and what plays it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamRecord {
+    pub kind: u16,
+    /// A movie's HED marker in bit 15 (stage 0); a scene's volume (low byte) and timing buffer kind (high byte).
+    pub control: u16,
+    /// Sectors from its container's start: a stored stream's data; an INTER movie's, as an earlier layout had it.
+    pub start: u32,
+    /// A movie: sectors into its disc's INTER file. A scene: its initial decode buffer in bytes.
+    pub source: u32,
+    /// A movie: the room state (0 any). A scene: its exact group.
+    pub group: u16,
+    /// A movie: the view it plays at, or 100 and up a full-screen one. A scene: its id.
+    pub id: u16,
+    pub sub_id: u16,
+    /// A movie: width, height, VRAM x and y, frame limit, loop mode, view stream, an unproven halfword, display mode,
+    /// volume, upload mode. A scene: second sub id, resume sector offset, sound bank mask, VLC table mode, VLC buffer
+    /// kind, timing bytes, timing buffer bytes, eight unproven bytes.
+    pub data: [u16; 11],
+}
+
+pub const STREAM_RECORD: usize = 0x28;
+/// Where a folder's stream records are in its header sector, and how many.
+const FOLDER_STREAMS: usize = 0x514;
+const FOLDER_STREAM_COUNT: usize = 0x12;
+
+impl StreamRecord {
+    #[must_use]
+    pub fn read(b: &[u8; STREAM_RECORD]) -> StreamRecord {
+        let mut data = [0u16; 11];
+        for (k, d) in data.iter_mut().enumerate() {
+            *d = u16_at(b, 0x12 + 2 * k);
+        }
+        StreamRecord {
+            kind: u16_at(b, 0),
+            control: u16_at(b, 2),
+            start: u32_at(b, 4),
+            source: u32_at(b, 8),
+            group: u16_at(b, 0xC),
+            id: u16_at(b, 0xE),
+            sub_id: u16_at(b, 0x10),
+            data,
+        }
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> [u8; STREAM_RECORD] {
+        let mut b = [0u8; STREAM_RECORD];
+        b[0..2].copy_from_slice(&self.kind.to_le_bytes());
+        b[2..4].copy_from_slice(&self.control.to_le_bytes());
+        b[4..8].copy_from_slice(&self.start.to_le_bytes());
+        b[8..12].copy_from_slice(&self.source.to_le_bytes());
+        b[0xC..0xE].copy_from_slice(&self.group.to_le_bytes());
+        b[0xE..0x10].copy_from_slice(&self.id.to_le_bytes());
+        b[0x10..0x12].copy_from_slice(&self.sub_id.to_le_bytes());
+        for (k, d) in self.data.iter().enumerate() {
+            b[0x12 + 2 * k..0x14 + 2 * k].copy_from_slice(&d.to_le_bytes());
+        }
+        b
+    }
+
+    /// An empty place in a table.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == StreamRecord::default()
+    }
+}
+
+fn records(bytes: &[u8], count: usize) -> Vec<StreamRecord> {
+    bytes.as_chunks::<STREAM_RECORD>().0.iter().take(count).map(StreamRecord::read).collect()
+}
+
+/// Stage 0's three stream records, at the start of STAGE0.HED.
+///
+/// # Errors
+/// The table is short.
+pub fn stage0_streams(hed: &[u8]) -> io::Result<Vec<StreamRecord>> {
+    let table = hed.get(..HED_STREAMS).ok_or_else(|| invalid("STAGE0.HED is shorter than its stream records".into()))?;
+    Ok(records(table, HED_STREAMS / STREAM_RECORD))
+}
+
+/// A folder of a STAGE<N>.CDF: its id, where it starts and how long it is, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Folder {
+    pub id: u32,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// A STAGE<N>.CDF's folders, in table order.
+///
+/// # Errors
+/// The table cannot be read.
+pub fn stage_folders(cdf: &mut impl Source) -> io::Result<Vec<Folder>> {
+    let table = cdf.read_at(0, FOLDERS * 8)?;
+    let (mut out, mut base) = (Vec::new(), SECTOR);
+    for f in 0..FOLDERS {
+        let (id, sectors) = (u32_at(&table, f * 8), u32_at(&table, f * 8 + 4));
+        if id == 0 && sectors == 0 {
+            continue;
+        }
+        let size = u64::from(sectors) * SECTOR;
+        out.push(Folder { id, offset: base, size });
+        base += size;
+    }
+    Ok(out)
+}
+
+/// A folder's 18 stream records, from its header sector.
+///
+/// # Errors
+/// The header cannot be read.
+pub fn folder_streams(cdf: &mut impl Source, folder: &Folder) -> io::Result<Vec<StreamRecord>> {
+    let table = cdf.read_at(folder.offset + FOLDER_STREAMS as u64, FOLDER_STREAM_COUNT * STREAM_RECORD)?;
+    Ok(records(&table, FOLDER_STREAM_COUNT))
+}
+
+/// Where a file of a container is: bytes of its own, or the place of an earlier file of the same container (one file
+/// under two ids).
+#[derive(Clone, Copy, Debug)]
+pub enum Place<'a> {
+    Own(&'a [u8]),
+    Shares(u32),
+}
+
+/// Files laid back to back in the order given, a file that shares an earlier one's place taking it: the bytes, and
+/// each file's offset from their start.
+///
+/// # Panics
+/// A file shares the place of one not before it.
+fn lay_out(files: &[(u32, Place<'_>)]) -> (Vec<u8>, Vec<(u32, u64)>) {
+    let (mut out, mut places): (Vec<u8>, Vec<(u32, u64)>) = (Vec::new(), Vec::new());
+    for &(id, place) in files {
+        let at = match place {
+            Place::Own(bytes) => {
+                let at = out.len() as u64;
+                out.extend_from_slice(bytes);
+                at
+            }
+            Place::Shares(other) => places.iter().find(|p| p.0 == other).map(|p| p.1).expect("a file it shares the place of"),
+        };
+        places.push((id, at));
+    }
+    (out, places)
+}
+
+fn sectors(bytes: u64) -> u32 {
+    u32::try_from(bytes / SECTOR).unwrap_or(u32::MAX)
+}
+
+/// A folder: its header sector - the files' (id, sector) list, a zero word, its 18 stream records - then its files in
+/// the order given (each a whole number of sectors; one under two ids once), then `tail`, its stored streams' data.
+///
+/// # Panics
+/// More files or stream records than a folder holds.
+#[must_use]
+pub fn pack_folder(files: &[(u32, Place<'_>)], streams: &[StreamRecord], tail: &[u8]) -> Vec<u8> {
+    assert!(files.len() <= FOLDER_FILES && streams.len() <= FOLDER_STREAM_COUNT, "a folder holds 162 files, 18 streams");
+    let (body, places) = lay_out(files);
+    let mut out = vec![0u8; usize::try_from(SECTOR).unwrap_or(0x800)];
+    for (k, (id, at)) in places.iter().enumerate() {
+        out[k * 8..k * 8 + 4].copy_from_slice(&id.to_le_bytes());
+        out[k * 8 + 4..k * 8 + 8].copy_from_slice(&(sectors(*at) + 1).to_le_bytes());
+    }
+    for (k, record) in streams.iter().enumerate() {
+        out[FOLDER_STREAMS + k * STREAM_RECORD..FOLDER_STREAMS + (k + 1) * STREAM_RECORD].copy_from_slice(&record.bytes());
+    }
+    out.extend_from_slice(&body);
+    out.extend_from_slice(tail);
+    out
+}
+
+/// A STAGE<N>.CDF: its folder table - (id, sectors) - then its folders in the order given.
+///
+/// # Panics
+/// More folders than a table holds.
+#[must_use]
+pub fn pack_stage(folders: &[(u32, &[u8])]) -> Vec<u8> {
+    assert!(folders.len() <= FOLDERS, "a stage holds 256 folders");
+    let mut out = vec![0u8; usize::try_from(SECTOR).unwrap_or(0x800)];
+    for (k, (id, folder)) in folders.iter().enumerate() {
+        out[k * 8..k * 8 + 4].copy_from_slice(&id.to_le_bytes());
+        out[k * 8 + 4..k * 8 + 8].copy_from_slice(&sectors(folder.len() as u64).to_le_bytes());
+    }
+    for (_, folder) in folders {
+        out.extend_from_slice(folder);
+    }
+    out
+}
+
+/// Stage 0's STAGE0.HED - its three stream records, then each file's (id, sector), ended by eight bytes of `0xFF` - and
+/// STAGE0.CDF, its files in the order given.
+#[must_use]
+pub fn pack_stage0(files: &[(u32, Place<'_>)], streams: &[StreamRecord]) -> (Vec<u8>, Vec<u8>) {
+    let (cdf, places) = lay_out(files);
+    let mut hed = Vec::with_capacity(HED_STREAMS + 8 * (places.len() + 1));
+    for k in 0..HED_STREAMS / STREAM_RECORD {
+        hed.extend_from_slice(&streams.get(k).copied().unwrap_or_default().bytes());
+    }
+    for (id, at) in places {
+        hed.extend_from_slice(&id.to_le_bytes());
+        hed.extend_from_slice(&sectors(at).to_le_bytes());
+    }
+    hed.extend_from_slice(&[0xFF; 8]);
+    (hed, cdf)
+}
+
 /// The chunk types whose payload is LZSS: a package, an image's strips, a palette's colors.
 fn compressed(kind: u8) -> bool {
     matches!(kind, 0..=2)
@@ -288,5 +496,15 @@ mod tests {
         let table = [0u8; 0x20];
         let payload = image_payload(&table, &strips, 0x800);
         assert_eq!(crate::lzss::decode_streams(&payload, table.len()), strips);
+    }
+
+    #[test]
+    fn a_stream_record_reads_back() {
+        let mut b = [0u8; STREAM_RECORD];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = u8::try_from(i * 7 % 256).unwrap();
+        }
+        assert_eq!(StreamRecord::read(&b).bytes(), b);
+        assert!(StreamRecord::read(&[0; STREAM_RECORD]).is_empty());
     }
 }
