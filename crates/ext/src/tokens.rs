@@ -49,8 +49,8 @@ pub enum Yields {
     IntLiteral,
     FloatLiteral,
     StringLiteral,
-    /// What goes between a brace initializer's braces.
-    BraceInit,
+    /// A brace initializer, braces and all: what follows `=` in a definition.
+    Initializer,
     /// A definition of an object of this type, under the name its args give.
     Definition(&'static str),
 }
@@ -61,7 +61,7 @@ impl fmt::Display for Yields {
             Yields::IntLiteral => f.write_str("int_literal"),
             Yields::FloatLiteral => f.write_str("float_literal"),
             Yields::StringLiteral => f.write_str("string_literal"),
-            Yields::BraceInit => f.write_str("brace_init"),
+            Yields::Initializer => f.write_str("initializer"),
             Yields::Definition(ty) => write!(f, "definition {ty}"),
         }
     }

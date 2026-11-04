@@ -13,9 +13,9 @@ mod tokenizers;
 mod views;
 
 use pe2_ext::ty::{self, Registered, SourceTree};
-use pe2_ext::{Field, Icon, Registry, Result, Retain, Tint};
+use pe2_ext::{Call, Field, Icon, Registry, Result, Retain, Table, Tint, Value, anyhow};
 
-pe2_ext::extension!("pe2.packages", "0.1.0", register, requires = ["pe2.images@^0.1", "pe2.render@^0.1"]);
+pe2_ext::extension!("pe2.packages", "0.1.0", register, requires = ["pe2.game@^0.1", "pe2.images@^0.1", "pe2.render@^0.1"]);
 
 /// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name.
 const STACK: &str = r#"[[stack]]
@@ -95,6 +95,34 @@ from = { value = "overlay" }
 /// What a package is, its sources and what fills its slots: what is set on it.
 const PACKAGE: &str = "pe2.packages@package";
 
+/// A list: references in order, which a package indexes. Each item is an output leading to what it names
+/// (`items/<index>`), so that `PE2_VALUE(demos, items, 0, _id)` reads the first through its own tokenizer.
+const LIST: &str = r#"[[stack]]
+id = "list"
+op = "pe2.packages@list"
+
+[[stack]]
+op = "pe2.packages@item"
+list = { from = "list" }
+
+[[stack]]
+op = "output"
+name = "items"
+"#;
+
+/// A list's item: what its reference names, as the reference names it - an output of a node leads on where that output does.
+fn item(call: &mut Call) -> Result<Table> {
+    let index: String = call.parameter()?;
+    let given = call.given();
+    let items = given.get("items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let at: usize = index.parse().map_err(|_| anyhow!("{index} is no index"))?;
+    let reference = items.get(at).ok_or_else(|| anyhow!("it has {} items, and no item {at}", items.len()))?;
+    match (pe2_ext::target_of(reference), pe2_ext::output_of(reference)) {
+        (Some(node), Some(output)) => call.table_of(node, output),
+        _ => pe2_ext::tokens::link(Some(reference)),
+    }
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<SourceTree>();
@@ -102,6 +130,19 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.op("gather").label("Sources").takes("package", &[PACKAGE]).output::<ty::File<SourceTree>>().run(gather::gather);
     let _ = r.op("resolve").label("Slots and values").input::<SourceTree>("sources").output::<SourceTree>().prepared_by_running().run(gather::resolve);
     tokenizers::register(r);
+    let _ = r
+        .op("item")
+        .label("An item of the list")
+        .takes("list", &["pe2.packages@list"])
+        .output::<ty::Table>()
+        .parameter::<String>("index")
+        .members(|asset| {
+            let count = asset.field("items").and_then(Value::as_array).map_or(0, Vec::len);
+            (0..count).map(|at| (at.to_string(), at.to_string())).collect()
+        })
+        .prepared_by_running()
+        .run(item);
+    r.named_type("list").alias("list").label("List").data().icon(Icon::Stack, Tint::Structure).field(Field::new("items").label("Items")).stack(LIST).register();
     let _ = r.op("reflect").label("What it asks for").takes("package", &[PACKAGE]).output::<ty::Table>().provides("reflection").keeps(Retain::Cache).run(gather::reflection);
     let _ = r.op("database").label("Compile database").output::<ty::Bytes>().prepare(database::database_reads).run(database::database);
     let _ = r.op("overlay").label("Include overlay").output::<ty::Bytes>().run(database::overlay);

@@ -3,7 +3,7 @@
 //! written and not found is left for the compiler to say. `resolve` reads what the first pass left, the live code with its other macros
 //! expanded: the slots and values a package really uses, each made only where it is read, an error being a macro that fires at the use.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 
 use pe2_ext::tokens::{self, Args};
@@ -14,15 +14,15 @@ use crate::{scan, tokenizers};
 
 /// The package holding what every unit includes first, and what the assembler reads.
 const CORE: &str = "core";
-/// What every unit includes first, beside `core`'s public files.
-const MACROS: &str = "pe2.h";
-/// What `MACROS` includes: the values of the slots of the package being built.
+/// What `pe2.h`, of `core`, includes: the values of the slots of the package being built.
 pub const VALUES: &str = "pe2_values.h";
 /// What it includes in both passes: the options and the build config.
 pub const OPTIONS: &str = "pe2_options.h";
+/// The folders of the tree its plain includes are found in, in order, one a line: what a target puts on its include path.
+pub const INCLUDES: &str = "includes";
 /// Where a first pass leaves what it made of each unit.
 const FIRST: &str = "first/";
-/// The most a line of a macro takes: `mcpp` stops near 65,000 bytes, so a long value is a chain of macros.
+/// The most a line of a macro takes, as a preprocessor may limit one, so a long value is a chain of macros.
 const LINE: usize = 32_000;
 
 /// A package of the build graph: the graph has one, by name.
@@ -79,13 +79,68 @@ struct Gathering<'a> {
     packaged: BTreeSet<String>,
     included: Vec<(String, String)>,
     options: Options,
+    /// Where its plain includes are found, in order: `include_path`.
+    path: Vec<Searched>,
+}
+
+/// A folder on a package's include path: where it is in the tree, the folder of the project it holds, and whose that is. A dependency's
+/// files keep their places in it (`dep/<name>/<path>`), so that one of its headers including its own private file finds it there.
+pub struct Searched {
+    pub dir: String,
+    pub folder: String,
+    pub owner: String,
+}
+
+/// Where a package's plain includes are found: its own public folders and `src`, then the public folders of its `dependencies`, and of
+/// theirs, in that order. What a slot holds (`PE2_INCLUDE`) is found by its binding instead.
+///
+/// # Errors
+/// A dependency names nothing, or no package.
+pub fn include_path(call: &Call, packages: &HashMap<String, Package>, own: &str) -> Result<Vec<Searched>> {
+    let package = packages.get(own).ok_or_else(|| anyhow!("{own} is no package of the graph"))?;
+    let mut path: Vec<Searched> = package.public_folders().into_iter().chain(["src"]).map(|folder| Searched {
+        dir: format!("self/{folder}"),
+        folder: format!("{}/{folder}", package.path),
+        owner: own.to_string(),
+    }).collect();
+    let mut seen = BTreeSet::from([own.to_string()]);
+    let mut pending: VecDeque<Value> = dependencies(&package.fields).collect();
+    while let Some(reference) = pending.pop_front() {
+        let target = pe2_ext::target_of(&reference).ok_or_else(|| anyhow!("{}: a dependency names nothing", package.path))?;
+        let named = call.node_named(target).ok_or_else(|| anyhow!("{}: its dependency {target} names nothing", package.path))?;
+        let (name, dependency) = packages.iter().find(|(_, known)| known.path == named.path).ok_or_else(|| anyhow!("{}: {} is no package", package.path, named.path))?;
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        path.extend(dependency.public_folders().into_iter().map(|folder| Searched {
+            dir: format!("dep/{name}/{folder}"),
+            folder: format!("{}/{folder}", dependency.path),
+            owner: name.clone(),
+        }));
+        pending.extend(dependencies(&dependency.fields));
+    }
+    Ok(path)
+}
+
+fn dependencies(fields: &Table) -> impl Iterator<Item = Value> + '_ {
+    fields.get("dependencies").and_then(Value::as_array).into_iter().flatten().cloned()
+}
+
+/// The file an include names on a path: the first folder holding it.
+fn on_path<'a>(path: &'a [Searched], packages: &HashMap<String, Package>, file: &str) -> Option<(&'a Searched, String)> {
+    path.iter().find_map(|searched| {
+        let entry = normal(&format!("{}/{file}", searched.folder));
+        packages.get(&searched.owner).is_some_and(|package| package.files.contains(&entry)).then_some((searched, entry))
+    })
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let path = call.host.path().to_string();
     let name = name_of(&path).to_string();
-    let mut gathering = Gathering { call, packages: packages(call)?, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new() };
+    let packages = packages(call)?;
+    let searched = include_path(call, &packages, &name)?;
+    let mut gathering = Gathering { call, packages, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new(), path: searched };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let units = selected(&call.given(), &own_path, &own_files)?;
@@ -98,7 +153,8 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         gathering.pending.push(Taken { entry: unit.clone(), place, owner: name.clone() });
     }
     gathering.reached.insert(name);
-    gathering.take_macros()?;
+    let dependencies: Vec<String> = gathering.path.iter().map(|searched| searched.owner.clone()).collect();
+    gathering.reached.extend(dependencies);
     gathering.follow()?;
     if let Some((binding, at)) = gathering.included.iter().find(|(binding, _)| !gathering.packaged.contains(binding)) {
         bail!("{at}: {binding} has no PE2_BIND({binding}, package)");
@@ -110,7 +166,13 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         bail!("{path} asks for {}, which no package answers", open.join(", "));
     }
     gathering.take_target_files()?;
-    let mut files: Vec<File> = vec![File::new("units", listed.into_bytes())];
+    let mut dirs: Vec<&str> = vec![];
+    for searched in &gathering.path {
+        if !dirs.contains(&searched.dir.as_str()) {
+            dirs.push(&searched.dir);
+        }
+    }
+    let mut files: Vec<File> = vec![File::new("units", listed.into_bytes()), File::new(INCLUDES, dirs.join("\n").into_bytes())];
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
     // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
@@ -188,10 +250,13 @@ fn folder_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(folder, _)| folder)
 }
 
-/// The file a line includes beside itself: `#include "path"`.
-fn beside(line: &str) -> Option<&str> {
+/// The file a line includes, and whether it is quoted, so looked for beside it first: `#include "path"` or `#include <path>`.
+fn included(line: &str) -> Option<(&str, bool)> {
     let rest = line.trim_start().strip_prefix('#')?.trim_start().strip_prefix("include")?.trim_start();
-    rest.strip_prefix('"')?.split_once('"').map(|(file, _)| file)
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.split_once('"').map(|(file, _)| (file, true));
+    }
+    rest.strip_prefix('<')?.split_once('>').map(|(file, _)| (file, false))
 }
 
 /// What the assembler is told to read: `.include "name"`, in assembly or in the strings of C.
@@ -219,7 +284,8 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     let packages = packages(call)?;
     let own = packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let public: Vec<String> = strings(&own.fields, "public").iter().map(|folder| format!("{path}/{folder}/")).collect();
-    let mut walk = Walk { call, own, packages: &packages, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
+    let searched = include_path(call, &packages, &name)?;
+    let mut walk = Walk { call, own, packages: &packages, public, path: &searched, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
     // As a compile reads them, then whatever only dependents read.
     let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
     for file in units.iter().chain(own.files.iter().filter(|file| is_source(file))) {
@@ -245,6 +311,7 @@ struct Walk<'a> {
     own: &'a Package,
     packages: &'a HashMap<String, Package>,
     public: Vec<String>,
+    path: &'a [Searched],
     seen: BTreeSet<String>,
     label: String,
     order: i64,
@@ -263,10 +330,10 @@ impl Walk<'_> {
         let its_own = self.own.owns(file);
         let in_public = !its_own || self.public.iter().any(|folder| file.starts_with(folder.as_str()));
         let entered = self.label.clone();
-        let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, beside(line)?))).peekable();
+        let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, included(line)?))).peekable();
         for found in scan::uses(&text) {
-            while let Some((_, beside)) = includes.next_if(|(line, _)| *line < found.line) {
-                self.beside(file, beside)?;
+            while let Some((_, (name, quoted))) = includes.next_if(|(line, _)| *line < found.line) {
+                self.include(file, name, quoted)?;
             }
             self.order += 1;
             self.options.read(&found, &format!("{file}:{}", found.line));
@@ -285,17 +352,23 @@ impl Walk<'_> {
             }
             self.options.place(&found, &self.label, self.order);
         }
-        for (_, beside) in includes {
-            self.beside(file, beside)?;
+        for (_, (name, quoted)) in includes {
+            self.include(file, name, quoted)?;
         }
         self.label = entered;
         Ok(())
     }
 
-    fn beside(&mut self, from: &str, file: &str) -> Result<()> {
+    /// A file included, as cpp finds it: beside the file including it where quoted, then on the include path.
+    fn include(&mut self, from: &str, file: &str, quoted: bool) -> Result<()> {
         let entry = normal(&format!("{}/{file}", folder_of(from)));
-        let held = self.packages.values().any(|package| package.owns(from) && package.files.contains(&entry));
-        if held { self.file(&entry) } else { Ok(()) }
+        if quoted && self.packages.values().any(|package| package.owns(from) && package.files.contains(&entry)) {
+            return self.file(&entry);
+        }
+        match on_path(self.path, self.packages, file) {
+            Some((_, entry)) => self.file(&entry),
+            None => Ok(()),
+        }
     }
 }
 
@@ -384,6 +457,7 @@ impl Slots {
 /// An option a source defines.
 struct Option_ {
     ty: String,
+    /// An enum's members; for the other types, the default written after the type, if any.
     members: Vec<String>,
     at: String,
     label: String,
@@ -415,6 +489,9 @@ impl Options {
                 if !["int", "bool", "string", "enum"].contains(ty) {
                     self.wrong.push(format!("{at}: {name}: there is no option type {ty}"));
                 }
+                if *ty != "enum" && def.members.len() > 1 {
+                    self.wrong.push(format!("{at}: {name}: an option has one default"));
+                }
                 // A package has one of each, wherever it is read.
                 if let Some(known) = self.defined.get(*name) {
                     self.wrong.push(format!("{at}: {name} is defined already, at {}", known.at));
@@ -437,6 +514,9 @@ impl Options {
         }
         for (name, member, at) in &self.read {
             let Some(def) = self.defined.get(name) else { bail!("{at}: {name} has no PE2_OPTION_DEF") };
+            if member.is_some() && def.ty != "enum" {
+                bail!("{at}: {name} is {}, and only an enum has members", def.ty);
+            }
             if let Some(member) = member.as_ref().filter(|member| !def.members.contains(member)) {
                 bail!("{at}: {name} has no member {member}; it has {}", def.members.join(", "));
             }
@@ -519,7 +599,11 @@ impl Options {
             out.insert("order".into(), def.order.into());
             out.insert("read".into(), read.contains(name).into());
             out.insert("type".into(), def.ty.clone().into());
-            out.insert("members".into(), Value::Array(def.members.iter().map(|member| Value::String(member.clone())).collect()));
+            let members = if def.ty == "enum" { def.members.clone() } else { Vec::new() };
+            out.insert("members".into(), Value::Array(members.into_iter().map(Value::String).collect()));
+            if let Ok(Some(default)) = default_of(name, def) {
+                out.insert("default".into(), Value::String(default));
+            }
             out.insert("name".into(), name.clone().into());
             Value::Table(out)
         });
@@ -527,10 +611,11 @@ impl Options {
     }
 }
 
-/// An option's value for this package, as C reads it; none where it has none.
+/// An option's value for this package, as C reads it: what its package sets, else the default its source gives; none where it has
+/// neither.
 fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>> {
     let at = &def.at;
-    let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return Ok(None) };
+    let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return default_of(name, def) };
     let wrong = |what: &str| anyhow!("{at}: {name} is {what}, and this package gives it {value}");
     let read = match def.ty.as_str() {
         "int" => value.as_integer().map(|number| number.to_string()).ok_or_else(|| wrong("an int")),
@@ -542,6 +627,33 @@ fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>>
         }
     };
     read.map(Some)
+}
+
+/// The default a source gives an option after its type, as C reads it: an integer (`900`, `0x38`, `-1`), `true` or `false`, or a
+/// string literal.
+fn default_of(name: &str, def: &Option_) -> Result<Option<String>> {
+    let (Some(written), false) = (def.members.first(), def.ty == "enum") else { return Ok(None) };
+    let wrong = || anyhow!("{}: {name} is {}, and its default is {written}", def.at, def.ty);
+    let read = match def.ty.as_str() {
+        "int" => integer(written).map(|number| number.to_string()).ok_or_else(wrong),
+        "bool" => match written.as_str() {
+            "true" | "1" => Ok("1".to_string()),
+            "false" | "0" => Ok("0".to_string()),
+            _ => Err(wrong()),
+        },
+        _ => (written.len() >= 2 && written.starts_with('"') && written.ends_with('"')).then(|| written.clone()).ok_or_else(wrong),
+    };
+    read.map(Some)
+}
+
+/// An integer as C writes one, in decimal or hexadecimal, signed.
+fn integer(text: &str) -> Option<i64> {
+    let (negative, digits) = text.strip_prefix('-').map_or((false, text), |rest| (true, rest));
+    let magnitude = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+        None => digits.parse().ok()?,
+    };
+    Some(if negative { -magnitude } else { magnitude })
 }
 
 /// A use of a value, read from what a first pass left.
@@ -760,7 +872,7 @@ fn walked(call: &Call, from: &Bound, path: &[String]) -> Result<Reached> {
 }
 
 /// The output making a node's tokens: the target's own, where it has one.
-fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
+pub fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
     let active = call.config().and_then(|config| config.target);
     if let Some(active) = active {
         let own = format!("{}.{active}", tokens::OUTPUT);
@@ -772,14 +884,6 @@ fn tokenizer_of(call: &Call, target: &str) -> Result<String> {
 }
 
 impl Gathering<'_> {
-    fn take_macros(&mut self) -> Result<()> {
-        let core = self.packages.get(CORE).ok_or_else(|| anyhow!("the graph has no package {CORE}"))?;
-        let entry = format!("{}/{MACROS}", core.path);
-        let bytes = self.call.read_entry(&entry)?;
-        self.tree.insert(MACROS.to_string(), bytes);
-        Ok(())
-    }
-
     /// Take in what is pending and everything it reaches.
     fn follow(&mut self) -> Result<()> {
         while let Some(taken) = self.pending.pop() {
@@ -804,8 +908,8 @@ impl Gathering<'_> {
                 }
             }
             for line in text.lines() {
-                if let Some(file) = beside(line) {
-                    self.take_beside(&taken, file);
+                if let Some((file, quoted)) = included(line) {
+                    self.take_included(&taken, file, quoted);
                 }
             }
             for name in assembled(&text) {
@@ -826,12 +930,19 @@ impl Gathering<'_> {
         self.pending.push(Taken { entry, place: format!("pkg/{name}/{inside}"), owner: name.to_string() });
     }
 
-    /// A file named beside another: of the same package, kept beside it in the tree.
-    fn take_beside(&mut self, from: &Taken, file: &str) {
+    /// A file included, as cpp finds it: where quoted, beside the file including it, of the same package and kept beside it in the
+    /// tree; then on the include path, kept where that folder is in the tree.
+    fn take_included(&mut self, from: &Taken, file: &str, quoted: bool) {
         let entry = normal(&format!("{}/{file}", folder_of(&from.entry)));
-        if self.packages.get(&from.owner).is_some_and(|package| package.files.contains(&entry)) {
+        if quoted && self.packages.get(&from.owner).is_some_and(|package| package.files.contains(&entry)) {
             let place = normal(&format!("{}/{file}", folder_of(&from.place)));
             self.pending.push(Taken { entry, place, owner: from.owner.clone() });
+            return;
+        }
+        if let Some((searched, entry)) = on_path(&self.path, &self.packages, file) {
+            let place = normal(&format!("{}/{file}", searched.dir));
+            let owner = searched.owner.clone();
+            self.pending.push(Taken { entry, place, owner });
         }
     }
 
@@ -870,6 +981,23 @@ mod tests {
         assert_eq!(value_of("other", &def, &fields).unwrap(), None);
         let wrong: toml::Table = "option.title = 3".parse().unwrap();
         assert!(value_of("title", &def, &wrong).is_err());
+    }
+
+    #[test]
+    fn a_default_is_what_a_package_does_not_set() {
+        let def = |ty: &str, default: &str| Option_ { ty: ty.to_string(), members: vec![default.to_string()], at: "here".to_string(), label: String::new(), order: 0 };
+        let unset = toml::Table::new();
+        assert_eq!(value_of("ticks", &def("int", "900"), &unset).unwrap().as_deref(), Some("900"));
+        assert_eq!(value_of("y", &def("int", "0x38"), &unset).unwrap().as_deref(), Some("56"));
+        assert_eq!(value_of("n", &def("int", "-1"), &unset).unwrap().as_deref(), Some("-1"));
+        assert_eq!(value_of("on", &def("bool", "true"), &unset).unwrap().as_deref(), Some("1"));
+        assert_eq!(value_of("s", &def("string", "\"a\""), &unset).unwrap().as_deref(), Some("\"a\""));
+        let set: toml::Table = "option.ticks = 600".parse().unwrap();
+        assert_eq!(value_of("ticks", &def("int", "900"), &set).unwrap().as_deref(), Some("600"));
+        assert!(value_of("ticks", &def("int", "fast"), &unset).is_err());
+        assert!(value_of("s", &def("string", "a"), &unset).is_err());
+        let members = Option_ { ty: "enum".to_string(), members: vec!["matte".into(), "gloss".into()], at: "here".into(), label: String::new(), order: 0 };
+        assert_eq!(value_of("finish", &members, &unset).unwrap(), None);
     }
 
     use super::label_in;

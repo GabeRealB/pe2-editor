@@ -132,6 +132,12 @@ fn part_outputs(r: &mut Registry) {
         let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no palettes") };
         palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
     });
+    // A cell as what reads its values sees it: the image again, told which cell (`tokens::leads_on`), so that
+    // `PE2_VALUE(chrome, cell, prompt, _v)` reads the prompt's row of the chrome.
+    let _ = r.op("cell").label("A cell, as what reads it").input::<NativeForm>("native").output::<ty::Table>().parameter::<String>("name").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
+        let name: String = call.parameter()?;
+        Ok(pe2_ext::tokens::leads_on(call.host.path(), "image", &[("cell", &name)]))
+    });
     let _ = r.op("cell_picture").label("A cell's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
         let name: String = call.parameter()?;
         let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no cells") };
@@ -164,6 +170,14 @@ native = { from = "image" }
 [[stack]]
 op = "output"
 name = "cells"
+
+[[stack]]
+op = "pe2.images@cell"
+native = { from = "image" }
+
+[[stack]]
+op = "output"
+name = "cell"
 
 [[stack]]
 op = "pe2.images@marks"

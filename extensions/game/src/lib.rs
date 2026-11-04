@@ -46,18 +46,50 @@ op = "output"
 name = "entries"
 "#;
 
+/// A file group's stack: its files, each read as itself (`files/<name>`), which a list of them names.
+const FILE_GROUP: &str = r#"[[stack]]
+id = "group"
+op = "pe2.game@file_group"
+
+[[stack]]
+op = "pe2.game@group_file"
+group = { from = "group" }
+
+[[stack]]
+op = "output"
+name = "files"
+"#;
+
+/// The names of a file group's files, in its order.
+fn group_files(asset: &Asset) -> Vec<(String, String)> {
+    let files = asset.field("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    files.iter().filter_map(|file| file.get("name")?.as_str()).map(|name| (name.to_string(), name.to_string())).collect()
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let held = [
         ("disc", "Disc", Icon::Disc, Tint::Structure),
         ("stage", "Stage", Icon::Stack, Tint::Structure),
         ("folder", "Folder", Icon::Folder, Tint::Structure),
-        ("file_group", "File group", Icon::Grid, Tint::Structure),
         ("movie_slot", "Movie slot", Icon::Film, Tint::Motion),
     ];
     for (name, label, icon, tint) in held {
         r.named_type(name).alias(name).label(label).icon(icon, tint).data().extracted().register();
     }
+    // A file of a group, as what reads it: the group again, told which (`tokens::leads_on`), so that its id is the group's to say.
+    let _ = r
+        .op("group_file")
+        .label("A file of the group")
+        .takes("group", &["pe2.game@file_group"])
+        .output::<ty::Table>()
+        .parameter::<String>("name")
+        .members(group_files)
+        .run(|call| {
+            let name: String = call.parameter()?;
+            Ok(pe2_ext::tokens::leads_on(call.host.path(), "file", &[("file", &name)]))
+        });
+    r.named_type("file_group").alias("file_group").label("File group").icon(Icon::Grid, Tint::Structure).data().extracted().stack(FILE_GROUP).register();
     // What the disc stores as files of their own, known by their names.
     let stored = [
         ("executable", "Executable", Icon::Terminal, Tint::Code, "exe", "*.exe"),

@@ -1,12 +1,13 @@
 //! What a language server is told, as nodes of the graph: `compile_commands.json` for every package that compiles, and the overlay that gives `PE2_PACKAGE`'s paths,
 //! which are on no disk, the files they stand for, so that going to a definition lands in the real file. Both read each package's `reflection`, and what the target says it needs.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use pe2_ext::{Call, Data, File, Need, Prepared, Result, Typed, Value, anyhow};
 use serde_json::json;
 
-use crate::gather::{Package, packages};
+use crate::gather::{Package, include_path, packages};
 
 fn file(name: &str, value: &serde_json::Value) -> Result<Typed> {
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -80,16 +81,20 @@ pub fn database(call: &mut Call) -> Result<Typed> {
     let defines = flags.get("defines").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     args.extend(defines.iter().filter_map(Value::as_str).map(|define| format!("-D{define}")));
     args.push("-DPE2_LANGUAGE_SERVER".to_string());
-    let core = packages.iter().find(|(name, _)| name == "core").and_then(|(_, package)| call.place(&package.path));
-    args.extend(core.map(|core| format!("-I{core}")));
     args.extend([format!("-I{folder}/virtual"), "-ivfsoverlay".to_string(), format!("{folder}/overlay.yaml")]);
+    let graph: HashMap<String, Package> = crate::gather::packages(call)?;
     let mut commands = vec![];
     for (name, package) in &packages {
         let Ok(reflected) = call.table_of(&package.path, "reflection") else { continue };
+        // Its own folders and its dependencies' first, as its build searches them.
+        let searched = include_path(call, &graph, name).unwrap_or_default();
+        let path: Vec<String> = searched.iter().filter_map(|searched| call.place(&searched.folder)).map(|place| format!("-I{place}")).collect();
         let sources = reflected.get("sources").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
         for source in sources.iter().filter_map(Value::as_str) {
             let Some(place) = call.place(&format!("{}/{source}", package.path)) else { continue };
             let mut arguments = args.clone();
+            let at = arguments.len() - 3;
+            arguments.splice(at..at, path.iter().cloned());
             arguments.extend([format!("-DPE2_PACKAGE_{name}"), "-c".to_string(), place.clone()]);
             commands.push(json!({ "directory": folder, "file": place, "arguments": arguments }));
         }

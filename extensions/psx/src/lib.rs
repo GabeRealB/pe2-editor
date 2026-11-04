@@ -32,7 +32,10 @@ const SLOTS: [(&str, u32); 12] = [
     ("actor_3", 0x8016_1E20),
 ];
 
-const CPP: [&str; 7] = ["-undef", "-Wall", "-lang-c", "-nostdinc", "-D_LANGUAGE_C", "-DUSE_INCLUDE_ASM", "-DVER_USA"];
+/// The preprocessor: GCC 14.2.0's `cc1`, which the extension ships for each platform at this path, run without a driver
+/// (`tools/<os>/cpp/README.md`). A package is preprocessed with `-Werror`, so a macro defined twice stops it.
+const PREPROCESSOR: &str = "cpp/libexec/gcc/host/14.2.0/cc1";
+const CPP: [&str; 9] = ["-E", "-quiet", "-undef", "-Wall", "-Werror", "-nostdinc", "-D_LANGUAGE_C", "-DUSE_INCLUDE_ASM", "-DVER_USA"];
 const CC1: [&str; 16] = [
     "-O2", "-mips1", "-mcpu=3000", "-w", "-funsigned-char", "-fpeephole", "-ffunction-cse", "-fpcc-struct-return", "-fcommon",
     "-fverbose-asm", "-msoft-float", "-mgas", "-fgnu-linker", "-quiet", "-gcoff", "-G0",
@@ -77,7 +80,7 @@ fn register(r: &mut Registry) -> Result<()> {
 
 /// The programs a build needs that it does not ship, looked for before anything is compiled: without them each package fails on its own, saying less.
 fn check_tools(_: &mut Call) -> Result<()> {
-    for tool in ["mips-linux-gnu-cpp", "mips-linux-gnu-ld", "mips-linux-gnu-objcopy", "python3"] {
+    for tool in [PREPROCESSOR, "mips-linux-gnu-ld", "mips-linux-gnu-objcopy", "python3"] {
         run(tool, &["--version".to_string()]).map_err(|e| anyhow!("building for {TARGET} needs {tool}: {e:#}"))?;
     }
     Ok(())
@@ -136,8 +139,9 @@ fn expand(call: &mut Call) -> Result<Typed> {
         for unit in fs::read_to_string(tree.join("units"))?.lines() {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
+            args.extend(searched(&tree));
             args.extend([format!("-I{}", text(&tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
-            run("mips-linux-gnu-cpp", &args)?;
+            run(PREPROCESSOR, &args)?;
             let said = replaced(&fs::read(&expanded)?, text(&tree).as_bytes(), TREE.as_bytes());
             made.push(File::new(&expanded_name(unit), said));
         }
@@ -237,8 +241,9 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
         for unit in fs::read_to_string(tree.join("units"))?.lines() {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
+            args.extend(searched(&tree));
             args.extend(["-P".to_string(), "-DPE2_FIRST_PASS".to_string(), format!("-I{}", text(&tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
-            run("mips-linux-gnu-cpp", &args)?;
+            run(PREPROCESSOR, &args)?;
             made.push(File::new(&format!("first/{unit}"), fs::read(&expanded)?));
         }
         Ok(made)
@@ -260,6 +265,12 @@ fn no_value(error: pe2_ext::Error, unset: &[&str]) -> pe2_ext::Error {
         Some(at) => anyhow!("{at}: {name} has no value on this package"),
         None => error.context(format!("{name} has no value on this package")),
     }
+}
+
+/// The folders a gathered tree's plain includes are found in, as the preprocessor is told them, in their order.
+fn searched(tree: &Path) -> Vec<String> {
+    let listed = fs::read_to_string(tree.join("includes")).unwrap_or_default();
+    listed.lines().filter(|dir| !dir.is_empty()).map(|dir| format!("-I{}", text(&tree.join(dir)))).collect()
 }
 
 /// What was gathered, on disk for the tools to read.

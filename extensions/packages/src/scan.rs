@@ -64,6 +64,13 @@ fn arguments(text: &str, open: usize) -> Option<(Vec<&str>, usize)> {
     None
 }
 
+/// Whether a word at `start` is the name a `#define` defines: a definition, not a use.
+fn defining(text: &str, start: usize) -> bool {
+    let head = &text[text[..start].rfind('\n').map_or(0, |at| at + 1)..start];
+    let rest = head.trim_start().strip_prefix('#').map(str::trim_start).and_then(|rest| rest.strip_prefix("define"));
+    rest.is_some_and(|rest| !rest.is_empty() && rest.trim().is_empty())
+}
+
 /// Every use in a text.
 #[must_use]
 pub fn uses(text: &str) -> Vec<Use<'_>> {
@@ -89,7 +96,7 @@ pub fn uses(text: &str) -> Vec<Use<'_>> {
                 }
                 let word = &text[start..at];
                 let open = at + text[at..].len() - text[at..].trim_start().len();
-                if KNOWN.contains(&word) && bytes.get(open) == Some(&b'(')
+                if KNOWN.contains(&word) && bytes.get(open) == Some(&b'(') && !defining(text, start)
                     && let Some((args, end)) = arguments(text, open)
                 {
                     found.push(Use { name: word, args, line });
@@ -131,5 +138,12 @@ mod tests {
     #[test]
     fn a_definition_uses_what_it_expands_to() {
         assert_eq!(uses("#define HIDDEN PE2_VALUE(body)\n")[0].args, ["body"]);
+    }
+
+    #[test]
+    fn the_name_a_definition_defines_is_no_use() {
+        let found = uses("#define PE2_OPTION(name) pe2_option_##name\n#  define PE2_VALUE(a) b\nPE2_OPTION(x)\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].args[0], found[0].line), ("x", 3));
     }
 }
