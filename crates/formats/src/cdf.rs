@@ -6,6 +6,14 @@
 //! A file is a chain of chunks, each a 16-byte header - type, end flag (`0xFF` on the last), the bytes of each sector
 //! that hold data (`sector_len`), the chunk's sectors, a load address, zero - and its sectors. A chunk's payload, its
 //! native form, is its sectors' data without the header and without each sector's bytes past `sector_len`.
+//!
+//! `pack_chunk` makes a chunk again, and makes every chunk of both discs (`examples/cdf_identity.rs`): the header and
+//! payload laid `sector_len` bytes to a sector, zeros after; an LZSS chunk (package, image, palette) as few sectors
+//! as hold its data and a byte more, a payload kept as stored as many as it fills. `sector_len` is the file's choice
+//! (2048, or less where a file streams in while it decodes) and the load address the package's or bundle's.
+//! `image_payload` lays out an image's strips as the loader takes them: each right after the one before unless two
+//! strips already end in that sector - the loader uploads two a sector at most - then at the next sector's start;
+//! a zero byte after a strip whose bits end on a byte boundary, or that ends a column of eight.
 
 use std::io;
 
@@ -161,6 +169,79 @@ impl Chunk {
     }
 }
 
+/// The chunk types whose payload is LZSS: a package, an image's strips, a palette's colors.
+fn compressed(kind: u8) -> bool {
+    matches!(kind, 0..=2)
+}
+
+/// A chunk of `kind` holding `payload`, the last of its file or not, `sector_len` data bytes to a sector.
+///
+/// # Panics
+/// `sector_len` is more than a sector, or less than a header.
+#[must_use]
+pub fn pack_chunk(kind: u8, last: bool, sector_len: u16, load: u32, payload: &[u8]) -> Vec<u8> {
+    let used = usize::from(sector_len);
+    let sector = usize::try_from(SECTOR).unwrap_or(0x800);
+    assert!((HEADER..=sector).contains(&used), "a sector length of {used}");
+    let mut data = vec![0u8; HEADER];
+    data.extend_from_slice(payload);
+    let sectors = if compressed(kind) { data.len() / used + 1 } else { data.len().div_ceil(used).max(1) };
+    data.resize(sectors * used, 0);
+    data[0] = kind;
+    data[1] = if last { LAST_CHUNK } else { 1 };
+    data[2..4].copy_from_slice(&sector_len.to_le_bytes());
+    data[4..8].copy_from_slice(&u32::try_from(sectors).unwrap_or(u32::MAX).to_le_bytes());
+    data[8..12].copy_from_slice(&load.to_le_bytes());
+    let mut out = Vec::with_capacity(sectors * sector);
+    for s in data.chunks(used) {
+        out.extend_from_slice(s);
+        out.resize(out.len() + sector - used, 0);
+    }
+    out
+}
+
+/// How many bits an LZSS stream takes through its end token: 9 a literal, 13 a reference, 9 the end.
+fn stream_bits(stream: &[u8]) -> usize {
+    let (mut bits, mut at) = (0usize, 0usize);
+    let bit = |at: usize| stream.get(at / 8).map(|b| (b >> (7 - at % 8)) & 1);
+    loop {
+        match bit(at) {
+            Some(1) => (bits, at) = (bits + 9, at + 9),
+            Some(_) => {
+                let offset = (1..=8).try_fold(0u32, |x, k| bit(at + k).map(|b| (x << 1) | u32::from(b)));
+                bits += 9;
+                if offset.is_none_or(|o| o == 0) {
+                    return bits;
+                }
+                (bits, at) = (bits + 4, at + 13);
+            }
+            None => return bits,
+        }
+    }
+}
+
+/// An image chunk's payload: its column table (through the first strip's offset), then each strip encoded.
+#[must_use]
+pub fn image_payload(table: &[u8], strips: &[Vec<u8>], sector_len: u16) -> Vec<u8> {
+    let used = usize::from(sector_len);
+    let sector_of = |x: usize| (HEADER + x) / used;
+    let mut out = table.to_vec();
+    let mut ends: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (index, strip) in strips.iter().enumerate() {
+        if index > 0 && ends.get(&sector_of(out.len())).copied().unwrap_or(0) >= 2 {
+            out.resize((sector_of(out.len()) + 1) * used - HEADER, 0);
+        }
+        let stream = crate::lzss::encode(strip);
+        let pad = stream_bits(&stream) % 8 == 0 || (index + 1) % 8 == 0;
+        out.extend_from_slice(&stream);
+        if pad {
+            out.push(0);
+        }
+        *ends.entry(sector_of(out.len() - 1)).or_default() += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +262,31 @@ mod tests {
         let payload = chunks[0].payload(&mut src).unwrap();
         assert_eq!(payload.len(), 0x5F0 + 0x600);
         assert!(payload[..0x5F0].iter().all(|&b| b == 1) && payload[0x5F0..].iter().all(|&b| b == 2));
+    }
+    #[test]
+    fn a_packed_chunk_reads_back() {
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251).to_le_bytes()[0]).collect();
+        let chunk = pack_chunk(7, true, 0x600, 0, &payload);
+        let mut src: &[u8] = &chunk;
+        let found = chunks(&mut src, 0).unwrap();
+        assert_eq!((found.len(), found[0].kind, found[0].sector_len), (1, 7, 0x600));
+        let read = found[0].payload(&mut src).unwrap();
+        assert_eq!(&read[..payload.len()], &payload[..]);
+        assert!(read[payload.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_compressed_chunk_keeps_a_byte_of_room() {
+        // 16 + 2032 bytes fill one sector exactly: a compressed chunk takes a second, a stored one does not.
+        assert_eq!(pack_chunk(0, true, 0x800, 0, &[1; 0x7F0]).len(), 2 * 0x800);
+        assert_eq!(pack_chunk(5, true, 0x800, 0, &[1; 0x7F0]).len(), 0x800);
+    }
+
+    #[test]
+    fn image_strips_decode_back_in_order() {
+        let strips: Vec<Vec<u8>> = (0..10u8).map(|k| (0..0x1000u32).map(|i| i.to_le_bytes()[0].wrapping_mul(k)).collect()).collect();
+        let table = [0u8; 0x20];
+        let payload = image_payload(&table, &strips, 0x800);
+        assert_eq!(crate::lzss::decode_streams(&payload, table.len()), strips);
     }
 }
