@@ -18,10 +18,17 @@ const CORE: &str = "core";
 pub const VALUES: &str = "pe2_values.h";
 /// What it includes in both passes: the options and the build config.
 pub const OPTIONS: &str = "pe2_options.h";
-/// The folders of the tree its plain includes are found in, in order, one a line: what a target puts on its include path.
+/// The folders of the tree its includes are found in, in order, one a line: `quote <dir>` for what it includes in quotes, `angle <dir>`
+/// for what in angle brackets - what a target puts on its include path.
 pub const INCLUDES: &str = "includes";
 /// What a gathered package links besides its own objects, a line each: `dependency <path>` and `bound <path>`.
 pub const LINKED: &str = "linked";
+/// What a gathered tree is of: the package's name, which names its objects.
+pub const NAME: &str = "package";
+/// Where a package's tree holds what it can include of others, each under its name: what it includes in angle brackets.
+const DEP: &str = "dep";
+/// What the build makes for the package being built, which core's `pe2.h` includes in quotes.
+const MADE: [&str; 3] = [VALUES, OPTIONS, "pe2_server.h"];
 /// Where a first pass leaves what it made of each unit.
 const FIRST: &str = "first/";
 /// The most a line of a macro takes, as a preprocessor may limit one, so a long value is a chain of macros.
@@ -36,6 +43,8 @@ pub struct Package {
     declared: Table,
     /// Its files, by their paths, as the stack resolves them.
     files: BTreeSet<String>,
+    /// What it depends on, by name, as its declaration says for its target.
+    dependencies: Vec<String>,
 }
 
 impl Package {
@@ -49,24 +58,24 @@ impl Package {
         self.compiles() || !strings(&self.fields, "objects").is_empty()
     }
 
-    /// Whether its target makes it an image of its own, which says what it exports: it has a link script.
+    /// Whether its target makes it an image, which others link against by the symbols it publishes: it has a link script, or,
+    /// built elsewhere, publishes symbols (`symbols`).
     fn makes_image(&self) -> bool {
-        self.fields.contains_key("link_script")
+        self.fields.contains_key("link_script") || self.fields.contains_key("symbols")
     }
 
     pub fn public_folders(&self) -> Vec<&str> {
         strings(&self.fields, "public")
     }
 
+    /// The folder of what others may include of it, from the project's root, if it has one.
+    fn public_folder(&self) -> Option<String> {
+        self.public_folders().first().map(|folder| format!("{}/{folder}", self.path))
+    }
+
     /// Whether a file is one of its.
     fn owns(&self, file: &str) -> bool {
         file.strip_prefix(self.path.as_str()).is_some_and(|inside| inside.starts_with('/'))
-    }
-
-    /// A public file by its path within what it makes public.
-    fn public(&self, inside: &str) -> Option<String> {
-        let folders = strings(&self.fields, "public");
-        folders.into_iter().map(|folder| format!("{}/{folder}/{inside}", self.path)).find(|file| self.files.contains(file))
     }
 }
 
@@ -85,80 +94,142 @@ struct Taken {
 struct Gathering<'a> {
     call: &'a Call<'a>,
     packages: HashMap<String, Package>,
+    /// The package gathered.
+    own: String,
     tree: BTreeMap<String, Vec<u8>>,
+    /// The packages whose target files it takes: its own, and the images it links against.
     reached: BTreeSet<String>,
     pending: Vec<Taken>,
-    /// Names asked for that no package answers: the slots left open.
-    open: BTreeSet<String>,
-    /// The slots of type `package` declared, and the files asked of a binding, where.
-    packaged: BTreeSet<String>,
-    included: Vec<(String, String)>,
     options: Options,
-    /// Where its plain includes are found, in order: `include_path`.
-    path: Vec<Searched>,
 }
 
-/// A folder on a package's include path: where it is in the tree, the folder of the project it holds, and whose that is. A dependency's
-/// files keep their places in it (`dep/<name>/<path>`), so that one of its headers including its own private file finds it there.
-pub struct Searched {
-    pub dir: String,
-    pub folder: String,
-    pub owner: String,
+/// Every package's name, by its path: what others include it by (`<engine/fs.h>`) and its objects are named by - its folder's name,
+/// after the name of the nearest package whose folder holds it. A package nests in packages, not in folders: `packages/a/aya` and
+/// `packages/b/aya` are both `aya`, and `packages/aya/akropolis` is `aya/akropolis`. (`declarations.py`'s `Declarations.names`.)
+fn package_names(paths: &[String]) -> HashMap<String, String> {
+    let mut sorted: Vec<&String> = paths.iter().collect();
+    sorted.sort();
+    let mut names: HashMap<String, String> = HashMap::new();
+    for path in sorted {
+        let outer = paths.iter().filter(|other| path.strip_prefix(other.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|other| other.len());
+        let last = name_of(path);
+        let name = match outer.and_then(|outer| names.get(outer)) {
+            Some(outer) => format!("{outer}/{last}"),
+            None => last.to_string(),
+        };
+        names.insert(path.clone(), name);
+    }
+    names
 }
 
-/// Where a package's plain includes are found: its own public folders and `src`, then the public folders of its `dependencies`, and of
-/// theirs, in that order. What a slot holds (`PE2_INCLUDE`) is found by its binding instead.
-///
-/// # Errors
-/// A dependency names nothing, or no package.
-pub fn include_path(call: &Call, packages: &HashMap<String, Package>, own: &str) -> Result<Vec<Searched>> {
-    let package = packages.get(own).ok_or_else(|| anyhow!("{own} is no package of the graph"))?;
-    let mut path: Vec<Searched> = package.public_folders().into_iter().chain(["src"]).map(|folder| Searched {
-        dir: format!("self/{folder}"),
-        folder: format!("{}/{folder}", package.path),
-        owner: own.to_string(),
-    }).collect();
-    let mut seen = BTreeSet::from([own.to_string()]);
-    let mut pending: VecDeque<Value> = dependencies(&package.fields).collect();
-    while let Some(reference) = pending.pop_front() {
-        let target = pe2_ext::target_of(&reference).ok_or_else(|| anyhow!("{}: a dependency names nothing", package.path))?;
-        let named = call.node_named(target).ok_or_else(|| anyhow!("{}: its dependency {target} names nothing", package.path))?;
-        let (name, dependency) = packages.iter().find(|(_, known)| known.path == named.path).ok_or_else(|| anyhow!("{}: {} is no package", package.path, named.path))?;
-        if !seen.insert(name.clone()) {
+/// The name of the package at a path, in the graph.
+fn name_at(packages: &HashMap<String, Package>, path: &str) -> Result<String> {
+    packages.iter().find(|(_, package)| package.path == path).map(|(name, _)| name.clone()).ok_or_else(|| anyhow!("{path} is no package of the graph"))
+}
+
+/// The package an include in angle brackets names, and the path within its public folder: the longest name it starts with.
+fn spelled<'a>(packages: &HashMap<String, Package>, spelled: &'a str) -> Option<(String, &'a str)> {
+    let name = packages.keys().filter(|name| spelled.strip_prefix(name.as_str()).is_some_and(|rest| rest.starts_with('/'))).max_by_key(|name| name.len())?;
+    Some((name.clone(), &spelled[name.len() + 1..]))
+}
+
+/// The package a file is of: the one whose folder holds it nearest.
+fn owner_of(packages: &HashMap<String, Package>, file: &str) -> Option<String> {
+    packages.iter().filter(|(_, package)| package.owns(file)).max_by_key(|(_, package)| package.path.len()).map(|(name, _)| name.clone())
+}
+
+/// The names of everything a package depends on, however far.
+fn closure(packages: &HashMap<String, Package>, name: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut pending: Vec<String> = packages.get(name).map_or_else(Vec::new, |package| package.dependencies.clone());
+    while let Some(next) = pending.pop() {
+        if found.insert(next.clone()) {
+            pending.extend(packages.get(&next).map_or_else(Vec::new, |package| package.dependencies.clone()));
+        }
+    }
+    found
+}
+
+/// What a package's image links: the libraries whose objects it takes, and the images it links against. Everything it depends on,
+/// and theirs, as far as an image: an image is linked against by its symbols, and what it depends on is its own, so a library reached
+/// through it is not taken again (Psy-Q's members are the executable's).
+fn linked(packages: &HashMap<String, Package>, own: &str) -> (Vec<String>, Vec<String>) {
+    let (mut libraries, mut images, mut covered) = (vec![], vec![], BTreeSet::new());
+    let mut pending: VecDeque<String> = packages.get(own).map_or_else(VecDeque::new, |package| package.dependencies.iter().cloned().collect());
+    while let Some(name) = pending.pop_front() {
+        if name == own || libraries.contains(&name) || images.contains(&name) {
             continue;
         }
-        path.extend(dependency.public_folders().into_iter().map(|folder| Searched {
-            dir: format!("dep/{name}/{folder}"),
-            folder: format!("{}/{folder}", dependency.path),
-            owner: name.clone(),
-        }));
-        pending.extend(dependencies(&dependency.fields));
+        let Some(package) = packages.get(&name) else { continue };
+        if package.makes_image() {
+            covered.extend(closure(packages, &name));
+            images.push(name);
+            continue;
+        }
+        pending.extend(package.dependencies.iter().cloned());
+        libraries.push(name);
     }
-    Ok(path)
+    let objects = libraries.into_iter().filter(|name| !covered.contains(name) && packages.get(name).is_some_and(Package::makes_objects)).collect();
+    (objects, images)
 }
 
-fn dependencies(fields: &Table) -> impl Iterator<Item = Value> + '_ {
-    fields.get("dependencies").and_then(Value::as_array).into_iter().flatten().cloned()
+/// The file an include in a file of `owner` names, by the rules both builds hold every package's files to (`declarations.py`'s
+/// `Package.resolved`): in quotes, a file of the same package - of the same public folder, from a public header - or one the build
+/// makes (`pe2_options.h`); in angle brackets, a public file of a package its declaration names. With whose it is. A file not there is
+/// the compiler's to say: it knows which branch of a conditional is taken.
+fn resolved(packages: &HashMap<String, Package>, owner: &str, from: &str, written: &str, quoted: bool, at: &str) -> Result<Option<(String, String)>> {
+    let package = packages.get(owner).ok_or_else(|| anyhow!("{at}: {owner} is no package"))?;
+    if quoted {
+        if MADE.contains(&written) {
+            return Ok(None);
+        }
+        let public = package.public_folder();
+        let in_public = public.as_ref().is_some_and(|public| from.starts_with(&format!("{public}/")));
+        let mut folders = vec![folder_of(from).to_string()];
+        if !in_public {
+            folders.extend(public.clone());
+            folders.push(format!("{}/src", package.path));
+        }
+        let within = if in_public { public.unwrap_or_default() } else { package.path.clone() };
+        for folder in folders {
+            let entry = normal(&format!("{folder}/{written}"));
+            if packages.values().any(|any| any.files.contains(&entry)) {
+                if !entry.starts_with(&format!("{within}/")) {
+                    bail!("{at}: \"{written}\" is not {} of {owner}", if in_public { "a public file" } else { "a file" });
+                }
+                return Ok(Some((entry, owner.to_string())));
+            }
+        }
+        bail!("{at}: \"{written}\" is no file of {owner}; another package's is included in angle brackets");
+    }
+    let (name, inside) = spelled(packages, written).ok_or_else(|| anyhow!("{at}: <{written}> names no package"))?;
+    if !package.dependencies.contains(&name) {
+        bail!("{at}: <{written}> is {name}'s, which {owner} does not depend on");
+    }
+    let entry = packages.get(&name).and_then(Package::public_folder).map(|public| format!("{public}/{inside}"));
+    Ok(entry.filter(|entry| packages.get(&name).is_some_and(|dependency| dependency.files.contains(entry))).map(|entry| (entry, name)))
 }
 
-/// The file an include names on a path: the first folder holding it.
-fn on_path<'a>(path: &'a [Searched], packages: &HashMap<String, Package>, file: &str) -> Option<(&'a Searched, String)> {
-    path.iter().find_map(|searched| {
-        let entry = normal(&format!("{}/{file}", searched.folder));
-        packages.get(&searched.owner).is_some_and(|package| package.files.contains(&entry)).then_some((searched, entry))
-    })
+/// Where a file goes in a package's tree: its own at `self/<path>`, a dependency's public file at `dep/<name>/<path>`, where the
+/// dependency's name is what includes it in angle brackets.
+fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: &str) -> String {
+    let Some(package) = packages.get(owner) else { return entry.to_string() };
+    if owner == own {
+        return format!("self/{}", entry.strip_prefix(&format!("{}/", package.path)).unwrap_or(entry));
+    }
+    let public = package.public_folder().unwrap_or_default();
+    format!("{DEP}/{owner}/{}", entry.strip_prefix(&format!("{public}/")).unwrap_or(entry))
 }
 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let path = call.host.path().to_string();
-    let name = name_of(&path).to_string();
     let packages = packages(call)?;
-    let searched = include_path(call, &packages, &name)?;
-    let mut gathering = Gathering { call, packages, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new(), path: searched };
-    let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
+    let name = name_at(&packages, &path)?;
+    let own = &packages[&name];
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
-    let own_name = name.clone();
+    let (objects, images) = linked(&packages, &name);
+    let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::default() };
     // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
     let fields = own_fields(call);
     let units = if strings(&fields, "sources").is_empty() { vec![] } else { selected(&fields, &own_path, &own_files)? };
@@ -170,43 +241,30 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         listed.push('\n');
         gathering.pending.push(Taken { entry: unit.clone(), place, owner: name.clone() });
     }
-    gathering.reached.insert(name);
-    let dependencies: Vec<String> = gathering.path.iter().map(|searched| searched.owner.clone()).collect();
-    gathering.reached.extend(dependencies);
+    gathering.reached.insert(name.clone());
+    gathering.reached.extend(images.iter().cloned());
     gathering.follow()?;
-    if let Some((binding, at)) = gathering.included.iter().find(|(binding, _)| !gathering.packaged.contains(binding)) {
-        bail!("{at}: {binding} has no PE2_BIND({binding}, package)");
-    }
     let header = gathering.options.header(call)?;
     gathering.tree.insert(OPTIONS.to_string(), header.into_bytes());
-    if !gathering.open.is_empty() {
-        let open: Vec<&str> = gathering.open.iter().map(String::as_str).collect();
-        bail!("{path} asks for {}, which no package answers", open.join(", "));
-    }
-    gathering.take_target_files(&own_name)?;
-    let mut dirs: Vec<&str> = vec![];
-    for searched in &gathering.path {
-        if !dirs.contains(&searched.dir.as_str()) {
-            dirs.push(&searched.dir);
-        }
-    }
-    // What its image links besides its own: each dependency's objects, and what each package it binds publishes.
+    gathering.take_target_files(&name)?;
+    // Where its includes are found: in quotes, its own folders; in angle brackets, its dependencies, each under its name.
+    let own = &gathering.packages[&name];
+    let mut dirs: Vec<String> = own.public_folders().into_iter().chain(["src"]).map(|folder| format!("quote self/{folder}")).collect();
+    dirs.push(format!("angle {DEP}"));
+    // What its image links besides its own: the objects of the libraries it takes, and what the images it depends on publish.
     let mut linked = String::new();
-    for searched in &gathering.path {
-        if let Some(package) = gathering.packages.get(&searched.owner).filter(|package| package.makes_objects() && searched.owner != own_name) {
-            let line = format!("dependency {}\n", package.path);
-            if !linked.contains(&line) {
-                linked.push_str(&line);
-            }
-        }
+    for name in &objects {
+        let _ = writeln!(linked, "dependency {}", gathering.packages[name].path);
     }
-    for name in &gathering.packaged {
-        if let Some(package) = gathering.packages.get(name).filter(|package| package.makes_image() && *name != own_name) {
-            let _ = writeln!(linked, "bound {}", package.path);
-        }
+    for name in images.iter().filter(|name| gathering.packages[*name].fields.contains_key("link_script")) {
+        let _ = writeln!(linked, "bound {}", gathering.packages[name].path);
     }
-    let mut files: Vec<File> =
-        vec![File::new("units", listed.into_bytes()), File::new(INCLUDES, dirs.join("\n").into_bytes()), File::new(LINKED, linked.into_bytes())];
+    let mut files: Vec<File> = vec![
+        File::new("units", listed.into_bytes()),
+        File::new(INCLUDES, dirs.join("\n").into_bytes()),
+        File::new(LINKED, linked.into_bytes()),
+        File::new(NAME, name.into_bytes()),
+    ];
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
     // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
@@ -229,18 +287,35 @@ fn own_fields(call: &Call) -> Table {
     pe2_ext::targeted(&call.given(), target_of(call).as_deref())
 }
 
-/// The build graph's one table: every `package` asset by its name, with its files.
+/// The build graph's one table: every `package` asset by its name, with its files and what it depends on.
 pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
-    let mut packages = HashMap::new();
     let target = target_of(call);
+    let mut read = vec![];
     for (path, declaration) in call.assets_of("package")? {
         let declared: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
         let fields = pe2_ext::targeted(&declared, target.as_deref());
         let files = call.entries(&path)?.into_iter().collect();
-        let name = name_of(&path).to_string();
-        let package = Package { path: path.clone(), fields, declared, files };
+        read.push((path, fields, declared, files));
+    }
+    let names = package_names(&read.iter().map(|(path, ..)| path.clone()).collect::<Vec<_>>());
+    let mut packages = HashMap::new();
+    for (path, fields, declared, files) in read {
+        let mut dependencies = vec![];
+        for reference in fields.get("dependencies").and_then(Value::as_array).into_iter().flatten() {
+            let target = pe2_ext::target_of(reference).ok_or_else(|| anyhow!("{path}: a dependency names nothing"))?;
+            let node = call.node_named(target).ok_or_else(|| anyhow!("{path}: its dependency {target} names nothing"))?;
+            dependencies.push(names.get(&node.path).cloned().ok_or_else(|| anyhow!("{path}: {} is no package", node.path))?);
+        }
+        let name = names[&path].clone();
+        let package = Package { path: path.clone(), fields, declared, files, dependencies };
         if let Some(other) = packages.insert(name.clone(), package) {
-            bail!("two packages are named {name}: {}, {path}", other.path);
+            bail!("{} and {path} are both named {name}, in the same package or none", other.path);
+        }
+    }
+    // Two packages' public files at one place: one with a public folder inside one that has one.
+    for name in packages.iter().filter(|(_, package)| package.public_folder().is_some()).map(|(name, _)| name) {
+        if let Some(outer) = packages.iter().find(|(outer, package)| package.public_folder().is_some() && name.starts_with(&format!("{outer}/"))) {
+            bail!("the package {name}: its public files and {}'s are both <{name}/...>", outer.0);
         }
     }
     Ok(packages)
@@ -333,12 +408,10 @@ fn is_source(file: &str) -> bool {
 pub fn reflection(call: &mut Call) -> Result<Table> {
     let call: &Call = call;
     let path = call.host.path().to_string();
-    let name = name_of(&path).to_string();
     let packages = packages(call)?;
-    let own = packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
+    let own = &packages[&name_at(&packages, &path)?];
     let public: Vec<String> = strings(&own.fields, "public").iter().map(|folder| format!("{path}/{folder}/")).collect();
-    let searched = include_path(call, &packages, &name)?;
-    let mut walk = Walk { call, own, packages: &packages, public, path: &searched, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
+    let mut walk = Walk { call, own, packages: &packages, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
     // As a compile reads them, then whatever only dependents read.
     let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
     for file in units.iter().chain(own.files.iter().filter(|file| is_source(file))) {
@@ -364,7 +437,6 @@ struct Walk<'a> {
     own: &'a Package,
     packages: &'a HashMap<String, Package>,
     public: Vec<String>,
-    path: &'a [Searched],
     seen: BTreeSet<String>,
     label: String,
     order: i64,
@@ -385,41 +457,29 @@ impl Walk<'_> {
         let entered = self.label.clone();
         let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, included(line)?))).peekable();
         for found in scan::uses(&text) {
-            while let Some((_, (name, quoted))) = includes.next_if(|(line, _)| *line < found.line) {
-                self.include(file, name, quoted)?;
+            while let Some((line, (name, quoted))) = includes.next_if(|(line, _)| *line < found.line) {
+                self.include(file, line, name, quoted)?;
             }
             self.order += 1;
             self.options.read(&found, &format!("{file}:{}", found.line));
-            match found.args.as_slice() {
-                [label] if found.name == "PE2_EDITOR_LABEL" => self.label = label_in(label).unwrap_or_default(),
-                [package, inside] if found.name == "PE2_INCLUDE" => {
-                    if let Some(entry) = self.packages.get(*package).and_then(|package| package.public(inside)) {
-                        self.file(&entry)?;
-                    }
-                }
-                _ => {}
+            if let ("PE2_EDITOR_LABEL", [label]) = (found.name, found.args.as_slice()) {
+                self.label = label_in(label).unwrap_or_default();
             }
-            // What a dependency depends on is its own to say.
-            if its_own || found.name != "PE2_INCLUDE" {
-                self.slots.read(&found, in_public, &self.label, self.order);
-            }
+            self.slots.read(&found, in_public, &self.label, self.order);
             self.options.place(&found, &self.label, self.order);
         }
-        for (_, (name, quoted)) in includes {
-            self.include(file, name, quoted)?;
+        for (line, (name, quoted)) in includes {
+            self.include(file, line, name, quoted)?;
         }
         self.label = entered;
         Ok(())
     }
 
-    /// A file included, as cpp finds it: beside the file including it where quoted, then on the include path.
-    fn include(&mut self, from: &str, file: &str, quoted: bool) -> Result<()> {
-        let entry = normal(&format!("{}/{file}", folder_of(from)));
-        if quoted && self.packages.values().any(|package| package.owns(from) && package.files.contains(&entry)) {
-            return self.file(&entry);
-        }
-        match on_path(self.path, self.packages, file) {
-            Some((_, entry)) => self.file(&entry),
+    /// A file included, as the build finds it (`resolved`).
+    fn include(&mut self, from: &str, line: usize, written: &str, quoted: bool) -> Result<()> {
+        let owner = owner_of(self.packages, from).ok_or_else(|| anyhow!("{from} is no package's"))?;
+        match resolved(self.packages, &owner, from, written, quoted, &format!("{from}:{line}"))? {
+            Some((entry, _)) => self.file(&entry),
             None => Ok(()),
         }
     }
@@ -475,11 +535,6 @@ impl Slots {
                 let own = self.held.entry(SELF.to_string()).or_default();
                 own.ty.get_or_insert_with(|| "package".to_string());
                 own.attributes.extend(["self".to_string(), HIDDEN.to_string()]);
-            }
-            "PE2_INCLUDE" => {
-                let slot = self.held.entry((*name).to_string()).or_default();
-                slot.public |= public;
-                slot.reads.insert(rest);
             }
             "PE2_VALUE" => {
                 self.held.entry((*name).to_string()).or_default().reads.insert(rest);
@@ -1055,56 +1110,26 @@ impl Gathering<'_> {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             self.tree.insert(taken.place.clone(), bytes);
             for found in scan::uses(&text) {
-                let at = format!("{}:{}", taken.entry, found.line);
-                self.options.read(&found, &at);
-                match (found.name, found.args.as_slice()) {
-                    ("PE2_BIND", [name, "package"]) => {
-                        self.packaged.insert((*name).to_string());
-                    }
-                    ("PE2_INCLUDE", [name, inside]) => {
-                        self.included.push(((*name).to_string(), at));
-                        self.take_public(name, inside);
-                    }
-                    _ => {}
+                self.options.read(&found, &format!("{}:{}", taken.entry, found.line));
+            }
+            for (at, line) in text.lines().enumerate() {
+                let Some((written, quoted)) = included(line) else { continue };
+                let reached = resolved(&self.packages, &taken.owner, &taken.entry, written, quoted, &format!("{}:{}", taken.entry, at + 1))?;
+                if let Some((entry, owner)) = reached {
+                    let place = place_of(&self.packages, &self.own, &owner, &entry);
+                    self.pending.push(Taken { entry, place, owner });
                 }
             }
-            for line in text.lines() {
-                if let Some((file, quoted)) = included(line) {
-                    self.take_included(&taken, file, quoted);
-                }
-            }
+            // What the assembler reads is core's, where its public files are.
             for name in assembled(&text) {
-                self.take_public(CORE, name);
+                let entry = self.packages.get(CORE).and_then(Package::public_folder).map(|public| format!("{public}/{name}"));
+                if let Some(entry) = entry.filter(|entry| self.packages[CORE].files.contains(entry)) {
+                    let place = place_of(&self.packages, &self.own, CORE, &entry);
+                    self.pending.push(Taken { entry, place, owner: CORE.to_string() });
+                }
             }
         }
         Ok(())
-    }
-
-    fn take_public(&mut self, name: &str, inside: &str) {
-        let Some(package) = self.packages.get(name) else {
-            self.open.insert(name.to_string());
-            return;
-        };
-        // A file not there is the compiler's to say: it knows which branch of a conditional is taken.
-        let Some(entry) = package.public(inside) else { return };
-        self.reached.insert(name.to_string());
-        self.pending.push(Taken { entry, place: format!("pkg/{name}/{inside}"), owner: name.to_string() });
-    }
-
-    /// A file included, as cpp finds it: where quoted, beside the file including it, of the same package and kept beside it in the
-    /// tree; then on the include path, kept where that folder is in the tree.
-    fn take_included(&mut self, from: &Taken, file: &str, quoted: bool) {
-        let entry = normal(&format!("{}/{file}", folder_of(&from.entry)));
-        if quoted && self.packages.get(&from.owner).is_some_and(|package| package.files.contains(&entry)) {
-            let place = normal(&format!("{}/{file}", folder_of(&from.place)));
-            self.pending.push(Taken { entry, place, owner: from.owner.clone() });
-            return;
-        }
-        if let Some((searched, entry)) = on_path(&self.path, &self.packages, file) {
-            let place = normal(&format!("{}/{file}", searched.dir));
-            let owner = searched.owner.clone();
-            self.pending.push(Taken { entry, place, owner });
-        }
     }
 
     /// What the packages reached name under `target.<target>`: each target takes what it knows - a file by its key, and

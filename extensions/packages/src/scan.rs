@@ -2,12 +2,11 @@
 //! left, finding each anywhere on a line, comments and strings left out.
 
 /// Every macro read.
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 11] = [
     "PE2_BIND",
     "PE2_BIND_ARG",
     "PE2_BIND_SELF",
     "PE2_EDITOR_LABEL",
-    "PE2_INCLUDE",
     "PE2_VALUE",
     "PE2_QUERY",
     "PE2_OPTION_DEF",

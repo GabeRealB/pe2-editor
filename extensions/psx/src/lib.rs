@@ -180,6 +180,8 @@ fn split_build(call: &mut Call) -> Result<Prepared> {
     let sources = call.take::<SourceTree>(0)?;
     let units = sources.files.iter().find(|file| file.name == "units").ok_or_else(|| anyhow!("it names no units"))?;
     let units = String::from_utf8(call.read(units)?)?;
+    let name = sources.files.iter().find(|file| file.name == "package").ok_or_else(|| anyhow!("it names no package"))?;
+    let name = Value::String(String::from_utf8(call.read(name)?)?);
     let mut micros = vec![Micro { op: "expand".into(), label: "expand".into(), ports: vec![vec![MicroInput::port(0)]], ..Micro::default() }];
     let mut objects = vec![];
     for unit in units.lines() {
@@ -188,7 +190,7 @@ fn split_build(call: &mut Call) -> Result<Prepared> {
             micros.push(Micro {
                 op: "assemble".into(),
                 label: unit.to_string(),
-                settings: Table::from_iter([("unit".to_string(), Value::String(unit.to_string()))]),
+                settings: Table::from_iter([("unit".to_string(), Value::String(unit.to_string())), ("package".to_string(), name.clone())]),
                 ports: vec![vec![MicroInput::port(0).only(&[unit])]],
                 keep: true,
             });
@@ -197,13 +199,14 @@ fn split_build(call: &mut Call) -> Result<Prepared> {
         micros.push(Micro {
             op: "object".into(),
             label: unit.to_string(),
-            settings: Table::from_iter([("unit".to_string(), Value::String(unit.to_string()))]),
-            ports: vec![vec![MicroInput::micro(0).only(&[&expanded_name(unit)])], vec![MicroInput::port(0).only(&["pkg/core/"])]],
+            settings: Table::from_iter([("unit".to_string(), Value::String(unit.to_string())), ("package".to_string(), name.clone())]),
+            ports: vec![vec![MicroInput::micro(0).only(&[&expanded_name(unit)])], vec![MicroInput::port(0).only(&["dep/core/"])]],
             keep: true,
         });
     }
     let prebuilt = format!("target/{TARGET}/");
-    micros.push(Micro { op: "collect".into(), label: "objects".into(), ports: vec![objects, vec![MicroInput::port(0).only(&[&prebuilt])]], ..Micro::default() });
+    let settings = Table::from_iter([("package".to_string(), name)]);
+    micros.push(Micro { op: "collect".into(), label: "objects".into(), settings, ports: vec![objects, vec![MicroInput::port(0).only(&[&prebuilt])]], ..Micro::default() });
     Ok(Prepared { needs: Vec::new(), micros })
 }
 
@@ -218,10 +221,20 @@ fn object_name(package: &str, unit: &str) -> String {
     format!("{package}/{}", Path::new(inside).with_extension("o").display())
 }
 
-/// A package's name, from its node's path.
-fn package_name(call: &Call) -> String {
-    let path = call.host.path();
-    path.rsplit('/').next().unwrap_or(path).to_string()
+/// A package's name, as the gathered tree says it (`package`), handed to each step of its build.
+fn package_name(call: &Call) -> Result<String> {
+    call.settings.get("package").and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow!("it is told no package's name"))
+}
+
+/// A package's name, in the gathered tree written out.
+fn name_in(tree: &Path) -> Result<String> {
+    fs::read_to_string(tree.join("package")).map_err(|_| anyhow!("the tree names no package"))
+}
+
+/// The file an image is written to: its package's name as the release names its files, the path's steps joined by `_` (`aya/mist`:
+/// `aya_mist`).
+fn file_name(name: &str) -> String {
+    name.replace('/', "_")
 }
 
 fn expanded_name(unit: &str) -> String {
@@ -281,7 +294,7 @@ fn object(call: &mut Call) -> Result<Typed> {
         fs::write(&at, call.read(source)?)?;
         compile(&at, &tree, &scratch)
     });
-    let kept = made.and_then(|object| call.keep(&text(&object), &object_name(&package_name(call), &unit)));
+    let kept = made.and_then(|object| call.keep(&text(&object), &object_name(&package_name(call)?, &unit)));
     let _ = fs::remove_dir_all(&scratch);
     Ok(Typed::new(Object::NAME, vec![said_of(kept, &path)?]))
 }
@@ -289,7 +302,7 @@ fn object(call: &mut Call) -> Result<Typed> {
 /// What a tool said of a unit expanded, said of the files it came from.
 fn said_of<T>(result: Result<T>, path: &str) -> Result<T> {
     let tree = format!("{TREE}/");
-    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}self/"), &format!("{path}/")).replace(&format!("{tree}pkg/"), "packages/").replace(&tree, "")))
+    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}self/"), &format!("{path}/")).replace(&format!("{tree}dep/"), "packages/").replace(&tree, "")))
 }
 
 /// A unit of assembly assembled, as it is written: no preprocessor, no maspsx.
@@ -304,7 +317,7 @@ fn assemble(call: &mut Call) -> Result<Typed> {
         let mut args: Vec<String> = ASSEMBLER.iter().map(ToString::to_string).collect();
         args.extend(["-o".to_string(), text(&object), text(&tree.join(&unit))]);
         run("mips-linux-gnu-as", &args)?;
-        call.keep(&text(&object), &object_name(&package_name(call), &unit))
+        call.keep(&text(&object), &object_name(&package_name(call)?, &unit))
     });
     let _ = fs::remove_dir_all(&scratch);
     Ok(Typed::new(Object::NAME, vec![in_project(made, &scratch, &path)?]))
@@ -312,7 +325,7 @@ fn assemble(call: &mut Call) -> Result<Typed> {
 
 /// The package's objects: its units', and its prebuilt ones (`target/psx/<package>/objects/<place>`) by their place in it.
 fn collect(call: &mut Call) -> Result<Typed> {
-    let name = package_name(call);
+    let name = package_name(call)?;
     let compiled = call.take_all::<ty::File<Object>>(0)?;
     let prebuilt = call.take::<SourceTree>(1)?;
     let mut files = vec![];
@@ -366,13 +379,13 @@ fn script_of(tree: &Path, name: &str) -> Result<PathBuf> {
 /// on from, the addresses being what this is for - and of its names those its sections hold.
 fn symbols(call: &mut Call) -> Result<Typed> {
     let path = call.host.path().to_string();
-    let name = package_name(call);
     let fields = call.given();
     let sources = call.take::<SourceTree>(0)?;
     let objects = call.take::<Objects>(1)?;
     let scratch = PathBuf::from(format!("{}.symbols", call.temp()?));
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
+        let name = name_in(&tree)?;
         let address = slot_of(&fields, &name)?;
         let objects = write_objects(call, &objects.files, &scratch)?;
         let layout = scratch.join("layout.elf");
@@ -404,7 +417,6 @@ fn symbols(call: &mut Call) -> Result<Typed> {
 /// and what the images it binds do.
 fn link_image(call: &mut Call) -> Result<Typed> {
     let path = call.host.path().to_string();
-    let name = package_name(call);
     let fields = call.given();
     let sources = call.take::<SourceTree>(0)?;
     let notes = sources.notes.clone();
@@ -412,6 +424,7 @@ fn link_image(call: &mut Call) -> Result<Typed> {
     let scratch = PathBuf::from(format!("{}.link", call.temp()?));
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
+        let name = name_in(&tree)?;
         let address = slot_of(&fields, &name)?;
         let mut files = own.files.clone();
         for dependency in linked(&tree, "dependency") {
@@ -435,12 +448,12 @@ fn link_image(call: &mut Call) -> Result<Typed> {
         }
         let image = link(address, &script_of(&tree, &name)?, &published, &objects, &scratch, &name)?;
         if pe2_ext::targeted(&fields, Some(TARGET)).get("slot").and_then(Value::as_str) != Some(EXECUTABLE) {
-            return Ok((image, format!("{name}.pe2pkg")));
+            return Ok((image, format!("{}.pe2pkg", file_name(&name))));
         }
         let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
-        let exe = scratch.join(format!("{name}.exe"));
+        let exe = scratch.join(format!("{}.exe", file_name(&name)));
         fs::write(&exe, exe_header(&fs::read(&image)?, &fs::read(scratch.join("image.elf"))?, address, &release)?)?;
-        Ok((exe, format!("{name}.exe")))
+        Ok((exe, format!("{}.exe", file_name(&name))))
     });
     let result = made.and_then(|(image, kept_as)| {
         let kept = call.keep(&image.display().to_string(), &kept_as)?;
@@ -454,10 +467,10 @@ fn link_image(call: &mut Call) -> Result<Typed> {
 /// What a tool said of the tree it was given, said of the files they are.
 fn in_project<T>(result: Result<T>, scratch: &Path, path: &str) -> Result<T> {
     let tree = scratch.join("tree").display().to_string();
-    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}/self/"), &format!("{path}/")).replace(&format!("{tree}/pkg/"), "packages/").replace(&format!("{tree}/"), "")))
+    result.map_err(|e| anyhow!("{}", format!("{e:#}").replace(&format!("{tree}/self/"), &format!("{path}/")).replace(&format!("{tree}/dep/"), "packages/").replace(&format!("{tree}/"), "")))
 }
 
-/// What the units come to with `PE2_INCLUDE` and the options expanded and the other `PE2_*` macros left as they are written, for
+/// What the units come to with their includes and the options expanded and the other `PE2_*` macros left as they are written, for
 /// `pe2.packages` to read: each unit beside what was gathered, under `first/`.
 fn first_pass(call: &mut Call) -> Result<Typed> {
     let mut sources = call.take::<SourceTree>(0)?;
@@ -494,10 +507,19 @@ fn no_value(error: pe2_ext::Error, unset: &[&str]) -> pe2_ext::Error {
     }
 }
 
-/// The folders a gathered tree's plain includes are found in, as the preprocessor is told them, in their order.
+/// The folders a gathered tree's includes are found in, as the preprocessor is told them, in their order: a package's own for what
+/// it includes in quotes (`-iquote`), its dependencies' for what in angle brackets.
 fn searched(tree: &Path) -> Vec<String> {
     let listed = fs::read_to_string(tree.join("includes")).unwrap_or_default();
-    listed.lines().filter(|dir| !dir.is_empty()).map(|dir| format!("-I{}", text(&tree.join(dir)))).collect()
+    let mut args = vec![];
+    for line in listed.lines() {
+        match line.split_once(' ') {
+            Some(("quote", dir)) => args.extend(["-iquote".to_string(), text(&tree.join(dir))]),
+            Some(("angle", dir)) => args.push(format!("-I{}", text(&tree.join(dir)))),
+            _ => {}
+        }
+    }
+    args
 }
 
 /// What was gathered, on disk for the tools to read.
@@ -546,14 +568,14 @@ fn run(tool: &str, args: &[String]) -> Result<()> {
     process.wait()
 }
 
-/// A unit expanded to its object: the compiler on what it comes to, then the assembler, which includes from `pkg/core`.
+/// A unit expanded to its object: the compiler on what it comes to, then the assembler, which includes from `dep/core`.
 fn compile(expanded: &Path, tree: &Path, scratch: &Path) -> Result<PathBuf> {
     let (assembly, object) = (scratch.join("unit.s"), scratch.join("unit.o"));
     let mut args: Vec<String> = CC1.iter().map(ToString::to_string).collect();
     args.extend(["-o".to_string(), text(&assembly), text(expanded)]);
     run("cc1", &args)?;
     let mut args: Vec<String> = MASPSX.iter().map(ToString::to_string).collect();
-    args.extend(["-no-pad-sections".to_string(), format!("-I{}", text(&tree.join("pkg/core"))), "-o".to_string(), text(&object), text(&assembly)]);
+    args.extend(["-no-pad-sections".to_string(), format!("-I{}", text(&tree.join("dep/core"))), "-o".to_string(), text(&object), text(&assembly)]);
     run("maspsx", &args)?;
     Ok(object)
 }
@@ -570,7 +592,7 @@ fn link(address: u32, script: &Path, published: &[PathBuf], objects: &[PathBuf],
     args.extend(["-o".to_string(), text(&linked)]);
     args.extend(objects.iter().map(|object| text(object)));
     run("mips-linux-gnu-ld", &args)?;
-    let image = scratch.join(format!("{name}.pe2pkg"));
+    let image = scratch.join(format!("{}.pe2pkg", file_name(name)));
     run("mips-linux-gnu-objcopy", &["-O".into(), "binary".into(), "-j".into(), ".image".into(), text(&linked), text(&image)])?;
     Ok(image)
 }
