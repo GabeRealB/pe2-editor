@@ -721,11 +721,13 @@ pub enum ContentRequest {
 }
 
 /// What comes of it: its name in the history, what it changes in the declaration, each by its path (keys, a list's place) and
-/// removed where it has no value, and what is selected after it.
+/// removed where it has no value, or a file of the asset it writes whole (by its name in the bundle), and what is selected
+/// after it. One step does one of the two.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContentOutcome {
     pub label: String,
     pub sets: Vec<(Vec<String>, Option<Value>)>,
+    pub writes: Option<(String, Vec<u8>)>,
     pub select: Option<String>,
 }
 

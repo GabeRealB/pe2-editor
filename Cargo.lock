@@ -1932,6 +1932,7 @@ version = "0.1.0"
 dependencies = [
  "pe2-events",
  "pe2-ext",
+ "pe2-fonts",
  "pe2-formats",
  "pe2-game",
  "pe2-images",
@@ -4034,6 +4035,19 @@ name = "pe2-ffmpeg"
 version = "0.1.0"
 dependencies = [
  "pe2-ext",
+]
+
+[[package]]
+name = "pe2-fonts"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "formats",
+ "pe2-ext",
+ "png",
+ "serde",
+ "sha1",
+ "toml 0.8.23",
 ]
 
 [[package]]

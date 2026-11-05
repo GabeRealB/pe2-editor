@@ -656,13 +656,23 @@ impl Scan {
     }
 }
 
-/// A bundle's files by name.
-fn bundle_files(dir: &Path) -> BTreeMap<String, PathBuf> {
+/// A bundle's files by name: their paths within it, a file in a folder of it (a UFO font's) as `<folder>/<file>`.
+/// What is hidden (a name starting with `.`) is left out, folders and all.
+pub(crate) fn bundle_files(dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut files = BTreeMap::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with('.') && entry.file_type().is_ok_and(|t| t.is_file()) {
-            files.insert(name, entry.path());
+    let mut pending = vec![(dir.to_path_buf(), String::new())];
+    while let Some((folder, prefix)) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_file() {
+                files.insert(format!("{prefix}{name}"), entry.path());
+            } else if kind.is_dir() {
+                pending.push((entry.path(), format!("{prefix}{name}/")));
+            }
         }
     }
     files
@@ -1919,6 +1929,22 @@ mod tests {
         // Listed now, and read: nothing is listed or read again.
         let (_, again) = open(&root);
         assert_eq!((again.read, changeset(&root, "base")), (0, base));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_bundle_holds_folders() {
+        let root = project("folders");
+        write(&root, ".layers/base/f.node/node.toml", "stack = [{ op = \"file\", file = \"face.ufo\" }]\n");
+        write(&root, ".layers/base/f.node/face.ufo/metainfo.plist", "<plist/>");
+        write(&root, ".layers/base/f.node/face.ufo/glyphs/A_.glif", "<glyph/>");
+        write(&root, ".layers/base/f.node/face.ufo/.hidden/x", "left out");
+        let (_, index) = open(&root);
+        let names: Vec<&str> = index.assets["f"].files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["face.ufo/glyphs/A_.glif", "face.ufo/metainfo.plist", "node.toml"], "{names:?}");
+        // What a stored-file layer naming the folder reads.
+        let node: &dyn crate::graph::exec::Node = &*index.assets["f"];
+        assert_eq!(node.file_names().len(), 3);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

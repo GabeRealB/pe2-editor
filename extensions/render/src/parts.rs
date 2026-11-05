@@ -108,13 +108,13 @@ fn node_at(assembled: &Assembled, row: &str) -> Result<usize> {
 fn detach(asset: &Asset, name: &str, within: &[String]) -> ContentOutcome {
     let label = format!("Detach {name}");
     if within.first().is_some_and(|step| step == "groups") {
-        return ContentOutcome { label, sets: vec![(within.to_vec(), None)], select: None };
+        return ContentOutcome { label, sets: vec![(within.to_vec(), None)], writes: None, select: None };
     }
     let mut part = pe2_ext::Table::new();
     if let Some(node) = prefab::fill_at(asset, within).and_then(|part| part.get("node")) {
         part.insert("node".to_string(), node.clone());
     }
-    ContentOutcome { label, sets: vec![(within.to_vec(), Some(Value::Table(part)))], select: None }
+    ContentOutcome { label, sets: vec![(within.to_vec(), Some(Value::Table(part)))], writes: None, select: None }
 }
 
 /// An open part goes, where nothing depends on it.
@@ -126,7 +126,7 @@ fn remove(asset: &Asset, project: &dyn Project, name: &str, within: &[String]) -
     if members.into_iter().any(|member| member.get(name).is_some()) {
         bail!("a member of a group fills {name}");
     }
-    Ok(ContentOutcome { label: format!("Remove {name}"), sets: vec![(within.to_vec(), None)], select: None })
+    Ok(ContentOutcome { label: format!("Remove {name}"), sets: vec![(within.to_vec(), None)], writes: None, select: None })
 }
 
 fn act_on_node(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &str, action: &str) -> Result<ContentOutcome> {
@@ -138,7 +138,7 @@ fn act_on_node(asset: &Asset, project: &dyn Project, assembled: &Assembled, row:
             let mut poses = asset.field("pose").and_then(Value::as_table).cloned().unwrap_or_default();
             poses.remove(name);
             let sets = vec![(vec!["pose".to_string()], (!poses.is_empty()).then_some(Value::Table(poses)))];
-            Ok(ContentOutcome { label: format!("Revert {name} to the skeleton"), sets, select: Some(row.to_string()) })
+            Ok(ContentOutcome { label: format!("Revert {name} to the skeleton"), sets, writes: None, select: Some(row.to_string()) })
         }
         _ => bail!("no action {action} on {}", node.name),
     }
@@ -152,7 +152,7 @@ fn reattach(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &s
         bail!("{} hangs from {}", target.name, node.name);
     }
     let path = vec!["parts".to_string(), node.name.clone(), "node".to_string()];
-    Ok(ContentOutcome { label: format!("Attach {} to {}", node.name, target.name), sets: vec![(path, Some(target.name.as_str().into()))], select: None })
+    Ok(ContentOutcome { label: format!("Attach {} to {}", node.name, target.name), sets: vec![(path, Some(target.name.as_str().into()))], writes: None, select: None })
 }
 
 /// A part's name from a model's, kept apart from those there are.
@@ -171,13 +171,13 @@ fn attach_model(asset: &Asset, project: &dyn Project, assembled: &Assembled, ont
     if let (Some(Place::Fill(within)), None) = (&target.place, &target.attached) {
         let mut at = within.clone();
         at.push("model".to_string());
-        return Ok(ContentOutcome { label: format!("Fill {} with {name}", target.name), sets: vec![(at, Some(reference(uid)))], select: None });
+        return Ok(ContentOutcome { label: format!("Fill {} with {name}", target.name), sets: vec![(at, Some(reference(uid)))], writes: None, select: None });
     }
     let mut part = pe2_ext::Table::new();
     part.insert("node".to_string(), target.name.as_str().into());
     part.insert("model".to_string(), reference(uid));
     let at = vec!["parts".to_string(), new_part(asset, name)];
-    Ok(ContentOutcome { label: format!("Attach {name} to {}", target.name), sets: vec![(at, Some(Value::Table(part)))], select: None })
+    Ok(ContentOutcome { label: format!("Attach {name} to {}", target.name), sets: vec![(at, Some(Value::Table(part)))], writes: None, select: None })
 }
 
 /// Something done in a prefab's contents.

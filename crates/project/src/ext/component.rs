@@ -1916,7 +1916,7 @@ fn content_outcome(outcome: g::ContentOutcome) -> Result<pe2_ext::ContentOutcome
         let value = set.value.as_deref().map(|text| parsed(text, &set.path.join("."))).transpose()?;
         sets.push((set.path, value));
     }
-    Ok(pe2_ext::ContentOutcome { label: outcome.label, sets, select: outcome.select })
+    Ok(pe2_ext::ContentOutcome { label: outcome.label, sets, writes: outcome.writes, select: outcome.select })
 }
 
 fn part_sheet_of(sheet: g::PartSheet) -> Result<pe2_ext::PartSheet> {

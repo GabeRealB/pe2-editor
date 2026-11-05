@@ -566,13 +566,18 @@ fn nested_sheet(ui: &mut egui::Ui, sheet: &Sheet, key: &str, fields: &[(&String,
     });
 }
 
-/// A value's cell of a sheet: a line that wraps, for a value and what goes beside it; top down for a list or a table,
-/// which a line would center on itself, over the rows above and below.
+/// How many characters a text holds before it may wrap in a cell.
+const LONG_TEXT: usize = 32;
+
+/// A value's cell of a sheet: a line that wraps, for a value and what goes beside it; top down for a list, a table or a
+/// long text, which a line would center on itself, over the rows above and below.
 fn cell(ui: &mut egui::Ui, value: &toml::Value, add: impl FnOnce(&mut egui::Ui)) {
     let tall = match value {
         toml::Value::Array(items) => items.len() > 1 && ints(value).is_none(),
         // A reference, or a placement (a slot and where in it), reads on a line.
         toml::Value::Table(table) => !is_reference(value) && !table.contains_key("slot"),
+        // A text that wraps: laid out in a row, its lines past the first would run over the rows below.
+        toml::Value::String(text) => text.chars().count() > LONG_TEXT || text.contains('\n'),
         _ => false,
     };
     if tall {
@@ -709,6 +714,22 @@ fn with_sets(text: &str, sets: &[(Vec<String>, Option<toml::Value>)]) -> Result<
 /// The edit an extension's answer to something done in the contents makes, one step of the history: none where it changes
 /// nothing, or why it cannot be made.
 pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<Option<EditRequest>, String> {
+    if let Some((file, bytes)) = &outcome.writes {
+        if !outcome.sets.is_empty() {
+            return Err("It would both set the declaration and write a file, which are two steps".to_string());
+        }
+        if file == project::index::NODE_FILE {
+            return Err(format!("It would write {file} whole, which only its settings change"));
+        }
+        let unchanged = asset.files.iter().find(|f| f.name == *file).and_then(|f| std::fs::read(&f.path).ok()).is_some_and(|now| now == *bytes);
+        return Ok((!unchanged).then(|| EditRequest::Write {
+            uid: asset.uid.clone().unwrap_or_default(),
+            file: file.clone(),
+            bytes: bytes.clone(),
+            label: outcome.label.clone(),
+            merge: None,
+        }));
+    }
     let text = with_sets(asset.text(), &outcome.sets)?;
     Ok((text != asset.text()).then(|| EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),

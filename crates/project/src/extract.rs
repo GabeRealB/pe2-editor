@@ -421,6 +421,10 @@ fn write_bundle(layer: &Path, path: &str, files: &[(&str, &[u8])]) -> Result<()>
             crate::graph::layers::settings_on_layers(text).with_context(|| path.to_string())
         });
         let bytes = on_layers.transpose()?.map_or_else(|| bytes.to_vec(), String::into_bytes);
+        // A file in a folder of the bundle (a UFO font's) has its folder made first.
+        if let Some(parent) = dir.join(name).parent() {
+            fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+        }
         fs::write(dir.join(name), bytes).with_context(|| format!("{}", dir.join(name).display()))?;
     }
     Ok(())
@@ -572,6 +576,10 @@ impl crate::graph::exec::Node for Lent<'_> {
         self.files.get(name).map(|bytes| sha1_hex(bytes))
     }
 
+    fn file_names(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
+
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         self.files.get(name).cloned().with_context(|| format!("{}: no file {name}", self.path))
     }
@@ -625,8 +633,14 @@ impl Sourcing<'_> {
         let settings = crate::graph::with_settings(fields.clone());
         let native_form = crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, settings, ..pe2_ext::Typed::default() });
         let written = self.engine.run(&inverse, vec![vec![native_form]], &toml::Table::new(), &lent);
-        let bytes = match written.with_context(|| format!("{path}: {inverse} could not write its source"))? {
-            crate::graph::Value::Typed(written) => self.read(&written.file()?.content)?,
+        // One file, the source itself (`source.ora`); several, a folder of that name (`medium.ufo/glyphs/A_.glif`).
+        let written_files: Vec<(String, Vec<u8>)> = match written.with_context(|| format!("{path}: {inverse} could not write its source"))? {
+            crate::graph::Value::Typed(written) if written.files.len() == 1 => vec![(source.clone(), self.read(&written.file()?.content)?)],
+            crate::graph::Value::Typed(written) if !written.files.is_empty() => written
+                .files
+                .iter()
+                .map(|file| Ok((format!("{}/{}", source.trim_end_matches('/'), file.name), self.read(&file.content)?)))
+                .collect::<Result<_>>()?,
             other => bail!("{path}: {inverse} wrote {}, not a file", other.ty()),
         };
         // What the bundle says: the declaration without what the source holds. Imported back by its stack, as the
@@ -638,7 +652,7 @@ impl Sourcing<'_> {
             uid: Some(&asset.uid),
             fields: crate::graph::with_settings(placed.parse()?),
             declaration: &written,
-            files: BTreeMap::from([(source.clone(), bytes.clone())]),
+            files: written_files.iter().cloned().collect(),
         };
         let (plan, wrong) = crate::graph::Plan::of(&lent.fields, &self.engine.ops, &[]);
         if let Some(wrong) = wrong.first() {
@@ -673,8 +687,14 @@ impl Sourcing<'_> {
             bail!("{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})", resolved.orphans);
         }
         self.sources += 1;
-        Ok((written, vec![(source, bytes)]))
+        Ok((written, written_files))
     }
+}
+
+/// The one folder an extractor's files are all in, where they are (a font's `<name>.ufo/`).
+fn made_folder(made: &pe2_ext::Made) -> Option<String> {
+    let first = made.first()?.0.split_once('/')?.0;
+    made.iter().all(|(name, _)| name.split_once('/').is_some_and(|(folder, _)| folder == first)).then(|| first.to_string())
 }
 
 /// A bundle's `node.toml` with a stack added, before the originals.
@@ -729,7 +749,9 @@ fn write_assets(
                 }
                 originals.extend(asset.from[release].sha1.iter().map(|s| (release.clone(), s.clone())));
             }
-            let toml = sourcing.stack(path, &asset.template, None, &asset_toml(&asset.body, &originals)?)?;
+            // What it made in one folder (a font's `medium.ufo/`) is what the template's file names.
+            let folder = made_folder(&made);
+            let toml = sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
             let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
             let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
             files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
@@ -849,6 +871,10 @@ impl crate::graph::exec::Node for Written {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let path = self.dir.join(name);
         fs::read(&path).with_context(|| path.display().to_string())
+    }
+
+    fn file_names(&self) -> Vec<String> {
+        crate::index::bundle_files(&self.dir).into_keys().collect()
     }
 
     fn file_size(&self, name: &str) -> Option<u64> {

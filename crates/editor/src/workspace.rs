@@ -1387,9 +1387,9 @@ impl Workspace {
         uid.is_some_and(|uid| self.applied.text(uid).is_some())
     }
 
-    /// How many assets have settings not applied yet.
+    /// How many assets have settings not applied yet: of those the project has, not one since deleted.
     pub fn unapplied_count(&self) -> usize {
-        self.applied.pending().len()
+        self.applied.pending().iter().filter(|uid| self.index.by_uid.contains_key(*uid)).count()
     }
 
     /// Apply an asset's settings: its outputs made again from them.

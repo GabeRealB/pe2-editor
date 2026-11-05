@@ -29,6 +29,10 @@ pub trait Node: Sync {
     }
     /// A stored file's hash; none where its bundle has no such file.
     fn file_sha1(&self, name: &str) -> Option<String>;
+    /// Its stored files' names, a file in a folder of the bundle as `<folder>/<file>`: what a folder of it holds.
+    fn file_names(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// A stored file, whole.
     ///
     /// # Errors
@@ -84,6 +88,10 @@ impl Node for crate::index::Asset {
 
     fn file_sha1(&self, name: &str) -> Option<String> {
         self.files.iter().find(|f| f.name == name && f.made_by.is_none()).map(|f| f.sha1.clone())
+    }
+
+    fn file_names(&self) -> Vec<String> {
+        self.files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.clone()).collect()
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {
@@ -429,14 +437,45 @@ impl<'a> Call<'a> {
     /// # Errors
     /// The node has no such file.
     pub fn stored(&self, name: &str, mut names: Vec<String>) -> Result<Typed> {
-        self.recorder.file(name);
         let node = self.recorder.node;
+        let ty = if names.is_empty() { pe2_ext::data::BYTES.to_string() } else { names.remove(0) };
+        let settings = super::set_on(super::FILE, self.settings);
+        // A folder of the bundle (a UFO font): every file in it, named within it.
+        if node.file_sha1(name).is_none() {
+            let within = format!("{}/", name.trim_end_matches('/'));
+            let held: Vec<String> = node.file_names().into_iter().filter(|file| file.starts_with(&within)).collect();
+            anyhow::ensure!(!held.is_empty(), "{}: no file or folder {name}", node.path());
+            let mut files = Vec::with_capacity(held.len());
+            for file in held {
+                self.recorder.file(&file);
+                let sha1 = node.file_sha1(&file).with_context(|| format!("{}: no file {file}", node.path()))?;
+                let size = node.file_size(&file).unwrap_or_default();
+                files.push(File { name: file[within.len()..].to_string(), content: Content::Stored { sha1, size } });
+            }
+            return Ok(Typed { ty, also: names, files, settings, ..Typed::default() });
+        }
+        self.recorder.file(name);
         let sha1 = node.file_sha1(name).with_context(|| format!("{}: no file {name}", node.path()))?;
         let size = node.file_size(name).unwrap_or_default();
-        let ty = if names.is_empty() { pe2_ext::data::BYTES.to_string() } else { names.remove(0) };
         let file = File { name: name.to_string(), content: Content::Stored { sha1, size } };
         // A stored file comes with what is said of it, on its layer.
-        Ok(Typed { ty, also: names, files: vec![file], settings: super::set_on(super::FILE, self.settings), ..Typed::default() })
+        Ok(Typed { ty, also: names, files: vec![file], settings, ..Typed::default() })
+    }
+
+    /// A stored file or folder of the node, as `stored` gives it; where it has neither, no files - its absence recorded,
+    /// so that what was made without it is made again once it is there.
+    ///
+    /// # Errors
+    /// What `stored` fails with, but the file's absence.
+    pub fn stored_if_any(&self, name: &str) -> Result<Typed> {
+        let node = self.recorder.node;
+        let within = format!("{}/", name.trim_end_matches('/'));
+        if node.file_sha1(name).is_none() && !node.file_names().iter().any(|file| file.starts_with(&within)) {
+            self.recorder.file(name);
+            let settings = super::set_on(super::FILE, self.settings);
+            return Ok(Typed { ty: pe2_ext::data::BYTES.to_string(), settings, ..Typed::default() });
+        }
+        self.stored(name, Vec::new())
     }
 
     /// Another node's output, by a reference to it and its address, recorded as read.

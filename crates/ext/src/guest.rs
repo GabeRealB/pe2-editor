@@ -816,6 +816,7 @@ impl g::Guest for Component {
         Ok(g::ContentOutcome {
             label: outcome.label,
             sets: outcome.sets.into_iter().map(|(path, value)| g::ContentSet { path, value: value.as_ref().map(value_text) }).collect(),
+            writes: outcome.writes,
             select: outcome.select,
         })
     }

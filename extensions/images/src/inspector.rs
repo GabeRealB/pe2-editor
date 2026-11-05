@@ -358,6 +358,7 @@ pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentReque
     let of_variants = |label: String, change, select| ContentOutcome {
         label,
         sets: vec![(vec!["variants".to_string()], shown.changed(change))],
+        writes: None,
         select,
     };
     match request {
@@ -379,6 +380,7 @@ pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentReque
                 return Ok(ContentOutcome {
                     label: format!("Draw {cell} through {palette}"),
                     sets: vec![(vec!["cells".to_string(), cell.to_string(), "palette".to_string()], Some(Value::String(palette.to_string())))],
+                    writes: None,
                     select: None,
                 });
             }

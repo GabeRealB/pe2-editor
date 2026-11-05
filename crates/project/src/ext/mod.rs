@@ -1525,6 +1525,10 @@ impl Extensions {
         let named = move |settings: &toml::Table| named_type(&by_name, settings.get("file")?.as_str()?);
         let stored = graph::OpDef::new(graph::FILE, "Stored file", "1").output_of(named).makes(any_file, move |call| {
             let name = call.setting_str("file")?.to_string();
+            // A file the node may lack (`optional`): none, without it.
+            if call.settings().get("optional").and_then(toml::Value::as_bool) == Some(true) && call.recorder().node().file_sha1(&name).is_none() {
+                return call.stored_if_any(&name).map(graph::Value::Typed);
+            }
             let node = call.recorder().node();
             let head = node.read_head(&name, HEAD);
             let size = node.file_size(&name).unwrap_or_default();

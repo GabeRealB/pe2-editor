@@ -325,6 +325,10 @@ impl Default for Ops {
         let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()) };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             let name = call.setting_str("file")?.to_string();
+            // A file the node may lack (`optional`): none, without it.
+            if call.settings().get("optional").and_then(Toml::as_bool) == Some(true) {
+                return call.stored_if_any(&name).map(Value::Typed);
+            }
             call.stored(&name, Vec::new()).map(Value::Typed)
         }));
         ops.add(OpDef::new(PICK, "One of its outputs", "1").input(port("made", Type::Any)).makes(Type::Any, |call| {
@@ -534,7 +538,7 @@ pub fn set_on(op: &str, settings: &Table) -> Table {
 /// Whether a layer's key is no setting of its node's, but how the stack is put together.
 fn structural(op: &str, key: &str) -> bool {
     matches!(key, "op" | "id" | "pos" | "ops" | "result")
-        || (op == FILE && key == "file")
+        || (op == FILE && matches!(key, "file" | "optional"))
         || (op == REFERENCES && matches!(key, "field" | "key" | "output"))
 }
 

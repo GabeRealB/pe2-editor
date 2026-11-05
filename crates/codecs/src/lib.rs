@@ -4,5 +4,6 @@
 pub mod bs;
 pub mod ora;
 pub mod texture;
+pub mod ufo;
 pub mod xa;
 pub mod zip;

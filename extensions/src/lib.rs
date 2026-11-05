@@ -42,7 +42,7 @@ pub fn built_suites() -> Vec<PathBuf> {
 /// The built-in extensions linked in.
 #[must_use]
 pub fn linked() -> Vec<pe2_ext::Extension> {
-    vec![pe2_render::extension(), pe2_events::extension(), pe2_formats::extension(), pe2_game::extension(), pe2_images::extension(), pe2_movies::extension(), pe2_packages::extension(), pe2_str::extension()]
+    vec![pe2_render::extension(), pe2_events::extension(), pe2_fonts::extension(), pe2_formats::extension(), pe2_game::extension(), pe2_images::extension(), pe2_movies::extension(), pe2_packages::extension(), pe2_str::extension()]
 }
 
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.

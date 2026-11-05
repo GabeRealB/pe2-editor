@@ -12,6 +12,7 @@ workspace = true
 pe2-ext.workspace = true
 project.workspace = true
 pe2-formats.workspace = true
+pe2-fonts.workspace = true
 pe2-game.workspace = true
 pe2-images.workspace = true
 pe2-movies.workspace = true

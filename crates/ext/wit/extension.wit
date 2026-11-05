@@ -578,10 +578,12 @@ interface guest {
         value: option<string>,
     }
 
-    /// What comes of it: its name in the history, what it changes in the declaration, what is selected after it.
+    /// What comes of it: its name in the history, what it changes in the declaration or the file of the asset it writes
+    /// whole (its name in the bundle, its bytes) - one or the other - and what is selected after it.
     record content-outcome {
         label: string,
         sets: list<content-set>,
+        writes: option<tuple<string, list<u8>>>,
         select: option<string>,
     }
 

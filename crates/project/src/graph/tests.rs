@@ -48,6 +48,10 @@ impl Node for Bundle {
         self.files.lock().unwrap().get(name).cloned().context("no such file")
     }
 
+    fn file_names(&self) -> Vec<String> {
+        self.files.lock().unwrap().keys().cloned().collect()
+    }
+
     fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
         let files = self.files.lock().unwrap();
         files.values().find(|b| crate::extract::sha1_hex(b) == sha1).cloned().context("no such content")
@@ -313,7 +317,46 @@ fn a_failure_reaches_what_takes_from_it() {
     let node = Bundle::new(STACK, &[]);
     let (count, _) = plan.output("count").unwrap();
     let (made, _) = evaluate(&plan, &ops, &node, &[(count, None)], &Vec::new(), (None, None));
-    assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: test/bundle: no file a.txt");
+    assert_eq!(made[0].as_ref().unwrap_err().as_ref(), "stack[0]: test/bundle: no file or folder a.txt");
+}
+
+#[test]
+fn a_stored_folder_is_every_file_in_it_named_within_it() {
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"face.ufo\"\n\n[[stack]]\nop = \"output\"\nname = \"source\"\n";
+    let ops = ops();
+    let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    let node = Bundle::new(stack, &[("face.ufo/metainfo.plist", "m"), ("face.ufo/glyphs/A_.glif", "a"), ("other.txt", "o")]);
+    let (source, _) = plan.output("source").unwrap();
+    let (made, _) = evaluate(&plan, &ops, &node, &[(source, None)], &Vec::new(), (None, None));
+    let made = made[0].as_ref().unwrap();
+    let Value::Typed(typed) = &**made else { panic!("not files") };
+    let names: Vec<&str> = typed.files.iter().map(|file| file.name.as_str()).collect();
+    assert_eq!(names, ["glyphs/A_.glif", "metainfo.plist"]);
+    // What is not there is said so.
+    let empty = Bundle::new(stack, &[("other.txt", "o")]);
+    let (made, _) = evaluate(&plan, &ops, &empty, &[(source, None)], &Vec::new(), (None, None));
+    assert!(made[0].as_ref().unwrap_err().contains("no file or folder face.ufo"), "{:?}", made[0]);
+}
+
+#[test]
+fn an_optional_stored_file_is_none_where_the_node_lacks_it_and_read_once_it_is_there() {
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"under.png\"\noptional = true\n\n[[stack]]\nop = \"output\"\nname = \"source\"\n";
+    let ops = ops();
+    let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    let (source, _) = plan.output("source").unwrap();
+    let made_of = |node: &Bundle| {
+        let (made, reads) = evaluate(&plan, &ops, node, &[(source, None)], &Vec::new(), (None, None));
+        let Value::Typed(typed) = &**made[0].as_ref().unwrap() else { panic!("not files") };
+        (typed.files.iter().map(|file| file.name.clone()).collect::<Vec<_>>(), reads)
+    };
+    let (none, reads) = made_of(&Bundle::new(stack, &[("other.txt", "o")]));
+    assert_eq!(none, Vec::<String>::new());
+    // Its absence was read: the file come, what was made of none no longer holds.
+    let there = Bundle::new(stack, &[("other.txt", "o"), ("under.png", "u")]);
+    assert!(!reads.hold(&there, None));
+    assert_eq!(made_of(&there).0, ["under.png"]);
+    // `optional` is how the stack is put together, not a setting of the node's.
+    assert!(!super::set_on(super::FILE, &toml::from_str("file = \"under.png\"\noptional = true").unwrap()).contains_key("optional"));
 }
 
 #[test]

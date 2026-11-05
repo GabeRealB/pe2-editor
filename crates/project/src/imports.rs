@@ -47,6 +47,8 @@ pub struct Imports {
     /// What attaching read of each import, and the settings it resolved to, by its output's key, with what it read:
     /// a refresh finds them here rather than on disk while that holds.
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
+    /// The nodes each asset's last import read outputs of (as traces name them), by its path.
+    read_from: Mutex<HashMap<String, BTreeSet<String>>>,
     /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from.
     addresses: Mutex<HashMap<String, Listed>>,
     /// Set when what is attaching is no longer wanted.
@@ -115,7 +117,7 @@ impl Imports {
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), addresses: Mutex::default(), stop: Arc::default() })
+        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), read_from: Mutex::default(), addresses: Mutex::default(), stop: Arc::default() })
     }
 
     /// Sweep the store of what the project's nodes no longer make, and of what nodes it no longer has made
@@ -162,7 +164,35 @@ impl Imports {
     pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
         let mut changed = changed.clone();
         changed.extend(extensions.dependents(index, &changed));
+        changed.extend(self.readers(index, &changed));
+        // What failed may have failed for what another made, which it did not get to say it read: it is tried again.
+        let failed = index.problems.iter().filter_map(|p| match p {
+            Problem::Import { asset, .. } => Some(asset.clone()),
+            _ => None,
+        });
+        let failed: Vec<String> = failed.collect();
+        changed.extend(failed.iter().cloned());
+        changed.extend(self.readers(index, &failed.into_iter().collect()));
         self.attach_some(index, extensions, Some(&changed), &|_, _, _| {})
+    }
+
+    /// The assets whose last import read an output of one of these, through others or not: what an operation reads of
+    /// another node as it runs (`Call::output_of`), which no `references` layer says. These not among them.
+    fn readers(&self, index: &Index, changed: &BTreeSet<String>) -> BTreeSet<String> {
+        let read_from = self.read_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut found = BTreeSet::new();
+        let mut next: Vec<String> = changed.iter().cloned().collect();
+        while let Some(path) = next.pop() {
+            let Some(asset) = index.assets.get(&path) else { continue };
+            let node = graph::exec::id(&**asset);
+            for (reader, nodes) in read_from.iter() {
+                if !changed.contains(reader) && !found.contains(reader) && nodes.contains(node) {
+                    found.insert(reader.clone());
+                    next.push(reader.clone());
+                }
+            }
+        }
+        found
     }
 
     fn attach_some(
@@ -200,6 +230,7 @@ impl Imports {
         let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
         let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
+        let mut read_from: Vec<(String, BTreeSet<String>)> = Vec::new();
         if self.stopping() {
             return attached;
         }
@@ -228,10 +259,15 @@ impl Imports {
                     } else {
                         attached.kept += 1;
                     }
+                    let nodes = reads.outputs.keys().map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string()).collect();
+                    read_from.push((asset.path.clone(), nodes));
                     new.push((key.clone(), (reads, import.clone())));
                     found.push((asset.path.clone(), key, import));
                 }
-                Err(e) => attached.failed.push((asset.path.clone(), format!("{e:#}"))),
+                Err(e) => {
+                    read_from.push((asset.path.clone(), BTreeSet::new()));
+                    attached.failed.push((asset.path.clone(), format!("{e:#}")));
+                }
             }
         }
         if only.is_none() {
@@ -240,6 +276,7 @@ impl Imports {
         }
         known.extend(new);
         drop(known);
+        self.read_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(read_from);
         let mut problems: Vec<Problem> =
             attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
         problems.extend(stacks);
@@ -787,6 +824,59 @@ mod attaching {
         assert_eq!((attached.made, attached.failed.len()), (COUNT, 0), "{:?}", attached.failed);
         assert_eq!(DEEPEST.load(std::sync::atomic::Ordering::SeqCst), 1, "each found what it reads made");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `strips`, and `copy`: a strip of what `uid://s` makes, read as it runs - no `references` layer says it.
+    fn copying(r: &mut Registry) -> Result<()> {
+        strips(r)?;
+        let needs = |_: &mut pe2_ext::Call<'_>| Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", "native")], micros: Vec::new() });
+        let _ = r.op("copy").output::<Strip>().prepare(needs).run(|call| {
+            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", "native")? else { anyhow::bail!("uid://s makes no files") };
+            let bytes = call.read(read.file()?)?;
+            anyhow::ensure!(!bytes.is_empty(), "uid://s is empty");
+            Ok(Typed { ty: Strip::NAME.into(), files: vec![File::new("native.bin", bytes)], ..Typed::default() })
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn what_reads_another_node_as_it_runs_is_attached_again_when_that_changes() {
+        let root: PathBuf = std::env::temp_dir().join(format!("pe2-imports-readers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
+        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
+        write(&root, ".layers/base/s.node/source.txt", "a b");
+        let copy = "[[stack]]\nop = \"test.strips@copy\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n";
+        // Read through another: `c` copies `uid://s`, which nothing of its declaration names.
+        write(&root, ".layers/base/c.node/node.toml", &format!("uid = \"uid://c\"\n{copy}"));
+        let extension = Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: copying };
+        let extensions = Extensions::load(vec![Loadable::from(extension)], true);
+        assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
+        let project = Project::load(&root).unwrap();
+        let (mut index, attached) = open(&root, &extensions);
+        assert_eq!((attached.made, attached.failed.len()), (2, 0), "{:?}", attached.failed);
+        let lock = Lock::try_acquire(&root, "a test").unwrap();
+        let imports = Imports::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        drop(lock);
+        // Its first attach is what it learns what each read from.
+        imports.attach(&mut index, &extensions);
+        write(&root, ".layers/base/s.node/source.txt", "a b c");
+        let refreshed = index.refresh(&project, &[root.join(".layers/base/s.node/source.txt")]).unwrap();
+        assert!(!refreshed.assets.contains("c"), "c's own files did not change");
+        imports.attach_changed(&mut index, &extensions, &refreshed.assets);
+        let (fresh, _) = open(&root, &extensions);
+        assert_eq!(shown(&index), shown(&fresh));
+        // What it reads emptied, it fails; filled again, it is made again, though its failure read nothing.
+        for (text, fails) in [("", true), ("a", false)] {
+            write(&root, ".layers/base/s.node/source.txt", text);
+            let refreshed = index.refresh(&project, &[root.join(".layers/base/s.node/source.txt")]).unwrap();
+            imports.attach_changed(&mut index, &extensions, &refreshed.assets);
+            let failed = index.problems.iter().any(|p| matches!(p, Problem::Import { asset, .. } if asset == "c"));
+            assert_eq!(failed, fails, "{text:?}: {:?}", index.problems);
+            let (fresh, _) = open(&root, &extensions);
+            assert_eq!(shown(&index), shown(&fresh), "{text:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Runs of `counted`, of the tests below, by the node: they run at once, so each counts its own.
