@@ -1,6 +1,6 @@
 //! pe2.psx, an unsandboxed extension: the PS1 target, as a toolchain file is `CMake`'s, and the last steps of a package. It provides
 //! `package-target`, given the files `pe2.packages` gathered: `compile` makes the package's objects - its C units with the tools it ships, its
-//! assembly as written, its own prebuilt objects as they are - each named by its package and its place in it (`title/src/title.o`), as a
+//! assembly as written, its own prebuilt objects as they are - each named by its package and its place in it (`title/src/package.o`), as a
 //! link script names it; `symbols` lays an image out alone and says what it exports; `link` makes its image by the package's `link_script` at the
 //! address of its slot, with what its dependencies' objects add and against what the images it binds publish. A target that links packages
 //! otherwise takes their objects and leaves the last two out. Slots are named by packages and mapped here, as what a target calls a place in
@@ -215,7 +215,7 @@ fn is_assembly(unit: &str) -> bool {
     Path::new(unit).extension().is_some_and(|extension| extension == "s")
 }
 
-/// What a unit's object is named: its package and its place in it (`title/src/title.o`), as a link script names it.
+/// What a unit's object is named: its package and its place in it (`title/src/package.o`), as a link script names it.
 fn object_name(package: &str, unit: &str) -> String {
     let inside = unit.strip_prefix("self/").unwrap_or(unit);
     format!("{package}/{}", Path::new(inside).with_extension("o").display())
@@ -618,8 +618,8 @@ mod tests {
     fn an_option_with_no_value_is_told_at_the_line_asking() {
         let said = "exit status: 1: In file included from pe2.h:29,\npe2_options.h:1:26: error: division by zero in #if\n\
                     1 | #define pe2_option_foo (0/pe2_unset_foo)\n\
-                    packages/title/src/title.c:4:5: note: in expansion of macro \u{2018}PE2_OPTION\u{2019}\n";
-        assert_eq!(super::no_value(anyhow!("{said}"), &["bar", "foo"]).to_string(), "packages/title/src/title.c:4: foo has no value on this package");
+                    packages/title/src/package.c:4:5: note: in expansion of macro \u{2018}PE2_OPTION\u{2019}\n";
+        assert_eq!(super::no_value(anyhow!("{said}"), &["bar", "foo"]).to_string(), "packages/title/src/package.c:4: foo has no value on this package");
         assert_eq!(super::no_value(anyhow!("other"), &["foo"]).to_string(), "other");
     }
 }
