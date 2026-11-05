@@ -11,23 +11,35 @@ pub(crate) use pe2_model::{material, mesh, model, skeleton};
 
 mod assembly;
 #[cfg(any(target_family = "wasm", test))]
-#[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
+#[cfg_attr(
+    not(target_family = "wasm"),
+    expect(dead_code, reason = "tested here, used by the view, which is the component's")
+)]
 mod camera;
 mod extract;
 #[cfg(any(target_family = "wasm", test))]
-#[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
+#[cfg_attr(
+    not(target_family = "wasm"),
+    expect(dead_code, reason = "tested here, used by the view, which is the component's")
+)]
 mod gizmo;
-#[cfg(any(target_family = "wasm", test))]
-#[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
-mod math;
 mod material_panel;
 mod materials;
+#[cfg(any(target_family = "wasm", test))]
+#[cfg_attr(
+    not(target_family = "wasm"),
+    expect(dead_code, reason = "tested here, used by the view, which is the component's")
+)]
+mod math;
 mod parts;
 mod prefab;
 #[cfg(target_family = "wasm")]
 mod render;
 #[cfg(any(target_family = "wasm", test))]
-#[cfg_attr(not(target_family = "wasm"), expect(dead_code, reason = "tested here, used by the view, which is the component's"))]
+#[cfg_attr(
+    not(target_family = "wasm"),
+    expect(dead_code, reason = "tested here, used by the view, which is the component's")
+)]
 mod scene;
 mod uv;
 #[cfg(target_family = "wasm")]
@@ -186,20 +198,71 @@ fn joint_names(asset: &Asset) -> Vec<String> {
 
 /// What a sub-path goes through: a model's mesh and materials, a mesh's skeleton, a skeleton's joints, each joint its place.
 fn links(r: &mut Registry) {
-    let _ = r.op("mesh_of").label("Its mesh").takes("model", &[MODEL]).output::<ty::Table>().run(|call| link(call.given().get("mesh")));
-    let _ = r.op("skeleton_of").label("Its skeleton").takes("mesh", &[Usd::NAME]).output::<ty::Table>().run(|call| link(call.given().get("skeleton")));
-    let _ = r.op("material_of").label("What fills a slot").takes("model", &[MODEL]).output::<ty::Table>().parameter::<String>("slot").members(|asset| asset.parts("materials").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
-        let slot: String = call.parameter()?;
-        link(call.given().get("materials").and_then(|materials| materials.get(&slot)))
-    });
-    let _ = r.op("joint_at").label("A joint's place").takes("skeleton", &["pe2.render@skeleton"]).output::<ty::Table>().parameter::<String>("joint").members(|asset| joint_names(asset).into_iter().map(|name| (name.clone(), name)).collect()).run(|call| {
-        let name: String = call.parameter()?;
-        let given = call.given();
-        let joints = given.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-        let at = joints.iter().position(|joint| joint.get("name").and_then(Value::as_str) == Some(&name));
-        let at = at.ok_or_else(|| pe2_ext::anyhow!("it has no joint {name}"))?;
-        Ok(Table::from_iter([(VALUE.to_string(), Value::Integer(i64::try_from(at)?))]))
-    });
+    let _ = r
+        .op("mesh_of")
+        .label("Its mesh")
+        .takes("model", &[MODEL])
+        .output::<ty::Table>()
+        .run(|call| link(call.given().get("mesh")));
+    let _ = r
+        .op("skeleton_of")
+        .label("Its skeleton")
+        .takes("mesh", &[Usd::NAME])
+        .output::<ty::Table>()
+        .run(|call| link(call.given().get("skeleton")));
+    let _ = r
+        .op("material_of")
+        .label("What fills a slot")
+        .takes("model", &[MODEL])
+        .output::<ty::Table>()
+        .parameter::<String>("slot")
+        .members(|asset| {
+            asset.parts("materials").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()
+        })
+        .run(|call| {
+            let slot: String = call.parameter()?;
+            link(call.given().get("materials").and_then(|materials| materials.get(&slot)))
+        });
+    let _ = r
+        .op("joint_at")
+        .label("A joint's place")
+        .takes("skeleton", &["pe2.render@skeleton"])
+        .output::<ty::Table>()
+        .parameter::<String>("joint")
+        .members(|asset| joint_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
+        .run(|call| {
+            let name: String = call.parameter()?;
+            let given = call.given();
+            let joints = given.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+            let at = joints.iter().position(|joint| joint.get("name").and_then(Value::as_str) == Some(&name));
+            let at = at.ok_or_else(|| pe2_ext::anyhow!("it has no joint {name}"))?;
+            Ok(Table::from_iter([(VALUE.to_string(), Value::Integer(i64::try_from(at)?))]))
+        });
+}
+
+/// A material: its shader, surface, blend and effect, and its textures, extracted as authored.
+fn material_type(r: &mut Registry) {
+    let material = r
+        .named_type("material")
+        .alias("material")
+        .label("Material")
+        .data()
+        .stack(MATERIAL)
+        .icon(Icon::Palette, Tint::Picture)
+        .field(
+            Field::new("shader")
+                .label("Shader")
+                .choices(material::SHADERS.iter().map(|shader| (shader.id, shader.label))),
+        )
+        .field(Field::new("surface").label("Surface").choices(material::SURFACES))
+        .field(Field::new("blend").label("Blend").choices(material::BLENDS.iter().map(|(id, label, _)| (*id, *label))))
+        .field(Field::new(material::EFFECT).label("Effect"))
+        .field(Field::new(material::MAIN).custom())
+        .field(Field::new(material::ENVIRONMENT).custom())
+        .contents(parts::contents)
+        .inspector("Textures", |_| Box::new(material_panel::Panel::default()))
+        .register();
+    let _ = r.extractor("materials", &material, &[], extract::authored);
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -211,7 +274,14 @@ fn register(r: &mut Registry) -> Result<()> {
     r.viewer(&scene_type, "3D", Icon::Cube, |_| make_view());
     r.viewer(&scene_type, "UV", Icon::Grid, |_| Box::new(uv::UvView::default()));
     let shown = [Usd::NAME, "pe2.render@material", "pe2.render@skeleton", MODEL, PREFAB];
-    let _ = r.op("assemble").label("What it shows").takes("node", &shown).output::<Scene>().prepared_by_running().parameter::<String>("chosen").run(assembly::scene);
+    let _ = r
+        .op("assemble")
+        .label("What it shows")
+        .takes("node", &shown)
+        .output::<Scene>()
+        .prepared_by_running()
+        .parameter::<String>("chosen")
+        .run(assembly::scene);
     links(r);
     let _ = r
         .op("member")
@@ -234,23 +304,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))
         .register();
     let _ = r.extractor("meshes", &mesh, &[], extract::begin);
-    let material = r
-        .named_type("material")
-        .alias("material")
-        .label("Material")
-        .data()
-        .stack(MATERIAL)
-        .icon(Icon::Palette, Tint::Picture)
-        .field(Field::new("shader").label("Shader").choices(material::SHADERS.iter().map(|shader| (shader.id, shader.label))))
-        .field(Field::new("surface").label("Surface").choices(material::SURFACES))
-        .field(Field::new("blend").label("Blend").choices(material::BLENDS.iter().map(|(id, label, _)| (*id, *label))))
-        .field(Field::new(material::EFFECT).label("Effect"))
-        .field(Field::new(material::MAIN).custom())
-        .field(Field::new(material::ENVIRONMENT).custom())
-        .contents(parts::contents)
-        .inspector("Textures", |_| Box::new(material_panel::Panel::default()))
-        .register();
-    let _ = r.extractor("materials", &material, &[], extract::authored);
+    material_type(r);
     let skeleton = r
         .named_type("skeleton")
         .alias("skeleton")
@@ -343,7 +397,14 @@ impl View for Summary {
                 }
             }
         }
-        let rows: Vec<Vec<Cell>> = self.lines.iter().flatten().map(|(label, value)| vec![Cell::Text((*label).to_string(), Style::Weak), Cell::Text(value.clone(), Style::Normal)]).collect();
+        let rows: Vec<Vec<Cell>> = self
+            .lines
+            .iter()
+            .flatten()
+            .map(|(label, value)| {
+                vec![Cell::Text((*label).to_string(), Style::Weak), Cell::Text(value.clone(), Style::Normal)]
+            })
+            .collect();
         ui.section("Mesh", |ui| {
             let _ = ui.table("mesh", &rows);
         });

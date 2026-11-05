@@ -107,7 +107,11 @@ pub fn install(instance: &wgpu::Instance, adapter: wgpu::Adapter, device: wgpu::
     }));
     device.set_device_lost_callback(|reason, message| {
         eprintln!("wgpu: the device is lost: {message}");
-        let reason = if matches!(reason, wgpu::DeviceLostReason::Destroyed) { GpuDeviceLostReason::Destroyed } else { GpuDeviceLostReason::Unknown };
+        let reason = if matches!(reason, wgpu::DeviceLostReason::Destroyed) {
+            GpuDeviceLostReason::Destroyed
+        } else {
+            GpuDeviceLostReason::Unknown
+        };
         for inbox in LOST_INBOXES.lock().unwrap_or_else(PoisonError::into_inner).iter() {
             let mut inbox = inbox.lock().unwrap_or_else(PoisonError::into_inner);
             inbox.queue.push_back(Lost { reason, message: message.clone() });
@@ -135,7 +139,9 @@ pub(crate) fn lost_inbox() -> Arc<Mutex<Inbox<Lost>>> {
 pub(crate) fn poll_soon() {
     let Some(shared) = DEVICE.get() else { return };
     let device = shared.device.clone();
-    let _ = std::thread::Builder::new().name("gpu poll".into()).spawn(move || device.poll(wgpu::PollType::wait_indefinitely()));
+    let _ = std::thread::Builder::new()
+        .name("gpu poll".into())
+        .spawn(move || device.poll(wgpu::PollType::wait_indefinitely()));
 }
 
 /// What a future wgpu gives comes to, where it has already: native ones have.

@@ -58,7 +58,8 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     });
     match opened {
         Ok((project, index, extensions)) => {
-            let reply = answer(&mut View { project: &project, index: &index, extensions: &extensions, editor: None }, request);
+            let reply =
+                answer(&mut View { project: &project, index: &index, extensions: &extensions, editor: None }, request);
             // The server has no frames, and waits for the next request: its extensions' readings give their memory back.
             extensions.release();
             reply

@@ -30,7 +30,10 @@ impl Registered for Video {
     const LABEL: &str = "Video file";
 
     fn signatures() -> Vec<Signature> {
-        ["*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi"].into_iter().map(|name| Signature::Name(name.into())).collect()
+        ["*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi"]
+            .into_iter()
+            .map(|name| Signature::Name(name.into()))
+            .collect()
     }
 }
 
@@ -49,7 +52,11 @@ impl Encoder {
     /// An encoder as an encoding writes it: `name[:option=value,...]`.
     fn parse(text: &str) -> Result<Encoder> {
         let (name, options) = text.split_once(':').unwrap_or((text, ""));
-        let plain = |word: &str| !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)) && !word.starts_with('-');
+        let plain = |word: &str| {
+            !word.is_empty()
+                && word.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+                && !word.starts_with('-')
+        };
         if !plain(name) {
             bail!("`{name}` is no encoder");
         }
@@ -82,10 +89,14 @@ impl Encoding {
     fn parse(text: &str) -> Result<Encoding> {
         let text = if text == "lossless" { LOSSLESS } else { text };
         let mut parts = text.split('+');
-        let (Some(container), Some(video), Some(audio), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        let (Some(container), Some(video), Some(audio), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             bail!("`{text}` is no <container>+<video>+<audio>");
         };
-        let plain = !container.is_empty() && container.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)) && !container.starts_with('-');
+        let plain = !container.is_empty()
+            && container.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+            && !container.starts_with('-');
         if !plain {
             bail!("`{container}` is no container");
         }
@@ -98,10 +109,11 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Video>();
     ask::register(r);
     // What is in a video file, as a stream.
-    let _ = r.op("decode").label("Frames and sound").input::<Video>("source").output::<ty::Playback>().streams(|call| {
-        let source = call.take::<Video>(0)?;
-        Ok(Box::new(decode::Reading::start(call, &source)?))
-    });
+    let _ =
+        r.op("decode").label("Frames and sound").input::<Video>("source").output::<ty::Playback>().streams(|call| {
+            let source = call.take::<Video>(0)?;
+            Ok(Box::new(decode::Reading::start(call, &source)?))
+        });
     let _ = r
         .op("encode")
         .label("Video file")
@@ -142,14 +154,34 @@ fn register(r: &mut Registry) -> Result<()> {
                 }
             }
             encoder.ok_or_else(|| anyhow!("the stream has no frames"))?.wait()?;
-            let Some(first) = sound.first() else { return Ok(Typed::new(Video::NAME, vec![call.keep(&video, &source)?])) };
+            let Some(first) = sound.first() else {
+                return Ok(Typed::new(Video::NAME, vec![call.keep(&video, &source)?]));
+            };
             if first.format != SampleFormat::S16Interleaved {
                 bail!("it takes s16-interleaved sound, not {}", first.format.name());
             }
             let file = call.temp()?;
             let mut args = strings(&[
-                "-hide_banner", "-loglevel", "error", "-y", "-i", &video, "-f", "s16le", "-ar", &first.sample_rate.to_string(),
-                "-ac", &first.channels.to_string(), "-i", "pipe:0", "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                &video,
+                "-f",
+                "s16le",
+                "-ar",
+                &first.sample_rate.to_string(),
+                "-ac",
+                &first.channels.to_string(),
+                "-i",
+                "pipe:0",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "copy",
             ]);
             args.extend(encoding.audio.args("a"));
             args.extend(strings(&["-strict", "-2", "-f", &encoding.container, &file]));
@@ -177,8 +209,22 @@ fn strings(args: &[&str]) -> Vec<String> {
 /// ffmpeg, encoding frames written to it to a file.
 fn encode(encoding: &Encoding, width: u32, height: u32, rate: f64, file: &str) -> Result<Process> {
     let mut args = strings(&[
-        "-hide_banner", "-loglevel", "error", "-y", "-color_range", "pc", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s",
-        &format!("{width}x{height}"), "-r", &rate.to_string(), "-i", "pipe:0",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-color_range",
+        "pc",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-s",
+        &format!("{width}x{height}"),
+        "-r",
+        &rate.to_string(),
+        "-i",
+        "pipe:0",
     ]);
     args.extend(encoding.video.args("v"));
     // Full range going in and coming out: an encoder taking no `yuvj420p` is not given limited range by a conversion.

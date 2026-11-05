@@ -48,7 +48,8 @@ fn inverse(m: &Rows) -> Option<Rows> {
         m[r1][c1] * m[r2][c2] - m[r1][c2] * m[r2][c1]
     };
     let determinant: f64 = (0..3).map(|column| m[0][column] * cofactor(0, column)).sum();
-    (determinant.abs() > 1e-12).then(|| std::array::from_fn(|row| std::array::from_fn(|column| cofactor(column, row) / determinant)))
+    (determinant.abs() > 1e-12)
+        .then(|| std::array::from_fn(|row| std::array::from_fn(|column| cofactor(column, row) / determinant)))
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -62,7 +63,10 @@ impl Bind {
         match above {
             Some(above) => {
                 let moved = times(&above.rotation, at);
-                Bind { rotation: composed(&above.rotation, &rotation), at: [moved[0] + above.at[0], moved[1] + above.at[1], moved[2] + above.at[2]] }
+                Bind {
+                    rotation: composed(&above.rotation, &rotation),
+                    at: [moved[0] + above.at[0], moved[1] + above.at[1], moved[2] + above.at[2]],
+                }
             }
             None => Bind { rotation, at },
         }
@@ -76,11 +80,19 @@ impl Bind {
     /// USD's row-vector matrix.
     fn matrix(&self) -> [[f64; 4]; 4] {
         let r = &self.rotation;
-        [[r[0][0], r[1][0], r[2][0], 0.0], [r[0][1], r[1][1], r[2][1], 0.0], [r[0][2], r[1][2], r[2][2], 0.0], [self.at[0], self.at[1], self.at[2], 1.0]]
+        [
+            [r[0][0], r[1][0], r[2][0], 0.0],
+            [r[0][1], r[1][1], r[2][1], 0.0],
+            [r[0][2], r[1][2], r[2][2], 0.0],
+            [self.at[0], self.at[1], self.at[2], 1.0],
+        ]
     }
 
     fn from_matrix(m: &[f64; 16]) -> Bind {
-        Bind { rotation: std::array::from_fn(|row| std::array::from_fn(|column| m[column * 4 + row])), at: [m[12], m[13], m[14]] }
+        Bind {
+            rotation: std::array::from_fn(|row| std::array::from_fn(|column| m[column * 4 + row])),
+            at: [m[12], m[13], m[14]],
+        }
     }
 }
 
@@ -91,7 +103,8 @@ fn binds(parts: &[Part]) -> Vec<Bind> {
             return known;
         }
         let parent = parts[at].parent;
-        let above = (parent != at && parent < parts.len() && depth < parts.len()).then(|| bind(parts, parent, out, depth + 1));
+        let above =
+            (parent != at && parent < parts.len() && depth < parts.len()).then(|| bind(parts, parent, out, depth + 1));
         let found = Bind::of(&parts[at], above.as_ref());
         out[at] = Some(found);
         found
@@ -165,7 +178,9 @@ fn number_of(index: Option<usize>) -> i64 {
 }
 
 fn face_normal(points: &[[f64; 3]], face: &Face) -> [f32; 3] {
-    let at = |corner: usize| face.corners.get(corner).and_then(|corner| points.get(corner.vertex)).copied().unwrap_or_default();
+    let at = |corner: usize| {
+        face.corners.get(corner).and_then(|corner| points.get(corner.vertex)).copied().unwrap_or_default()
+    };
     let (a, b) = (sub(at(1), at(0)), sub(at(2), at(0)));
     let cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
     let length = cross.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -179,14 +194,22 @@ fn gather(model: &Model, points: &[[f64; 3]], joint: &[usize], worlds: &[Bind]) 
         out.shading.push(shading_name(face.shading));
         out.part.push(number_of(face.part));
         let by_corner = face.corners.iter().any(|corner| corner.color.is_some());
-        out.source.push(if by_corner { "corner" } else if face.color.is_some() { "face" } else { "none" });
+        out.source.push(if by_corner {
+            "corner"
+        } else if face.color.is_some() {
+            "face"
+        } else {
+            "none"
+        });
         let plain = face_normal(points, face);
         for corner in &face.corners {
             out.indices.push(corner.vertex);
             let index = corner.normal.or(face.normal);
             out.normal_index.push(number_of(index));
             let stored = index.and_then(|index| model.normals.get(index));
-            let turned = stored.zip(joint.get(corner.vertex)).map(|(normal, part)| narrow(times(&worlds[*part].rotation, normal.map(|x| f64::from(x) / ONE))));
+            let turned = stored
+                .zip(joint.get(corner.vertex))
+                .map(|(normal, part)| narrow(times(&worlds[*part].rotation, normal.map(|x| f64::from(x) / ONE))));
             out.normals.push(turned.unwrap_or(plain));
             let color = corner.color.or(face.color).unwrap_or([255; 3]);
             out.colors.push(color.map(|x| f32::from(x) / 255.0));
@@ -199,11 +222,18 @@ fn gather(model: &Model, points: &[[f64; 3]], joint: &[usize], worlds: &[Bind]) 
 }
 
 fn face_varying(out: &mut String, kind: &str, name: &str, items: impl IntoIterator<Item = impl Display>) {
-    let _ = writeln!(out, "            {kind}[] primvars:{name} = [{}] (\n                interpolation = \"faceVarying\"\n            )", join(items));
+    let _ = writeln!(
+        out,
+        "            {kind}[] primvars:{name} = [{}] (\n                interpolation = \"faceVarying\"\n            )",
+        join(items)
+    );
 }
 
 fn uniform(out: &mut String, kind: &str, name: &str, items: &str) {
-    let _ = writeln!(out, "            {kind}[] primvars:{name} = [{items}] (\n                interpolation = \"uniform\"\n            )");
+    let _ = writeln!(
+        out,
+        "            {kind}[] primvars:{name} = [{items}] (\n                interpolation = \"uniform\"\n            )"
+    );
 }
 
 fn skeleton_prim(out: &mut String, model: &Model, worlds: &[Bind], names: Option<&[String]>) {
@@ -218,8 +248,14 @@ fn skeleton_prim(out: &mut String, model: &Model, worlds: &[Bind], names: Option
 fn subset_prims(out: &mut String, model: &Model, slots: &[String]) {
     for at in 0..slots.len() {
         let faces = model.faces.iter().enumerate().filter(|(_, face)| face.material == at).map(|(index, _)| index);
-        let _ = writeln!(out, "\n            def GeomSubset \"material{at}\" (\n                prepend apiSchemas = [\"MaterialBindingAPI\"]\n            )\n            {{");
-        let _ = writeln!(out, "                uniform token elementType = \"face\"\n                uniform token familyName = \"materialBind\"");
+        let _ = writeln!(
+            out,
+            "\n            def GeomSubset \"material{at}\" (\n                prepend apiSchemas = [\"MaterialBindingAPI\"]\n            )\n            {{"
+        );
+        let _ = writeln!(
+            out,
+            "                uniform token elementType = \"face\"\n                uniform token familyName = \"materialBind\""
+        );
         let _ = writeln!(out, "                int[] indices = [{}]", join(faces));
         let _ = writeln!(out, "                rel material:binding = </Model/Materials/material{at}>\n            }}");
     }
@@ -236,12 +272,22 @@ fn mesh_prim(out: &mut String, model: &Model, slots: &[String], worlds: &[Bind])
     points.extend(model.loose_vertices.iter().map(|v| v.map(f64::from)));
     joint.resize(points.len(), 0);
     let corners = gather(model, &points, &joint, worlds);
-    let _ = writeln!(out, "        def Mesh \"Mesh\" (\n            prepend apiSchemas = [\"SkelBindingAPI\", \"MaterialBindingAPI\"]\n        )\n        {{");
-    let _ = writeln!(out, "            uniform bool doubleSided = 1\n            uniform token orientation = \"leftHanded\"");
+    let _ = writeln!(
+        out,
+        "        def Mesh \"Mesh\" (\n            prepend apiSchemas = [\"SkelBindingAPI\", \"MaterialBindingAPI\"]\n        )\n        {{"
+    );
+    let _ = writeln!(
+        out,
+        "            uniform bool doubleSided = 1\n            uniform token orientation = \"leftHanded\""
+    );
     let _ = writeln!(out, "            point3f[] points = [{}]", join(points.iter().map(|p| tuple(narrow(*p)))));
     let _ = writeln!(out, "            int[] faceVertexCounts = [{}]", join(&corners.counts));
     let _ = writeln!(out, "            int[] faceVertexIndices = [{}]", join(&corners.indices));
-    let _ = writeln!(out, "            custom float3[] sourceNormals = [{}]", join(model.normals.iter().map(|n| tuple(n.map(|x| f32::from(x) / 4096.0)))));
+    let _ = writeln!(
+        out,
+        "            custom float3[] sourceNormals = [{}]",
+        join(model.normals.iter().map(|n| tuple(n.map(|x| f32::from(x) / 4096.0))))
+    );
     face_varying(out, "normal3f", "normals", corners.normals.iter().map(|n| tuple(*n)));
     face_varying(out, "int", "normalIndex", &corners.normal_index);
     face_varying(out, "color3f", "displayColor", corners.colors.iter().map(|c| tuple(*c)));
@@ -250,10 +296,21 @@ fn mesh_prim(out: &mut String, model: &Model, slots: &[String], worlds: &[Bind])
     uniform(out, "token", "shading", &quoted(&corners.shading));
     uniform(out, "int", "part", &join(&corners.part));
     uniform(out, "token", "colorSource", &quoted(&corners.source));
-    let _ = writeln!(out, "            int[] primvars:skel:jointIndices = [{}] (\n                elementSize = 1\n                interpolation = \"vertex\"\n            )", join(&joint));
+    let _ = writeln!(
+        out,
+        "            int[] primvars:skel:jointIndices = [{}] (\n                elementSize = 1\n                interpolation = \"vertex\"\n            )",
+        join(&joint)
+    );
     let weights = (0..joint.len()).map(|at| u8::from(at < owned));
-    let _ = writeln!(out, "            float[] primvars:skel:jointWeights = [{}] (\n                elementSize = 1\n                interpolation = \"vertex\"\n            )", join(weights));
-    let _ = writeln!(out, "            matrix4d primvars:skel:geomBindTransform = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))");
+    let _ = writeln!(
+        out,
+        "            float[] primvars:skel:jointWeights = [{}] (\n                elementSize = 1\n                interpolation = \"vertex\"\n            )",
+        join(weights)
+    );
+    let _ = writeln!(
+        out,
+        "            matrix4d primvars:skel:geomBindTransform = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))"
+    );
     let _ = writeln!(out, "            rel skel:skeleton = </Model/Rig/Skeleton>");
     subset_prims(out, model, slots);
     let _ = writeln!(out, "        }}");
@@ -264,9 +321,18 @@ fn material_prims(out: &mut String, slots: &[String]) {
     for (at, slot) in slots.iter().enumerate() {
         let _ = writeln!(out, "        def Material \"material{at}\"\n        {{");
         let _ = writeln!(out, "            token inputs:slot = \"{slot}\"");
-        let _ = writeln!(out, "            token outputs:surface.connect = </Model/Materials/material{at}/Surface.outputs:surface>\n");
-        let _ = writeln!(out, "            def Shader \"Surface\"\n            {{\n                uniform token info:id = \"UsdPreviewSurface\"");
-        let _ = writeln!(out, "                float inputs:roughness = 1\n                token outputs:surface\n            }}\n        }}");
+        let _ = writeln!(
+            out,
+            "            token outputs:surface.connect = </Model/Materials/material{at}/Surface.outputs:surface>\n"
+        );
+        let _ = writeln!(
+            out,
+            "            def Shader \"Surface\"\n            {{\n                uniform token info:id = \"UsdPreviewSurface\""
+        );
+        let _ = writeln!(
+            out,
+            "                float inputs:roughness = 1\n                token outputs:surface\n            }}\n        }}"
+        );
     }
     let _ = writeln!(out, "    }}");
 }
@@ -275,11 +341,16 @@ fn material_prims(out: &mut String, slots: &[String]) {
 #[must_use]
 pub fn write(model: &Model, slots: &[String], joints: Option<&[String]>) -> String {
     let worlds = binds(&model.parts);
-    let mut out = String::from("#usda 1.0\n(\n    defaultPrim = \"Model\"\n    metersPerUnit = 0.001\n    upAxis = \"Y\"\n)\n\n");
+    let mut out =
+        String::from("#usda 1.0\n(\n    defaultPrim = \"Model\"\n    metersPerUnit = 0.001\n    upAxis = \"Y\"\n)\n\n");
     // The game's Y points down: it shows upright turned half about X, with its numbers left as they are.
     let _ = writeln!(out, "def Xform \"Model\"\n{{\n    custom token[] slots = [{}]", quoted(slots));
-    let _ = writeln!(out, "    float xformOp:rotateX = 180\n    uniform token[] xformOpOrder = [\"xformOp:rotateX\"]\n");
-    let _ = writeln!(out, "    def SkelRoot \"Rig\" (\n        prepend apiSchemas = [\"SkelBindingAPI\"]\n    )\n    {{\n        rel skel:skeleton = </Model/Rig/Skeleton>\n");
+    let _ =
+        writeln!(out, "    float xformOp:rotateX = 180\n    uniform token[] xformOpOrder = [\"xformOp:rotateX\"]\n");
+    let _ = writeln!(
+        out,
+        "    def SkelRoot \"Rig\" (\n        prepend apiSchemas = [\"SkelBindingAPI\"]\n    )\n    {{\n        rel skel:skeleton = </Model/Rig/Skeleton>\n"
+    );
     skeleton_prim(&mut out, model, &worlds, joints);
     mesh_prim(&mut out, model, slots, &worlds);
     let _ = writeln!(out, "    }}");
@@ -288,7 +359,10 @@ pub fn write(model: &Model, slots: &[String], joints: Option<&[String]>) -> Stri
     out
 }
 
-#[expect(clippy::cast_possible_truncation, reason = "what is rounded is checked against the range by the caller's conversion")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "what is rounded is checked against the range by the caller's conversion"
+)]
 fn whole(x: f64) -> i64 {
     x.round() as i64
 }
@@ -317,21 +391,30 @@ fn read_parts(skeleton: &Prim) -> Result<Vec<Part>> {
         .iter()
         .enumerate()
         .map(|(at, path)| {
-            let parent = path.rsplit_once('/').map(|(above, _)| paths.iter().position(|other| other == above).ok_or_else(|| anyhow!("{path} has no parent")));
+            let parent = path.rsplit_once('/').map(|(above, _)| {
+                paths.iter().position(|other| other == above).ok_or_else(|| anyhow!("{path} has no parent"))
+            });
             let parent = parent.transpose()?.unwrap_or(at);
             let (rotation, translation) = if parent == at {
                 (worlds[at].rotation, worlds[at].at)
             } else {
-                let back = inverse(&worlds[parent].rotation).ok_or_else(|| anyhow!("{path}'s parent has no inverse"))?;
+                let back =
+                    inverse(&worlds[parent].rotation).ok_or_else(|| anyhow!("{path}'s parent has no inverse"))?;
                 (composed(&back, &worlds[at].rotation), times(&back, sub(worlds[at].at, worlds[parent].at)))
             };
-            let fixed = |x: f64| i16::try_from(whole(x * ONE)).map_err(|_| anyhow!("{path}: its rotation is out of range"));
+            let fixed =
+                |x: f64| i16::try_from(whole(x * ONE)).map_err(|_| anyhow!("{path}: its rotation is out of range"));
             let wide = |x: f64| i32::try_from(whole(x)).map_err(|_| anyhow!("{path}: its translation is out of range"));
             let mut rows = [[0; 3]; 3];
             for (cell, value) in rows.iter_mut().flatten().zip(rotation.iter().flatten()) {
                 *cell = fixed(*value)?;
             }
-            Ok(Part { parent, rotation: rows, translation: [wide(translation[0])?, wide(translation[1])?, wide(translation[2])?], vertices: Vec::new() })
+            Ok(Part {
+                parent,
+                rotation: rows,
+                translation: [wide(translation[0])?, wide(translation[1])?, wide(translation[2])?],
+                vertices: Vec::new(),
+            })
         })
         .collect()
 }
@@ -353,7 +436,9 @@ fn read_vertices(mesh: &Prim, parts: &mut [Part]) -> Result<Vec<[i16; 3]>> {
     let back: Vec<Option<Rows>> = worlds.iter().map(|world| inverse(&world.rotation)).collect();
     let mut last = 0;
     for (point, joint) in points[..owned].iter().zip(&joints) {
-        let joint = joint.filter(|joint| *joint < parts.len() && *joint >= last).ok_or_else(|| anyhow!("points are not grouped by part, in part order"))?;
+        let joint = joint
+            .filter(|joint| *joint < parts.len() && *joint >= last)
+            .ok_or_else(|| anyhow!("points are not grouped by part, in part order"))?;
         last = joint;
         let rows = back[joint].as_ref().ok_or_else(|| anyhow!("a part with vertices has no inverse"))?;
         let local = shorts(&times(rows, sub(*point, worlds[joint].at)))?;
@@ -366,9 +451,14 @@ fn read_vertices(mesh: &Prim, parts: &mut [Part]) -> Result<Vec<[i16; 3]>> {
 fn read_materials(mesh: &Prim, faces: usize) -> Result<Vec<usize>> {
     let mut materials = vec![None; faces];
     for subset in mesh.children.iter().filter(|child| child.kind == "GeomSubset") {
-        let at: usize = subset.name.strip_prefix("material").and_then(|at| at.parse().ok()).ok_or_else(|| anyhow!("a subset is called {}", subset.name))?;
+        let at: usize = subset
+            .name
+            .strip_prefix("material")
+            .and_then(|at| at.parse().ok())
+            .ok_or_else(|| anyhow!("a subset is called {}", subset.name))?;
         for face in indices(&subset.numbers("indices")?) {
-            *face.and_then(|face| materials.get_mut(face)).ok_or_else(|| anyhow!("{} names no face", subset.name))? = Some(at);
+            *face.and_then(|face| materials.get_mut(face)).ok_or_else(|| anyhow!("{} names no face", subset.name))? =
+                Some(at);
         }
     }
     materials.into_iter().map(|material| material.ok_or_else(|| anyhow!("a face has no material"))).collect()
@@ -420,7 +510,11 @@ fn read_faces(mesh: &Prim) -> Result<Vec<Face>> {
             material: materials[at],
             shading,
             part: parts[at],
-            normal: if shading == Shading::Flat { *normals.get(first).ok_or_else(|| anyhow!("a face has no corners"))? } else { None },
+            normal: if shading == Shading::Flat {
+                *normals.get(first).ok_or_else(|| anyhow!("a face has no corners"))?
+            } else {
+                None
+            },
             color: if source[at] == "face" { rgb(first) } else { None },
             corners: span.map(corner).collect::<Result<_>>()?,
         });
@@ -449,7 +543,10 @@ pub fn pose(model: &mut Model, joints: &[Joint]) -> Result<()> {
 #[must_use]
 pub fn rests_on(model: &Model, joints: &[Joint]) -> bool {
     let mut expected = model.clone();
-    pose(&mut expected, joints).is_ok() && expected.parts.iter().zip(&model.parts).all(|(want, got)| want.parent == got.parent && want.rotation == got.rotation && want.translation == got.translation)
+    pose(&mut expected, joints).is_ok()
+        && expected.parts.iter().zip(&model.parts).all(|(want, got)| {
+            want.parent == got.parent && want.rotation == got.rotation && want.translation == got.translation
+        })
 }
 
 /// A mesh, and its slots' names.
@@ -468,12 +565,16 @@ pub fn read(text: &str) -> Result<(Model, Vec<String>)> {
     let mut parts = read_parts(skeleton)?;
     let loose_vertices = read_vertices(mesh, &mut parts)?;
     let rounded = mesh.numbers("sourceNormals")?;
-    let normals = triples(&rounded).iter().map(|n| shorts(&n.map(|x| x * ONE)).map(|n| [n[0], n[1], n[2]])).collect::<Result<_>>()?;
+    let normals = triples(&rounded)
+        .iter()
+        .map(|n| shorts(&n.map(|x| x * ONE)).map(|n| [n[0], n[1], n[2]]))
+        .collect::<Result<_>>()?;
     let faces = read_faces(mesh)?;
     if let Some(past) = faces.iter().map(|face| face.material).find(|material| *material >= slots.len()) {
         bail!("a face has material {past} of {}", slots.len());
     }
-    let materials = (0..slots.len()).map(|slot| Material { transparent: false, slot: Some(slot), blend: None }).collect();
+    let materials =
+        (0..slots.len()).map(|slot| Material { transparent: false, slot: Some(slot), blend: None }).collect();
     Ok((Model { parts, loose_vertices, normals, materials, faces, ..Model::default() }, slots))
 }
 
@@ -484,13 +585,50 @@ mod tests {
     fn sample() -> Model {
         let corner = |vertex, uv| Corner { vertex, normal: Some(vertex), color: None, uv };
         let flat = |vertex| Corner { vertex, normal: None, color: Some([1, 128, 255]), uv: None };
-        let root = Part { parent: 0, rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], translation: [1, -2, 300_000], vertices: vec![[1, 2, 3], [-4, 5, 6]] };
+        let root = Part {
+            parent: 0,
+            rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            translation: [1, -2, 300_000],
+            vertices: vec![[1, 2, 3], [-4, 5, 6]],
+        };
         // Not quite orthonormal, as they are stored.
-        let child = Part { parent: 0, rotation: [[0, -4095, 3], [4096, 1, 0], [-2, 0, 4094]], translation: [0, -927, 3], vertices: vec![[7, 8, 9]] };
-        let textured = Face { material: 1, shading: Shading::Smooth, part: Some(0), normal: None, color: None, corners: vec![corner(0, Some([0, 255])), corner(1, Some([12, 34])), corner(2, Some([56, 78]))] };
-        let seam = Face { material: 0, shading: Shading::Flat, part: None, normal: Some(1), color: None, corners: vec![flat(2), flat(1), flat(0)] };
-        let unlit = Face { material: 0, shading: Shading::Unlit, part: Some(1), normal: None, color: Some([10, 20, 30]), corners: vec![Corner { vertex: 1, ..Corner::default() }; 3] };
-        Model { parts: vec![root, child], loose_vertices: vec![[-300, 40, 5]], normals: vec![[4096, 0, 0], [0, 0, -4096], [1, 2, 3]], faces: vec![textured, seam, unlit], ..Model::default() }
+        let child = Part {
+            parent: 0,
+            rotation: [[0, -4095, 3], [4096, 1, 0], [-2, 0, 4094]],
+            translation: [0, -927, 3],
+            vertices: vec![[7, 8, 9]],
+        };
+        let textured = Face {
+            material: 1,
+            shading: Shading::Smooth,
+            part: Some(0),
+            normal: None,
+            color: None,
+            corners: vec![corner(0, Some([0, 255])), corner(1, Some([12, 34])), corner(2, Some([56, 78]))],
+        };
+        let seam = Face {
+            material: 0,
+            shading: Shading::Flat,
+            part: None,
+            normal: Some(1),
+            color: None,
+            corners: vec![flat(2), flat(1), flat(0)],
+        };
+        let unlit = Face {
+            material: 0,
+            shading: Shading::Unlit,
+            part: Some(1),
+            normal: None,
+            color: Some([10, 20, 30]),
+            corners: vec![Corner { vertex: 1, ..Corner::default() }; 3],
+        };
+        Model {
+            parts: vec![root, child],
+            loose_vertices: vec![[-300, 40, 5]],
+            normals: vec![[4096, 0, 0], [0, 0, -4096], [1, 2, 3]],
+            faces: vec![textured, seam, unlit],
+            ..Model::default()
+        }
     }
 
     #[test]
@@ -498,7 +636,9 @@ mod tests {
         let slots = vec!["page_1".to_string(), "page_0".to_string()];
         let (back, named) = read(&write(&sample(), &slots, None)).unwrap();
         assert_eq!(named, slots);
-        let geometry = |model: &Model| format!("{:?} {:?} {:?} {:?}", model.parts, model.loose_vertices, model.normals, model.faces);
+        let geometry = |model: &Model| {
+            format!("{:?} {:?} {:?} {:?}", model.parts, model.loose_vertices, model.normals, model.faces)
+        };
         assert_eq!(geometry(&back), geometry(&sample()));
         assert_eq!(back.materials.len(), 2);
     }
@@ -516,7 +656,11 @@ mod tests {
         pose(&mut back, &joints).unwrap();
         assert_eq!(back.parts[1].parent, 0);
         assert_eq!(back.parts[1].translation, [5, 6, 7]);
-        assert_eq!(back.parts[1].vertices, sample().parts[1].vertices, "found by the file's bind, not by the pose it now takes");
+        assert_eq!(
+            back.parts[1].vertices,
+            sample().parts[1].vertices,
+            "found by the file's bind, not by the pose it now takes"
+        );
         assert!(rests_on(&back, &joints));
         assert!(!rests_on(&sample(), &joints), "its second part rests elsewhere");
         assert!(pose(&mut back, &joints[..1]).is_err());
@@ -530,7 +674,10 @@ mod tests {
         assert!(read("#usda 1.0\n").is_err());
         let weights = "float[] primvars:skel:jointWeights = [1, 1, 1, 0]";
         assert!(text.contains(weights), "the point no joint moves");
-        assert!(read(&text.replace(weights, "float[] primvars:skel:jointWeights = [1, 0, 1, 0]")).is_err(), "out of order");
+        assert!(
+            read(&text.replace(weights, "float[] primvars:skel:jointWeights = [1, 0, 1, 0]")).is_err(),
+            "out of order"
+        );
     }
 
     #[test]

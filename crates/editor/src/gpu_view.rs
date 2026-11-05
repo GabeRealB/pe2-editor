@@ -70,7 +70,11 @@ pub fn input(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect) -> pe2_
             released: button(&|b| input.pointer.button_released(b)),
             clicked,
             scroll: if over { input.smooth_scroll_delta.y } else { 0.0 },
-            modifiers: pe2_ext::Modifiers { shift: input.modifiers.shift, ctrl: input.modifiers.command, alt: input.modifiers.alt },
+            modifiers: pe2_ext::Modifiers {
+                shift: input.modifiers.shift,
+                ctrl: input.modifiers.command,
+                alt: input.modifiers.alt,
+            },
             keys,
         }
     })

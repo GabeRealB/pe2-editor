@@ -24,7 +24,8 @@ fn with_runner() -> Scenario {
     let mut editor = Scenario::open_showing(Fixture::rig(), Some("tests"));
     let png = codecs::texture::rgba_png(2, 2, &[255; 16]).expect("a picture");
     let picture = editor.file_elsewhere("failed.png", &png);
-    let runner = editor.file_elsewhere("runner.sh", RUNNER.replace("PICTURE", &picture.display().to_string()).as_bytes());
+    let runner =
+        editor.file_elsewhere("runner.sh", RUNNER.replace("PICTURE", &picture.display().to_string()).as_bytes());
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).expect("a program");
     editor.workspace().tests.use_runner(runner);
     editor.settle();

@@ -72,7 +72,8 @@ pub fn trusted() -> Vec<Trusted> {
     held.iter()
         .filter_map(|entry| {
             let project = entry.get("project").and_then(path)?;
-            let list = |key: &str| entry.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(path).collect();
+            let list =
+                |key: &str| entry.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(path).collect();
             Some(Trusted { project, places: list("places"), declined: list("declined") })
         })
         .collect()
@@ -82,7 +83,10 @@ fn store(all: &[Trusted]) -> std::io::Result<()> {
     let text = |path: &Path| Value::String(path.display().to_string());
     let entry = |trusted: &Trusted| {
         let list = |paths: &[PathBuf]| Value::Array(paths.iter().map(|place| text(place)).collect());
-        let mut entry = Table::from_iter([("project".to_string(), text(&trusted.project)), ("places".to_string(), list(&trusted.places))]);
+        let mut entry = Table::from_iter([
+            ("project".to_string(), text(&trusted.project)),
+            ("places".to_string(), list(&trusted.places)),
+        ]);
         if !trusted.declined.is_empty() {
             entry.insert("declined".to_string(), list(&trusted.declined));
         }
@@ -147,7 +151,8 @@ pub fn decline(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
 /// What is trusted cannot be written.
 pub fn distrust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
     let project = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
-    let places: Vec<PathBuf> = places.iter().map(|place| place.canonicalize().unwrap_or_else(|_| place.clone())).collect();
+    let places: Vec<PathBuf> =
+        places.iter().map(|place| place.canonicalize().unwrap_or_else(|_| place.clone())).collect();
     let mut all = trusted();
     for known in all.iter_mut().filter(|known| known.project == project) {
         known.places.retain(|place| !places.is_empty() && !places.contains(place));
@@ -204,7 +209,9 @@ fn allowed(origin: &Origin, everything: bool, trusted: &[Trusted]) -> Option<All
     }
     match origin {
         Origin::User(_) | Origin::Install(_) => Some(Allowed::Own),
-        Origin::Project { file, .. } | Origin::Component(file) => holding(file, trusted.iter().flat_map(|known| &known.places)).map(Allowed::Place),
+        Origin::Project { file, .. } | Origin::Component(file) => {
+            holding(file, trusted.iter().flat_map(|known| &known.places)).map(Allowed::Place)
+        }
         _ => None,
     }
 }

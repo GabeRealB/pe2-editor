@@ -329,8 +329,10 @@ impl Driver {
                 for line in &all {
                     within.truncate(line.depth);
                     if line.words.to_lowercase().contains(&needle) {
-                        let path: Vec<&str> = within.iter().filter(|l| !l.label.is_empty()).map(|l| l.label.as_str()).collect();
-                        let context = if path.is_empty() { String::new() } else { format!("   (in {})", path.join(" › ")) };
+                        let path: Vec<&str> =
+                            within.iter().filter(|l| !l.label.is_empty()).map(|l| l.label.as_str()).collect();
+                        let context =
+                            if path.is_empty() { String::new() } else { format!("   (in {})", path.join(" › ")) };
                         found.push(format!("{}{context}", line.text));
                     }
                     within.push(line);
@@ -388,7 +390,8 @@ fn lines(tree: &Tree, rect: Option<egui::Rect>, places: Option<&egui::Context>) 
         let Some(node) = tree.nodes.get(&id) else { continue };
         let area = node.bounds().map(|b| {
             #[expect(clippy::cast_possible_truncation, reason = "window coordinates")]
-            let area = egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32));
+            let area =
+                egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32));
             places.map_or(area, |ctx| to_window(ctx, id).mul_rect(area))
         });
         let inside = rect.is_none_or(|r| area.is_some_and(|a| r.contains(a.center())));
@@ -537,7 +540,8 @@ fn act(ctx: &egui::Context, tree: &Tree, args: &mcp::ActArgs) -> Result<Vec<Vec<
         (None, None) => return Err("give a widget (node) or a point (at)".into()),
     };
     let window = ctx.content_rect();
-    let hidden = args.at.is_none() && at.is_none_or(|p| !window.contains(p) || target.is_some_and(|(id, _)| clipped(ctx, id, p)));
+    let hidden = args.at.is_none()
+        && at.is_none_or(|p| !window.contains(p) || target.is_some_and(|(id, _)| clipped(ctx, id, p)));
     let point = || at.ok_or_else(|| "the widget has no place in the window".to_string());
     let moved = |p: egui::Pos2| vec![egui::Event::PointerMoved(p)];
     let primary = egui::PointerButton::Primary;
@@ -581,7 +585,13 @@ fn act(ctx: &egui::Context, tree: &Tree, args: &mcp::ActArgs) -> Result<Vec<Vec<
         "drag" => {
             let (from, [x, y]) = (point()?, args.to.ok_or("a drag takes where it ends (to)")?);
             let to = egui::pos2(x, y);
-            vec![moved(from), button(from, primary, true), moved(from.lerp(to, 0.5)), moved(to), button(to, primary, false)]
+            vec![
+                moved(from),
+                button(from, primary, true),
+                moved(from.lerp(to, 0.5)),
+                moved(to),
+                button(to, primary, false),
+            ]
         }
         "scroll" => {
             let (p, [dx, dy]) = (point()?, args.by.ok_or("a scroll takes how far (by)")?);
@@ -594,8 +604,12 @@ fn act(ctx: &egui::Context, tree: &Tree, args: &mcp::ActArgs) -> Result<Vec<Vec<
             };
             vec![moved(p), vec![wheel]]
         }
-        other => return Err(format!("{other}: not an action (click, double_click, right_click, hover, focus, \
-                                     scroll_into_view, drag, scroll)")),
+        other => {
+            return Err(format!(
+                "{other}: not an action (click, double_click, right_click, hover, focus, \
+                                     scroll_into_view, drag, scroll)"
+            ));
+        }
     })
 }
 

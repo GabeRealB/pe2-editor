@@ -186,8 +186,13 @@ impl<'a> Archive<'a> {
         if get32(self.bytes, e.local)? != LOCAL {
             return error(format!("{name}: no local header"));
         }
-        let start = e.local + 30 + usize::from(get16(self.bytes, e.local + 26)?) + usize::from(get16(self.bytes, e.local + 28)?);
-        let Some(body) = self.bytes.get(start..start + e.compressed) else { return error(format!("{name}: truncated")) };
+        let start = e.local
+            + 30
+            + usize::from(get16(self.bytes, e.local + 26)?)
+            + usize::from(get16(self.bytes, e.local + 28)?);
+        let Some(body) = self.bytes.get(start..start + e.compressed) else {
+            return error(format!("{name}: truncated"));
+        };
         let data = match e.method {
             0 => body.to_vec(),
             8 => miniz_oxide::inflate::decompress_to_vec_with_limit(body, e.size.max(1))
@@ -208,12 +213,10 @@ mod tests {
     #[test]
     fn an_archive_reads_back_and_writes_the_same_twice() {
         let big = vec![7u8; 10_000];
-        let entries =
-            [Entry { name: "mimetype", data: b"image/openraster", deflate: false }, Entry {
-                name: "data/a.png",
-                data: &big,
-                deflate: true,
-            }];
+        let entries = [
+            Entry { name: "mimetype", data: b"image/openraster", deflate: false },
+            Entry { name: "data/a.png", data: &big, deflate: true },
+        ];
         let bytes = write(&entries);
         assert_eq!(bytes, write(&entries));
         assert_eq!(&bytes[30..38], b"mimetype");

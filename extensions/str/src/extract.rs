@@ -67,18 +67,22 @@ fn hex(bytes: &[u8]) -> String {
 impl Extraction for Clips {
     fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
         let declared = self.movies.get(path).ok_or_else(|| anyhow!("{path}: not a movie"))?;
-        let from = declared
-            .get("from")
-            .and_then(|f| f.get(release))
-            .ok_or_else(|| anyhow!("{path}: not in {release}"))?;
-        let want = from.get("sha1").and_then(Value::as_str).ok_or_else(|| anyhow!("{path}: {release} gives no sha1"))?;
-        let places = from.get("at").and_then(Value::as_array).ok_or_else(|| anyhow!("{path}: {release} says not where it is"))?;
+        let from =
+            declared.get("from").and_then(|f| f.get(release)).ok_or_else(|| anyhow!("{path}: not in {release}"))?;
+        let want =
+            from.get("sha1").and_then(Value::as_str).ok_or_else(|| anyhow!("{path}: {release} gives no sha1"))?;
+        let places = from
+            .get("at")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("{path}: {release} says not where it is"))?;
         let mut native = None;
         for at in places {
             let at = at.as_table().ok_or_else(|| anyhow!("{path}: a place that is no table"))?;
             let text = |key: &str| at.get(key).and_then(Value::as_str).map(str::to_string);
             let (bytes, said) = if let Some(clip) = at.get("clip").and_then(Value::as_integer) {
-                let (Some(disc), Some(slot)) = (text("disc"), text("slot")) else { bail!("{path}: a clip of no disc's file") };
+                let (Some(disc), Some(slot)) = (text("disc"), text("slot")) else {
+                    bail!("{path}: a clip of no disc's file")
+                };
                 let mut file = Table::new();
                 file.insert("disc".into(), Value::String(disc.clone()));
                 file.insert("slot".into(), Value::String(slot.clone()));
@@ -92,7 +96,10 @@ impl Extraction for Clips {
                     .ok()
                     .and_then(|c| found.get(c))
                     .ok_or_else(|| anyhow!("{path}: {disc} {slot} holds {} clips, not a clip {clip}", found.len()))?;
-                (discs.read_range(&file, start * SECTOR as u64, usize::try_from(end - start)? * SECTOR)?, format!("{disc} {slot} clip {clip}"))
+                (
+                    discs.read_range(&file, start * SECTOR as u64, usize::try_from(end - start)? * SECTOR)?,
+                    format!("{disc} {slot} clip {clip}"),
+                )
             } else {
                 (discs.read(at)?, format!("{at:?}"))
             };

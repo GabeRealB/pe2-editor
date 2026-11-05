@@ -47,7 +47,9 @@ struct Kind {
 fn kind(base: u32) -> Option<Kind> {
     use Colored::{Corner, Face, Not};
     use Shading::{Flat, Smooth, Unlit};
-    let k = |corners, normals, colors, textured, seam, shading, colored, semi| Some(Kind { corners, normals, colors, textured, seam, shading, colored, semi });
+    let k = |corners, normals, colors, textured, seam, shading, colored, semi| {
+        Some(Kind { corners, normals, colors, textured, seam, shading, colored, semi })
+    };
     match base {
         0x04 => k(3, 0, 1, false, false, Unlit, Face, false),
         0x44 => k(4, 0, 1, false, false, Unlit, Face, false),
@@ -333,7 +335,8 @@ fn passes(groups: &[Vec<Command>]) -> Result<HashMap<(usize, u32), Passed>> {
             let short = || anyhow!("a pass element is too short");
             let first = *words.first().ok_or_else(short)?;
             let (vertex, normal) = (((first & 0xFFFF) / 8) as usize, ((first >> 16) / 8) as usize);
-            let (color, destinations) = if colored { (Some(*words.get(1).ok_or_else(short)?), words.get(2)) } else { (None, words.get(1)) };
+            let (color, destinations) =
+                if colored { (Some(*words.get(1).ok_or_else(short)?), words.get(2)) } else { (None, words.get(1)) };
             passes.insert((vertex, destinations.ok_or_else(short)? & 0xFFFF), Passed { normal, color });
         }
     }
@@ -386,7 +389,14 @@ impl Reading {
 }
 
 /// Read the faces of a command.
-fn read_command(model: &mut Model, reading: &mut Reading, command: &Command, passed: &HashMap<(usize, u32), Passed>, group: usize, written: &mut usize) -> Result<()> {
+fn read_command(
+    model: &mut Model,
+    reading: &mut Reading,
+    command: &Command,
+    passed: &HashMap<(usize, u32), Passed>,
+    group: usize,
+    written: &mut usize,
+) -> Result<()> {
     let base = command.op & !MODIFIERS;
     if pass_color(base).is_some() {
         return Ok(());
@@ -415,14 +425,18 @@ fn read_command(model: &mut Model, reading: &mut Reading, command: &Command, pas
             if kind.seam {
                 let (_, stride) = packet(kind.corners, kind.textured);
                 let destination = *written + if layered { 4 } else { 8 } + stride * k;
-                let pass = u32::try_from(destination).ok().and_then(|d| passed.get(&(vertex, d))).ok_or_else(|| anyhow!("a seam corner no pass wrote"))?;
+                let pass = u32::try_from(destination)
+                    .ok()
+                    .and_then(|d| passed.get(&(vertex, d)))
+                    .ok_or_else(|| anyhow!("a seam corner no pass wrote"))?;
                 corner.normal = Some(pass.normal);
                 corner.color = pass.color.map(|color| rgb(color & 0xFF_FFFF));
             } else if kind.shading == Shading::Smooth {
                 corner.normal = Some(*read.normals.get(k).ok_or_else(|| anyhow!("a corner without a normal"))?);
             }
             if kind.colored == Colored::Corner && !kind.seam {
-                corner.color = Some(rgb(read.colors.get(k).ok_or_else(|| anyhow!("a corner without a color"))? & 0xFF_FFFF));
+                corner.color =
+                    Some(rgb(read.colors.get(k).ok_or_else(|| anyhow!("a corner without a color"))? & 0xFF_FFFF));
             }
             corners.push(corner);
         }
@@ -441,7 +455,9 @@ fn read_command(model: &mut Model, reading: &mut Reading, command: &Command, pas
             shading: kind.shading,
             part: (!kind.seam).then_some(group),
             normal: (kind.shading == Shading::Flat).then(|| read.normals[0]),
-            color: (kind.colored == Colored::Face).then(|| read.colors.first().map(|color| rgb(color & 0xFF_FFFF))).flatten(),
+            color: (kind.colored == Colored::Face)
+                .then(|| read.colors.first().map(|color| rgb(color & 0xFF_FFFF)))
+                .flatten(),
             corners,
         });
     }
@@ -456,12 +472,18 @@ pub fn decode(blob: &[u8], address: u32) -> Result<Model> {
     let bytes = Bytes { data: blob, load: address };
     let record = blob.len().checked_sub(RECORD_SIZE).ok_or_else(|| anyhow!("too short for a record"))?;
     let (parts, counts) = (bytes.u32(record + 12)? as usize, bytes.u32(record + 16)?);
-    let (verts, norms, skeleton, stream) = (bytes.u32(record + 20)?, bytes.u32(record + 24)?, bytes.u32(record + 28)?, bytes.u32(record + 32)?);
+    let (verts, norms, skeleton, stream) =
+        (bytes.u32(record + 20)?, bytes.u32(record + 24)?, bytes.u32(record + 28)?, bytes.u32(record + 32)?);
     if counts == 0 {
         bail!("no counts of each part's vertices");
     }
-    let (counts, verts_at, norms_at, skeleton_at, stream_at) =
-        (bytes.offset(counts)?, bytes.offset(verts)?, bytes.offset(norms)?, bytes.offset(skeleton)?, bytes.offset(stream)?);
+    let (counts, verts_at, norms_at, skeleton_at, stream_at) = (
+        bytes.offset(counts)?,
+        bytes.offset(verts)?,
+        bytes.offset(norms)?,
+        bytes.offset(skeleton)?,
+        bytes.offset(stream)?,
+    );
     let vertex_count = norms_at.saturating_sub(verts_at) / 8;
     let normal_count = stream_at.saturating_sub(norms_at) / 8;
     let mut model = Model::default();
@@ -528,7 +550,12 @@ impl Binding {
     pub fn tpage(&self) -> Option<u32> {
         let placement = self.texture?;
         let [x, y] = placement.page;
-        Some(u32::from(x / 64) | u32::from(y / 256) << 4 | (self.blend as u32) << 5 | u32::from(placement.bits == 8) << 7)
+        Some(
+            u32::from(x / 64)
+                | u32::from(y / 256) << 4
+                | (self.blend as u32) << 5
+                | u32::from(placement.bits == 8) << 7,
+        )
     }
 }
 
@@ -591,7 +618,8 @@ fn primitive(base: u32) -> usize {
 fn opcode(want: Kind) -> Option<u32> {
     (0..0x200).find(|&base| {
         kind(base).is_some_and(|k| {
-            (k.corners, k.textured, k.seam, k.shading, k.colored, k.semi) == (want.corners, want.textured, want.seam, want.shading, want.colored, want.semi)
+            (k.corners, k.textured, k.seam, k.shading, k.colored, k.semi)
+                == (want.corners, want.textured, want.seam, want.shading, want.colored, want.semi)
         })
     })
 }
@@ -617,7 +645,8 @@ fn element_words(base: u32, kind: Kind, face: &Face, corners: &[Corner], binding
         }
         for corner in corners {
             if face.shading == Shading::Smooth {
-                references.push(index_word(corner.normal.ok_or_else(|| anyhow!("a smooth corner without a normal"))?, 8)?);
+                references
+                    .push(index_word(corner.normal.ok_or_else(|| anyhow!("a smooth corner without a normal"))?, 8)?);
             }
         }
         if face.shading == Shading::Flat {
@@ -638,7 +667,9 @@ fn element_words(base: u32, kind: Kind, face: &Face, corners: &[Corner], binding
     if kind.textured {
         let placement = binding.texture.ok_or_else(|| anyhow!("a face with coordinates, in a slot with no texture"))?;
         let (page, clut) = (binding.tpage().unwrap_or(0), placement.clut());
-        let uv = |at: usize| corners.get(at).and_then(|corner| corner.uv).map_or(0, |[u, v]| u32::from(u) | u32::from(v) << 8);
+        let uv = |at: usize| {
+            corners.get(at).and_then(|corner| corner.uv).map_or(0, |[u, v]| u32::from(u) | u32::from(v) << 8)
+        };
         words.extend([uv(0) | clut << 16, uv(1) | page << 16, uv(2) | uv(3) << 16]);
     }
     Ok(words)
@@ -661,7 +692,9 @@ fn commands(model: &Model, bindings: &[Binding], layered: bool, effect: u32) -> 
         if corners.len() == 4 {
             corners.swap(2, 3);
         }
-        let binding = *bindings.get(face.material).ok_or_else(|| anyhow!("a face in slot {} of {}", face.material, bindings.len()))?;
+        let binding = *bindings
+            .get(face.material)
+            .ok_or_else(|| anyhow!("a face in slot {} of {}", face.material, bindings.len()))?;
         let seam = face.part.is_none();
         let colored = if corners.iter().any(|corner| corner.color.is_some()) {
             Colored::Corner
@@ -671,8 +704,18 @@ fn commands(model: &Model, bindings: &[Binding], layered: bool, effect: u32) -> 
             Colored::Not
         };
         let textured = corners.iter().any(|corner| corner.uv.is_some());
-        let wanted = Kind { corners: corners.len(), normals: 0, colors: 0, textured, seam, shading: face.shading, colored, semi: binding.transparent };
-        let base = opcode(wanted).ok_or_else(|| anyhow!("no opcode draws a {}-cornered {:?} face", corners.len(), face.shading))?;
+        let wanted = Kind {
+            corners: corners.len(),
+            normals: 0,
+            colors: 0,
+            textured,
+            seam,
+            shading: face.shading,
+            colored,
+            semi: binding.transparent,
+        };
+        let base = opcode(wanted)
+            .ok_or_else(|| anyhow!("no opcode draws a {}-cornered {:?} face", corners.len(), face.shading))?;
         let routine = if !seam || effect == 1 { effect } else { 0 };
         let op = base | if layered { 0x4000 } else { 0 } | [0, 0x8000, 0x10000, 0x20000][routine as usize & 3];
         let words = element_words(base, wanted, face, &corners, binding)?;
@@ -714,7 +757,9 @@ fn commands(model: &Model, bindings: &[Binding], layered: bool, effect: u32) -> 
     let size = |groups: &[Vec<Run>]| -> usize {
         let runs = groups.iter().flatten();
         let drawn = runs.filter(|run| pass_color(run.op & !MODIFIERS).is_none());
-        drawn.map(|run| primitive(run.op & !MODIFIERS) * if run.op & 0x4000 != 0 { 2 } else { 1 } * run.elements.len()).sum()
+        drawn
+            .map(|run| primitive(run.op & !MODIFIERS) * if run.op & 0x4000 != 0 { 2 } else { 1 } * run.elements.len())
+            .sum()
     };
     let (seam, all) = (size(&groups[seam_group..=seam_group]), size(&groups));
     Ok((groups, seam, all))
@@ -763,7 +808,9 @@ pub fn arrays<'a>(model: &'a Model, bindings: &[Binding]) -> Result<Arrays<'a>> 
         }
         stream.push(if at == last { STREAM_END } else { GROUP_END });
     }
-    let bones = model.parts.iter().map(|part| Ok(Bone { rotation: &part.rotation, translation: part.translation, parent: i32::try_from(part.parent)? }));
+    let bones = model.parts.iter().map(|part| {
+        Ok(Bone { rotation: &part.rotation, translation: part.translation, parent: i32::try_from(part.parent)? })
+    });
     Ok(Arrays {
         bones: bones.collect::<Result<_>>()?,
         part_vertices: model.parts.iter().map(|part| u32::try_from(part.vertices.len())).collect::<Result<_, _>>()?,
@@ -836,20 +883,45 @@ mod encoding {
     const ADDRESS: u32 = 0x8010_0000;
 
     fn binding(transparent: bool, blend: Blend) -> Binding {
-        Binding { texture: Some(Placement { bits: 8, page: [448, 256], palette: [0, 246] }), transparent, blend, reflective: false, effect: 0 }
+        Binding {
+            texture: Some(Placement { bits: 8, page: [448, 256], palette: [0, 246] }),
+            transparent,
+            blend,
+            reflective: false,
+            effect: 0,
+        }
     }
 
     /// Two parts, a textured smooth quad on the first and a triangle spanning both.
     fn model() -> Model {
         let identity = [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]];
         let corner = |vertex: usize, u: u8| Corner { vertex, normal: Some(vertex), color: None, uv: Some([u, u + 1]) };
-        let part = |parent: usize, vertices: Vec<[i16; 3]>| Part { parent, rotation: identity, translation: [0, -100, 0], vertices };
+        let part = |parent: usize, vertices: Vec<[i16; 3]>| Part {
+            parent,
+            rotation: identity,
+            translation: [0, -100, 0],
+            vertices,
+        };
         Model {
             parts: vec![part(0, vec![[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]]), part(0, vec![[5, 5, 5]])],
             normals: vec![[0, 0, 4096]; 5],
             faces: vec![
-                Face { material: 0, shading: Shading::Smooth, part: Some(0), normal: None, color: None, corners: vec![corner(0, 1), corner(1, 2), corner(2, 3), corner(3, 4)] },
-                Face { material: 0, shading: Shading::Smooth, part: None, normal: None, color: None, corners: vec![corner(0, 5), corner(1, 6), corner(4, 7)] },
+                Face {
+                    material: 0,
+                    shading: Shading::Smooth,
+                    part: Some(0),
+                    normal: None,
+                    color: None,
+                    corners: vec![corner(0, 1), corner(1, 2), corner(2, 3), corner(3, 4)],
+                },
+                Face {
+                    material: 0,
+                    shading: Shading::Smooth,
+                    part: None,
+                    normal: None,
+                    color: None,
+                    corners: vec![corner(0, 5), corner(1, 6), corner(4, 7)],
+                },
             ],
             ..Model::default()
         }
@@ -872,7 +944,10 @@ mod encoding {
     #[test]
     fn a_material_says_how_the_faces_draw() {
         let bytes = encode(&model(), &[binding(true, Blend::Subtract)], ADDRESS).unwrap();
-        assert_eq!(drawn(&bytes).materials[0], Material { transparent: true, slot: Some(0), blend: Some(Blend::Subtract) });
+        assert_eq!(
+            drawn(&bytes).materials[0],
+            Material { transparent: true, slot: Some(0), blend: Some(Blend::Subtract) }
+        );
     }
 
     #[test]
@@ -886,7 +961,14 @@ mod encoding {
     fn a_reflective_slot_layers_the_whole_model() {
         let reflective = Binding { reflective: true, ..binding(false, Blend::Add) };
         assert!(drawn(&encode(&model(), &[reflective], ADDRESS).unwrap()).reflection);
-        let mixed = Model { faces: model().faces.into_iter().map(|face| Face { material: usize::from(face.part.is_none()), ..face }).collect(), ..model() };
+        let mixed = Model {
+            faces: model()
+                .faces
+                .into_iter()
+                .map(|face| Face { material: usize::from(face.part.is_none()), ..face })
+                .collect(),
+            ..model()
+        };
         assert!(encode(&mixed, &[reflective, binding(false, Blend::Add)], ADDRESS).is_err());
     }
 

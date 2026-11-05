@@ -156,7 +156,15 @@ pub fn write_file(
 ///
 /// # Errors
 /// The layer holds no such uid to give, or it cannot be written.
-pub fn create(project: &Project, index: &Index, layer_name: &str, uid: &str, path: &str, (declaration, files): (&str, &[(&str, &[u8])]), history: &mut History) -> Result<Vec<PathBuf>> {
+pub fn create(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    uid: &str,
+    path: &str,
+    (declaration, files): (&str, &[(&str, &[u8])]),
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
@@ -278,7 +286,13 @@ pub fn delete(
 ///
 /// # Errors
 /// The layer does not list the uid, or still holds its path.
-pub fn forget(project: &Project, index: &Index, layer_name: &str, uid: &str, history: &mut History) -> Result<Vec<PathBuf>> {
+pub fn forget(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    uid: &str,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let path = changeset.entries.get(uid).cloned().with_context(|| format!("{layer_name} does not list {uid}"))?;
     anyhow::ensure!(!layer.disk(&path).exists(), "{layer_name} still holds {path}");
@@ -589,7 +603,11 @@ mod tests {
         let (gone, kept) = (o.uid("code/gone.c"), o.uid("code/kept.c"));
         std::fs::remove_file(mounted.join("gone.c")).unwrap();
         o.refresh(&[mounted.join("gone.c")]);
-        assert!(o.index.problems.contains(&Problem::Missing { layer: "code".into(), path: "code/gone.c".into() }), "{:?}", o.index.problems);
+        assert!(
+            o.index.problems.contains(&Problem::Missing { layer: "code".into(), path: "code/gone.c".into() }),
+            "{:?}",
+            o.index.problems
+        );
         assert!(forget(&o.project, &o.index, "code", &kept, &mut o.history).is_err(), "what is there is not forgotten");
         let paths = forget(&o.project, &o.index, "code", &gone, &mut o.history).unwrap();
         o.refresh(&paths);

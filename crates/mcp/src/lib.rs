@@ -78,7 +78,8 @@ impl Reply {
     pub fn picture(caption: String, png: &[u8]) -> Reply {
         use base64::Engine;
         let png = base64::engine::general_purpose::STANDARD.encode(png);
-        let content = vec![rmcp::model::ContentBlock::text(caption), rmcp::model::ContentBlock::image(png, "image/png")];
+        let content =
+            vec![rmcp::model::ContentBlock::text(caption), rmcp::model::ContentBlock::image(png, "image/png")];
         Reply::Call(CallToolResult::success(content))
     }
 }

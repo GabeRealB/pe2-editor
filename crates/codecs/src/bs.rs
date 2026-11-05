@@ -93,10 +93,28 @@ const COS: [[i32; 8]; 8] = [
 ];
 
 /// Version 3's DC codes, chroma and luma: (code, the difference's width in bits).
-const V3_CHROMA_DC: [(&str, u32); 9] =
-    [("11111110", 8), ("1111110", 7), ("111110", 6), ("11110", 5), ("1110", 4), ("110", 3), ("10", 2), ("01", 1), ("00", 0)];
-const V3_LUMA_DC: [(&str, u32); 9] =
-    [("1111110", 8), ("111110", 7), ("11110", 6), ("1110", 5), ("110", 4), ("101", 3), ("01", 2), ("00", 1), ("100", 0)];
+const V3_CHROMA_DC: [(&str, u32); 9] = [
+    ("11111110", 8),
+    ("1111110", 7),
+    ("111110", 6),
+    ("11110", 5),
+    ("1110", 4),
+    ("110", 3),
+    ("10", 2),
+    ("01", 1),
+    ("00", 0),
+];
+const V3_LUMA_DC: [(&str, u32); 9] = [
+    ("1111110", 8),
+    ("111110", 7),
+    ("11110", 6),
+    ("1110", 5),
+    ("110", 4),
+    ("101", 3),
+    ("01", 2),
+    ("00", 1),
+    ("100", 0),
+];
 
 #[derive(Debug)]
 pub enum Error {
@@ -178,8 +196,9 @@ impl Bits<'_> {
         let mut code = 0u32;
         for len in 1..=8u32 {
             code = (code << 1) | self.bits(1)?;
-            let Some(&(_, width)) =
-                table.iter().find(|(c, _)| c.len() == len as usize && u32::from_str_radix(c, 2).is_ok_and(|v| v == code))
+            let Some(&(_, width)) = table
+                .iter()
+                .find(|(c, _)| c.len() == len as usize && u32::from_str_radix(c, 2).is_ok_and(|v| v == code))
             else {
                 continue;
             };

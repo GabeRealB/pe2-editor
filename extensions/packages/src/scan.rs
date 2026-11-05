@@ -84,7 +84,9 @@ fn in_taking(text: &str, at: usize) -> bool {
     while start > 1 && text.as_bytes()[start - 2] == b'\\' {
         start = text[..start - 1].rfind('\n').map_or(0, |end| end + 1);
     }
-    let Some(rest) = text[start..].trim_start().strip_prefix('#').map(str::trim_start).and_then(|rest| rest.strip_prefix("define")) else {
+    let Some(rest) =
+        text[start..].trim_start().strip_prefix('#').map(str::trim_start).and_then(|rest| rest.strip_prefix("define"))
+    else {
         return false;
     };
     let rest = rest.trim_start();
@@ -117,7 +119,10 @@ pub fn uses(text: &str) -> Vec<Use<'_>> {
                 }
                 let word = &text[start..at];
                 let open = at + text[at..].len() - text[at..].trim_start().len();
-                if KNOWN.contains(&word) && bytes.get(open) == Some(&b'(') && !defining(text, start) && !in_taking(text, start)
+                if KNOWN.contains(&word)
+                    && bytes.get(open) == Some(&b'(')
+                    && !defining(text, start)
+                    && !in_taking(text, start)
                     && let Some((args, end)) = arguments(text, open)
                 {
                     found.push(Use { name: word, args, line, offset: start });
@@ -163,7 +168,9 @@ mod tests {
 
     #[test]
     fn a_macro_taking_parameters_uses_nothing_until_expanded() {
-        let found = uses("#define PE2_BIND_SELF(binding) \\\n    PE2_BIND(binding, file)\n#define ONE PE2_VALUE(a)\nPE2_BIND_SELF(file)\n");
+        let found = uses(
+            "#define PE2_BIND_SELF(binding) \\\n    PE2_BIND(binding, file)\n#define ONE PE2_VALUE(a)\nPE2_BIND_SELF(file)\n",
+        );
         let found: Vec<(&str, usize)> = found.iter().map(|found| (found.name, found.line)).collect();
         assert_eq!(found, [("PE2_VALUE", 3), ("PE2_BIND_SELF", 4)]);
     }

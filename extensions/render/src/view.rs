@@ -9,13 +9,13 @@ use pe2_ext::Value;
 use crate::assembly::{self, Assembled, Place};
 use crate::camera::Camera;
 use crate::gizmo::{self, AXES, Ball, Handle, Handles, Overlay};
+use crate::material;
 use crate::math::{M3, V3, add, compose, m4_bytes, scale, sub};
 use crate::parts::{self, BONE};
-use crate::skeleton;
-use crate::render::{Drawn, Renderer};
-use crate::material;
 use crate::prefab;
+use crate::render::{Drawn, Renderer};
 use crate::scene::{self, BlendedFace, Paint, Scene, upright};
+use crate::skeleton;
 
 /// How the faces are shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -144,14 +144,21 @@ impl ModelView {
         self.shading = if flags.next()? { Shading::Solid } else { Shading::Wire };
         self.shown = Shown { grid: flags.next()?, bones: flags.next()?, normals: flags.next()? };
         self.isolated = flags.next()?;
-        self.paint = Paint::ALL.into_iter().find(|(paint, _)| paint.written() == paints.chars().next()).map_or(Paint::Off, |(paint, _)| paint);
+        self.paint = Paint::ALL
+            .into_iter()
+            .find(|(paint, _)| paint.written() == paints.chars().next())
+            .map_or(Paint::Off, |(paint, _)| paint);
         self.camera = Camera::resumed(camera)?;
         Some(())
     }
 
     fn note(&self) -> String {
         let flag = |on: bool| if on { '1' } else { '0' };
-        let flags: String = [self.shading == Shading::Solid, self.shown.grid, self.shown.bones, self.shown.normals, self.isolated].map(flag).iter().collect();
+        let flags: String =
+            [self.shading == Shading::Solid, self.shown.grid, self.shown.bones, self.shown.normals, self.isolated]
+                .map(flag)
+                .iter()
+                .collect();
         format!("{flags} {} {}", self.paint.written().unwrap_or('-'), self.camera.written())
     }
 
@@ -163,12 +170,15 @@ impl ModelView {
         let [x, y, z] = numbers.map(|number| number as f32);
         let held = self.places.get(part).and_then(Option::as_ref);
         let child = ui.asset().and_then(|asset| match held {
-            Some(Place::Fill(within)) => Some(prefab::fill_at(&asset, within).cloned().unwrap_or(Value::Table(pe2_ext::Table::new()))),
+            Some(Place::Fill(within)) => {
+                Some(prefab::fill_at(&asset, within).cloned().unwrap_or(Value::Table(pe2_ext::Table::new())))
+            }
             _ => None,
         });
         let Some(Ok(scene)) = &mut self.scene else { return };
         let (Some(rest), Some(pose)) = (scene.rest.get(part).copied(), scene.pose.get_mut(part)) else { return };
-        let turned = |degrees: [f32; 3]| skeleton::matrix(degrees.map(f64::from)).map(|row| row.map(|x| f32::from(x) / 4096.0));
+        let turned =
+            |degrees: [f32; 3]| skeleton::matrix(degrees.map(f64::from)).map(|row| row.map(|x| f32::from(x) / 4096.0));
         match (key.as_str(), &child) {
             ("translation", None) => pose.translation = [x, y, z],
             ("rotation", None) => pose.rotation = turned([x, y, z]),
@@ -197,15 +207,23 @@ impl ModelView {
         #[expect(clippy::cast_possible_truncation, reason = "a coordinate is well within range")]
         let rounded = |at: V3| Value::Array(at.map(|x| Value::Integer(i64::from(x.round() as i32))).to_vec());
         // Adding zero takes the sign off what rounded to none: there is no turn of -0.0.
-        let degrees = |rotation: &M3| Value::Array(parts::euler_degrees(rotation).map(|x| Value::Float(f64::from((x * 10.0).round() / 10.0 + 0.0))).to_vec());
+        let degrees = |rotation: &M3| {
+            Value::Array(
+                parts::euler_degrees(rotation)
+                    .map(|x| Value::Float(f64::from((x * 10.0).round() / 10.0 + 0.0)))
+                    .to_vec(),
+            )
+        };
         if let Place::Fill(within) = self.places.get(part)?.as_ref()? {
             // What fills a part is held over what its model's root says: what moved is the difference.
             let child = prefab::fill_at(asset, within)?;
             #[expect(clippy::cast_precision_loss, reason = "a coordinate is far from where floats lose it")]
             let was = skeleton::translation_of(child).unwrap_or_default().map(|x| x as f32);
             let by = sub(pose.translation, rest.translation);
-            let was_turned = skeleton::matrix(skeleton::numbers_of(child, "rotation").unwrap_or_default()).map(|row| row.map(|x| f32::from(x) / 4096.0));
-            let turned = crate::math::inverse(&rest.rotation).map_or(was_turned, |inverse| compose(&compose(&pose.rotation, &inverse), &was_turned));
+            let was_turned = skeleton::matrix(skeleton::numbers_of(child, "rotation").unwrap_or_default())
+                .map(|row| row.map(|x| f32::from(x) / 4096.0));
+            let turned = crate::math::inverse(&rest.rotation)
+                .map_or(was_turned, |inverse| compose(&compose(&pose.rotation, &inverse), &was_turned));
             return Some((rounded(add(was, by)), degrees(&turned)));
         }
         Some((rounded(pose.translation), degrees(&pose.rotation)))
@@ -273,11 +291,21 @@ impl ModelView {
         }
         let pictures: Vec<_> = images.iter().map(|image| (image.width, image.height, image.rgba.as_slice())).collect();
         let (width, height, pixels, regions) = scene::pack(&pictures);
-        let region_of = |bound: Option<&assembly::Bound>| bound.and_then(|bound| seen.iter().position(|known| *known == bound)).map(|at| regions[at]);
-        let of_slots = |pick: fn(&assembly::Drawn) -> Option<&assembly::Bound>| assembled.slots.iter().map(|slot| region_of(slot.drawn.as_ref().and_then(pick))).collect::<Vec<_>>();
+        let region_of = |bound: Option<&assembly::Bound>| {
+            bound.and_then(|bound| seen.iter().position(|known| *known == bound)).map(|at| regions[at])
+        };
+        let of_slots = |pick: fn(&assembly::Drawn) -> Option<&assembly::Bound>| {
+            assembled.slots.iter().map(|slot| region_of(slot.drawn.as_ref().and_then(pick))).collect::<Vec<_>>()
+        };
         let by_material = of_slots(|drawn| drawn.main.as_ref());
-        let shares = assembled.slots.iter().map(|slot| slot.drawn.as_ref().map_or(0.0, |drawn| f32::from(drawn.strength) / f32::from(material::LAYER_FULL)));
-        let by_layer = of_slots(|drawn| drawn.environment.as_ref()).into_iter().zip(shares).map(|(region, share)| region.map(|region| (region, share))).collect();
+        let shares = assembled.slots.iter().map(|slot| {
+            slot.drawn.as_ref().map_or(0.0, |drawn| f32::from(drawn.strength) / f32::from(material::LAYER_FULL))
+        });
+        let by_layer = of_slots(|drawn| drawn.environment.as_ref())
+            .into_iter()
+            .zip(shares)
+            .map(|(region, share)| region.map(|region| (region, share)))
+            .collect();
         #[expect(clippy::cast_possible_truncation, reason = "an atlas is a few cells tall")]
         if !images.is_empty() {
             self.atlas = Some(((width as u32, height as u32), pixels));
@@ -291,7 +319,8 @@ impl ModelView {
     fn toolbar(&mut self, ui: &mut Ui) {
         let Some(Ok(scene)) = &mut self.scene else { return };
         let mut frame_all = false;
-        let (mut shading, Shown { mut grid, mut bones, mut normals }, mut orthographic) = (self.shading, self.shown, self.camera.orthographic);
+        let (mut shading, Shown { mut grid, mut bones, mut normals }, mut orthographic) =
+            (self.shading, self.shown, self.camera.orthographic);
         let (mut isolated, mut paint) = (self.isolated, self.paint);
         let was = (bones, orthographic);
         // A skeleton has no faces to shade, and is its bones.
@@ -341,9 +370,16 @@ impl ModelView {
         if !legend.is_empty() {
             ui.wrapped(|ui| {
                 for (color, label, count) in &legend {
-                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a color's share, of a byte")]
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "a color's share, of a byte"
+                    )]
                     let [red, green, blue] = color.map(|x| (x * 255.0) as u8);
-                    let swatch = Texture::new(format!("paint {label}"), Image { width: 1, height: 1, rgba: vec![red, green, blue, 255] });
+                    let swatch = Texture::new(
+                        format!("paint {label}"),
+                        Image { width: 1, height: 1, rgba: vec![red, green, blue, 255] },
+                    );
                     ui.image(&swatch, 10.0, 10.0);
                     ui.styled(&format!("{label}  {count}"), Style::Note);
                 }
@@ -484,11 +520,15 @@ impl ModelView {
         if !input.held.0 && self.held.take().is_some() {
             self.released = self.selected;
         }
-        let (Some(held), Some(part), Some(Ok(scene))) = (self.held, self.selected, &mut self.scene) else { return false };
+        let (Some(held), Some(part), Some(Ok(scene))) = (self.held, self.selected, &mut self.scene) else {
+            return false;
+        };
         if let (Some(now), Some(before)) = (input.pointer, self.last_pointer) {
             match held {
                 Handle::Move(axis) => scene.move_part(part, scale(AXES[axis], handles.along(axis, input.drag))),
-                Handle::Turn(axis) => scene.turn_part(part, AXES[axis], handles.turned(AXES[axis], self.camera.axes().2, before, now)),
+                Handle::Turn(axis) => {
+                    scene.turn_part(part, AXES[axis], handles.turned(AXES[axis], self.camera.axes().2, before, now))
+                }
             }
             self.dirty.geometry = true;
             self.dirty.lines = true;
@@ -507,7 +547,8 @@ impl ModelView {
         }
         self.keys(input);
         let ball = Ball::new(&self.camera, size);
-        let handles = self.scene.as_ref().and_then(|scene| scene.as_ref().ok()).and_then(|scene| self.handles_in(scene, size));
+        let handles =
+            self.scene.as_ref().and_then(|scene| scene.as_ref().ok()).and_then(|scene| self.handles_in(scene, size));
         // What the ball draws depends on where the pointer is over it.
         if ball.holds(input.pointer) || self.ball_state.over {
             self.dirty.frame = self.dirty.frame || input.pointer != self.last_pointer;
@@ -521,7 +562,12 @@ impl ModelView {
             self.report(ui, part);
         }
         let navigating = self.navigate(input, size);
-        if input.clicked && !on_ball && !on_handle && !navigating && let (Some(at), Some(Ok(scene))) = (input.pointer, &self.scene) {
+        if input.clicked
+            && !on_ball
+            && !on_handle
+            && !navigating
+            && let (Some(at), Some(Ok(scene))) = (input.pointer, &self.scene)
+        {
             let (origin, direction) = self.camera.ray(at, size);
             if let Some(part) = scene.pick(origin, direction) {
                 ui.select(&format!("{BONE}{part}"));

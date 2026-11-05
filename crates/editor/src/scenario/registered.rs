@@ -31,7 +31,8 @@ fn a_test_failing_says_why() {
     let report = suite::run(&[suite], &["a_prefab".to_string()], &out);
     assert!(!report.passed());
     assert!(report.failed.iter().any(|(_, why)| why.contains("texture")), "{:?}", report.failed);
-    let kept: Vec<std::path::PathBuf> = std::fs::read_dir(&artifacts).expect("what it kept").flatten().map(|entry| entry.path()).collect();
+    let kept: Vec<std::path::PathBuf> =
+        std::fs::read_dir(&artifacts).expect("what it kept").flatten().map(|entry| entry.path()).collect();
     let has = |extension: &str| kept.iter().any(|file| file.extension().is_some_and(|own| own == extension));
     assert!(has("txt") && has("png"), "{kept:?}");
 }
@@ -63,6 +64,8 @@ fn a_folder_holds_a_suite_or_says_it_does_not() {
 
 #[test]
 fn an_extension_says_what_counts_as_it() {
-    let about = project::ext::component::about(&extensions::built_apart("pe2_psx.wasm").expect("built with the others")).expect("who it is");
+    let about =
+        project::ext::component::about(&extensions::built_apart("pe2_psx.wasm").expect("built with the others"))
+            .expect("who it is");
     assert_eq!(about.hashed, ["linux-x86_64"]);
 }

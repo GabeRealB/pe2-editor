@@ -32,7 +32,10 @@ fn a_node_short_of_a_setting_says_so_of_its_stack() {
     let mut editor = Scenario::open(Fixture::rig());
     editor.menu(&["File", "New node", "VRAM slot"]);
     let problems = editor.problems();
-    assert!(problems.iter().any(|problem| problem.starts_with("its stack:") && problem.contains("has to be given")), "{problems:?}");
+    assert!(
+        problems.iter().any(|problem| problem.starts_with("its stack:") && problem.contains("has to be given")),
+        "{problems:?}"
+    );
 }
 
 #[test]

@@ -25,7 +25,12 @@ pub const ENVIRONMENT: &str = "environment";
 
 pub const SHADERS: [Shader; 3] = [
     Shader { id: "textured", label: "Textured", textures: &[(MAIN, "Main texture")], reflective: false },
-    Shader { id: "reflective", label: "Reflective", textures: &[(MAIN, "Main texture"), (ENVIRONMENT, "Environment")], reflective: true },
+    Shader {
+        id: "reflective",
+        label: "Reflective",
+        textures: &[(MAIN, "Main texture"), (ENVIRONMENT, "Environment")],
+        reflective: true,
+    },
     Shader { id: "colored", label: "Colored", textures: &[], reflective: false },
 ];
 
@@ -61,9 +66,15 @@ impl Definition {
     pub fn read<'a>(field: impl Fn(&str) -> Option<&'a Value>) -> Definition {
         let text = |key: &str| field(key).and_then(Value::as_str);
         let shader = text("shader").and_then(|id| SHADERS.iter().find(|shader| shader.id == id)).unwrap_or(&SHADERS[0]);
-        let blend = text("blend").and_then(|id| BLENDS.iter().find(|(known, ..)| *known == id)).map_or(Blend::Mix, |(.., blend)| *blend);
-        let strength = field(STRENGTH).and_then(Value::as_integer).and_then(|strength| u8::try_from(strength).ok()).map_or(LAYER_FULL / 2, |strength| strength.min(LAYER_FULL));
-        let effect = field(EFFECT).and_then(Value::as_integer).and_then(|effect| u32::try_from(effect).ok()).unwrap_or(0);
+        let blend = text("blend")
+            .and_then(|id| BLENDS.iter().find(|(known, ..)| *known == id))
+            .map_or(Blend::Mix, |(.., blend)| *blend);
+        let strength = field(STRENGTH)
+            .and_then(Value::as_integer)
+            .and_then(|strength| u8::try_from(strength).ok())
+            .map_or(LAYER_FULL / 2, |strength| strength.min(LAYER_FULL));
+        let effect =
+            field(EFFECT).and_then(Value::as_integer).and_then(|effect| u32::try_from(effect).ok()).unwrap_or(0);
         Definition { shader, transparent: text("surface") == Some("transparent"), blend, strength, effect }
     }
 }
@@ -146,7 +157,8 @@ pub fn placement(image: &Table, texture: &Value) -> Result<Placement> {
     let cell = image.get("cells").and_then(|cells| cells.get(name)).ok_or_else(|| anyhow!("no cell {name}"))?;
     let palette = palette_of(texture).or_else(|| cell.get("palette").and_then(Value::as_str));
     let palette = palette.ok_or_else(|| anyhow!("{name} has no palette"))?;
-    let colors = pair(image.get("palettes").and_then(|palettes| palettes.get(palette))).ok_or_else(|| anyhow!("{palette} is in no slot"))?;
+    let colors = pair(image.get("palettes").and_then(|palettes| palettes.get(palette)))
+        .ok_or_else(|| anyhow!("{palette} is in no slot"))?;
     let [x, y] = pair(cell.get("rect")).ok_or_else(|| anyhow!("{name} has no place"))?;
     let [page_x, page_y] = pair(image.get("page")).ok_or_else(|| anyhow!("no page"))?;
     let narrow = |value: i64| u16::try_from(value).map_err(|_| anyhow!("{value} is off the console's memory"));
@@ -165,7 +177,13 @@ pub fn binding(fields: &Table, place: impl Fn(&Value) -> Result<Placement>) -> R
     } else {
         Some(place(fields.get(MAIN).ok_or_else(|| anyhow!("it has no texture"))?)?)
     };
-    Ok(Binding { texture, transparent: read.transparent, blend: read.blend, reflective: read.shader.reflective, effect: read.effect })
+    Ok(Binding {
+        texture,
+        transparent: read.transparent,
+        blend: read.blend,
+        reflective: read.shader.reflective,
+        effect: read.effect,
+    })
 }
 
 #[cfg(test)]
@@ -181,7 +199,8 @@ mod tests {
 
     #[test]
     fn a_texture_names_a_cell_and_a_palette_of_its_image() {
-        let table: pe2_ext::Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
+        let table: pe2_ext::Table =
+            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
         let written = &table["main"];
         assert_eq!((cell_of(written), palette_of(written)), (Some("left"), Some("two")));
         let again = reading(written, "right", None);
@@ -195,7 +214,16 @@ mod tests {
     fn a_material_says_how_it_draws() {
         let table: pe2_ext::Table = "shader = 'reflective'\nsurface = 'transparent'\nblend = 'add'".parse().unwrap();
         let read = Definition::read(|key| table.get(key));
-        assert_eq!(read, Definition { shader: &SHADERS[1], transparent: true, blend: Blend::Add, strength: LAYER_FULL / 2, effect: 0 });
+        assert_eq!(
+            read,
+            Definition {
+                shader: &SHADERS[1],
+                transparent: true,
+                blend: Blend::Add,
+                strength: LAYER_FULL / 2,
+                effect: 0
+            }
+        );
     }
 
     #[test]
@@ -207,6 +235,15 @@ mod tests {
     #[test]
     fn what_a_material_leaves_out_is_opaque_and_textured() {
         let read = Definition::read(|_| None);
-        assert_eq!(read, Definition { shader: &SHADERS[0], transparent: false, blend: Blend::Mix, strength: LAYER_FULL / 2, effect: 0 });
+        assert_eq!(
+            read,
+            Definition {
+                shader: &SHADERS[0],
+                transparent: false,
+                blend: Blend::Mix,
+                strength: LAYER_FULL / 2,
+                effect: 0
+            }
+        );
     }
 }

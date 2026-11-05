@@ -52,9 +52,16 @@ impl Suite {
     /// # Errors
     /// Its `test.toml` cannot be read.
     pub fn at(folder: &Path) -> Result<Suite, String> {
-        let name = folder.parent().and_then(Path::file_name).map_or_else(|| "tests".to_string(), |name| name.to_string_lossy().into_owned());
+        let name = folder
+            .parent()
+            .and_then(Path::file_name)
+            .map_or_else(|| "tests".to_string(), |name| name.to_string_lossy().into_owned());
         let manifest = folder.join("test.toml");
-        let text = if manifest.is_file() { std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))? } else { String::new() };
+        let text = if manifest.is_file() {
+            std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?
+        } else {
+            String::new()
+        };
         let declared = toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest.display()))?;
         Ok(Suite { name, folder: folder.to_path_buf(), declared })
     }
@@ -81,7 +88,8 @@ impl Suite {
                     other => Some(format!("{} is {other:?}", p.id)),
                 })
                 .collect();
-            let why = if unloaded.is_empty() { "none of its extensions gives any".to_string() } else { unloaded.join("; ") };
+            let why =
+                if unloaded.is_empty() { "none of its extensions gives any".to_string() } else { unloaded.join("; ") };
             return Err(format!("{}: no tests, {why}", self.name));
         }
         Ok(tests)
@@ -140,7 +148,9 @@ pub fn list(suites: &[Suite], out: &Out) -> bool {
         match suite.tests() {
             Ok(tests) => {
                 for name in tests {
-                    out.say(&serde_json::json!({ "event": "test", "suite": suite.name, "name": name }), || name.clone());
+                    out.say(&serde_json::json!({ "event": "test", "suite": suite.name, "name": name }), || {
+                        name.clone()
+                    });
                 }
             }
             Err(why) => {
@@ -161,7 +171,10 @@ pub fn run(suites: &[Suite], filters: &[String], out: &Out) -> Report {
         let mut tests = match suite.tests() {
             Ok(tests) => tests,
             Err(why) => {
-                out.say(&serde_json::json!({ "event": "failed", "suite": suite.name, "name": suite.name, "why": why }), || format!("FAILED  {}\n{why}", suite.name));
+                out.say(
+                    &serde_json::json!({ "event": "failed", "suite": suite.name, "name": suite.name, "why": why }),
+                    || format!("FAILED  {}\n{why}", suite.name),
+                );
                 report.failed.push((suite.name.clone(), why));
                 continue;
             }
@@ -172,7 +185,8 @@ pub fn run(suites: &[Suite], filters: &[String], out: &Out) -> Report {
             let started = std::time::Instant::now();
             let mut editor = Scenario::open_with(suite.scratch(), None, true);
             let result = editor.run_test(&name);
-            let kept = result.as_ref().err().zip(out.artifacts.as_ref()).map(|(_, folder)| editor.keep_failure(folder, &name));
+            let kept =
+                result.as_ref().err().zip(out.artifacts.as_ref()).map(|(_, folder)| editor.keep_failure(folder, &name));
             drop(editor);
             let seconds = started.elapsed().as_secs_f64();
             match result {
@@ -190,7 +204,9 @@ pub fn run(suites: &[Suite], filters: &[String], out: &Out) -> Report {
         }
     }
     let (passed, failed) = (report.passed.len(), report.failed.len());
-    out.say(&serde_json::json!({ "event": "done", "passed": passed, "failed": failed }), || format!("{passed} passed, {failed} failed"));
+    out.say(&serde_json::json!({ "event": "done", "passed": passed, "failed": failed }), || {
+        format!("{passed} passed, {failed} failed")
+    });
     report
 }
 
@@ -209,7 +225,11 @@ pub fn in_folders(folders: &[PathBuf]) -> Result<Vec<Suite>, String> {
     let found = |folder: &PathBuf| {
         let inside = folder.join("tests");
         let folder = if inside.is_dir() { inside } else { folder.clone() };
-        if folder.join("tests.wasm").is_file() { Suite::at(&folder) } else { Err(format!("{}: no tests.wasm", folder.display())) }
+        if folder.join("tests.wasm").is_file() {
+            Suite::at(&folder)
+        } else {
+            Err(format!("{}: no tests.wasm", folder.display()))
+        }
     };
     folders.iter().map(found).collect()
 }

@@ -192,12 +192,19 @@ impl Asking for Requests {
             state.slots.insert(key.clone(), Slot::Making { since: Instant::now(), asked });
             let _ = self.jobs.lock().unwrap_or_else(PoisonError::into_inner).send((key.clone(), asked));
             let making = |state: &mut State| matches!(state.slots.get(&key), Some(Slot::Making { .. }));
-            state = self.shared.answered.wait_timeout_while(state, BUDGET, making).unwrap_or_else(PoisonError::into_inner).0;
+            state = self
+                .shared
+                .answered
+                .wait_timeout_while(state, BUDGET, making)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
         let answer = match state.slots.get(&key) {
             Some(Slot::Made(bytes)) => Requested::Ready(bytes.to_vec()),
             Some(Slot::Failed(why)) => Requested::Failed(why.clone()),
-            Some(Slot::Making { since, .. }) => Requested::Pending { waited: u32::try_from(since.elapsed().as_millis()).unwrap_or(u32::MAX) },
+            Some(Slot::Making { since, .. }) => {
+                Requested::Pending { waited: u32::try_from(since.elapsed().as_millis()).unwrap_or(u32::MAX) }
+            }
             None => Requested::Pending { waited: 0 },
         };
         drop(state);
@@ -263,12 +270,25 @@ mod tests {
             std::fs::write(path, text).unwrap();
         };
         write("project.toml", "[[layer]]\nname = \"base\"\n");
-        write(".layers/base/n.node/node.toml", "[[stack]]\nop = \"test.requested@slow\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"transient\"\n");
+        write(
+            ".layers/base/n.node/node.toml",
+            "[[stack]]\nop = \"test.requested@slow\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"transient\"\n",
+        );
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let index = crate::index::Index::open(&project, &cache).unwrap();
-        let extension = Extension { id: "test.requested", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register };
+        let extension = Extension {
+            id: "test.requested",
+            version: "0.1.0",
+            requires: &[],
+            weak: &[],
+            optional: &[],
+            provides: &[],
+            platforms: &[],
+            unsandboxed: false,
+            register,
+        };
         let extensions = Arc::new(Extensions::load(vec![Loadable::from(extension)], true));
         extensions.keep_in(crate::graph::store::Store::open(&cache).unwrap());
         let requests = Requests::start(Arc::new(index));
@@ -305,7 +325,11 @@ mod tests {
         // Made quickly, it is there for the one asking.
         TAKES.store(0, Ordering::SeqCst);
         requests.clear();
-        assert_eq!(requests.request("n", "native"), Requested::Ready(b"made".to_vec()), "within what a frame can spare");
+        assert_eq!(
+            requests.request("n", "native"),
+            Requested::Ready(b"made".to_vec()),
+            "within what a frame can spare"
+        );
         assert_eq!(MADE.load(Ordering::SeqCst), 2);
         // What was forgotten while on its way arrives to nobody.
         TAKES.store(60, Ordering::SeqCst);

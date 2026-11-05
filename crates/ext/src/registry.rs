@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::marker::PhantomData;
 
 use crate::data::{Call, OpDef, Port, Prepared, Provides, Retain, Type};
-use crate::ty::ValueType;
 use crate::import::{Recognized, Signature, TypeDef};
+use crate::ty::ValueType;
 use crate::{Asset, Project, Result, Table, Value, View};
 
 /// An extension: its id, its version, how it depends on others and its entry point. `extension!` makes it.
@@ -316,7 +316,10 @@ impl TemplateDef {
     pub fn stored(&self) -> bool {
         let parsed: Option<Table> = self.stack.parse().ok();
         let layers = parsed.as_ref().and_then(|stack| stack.get("stack")).and_then(Value::as_array);
-        self.stack.contains("{file}") || layers.is_some_and(|layers| layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some("file")))
+        self.stack.contains("{file}")
+            || layers.is_some_and(|layers| {
+                layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some("file"))
+            })
     }
 }
 
@@ -713,11 +716,24 @@ pub enum ContentPlace {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentRequest {
     /// An action, of a row, or of the pane where `row` is empty.
-    Action { row: String, action: String },
-    Rename { row: String, name: String },
-    Moved { row: String, onto: String, place: ContentPlace },
+    Action {
+        row: String,
+        action: String,
+    },
+    Rename {
+        row: String,
+        name: String,
+    },
+    Moved {
+        row: String,
+        onto: String,
+        place: ContentPlace,
+    },
     /// An asset, by its path, dropped on a row whose `takes` names `asset:` and its type.
-    Dropped { row: String, asset: String },
+    Dropped {
+        row: String,
+        asset: String,
+    },
 }
 
 /// What comes of it: its name in the history, what it changes in the declaration, each by its path (keys, a list's place) and
@@ -818,7 +834,9 @@ impl Registry {
     pub fn setting(&mut self, setting: Setting) -> Value {
         let kept = self.stored.get(setting.scope.name()).and_then(Value::as_table).and_then(|t| t.get(&setting.key));
         let value = match kept {
-            Some(Value::Integer(i)) if matches!(setting.default, Value::Float(_)) && setting.accepts(&Value::Integer(*i)) => {
+            Some(Value::Integer(i))
+                if matches!(setting.default, Value::Float(_)) && setting.accepts(&Value::Integer(*i)) =>
+            {
                 #[expect(clippy::cast_precision_loss, reason = "a setting's number")]
                 Value::Float(*i as f64)
             }
@@ -846,7 +864,13 @@ impl Registry {
     }
 
     /// A panel, `<id>@<name>`, labeled in the View menu and its tab.
-    pub fn panel(&mut self, name: &str, label: &str, icon: Icon, make: impl Fn() -> Box<dyn View> + Send + Sync + 'static) {
+    pub fn panel(
+        &mut self,
+        name: &str,
+        label: &str,
+        icon: Icon,
+        make: impl Fn() -> Box<dyn View> + Send + Sync + 'static,
+    ) {
         let name = Name::of(&self.id, name);
         self.parts.panels.push(PanelDef { name, label: label.to_string(), icon: Some(icon), make: Arc::new(make) });
     }
@@ -956,22 +980,32 @@ impl Registry {
         OpBuilder { registry: self, def, same: Vec::new(), list_of: None, by_running: false, out: PhantomData }
     }
 
-
     /// Declare an event of this extension, for others to wire to and for it to signal.
     pub fn event<E: crate::events::Event>(&mut self) {
         self.parts.events.push((E::NAME.to_string(), E::LABEL.to_string()));
     }
 
     /// Run this where an event is signaled: called with the event's name as its `event` setting, seeing the config and the project as any operation does.
-    pub fn on<E: crate::events::Event>(&mut self, run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static) -> HookBuilder<'_> {
+    pub fn on<E: crate::events::Event>(
+        &mut self,
+        run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> HookBuilder<'_> {
         self.on_id(E::NAME, run)
     }
 
     /// `on`, for an event only known by its id: a project's own, from the extension's settings.
-    pub fn on_id(&mut self, event: &str, run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static) -> HookBuilder<'_> {
+    pub fn on_id(
+        &mut self,
+        event: &str,
+        run: impl Fn(&mut Call<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> HookBuilder<'_> {
         let at = self.parts.hooks.len();
         let name = format!("on-{at}");
-        let op = self.op(&name).label("Hook").output::<crate::ty::Table>().run(move |call| run(call).map(|()| crate::Table::new()));
+        let op = self
+            .op(&name)
+            .label("Hook")
+            .output::<crate::ty::Table>()
+            .run(move |call| run(call).map(|()| crate::Table::new()));
         self.parts.hooks.push(HookDef { event: event.to_string(), op: op.to_string(), signals: Vec::new() });
         HookBuilder { hook: &mut self.parts.hooks[at] }
     }
@@ -987,7 +1021,13 @@ impl Registry {
     }
 
     /// A viewer of a type: a document's tab showing any output of it that is a preview.
-    pub fn viewer(&mut self, ty: &Name, name: &str, icon: Icon, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) {
+    pub fn viewer(
+        &mut self,
+        ty: &Name,
+        name: &str,
+        icon: Icon,
+        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
+    ) {
         let tab = Some(TabDef { icon, fields: Vec::new() });
         self.parts.viewers.push((ty.to_string(), ViewDef { name: name.to_string(), make: Arc::new(make), tab }));
     }
@@ -999,7 +1039,14 @@ impl Registry {
 
     /// A way to make a node of a type: `stack`, stamped into it, `{file}` standing for its file.
     pub fn template(&mut self, name: &str, node_type: &str, stack: &str) -> TemplateBuilder<'_> {
-        let def = TemplateDef { name: name.to_string(), label: name.to_string(), node_type: node_type.to_string(), files: vec![], stack: stack.to_string(), offered: true };
+        let def = TemplateDef {
+            name: name.to_string(),
+            label: name.to_string(),
+            node_type: node_type.to_string(),
+            files: vec![],
+            stack: stack.to_string(),
+            offered: true,
+        };
         TemplateBuilder { registry: self, def: Some(def) }
     }
 
@@ -1193,11 +1240,7 @@ impl TypeBuilder<'_> {
 
     /// A view at the head of the contents pane, over its rows: for what rows cannot say. With no rows, the pane is its own.
     #[must_use]
-    pub fn contents_view(
-        mut self,
-        name: &str,
-        make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static,
-    ) -> Self {
+    pub fn contents_view(mut self, name: &str, make: impl Fn(&Asset) -> Box<dyn View> + Send + Sync + 'static) -> Self {
         self.def.contents_views.push(ViewDef { name: name.to_string(), make: Arc::new(make), tab: None });
         self
     }
@@ -1232,21 +1275,30 @@ impl TypeBuilder<'_> {
 
     /// What is inside its assets, for the contents pane.
     #[must_use]
-    pub fn contents(mut self, contents: impl Fn(&Asset, &dyn crate::Project) -> Contents + Send + Sync + 'static) -> Self {
+    pub fn contents(
+        mut self,
+        contents: impl Fn(&Asset, &dyn crate::Project) -> Contents + Send + Sync + 'static,
+    ) -> Self {
         self.def.contents = Some(Arc::new(contents));
         self
     }
 
     /// What comes of what is done to its contents: a row's action, a row renamed or dragged.
     #[must_use]
-    pub fn content_act(mut self, act: impl Fn(&Asset, &dyn crate::Project, ContentRequest) -> Result<ContentOutcome> + Send + Sync + 'static) -> Self {
+    pub fn content_act(
+        mut self,
+        act: impl Fn(&Asset, &dyn crate::Project, ContentRequest) -> Result<ContentOutcome> + Send + Sync + 'static,
+    ) -> Self {
         self.def.content_act = Some(Arc::new(act));
         self
     }
 
     /// Its parts' fields, where those are not simply what their tables hold.
     #[must_use]
-    pub fn part_sheet(mut self, sheet: impl Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync + 'static) -> Self {
+    pub fn part_sheet(
+        mut self,
+        sheet: impl Fn(&Asset, &dyn crate::Project, &str) -> Option<PartSheet> + Send + Sync + 'static,
+    ) -> Self {
         self.def.part_sheet = Some(Arc::new(sheet));
         self
     }
@@ -1364,13 +1416,19 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
 
     /// The members of the family it makes: each by a value of its parameter, with a label.
     #[must_use]
-    pub fn members<P: crate::ty::Parameter>(self, members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static) -> Self {
+    pub fn members<P: crate::ty::Parameter>(
+        self,
+        members: impl Fn(&Asset) -> Vec<(P, String)> + Send + Sync + 'static,
+    ) -> Self {
         self.members_described(move |asset| members(asset).into_iter().map(|(p, label)| (p.to_text(), label)).collect())
     }
 
     /// The members of a family as described where values cross as text.
     #[must_use]
-    pub fn members_described(mut self, members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static) -> Self {
+    pub fn members_described(
+        mut self,
+        members: impl Fn(&Asset) -> Vec<(String, String)> + Send + Sync + 'static,
+    ) -> Self {
         self.def.members = Some(Arc::new(members));
         self
     }
@@ -1466,7 +1524,9 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
                 };
                 match ty {
                     Some(ty) if *ty == Type::Any => *ty = var.clone(),
-                    Some(_) => self.registry.parts.problems.push(format!("{name}: a constraint relates a port of a type")),
+                    Some(_) => {
+                        self.registry.parts.problems.push(format!("{name}: a constraint relates a port of a type"));
+                    }
                     None => self.registry.parts.problems.push(format!("{name}: a constraint names no port {slot:?}")),
                 }
             }

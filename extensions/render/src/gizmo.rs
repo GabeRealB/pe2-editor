@@ -119,7 +119,12 @@ impl Ball {
         for (axis, direction) in AXES.iter().enumerate() {
             for sign in [1.0, -1.0] {
                 let end = scale(*direction, sign);
-                ends.push((axis, sign, (center.0 + dot(end, right) * BALL_RADIUS * 0.72, center.1 - dot(end, up) * BALL_RADIUS * 0.72), dot(end, back)));
+                ends.push((
+                    axis,
+                    sign,
+                    (center.0 + dot(end, right) * BALL_RADIUS * 0.72, center.1 - dot(end, up) * BALL_RADIUS * 0.72),
+                    dot(end, back),
+                ));
             }
         }
         ends.sort_by(|a, b| a.3.total_cmp(&b.3));
@@ -212,7 +217,8 @@ impl Handles {
             }
         }
         for (axis, ring) in self.rings.iter().enumerate() {
-            let nearest = ring.windows(2).map(|pair| distance_to_segment(point, pair[0], pair[1])).fold(f32::MAX, f32::min);
+            let nearest =
+                ring.windows(2).map(|pair| distance_to_segment(point, pair[0], pair[1])).fold(f32::MAX, f32::min);
             offer(nearest, Handle::Turn(axis));
         }
         best.map(|(_, handle)| handle)
@@ -242,7 +248,8 @@ impl Handles {
     }
 
     pub fn draw(&self, overlay: &mut Overlay, active: Option<Handle>) {
-        let shown = |handle: Handle, axis: usize| if active == Some(handle) { [1.0, 1.0, 1.0] } else { AXIS_COLORS[axis] };
+        let shown =
+            |handle: Handle, axis: usize| if active == Some(handle) { [1.0, 1.0, 1.0] } else { AXIS_COLORS[axis] };
         for (axis, ring) in self.rings.iter().enumerate() {
             overlay.polyline(ring, 1.8, opaque(shown(Handle::Turn(axis), axis), 0.85));
         }
@@ -254,14 +261,21 @@ impl Handles {
             let size = dx.hypot(dy).max(1e-3);
             let (ux, uy) = (dx / size, dy / size);
             let (base, end) = ((tip.0 - ux * 12.0, tip.1 - uy * 12.0), (tip.0 + ux * 2.0, tip.1 + uy * 2.0));
-            overlay.triangle([end, (base.0 - uy * 5.0, base.1 + ux * 5.0), (base.0 + uy * 5.0, base.1 - ux * 5.0)], color);
+            overlay
+                .triangle([end, (base.0 - uy * 5.0, base.1 + ux * 5.0), (base.0 + uy * 5.0, base.1 - ux * 5.0)], color);
         }
         overlay.disc(self.center, 3.5, [1.0, 1.0, 1.0, 1.0]);
     }
 }
 
 /// The bones, as lines from each part to its parent and a dot on each.
-pub fn draw_bones(overlay: &mut Overlay, camera: &Camera, bones: &[(V3, Option<V3>)], selected: Option<usize>, size: At) {
+pub fn draw_bones(
+    overlay: &mut Overlay,
+    camera: &Camera,
+    bones: &[(V3, Option<V3>)],
+    selected: Option<usize>,
+    size: At,
+) {
     let project = camera.projector(size);
     for (index, (at, parent)) in bones.iter().enumerate() {
         let Some(here) = project(*at) else { continue };
@@ -284,7 +298,14 @@ pub fn floor_step(radius: f32) -> f32 {
 pub fn floor_quad(step: f32) -> Vec<u8> {
     let reach = step * 24.0;
     let corner = |x: f32, z: f32| [x, 0.0, z, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-    let corners = [corner(-reach, -reach), corner(reach, -reach), corner(reach, reach), corner(-reach, -reach), corner(reach, reach), corner(-reach, reach)];
+    let corners = [
+        corner(-reach, -reach),
+        corner(reach, -reach),
+        corner(reach, reach),
+        corner(-reach, -reach),
+        corner(reach, reach),
+        corner(-reach, reach),
+    ];
     corners.iter().flatten().flat_map(|value| value.to_le_bytes()).collect()
 }
 

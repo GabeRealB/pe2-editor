@@ -117,7 +117,13 @@ impl Imports {
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        Ok(Imports { store: Store::open(cache)?, known: Mutex::default(), read_from: Mutex::default(), addresses: Mutex::default(), stop: Arc::default() })
+        Ok(Imports {
+            store: Store::open(cache)?,
+            known: Mutex::default(),
+            read_from: Mutex::default(),
+            addresses: Mutex::default(),
+            stop: Arc::default(),
+        })
     }
 
     /// Sweep the store of what the project's nodes no longer make, and of what nodes it no longer has made
@@ -225,7 +231,8 @@ impl Imports {
         let reach = graph::exec::Reach { engine: &engine, world: &world };
         // Each asset's by itself, at the same time, as all of it only reads.
         let held = &*known;
-        let looked = crate::parallel(&assets, |asset| (!self.stopping()).then(|| self.look(asset, extensions, reach, held)));
+        let looked =
+            crate::parallel(&assets, |asset| (!self.stopping()).then(|| self.look(asset, extensions, reach, held)));
         let mut made = self.make(&world, &assets, &looked, extensions, reach, report);
         let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
@@ -236,7 +243,10 @@ impl Imports {
         }
         for (at, (asset, look)) in assets.into_iter().zip(looked).enumerate() {
             let Some(look) = look else { return attached };
-            let wrong = |p: graph::Problem| Problem::Stack { asset: asset.path.clone(), error: format!("{}: {}", p.at, p.what) };
+            let wrong = |p: graph::Problem| Problem::Stack {
+                asset: asset.path.clone(),
+                error: format!("{}: {}", p.at, p.what),
+            };
             stacks.extend(look.wrong.into_iter().map(wrong));
             let Some((key, import)) = look.import else { continue };
             let done = match import {
@@ -259,7 +269,11 @@ impl Imports {
                     } else {
                         attached.kept += 1;
                     }
-                    let nodes = reads.outputs.keys().map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string()).collect();
+                    let nodes = reads
+                        .outputs
+                        .keys()
+                        .map(|read| read.split_once('#').map_or(read.as_str(), |(of, _)| of).to_string())
+                        .collect();
                     read_from.push((asset.path.clone(), nodes));
                     new.push((key.clone(), (reads, import.clone())));
                     found.push((asset.path.clone(), key, import));
@@ -277,8 +291,11 @@ impl Imports {
         known.extend(new);
         drop(known);
         self.read_from.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(read_from);
-        let mut problems: Vec<Problem> =
-            attached.failed.iter().map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() }).collect();
+        let mut problems: Vec<Problem> = attached
+            .failed
+            .iter()
+            .map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() })
+            .collect();
         problems.extend(stacks);
         problems.extend(self.give(index, found));
         problems.extend(self.missing_outputs(index, extensions, only));
@@ -320,12 +337,17 @@ impl Imports {
                     made_by: Some(import.importer.clone()),
                 });
             }
-            problems.extend(resolved.overridden.iter().map(|setting| Problem::Overridden {
-                asset: path.clone(),
-                setting: setting.clone(),
-            }));
-            problems.extend(resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }));
-            problems.extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
+            problems.extend(
+                resolved
+                    .overridden
+                    .iter()
+                    .map(|setting| Problem::Overridden { asset: path.clone(), setting: setting.clone() }),
+            );
+            problems.extend(
+                resolved.orphans.iter().map(|part| Problem::Orphan { asset: path.clone(), part: part.clone() }),
+            );
+            problems
+                .extend(resolved.notes.iter().map(|note| Problem::Taken { asset: path.clone(), note: note.clone() }));
             asset.imported = Some(resolved);
         }
         problems
@@ -341,15 +363,25 @@ impl Imports {
         let held = &*known;
         let listed = crate::parallel(&targets, |(target, references)| {
             // Of the assets attached: the references to them, and from them.
-            let named: Vec<_> = references.iter().filter(|r| r.output.is_some() && (of(target) || of(&r.from))).collect();
-            let asset = index.assets.get(*target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())?;
+            let named: Vec<_> =
+                references.iter().filter(|r| r.output.is_some() && (of(target) || of(&r.from))).collect();
+            let asset =
+                index.assets.get(*target).filter(|a| !named.is_empty() && extensions.node_type_of(a).is_some())?;
             // Of what it makes, what is named: listing the members of the rest would be asking its extension for nothing.
             let mut families: Vec<&str> = named.iter().filter_map(|r| r.output.as_deref()?.split('/').next()).collect();
             families.sort_unstable();
             families.dedup();
             let digest = sha1_hex(format!("{}\n{}", families.join(" "), asset.settings_text()).as_bytes());
             let addresses = held.get(*target).filter(|(d, _)| *d == digest).map_or_else(
-                || Arc::new(extensions.addresses_of(asset, Some(&families)).into_iter().map(|(address, _)| address).collect::<HashSet<_>>()),
+                || {
+                    Arc::new(
+                        extensions
+                            .addresses_of(asset, Some(&families))
+                            .into_iter()
+                            .map(|(address, _)| address)
+                            .collect::<HashSet<_>>(),
+                    )
+                },
                 |(_, addresses)| addresses.clone(),
             );
             let problems: Vec<Problem> = named
@@ -373,12 +405,17 @@ impl Imports {
         }
         problems
     }
-
 }
 
 impl Imports {
     /// What there is of an asset's import without making anything.
-    fn look(&self, asset: &Asset, extensions: &Extensions, reach: graph::exec::Reach<'_>, held: &HashMap<String, (Reads, Arc<Known>)>) -> Look {
+    fn look(
+        &self,
+        asset: &Asset,
+        extensions: &Extensions,
+        reach: graph::exec::Reach<'_>,
+        held: &HashMap<String, (Reads, Arc<Known>)>,
+    ) -> Look {
         let (plan, wrong) = extensions.plan(asset);
         let Some((importer, output)) = import_output(&plan, extensions) else { return Look { wrong, import: None } };
         let key = reach.engine.key(&plan, asset, output, None);
@@ -426,7 +463,9 @@ impl Imports {
         for level in in_order(world.index, &paths) {
             let level: Vec<_> = level.into_iter().map(|at| to_make[at]).collect();
             let done = crate::parallel(&level, |(at, key, importer, plan, output)| {
-                (!self.stopping()).then(|| (*at, self.import(assets[*at], extensions, reach, ((*importer).clone(), plan, *output), key)))
+                (!self.stopping()).then(|| {
+                    (*at, self.import(assets[*at], extensions, reach, ((*importer).clone(), plan, *output), key))
+                })
             });
             made.extend(done.into_iter().flatten());
         }
@@ -449,15 +488,20 @@ impl Imports {
         let (reads, import) = known_of(extensions, importer, kept, trace.reads)?;
         Ok((true, reads, import))
     }
-
 }
 
 /// These nodes in rounds, by their places, each round after those holding what its nodes refer to. Nodes referring to each
 /// other in a circle go last: what they make of it is theirs to say.
 fn in_order(index: &Index, paths: &[&str]) -> Vec<Vec<usize>> {
     let places: HashMap<&str, usize> = paths.iter().enumerate().map(|(at, path)| (*path, at)).collect();
-    let reads = |at: usize| index.references_from(paths[at]).into_iter().filter_map(|r| places.get(index.resolve(&r.uid, &r.target)?.path.as_str()).copied());
-    let mut waiting: Vec<(usize, HashSet<usize>)> = (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();
+    let reads = |at: usize| {
+        index
+            .references_from(paths[at])
+            .into_iter()
+            .filter_map(|r| places.get(index.resolve(&r.uid, &r.target)?.path.as_str()).copied())
+    };
+    let mut waiting: Vec<(usize, HashSet<usize>)> =
+        (0..paths.len()).map(|at| (at, reads(at).filter(|other| *other != at).collect())).collect();
     let mut rounds = Vec::new();
     while !waiting.is_empty() {
         let (free, rest): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, on)| on.is_empty());
@@ -486,7 +530,9 @@ fn known_of(extensions: &Extensions, importer: String, kept: Kept, reads: Reads)
 /// does not have, and what is no longer what it took in.
 fn extension_problems(extensions: &Extensions) -> Vec<Problem> {
     let refused = extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
-        (Origin::Project { asset, .. }, Status::Refused(why)) => Some(Problem::Extension { asset: asset.clone(), error: why.clone() }),
+        (Origin::Project { asset, .. }, Status::Refused(why)) => {
+            Some(Problem::Extension { asset: asset.clone(), error: why.clone() })
+        }
         _ => None,
     });
     let unmet = extensions.unmet.iter().map(|(id, why)| Problem::Required { id: id.clone(), why: why.clone() });
@@ -734,13 +780,19 @@ mod attaching {
     fn strips(r: &mut Registry) -> Result<()> {
         let _ = r.value_type::<Line>();
         let _ = r.value_type::<Strip>();
-        let _ = r.op("cell").input::<Strip>("native").output::<ty::Image>().parameter::<String>("name").provides("cells").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|_| Ok(Image::default()));
         let _ = r
-            .named_type("strip")
-            .alias("strip")
-            .of(Strip::NAME)
-            .register();
-        let _ = r.op("line").input::<Line>("source").output::<Strip>().derives("size").derives("cells.*.rect").run(strip);
+            .op("cell")
+            .input::<Strip>("native")
+            .output::<ty::Image>()
+            .parameter::<String>("name")
+            .provides("cells")
+            .members(|asset| {
+                asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()
+            })
+            .run(|_| Ok(Image::default()));
+        let _ = r.named_type("strip").alias("strip").of(Strip::NAME).register();
+        let _ =
+            r.op("line").input::<Line>("source").output::<Strip>().derives("size").derives("cells.*.rect").run(strip);
         // The same, saying nothing of what it makes.
         let _ = r.op("silent_line").input::<Line>("source").output::<Strip>().run(strip);
         Ok(())
@@ -756,7 +808,8 @@ mod attaching {
             cells.insert((*name).to_string(), Value::Table(Table::from_iter([("rect".to_string(), rect)])));
         }
         let mut settings = Table::new();
-        settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
+        settings
+            .insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(names.len())?), Value::Integer(1)]));
         settings.insert("cells".into(), Value::Table(cells));
         let files = vec![File::new("native.bin", source.bytes().rev().collect())];
         Ok(Typed { ty: Strip::NAME.into(), files, settings, ..Typed::default() })
@@ -787,7 +840,12 @@ mod attaching {
     fn links(r: &mut Registry) -> Result<()> {
         let _ = r.value_type::<Strip>();
         let next_of = |call: &pe2_ext::Call<'_>| call.settings.get("next").and_then(Value::as_str).map(str::to_string);
-        let reads = move |call: &mut pe2_ext::Call<'_>| Ok(pe2_ext::Prepared { needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, "native")).collect(), micros: Vec::new() });
+        let reads = move |call: &mut pe2_ext::Call<'_>| {
+            Ok(pe2_ext::Prepared {
+                needs: next_of(call).iter().map(|next| pe2_ext::Need::new(next, "native")).collect(),
+                micros: Vec::new(),
+            })
+        };
         let _ = r.op("link").output::<Strip>().prepare(reads).run(|call| {
             let depth = DEPTH.with(|depth| {
                 depth.set(depth.get() + 1);
@@ -798,7 +856,11 @@ mod attaching {
             let read = next.map(|next| call.output_of(&next, "native")).transpose();
             DEPTH.with(|depth| depth.set(depth.get() - 1));
             read?;
-            Ok(Typed { ty: Strip::NAME.into(), files: vec![File::new("native.bin", b"a".to_vec())], ..Typed::default() })
+            Ok(Typed {
+                ty: Strip::NAME.into(),
+                files: vec![File::new("native.bin", b"a".to_vec())],
+                ..Typed::default()
+            })
         });
         Ok(())
     }
@@ -812,11 +874,27 @@ mod attaching {
         // Named last first, so that the order they are found in is the wrong one.
         for at in 0..COUNT {
             let next = if at + 1 == COUNT { String::new() } else { format!("next = \"uid://n{}\"\n", at + 1) };
-            let stack = format!("[[stack]]\nop = \"test.strips@link\"\n{next}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n");
-            write(&root, &format!(".layers/base/n{at:02}.node/node.toml"), &format!("uid = \"uid://n{at}\"\n\n{stack}"));
+            let stack = format!(
+                "[[stack]]\nop = \"test.strips@link\"\n{next}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n"
+            );
+            write(
+                &root,
+                &format!(".layers/base/n{at:02}.node/node.toml"),
+                &format!("uid = \"uid://n{at}\"\n\n{stack}"),
+            );
         }
         let extensions = Extensions::load(
-            vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: links })],
+            vec![Loadable::from(Extension {
+                id: "test.strips",
+                version: "0.1.0",
+                requires: &[],
+                weak: &[],
+                optional: &[],
+                provides: &[],
+                platforms: &[],
+                unsandboxed: false,
+                register: links,
+            })],
             true,
         );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
@@ -829,9 +907,13 @@ mod attaching {
     /// `strips`, and `copy`: a strip of what `uid://s` makes, read as it runs - no `references` layer says it.
     fn copying(r: &mut Registry) -> Result<()> {
         strips(r)?;
-        let needs = |_: &mut pe2_ext::Call<'_>| Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", "native")], micros: Vec::new() });
+        let needs = |_: &mut pe2_ext::Call<'_>| {
+            Ok(pe2_ext::Prepared { needs: vec![pe2_ext::Need::new("uid://s", "native")], micros: Vec::new() })
+        };
         let _ = r.op("copy").output::<Strip>().prepare(needs).run(|call| {
-            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", "native")? else { anyhow::bail!("uid://s makes no files") };
+            let pe2_ext::Data::Typed(read) = call.output_of("uid://s", "native")? else {
+                anyhow::bail!("uid://s makes no files")
+            };
             let bytes = call.read(read.file()?)?;
             anyhow::ensure!(!bytes.is_empty(), "uid://s is empty");
             Ok(Typed { ty: Strip::NAME.into(), files: vec![File::new("native.bin", bytes)], ..Typed::default() })
@@ -849,7 +931,17 @@ mod attaching {
         let copy = "[[stack]]\nop = \"test.strips@copy\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\nwhen = \"eager\"\n";
         // Read through another: `c` copies `uid://s`, which nothing of its declaration names.
         write(&root, ".layers/base/c.node/node.toml", &format!("uid = \"uid://c\"\n{copy}"));
-        let extension = Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: copying };
+        let extension = Extension {
+            id: "test.strips",
+            version: "0.1.0",
+            requires: &[],
+            weak: &[],
+            optional: &[],
+            provides: &[],
+            platforms: &[],
+            unsandboxed: false,
+            register: copying,
+        };
         let extensions = Extensions::load(vec![Loadable::from(extension)], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let project = Project::load(&root).unwrap();
@@ -894,7 +986,17 @@ mod attaching {
         for (path, declaration) in nodes {
             write(&root, &format!(".layers/base/{path}.node/node.toml"), declaration);
         }
-        let extension = Extension { id: "test.staged", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: stages };
+        let extension = Extension {
+            id: "test.staged",
+            version: "0.1.0",
+            requires: &[],
+            weak: &[],
+            optional: &[],
+            provides: &[],
+            platforms: &[],
+            unsandboxed: false,
+            register: stages,
+        };
         let extensions = Extensions::load(vec![Loadable::from(extension)], true);
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         (root, extensions)
@@ -902,7 +1004,9 @@ mod attaching {
 
     /// A node of one layer of `test.staged`, with what is set on it, kept or not.
     fn staged_node(op: &str, settings: &str, retain: &str) -> String {
-        format!("[[stack]]\nop = \"test.staged@{op}\"\n{settings}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"{retain}\"\n")
+        format!(
+            "[[stack]]\nop = \"test.staged@{op}\"\n{settings}\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"{retain}\"\n"
+        )
     }
 
     fn one_table(key: &str, value: &str) -> Table {
@@ -925,12 +1029,24 @@ mod attaching {
         });
         // Reads each of its `reads`, a list of nodes.
         let list = |call: &pe2_ext::Call<'_>| -> Vec<String> {
-            call.settings.get("reads").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+            call.settings
+                .get("reads")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
         };
         let _ = r
             .op("reader")
             .output::<ty::Table>()
-            .prepare(move |call| Ok(pe2_ext::Prepared { needs: list(call).iter().map(|node| pe2_ext::Need::new(node, "native")).collect(), micros: Vec::new() }))
+            .prepare(move |call| {
+                Ok(pe2_ext::Prepared {
+                    needs: list(call).iter().map(|node| pe2_ext::Need::new(node, "native")).collect(),
+                    micros: Vec::new(),
+                })
+            })
             .run(move |call| {
                 for node in list(call) {
                     call.table_of(&node, "native")?;
@@ -956,13 +1072,32 @@ mod attaching {
             .op("whole")
             .output::<ty::Table>()
             .prepare(|call| {
-                let names: Vec<String> = call.settings.get("pieces").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let names: Vec<String> = call
+                    .settings
+                    .get("pieces")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
                 let mut micros: Vec<pe2_ext::Micro> = names
                     .iter()
-                    .map(|name| pe2_ext::Micro { op: "piece".into(), label: name.clone(), settings: one_table("name", name), ports: vec![], keep: true })
+                    .map(|name| pe2_ext::Micro {
+                        op: "piece".into(),
+                        label: name.clone(),
+                        settings: one_table("name", name),
+                        ports: vec![],
+                        keep: true,
+                    })
                     .collect();
                 let pieces = (0..names.len()).map(pe2_ext::MicroInput::micro).collect();
-                micros.push(pe2_ext::Micro { op: "join".into(), label: "join".into(), ports: vec![pieces], ..pe2_ext::Micro::default() });
+                micros.push(pe2_ext::Micro {
+                    op: "join".into(),
+                    label: "join".into(),
+                    ports: vec![pieces],
+                    ..pe2_ext::Micro::default()
+                });
                 Ok(pe2_ext::Prepared { needs: Vec::new(), micros })
             })
             .run(|_| anyhow::bail!("it is done by its micro ops"));
@@ -981,10 +1116,16 @@ mod attaching {
     fn what_is_transient_lasts_the_run_and_no_longer() {
         let shared = staged_node("counted", "as = \"lasting\"", "transient");
         let reads = "reads = [\"shared\"]";
-        let nodes = [("shared", shared), ("a", staged_node("reader", reads, "transient")), ("b", staged_node("reader", reads, "transient"))];
+        let nodes = [
+            ("shared", shared),
+            ("a", staged_node("reader", reads, "transient")),
+            ("b", staged_node("reader", reads, "transient")),
+        ];
         let (root, extensions) = staged("lasting", &nodes);
         let (_lock, cache, index) = opened(&root);
-        let make = |engine: &crate::graph::exec::Engine, at: &str| extensions.output(engine, &index, &index.assets[at], "native", true).unwrap();
+        let make = |engine: &crate::graph::exec::Engine, at: &str| {
+            extensions.output(engine, &index, &index.assets[at], "native", true).unwrap()
+        };
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let run = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone())).for_a_run();
         drop((make(&run, "a"), make(&run, "b")));
@@ -1007,7 +1148,10 @@ mod attaching {
         ];
         let (root, extensions) = staged("hops", &nodes);
         let (_lock, cache, index) = opened(&root);
-        let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(crate::graph::store::Store::open(&cache).unwrap()));
+        let engine = crate::graph::exec::Engine::new(
+            extensions.operations(),
+            Some(crate::graph::store::Store::open(&cache).unwrap()),
+        );
         let given = extensions.output(&engine, &index, &index.assets["hop"], "native", true).unwrap();
         let value = format!("{:?}", given.value.unwrap());
         assert!(value.contains("arrived"), "{value}");
@@ -1016,10 +1160,17 @@ mod attaching {
 
     #[test]
     fn a_circle_of_reads_is_said_rather_than_followed() {
-        let nodes = [("a", staged_node("reader", "reads = [\"b\", \"c\"]", "transient")), ("b", staged_node("reader", "reads = [\"a\"]", "transient")), ("c", staged_node("reader", "reads = [\"a\"]", "transient"))];
+        let nodes = [
+            ("a", staged_node("reader", "reads = [\"b\", \"c\"]", "transient")),
+            ("b", staged_node("reader", "reads = [\"a\"]", "transient")),
+            ("c", staged_node("reader", "reads = [\"a\"]", "transient")),
+        ];
         let (root, extensions) = staged("circle", &nodes);
         let (_lock, cache, index) = opened(&root);
-        let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(crate::graph::store::Store::open(&cache).unwrap()));
+        let engine = crate::graph::exec::Engine::new(
+            extensions.operations(),
+            Some(crate::graph::store::Store::open(&cache).unwrap()),
+        );
         let why = extensions.output(&engine, &index, &index.assets["a"], "native", true).err().expect("a circle");
         assert!(format!("{why:#}").contains("reads, through others, itself"), "{why:#}");
         let _ = std::fs::remove_dir_all(&root);
@@ -1033,7 +1184,8 @@ mod attaching {
         let store = crate::graph::store::Store::open(&cache).unwrap();
         let make = |index: &Index| {
             let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
-            let value = extensions.output(&engine, index, &index.assets["whole"], "native", true).unwrap().value.unwrap();
+            let value =
+                extensions.output(&engine, index, &index.assets["whole"], "native", true).unwrap().value.unwrap();
             format!("{value:?}")
         };
         let first = make(&index);
@@ -1064,8 +1216,20 @@ mod attaching {
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\n{STACK}"));
         write(&root, ".layers/base/s.node/source.txt", "a b");
-        let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        let extensions = Extensions::load(
+            vec![Loadable::from(Extension {
+                id: "test.strips",
+                version: "0.1.0",
+                requires: &[],
+                weak: &[],
+                optional: &[],
+                provides: &[],
+                platforms: &[],
+                unsandboxed: false,
+                register: strips,
+            })],
+            true,
+        );
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
@@ -1090,12 +1254,26 @@ mod attaching {
         write(
             &root,
             ".layers/base/s.node/node.toml",
-            &format!("uid = \"uid://s\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"),
+            &format!(
+                "uid = \"uid://s\"\nsize = [9, 9]\ncells.a = {{ palette = \"warm\" }}\ncells.gone = {{}}\n{STACK}"
+            ),
         );
         write(&root, ".layers/base/s.node/source.txt", "a b");
         write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
-        let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        let extensions = Extensions::load(
+            vec![Loadable::from(Extension {
+                id: "test.strips",
+                version: "0.1.0",
+                requires: &[],
+                weak: &[],
+                optional: &[],
+                provides: &[],
+                platforms: &[],
+                unsandboxed: false,
+                register: strips,
+            })],
+            true,
+        );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, attached) = open(&root, &extensions);
         assert_eq!((attached.made, attached.kept, attached.failed.len()), (1, 0, 0));
@@ -1110,7 +1288,9 @@ mod attaching {
         let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
         problems.sort();
         assert_eq!(problems.len(), 3, "{problems:?}");
-        assert!(matches!(index.problems.iter().find(|p| matches!(p, Problem::MissingOutput { .. })), Some(Problem::MissingOutput { output, .. }) if output == "cells/z"));
+        assert!(
+            matches!(index.problems.iter().find(|p| matches!(p, Problem::MissingOutput { .. })), Some(Problem::MissingOutput { output, .. }) if output == "cells/z")
+        );
         assert!(index.problems.iter().any(|p| matches!(p, Problem::Overridden { setting, .. } if setting == "size")));
         assert!(index.problems.iter().any(|p| matches!(p, Problem::Orphan { part, .. } if part == "cells.gone")));
         // Opened again: found made. The source changed: made again, its old import swept.
@@ -1135,18 +1315,35 @@ mod attaching {
         let _ = std::fs::remove_dir_all(&root);
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n");
         let stack = STACK.replace("test.strips@line", "test.strips@silent_line");
-        write(&root, ".layers/base/s.node/node.toml", &format!("uid = \"uid://s\"\ncells.a = {{ palette = \"warm\" }}\n{stack}"));
+        write(
+            &root,
+            ".layers/base/s.node/node.toml",
+            &format!("uid = \"uid://s\"\ncells.a = {{ palette = \"warm\" }}\n{stack}"),
+        );
         write(&root, ".layers/base/s.node/source.txt", "a b");
         write(&root, ".layers/base/r.node/node.toml", "fine = \"uid://s#cells/b\"\nbad = \"uid://s#cells/z\"\n");
-        let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        let extensions = Extensions::load(
+            vec![Loadable::from(Extension {
+                id: "test.strips",
+                version: "0.1.0",
+                requires: &[],
+                weak: &[],
+                optional: &[],
+                provides: &[],
+                platforms: &[],
+                unsandboxed: false,
+                register: strips,
+            })],
+            true,
+        );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, _) = open(&root, &extensions);
         let settings = index.assets["s"].settings();
         assert_eq!(settings["cells"]["a"]["palette"].as_str(), Some("warm"));
         assert!(settings["cells"]["a"]["rect"].is_array(), "what the node says stays, what was made joins it");
         assert!(settings["cells"]["b"]["rect"].is_array());
-        let missing: Vec<&Problem> = index.problems.iter().filter(|p| matches!(p, Problem::MissingOutput { .. })).collect();
+        let missing: Vec<&Problem> =
+            index.problems.iter().filter(|p| matches!(p, Problem::MissingOutput { .. })).collect();
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert!(format!("{:?}", missing[0]).contains("cells/z"), "{missing:?}");
         std::fs::remove_dir_all(&root).unwrap();
@@ -1179,8 +1376,20 @@ mod attaching {
         write(&root, ".layers/base/t.node/node.toml", &format!("uid = \"uid://t\"\n{declared}"));
         write(&root, ".layers/base/t.node/source.txt", "a");
         write(&root, ".layers/base/r.node/node.toml", "one = \"uid://s#cells/b\"\ntwo = \"uid://t#cells/b\"\n");
-        let extensions =
-            Extensions::load(vec![Loadable::from(Extension { id: "test.strips", version: "0.1.0", requires: &[], weak: &[], optional: &[], provides: &[], platforms: &[], unsandboxed: false, register: strips })], true);
+        let extensions = Extensions::load(
+            vec![Loadable::from(Extension {
+                id: "test.strips",
+                version: "0.1.0",
+                requires: &[],
+                weak: &[],
+                optional: &[],
+                provides: &[],
+                platforms: &[],
+                unsandboxed: false,
+                register: strips,
+            })],
+            true,
+        );
         let project = Project::load(&root).unwrap();
         let (mut index, _) = open(&root, &extensions);
         let lock = Lock::try_acquire(&root, "a test").unwrap();

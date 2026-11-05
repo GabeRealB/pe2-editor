@@ -108,7 +108,11 @@ fn main() {
         let handles: Vec<_> = streams
             .chunks(per)
             .map(|part| {
-                scope.spawn(move || part.iter().map(|s| (s.kind, lzss::encode(&s.data) == s.stored, s.origin.as_str())).collect::<Vec<_>>())
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|s| (s.kind, lzss::encode(&s.data) == s.stored, s.origin.as_str()))
+                        .collect::<Vec<_>>()
+                })
             })
             .collect();
         handles.into_iter().flat_map(|h| h.join().expect("a worker")).collect()

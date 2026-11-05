@@ -14,8 +14,8 @@ use crate::panes::{self, EditorKind, Pane, PaneAction, PaneKind, PaneState, Pane
 use crate::settings::EditorSettings;
 use crate::windows::{Layouts, Window};
 use crate::workspace::{EditRequest, GraphAsk, Update, Workspace};
-use pe2_ext::events::{Build, Clean, ConfigChanged, Event};
 use crate::{icons, theme};
+use pe2_ext::events::{Build, Clean, ConfigChanged, Event};
 use project::history::StepError;
 
 /// What eframe and earlier versions stored and nothing reads any more. eframe's window goes on being applied, whether or not it
@@ -285,8 +285,9 @@ impl Editor {
         if let Some(opening) = &mut editor.opening {
             opening.select = start.select;
         }
-        if let Some(kind) =
-            start.show.and_then(|name| PaneKind::with_panels().into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
+        if let Some(kind) = start
+            .show
+            .and_then(|name| PaneKind::with_panels().into_iter().find(|k| k.title().eq_ignore_ascii_case(&name)))
         {
             editor.show_pane(Pane::first(kind));
         }
@@ -339,7 +340,8 @@ impl Editor {
                 // A layout outlives a project: tabs of what is not here close, and what is in front is what is selected.
                 self.layouts.close_documents(|path| !ws.exists(path));
                 self.opened = None;
-                let front = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
+                let front =
+                    self.layouts.active_document().and_then(|pane| self.layouts.subject(pane)).map(str::to_string);
                 if let Some(path) = opening.select.filter(|p| ws.exists(p)).or(front) {
                     ws.navigate(path);
                 }
@@ -369,7 +371,10 @@ impl Editor {
     fn opening_shown(&self) -> Option<panes::OpeningShown> {
         let opening = self.opening.as_ref()?;
         let (stage, done, total) = opening.progress.lock().map_or_default(|p| p.clone());
-        let name = opening.dir.file_name().map_or_else(|| opening.dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let name = opening
+            .dir
+            .file_name()
+            .map_or_else(|| opening.dir.display().to_string(), |n| n.to_string_lossy().into_owned());
         #[expect(clippy::cast_precision_loss, reason = "a fraction shown")]
         let fraction = (total > 0).then(|| done as f32 / total as f32);
         Some(panes::OpeningShown { name, stage, fraction })
@@ -695,14 +700,29 @@ impl Editor {
         let ws = self.workspace.as_ref();
         let document = self.layouts.active_document();
         match command {
-            Command::Palette | Command::OpenProject | Command::Quit | Command::Settings | Command::DocumentsOnly
-            | Command::Maximize | Command::Fullscreen | Command::ResetLayout | Command::NewMode | Command::ResetMode | Command::ZoomIn | Command::ZoomOut
-            | Command::ActualSize | Command::PerformanceOverlay | Command::Pane(_) | Command::Mode(_) => true,
+            Command::Palette
+            | Command::OpenProject
+            | Command::Quit
+            | Command::Settings
+            | Command::DocumentsOnly
+            | Command::Maximize
+            | Command::Fullscreen
+            | Command::ResetLayout
+            | Command::NewMode
+            | Command::ResetMode
+            | Command::ZoomIn
+            | Command::ZoomOut
+            | Command::ActualSize
+            | Command::PerformanceOverlay
+            | Command::Pane(_)
+            | Command::Mode(_) => true,
             Command::DeleteMode => self.layouts.modes.len() > 1,
             Command::Undo => ws.is_some_and(|ws| !ws.history.done().is_empty()),
             Command::Redo => ws.is_some_and(|ws| !ws.history.undone().is_empty()),
             Command::Back => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_back() } else { ws.can_go_back() }),
-            Command::Forward => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_forward() } else { ws.can_go_forward() }),
+            Command::Forward => {
+                ws.is_some_and(|ws| if self.in_browser { ws.can_folder_forward() } else { ws.can_go_forward() })
+            }
             Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_empty()),
             Command::CloseTab | Command::NextTab | Command::PreviousTab => self.layouts.has_tab(),
             // A view the document's asset has: not every asset has a graph, a preview or an extension's editor.
@@ -716,10 +736,16 @@ impl Editor {
             Command::CancelEpoch => ws.is_some_and(Workspace::in_epoch),
             Command::DeleteSelected => ws.is_some_and(|ws| ws.removing_selected().is_some()),
             // Its graph shown: asked for, and the asset having one.
-            Command::GraphFit | Command::GraphArrange => document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| {
-                state.editor == Some(EditorKind::Graph)
-                    && state.pinned.as_deref().zip(ws).is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&EditorKind::Graph))
-            }),
+            Command::GraphFit | Command::GraphArrange => {
+                document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| {
+                    state.editor == Some(EditorKind::Graph)
+                        && state
+                            .pinned
+                            .as_deref()
+                            .zip(ws)
+                            .is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&EditorKind::Graph))
+                })
+            }
         }
     }
 
@@ -728,7 +754,8 @@ impl Editor {
         match command {
             Command::Palette => self.palette = self.palette.is_none().then(Palette::default),
             Command::OpenProject => {
-                self.open_dialog = Some(self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()));
+                self.open_dialog =
+                    Some(self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()));
             }
             Command::Import => self.import = Some(String::new()),
             Command::Build => self.signal(Build::NAME),
@@ -911,7 +938,12 @@ impl Editor {
         if ctx.input(|i| i.viewport().inner_rect.is_none()) {
             self.refill = None;
             let size = ctx.content_rect().size();
-            self.place = Some(crate::windows::Place { position: [0.0, 0.0], size: size.into(), contents: [0.0, 0.0], scale: 0.0 });
+            self.place = Some(crate::windows::Place {
+                position: [0.0, 0.0],
+                size: size.into(),
+                contents: [0.0, 0.0],
+                scale: 0.0,
+            });
             return;
         }
         // Noticed first: what a window does on its way out is not a place.
@@ -955,7 +987,9 @@ impl Editor {
         let typing = ctx.egui_wants_keyboard_input();
         for (binding, command) in bound {
             let pressed = match binding {
-                Binding::Key(shortcut) => (!typing || command == Command::Palette) && ctx.input_mut(|i| i.consume_shortcut(&shortcut)),
+                Binding::Key(shortcut) => {
+                    (!typing || command == Command::Palette) && ctx.input_mut(|i| i.consume_shortcut(&shortcut))
+                }
                 Binding::Mouse(button) => ctx.input(|i| i.pointer.button_pressed(button)),
             };
             if pressed {
@@ -980,7 +1014,9 @@ impl Editor {
     fn palette_ui(&mut self, ctx: &egui::Context) {
         let Some(mut palette) = self.palette.take() else { return };
         let mut found: Vec<(u32, String, Command)> = Vec::new();
-        for command in self.commands().into_iter().filter(|command| self.can_run(*command) && *command != Command::Palette) {
+        for command in
+            self.commands().into_iter().filter(|command| self.can_run(*command) && *command != Command::Palette)
+        {
             let title = self.title_of(command);
             if let Some(rank) = crate::commands::rank(&title, &palette.typed) {
                 found.push((rank, title, command));
@@ -992,7 +1028,8 @@ impl Editor {
             (key(egui::Key::ArrowUp), key(egui::Key::ArrowDown), key(egui::Key::Enter), key(egui::Key::Escape))
         });
         let last = found.len().saturating_sub(1);
-        palette.at = if down { (palette.at + 1).min(last) } else { palette.at.saturating_sub(usize::from(up)).min(last) };
+        palette.at =
+            if down { (palette.at + 1).min(last) } else { palette.at.saturating_sub(usize::from(up)).min(last) };
         let mut chosen = (enter && !found.is_empty()).then(|| found[palette.at].2);
         let drawn = egui::Area::new(egui::Id::unique("palette"))
             .order(egui::Order::Foreground)
@@ -1001,7 +1038,9 @@ impl Editor {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).fill(ui.visuals().panel_fill).show(ui, |ui| {
                     ui.set_width(520.0);
-                    let edit = egui::TextEdit::singleline(&mut palette.typed).hint_text("Type a command").desired_width(f32::INFINITY);
+                    let edit = egui::TextEdit::singleline(&mut palette.typed)
+                        .hint_text("Type a command")
+                        .desired_width(f32::INFINITY);
                     let edit = ui.add(edit);
                     edit.request_focus();
                     if edit.changed() {
@@ -1011,7 +1050,8 @@ impl Editor {
                     egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
                         for (at, (_, title, command)) in found.iter().enumerate() {
                             let keys = command.keys(&self.settings);
-                            let row = egui::Button::selectable(at == palette.at, title.as_str()).right_text(RichText::new(keys).small().color(theme::weak()));
+                            let row = egui::Button::selectable(at == palette.at, title.as_str())
+                                .right_text(RichText::new(keys).small().color(theme::weak()));
                             let row = ui.add_sized([ui.available_width(), 22.0], row);
                             if at == palette.at && (up || down) {
                                 row.scroll_to_me(None);
@@ -1026,7 +1066,9 @@ impl Editor {
                     });
                 });
             });
-        let away = ctx.input(|i| i.pointer.any_pressed() && i.pointer.latest_pos().is_some_and(|at| !drawn.response.rect.contains(at)));
+        let away = ctx.input(|i| {
+            i.pointer.any_pressed() && i.pointer.latest_pos().is_some_and(|at| !drawn.response.rect.contains(at))
+        });
         if let Some(command) = chosen {
             self.run(ctx, command);
         } else if !escape && !away {
@@ -1078,7 +1120,10 @@ impl Editor {
         ui.scope(|ui| {
             ui.menu_button(format!("{}  {}", active.name, icons::CARET_DOWN), |ui| {
                 for config in &configs {
-                    let label = config.target.as_ref().map_or_else(|| config.name.clone(), |target| format!("{}  ·  {target}", config.name));
+                    let label = config
+                        .target
+                        .as_ref()
+                        .map_or_else(|| config.name.clone(), |target| format!("{}  ·  {target}", config.name));
                     if ui.selectable_label(config.name == active.name, label).clicked() {
                         chosen = Some(config.name.clone());
                         ui.close();
@@ -1124,18 +1169,22 @@ impl Editor {
     fn naming_dialog(&mut self, ctx: &egui::Context) {
         let Some(name) = &mut self.naming else { return };
         let (mut add, mut cancel) = (false, false);
-        egui::Window::new("New mode").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
-            ui.label("A copy of this mode, called:");
-            let edit = ui.add(egui::TextEdit::singleline(name).desired_width(240.0));
-            // Before it takes the focus back, or it has never lost it.
-            let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            edit.request_focus();
-            let named = !name.trim().is_empty();
-            ui.horizontal(|ui| {
-                add = ui.add_enabled(named, egui::Button::new("Add")).clicked() || (entered && named);
-                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+        egui::Window::new("New mode")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("A copy of this mode, called:");
+                let edit = ui.add(egui::TextEdit::singleline(name).desired_width(240.0));
+                // Before it takes the focus back, or it has never lost it.
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                edit.request_focus();
+                let named = !name.trim().is_empty();
+                ui.horizontal(|ui| {
+                    add = ui.add_enabled(named, egui::Button::new("Add")).clicked() || (entered && named);
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
             });
-        });
         if add {
             let name = name.trim().to_string();
             self.leave_bare();
@@ -1183,7 +1232,9 @@ impl Editor {
                     .fade_in(false)
                     .fixed_pos(egui::pos2(room.left() + 6.0, room.bottom() - size.y - 8.0))
                     .show(ui.ctx(), |ui| {
-                        let frame = egui::Frame::popup(ui.style()).inner_margin(egui::Margin::ZERO).fill(ui.visuals().panel_fill);
+                        let frame = egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::ZERO)
+                            .fill(ui.visuals().panel_fill);
                         frame.show(ui, |ui| {
                             ui.set_max_size(size);
                             ui.set_min_size(size);
@@ -1245,8 +1296,8 @@ impl Editor {
                         workspace: self.workspace.as_mut(),
                         nav: None,
                         pick: None,
-                focus: None,
-                reveal,
+                        focus: None,
+                        reveal,
                         settings: &mut self.settings,
                         layers: &mut self.layers_state,
                         states: &mut self.layouts.states,
@@ -1323,8 +1374,13 @@ impl Editor {
         let view_edit = self.workspace.as_mut().and_then(|ws| ws.view_edit.take());
         if let Some(request) = outcome.edit.or(view_edit) {
             // An edit keeps what it edited open.
-            if matches!(request, EditRequest::Override(_) | EditRequest::OverrideIn(..) | EditRequest::EditIn(_) | EditRequest::Write { .. })
-                && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
+            if matches!(
+                request,
+                EditRequest::Override(_)
+                    | EditRequest::OverrideIn(..)
+                    | EditRequest::EditIn(_)
+                    | EditRequest::Write { .. }
+            ) && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
             {
                 self.layouts.keep(&path);
             }
@@ -1355,8 +1411,12 @@ impl Editor {
     /// What a node can be made of with no file: the templates that take none.
     fn new_node_menu(&mut self, ui: &mut egui::Ui) {
         let Some(ws) = &self.workspace else { return };
-        let mut listed: Vec<(String, String)> =
-            ws.extensions.templates().filter(|template| template.offered && !template.stored()).map(|template| (template.label.clone(), template.name.clone())).collect();
+        let mut listed: Vec<(String, String)> = ws
+            .extensions
+            .templates()
+            .filter(|template| template.offered && !template.stored())
+            .map(|template| (template.label.clone(), template.name.clone()))
+            .collect();
         listed.sort();
         let mut chosen = None;
         ui.menu_button("New node", |ui| {
@@ -1391,7 +1451,9 @@ impl Editor {
                     (label(ws.history.done().last()), label(ws.history.undone().last()))
                 });
                 let (undo, redo) = labels.unwrap_or_default();
-                let text = |verb: &str, label: &Option<String>| label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"));
+                let text = |verb: &str, label: &Option<String>| {
+                    label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"))
+                };
                 self.item(ui, Command::Undo, &text("Undo", &undo));
                 self.item(ui, Command::Redo, &text("Redo", &redo));
                 ui.separator();
@@ -1435,7 +1497,9 @@ impl Editor {
         let mut step = None;
         ui.horizontal(|ui| {
             let hint = |command: Command| format!("{} ({})", command.title(), command.keys(&self.settings));
-            let what = |command: Command, label: &str| format!("{} {label} ({})", command.title(), command.keys(&self.settings));
+            let what = |command: Command, label: &str| {
+                format!("{} {label} ({})", command.title(), command.keys(&self.settings))
+            };
             let Some(ws) = &mut self.workspace else {
                 let text = if self.opening.is_some() { "Opening..." } else { "No project" };
                 ui.label(RichText::new(text).color(theme::weak()));
@@ -1443,7 +1507,9 @@ impl Editor {
             };
             let done = ws.history.done().last().map(|last| what(Command::Undo, &last.label));
             let undone = ws.history.undone().last().map(|last| what(Command::Redo, &last.label));
-            for (command, icon, step_of) in [(Command::Undo, icons::ARROW_ARC_LEFT, done), (Command::Redo, icons::ARROW_ARC_RIGHT, undone)] {
+            for (command, icon, step_of) in
+                [(Command::Undo, icons::ARROW_ARC_LEFT, done), (Command::Redo, icons::ARROW_ARC_RIGHT, undone)]
+            {
                 let enabled = step_of.is_some();
                 let tip = step_of.unwrap_or_else(|| hint(command));
                 if ui.add_enabled(enabled, egui::Button::new(icon)).on_hover_text(tip).clicked() {
@@ -1475,13 +1541,16 @@ impl Editor {
     /// The active layer's name in the status bar; the pane it asks for.
     fn pane_buttons(&self, ui: &mut egui::Ui) -> Option<PaneKind> {
         let mut open = None;
-        let drawer = format!("{}  Assets  {}", icons::FOLDER, if self.drawer { icons::CARET_DOWN } else { icons::CARET_UP });
+        let drawer =
+            format!("{}  Assets  {}", icons::FOLDER, if self.drawer { icons::CARET_DOWN } else { icons::CARET_UP });
         let button = egui::Button::new(RichText::new(drawer).small()).frame(false);
         if ui.add(button).on_hover_text("The assets, in a drawer over the window").clicked() {
             open = Some(PaneKind::Assets);
         }
         if let Some(layer) = self.workspace.as_ref().and_then(|ws| ws.active_layer()) {
-            let label = egui::Label::new(RichText::new(format!("{}  {}", icons::STACK_SIMPLE, layer.name)).small().color(theme::text()));
+            let label = egui::Label::new(
+                RichText::new(format!("{}  {}", icons::STACK_SIMPLE, layer.name)).small().color(theme::text()),
+            );
             if ui.add(label.sense(egui::Sense::click())).on_hover_text("The active layer: edits go there").clicked() {
                 open = Some(PaneKind::Layers);
             }
@@ -1674,45 +1743,55 @@ impl Editor {
         let files: Vec<PathBuf> = text.lines().filter_map(local_path).collect();
         let (mut replace, mut add, mut cancel) = (false, false, false);
         let mut made: Option<(String, PathBuf)> = None;
-        egui::Window::new("Import").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
-            ui.label("Files, one a line:");
-            ui.add(egui::TextEdit::multiline(text).desired_width(460.0).desired_rows(2));
-            ui.add_space(4.0);
-            // A node of its own, as the templates taking it make one.
-            if let [file] = files.as_slice() {
-                let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                for template in ws.extensions.templates_for(name).into_iter().filter(|_| file.is_file()) {
-                    if ui.button(format!("New node: {}", template.label)).clicked() {
-                        made = Some((template.name.clone(), file.clone()));
+        egui::Window::new("Import")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Files, one a line:");
+                ui.add(egui::TextEdit::multiline(text).desired_width(460.0).desired_rows(2));
+                ui.add_space(4.0);
+                // A node of its own, as the templates taking it make one.
+                if let [file] = files.as_slice() {
+                    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                    for template in ws.extensions.templates_for(name).into_iter().filter(|_| file.is_file()) {
+                        if ui.button(format!("New node: {}", template.label)).clicked() {
+                            made = Some((template.name.clone(), file.clone()));
+                        }
                     }
                 }
-            }
-            let Some(asset) = &asset else {
-                ui.label(RichText::new("Select the asset they go into").color(theme::weak()));
-                cancel = ui.button("Cancel").clicked();
-                return;
-            };
-            let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
-            let missing = files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
-            let name_of = |file: &PathBuf| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-            let stack = match files.as_slice() {
-                [] => Err("No file yet".to_string()),
-                [file] => ws.extensions.stack_for(asset, &name_of(file)).unwrap_or_else(|| Err(format!("Nothing imports it over {name}"))),
-                _ => Err("One file replaces an asset's source".to_string()),
-            };
-            ui.horizontal(|ui| {
-                let can = stack.is_ok() && missing.is_none();
-                let button = ui.add_enabled(can, egui::Button::new(format!("Replace the source of {name}")));
-                let button = button.on_disabled_hover_text(stack.clone().err().or_else(|| missing.clone()).unwrap_or_default());
-                replace = button.clicked();
-                let can = !files.is_empty() && missing.is_none();
-                add = ui.add_enabled(can, egui::Button::new(format!("Add to {name}"))).clicked();
-                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                let Some(asset) = &asset else {
+                    ui.label(RichText::new("Select the asset they go into").color(theme::weak()));
+                    cancel = ui.button("Cancel").clicked();
+                    return;
+                };
+                let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+                let missing =
+                    files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
+                let name_of =
+                    |file: &PathBuf| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                let stack = match files.as_slice() {
+                    [] => Err("No file yet".to_string()),
+                    [file] => ws
+                        .extensions
+                        .stack_for(asset, &name_of(file))
+                        .unwrap_or_else(|| Err(format!("Nothing imports it over {name}"))),
+                    _ => Err("One file replaces an asset's source".to_string()),
+                };
+                ui.horizontal(|ui| {
+                    let can = stack.is_ok() && missing.is_none();
+                    let button = ui.add_enabled(can, egui::Button::new(format!("Replace the source of {name}")));
+                    let button = button
+                        .on_disabled_hover_text(stack.clone().err().or_else(|| missing.clone()).unwrap_or_default());
+                    replace = button.clicked();
+                    let can = !files.is_empty() && missing.is_none();
+                    add = ui.add_enabled(can, egui::Button::new(format!("Add to {name}"))).clicked();
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+                if let Some(why) = missing.or(stack.err()) {
+                    ui.label(RichText::new(why).small().color(theme::weak()));
+                }
             });
-            if let Some(why) = missing.or(stack.err()) {
-                ui.label(RichText::new(why).small().color(theme::weak()));
-            }
-        });
         if let Some((template, file)) = made {
             self.import = None;
             if let Some(ws) = &mut self.workspace
@@ -1850,7 +1929,11 @@ impl Editor {
 
     /// Whether something it set going has yet to show.
     pub fn busy(&self) -> bool {
-        self.opening.is_some() || !self.deferred.is_empty() || self.workspace.as_ref().is_some_and(|ws| ws.taking_in() || ws.watch_is_starting() || ws.requests_busy() || ws.in_epoch() || ws.tests.running())
+        self.opening.is_some()
+            || !self.deferred.is_empty()
+            || self.workspace.as_ref().is_some_and(|ws| {
+                ws.taking_in() || ws.watch_is_starting() || ws.requests_busy() || ws.in_epoch() || ws.tests.running()
+            })
     }
 
     /// Undo the last step.
@@ -1916,7 +1999,8 @@ impl eframe::App for Editor {
         egui::Panel::top("menu").frame(bar).show(ui, |ui| {
             self.menu_bar(ui);
         });
-        let (show_problems, apply_all, open) = egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
+        let (show_problems, apply_all, open) =
+            egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
         if show_problems {
             self.show_pane(Pane::first(PaneKind::Problems));
         }

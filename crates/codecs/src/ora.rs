@@ -249,7 +249,10 @@ fn attributes(e: &quick_xml::events::BytesStart) -> Result<Vec<(String, String)>
         .map(|a| {
             let a = a.map_err(|e| Error(format!("stack.xml: {e}")))?;
             let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-            let value = a.normalized_value(quick_xml::XmlVersion::Implicit1_0).map_err(|e| Error(format!("stack.xml: {e}")))?.into_owned();
+            let value = a
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|e| Error(format!("stack.xml: {e}")))?
+                .into_owned();
             Ok((key, value))
         })
         .collect()

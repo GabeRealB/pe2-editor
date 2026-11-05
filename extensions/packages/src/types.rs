@@ -52,7 +52,9 @@ fn target_integer(target: &str, name: &str) -> Option<(bool, u32)> {
 /// A Q fixed-point type, `q<integer bits>_<fraction bits>`: signed when a sign bit makes up its size.
 fn fixed_point(name: &str) -> Option<(bool, u32)> {
     let (whole, fraction) = name.strip_prefix('q')?.split_once('_')?;
-    let digits = |text: &str| (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())).then(|| text.parse::<u32>().ok()).flatten();
+    let digits = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())).then(|| text.parse::<u32>().ok()).flatten()
+    };
     let bits = digits(whole)? + digits(fraction)?;
     if [8, 16, 32, 64].contains(&(bits + 1)) {
         Some((true, bits + 1))
@@ -68,7 +70,9 @@ fn integer(text: &str) -> Option<i128> {
     let text: String = text.chars().filter(|c| *c != ' ').collect();
     let (negative, digits) = text.strip_prefix('-').map_or((false, text.as_str()), |rest| (true, rest));
     let magnitude = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
-        Some(hex) if !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) => i128::from_str_radix(hex, 16).ok()?,
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            i128::from_str_radix(hex, 16).ok()?
+        }
         None if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) => digits.parse().ok()?,
         _ => return None,
     };
@@ -127,7 +131,11 @@ impl Shape {
 /// `T`, `T[N]` (N a literal) or `T[]`.
 #[must_use]
 pub fn spelled(text: &str) -> Option<Shape> {
-    let dynamic = text.trim().strip_suffix(']').and_then(|inner| inner.rsplit_once('[')).filter(|(_, count)| count.trim().is_empty());
+    let dynamic = text
+        .trim()
+        .strip_suffix(']')
+        .and_then(|inner| inner.rsplit_once('['))
+        .filter(|(_, count)| count.trim().is_empty());
     if let Some((before, _)) = dynamic {
         let words: Vec<&str> = before.split_whitespace().collect();
         return Some(Shape { ty: type_name(&words)?, count: None, dynamic: true });
@@ -224,7 +232,9 @@ impl Types {
             if base.contains('*') {
                 self.wrong.push(format!("{at}: {name} is a pointer, which no registered type is"));
             } else if self.primitive(&base).is_none() {
-                self.wrong.push(format!("{at}: {name} is an alias of {base}, and a registered alias is of an integer primitive"));
+                self.wrong.push(format!(
+                    "{at}: {name} is an alias of {base}, and a registered alias is of an integer primitive"
+                ));
             } else {
                 self.registered.insert(name.to_string(), Type { at: at.to_string(), base: Some(base), fields: vec![] });
             }
@@ -246,7 +256,9 @@ impl Types {
             }
         }
         if !is_struct_head(&before[..start]) {
-            self.wrong.push(format!("{at}: {name} is registered as a struct or an alias of a fixed-size integer, and is neither"));
+            self.wrong.push(format!(
+                "{at}: {name} is registered as a struct or an alias of a fixed-size integer, and is neither"
+            ));
             return;
         }
         let mut fields = vec![];
@@ -260,7 +272,9 @@ impl Types {
                 continue;
             }
             if declaration.contains('*') {
-                self.wrong.push(format!("{at}: {name}: `{declaration}` is a pointer, which no field of a registered struct is"));
+                self.wrong.push(format!(
+                    "{at}: {name}: `{declaration}` is a pointer, which no field of a registered struct is"
+                ));
                 return;
             }
             let field = counted(declaration).and_then(|(before, count)| {
@@ -325,7 +339,9 @@ impl Types {
             out.insert("high".into(), clamp(high).into());
         } else if let Some(registered) = self.registered.get(&shape.ty) {
             let fields = registered.fields.iter().map(|field| {
-                let Value::Table(mut described) = self.describe(&Shape::of(&field.ty, field.count)) else { unreachable!() };
+                let Value::Table(mut described) = self.describe(&Shape::of(&field.ty, field.count)) else {
+                    unreachable!()
+                };
                 described.insert("name".into(), field.name.clone().into());
                 if !field.doc.is_empty() {
                     described.insert("doc".into(), field.doc.clone().into());
@@ -373,7 +389,12 @@ impl Types {
                 bail!("{place} is one or more of {}", shape.ty);
             }
             let one = Shape::of(&shape.ty, None);
-            return items.iter().enumerate().map(|(index, item)| self.shaped(&one, item, at, &format!("{path}[{index}]"))).collect::<Result<_>>().map(Tree::List);
+            return items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| self.shaped(&one, item, at, &format!("{path}[{index}]")))
+                .collect::<Result<_>>()
+                .map(Tree::List);
         }
         if let Some(count) = shape.count {
             let Written::List(items) = value else { bail!("{place} is {count} of {}", shape.ty) };
@@ -381,7 +402,12 @@ impl Types {
                 bail!("{place} is {count} of {}", shape.ty);
             }
             let one = Shape::of(&shape.ty, None);
-            return items.iter().enumerate().map(|(index, item)| self.shaped(&one, item, at, &format!("{path}[{index}]"))).collect::<Result<_>>().map(Tree::List);
+            return items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| self.shaped(&one, item, at, &format!("{path}[{index}]")))
+                .collect::<Result<_>>()
+                .map(Tree::List);
         }
         if self.integral(&shape.ty).is_some() {
             return match value {
@@ -408,23 +434,35 @@ impl Types {
     pub fn merged(&self, shape: &Shape, default: Option<&Tree>, given: &Value, at: &str, path: &str) -> Result<Tree> {
         let place = format!("{at}: {}", if path.is_empty() { "the value" } else { path });
         if shape.dynamic {
-            let items = given.as_array().filter(|items| !items.is_empty()).ok_or_else(|| anyhow!("{place} is set to one or more of {}", shape.ty))?;
+            let items = given
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .ok_or_else(|| anyhow!("{place} is set to one or more of {}", shape.ty))?;
             let one = Shape::of(&shape.ty, None);
             let known: Vec<&Tree> = match default {
                 Some(Tree::List(list)) => list.iter().collect(),
                 _ => vec![],
             };
-            let merged = items.iter().enumerate().map(|(index, item)| self.merged(&one, known.get(index).copied(), item, at, &format!("{path}[{index}]")));
+            let merged = items.iter().enumerate().map(|(index, item)| {
+                self.merged(&one, known.get(index).copied(), item, at, &format!("{path}[{index}]"))
+            });
             return merged.collect::<Result<_>>().map(Tree::List);
         }
         if let Some(count) = shape.count {
-            let items = given.as_array().filter(|items| items.len() == count).ok_or_else(|| anyhow!("{place} is set to {count} of {}", shape.ty))?;
+            let items = given
+                .as_array()
+                .filter(|items| items.len() == count)
+                .ok_or_else(|| anyhow!("{place} is set to {count} of {}", shape.ty))?;
             let one = Shape::of(&shape.ty, None);
             let defaults: Vec<Option<&Tree>> = match default {
                 Some(Tree::List(list)) => list.iter().map(Some).collect(),
                 _ => vec![None; count],
             };
-            let merged = items.iter().zip(defaults).enumerate().map(|(index, (item, old))| self.merged(&one, old, item, at, &format!("{path}[{index}]")));
+            let merged = items
+                .iter()
+                .zip(defaults)
+                .enumerate()
+                .map(|(index, (item, old))| self.merged(&one, old, item, at, &format!("{path}[{index}]")));
             return merged.collect::<Result<_>>().map(Tree::List);
         }
         if self.integral(&shape.ty).is_some() {
@@ -467,7 +505,8 @@ fn ends_of(before: &str, name: &str) -> (Option<(usize, String)>, Option<usize>)
     while let Some(found) = before[from..].find(name) {
         let start = from + found;
         from = start + name.len();
-        let bounded = (start == 0 || !is_word(&before[start - 1..start])) && !before[from..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        let bounded = (start == 0 || !is_word(&before[start - 1..start]))
+            && !before[from..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
         if !bounded || !before[from..].trim_start().starts_with(';') {
             continue;
         }
@@ -499,14 +538,22 @@ fn doc_of(text: &str, from: usize, to: usize) -> String {
     }
     let lines: Vec<&str> = text[from.min(text.len())..to.min(text.len())].lines().map(str::trim).collect();
     let code = lines.iter().position(|line| !line.is_empty() && !line.starts_with("//")).unwrap_or(lines.len());
-    let above = lines[..code].iter().rev().take_while(|line| line.starts_with("///")).map(|line| line.trim_start_matches('/').trim()).collect::<Vec<_>>();
+    let above = lines[..code]
+        .iter()
+        .rev()
+        .take_while(|line| line.starts_with("///"))
+        .map(|line| line.trim_start_matches('/').trim())
+        .collect::<Vec<_>>();
     above.into_iter().rev().collect::<Vec<_>>().join(" ")
 }
 
 /// Whether a text ends in `typedef struct`, with or without a tag.
 fn is_struct_head(text: &str) -> bool {
     let statement = text.rfind([';', '{', '}']).map_or(text, |at| &text[at + 1..]);
-    matches!(statement.split_whitespace().collect::<Vec<_>>().as_slice(), ["typedef", "struct"] | ["typedef", "struct", _])
+    matches!(
+        statement.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["typedef", "struct"] | ["typedef", "struct", _]
+    )
 }
 
 /// What a C initializer is written as, before its shape is known.
@@ -559,8 +606,12 @@ impl Tree {
     #[must_use]
     pub fn value(&self) -> Value {
         match self {
-            Tree::Int(number) => i64::try_from(*number).map_or_else(|_| Value::String(number.to_string()), Value::Integer),
-            Tree::Fields(fields) => Value::Table(fields.iter().map(|(name, tree)| (name.clone(), tree.value())).collect()),
+            Tree::Int(number) => {
+                i64::try_from(*number).map_or_else(|_| Value::String(number.to_string()), Value::Integer)
+            }
+            Tree::Fields(fields) => {
+                Value::Table(fields.iter().map(|(name, tree)| (name.clone(), tree.value())).collect())
+            }
             Tree::List(items) => Value::Array(items.iter().map(Tree::value).collect()),
         }
     }
@@ -570,8 +621,12 @@ impl Tree {
     pub fn initializer(&self) -> String {
         match self {
             Tree::Int(number) => number.to_string(),
-            Tree::Fields(fields) => format!("{{ {} }}", fields.iter().map(|(_, tree)| tree.initializer()).collect::<Vec<_>>().join(", ")),
-            Tree::List(items) => format!("{{ {} }}", items.iter().map(Tree::initializer).collect::<Vec<_>>().join(", ")),
+            Tree::Fields(fields) => {
+                format!("{{ {} }}", fields.iter().map(|(_, tree)| tree.initializer()).collect::<Vec<_>>().join(", "))
+            }
+            Tree::List(items) => {
+                format!("{{ {} }}", items.iter().map(Tree::initializer).collect::<Vec<_>>().join(", "))
+            }
         }
     }
 
@@ -632,7 +687,8 @@ mod tests {
         let alias = "typedef unsigned  int Angle;\n";
         types.register("Angle", alias, alias.len(), "a.c:1");
         types.check().unwrap();
-        let fields: Vec<(&str, &str, Option<usize>)> = types.registered["_Level"].fields.iter().map(|f| (f.name.as_str(), f.ty.as_str(), f.count)).collect();
+        let fields: Vec<(&str, &str, Option<usize>)> =
+            types.registered["_Level"].fields.iter().map(|f| (f.name.as_str(), f.ty.as_str(), f.count)).collect();
         assert_eq!(fields, [("wedges", "s16", None), ("limit", "unsigned short", None), ("steps", "u8", Some(2))]);
         assert_eq!(types.registered["Angle"].base.as_deref(), Some("unsigned int"));
         assert_eq!(types.registered["_Level"].fields[0].doc, "Fanned");
@@ -658,7 +714,10 @@ mod tests {
         let shape = spelled("_Level[]").unwrap();
         assert!(shape.dynamic && shape.count.is_none());
         let default = types.parsed(&shape, "{ { 1, 0, { 2, 3 } }, { 4, 0, { 5, 6 } } }", "a.c:7").unwrap();
-        let given: Value = toml::from_str::<toml::Table>("v = [{ wedges = 9 }, {}, { wedges = 7, limit = 1, steps = [8, 9] }]").unwrap()["v"].clone();
+        let given: Value =
+            toml::from_str::<toml::Table>("v = [{ wedges = 9 }, {}, { wedges = 7, limit = 1, steps = [8, 9] }]")
+                .unwrap()["v"]
+                .clone();
         let merged = types.merged(&shape, Some(&default), &given, "decl", "").unwrap();
         assert_eq!(merged.initializer(), "{ { 9, 0, { 2, 3 } }, { 4, 0, { 5, 6 } }, { 7, 1, { 8, 9 } } }");
         let partial: Value = toml::from_str::<toml::Table>("v = [{}, {}, { wedges = 7 }]").unwrap()["v"].clone();
@@ -676,8 +735,14 @@ mod tests {
             types.register(name, text, text.find("PE2_TYPE").unwrap_or(text.len()), "a.c:2");
             types.check().unwrap_err().to_string()
         };
-        assert_eq!(wrong("typedef struct { s16* p; } P;\nPE2_TYPE(P)\n", "P"), "a.c:2: P: `s16* p` is a pointer, which no field of a registered struct is");
-        assert_eq!(wrong("typedef struct { float f; } F;\nPE2_TYPE(F)\n", "F"), "a.c:2: F.f is a float, which is neither an integer primitive of psx nor a registered type");
+        assert_eq!(
+            wrong("typedef struct { s16* p; } P;\nPE2_TYPE(P)\n", "P"),
+            "a.c:2: P: `s16* p` is a pointer, which no field of a registered struct is"
+        );
+        assert_eq!(
+            wrong("typedef struct { float f; } F;\nPE2_TYPE(F)\n", "F"),
+            "a.c:2: F.f is a float, which is neither an integer primitive of psx nor a registered type"
+        );
         assert_eq!(wrong("PE2_TYPE(G)\n", "G"), "a.c:2: PE2_TYPE(G) follows no typedef of G in its file");
         let types = registered();
         let short = types.parsed(&spelled("_Level").unwrap(), "{ 1, 2 }", "a.c:7").unwrap_err().to_string();

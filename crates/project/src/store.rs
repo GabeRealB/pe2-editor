@@ -196,8 +196,9 @@ impl Store {
                  sha1 = excluded.sha1, declaration = excluded.declaration, node_type = excluded.node_type,
                  uid = excluded.uid, variants = excluded.variants, error = excluded.error, text = excluded.text",
         ))?;
-        let mut reference =
-            block_on(self.conn.prepare("INSERT INTO reference (path, slot, uid, target, output) VALUES (?1, ?2, ?3, ?4, ?5)"))?;
+        let mut reference = block_on(
+            self.conn.prepare("INSERT INTO reference (path, slot, uid, target, output) VALUES (?1, ?2, ?3, ?4, ?5)"),
+        )?;
         for path in gone {
             written += 1;
             let path = path.to_string_lossy();

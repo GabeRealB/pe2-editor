@@ -7,14 +7,34 @@ const FEATURES: &[(&str, GpuFeatureName, wgpu::FeaturesWebGPU)] = &[
     ("depth-clip-control", GpuFeatureName::DepthClipControl, wgpu::FeaturesWebGPU::DEPTH_CLIP_CONTROL),
     ("depth32float-stencil8", GpuFeatureName::Depth32floatStencil8, wgpu::FeaturesWebGPU::DEPTH32FLOAT_STENCIL8),
     ("texture-compression-bc", GpuFeatureName::TextureCompressionBc, wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_BC),
-    ("texture-compression-bc-sliced3d", GpuFeatureName::TextureCompressionBcSliced3d, wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_BC_SLICED_3D),
-    ("texture-compression-etc2", GpuFeatureName::TextureCompressionEtc2, wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_ETC2),
-    ("texture-compression-astc", GpuFeatureName::TextureCompressionAstc, wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_ASTC),
-    ("texture-compression-astc-sliced3d", GpuFeatureName::TextureCompressionAstcSliced3d, wgpu::FeaturesWebGPU::empty()),
+    (
+        "texture-compression-bc-sliced3d",
+        GpuFeatureName::TextureCompressionBcSliced3d,
+        wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_BC_SLICED_3D,
+    ),
+    (
+        "texture-compression-etc2",
+        GpuFeatureName::TextureCompressionEtc2,
+        wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_ETC2,
+    ),
+    (
+        "texture-compression-astc",
+        GpuFeatureName::TextureCompressionAstc,
+        wgpu::FeaturesWebGPU::TEXTURE_COMPRESSION_ASTC,
+    ),
+    (
+        "texture-compression-astc-sliced3d",
+        GpuFeatureName::TextureCompressionAstcSliced3d,
+        wgpu::FeaturesWebGPU::empty(),
+    ),
     ("timestamp-query", GpuFeatureName::TimestampQuery, wgpu::FeaturesWebGPU::TIMESTAMP_QUERY),
     ("indirect-first-instance", GpuFeatureName::IndirectFirstInstance, wgpu::FeaturesWebGPU::INDIRECT_FIRST_INSTANCE),
     ("shader-f16", GpuFeatureName::ShaderF16, wgpu::FeaturesWebGPU::SHADER_F16),
-    ("rg11b10ufloat-renderable", GpuFeatureName::Rg11b10ufloatRenderable, wgpu::FeaturesWebGPU::RG11B10UFLOAT_RENDERABLE),
+    (
+        "rg11b10ufloat-renderable",
+        GpuFeatureName::Rg11b10ufloatRenderable,
+        wgpu::FeaturesWebGPU::RG11B10UFLOAT_RENDERABLE,
+    ),
     ("bgra8unorm-storage", GpuFeatureName::Bgra8unormStorage, wgpu::FeaturesWebGPU::BGRA8UNORM_STORAGE),
     ("float32-filterable", GpuFeatureName::Float32Filterable, wgpu::FeaturesWebGPU::FLOAT32_FILTERABLE),
     ("float32-blendable", GpuFeatureName::Float32Blendable, wgpu::FeaturesWebGPU::FLOAT32_BLENDABLE),
@@ -37,7 +57,8 @@ pub fn named(name: &str) -> Option<wgpu::FeaturesWebGPU> {
 #[must_use]
 pub fn of(names: &[GpuFeatureName]) -> wgpu::Features {
     let wanted = |name: &&(&str, GpuFeatureName, wgpu::FeaturesWebGPU)| names.contains(&name.1);
-    let features = FEATURES.iter().filter(wanted).fold(wgpu::FeaturesWebGPU::empty(), |all, (.., feature)| all | *feature);
+    let features =
+        FEATURES.iter().filter(wanted).fold(wgpu::FeaturesWebGPU::empty(), |all, (.., feature)| all | *feature);
     whole(features)
 }
 

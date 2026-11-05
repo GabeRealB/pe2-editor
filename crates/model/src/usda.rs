@@ -77,7 +77,8 @@ struct Reader<'a> {
 }
 
 const SPECIFIERS: [&str; 3] = ["def", "over", "class"];
-const QUALIFIERS: [&str; 9] = ["custom", "uniform", "varying", "config", "prepend", "append", "add", "delete", "reorder"];
+const QUALIFIERS: [&str; 9] =
+    ["custom", "uniform", "varying", "config", "prepend", "append", "add", "delete", "reorder"];
 
 fn is_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'.' | b'-' | b'+')
@@ -138,7 +139,10 @@ impl Reader<'_> {
 
     fn string(&mut self) -> Result<String> {
         self.skip();
-        let quote = self.peek().filter(|byte| matches!(byte, b'"' | b'\'')).ok_or_else(|| anyhow!("line {}: expected a string", self.line()))?;
+        let quote = self
+            .peek()
+            .filter(|byte| matches!(byte, b'"' | b'\''))
+            .ok_or_else(|| anyhow!("line {}: expected a string", self.line()))?;
         let long = self.text[self.at..].starts_with(&[quote; 3]);
         self.at += if long { 3 } else { 1 };
         let mut out = Vec::new();

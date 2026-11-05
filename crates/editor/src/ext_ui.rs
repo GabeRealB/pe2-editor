@@ -286,9 +286,9 @@ impl UiHost for Host<'_> {
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
         let ui = self.target.ui();
         let id = self.textures.get(ui.ctx(), texture, Upscale::Nearest);
-        let shown = egui::Frame::new().stroke(egui::Stroke::new(1.0, theme::border())).show(ui, |ui| {
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(id, egui::vec2(width, height))))
-        });
+        let shown = egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, theme::border()))
+            .show(ui, |ui| ui.add(egui::Image::new(egui::load::SizedTexture::new(id, egui::vec2(width, height)))));
         self.last = Some(shown.inner);
     }
 
@@ -352,7 +352,8 @@ impl UiHost for Host<'_> {
         let ui = self.target.ui();
         let Some(chip) = reference.and_then(crate::inspector::reference_in) else {
             let article = if node_type.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
-            let shown = ui.label(RichText::new(format!("Drop {article} {node_type} here")).small().color(theme::weak()));
+            let shown =
+                ui.label(RichText::new(format!("Drop {article} {node_type} here")).small().color(theme::weak()));
             self.last = None;
             let asset = self.frame.asset.filter(|_| self.frame.editable)?;
             return crate::inspector::reference_filling(ui, shown.rect, &sheet, asset, node_type);
@@ -397,7 +398,8 @@ impl UiHost for Host<'_> {
         // On a section's background a field has to stand out as a dropdown does.
         let fill = ui.visuals().widgets.inactive.weak_bg_fill;
         let width = if width > 0.0 { width } else { 120.0 };
-        let edit = egui::TextEdit::singleline(text).id_salt(id).desired_width(width).background_color(fill).hint_text(hint);
+        let edit =
+            egui::TextEdit::singleline(text).id_salt(id).desired_width(width).background_color(fill).hint_text(hint);
         let response = ui.add_enabled(self.frame.editable, edit);
         let committed = response.lost_focus();
         self.last = Some(response);
@@ -520,7 +522,11 @@ impl UiHost for Host<'_> {
             size: egui::vec2(canvas.width, canvas.height),
             pictures,
             // The selected one is the host's to mark, whatever view drew it.
-            boxes: canvas.boxes.iter().map(|b| (b.name.clone(), to_rect(b.rect), b.highlight || shown == Some(b.name.as_str()))).collect(),
+            boxes: canvas
+                .boxes
+                .iter()
+                .map(|b| (b.name.clone(), to_rect(b.rect), b.highlight || shown == Some(b.name.as_str())))
+                .collect(),
             summary: canvas.summary.clone(),
             toggle: canvas.toggle.clone(),
             legend: canvas.legend,

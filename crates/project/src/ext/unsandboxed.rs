@@ -26,7 +26,8 @@ pub fn platform() -> String {
 #[must_use]
 pub fn elsewhere(platforms: &[String]) -> Option<String> {
     let here = platform();
-    (!platforms.is_empty() && !platforms.contains(&here)).then(|| format!("it runs on {}, and this editor on {here}", platforms.join(", ")))
+    (!platforms.is_empty() && !platforms.contains(&here))
+        .then(|| format!("it runs on {}, and this editor on {here}", platforms.join(", ")))
 }
 
 /// Where an extension's programs are: `tool` in what it ships, for this platform or any; else `tool` as it is, for the
@@ -40,7 +41,9 @@ pub fn program(folder: Option<&Path>, tool: &str) -> PathBuf {
 
 /// The files in a folder, by their paths within it, in order.
 fn files_in(folder: &Path, within: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
-    let mut entries = std::fs::read_dir(folder).with_context(|| folder.display().to_string())?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut entries = std::fs::read_dir(folder)
+        .with_context(|| folder.display().to_string())?
+        .collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let (path, name) = (entry.path(), within.join(entry.file_name()));
@@ -63,12 +66,19 @@ pub const TESTS: &str = "tests";
 /// # Errors
 /// What it holds cannot be read.
 pub fn trust(file: &Path, folder: Option<&Path>, hashed: &[String]) -> Result<String> {
-    let Some(folder) = folder else { return crate::extract::sha1_file(file).with_context(|| file.display().to_string()) };
+    let Some(folder) = folder else {
+        return crate::extract::sha1_file(file).with_context(|| file.display().to_string());
+    };
     let mut files = Vec::new();
     files_in(folder, Path::new(""), &mut files)?;
     let counts = |name: &Path| {
         let component = file.file_name().is_some_and(|own| name.as_os_str() == own);
-        component || if hashed.is_empty() { !name.starts_with(TESTS) } else { hashed.iter().any(|listed| name.starts_with(listed)) }
+        component
+            || if hashed.is_empty() {
+                !name.starts_with(TESTS)
+            } else {
+                hashed.iter().any(|listed| name.starts_with(listed))
+            }
     };
     let mut listing = String::new();
     for (name, path) in files.into_iter().filter(|(name, _)| counts(name)) {

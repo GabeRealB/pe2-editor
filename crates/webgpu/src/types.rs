@@ -11,7 +11,9 @@ use wasmtime::StoreContextMut;
 use wasmtime::component::{Destination, FutureProducer, Resource, StreamProducer, StreamResult, VecBuffer};
 use wasmtime_wasi::WasiView;
 
-use crate::wasi::webgpu::webgpu::{GpuBufferMapState, GpuDeviceLostReason, GpuErrorKind, GpuCompilationMessageType, GpuQueryType, GpuTextureFormat};
+use crate::wasi::webgpu::webgpu::{
+    GpuBufferMapState, GpuCompilationMessageType, GpuDeviceLostReason, GpuErrorKind, GpuQueryType, GpuTextureFormat,
+};
 
 /// `get-gpu`, which holds nothing.
 pub struct Instance;
@@ -182,7 +184,12 @@ pub struct LostFuture(pub Arc<Mutex<Inbox<Lost>>>);
 impl<T: WasiView + 'static> FutureProducer<T> for LostFuture {
     type Item = Resource<Lost>;
 
-    fn poll_produce(self: Pin<&mut Self>, cx: &mut Context<'_>, mut store: StoreContextMut<'_, T>, finish: bool) -> Poll<wasmtime::Result<Option<Self::Item>>> {
+    fn poll_produce(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'_, T>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
         let mut inbox = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match inbox.queue.pop_front() {
             Some(lost) => Poll::Ready(Ok(Some(store.data_mut().ctx().table.push(lost)?))),

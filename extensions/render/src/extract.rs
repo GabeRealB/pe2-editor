@@ -28,7 +28,13 @@ struct Tables {
 impl Tables {
     fn new(declared: &dyn Declared) -> Tables {
         let of = |node_type: &str| declared.declarations(node_type).into_iter().collect();
-        Tables { meshes: of("mesh"), skeletons: of("skeleton"), materials: of("material"), images: of("image"), slots: of("vram_slot") }
+        Tables {
+            meshes: of("mesh"),
+            skeletons: of("skeleton"),
+            materials: of("material"),
+            images: of("image"),
+            slots: of("vram_slot"),
+        }
     }
 }
 
@@ -45,7 +51,10 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
 
 #[expect(clippy::unnecessary_wraps, reason = "what begins an extraction may fail; this does not")]
 pub fn models(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
-    Ok(Box::new(Models { meshes: Meshes { tables: Tables::new(declared), package: None }, declared: declared.declarations("model").into_iter().collect() }))
+    Ok(Box::new(Models {
+        meshes: Meshes { tables: Tables::new(declared), package: None },
+        declared: declared.declarations("model").into_iter().collect(),
+    }))
 }
 
 /// A model holds nothing of its own: extracting one is rebuilding what the disc stores from its mesh, its skeleton, its
@@ -78,16 +87,30 @@ fn placed(tables: &Tables, placement: &Value) -> Option<[i64; 2]> {
 fn placement(tables: &Tables, texture: &Value) -> Result<Placement> {
     let path = target(texture).ok_or_else(|| anyhow!("a texture names no image"))?;
     let image = tables.images.get(path).ok_or_else(|| anyhow!("no image {path}"))?;
-    material::placement(&material::image_placement(image, |placement| placed(tables, placement)), texture).map_err(|why| anyhow!("{path}: {why:#}"))
+    material::placement(&material::image_placement(image, |placement| placed(tables, placement)), texture)
+        .map_err(|why| anyhow!("{path}: {why:#}"))
 }
 
 fn binding(tables: &Tables, model: &Table, slot: &str) -> Result<Binding> {
-    let reference = model.get("materials").and_then(|materials| materials.get(slot)).ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
+    let reference = model
+        .get("materials")
+        .and_then(|materials| materials.get(slot))
+        .ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
     let path = target(reference).ok_or_else(|| anyhow!("its slot {slot} names nothing"))?;
     let table = tables.materials.get(path).ok_or_else(|| anyhow!("no material {path}"))?;
     let read = Definition::read(|key| table.get(key));
-    let texture = if read.shader.textures.is_empty() { None } else { Some(placement(tables, table.get(material::MAIN).ok_or_else(|| anyhow!("{path}: no main texture"))?)?) };
-    Ok(Binding { texture, transparent: read.transparent, blend: read.blend, reflective: read.shader.reflective, effect: read.effect })
+    let texture = if read.shader.textures.is_empty() {
+        None
+    } else {
+        Some(placement(tables, table.get(material::MAIN).ok_or_else(|| anyhow!("{path}: no main texture"))?)?)
+    };
+    Ok(Binding {
+        texture,
+        transparent: read.transparent,
+        blend: read.blend,
+        reflective: read.shader.reflective,
+        effect: read.effect,
+    })
 }
 
 /// What an asset made by hand needs of an extraction: nothing but its bundle.
@@ -120,9 +143,20 @@ impl Meshes {
 
     /// The bytes a declaration's `from` says, checked against its sha1, and the address they load at.
     fn stored(&mut self, path: &str, declared: &Table, release: &str, discs: &mut dyn Discs) -> Result<(Vec<u8>, u32)> {
-        let from = declared.get("from").and_then(|f| f.get(release)).ok_or_else(|| anyhow!("{path}: not in {release}"))?;
-        let at = from.get("at").and_then(Value::as_array).and_then(|at| at.first()).and_then(Value::as_table).ok_or_else(|| anyhow!("{path}: from no package"))?;
-        let number = |key: &str| from.get(key).and_then(Value::as_integer).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| anyhow!("{path}: no {key}"));
+        let from =
+            declared.get("from").and_then(|f| f.get(release)).ok_or_else(|| anyhow!("{path}: not in {release}"))?;
+        let at = from
+            .get("at")
+            .and_then(Value::as_array)
+            .and_then(|at| at.first())
+            .and_then(Value::as_table)
+            .ok_or_else(|| anyhow!("{path}: from no package"))?;
+        let number = |key: &str| {
+            from.get(key)
+                .and_then(Value::as_integer)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| anyhow!("{path}: no {key}"))
+        };
         let (offset, size) = (number("offset")?, number("size")?);
         let want = from.get("sha1").and_then(Value::as_str).ok_or_else(|| anyhow!("{path}: {release} has no sha1"))?;
         let key = at.to_string();
@@ -131,7 +165,9 @@ impl Meshes {
             self.package = Some((key, lzss::decode_stream(&stored, 0).0));
         }
         let inflated = self.package.as_ref().map_or(&[][..], |(_, bytes)| bytes);
-        let bytes = inflated.get(offset..offset + size).ok_or_else(|| anyhow!("{path}: past the end of its package, of {}", inflated.len()))?;
+        let bytes = inflated
+            .get(offset..offset + size)
+            .ok_or_else(|| anyhow!("{path}: past the end of its package, of {}", inflated.len()))?;
         let got = sha1_of(bytes);
         if got != want {
             bail!("{path}: has sha1 {got}, the declaration {want}");
@@ -145,7 +181,14 @@ impl Meshes {
         let model = decode(&bytes, address)?;
         let joints = self.check_skeleton(path, declared, &model)?;
         let from = declared.get("from").and_then(|f| f.get(release));
-        let slots: Vec<String> = from.and_then(|from| from.get("material_slots")).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        let slots: Vec<String> = from
+            .and_then(|from| from.get("material_slots"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
         if slots.len() != model.materials.len() {
             bail!("{path}: has {} materials, the declaration names {}", model.materials.len(), slots.len());
         }
@@ -172,19 +215,29 @@ impl Extraction for Models {
         let declared = self.declared.get(path).ok_or_else(|| anyhow!("{path}: not a model"))?.clone();
         let (stored, address) = self.meshes.stored(path, &declared, release, discs)?;
         let mesh_path = declared.get("mesh").and_then(target).ok_or_else(|| anyhow!("{path}: no mesh"))?.to_string();
-        let mesh_table = self.meshes.tables.meshes.get(&mesh_path).ok_or_else(|| anyhow!("{path}: no mesh {mesh_path}"))?.clone();
+        let mesh_table =
+            self.meshes.tables.meshes.get(&mesh_path).ok_or_else(|| anyhow!("{path}: no mesh {mesh_path}"))?.clone();
         // From the text a bundle holds, so that this holds of what the editor reads.
         let text = self.meshes.text_of(&mesh_path, &mesh_table, release, discs)?;
         let (mut model, slots) = mesh::read(&text)?;
         if let Some(named) = mesh_table.get("skeleton").and_then(target) {
-            let joints = self.meshes.tables.skeletons.get(named).and_then(|table| table.get("joints")).and_then(Value::as_array);
+            let joints =
+                self.meshes.tables.skeletons.get(named).and_then(|table| table.get("joints")).and_then(Value::as_array);
             mesh::pose(&mut model, &skeleton::parse(joints.map_or(&[][..], Vec::as_slice))?)?;
         }
-        let bindings: Vec<Binding> = slots.iter().map(|slot| binding(&self.meshes.tables, &declared, slot).map_err(|why| anyhow!("{path}: {why:#}"))).collect::<Result<_>>()?;
+        let bindings: Vec<Binding> = slots
+            .iter()
+            .map(|slot| binding(&self.meshes.tables, &declared, slot).map_err(|why| anyhow!("{path}: {why:#}")))
+            .collect::<Result<_>>()?;
         let rebuilt = encode(&model, &bindings, address).map_err(|why| anyhow!("{path}: {why:#}"))?;
         if rebuilt != stored {
-            let first = rebuilt.iter().zip(&stored).position(|(a, b)| a != b).unwrap_or(rebuilt.len().min(stored.len()));
-            bail!("{path}: rebuilt from its mesh and materials it differs from the disc at {first:#x}, of {} against {} bytes", rebuilt.len(), stored.len());
+            let first =
+                rebuilt.iter().zip(&stored).position(|(a, b)| a != b).unwrap_or(rebuilt.len().min(stored.len()));
+            bail!(
+                "{path}: rebuilt from its mesh and materials it differs from the disc at {first:#x}, of {} against {} bytes",
+                rebuilt.len(),
+                stored.len()
+            );
         }
         Ok(Vec::new())
     }
@@ -208,20 +261,25 @@ mod tests {
             skeletons: HashMap::new(),
             materials: HashMap::new(),
             images: HashMap::from([("image".to_string(), text(&image))]),
-            slots: HashMap::from([("sheet".to_string(), text("rect = [384, 256, 128, 256]")), ("colors".to_string(), text("rect = [0, 245, 256, 2]"))]),
+            slots: HashMap::from([
+                ("sheet".to_string(), text("rect = [384, 256, 128, 256]")),
+                ("colors".to_string(), text("rect = [0, 245, 256, 2]")),
+            ]),
         }
     }
 
     #[test]
     fn a_cell_past_a_page_is_on_the_next() {
-        let texture: Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/right' }".parse().unwrap();
+        let texture: Table =
+            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/right' }".parse().unwrap();
         let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [448, 256], palette: [0, 246] });
     }
 
     #[test]
     fn a_binding_chooses_its_palette_over_its_cells() {
-        let texture: Table = "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
+        let texture: Table =
+            "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
         let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [384, 256], palette: [0, 246] });
     }

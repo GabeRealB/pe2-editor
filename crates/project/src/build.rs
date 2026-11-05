@@ -58,7 +58,11 @@ pub fn wiring(index: &Index, extensions: &Extensions, config: &Config) -> Wiring
             let target = (asset.path.clone(), output.name.clone());
             if !output.events.pull.is_empty() {
                 let action = Action::Pull { asset: target.0.clone(), output: target.1.clone() };
-                triggers.push(Trigger { when: any_of(&plan, &output.events.pull), action, signals: signals_of(output) });
+                triggers.push(Trigger {
+                    when: any_of(&plan, &output.events.pull),
+                    action,
+                    signals: signals_of(output),
+                });
             }
             if !output.events.listen.is_empty() {
                 let action = Action::Push { asset: target.0, output: target.1 };
@@ -93,10 +97,20 @@ fn named(action: &Action) -> String {
 pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
     let folder = project.root.join("build").join(&config.name);
     let said = |config: &Config| {
-        [Some(("name", config.name.clone())), config.release.clone().map(|v| ("release", v)), config.target.clone().map(|v| ("target", v))]
+        [
+            Some(("name", config.name.clone())),
+            config.release.clone().map(|v| ("release", v)),
+            config.target.clone().map(|v| ("target", v)),
+        ]
     };
     let known = project.configs.iter().flat_map(said).flatten().map(|(key, value)| format!("{key}={value}")).collect();
-    BuildConfig { name: config.name.clone(), release: config.release.clone(), target: config.target.clone(), folder: folder.display().to_string(), known }
+    BuildConfig {
+        name: config.name.clone(),
+        release: config.release.clone(),
+        target: config.target.clone(),
+        folder: folder.display().to_string(),
+        known,
+    }
 }
 
 /// An epoch's effects on a project.
@@ -119,7 +133,11 @@ impl Site<'_> {
     fn output<'b>(&'b self, asset: &str, output: &str) -> Result<(&'b Asset, Plan, usize)> {
         let found = self.index.assets.get(asset).with_context(|| format!("{asset}: no such asset"))?;
         let (plan, _) = self.extensions.plan(found);
-        let at = plan.outputs.iter().position(|o| o.name == output).with_context(|| format!("{asset} has no output `{output}`"))?;
+        let at = plan
+            .outputs
+            .iter()
+            .position(|o| o.name == output)
+            .with_context(|| format!("{asset} has no output `{output}`"))?;
         Ok((found, plan, at))
     }
 
@@ -222,10 +240,12 @@ impl Effects for Site<'_> {
             Action::Pull { asset, output } => self.pull(asset, output),
             Action::Push { asset, output } => self.push(asset, output),
             Action::Signal(event) => Outcome { signaled: vec![event.clone()], ..Outcome::default() },
-            Action::Hook { op, event, signals } => match self.extensions.run_hook(&self.engine, self.index, op, event) {
-                Ok(()) => Outcome { signaled: signals.clone(), ..Outcome::default() },
-                Err(why) => Outcome { failed: Some(format!("{why:#}")), ..Outcome::default() },
-            },
+            Action::Hook { op, event, signals } => {
+                match self.extensions.run_hook(&self.engine, self.index, op, event) {
+                    Ok(()) => Outcome { signaled: signals.clone(), ..Outcome::default() },
+                    Err(why) => Outcome { failed: Some(format!("{why:#}")), ..Outcome::default() },
+                }
+            }
         }
     }
 
@@ -239,7 +259,15 @@ impl Effects for Site<'_> {
 
 /// Run an epoch on a project, begun by `roots`.
 #[must_use]
-pub fn epoch(project: &Project, index: &Index, extensions: &Extensions, wiring: &Wiring, config: &Config, roots: &[String], cancel: &AtomicBool) -> Report {
+pub fn epoch(
+    project: &Project,
+    index: &Index,
+    extensions: &Extensions,
+    wiring: &Wiring,
+    config: &Config,
+    roots: &[String],
+    cancel: &AtomicBool,
+) -> Report {
     extensions.set_config(Some(build_config(project, config)), &config.disabled);
     let config = build_config(project, config);
     let site = Site { project, index, extensions, config: &config, engine: extensions.engine().for_a_run() };

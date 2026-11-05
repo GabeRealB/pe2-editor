@@ -52,13 +52,16 @@ pub fn extensions_ui(ui: &mut egui::Ui, ws: &mut Workspace, user: &mut UserSetti
     }
     // At most most of the pane: a long value is cut short in it, never widening it over the graph.
     let widest = (ui.available_width() * 0.5).max(160.0);
-    egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(160.0..=widest).show(ui, |ui| {
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            if let Some(selected) = state.selected.clone() {
-                details_ui(ui, ws, &all, &selected, &mut state, user, message);
-            }
-        });
-    });
+    egui::Panel::right("extension details").resizable(true).default_size(300.0).size_range(160.0..=widest).show(
+        ui,
+        |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                if let Some(selected) = state.selected.clone() {
+                    details_ui(ui, ws, &all, &selected, &mut state, user, message);
+                }
+            });
+        },
+    );
     egui::CentralPanel::no_frame().show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             graph_ui(ui, &present, &mut state);
@@ -138,7 +141,9 @@ fn origin_text(origin: &Origin) -> String {
     match origin {
         Origin::Builtin => "built in".into(),
         Origin::Linked => "linked in".into(),
-        Origin::Component(path) => path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        Origin::Component(path) => {
+            path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+        }
         Origin::Project { .. } => "project".into(),
         Origin::User(_) => "user".into(),
         Origin::Install(_) => "beside the editor".into(),
@@ -165,7 +170,9 @@ fn left_off_too(present: &[Present], asked: &str, with: &[String]) -> Vec<String
 
 /// What an extension needs, and what needs it, both ways transitively.
 fn chains(present: &[Present], id: &str) -> (HashSet<String>, HashSet<String>) {
-    let needs_of = |id: &str| -> Vec<String> { present.iter().find(|p| p.id == id).map_or_default(|p| held(p).map(str::to_string).collect()) };
+    let needs_of = |id: &str| -> Vec<String> {
+        present.iter().find(|p| p.id == id).map_or_default(|p| held(p).map(str::to_string).collect())
+    };
     let mut needs = HashSet::new();
     let mut stack = needs_of(id);
     while let Some(next) = stack.pop() {
@@ -194,8 +201,10 @@ fn depth_of(id: &str, present: &[Present], depth: &mut HashMap<String, usize>, s
         return 0; // a cycle: its members on one row
     }
     // Every way it depends on another, by id: what depends on another, weakly or not, sits above it.
-    let needs: Vec<String> =
-        present.iter().find(|p| p.id == id).map_or_default(|p| p.dependencies().map(|(text, _)| requirement(text).0.to_string()).collect());
+    let needs: Vec<String> = present
+        .iter()
+        .find(|p| p.id == id)
+        .map_or_default(|p| p.dependencies().map(|(text, _)| requirement(text).0.to_string()).collect());
     let d = needs.iter().map(|r| depth_of(r, present, depth, seen) + 1).max().unwrap_or(0);
     depth.insert(id.to_string(), d);
     d
@@ -233,9 +242,16 @@ fn edge_ends(present: &[Present], places: &HashMap<&String, egui::Rect>) -> Hash
         leaving.sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
         let mut entering: Vec<&String> = edges.iter().filter(|e| e.1 == *to).map(|e| e.0).collect();
         entering.sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
-        let (Some(out), Some(into)) = (leaving.iter().position(|id| *id == to), entering.iter().position(|id| id == from)) else { continue };
+        let (Some(out), Some(into)) =
+            (leaving.iter().position(|id| *id == to), entering.iter().position(|id| id == from))
+        else {
+            continue;
+        };
         let (Some(start), Some(end)) = (places.get(from), places.get(to)) else { continue };
-        ends.insert(((*from).clone(), to.clone()), [port(start, out, leaving.len(), false), port(end, into, entering.len(), true)]);
+        ends.insert(
+            ((*from).clone(), to.clone()),
+            [port(start, out, leaving.len(), false), port(end, into, entering.len(), true)],
+        );
     }
     ends
 }
@@ -243,7 +259,13 @@ fn edge_ends(present: &[Present], places: &HashMap<&String, egui::Rect>) -> Hash
 /// An edge's label where it covers no node and no other label (`taken`, which it joins): along the edge from its middle
 /// outward, on a chip of the pane's own color that hides the lines it lies across. Left out where there is no room;
 /// the details say it.
-fn edge_label(painter: &egui::Painter, [a, b]: [egui::Pos2; 2], galley: std::sync::Arc<egui::Galley>, fill: Color32, taken: &mut Vec<egui::Rect>) {
+fn edge_label(
+    painter: &egui::Painter,
+    [a, b]: [egui::Pos2; 2],
+    galley: std::sync::Arc<egui::Galley>,
+    fill: Color32,
+    taken: &mut Vec<egui::Rect>,
+) {
     let size = galley.size() + egui::vec2(8.0, 2.0);
     let chip = [0.5, 0.35, 0.65, 0.25, 0.75]
         .into_iter()
@@ -320,7 +342,13 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
             let there = found.is_some_and(|q| q.status == Status::Loaded) && !refused;
             let met = there || dependency != Dependency::Required;
             let on = lit(&p.id) && lit(id);
-            let color = if !met { ui.visuals().error_fg_color } else if on { theme::accent() } else { theme::border().gamma_multiply(2.0) };
+            let color = if !met {
+                ui.visuals().error_fg_color
+            } else if on {
+                theme::accent()
+            } else {
+                theme::border().gamma_multiply(2.0)
+            };
             let stroke = egui::Stroke::new(if on { 2.0 } else { 1.0 }, color);
             edge(&painter, [a, b], stroke, dependency);
             let tip = b - (b - a).normalized() * 9.0;
@@ -328,11 +356,36 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
             painter.add(egui::Shape::convex_polygon(vec![b, tip + across, tip - across], color, egui::Stroke::NONE));
             // Short, on a line of its own beside the edge: the details name the service.
             let (wanted, service) = (requirement(text).1, asked_for(state, text).1);
-            let label = format!("{}  ·  has {}", wanted.unwrap_or("any"), service.or(found.map(|q| q.version.as_str())).unwrap_or("none"));
-            edge_label(&painter, [a, b], painter.layout_no_wrap(label, font.clone(), color), ui.visuals().panel_fill, &mut taken);
+            let label = format!(
+                "{}  ·  has {}",
+                wanted.unwrap_or("any"),
+                service.or(found.map(|q| q.version.as_str())).unwrap_or("none")
+            );
+            edge_label(
+                &painter,
+                [a, b],
+                painter.layout_no_wrap(label, font.clone(), color),
+                ui.visuals().panel_fill,
+                &mut taken,
+            );
         }
     }
-    for (id, rect) in &places {
+    nodes_ui(ui, &painter, present, &places, state, &lit);
+}
+
+/// The graph's nodes: each extension's name, version and where it is from, in the color of what became of it, dim
+/// where something is chosen and it is not `lit`, dashed where nothing provides it; clicked, chosen.
+fn nodes_ui(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    present: &[Present],
+    places: &HashMap<&String, egui::Rect>,
+    state: &mut State,
+    lit: &dyn Fn(&str) -> bool,
+) {
+    let chosen = state.selected.clone();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    for (id, rect) in places {
         let found = present.iter().find(|p| p.id == **id);
         let response = ui.interact(*rect, egui::Id::unique(("extension node", id.as_str())), egui::Sense::click());
         let selected = chosen.as_deref() == Some(id.as_str());
@@ -344,7 +397,8 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
         let color = status_color(ui, found.map(|p| &p.status));
         let dim = chosen.is_some() && !lit(id);
         let fill = color.gamma_multiply(if dim { 0.05 } else { 0.16 });
-        let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color.gamma_multiply(if dim { 0.4 } else { 1.0 }));
+        let stroke =
+            egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color.gamma_multiply(if dim { 0.4 } else { 1.0 }));
         if found.is_some() {
             painter.rect(*rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
         } else {
@@ -357,17 +411,37 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
         }
         let text = if dim { theme::weak() } else { theme::text() };
         let body = egui::TextStyle::Body.resolve(ui.style());
-        fitted(&painter, rect.center_top() + egui::vec2(0.0, 13.0), id, body, text, NODE.x - 12.0);
+        fitted(painter, rect.center_top() + egui::vec2(0.0, 13.0), id, body, text, NODE.x - 12.0);
         let note = found.map_or_else(
             || "not installed".to_string(),
-            |p| if p.version.is_empty() { origin_text(&p.origin) } else { format!("{}  ·  {}", p.version, origin_text(&p.origin)) },
+            |p| {
+                if p.version.is_empty() {
+                    origin_text(&p.origin)
+                } else {
+                    format!("{}  ·  {}", p.version, origin_text(&p.origin))
+                }
+            },
         );
-        fitted(&painter, rect.center_bottom() - egui::vec2(0.0, 12.0), &note, font.clone(), theme::weak(), NODE.x - 12.0);
+        fitted(
+            painter,
+            rect.center_bottom() - egui::vec2(0.0, 12.0),
+            &note,
+            font.clone(),
+            theme::weak(),
+            NODE.x - 12.0,
+        );
     }
 }
 
 /// Text on one line centered at `at`, cut short with an ellipsis where wider than `width`.
-pub(crate) fn fitted(painter: &egui::Painter, at: egui::Pos2, text: &str, font: egui::FontId, color: Color32, width: f32) {
+pub(crate) fn fitted(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    width: f32,
+) {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(width);
     let galley = painter.layout_job(job);
@@ -381,8 +455,10 @@ fn list_ui(ui: &mut egui::Ui, all: &[Present], state: &mut State) {
         ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter extensions").desired_width(220.0));
     });
     let filter = state.filter.to_lowercase();
-    let (replaced, effective): (Vec<&Present>, Vec<&Present>) =
-        all.iter().filter(|p| p.id.to_lowercase().contains(&filter)).partition(|p| matches!(p.status, Status::Replaced(_)));
+    let (replaced, effective): (Vec<&Present>, Vec<&Present>) = all
+        .iter()
+        .filter(|p| p.id.to_lowercase().contains(&filter))
+        .partition(|p| matches!(p.status, Status::Replaced(_)));
     // A column each - what became of it (a dot, said on hover), name, version, where from - lined up across the rows.
     // Scrolled sideways where the pane is narrower than the columns, never cut.
     egui::ScrollArea::horizontal().id_salt("extensions list").show(ui, |ui| {
@@ -396,7 +472,8 @@ fn list_ui(ui: &mut egui::Ui, all: &[Present], state: &mut State) {
                 let (dot, response) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 4.0, status_color(ui, Some(&p.status)));
                 response.on_hover_text(said);
-                let selected = state.selected.as_deref() == Some(p.id.as_str()) && !matches!(p.status, Status::Replaced(_));
+                let selected =
+                    state.selected.as_deref() == Some(p.id.as_str()) && !matches!(p.status, Status::Replaced(_));
                 let name = RichText::new(&p.id).strong();
                 let name = if matches!(p.status, Status::Replaced(_)) { name.color(theme::weak()) } else { name };
                 if ui.selectable_label(selected, name).clicked() {
@@ -450,7 +527,9 @@ fn details_ui(
             }
             match &p.origin {
                 Origin::Project { asset, .. } => row("Asset", asset.clone()),
-                Origin::User(path) | Origin::Install(path) | Origin::Component(path) => row("File", path.display().to_string()),
+                Origin::User(path) | Origin::Install(path) | Origin::Component(path) => {
+                    row("File", path.display().to_string());
+                }
                 Origin::Builtin | Origin::Linked => {}
             }
             for q in all.iter().filter(|q| q.id == p.id && matches!(q.status, Status::Replaced(_))) {
@@ -473,7 +552,9 @@ fn details_ui(
             if let Some(load) = p.load {
                 row("Loaded in", format!("{:.1} ms", load.as_secs_f64() * 1000.0));
             }
-            if let Some((_, m)) = ws.extensions.memory().into_iter().find(|(id, _)| *id == p.id).filter(|(_, m)| m.peak > 0) {
+            if let Some((_, m)) =
+                ws.extensions.memory().into_iter().find(|(id, _)| *id == p.id).filter(|(_, m)| m.peak > 0)
+            {
                 let mib = |bytes: usize| bytes.div_ceil(1 << 20);
                 let now = match m.instances {
                     0 => "none held now".to_string(),
@@ -492,11 +573,15 @@ fn details_ui(
             ui.label(RichText::new(note).color(theme::weak()));
         }
         for (what, names) in p.registers.iter().filter(|(_, names)| !names.is_empty()) {
-            egui::CollapsingHeader::new(format!("{what}  ·  {}", names.len())).id_salt(("registers", &p.id, *what)).show(ui, |ui| {
-                for name in names {
-                    ui.label(RichText::new(name.split_once('@').map_or(name.as_str(), |(_, local)| local)).monospace());
-                }
-            });
+            egui::CollapsingHeader::new(format!("{what}  ·  {}", names.len()))
+                .id_salt(("registers", &p.id, *what))
+                .show(ui, |ui| {
+                    for name in names {
+                        ui.label(
+                            RichText::new(name.split_once('@').map_or(name.as_str(), |(_, local)| local)).monospace(),
+                        );
+                    }
+                });
         }
     });
 }
@@ -506,76 +591,87 @@ pub type UserSettings = BTreeMap<String, toml::Table>;
 
 /// Its settings, each edited the way its default's type is, where it is kept said: the project's written to
 /// `project.toml` as a step of the history, the user's to the editor's settings. Either way it is loaded again.
-fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut UserSettings, message: &mut Option<String>) {
+fn settings_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    p: &Present,
+    user: &mut UserSettings,
+    message: &mut Option<String>,
+) {
     let declared = ws.extensions.settings.get(&p.id).cloned().unwrap_or_default();
     if declared.is_empty() {
         return;
     }
     theme::section(ui, "Settings", |ui| {
-        egui::Grid::new(("extension settings", &p.id)).num_columns(3).min_col_width(0.0).spacing([12.0, 6.0]).show(ui, |ui| {
-            for (setting, value) in &declared {
-                let label = setting.label.clone().unwrap_or_else(|| setting.key.clone());
-                let response = ui.label(&label);
-                if let Some(help) = &setting.help {
-                    response.on_hover_text(help);
-                }
-                let mut chosen = value.clone();
-                setting_input(ui, (&p.id, &setting.key), &label, setting, &mut chosen);
-                let kept = match setting.scope {
-                    Scope::Project => ws.project.extension_settings.get(&p.id).and_then(|t| t.get(&setting.key)).cloned(),
-                    Scope::User => user.get(&p.id).and_then(|t| t.get(&setting.key)).cloned(),
-                };
-                let mut next = (chosen != *value).then_some(Some(chosen));
-                ui.horizontal(|ui| {
-                    let (scope, says) = match setting.scope {
-                        Scope::Project => ("project", "Kept in project.toml: the same for everyone on the project"),
-                        Scope::User => ("yours", "Kept in your editor settings: the same in every project"),
+        egui::Grid::new(("extension settings", &p.id)).num_columns(3).min_col_width(0.0).spacing([12.0, 6.0]).show(
+            ui,
+            |ui| {
+                for (setting, value) in &declared {
+                    let label = setting.label.clone().unwrap_or_else(|| setting.key.clone());
+                    let response = ui.label(&label);
+                    if let Some(help) = &setting.help {
+                        response.on_hover_text(help);
+                    }
+                    let mut chosen = value.clone();
+                    setting_input(ui, (&p.id, &setting.key), &label, setting, &mut chosen);
+                    let kept = match setting.scope {
+                        Scope::Project => {
+                            ws.project.extension_settings.get(&p.id).and_then(|t| t.get(&setting.key)).cloned()
+                        }
+                        Scope::User => user.get(&p.id).and_then(|t| t.get(&setting.key)).cloned(),
                     };
-                    ui.label(RichText::new(scope).small().color(theme::weak())).on_hover_text(says);
-                    if kept.is_some() {
-                        let back = format!("Back to {}", setting.default);
-                        let response = ui.small_button(icons::ARROW_ARC_LEFT);
-                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &back));
-                        if response.on_hover_text(&back).clicked() {
-                            next = Some(None);
-                        }
-                    }
-                });
-                ui.end_row();
-                // A value its default's is not kept: going back to it removes the setting.
-                let Some(next) = next.map(|n| n.filter(|v| *v != setting.default)) else { continue };
-                let said = next.as_ref().map_or_else(|| "its default".to_string(), ToString::to_string);
-                match setting.scope {
-                    Scope::Project => {
-                        let written = project::switches::set_setting(
-                            &ws.project,
-                            &p.id,
-                            &setting.key,
-                            next.as_ref(),
-                            &mut ws.history,
-                            format!("Set {label} to {said}"),
-                        );
-                        if let Err(e) = written {
-                            *message = Some(format!("project.toml: {e:#}"));
-                        }
-                    }
-                    Scope::User => {
-                        let table = user.entry(p.id.clone()).or_default();
-                        match next {
-                            Some(v) => {
-                                table.insert(setting.key.clone(), v);
-                            }
-                            None => {
-                                table.remove(&setting.key);
+                    let mut next = (chosen != *value).then_some(Some(chosen));
+                    ui.horizontal(|ui| {
+                        let (scope, says) = match setting.scope {
+                            Scope::Project => ("project", "Kept in project.toml: the same for everyone on the project"),
+                            Scope::User => ("yours", "Kept in your editor settings: the same in every project"),
+                        };
+                        ui.label(RichText::new(scope).small().color(theme::weak())).on_hover_text(says);
+                        if kept.is_some() {
+                            let back = format!("Back to {}", setting.default);
+                            let response = ui.small_button(icons::ARROW_ARC_LEFT);
+                            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &back));
+                            if response.on_hover_text(&back).clicked() {
+                                next = Some(None);
                             }
                         }
-                        if table.is_empty() {
-                            user.remove(&p.id);
+                    });
+                    ui.end_row();
+                    // A value its default's is not kept: going back to it removes the setting.
+                    let Some(next) = next.map(|n| n.filter(|v| *v != setting.default)) else { continue };
+                    let said = next.as_ref().map_or_else(|| "its default".to_string(), ToString::to_string);
+                    match setting.scope {
+                        Scope::Project => {
+                            let written = project::switches::set_setting(
+                                &ws.project,
+                                &p.id,
+                                &setting.key,
+                                next.as_ref(),
+                                &mut ws.history,
+                                format!("Set {label} to {said}"),
+                            );
+                            if let Err(e) = written {
+                                *message = Some(format!("project.toml: {e:#}"));
+                            }
+                        }
+                        Scope::User => {
+                            let table = user.entry(p.id.clone()).or_default();
+                            match next {
+                                Some(v) => {
+                                    table.insert(setting.key.clone(), v);
+                                }
+                                None => {
+                                    table.remove(&setting.key);
+                                }
+                            }
+                            if table.is_empty() {
+                                user.remove(&p.id);
+                            }
                         }
                     }
                 }
-            }
-        });
+            },
+        );
     });
 }
 
@@ -583,7 +679,8 @@ fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut Us
 fn setting_input(ui: &mut egui::Ui, id: (&str, &str), label: &str, setting: &Setting, value: &mut toml::Value) {
     use toml::Value;
     if !setting.choices.is_empty() {
-        let shown = setting.choices.iter().find(|(v, _)| v == value).map_or_else(|| value.to_string(), |(_, l)| l.clone());
+        let shown =
+            setting.choices.iter().find(|(v, _)| v == value).map_or_else(|| value.to_string(), |(_, l)| l.clone());
         egui::ComboBox::from_id_salt(("setting", id)).selected_text(shown).show_ui(ui, |ui| {
             for (v, l) in &setting.choices {
                 ui.selectable_value(value, v.clone(), l);
@@ -653,8 +750,12 @@ fn unsandboxed_ui(ui: &mut egui::Ui, ws: &Workspace, p: &Present, message: &mut 
         }
     }
     // Where it is can be trusted instead, a no said when the project was opened taken back.
-    if let Some((place, label)) = crate::onboarding::file_of(p).filter(|_| enable).map(|file| crate::onboarding::place_of(ws, file))
-        && ui.button(format!("Trust {label}")).on_hover_text("What is there runs from now on: for you, on this computer").clicked()
+    if let Some((place, label)) =
+        crate::onboarding::file_of(p).filter(|_| enable).map(|file| crate::onboarding::place_of(ws, file))
+        && ui
+            .button(format!("Trust {label}"))
+            .on_hover_text("What is there runs from now on: for you, on this computer")
+            .clicked()
     {
         if crate::drive::agent_acting(ui.ctx()) {
             *message = Some(format!("{label}: only you can trust it, not an agent"));
@@ -694,7 +795,8 @@ fn dependencies_ui(ui: &mut egui::Ui, p: &Present, present: &[Present], state: &
         }
     });
     theme::section(ui, "Required by", |ui| {
-        let by: Vec<&Present> = present.iter().filter(|q| q.dependencies().any(|(r, _)| requirement(r).0 == p.id)).collect();
+        let by: Vec<&Present> =
+            present.iter().filter(|q| q.dependencies().any(|(r, _)| requirement(r).0 == p.id)).collect();
         if by.is_empty() {
             ui.label(RichText::new("Nothing").color(theme::weak()));
         }
@@ -707,24 +809,43 @@ fn dependencies_ui(ui: &mut egui::Ui, p: &Present, present: &[Present], state: &
 }
 
 /// Taking an extension from outside the project in, or letting it go: whether there is nothing more to say of it.
-fn taking_in_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, message: &mut Option<String>) -> bool {
+fn taking_in_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    present: &[Present],
+    p: &Present,
+    message: &mut Option<String>,
+) -> bool {
     let imported = ws.project.manifest.imported.iter().find(|imported| imported.id == p.id).cloned();
     // One of its id may be in effect, a built-in, and this in the user's folder to take its place.
     let waiting = present.iter().find(|q| q.id == p.id && q.status == Status::Available);
     let change = if let Some(waiting) = waiting {
         if p.status != Status::Available {
-            ui.label(RichText::new(format!("{} {} is {}", waiting.id, waiting.version, status_text(&waiting.status))).color(theme::weak()));
+            ui.label(
+                RichText::new(format!("{} {} is {}", waiting.id, waiting.version, status_text(&waiting.status)))
+                    .color(theme::weak()),
+            );
         }
-        let take = ui.button("Take it into the project").on_hover_text("It is listed in project.toml, for everyone on the project");
+        let take = ui
+            .button("Take it into the project")
+            .on_hover_text("It is listed in project.toml, for everyone on the project");
         take.clicked().then(|| {
-            let wanted = project::Imported { id: p.id.clone(), version: Some(accepted(&waiting.version)), ..project::Imported::default() };
+            let wanted = project::Imported {
+                id: p.id.clone(),
+                version: Some(accepted(&waiting.version)),
+                ..project::Imported::default()
+            };
             project::switches::import(&ws.project, &wanted, &mut ws.history, format!("Take {} in", p.id))
         })
     } else if let Some(imported) = imported.as_ref().filter(|_| !matches!(p.origin, Origin::Project { .. })) {
-        ui.label(RichText::new(if imported.required { "The project requires it" } else { "Taken in by the project" }).color(theme::weak()));
-        ui.button("Let it go").on_hover_text("It stops being listed in project.toml").clicked().then(|| {
-            project::switches::remove(&ws.project, &p.id, &mut ws.history, format!("Let {} go", p.id))
-        })
+        ui.label(
+            RichText::new(if imported.required { "The project requires it" } else { "Taken in by the project" })
+                .color(theme::weak()),
+        );
+        ui.button("Let it go")
+            .on_hover_text("It stops being listed in project.toml")
+            .clicked()
+            .then(|| project::switches::remove(&ws.project, &p.id, &mut ws.history, format!("Let {} go", p.id)))
     } else {
         None
     };
@@ -743,7 +864,14 @@ fn accepted(version: &str) -> String {
 }
 
 /// The switch: on or off for the project, saying first what goes with it.
-fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, state: &mut State, message: &mut Option<String>) {
+fn switch_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    present: &[Present],
+    p: &Present,
+    state: &mut State,
+    message: &mut Option<String>,
+) {
     // Not enabled, it is not this project's to turn on.
     if matches!(p.status, Status::NotEnabled { .. }) {
         return;
@@ -755,7 +883,10 @@ fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
     let off = disabled.contains(&p.id);
     if !off && matches!(p.status, Status::Refused(_)) {
         // Refused over what it needs, it waits for that; one that cannot be read at all has no switch.
-        let waits = p.requires.iter().any(|r| present.iter().find(|q| q.id == requirement(r).0).is_none_or(|q| q.status != Status::Loaded));
+        let waits = p
+            .requires
+            .iter()
+            .any(|r| present.iter().find(|q| q.id == requirement(r).0).is_none_or(|q| q.status != Status::Loaded));
         if waits {
             ui.label(RichText::new("It cannot be turned on until what it needs is.").small().color(theme::weak()));
         }
@@ -836,7 +967,11 @@ mod tests {
     fn a_service_is_shown_through_what_provides_it_as_it_was_asked_for() {
         let mut provider = extension("pe2.ffmpeg", &[], &[], &[], &[]);
         provider.provides = vec!["video-container@1.0.0".to_string()];
-        let present = vec![extension("user", &[], &["video-container@^1"], &[], &["video-container@^1"]), provider, extension("plain", &["pe2.ffmpeg"], &[], &[], &[])];
+        let present = vec![
+            extension("user", &[], &["video-container@^1"], &[], &["video-container@^1"]),
+            provider,
+            extension("plain", &["pe2.ffmpeg"], &[], &[], &[]),
+        ];
         let (shown, services) = through_providers(present);
         let state = State { services, ..State::default() };
         let weak = &shown[0].weak[0];

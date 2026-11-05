@@ -83,7 +83,8 @@ pub fn inverse(matrix: &M3) -> Option<M3> {
         matrix[below][next] * matrix[under][last] - matrix[below][last] * matrix[under][next]
     };
     let determinant: f32 = (0..3).map(|column| matrix[0][column] * cofactor(0, column)).sum();
-    (determinant.abs() > 1e-9).then(|| std::array::from_fn(|row| std::array::from_fn(|column| cofactor(column, row) / determinant)))
+    (determinant.abs() > 1e-9)
+        .then(|| std::array::from_fn(|row| std::array::from_fn(|column| cofactor(column, row) / determinant)))
 }
 
 #[cfg(test)]

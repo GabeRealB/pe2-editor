@@ -175,7 +175,12 @@ struct Geometry {
 
 impl Geometry {
     fn new() -> Geometry {
-        Geometry { usage: wg::GpuBufferUsage::VERTEX | wg::GpuBufferUsage::COPY_DST, buffer: None, capacity: 0, used: 0 }
+        Geometry {
+            usage: wg::GpuBufferUsage::VERTEX | wg::GpuBufferUsage::COPY_DST,
+            buffer: None,
+            capacity: 0,
+            used: 0,
+        }
     }
 
     fn write(&mut self, device: &wg::GpuDevice, queue: &wg::GpuQueue, bytes: &[u8]) {
@@ -185,7 +190,12 @@ impl Geometry {
         }
         if self.capacity < self.used {
             self.capacity = self.used.next_power_of_two();
-            self.buffer = Some(device.create_buffer(&wg::GpuBufferDescriptor { size: self.capacity, usage: self.usage, mapped_at_creation: None, label: None }));
+            self.buffer = Some(device.create_buffer(&wg::GpuBufferDescriptor {
+                size: self.capacity,
+                usage: self.usage,
+                mapped_at_creation: None,
+                label: None,
+            }));
         }
         if let Some(buffer) = &self.buffer {
             let _ = queue.write_buffer_with_copy(buffer, 0, bytes, None, None);
@@ -209,7 +219,13 @@ impl Drop for Target {
     }
 }
 
-fn texture(device: &wg::GpuDevice, size: (u32, u32), format: wg::GpuTextureFormat, samples: u32, usage: wg::GpuTextureUsage) -> wg::GpuTexture {
+fn texture(
+    device: &wg::GpuDevice,
+    size: (u32, u32),
+    format: wg::GpuTextureFormat,
+    samples: u32,
+    usage: wg::GpuTextureUsage,
+) -> wg::GpuTexture {
     device.create_texture(&wg::GpuTextureDescriptor {
         size: wg::GpuExtent3D { width: size.0, height: Some(size.1), depth_or_array_layers: None },
         mip_level_count: None,
@@ -279,23 +295,66 @@ impl Shared {
             texture: None,
             storage_texture: None,
         };
-        let bindings = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: vec![entry], label: None });
+        let bindings =
+            device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: vec![entry], label: None });
         let visible = wg::GpuShaderStage::FRAGMENT;
         let picture_entries = vec![
-            wg::GpuBindGroupLayoutEntry { binding: 0, visibility: visible, buffer: None, sampler: None, texture: Some(wg::GpuTextureBindingLayout { sample_type: None, view_dimension: None, multisampled: None }), storage_texture: None },
-            wg::GpuBindGroupLayoutEntry { binding: 1, visibility: visible, buffer: None, sampler: Some(wg::GpuSamplerBindingLayout { type_: None }), texture: None, storage_texture: None },
+            wg::GpuBindGroupLayoutEntry {
+                binding: 0,
+                visibility: visible,
+                buffer: None,
+                sampler: None,
+                texture: Some(wg::GpuTextureBindingLayout {
+                    sample_type: None,
+                    view_dimension: None,
+                    multisampled: None,
+                }),
+                storage_texture: None,
+            },
+            wg::GpuBindGroupLayoutEntry {
+                binding: 1,
+                visibility: visible,
+                buffer: None,
+                sampler: Some(wg::GpuSamplerBindingLayout { type_: None }),
+                texture: None,
+                storage_texture: None,
+            },
         ];
-        let pictures = device.create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: picture_entries, label: None });
-        let layout = device.create_pipeline_layout(&wg::GpuPipelineLayoutDescriptor { bind_group_layouts: vec![Some(&bindings), Some(&pictures)], immediate_size: None, label: None });
-        let module = device.create_shader_module(&wg::GpuShaderModuleDescriptor { code: SHADER.to_string(), compilation_hints: None, label: None });
-        let (solid, lines) = (world_pipeline(&device, &layout, &module, true), world_pipeline(&device, &layout, &module, false));
+        let pictures = device
+            .create_bind_group_layout(&wg::GpuBindGroupLayoutDescriptor { entries: picture_entries, label: None });
+        let layout = device.create_pipeline_layout(&wg::GpuPipelineLayoutDescriptor {
+            bind_group_layouts: vec![Some(&bindings), Some(&pictures)],
+            immediate_size: None,
+            label: None,
+        });
+        let module = device.create_shader_module(&wg::GpuShaderModuleDescriptor {
+            code: SHADER.to_string(),
+            compilation_hints: None,
+            label: None,
+        });
+        let (solid, lines) =
+            (world_pipeline(&device, &layout, &module, true), world_pipeline(&device, &layout, &module, false));
         let (floor, flat) = (floor_pipeline(&device, &layout, &module), flat_pipeline(&device, &module));
         // Nearest, as the console samples, and nothing to show until a scene says.
         let sampler = device.create_sampler(None);
         let blank = upload(&device, &queue, (1, 1), &[255; 4]);
-        let blended = [Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter].map(|blend| face_pipeline(&device, &layout, &module, Some(blend)));
+        let blended = [Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter]
+            .map(|blend| face_pipeline(&device, &layout, &module, Some(blend)));
         let solid_parts = face_pipeline(&device, &layout, &module, None);
-        Some(Shared { device, queue, solid, solid_parts, blended, floor, lines, flat, bindings, pictures, sampler, blank })
+        Some(Shared {
+            device,
+            queue,
+            solid,
+            solid_parts,
+            blended,
+            floor,
+            lines,
+            flat,
+            bindings,
+            pictures,
+            sampler,
+            blank,
+        })
     }
 }
 
@@ -321,8 +380,16 @@ fn multisample() -> wg::GpuMultisampleState {
 }
 
 fn world_attributes() -> Vec<Option<wg::GpuVertexBufferLayout>> {
-    let attribute = |offset, shader_location| wg::GpuVertexAttribute { format: wg::GpuVertexFormat::Float32x3, offset, shader_location };
-    vec![Some(wg::GpuVertexBufferLayout { array_stride: scene::VERTEX_SIZE, attributes: vec![attribute(0, 0), attribute(12, 1), attribute(24, 2)], step_mode: None })]
+    let attribute = |offset, shader_location| wg::GpuVertexAttribute {
+        format: wg::GpuVertexFormat::Float32x3,
+        offset,
+        shader_location,
+    };
+    vec![Some(wg::GpuVertexBufferLayout {
+        array_stride: scene::VERTEX_SIZE,
+        attributes: vec![attribute(0, 0), attribute(12, 1), attribute(24, 2)],
+        step_mode: None,
+    })]
 }
 
 fn depth(compare: wg::GpuCompareFunction, write: bool, bias: Option<i32>) -> wg::GpuDepthStencilState {
@@ -341,15 +408,27 @@ fn depth(compare: wg::GpuCompareFunction, write: bool, bias: Option<i32>) -> wg:
 }
 
 fn face_attributes() -> Vec<Option<wg::GpuVertexBufferLayout>> {
-    let attribute = |offset, shader_location| wg::GpuVertexAttribute { format: wg::GpuVertexFormat::Float32x3, offset, shader_location };
-    vec![Some(wg::GpuVertexBufferLayout { array_stride: scene::TRIANGLE_SIZE, attributes: vec![attribute(0, 0), attribute(12, 1), attribute(24, 2), attribute(36, 3)], step_mode: None })]
+    let attribute = |offset, shader_location| wg::GpuVertexAttribute {
+        format: wg::GpuVertexFormat::Float32x3,
+        offset,
+        shader_location,
+    };
+    vec![Some(wg::GpuVertexBufferLayout {
+        array_stride: scene::TRIANGLE_SIZE,
+        attributes: vec![attribute(0, 0), attribute(12, 1), attribute(24, 2), attribute(36, 3)],
+        step_mode: None,
+    })]
 }
 
 /// What each of the GPU's blends does with what is behind (B) and the face (F); a constant is `share`'s.
 fn blend_of(blend: Blend) -> wg::GpuBlendState {
     use wg::GpuBlendFactor::{Constant, One, OneMinusConstant};
     use wg::GpuBlendOperation::{Add, ReverseSubtract};
-    let part = |operation, src_factor, dst_factor| wg::GpuBlendComponent { operation: Some(operation), src_factor: Some(src_factor), dst_factor: Some(dst_factor) };
+    let part = |operation, src_factor, dst_factor| wg::GpuBlendComponent {
+        operation: Some(operation),
+        src_factor: Some(src_factor),
+        dst_factor: Some(dst_factor),
+    };
     let component = match blend {
         Blend::Mix => part(Add, Constant, OneMinusConstant),
         Blend::Add => part(Add, One, One),
@@ -365,47 +444,111 @@ fn share(blend: Blend) -> f64 {
 }
 
 /// Faces beyond the opaque: at the depth of what they go over, a layer being at its base's very depth.
-fn face_pipeline(device: &wg::GpuDevice, layout: &wg::GpuPipelineLayout, module: &wg::GpuShaderModule, blend: Option<Blend>) -> wg::GpuRenderPipeline {
+fn face_pipeline(
+    device: &wg::GpuDevice,
+    layout: &wg::GpuPipelineLayout,
+    module: &wg::GpuShaderModule,
+    blend: Option<Blend>,
+) -> wg::GpuRenderPipeline {
     let target = wg::GpuColorTargetState { format: COLOR, blend: blend.map(blend_of), write_mask: None };
     device.create_render_pipeline(wg::GpuRenderPipelineDescriptor {
-        vertex: wg::GpuVertexState { buffers: Some(face_attributes()), module, entry_point: Some("face".to_string()), constants: None },
-        primitive: Some(wg::GpuPrimitiveState { topology: Some(wg::GpuPrimitiveTopology::TriangleList), strip_index_format: None, front_face: None, cull_mode: None, unclipped_depth: None }),
+        vertex: wg::GpuVertexState {
+            buffers: Some(face_attributes()),
+            module,
+            entry_point: Some("face".to_string()),
+            constants: None,
+        },
+        primitive: Some(wg::GpuPrimitiveState {
+            topology: Some(wg::GpuPrimitiveTopology::TriangleList),
+            strip_index_format: None,
+            front_face: None,
+            cull_mode: None,
+            unclipped_depth: None,
+        }),
         depth_stencil: Some(depth(wg::GpuCompareFunction::LessEqual, blend.is_none(), Some(2))),
         multisample: Some(multisample()),
-        fragment: Some(wg::GpuFragmentState { targets: vec![Some(target)], module, entry_point: Some(if blend.is_some() { "lit_semi" } else { "lit_solid" }.to_string()), constants: None }),
+        fragment: Some(wg::GpuFragmentState {
+            targets: vec![Some(target)],
+            module,
+            entry_point: Some(if blend.is_some() { "lit_semi" } else { "lit_solid" }.to_string()),
+            constants: None,
+        }),
         layout: wg::GpuLayoutMode::Specific(layout),
         label: Some("render faces".to_string()),
     })
 }
 
-fn world_pipeline(device: &wg::GpuDevice, layout: &wg::GpuPipelineLayout, module: &wg::GpuShaderModule, lit: bool) -> wg::GpuRenderPipeline {
+fn world_pipeline(
+    device: &wg::GpuDevice,
+    layout: &wg::GpuPipelineLayout,
+    module: &wg::GpuShaderModule,
+    lit: bool,
+) -> wg::GpuRenderPipeline {
     let topology = if lit { wg::GpuPrimitiveTopology::TriangleList } else { wg::GpuPrimitiveTopology::LineList };
     let target = wg::GpuColorTargetState { format: COLOR, blend: None, write_mask: None };
     device.create_render_pipeline(wg::GpuRenderPipelineDescriptor {
-        vertex: wg::GpuVertexState { buffers: Some(if lit { face_attributes() } else { world_attributes() }), module, entry_point: Some(if lit { "face" } else { "world" }.to_string()), constants: None },
-        primitive: Some(wg::GpuPrimitiveState { topology: Some(topology), strip_index_format: None, front_face: None, cull_mode: None, unclipped_depth: None }),
+        vertex: wg::GpuVertexState {
+            buffers: Some(if lit { face_attributes() } else { world_attributes() }),
+            module,
+            entry_point: Some(if lit { "face" } else { "world" }.to_string()),
+            constants: None,
+        },
+        primitive: Some(wg::GpuPrimitiveState {
+            topology: Some(topology),
+            strip_index_format: None,
+            front_face: None,
+            cull_mode: None,
+            unclipped_depth: None,
+        }),
         // Faces a little back, so that lines on them are seen.
-        depth_stencil: Some(if lit { depth(wg::GpuCompareFunction::Less, true, Some(2)) } else { depth(wg::GpuCompareFunction::LessEqual, true, None) }),
+        depth_stencil: Some(if lit {
+            depth(wg::GpuCompareFunction::Less, true, Some(2))
+        } else {
+            depth(wg::GpuCompareFunction::LessEqual, true, None)
+        }),
         multisample: Some(multisample()),
-        fragment: Some(wg::GpuFragmentState { targets: vec![Some(target)], module, entry_point: Some(if lit { "lit" } else { "flat_color" }.to_string()), constants: None }),
+        fragment: Some(wg::GpuFragmentState {
+            targets: vec![Some(target)],
+            module,
+            entry_point: Some(if lit { "lit" } else { "flat_color" }.to_string()),
+            constants: None,
+        }),
         layout: wg::GpuLayoutMode::Specific(layout),
         label: Some("render world".to_string()),
     })
 }
 
 fn over_blend() -> wg::GpuBlendState {
-    let over = wg::GpuBlendComponent { operation: None, src_factor: Some(wg::GpuBlendFactor::SrcAlpha), dst_factor: Some(wg::GpuBlendFactor::OneMinusSrcAlpha) };
+    let over = wg::GpuBlendComponent {
+        operation: None,
+        src_factor: Some(wg::GpuBlendFactor::SrcAlpha),
+        dst_factor: Some(wg::GpuBlendFactor::OneMinusSrcAlpha),
+    };
     wg::GpuBlendState { color: over, alpha: over }
 }
 
-fn floor_pipeline(device: &wg::GpuDevice, layout: &wg::GpuPipelineLayout, module: &wg::GpuShaderModule) -> wg::GpuRenderPipeline {
+fn floor_pipeline(
+    device: &wg::GpuDevice,
+    layout: &wg::GpuPipelineLayout,
+    module: &wg::GpuShaderModule,
+) -> wg::GpuRenderPipeline {
     let target = wg::GpuColorTargetState { format: COLOR, blend: Some(over_blend()), write_mask: None };
     device.create_render_pipeline(wg::GpuRenderPipelineDescriptor {
-        vertex: wg::GpuVertexState { buffers: Some(world_attributes()), module, entry_point: Some("world".to_string()), constants: None },
+        vertex: wg::GpuVertexState {
+            buffers: Some(world_attributes()),
+            module,
+            entry_point: Some("world".to_string()),
+            constants: None,
+        },
         primitive: None,
         depth_stencil: Some(depth(wg::GpuCompareFunction::LessEqual, false, None)),
         multisample: Some(multisample()),
-        fragment: Some(wg::GpuFragmentState { targets: vec![Some(target)], module, entry_point: Some("floor_lines".to_string()), constants: None }),
+        fragment: Some(wg::GpuFragmentState {
+            targets: vec![Some(target)],
+            module,
+            entry_point: Some("floor_lines".to_string()),
+            constants: None,
+        }),
         layout: wg::GpuLayoutMode::Specific(layout),
         label: Some("render floor".to_string()),
     })
@@ -416,14 +559,25 @@ fn flat_pipeline(device: &wg::GpuDevice, module: &wg::GpuShaderModule) -> wg::Gp
         wg::GpuVertexAttribute { format: wg::GpuVertexFormat::Float32x2, offset: 0, shader_location: 0 },
         wg::GpuVertexAttribute { format: wg::GpuVertexFormat::Float32x4, offset: 8, shader_location: 1 },
     ];
-    let layout = vec![Some(wg::GpuVertexBufferLayout { array_stride: gizmo::VERTEX_SIZE, attributes, step_mode: None })];
+    let layout =
+        vec![Some(wg::GpuVertexBufferLayout { array_stride: gizmo::VERTEX_SIZE, attributes, step_mode: None })];
     let target = wg::GpuColorTargetState { format: COLOR, blend: Some(over_blend()), write_mask: None };
     device.create_render_pipeline(wg::GpuRenderPipelineDescriptor {
-        vertex: wg::GpuVertexState { buffers: Some(layout), module, entry_point: Some("screen".to_string()), constants: None },
+        vertex: wg::GpuVertexState {
+            buffers: Some(layout),
+            module,
+            entry_point: Some("screen".to_string()),
+            constants: None,
+        },
         primitive: None,
         depth_stencil: Some(depth(wg::GpuCompareFunction::Always, false, None)),
         multisample: Some(multisample()),
-        fragment: Some(wg::GpuFragmentState { targets: vec![Some(target)], module, entry_point: Some("over".to_string()), constants: None }),
+        fragment: Some(wg::GpuFragmentState {
+            targets: vec![Some(target)],
+            module,
+            entry_point: Some("over".to_string()),
+            constants: None,
+        }),
         layout: wg::GpuLayoutMode::Auto,
         label: Some("render over".to_string()),
     })
@@ -432,13 +586,19 @@ fn flat_pipeline(device: &wg::GpuDevice, module: &wg::GpuShaderModule) -> wg::Gp
 fn upload(device: &wg::GpuDevice, queue: &wg::GpuQueue, size: (u32, u32), rgba: &[u8]) -> wg::GpuTexture {
     let made = texture(device, size, COLOR, 1, wg::GpuTextureUsage::TEXTURE_BINDING | wg::GpuTextureUsage::COPY_DST);
     let place = wg::GpuTexelCopyTextureInfo { texture: &made, mip_level: None, origin: None, aspect: None };
-    let layout = wg::GpuTexelCopyBufferLayout { offset: None, bytes_per_row: Some(size.0 * 4), rows_per_image: Some(size.1) };
+    let layout =
+        wg::GpuTexelCopyBufferLayout { offset: None, bytes_per_row: Some(size.0 * 4), rows_per_image: Some(size.1) };
     let extent = wg::GpuExtent3D { width: size.0, height: Some(size.1), depth_or_array_layers: None };
     queue.write_texture_with_copy(&place, rgba, layout, extent);
     made
 }
 
-fn picture_group(device: &wg::GpuDevice, layout: &wg::GpuBindGroupLayout, sampler: &wg::GpuSampler, texture: &wg::GpuTexture) -> wg::GpuBindGroup {
+fn picture_group(
+    device: &wg::GpuDevice,
+    layout: &wg::GpuBindGroupLayout,
+    sampler: &wg::GpuSampler,
+    texture: &wg::GpuTexture,
+) -> wg::GpuBindGroup {
     let view = texture.create_view(None);
     device.create_bind_group(&wg::GpuBindGroupDescriptor {
         layout,
@@ -455,7 +615,12 @@ impl Renderer {
     pub fn new() -> Option<Renderer> {
         let shared = Shared::get()?;
         let device = &shared.device;
-        let frame = device.create_buffer(&wg::GpuBufferDescriptor { size: FRAME_SIZE, usage: wg::GpuBufferUsage::UNIFORM | wg::GpuBufferUsage::COPY_DST, mapped_at_creation: None, label: None });
+        let frame = device.create_buffer(&wg::GpuBufferDescriptor {
+            size: FRAME_SIZE,
+            usage: wg::GpuBufferUsage::UNIFORM | wg::GpuBufferUsage::COPY_DST,
+            mapped_at_creation: None,
+            label: None,
+        });
         let group = device.create_bind_group(&wg::GpuBindGroupDescriptor {
             layout: &shared.bindings,
             entries: vec![wg::GpuBindGroupEntry { binding: 0, resource: wg::GpuBindingResource::GpuBuffer(&frame) }],
@@ -463,7 +628,21 @@ impl Renderer {
         });
         let atlas = picture_group(device, &shared.pictures, &shared.sampler, &shared.blank);
         let geometry = Geometry::new;
-        Some(Renderer { vertices: [0; 2], blended_faces: geometry(), runs: Vec::new(), frame, group, atlas, atlas_texture: None, target: None, triangles: geometry(), floor_quad: geometry(), world_lines: geometry(), overlay: geometry(), shared })
+        Some(Renderer {
+            vertices: [0; 2],
+            blended_faces: geometry(),
+            runs: Vec::new(),
+            frame,
+            group,
+            atlas,
+            atlas_texture: None,
+            target: None,
+            triangles: geometry(),
+            floor_quad: geometry(),
+            world_lines: geometry(),
+            overlay: geometry(),
+            shared,
+        })
     }
 
     /// Make sure what is drawn to is this many pixels; what the window shows it by. Whether it changed.
@@ -471,7 +650,13 @@ impl Renderer {
         if self.target.as_ref().is_some_and(|target| target.size == size) {
             return false;
         }
-        let shown = texture(&self.shared.device, size, COLOR, 1, wg::GpuTextureUsage::RENDER_ATTACHMENT | wg::GpuTextureUsage::TEXTURE_BINDING);
+        let shown = texture(
+            &self.shared.device,
+            size,
+            COLOR,
+            1,
+            wg::GpuTextureUsage::RENDER_ATTACHMENT | wg::GpuTextureUsage::TEXTURE_BINDING,
+        );
         let samples = texture(&self.shared.device, size, COLOR, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
         let depth = texture(&self.shared.device, size, DEPTH, SAMPLES, wg::GpuTextureUsage::RENDER_ATTACHMENT);
         self.target = Some(Target {
@@ -498,7 +683,11 @@ impl Renderer {
 
     pub fn set_triangles(&mut self, triangles: Option<&Triangles>) {
         self.vertices = triangles.map_or([0; 2], |triangles| triangles.vertices);
-        self.triangles.write(&self.shared.device, &self.shared.queue, triangles.map_or(&[], |triangles| &triangles.bytes));
+        self.triangles.write(
+            &self.shared.device,
+            &self.shared.queue,
+            triangles.map_or(&[], |triangles| &triangles.bytes),
+        );
     }
 
     /// What blends, in the order it is to be drawn.
@@ -564,7 +753,10 @@ impl Renderer {
             pass.set_pipeline(&self.shared.solid_parts);
             pass.draw(solid_parts, None, Some(opaque), None);
         }
-        let layers = [(&self.shared.lines, &self.world_lines, scene::VERTEX_SIZE), (&self.shared.floor, &self.floor_quad, scene::VERTEX_SIZE)];
+        let layers = [
+            (&self.shared.lines, &self.world_lines, scene::VERTEX_SIZE),
+            (&self.shared.floor, &self.floor_quad, scene::VERTEX_SIZE),
+        ];
         for (pipeline, geometry, stride) in layers {
             draw_all(&pass, pipeline, geometry, stride);
         }

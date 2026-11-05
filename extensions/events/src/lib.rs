@@ -7,6 +7,12 @@ pe2_ext::extension!("pe2.events", "0.1.0", register);
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    r.named_type("event").alias("event").label("Event").data().icon(Icon::Terminal, Tint::Code).field(Field::new("label").label("Label")).register();
+    r.named_type("event")
+        .alias("event")
+        .label("Event")
+        .data()
+        .icon(Icon::Terminal, Tint::Code)
+        .field(Field::new("label").label("Label"))
+        .register();
     Ok(())
 }

@@ -30,11 +30,11 @@ use anyhow::{Context, Result, anyhow};
 use pe2_ext::{Asset, Declared, Discs, Extraction, Field, Image, Name, Project, Registry, Source, Table, UiHost};
 use pe2_ext::{Value, View};
 use std::path::Path;
+use std::sync::Weak;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use wasmtime::component::{Accessor, Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable};
-use std::sync::Weak;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{HostMonotonicClock, HostWallClock, WasiCtx, WasiCtxView, WasiView};
@@ -429,7 +429,11 @@ impl host::HostAsset for State {
         Ok(self.lent(&asset)?.read_range(&name, offset, len as usize).map_err(|e| format!("{e:#}")))
     }
 
-    fn writer(&mut self, asset: Resource<LentAsset>, name: String) -> wasmtime::Result<Result<Resource<HostWriter>, String>> {
+    fn writer(
+        &mut self,
+        asset: Resource<LentAsset>,
+        name: String,
+    ) -> wasmtime::Result<Result<Resource<HostWriter>, String>> {
         let made = match self.lent(&asset)?.writer(&name) {
             Some(made) => made.map_err(|e| format!("{e:#}")),
             None => Err(format!("{}: lent for no operation's run, it makes no files", self.lent(&asset)?.path())),
@@ -441,24 +445,44 @@ impl host::HostAsset for State {
     }
 
     fn entries(&mut self, asset: Resource<LentAsset>, folder: String) -> wasmtime::Result<Result<Vec<String>, String>> {
-        Ok(self.lent(&asset)?.entries(&folder).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+        Ok(self
+            .lent(&asset)?
+            .entries(&folder)
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map_err(|e| format!("{e:#}")))
     }
 
     fn read_entry(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
-        Ok(self.lent(&asset)?.read_entry(&path).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+        Ok(self
+            .lent(&asset)?
+            .read_entry(&path)
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map_err(|e| format!("{e:#}")))
     }
 
     fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<String>> {
         Ok(self.lent(&asset)?.place(&path))
     }
 
-    fn node_named(&mut self, asset: Resource<LentAsset>, reference: String) -> wasmtime::Result<Option<host::NodeNamed>> {
+    fn node_named(
+        &mut self,
+        asset: Resource<LentAsset>,
+        reference: String,
+    ) -> wasmtime::Result<Option<host::NodeNamed>> {
         let named = self.lent(&asset)?.node_named(&reference);
         Ok(named.map(|named| host::NodeNamed { path: named.path, uid: named.uid, types: named.types }))
     }
 
-    fn output_of(&mut self, asset: Resource<LentAsset>, path: String, address: String) -> wasmtime::Result<Result<types::Value, String>> {
-        let told = self.lent(&asset)?.output_of(&path, &address).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+    fn output_of(
+        &mut self,
+        asset: Resource<LentAsset>,
+        path: String,
+        address: String,
+    ) -> wasmtime::Result<Result<types::Value, String>> {
+        let told = self
+            .lent(&asset)?
+            .output_of(&path, &address)
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
         Ok(match told {
             Ok(value) => Ok(value_to_wit(value, &mut self.table).map_err(|e| wasmtime::Error::msg(format!("{e:#}")))?),
             Err(e) => Err(format!("{e:#}")),
@@ -467,21 +491,44 @@ impl host::HostAsset for State {
 
     fn build_config(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Option<host::BuildConfig>> {
         let told = self.lent(&asset)?.build_config();
-        Ok(told.map(|c| host::BuildConfig { name: c.name, release: c.release, target: c.target, folder: c.folder, known: c.known }))
+        Ok(told.map(|c| host::BuildConfig {
+            name: c.name,
+            release: c.release,
+            target: c.target,
+            folder: c.folder,
+            known: c.known,
+        }))
     }
 
-    fn assets_of(&mut self, asset: Resource<LentAsset>, node_type: String) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
-        Ok(self.lent(&asset)?.assets_of(&node_type).unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+    fn assets_of(
+        &mut self,
+        asset: Resource<LentAsset>,
+        node_type: String,
+    ) -> wasmtime::Result<Result<Vec<(String, String)>, String>> {
+        Ok(self
+            .lent(&asset)?
+            .assets_of(&node_type)
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map_err(|e| format!("{e:#}")))
     }
 
     fn temp(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<Result<String, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
-        Ok(self.lent(&asset)?.temp().unwrap_or_else(|| Err(anyhow!("lent for no operation's run"))).map_err(|e| format!("{e:#}")))
+        Ok(self
+            .lent(&asset)?
+            .temp()
+            .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map_err(|e| format!("{e:#}")))
     }
 
-    fn keep(&mut self, asset: Resource<LentAsset>, path: String, name: String) -> wasmtime::Result<Result<types::File, String>> {
+    fn keep(
+        &mut self,
+        asset: Resource<LentAsset>,
+        path: String,
+        name: String,
+    ) -> wasmtime::Result<Result<types::File, String>> {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
@@ -527,14 +574,22 @@ impl host::HostProject for State {
         self.found(project.asset(&path))
     }
 
-    fn resolve(&mut self, project: Resource<LentProject>, reference: String) -> wasmtime::Result<Option<Resource<LentAsset>>> {
+    fn resolve(
+        &mut self,
+        project: Resource<LentProject>,
+        reference: String,
+    ) -> wasmtime::Result<Option<Resource<LentAsset>>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
         let Some(reference) = parse_value(&reference) else { return Ok(None) };
         self.found(project.resolve(&reference))
     }
 
-    fn find(&mut self, project: Resource<LentProject>, node_type: String) -> wasmtime::Result<Vec<Resource<LentAsset>>> {
+    fn find(
+        &mut self,
+        project: Resource<LentProject>,
+        node_type: String,
+    ) -> wasmtime::Result<Vec<Resource<LentAsset>>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
         let mut out = vec![];
@@ -550,7 +605,12 @@ impl host::HostProject for State {
         self.found(project.selection())
     }
 
-    fn chosen(&mut self, project: Resource<LentProject>, path: String, family: String) -> wasmtime::Result<Option<String>> {
+    fn chosen(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        family: String,
+    ) -> wasmtime::Result<Option<String>> {
         // SAFETY: as `asset`.
         let project = unsafe { &*self.project(&project)? };
         Ok(project.chosen(&path, &family))
@@ -563,7 +623,9 @@ impl host::HostProject for State {
         look: Option<String>,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| p.picture(&path, look.as_deref()).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+        Ok(elsewhere(project, move |p| {
+            p.picture(&path, look.as_deref()).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))
+        }))
     }
 
     fn target(&mut self, project: Resource<LentProject>) -> wasmtime::Result<Option<String>> {
@@ -585,22 +647,39 @@ impl host::HostProject for State {
         address: String,
     ) -> wasmtime::Result<Option<Result<types::Image, String>>> {
         let project = self.project(&project)?;
-        Ok(elsewhere(project, move |p| p.image(&path, &address).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))))
+        Ok(elsewhere(project, move |p| {
+            p.image(&path, &address).map(|made| made.map(to_wit).map_err(|e| format!("{e:#}")))
+        }))
     }
 
-    fn table(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<Option<Result<String, String>>> {
+    fn table(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        address: String,
+    ) -> wasmtime::Result<Option<Result<String, String>>> {
         let project = self.project(&project)?;
         Ok(elsewhere(project, move |p| {
             p.table(&path, &address).map(|made| made.map(|table| table.to_string()).map_err(|e| format!("{e:#}")))
         }))
     }
 
-    fn bytes(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<Option<Result<Vec<u8>, String>>> {
+    fn bytes(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        address: String,
+    ) -> wasmtime::Result<Option<Result<Vec<u8>, String>>> {
         let project = self.project(&project)?;
         Ok(elsewhere(project, move |p| p.bytes(&path, &address).map(|made| made.map_err(|e| format!("{e:#}")))))
     }
 
-    fn request(&mut self, project: Resource<LentProject>, path: String, address: String) -> wasmtime::Result<host::Requested> {
+    fn request(
+        &mut self,
+        project: Resource<LentProject>,
+        path: String,
+        address: String,
+    ) -> wasmtime::Result<host::Requested> {
         let project = self.project(&project)?;
         Ok(match elsewhere(project, move |p| p.request(&path, &address)) {
             pe2_ext::Requested::Ready(bytes) => host::Requested::Ready(bytes),
@@ -634,7 +713,11 @@ impl host::HostProject for State {
 
 /// A value as it crosses: TOML.
 impl host::HostDeclarations for State {
-    fn of_type(&mut self, declarations: Resource<LentDeclarations>, node_type: String) -> wasmtime::Result<Vec<(String, String)>> {
+    fn of_type(
+        &mut self,
+        declarations: Resource<LentDeclarations>,
+        node_type: String,
+    ) -> wasmtime::Result<Vec<(String, String)>> {
         // SAFETY: lent for the call running now (`ComponentExtraction::begin`), taken back before it returns.
         let declared = unsafe { &*self.table.get(&declarations)?.declared };
         Ok(declared
@@ -798,14 +881,22 @@ impl unsandboxed::Host for State {
 impl unsandboxed::HostProcess for State {
     fn write(&mut self, process: Resource<HostProcess>, bytes: Vec<u8>) -> wasmtime::Result<Result<(), String>> {
         use std::io::Write;
-        let Some(input) = self.table.get_mut(&process)?.input.as_mut() else { return Ok(Err("its input ended".into())) };
+        let Some(input) = self.table.get_mut(&process)?.input.as_mut() else {
+            return Ok(Err("its input ended".into()));
+        };
         Ok(input.write_all(&bytes).map_err(|e| e.to_string()))
     }
 
-    fn write_buffer(&mut self, process: Resource<HostProcess>, buffer: Resource<HostMediaBuffer>) -> wasmtime::Result<Result<(), String>> {
+    fn write_buffer(
+        &mut self,
+        process: Resource<HostProcess>,
+        buffer: Resource<HostMediaBuffer>,
+    ) -> wasmtime::Result<Result<(), String>> {
         use std::io::Write;
         let bytes = self.table.get(&buffer)?.0.clone();
-        let Some(input) = self.table.get_mut(&process)?.input.as_mut() else { return Ok(Err("its input ended".into())) };
+        let Some(input) = self.table.get_mut(&process)?.input.as_mut() else {
+            return Ok(Err("its input ended".into()));
+        };
         Ok(input.write_all(&bytes).map_err(|e| e.to_string()))
     }
 
@@ -832,7 +923,8 @@ impl unsandboxed::HostProcess for State {
         // What it still writes, read: it would stop on a full pipe.
         let _ = std::io::copy(&mut running.output, &mut std::io::sink());
         let status = running.child.wait();
-        let said = running.said.lock().map_or_else(|_| String::new(), |s| String::from_utf8_lossy(&s).trim().to_string());
+        let said =
+            running.said.lock().map_or_else(|_| String::new(), |s| String::from_utf8_lossy(&s).trim().to_string());
         Ok(match status {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(format!("{status}: {said}")),
@@ -961,7 +1053,12 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn table(&mut self, ui: Resource<Frame>, id: String, rows: Vec<Vec<host::Cell>>) -> wasmtime::Result<Option<(u32, u32)>> {
+    fn table(
+        &mut self,
+        ui: Resource<Frame>,
+        id: String,
+        rows: Vec<Vec<host::Cell>>,
+    ) -> wasmtime::Result<Option<(u32, u32)>> {
         let rows: Vec<Vec<pe2_ext::Cell>> = rows
             .into_iter()
             .map(|row| {
@@ -1012,7 +1109,13 @@ impl host::HostUi for State {
         Ok(self.frame(&ui)?.available())
     }
 
-    fn gpu_viewport(&mut self, ui: Resource<Frame>, id: u64, width: f32, height: f32) -> wasmtime::Result<host::ViewportInput> {
+    fn gpu_viewport(
+        &mut self,
+        ui: Resource<Frame>,
+        id: u64,
+        width: f32,
+        height: f32,
+    ) -> wasmtime::Result<host::ViewportInput> {
         let input = self.frame(&ui)?.gpu_viewport(id, width, height);
         Ok(host::ViewportInput {
             hovered: input.hovered,
@@ -1033,7 +1136,13 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn image(&mut self, ui: Resource<Frame>, texture: Resource<HostTexture>, width: f32, height: f32) -> wasmtime::Result<()> {
+    fn image(
+        &mut self,
+        ui: Resource<Frame>,
+        texture: Resource<HostTexture>,
+        width: f32,
+        height: f32,
+    ) -> wasmtime::Result<()> {
         let texture = self.table.get(&texture)?;
         let texture = pe2_ext::Texture::shared(texture.key.clone(), texture.image.clone());
         self.frame(&ui)?.image(&texture, width, height);
@@ -1047,7 +1156,13 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn reference_taking(&mut self, ui: Resource<Frame>, label: String, node_type: String, reference: Option<String>) -> wasmtime::Result<Option<String>> {
+    fn reference_taking(
+        &mut self,
+        ui: Resource<Frame>,
+        label: String,
+        node_type: String,
+        reference: Option<String>,
+    ) -> wasmtime::Result<Option<String>> {
         let reference = reference.and_then(|text| parse_value(&text));
         Ok(self.frame(&ui)?.reference_taking(&label, &node_type, reference.as_ref()).map(|taken| taken.to_string()))
     }
@@ -1068,7 +1183,14 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn text_edit(&mut self, ui: Resource<Frame>, id: String, text: String, hint: String, width: f32) -> wasmtime::Result<(String, bool)> {
+    fn text_edit(
+        &mut self,
+        ui: Resource<Frame>,
+        id: String,
+        text: String,
+        hint: String,
+        width: f32,
+    ) -> wasmtime::Result<(String, bool)> {
         let mut text = text;
         let committed = self.frame(&ui)?.text_edit(&id, &mut text, &hint, width);
         Ok((text, committed))
@@ -1100,7 +1222,10 @@ impl host::HostUi for State {
     }
 
     fn live(&mut self, ui: Resource<Frame>, fields: Vec<(String, String)>) -> wasmtime::Result<()> {
-        let fields = fields.iter().map(|(key, text)| Ok((key.as_str(), field_value(key, text)?))).collect::<wasmtime::Result<Vec<_>>>()?;
+        let fields = fields
+            .iter()
+            .map(|(key, text)| Ok((key.as_str(), field_value(key, text)?)))
+            .collect::<wasmtime::Result<Vec<_>>>()?;
         self.frame(&ui)?.live(&fields);
         Ok(())
     }
@@ -1187,7 +1312,11 @@ impl host::HostUi for State {
             toggle: canvas.toggle,
             legend: canvas.legend,
             grid: canvas.grid,
-            traces: canvas.traces.into_iter().map(|t| pe2_ext::Traced { corners: t.corners, strong: t.strong, label: t.label, link: t.link }).collect(),
+            traces: canvas
+                .traces
+                .into_iter()
+                .map(|t| pe2_ext::Traced { corners: t.corners, strong: t.strong, label: t.label, link: t.link })
+                .collect(),
         };
         self.frame(&ui)?.canvas(&canvas);
         Ok(())
@@ -1203,7 +1332,8 @@ impl host::HostUi for State {
         Ok(Some(match shown {
             Ok(texture) => {
                 let (width, height) = (u32::try_from(texture.width())?, u32::try_from(texture.height())?);
-                let held = self.table.push(HostTexture { key: texture.key().to_string(), image: texture.image().clone() })?;
+                let held =
+                    self.table.push(HostTexture { key: texture.key().to_string(), image: texture.image().clone() })?;
                 Ok((held, width, height))
             }
             Err(e) => Err(e),
@@ -1324,7 +1454,12 @@ impl Runner {
         asset: &Asset,
         project: &dyn Project,
         ticks: u64,
-        call: impl AsyncFnOnce(&Accessor<State>, &g::Guest, Resource<LentAsset>, Resource<LentProject>) -> wasmtime::Result<R>,
+        call: impl AsyncFnOnce(
+            &Accessor<State>,
+            &g::Guest,
+            Resource<LentAsset>,
+            Resource<LentProject>,
+        ) -> wasmtime::Result<R>,
     ) -> Result<R> {
         let lent = self.lend(asset)?;
         let lent_project = match self.lend_project(project) {
@@ -1354,7 +1489,6 @@ impl Runner {
         self.unlend(lent);
         out
     }
-
 }
 
 /// A component, compiled once in an engine of its own, and its instances by the lifetime of their job: a job's (a
@@ -1428,7 +1562,8 @@ impl Shared {
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(LONG);
-        let runtime = Runtime(std::mem::ManuallyDrop::new(tokio::runtime::Builder::new_current_thread().enable_all().build()?));
+        let runtime =
+            Runtime(std::mem::ManuallyDrop::new(tokio::runtime::Builder::new_current_thread().enable_all().build()?));
         let instance = drive(&runtime, self.pre.instantiate_async(&mut store))?;
         Ok(Runner { store, instance, runtime, meter, stderr })
     }
@@ -1497,9 +1632,10 @@ impl Shared {
         }
         let Ok(mut views) = self.views.lock() else { return };
         let reclaimable = views.as_ref().is_none_or(|runner| {
-            runner.lock().ok().is_none_or(|mut r| {
-                r.call(QUICK, async |a, g| g.call_reclaimable(a).await).unwrap_or(true)
-            })
+            runner
+                .lock()
+                .ok()
+                .is_none_or(|mut r| r.call(QUICK, async |a, g| g.call_reclaimable(a).await).unwrap_or(true))
         });
         if reclaimable {
             *views = None;
@@ -1526,9 +1662,11 @@ impl Shared {
 
     fn format(&self, field: u32, brief: bool, value: &Value) -> Option<String> {
         let text = value.to_string();
-        self.read(|runner| runner.call(QUICK, async |accessor, guest| guest.call_format(accessor, field, brief, text).await))
-            .ok()
-            .flatten()
+        self.read(|runner| {
+            runner.call(QUICK, async |accessor, guest| guest.call_format(accessor, field, brief, text).await)
+        })
+        .ok()
+        .flatten()
     }
 }
 
@@ -1655,9 +1793,9 @@ impl pe2_ext::Generator for ComponentGenerator {
         let node = Node::new(call.host);
         let asset = Asset::new(&node, call.host.node_type());
         let count = u32::try_from(count).unwrap_or(u32::MAX);
-        let made = self
-            .runner
-            .with_asset(&asset, self.shared.long(), async |a, g, lent| g.generator().call_next(a, resource, lent, count).await)?;
+        let made = self.runner.with_asset(&asset, self.shared.long(), async |a, g, lent| {
+            g.generator().call_next(a, resource, lent, count).await
+        })?;
         self.shared.peak.fetch_max(self.runner.bytes(), Ordering::Relaxed);
         let table = &mut self.runner.store.data_mut().table;
         made.map_err(|e| anyhow!(e))?.into_iter().map(|v| value_from_wit(v, table)).collect()
@@ -1729,7 +1867,8 @@ impl Drop for ComponentExtraction {
 /// Register a component's extractors, their sessions begun in instances of their own.
 fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shared: &Arc<Shared>) -> Result<()> {
     for extractor in extractors {
-        let node_type = Name::parse(&extractor.node_type).with_context(|| format!("{}: not a qualified type", extractor.node_type))?;
+        let node_type = Name::parse(&extractor.node_type)
+            .with_context(|| format!("{}: not a qualified type", extractor.node_type))?;
         let requires: Vec<&str> = extractor.requires.iter().map(String::as_str).collect();
         let (shared, handle) = (shared.clone(), extractor.handle);
         let cap = shared.cap(&extractor.name);
@@ -1795,7 +1934,9 @@ fn views_cap(id: &str, registration: &g::Registration, caps: &std::collections::
     let with_views = registration
         .types
         .iter()
-        .filter(|k| !k.views.is_empty() || !k.inspector.is_empty() || !k.editors.is_empty() || !k.contents_views.is_empty())
+        .filter(|k| {
+            !k.views.is_empty() || !k.inspector.is_empty() || !k.editors.is_empty() || !k.contents_views.is_empty()
+        })
         .map(|k| k.name.as_str())
         .chain(registration.panels.iter().map(|p| p.name.as_str()));
     with_views.filter_map(|local| caps.get(&format!("{id}@{local}")).copied()).fold(MEMORY, u64::max)
@@ -1862,7 +2003,13 @@ fn tint(tint: types::Tint) -> pe2_ext::Tint {
 /// A view of an asset, made in its component.
 /// What is inside an asset as a component said.
 fn contents_of(contents: g::AssetContents) -> pe2_ext::Contents {
-    let action = |a: g::ContentAction| pe2_ext::ContentAction { id: a.id, label: a.label, icon: a.icon.map(icon), on_row: a.on_row, on: a.on };
+    let action = |a: g::ContentAction| pe2_ext::ContentAction {
+        id: a.id,
+        label: a.label,
+        icon: a.icon.map(icon),
+        on_row: a.on_row,
+        on: a.on,
+    };
     let rows = contents.rows.into_iter().map(|r| pe2_ext::ContentRow {
         id: r.id,
         label: r.label,
@@ -1923,8 +2070,16 @@ fn part_sheet_of(sheet: g::PartSheet) -> Result<pe2_ext::PartSheet> {
     let mut fields = vec![];
     for f in sheet.fields {
         let value = f.value.as_deref().map(|text| parsed(text, &f.key)).transpose()?;
-        let choices = f.choices.into_iter().map(|(value, label)| Ok((parsed(&value, &f.key)?, label))).collect::<Result<_>>()?;
-        fields.push(pe2_ext::PartField { key: f.key, label: f.label, value, absent: f.absent, choices, read_only: f.read_only });
+        let choices =
+            f.choices.into_iter().map(|(value, label)| Ok((parsed(&value, &f.key)?, label))).collect::<Result<_>>()?;
+        fields.push(pe2_ext::PartField {
+            key: f.key,
+            label: f.label,
+            value,
+            absent: f.absent,
+            choices,
+            read_only: f.read_only,
+        });
     }
     Ok(pe2_ext::PartSheet { within: sheet.within, fields, problem: None })
 }
@@ -1971,7 +2126,12 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     }
     for template in &registration.templates {
         let files: Vec<&str> = template.files.iter().map(String::as_str).collect();
-        drop(registry.template(&template.name, &template.node_type, &template.stack).label(&template.label).files(&files));
+        drop(
+            registry
+                .template(&template.name, &template.node_type, &template.stack)
+                .label(&template.label)
+                .files(&files),
+        );
     }
     for (label, tool) in &registration.commands {
         registry.command(label, tool);
@@ -1980,7 +2140,8 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     for panel in registration.panels {
         let (shared, handle) = (shared.clone(), panel.handle);
         let icon = panel.icon.map_or(pe2_ext::Icon::Grid, icon);
-        registry.panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
+        registry
+            .panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
     }
     apply_ops(registry, registration.ops, shared);
     apply_extractors(registry, registration.extractors, shared)?;
@@ -1995,11 +2156,65 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
     Ok(())
 }
 
+/// A type's contents, what is done to them and its parts' sheets, where it says it has them (`contents`, `part_sheet`):
+/// each a call into the component, by the type's place.
+fn with_parts<'a>(
+    mut builder: pe2_ext::TypeBuilder<'a>,
+    (contents, part_sheet): (bool, bool),
+    index: u32,
+    shared: &Arc<Shared>,
+) -> pe2_ext::TypeBuilder<'a> {
+    if contents {
+        let lister = shared.clone();
+        builder = builder.contents(move |asset, project| {
+            let contents = lister.read(|r| {
+                r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| {
+                    g.call_contents(a, index, lent, project).await
+                })
+            });
+            contents.map_or_else(
+                |why| pe2_ext::Contents { problem: Some(format!("{why:#}")), ..pe2_ext::Contents::default() },
+                contents_of,
+            )
+        });
+        let shared = shared.clone();
+        builder = builder.content_act(move |asset, project, request| {
+            let request = content_request(request);
+            let done = shared.read(|r| {
+                r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| {
+                    g.call_content_act(a, index, lent, project, request.clone()).await
+                })
+            })?;
+            content_outcome(done.map_err(|why| anyhow!(why))?)
+        });
+    }
+    if part_sheet {
+        let shared = shared.clone();
+        builder = builder.part_sheet(move |asset, project, part| {
+            let sheet = shared.read(|r| {
+                r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| {
+                    g.call_part_sheet_of(a, index, lent, project, part.to_string()).await
+                })
+            });
+            let problem = |why: anyhow::Error| pe2_ext::PartSheet {
+                problem: Some(format!("{why:#}")),
+                ..pe2_ext::PartSheet::default()
+            };
+            match sheet {
+                Ok(sheet) => sheet.map(|sheet| part_sheet_of(sheet).unwrap_or_else(problem)),
+                Err(why) => Some(problem(why)),
+            }
+        });
+    }
+    builder
+}
+
 /// Register a component's types; what they compute calls into it, by each one's place.
 fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<Shared>) {
     for node_type in types {
         let index = node_type.handle;
-        let builder = if node_type.extends { registry.extend(&node_type.name) } else { registry.named_type(&node_type.name) };
+        let builder =
+            if node_type.extends { registry.extend(&node_type.name) } else { registry.named_type(&node_type.name) };
         let mut builder = builder.label(&node_type.label);
         if let Some(media_type) = &node_type.media_type {
             builder = builder.media_type(media_type);
@@ -2015,7 +2230,10 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
             let shared = shared.clone();
             builder = builder.sniff(move |name, size, head| {
                 let (name, head) = (name.to_string(), head.to_vec());
-                let version = shared.read(|r| r.call(QUICK, async |a, g| g.call_sniff(a, index, name, size, head).await)).ok().flatten()?;
+                let version = shared
+                    .read(|r| r.call(QUICK, async |a, g| g.call_sniff(a, index, name, size, head).await))
+                    .ok()
+                    .flatten()?;
                 Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
             });
         }
@@ -2042,37 +2260,7 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
         if let Some(stack) = &node_type.stack {
             builder = builder.stack(stack);
         }
-        if node_type.contents {
-            let lister = shared.clone();
-            builder = builder.contents(move |asset, project| {
-                let contents = lister.read(|r| r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_contents(a, index, lent, project).await));
-                contents.map_or_else(
-                    |why| pe2_ext::Contents { problem: Some(format!("{why:#}")), ..pe2_ext::Contents::default() },
-                    contents_of,
-                )
-            });
-            let shared = shared.clone();
-            builder = builder.content_act(move |asset, project, request| {
-                let request = content_request(request);
-                let done = shared.read(|r| {
-                    r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_content_act(a, index, lent, project, request.clone()).await)
-                })?;
-                content_outcome(done.map_err(|why| anyhow!(why))?)
-            });
-        }
-        if node_type.part_sheet {
-            let shared = shared.clone();
-            builder = builder.part_sheet(move |asset, project, part| {
-                let sheet = shared.read(|r| {
-                    r.with_asset_in(asset, project, QUICK, async |a, g, lent, project| g.call_part_sheet_of(a, index, lent, project, part.to_string()).await)
-                });
-                let problem = |why: anyhow::Error| pe2_ext::PartSheet { problem: Some(format!("{why:#}")), ..pe2_ext::PartSheet::default() };
-                match sheet {
-                    Ok(sheet) => sheet.map(|sheet| part_sheet_of(sheet).unwrap_or_else(problem)),
-                    Err(why) => Some(problem(why)),
-                }
-            });
-        }
+        builder = with_parts(builder, (node_type.contents, node_type.part_sheet), index, shared);
         for v in node_type.views {
             builder = builder.view(&v.name, view(shared, v.handle));
         }
@@ -2117,7 +2305,9 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
         if op.members {
             let (shared, handle) = (shared.clone(), op.handle);
             builder = builder.members_described(move |asset| {
-                shared.read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, handle, lent).await)).unwrap_or_default()
+                shared
+                    .read(|r| r.with_asset(asset, QUICK, async |a, g, lent| g.call_members(a, handle, lent).await))
+                    .unwrap_or_default()
             });
         }
         if let Some(provides) = &op.provides {
@@ -2138,7 +2328,9 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let asset = Asset::new(&node, call.host.node_type());
                 let prepared = shared.job(cap, |r| {
                     let inputs = values_to_wit(given, &mut r.store.data_mut().table)?;
-                    r.with_asset(&asset, shared.long(), async |a, g, lent| g.call_prepare_op(a, handle, lent, inputs, settings, parameter).await)
+                    r.with_asset(&asset, shared.long(), async |a, g, lent| {
+                        g.call_prepare_op(a, handle, lent, inputs, settings, parameter).await
+                    })
                 })?;
                 prepared.map(prepared_from_wit).map_err(|e| anyhow!(e))
             });
@@ -2288,7 +2480,11 @@ fn prepared_from_wit(prepared: g::Prepared) -> pe2_ext::Prepared {
         keep: micro.keep,
     };
     pe2_ext::Prepared {
-        needs: prepared.needs.into_iter().map(|need| pe2_ext::Need { node: need.node, address: need.address }).collect(),
+        needs: prepared
+            .needs
+            .into_iter()
+            .map(|need| pe2_ext::Need { node: need.node, address: need.address })
+            .collect(),
         micros: prepared.micros.into_iter().map(micro).collect(),
     }
 }
@@ -2308,12 +2504,15 @@ fn value_to_wit(value: pe2_ext::Data, table: &mut ResourceTable) -> Result<types
     use pe2_ext::Data;
     Ok(match value {
         Data::List(items) => {
-            let items: Vec<Option<types::Item>> = items.into_iter().map(|v| item_to_wit(v, table)).collect::<Result<_>>()?;
+            let items: Vec<Option<types::Item>> =
+                items.into_iter().map(|v| item_to_wit(v, table)).collect::<Result<_>>()?;
             types::Value::Items(items.into_iter().flatten().collect())
         }
         Data::Image(image) => types::Value::Image(to_wit(image)),
         Data::Table(table) => types::Value::Table(toml::to_string(&table).unwrap_or_default()),
-        Data::Pcm(pcm) => types::Value::Pcm(types::Pcm { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples }),
+        Data::Pcm(pcm) => {
+            types::Value::Pcm(types::Pcm { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples })
+        }
         Data::Typed(t) => types::Value::Typed(types::Typed {
             ty: t.ty,
             also: t.also,
@@ -2391,14 +2590,19 @@ fn value_from_wit(value: types::Value, table: &mut ResourceTable) -> Result<pe2_
 }
 
 /// A media buffer an instance hands over: its handle taken back, the bytes it names kept.
-fn buffer_from_wit(buffer: Resource<HostMediaBuffer>, table: &mut ResourceTable) -> Result<pe2_ext::media::MediaBuffer> {
+fn buffer_from_wit(
+    buffer: Resource<HostMediaBuffer>,
+    table: &mut ResourceTable,
+) -> Result<pe2_ext::media::MediaBuffer> {
     Ok(pe2_ext::media::MediaBuffer::shared(table.delete(buffer)?.0))
 }
 
 fn item_from_wit(item: types::Item, table: &mut ResourceTable) -> Result<pe2_ext::Data> {
     use pe2_ext::Data;
     Ok(match item {
-        types::Item::Image(i) => Data::Image(Image { width: i.width as usize, height: i.height as usize, rgba: i.rgba }),
+        types::Item::Image(i) => {
+            Data::Image(Image { width: i.width as usize, height: i.height as usize, rgba: i.rgba })
+        }
         types::Item::Table(t) => Data::Table(toml::from_str(&t).unwrap_or_default()),
         types::Item::Pcm(p) => Data::Pcm(pe2_ext::Pcm { rate: p.rate, channels: p.channels, samples: p.samples }),
         types::Item::Typed(t) => Data::Typed(pe2_ext::Typed {
@@ -2461,7 +2665,12 @@ fn compiled_dir() -> Option<std::path::PathBuf> {
 fn sweep(dir: &Path) {
     const KEPT: Duration = Duration::from_hours(30 * 24);
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let old = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > KEPT);
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > KEPT);
         if old && entry.path().extension().is_some_and(|e| e == "cwasm") {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -2560,9 +2769,9 @@ const GUEST: &str = "pe2:extension/guest@";
 #[must_use]
 pub fn contract(bytes: &[u8]) -> Option<String> {
     wasmparser::Parser::new(0).parse_all(bytes).find_map(|payload| match payload.ok()? {
-        wasmparser::Payload::ComponentExportSection(exports) => exports
-            .into_iter()
-            .find_map(|e| Some(e.ok()?.name.name.strip_prefix(GUEST)?.to_string())),
+        wasmparser::Payload::ComponentExportSection(exports) => {
+            exports.into_iter().find_map(|e| Some(e.ok()?.name.name.strip_prefix(GUEST)?.to_string()))
+        }
         _ => None,
     })
 }
@@ -2585,7 +2794,9 @@ pub fn runs(contract: &str) -> std::result::Result<(), String> {
     } else if theirs > ours {
         format!("it is built for contract {their_line}, newer than this editor's {our_line}: update the editor")
     } else {
-        format!("it is built for contract {their_line}, and this editor runs {our_line}: rebuild it with this editor's SDK")
+        format!(
+            "it is built for contract {their_line}, and this editor runs {our_line}: rebuild it with this editor's SDK"
+        )
     })
 }
 
@@ -2687,7 +2898,12 @@ pub fn link_gpu(link: LinkGpu) {
 
 /// A component compiled in an engine of its own, its first instance asked who it is and what it registers - which
 /// then answers the first readings.
-fn start(name: &str, bytes: &[u8], settings: &str, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<(Arc<Shared>, About, g::Registration)> {
+fn start(
+    name: &str,
+    bytes: &[u8],
+    settings: &str,
+    unsandboxed: Option<Arc<Unsandboxed>>,
+) -> Result<(Arc<Shared>, About, g::Registration)> {
     let engine = new_engine()?;
     let component = compile(&engine, bytes).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
@@ -2722,7 +2938,8 @@ fn start(name: &str, bytes: &[u8], settings: &str, unsandboxed: Option<Arc<Unsan
     shared.caps = caps(&told.id, &registration)?;
     shared.views_cap = views_cap(&told.id, &registration, &shared.caps);
     runner.store.data_mut().id.clone_from(&told.id);
-    *shared.reading.get_mut().map_err(|_| anyhow!("{name}: its readings are poisoned"))? = Some((runner, READING_FRAMES));
+    *shared.reading.get_mut().map_err(|_| anyhow!("{name}: its readings are poisoned"))? =
+        Some((runner, READING_FRAMES));
     let about = About {
         id: told.id,
         version: told.version,

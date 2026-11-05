@@ -126,7 +126,8 @@ impl Asset {
     pub fn settings_text(&self) -> &str {
         let written = |settings: &toml::Table| {
             let settings = settings.iter().filter(|(key, _)| *key != "stack");
-            toml::to_string(&settings.map(|(key, value)| (key.clone(), value.clone())).collect::<toml::Table>()).unwrap_or_default()
+            toml::to_string(&settings.map(|(key, value)| (key.clone(), value.clone())).collect::<toml::Table>())
+                .unwrap_or_default()
         };
         match &self.imported {
             Some(imported) => imported.text.get_or_init(|| written(&imported.settings)).as_str(),
@@ -343,7 +344,9 @@ impl Problem {
                 format!("{setting} is set, but its import derives it from the source, which wins")
             }
             Problem::Orphan { part, .. } => format!("{part} has settings, but its source has no such part"),
-            Problem::MissingOutput { slot, target, output, .. } => format!("{slot} names {target}#{output}, which it does not have"),
+            Problem::MissingOutput { slot, target, output, .. } => {
+                format!("{slot} names {target}#{output}, which it does not have")
+            }
             Problem::Extension { error, .. } => format!("the extension is not loaded: {error}"),
             Problem::Taken { note, .. } => format!("its import: {note}"),
         }
@@ -375,7 +378,14 @@ impl Problem {
     /// Whether the build can go on with it: an override made from an older base still applies.
     #[must_use]
     pub fn is_warning(&self) -> bool {
-        matches!(self, Problem::Stale { .. } | Problem::Unlocked { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::Taken { .. })
+        matches!(
+            self,
+            Problem::Stale { .. }
+                | Problem::Unlocked { .. }
+                | Problem::Overridden { .. }
+                | Problem::Orphan { .. }
+                | Problem::Taken { .. }
+        )
     }
 }
 
@@ -641,7 +651,9 @@ impl Scan {
 
     /// Whether it holds the same paths as `other`: what a change of contents alone leaves.
     fn same_paths(&self, other: &Scan) -> bool {
-        self.bundles.keys().eq(other.bundles.keys()) && self.folders == other.folders && self.files.keys().eq(other.files.keys())
+        self.bundles.keys().eq(other.bundles.keys())
+            && self.folders == other.folders
+            && self.files.keys().eq(other.files.keys())
     }
 
     /// Whether it holds this file on disk, of a bundle or plain.
@@ -811,7 +823,12 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
     match value {
         toml::Value::Table(t) => {
             if let Some((uid, path)) = reference(value) {
-                out.push((field.to_string(), uid, path.unwrap_or_default(), pe2_ext::output_of(value).unwrap_or_default().to_string()));
+                out.push((
+                    field.to_string(),
+                    uid,
+                    path.unwrap_or_default(),
+                    pe2_ext::output_of(value).unwrap_or_default().to_string(),
+                ));
                 return;
             }
             let name = t.get("name").and_then(toml::Value::as_str);
@@ -822,7 +839,12 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
         toml::Value::Array(a) => a.iter().for_each(|v| references(v, field, out)),
         toml::Value::String(_) => {
             if let Some((uid, _)) = reference(value) {
-                out.push((field.to_string(), uid, String::new(), pe2_ext::output_of(value).unwrap_or_default().to_string()));
+                out.push((
+                    field.to_string(),
+                    uid,
+                    String::new(),
+                    pe2_ext::output_of(value).unwrap_or_default().to_string(),
+                ));
             }
         }
         _ => {}
@@ -1069,7 +1091,9 @@ impl Index {
         for (i, at) in regions {
             let scan = self.layers[*i].scan.under(at);
             if self.layers[*i].writable {
-                for (path, kind) in scan.bundles.keys().map(|p| (p, Kind::Asset)).chain(scan.files.keys().map(|p| (p, Kind::File))) {
+                for (path, kind) in
+                    scan.bundles.keys().map(|p| (p, Kind::Asset)).chain(scan.files.keys().map(|p| (p, Kind::File)))
+                {
                     if let Some(hash) = self.content_hash(*i, path, kind) {
                         Arc::make_mut(&mut self.hashes)[*i].insert(path.clone(), hash);
                     }
@@ -1192,7 +1216,8 @@ impl Index {
             Arc::new(if self.hidden.is_empty() { full.resolved } else { self.resolve_stack(&self.hidden).resolved });
         self.dependencies = self.dependencies();
         self.remember_hashes();
-        self.winning = Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
+        self.winning =
+            Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
         Ok(())
     }
 
@@ -1487,17 +1512,19 @@ impl Index {
 
     /// Keep the content hash of each entry a writable layer holds, for the next pass to tell moves.
     fn remember_hashes(&mut self) {
-        self.hashes = Arc::new((0..self.layers.len())
-            .map(|i| {
-                let layer = &self.layers[i];
-                if !layer.writable {
-                    return HashMap::new();
-                }
-                let held = layer.scan.bundles.keys().map(|p| (p, Kind::Asset));
-                let held = held.chain(layer.scan.files.keys().map(|p| (p, Kind::File)));
-                held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect()
-            })
-            .collect());
+        self.hashes = Arc::new(
+            (0..self.layers.len())
+                .map(|i| {
+                    let layer = &self.layers[i];
+                    if !layer.writable {
+                        return HashMap::new();
+                    }
+                    let held = layer.scan.bundles.keys().map(|p| (p, Kind::Asset));
+                    let held = held.chain(layer.scan.files.keys().map(|p| (p, Kind::File)));
+                    held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect()
+                })
+                .collect(),
+        );
     }
 
     /// The uid a layer lists an entry under, by its path in the layer.
@@ -1637,22 +1664,21 @@ impl Index {
     /// The entries, from the resolved stack.
     fn assemble_entries(&mut self) {
         self.entries = Arc::new(
-            self
-                .resolved
-            .iter()
-            .map(|(path, node)| {
-                let layer = &self.layers[node.content.0];
-                let entry = Entry {
-                    kind: node.kind,
-                    uid: node.uid.clone(),
-                    home: self.layers[node.home].name.clone(),
-                    layer: layer.name.clone(),
-                    disk: layer.place.disk(&node.content.1),
-                    overrides: node.overrides.iter().map(|&i| self.layers[i].name.clone()).collect(),
-                    moved: node.moved.map(|i| self.layers[i].name.clone()),
-                };
-                (path.clone(), entry)
-            })
+            self.resolved
+                .iter()
+                .map(|(path, node)| {
+                    let layer = &self.layers[node.content.0];
+                    let entry = Entry {
+                        kind: node.kind,
+                        uid: node.uid.clone(),
+                        home: self.layers[node.home].name.clone(),
+                        layer: layer.name.clone(),
+                        disk: layer.place.disk(&node.content.1),
+                        overrides: node.overrides.iter().map(|&i| self.layers[i].name.clone()).collect(),
+                        moved: node.moved.map(|i| self.layers[i].name.clone()),
+                    };
+                    (path.clone(), entry)
+                })
                 .collect(),
         );
     }
@@ -1775,7 +1801,8 @@ impl Index {
                 .iter()
                 .find(|f| f.name == NODE_FILE)
                 .and_then(|f| self.records.get(&f.path)?.declaration.as_ref());
-            for (slot, uid, target, output) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned() {
+            for (slot, uid, target, output) in declaration.map_or(&[][..], |d| d.references.as_slice()).iter().cloned()
+            {
                 let output = (!output.is_empty()).then_some(output);
                 let reference = Reference { from: asset.path.clone(), slot, uid, target, output };
                 // The uid decides; the path is the fallback.
@@ -1886,7 +1913,11 @@ mod tests {
         write(&root, "project.toml", "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n");
         write(&root, ".layers/base/g/a.node/node.toml", "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n");
         write(&root, ".layers/base/g/a.node/native.texels", "texels");
-        write(&root, ".layers/base/b.node/node.toml", "stack = [{ op = \"t.file\" }]\nslot = \"uid://a#palettes/default\"\n");
+        write(
+            &root,
+            ".layers/base/b.node/node.toml",
+            "stack = [{ op = \"t.file\" }]\nslot = \"uid://a#palettes/default\"\n",
+        );
         write(
             &root,
             ".layers/base/f.node/node.toml",
@@ -1969,7 +2000,10 @@ mod tests {
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // What it overrides is there, a node of its own.
         let below = index.version("below:uid://a").unwrap();
-        assert_eq!((below.uid.as_deref(), below.layers.as_slice()), (Some("below:uid://a"), ["base".to_string()].as_slice()));
+        assert_eq!(
+            (below.uid.as_deref(), below.layers.as_slice()),
+            (Some("below:uid://a"), ["base".to_string()].as_slice())
+        );
         assert!(below.files.iter().all(|f| f.layer == "base"));
         assert!(index.version("below:below:uid://a").is_none());
         // The base changes under the override: stale.
@@ -2044,7 +2078,11 @@ mod tests {
         let mut out = String::new();
         for (path, a) in &index.assets {
             let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
-            let _ = writeln!(out, "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", a.uid, a.shape, a.variants, a.layers, a.error, a.text, files);
+            let _ = writeln!(
+                out,
+                "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                a.uid, a.shape, a.variants, a.layers, a.error, a.text, files
+            );
         }
         for (path, e) in index.entries.iter() {
             let _ = writeln!(out, "entry {path} {e:?}");
@@ -2076,7 +2114,11 @@ mod tests {
         // Contents alone: a bundle's file, its declaration (a reference added, one made dangling), unreadable.
         write(&root, ".layers/base/g/a.node/native.texels", "repainted");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "a file of a bundle", false);
-        write(&root, ".layers/base/b.node/node.toml", "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n");
+        write(
+            &root,
+            ".layers/base/b.node/node.toml",
+            "stack = [{ op = \"t.file\" }]\nslot = \"uid://nowhere\"\nmore = \"uid://a\"\n",
+        );
         check(&mut index, &project, &[base("b.node/node.toml")], "references changed", false);
         write(&root, ".layers/base/f.node/node.toml", "kind = [unclosed\n");
         check(&mut index, &project, &[base("f.node/node.toml")], "an unreadable declaration", false);
@@ -2095,11 +2137,23 @@ mod tests {
         top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
         top.save(&root.join(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
-        check(&mut index, &project, &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.node/node.toml")], "an override", true);
+        check(
+            &mut index,
+            &project,
+            &[root.join(".layers/top.toml"), root.join(".layers/top/g/a.node/node.toml")],
+            "an override",
+            true,
+        );
         write(&root, ".layers/base/g/a.node/native.texels", "retouched");
         check(&mut index, &project, &[base("g/a.node/native.texels")], "an override's base changed", true);
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\nnote = \"uid://a\"\n");
-        check(&mut index, &project, &[root.join(".layers/top/g/a.node/node.toml")], "the override's own content", false);
+        check(
+            &mut index,
+            &project,
+            &[root.join(".layers/top/g/a.node/node.toml")],
+            "the override's own content",
+            false,
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

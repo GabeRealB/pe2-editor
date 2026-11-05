@@ -91,7 +91,11 @@ pub struct Coding {
 impl Coding {
     #[must_use]
     pub fn of(byte: u8) -> Coding {
-        Coding { stereo: byte & 3 == 1, rate: if (byte >> 2) & 3 == 1 { 18900 } else { 37800 }, four_bit: (byte >> 4) & 3 != 1 }
+        Coding {
+            stereo: byte & 3 == 1,
+            rate: if (byte >> 2) & 3 == 1 { 18900 } else { 37800 },
+            four_bit: (byte >> 4) & 3 != 1,
+        }
     }
 }
 
@@ -236,7 +240,10 @@ mod tests {
         let raw = video(1, 0, 1, 4, 0);
         assert_eq!(Form::of(&raw), Form::Raw);
         assert_eq!(Form::of(&raw[SUBHEADER..]), Form::Data);
-        assert!(matches!(Form::Data.sector(&raw[SUBHEADER..SUBHEADER + DATA]), Sector::Video(Chunk { frame: 1, .. }, _)));
+        assert!(matches!(
+            Form::Data.sector(&raw[SUBHEADER..SUBHEADER + DATA]),
+            Sector::Video(Chunk { frame: 1, .. }, _)
+        ));
     }
 
     #[test]

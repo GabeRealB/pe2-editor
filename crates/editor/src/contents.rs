@@ -94,10 +94,14 @@ fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
         let shown = size * (PICTURE / size.y.max(1.0)).min(slot.width() / size.x.max(1.0));
         let shown = egui::vec2(shown.x, shown.y.max(PICTURE / 2.0));
         let place = egui::Rect::from_center_size(slot.center(), shown);
-        egui::Image::new(egui::load::SizedTexture::new(texture, shown)).tint(Color32::WHITE.gamma_multiply(strength)).paint_at(ui, place);
+        egui::Image::new(egui::load::SizedTexture::new(texture, shown))
+            .tint(Color32::WHITE.gamma_multiply(strength))
+            .paint_at(ui, place);
     }
-    let body = |color| egui::TextFormat { font_id: egui::TextStyle::Body.resolve(ui.style()), color, ..Default::default() };
-    let small = |color| egui::TextFormat { font_id: egui::TextStyle::Small.resolve(ui.style()), color, ..Default::default() };
+    let body =
+        |color| egui::TextFormat { font_id: egui::TextStyle::Body.resolve(ui.style()), color, ..Default::default() };
+    let small =
+        |color| egui::TextFormat { font_id: egui::TextStyle::Small.resolve(ui.style()), color, ..Default::default() };
     let mut text = egui::text::LayoutJob::default();
     let heading = line.style == ContentStyle::Heading;
     if heading {
@@ -106,7 +110,11 @@ fn line(ui: &mut egui::Ui, line: &Line) -> (egui::Response, bool) {
         if line.picture.is_none() {
             text.append(line.icon, 0.0, body(line.tint.gamma_multiply(strength)));
         }
-        text.append(line.label, if line.picture.is_none() { 6.0 } else { 0.0 }, body(theme::text().gamma_multiply(strength)));
+        text.append(
+            line.label,
+            if line.picture.is_none() { 6.0 } else { 0.0 },
+            body(theme::text().gamma_multiply(strength)),
+        );
         text.append(line.detail, 6.0, small(theme::weak().gamma_multiply(strength)));
     }
     let button = if heading { egui::Button::new(()).frame(false) } else { egui::Button::selectable(line.selected, ()) };
@@ -146,7 +154,9 @@ fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Op
         ui.close();
     }
     for action in row.actions.iter().filter(|action| !action.on_row) {
-        let text = action.icon.map_or_else(|| action.label.clone(), |icon| format!("{}  {}", icons::glyph(icon), action.label));
+        let text = action
+            .icon
+            .map_or_else(|| action.label.clone(), |icon| format!("{}  {}", icons::glyph(icon), action.label));
         if ui.button(text).clicked() {
             *ask = Some(ContentRequest::Action { row: row.id.clone(), action: action.id.clone() });
             ui.close();
@@ -158,10 +168,17 @@ fn row_menu(ui: &mut egui::Ui, row: &ContentRow, rename: &mut bool, ask: &mut Op
 fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, ws: &Workspace) -> Result<String, String> {
     if let Dragged::Asset(path) = dragged {
         let node_type = ws.index.assets.get(path).and_then(|asset| ws.extensions.type_label(asset));
-        let taken = node_type.is_some_and(|node_type| row.takes.iter().any(|takes| takes.strip_prefix("asset:") == Some(node_type)));
-        return if taken { Ok(format!("Attach it to {}", row.label)) } else { Err(format!("{} does not take it", row.label)) };
+        let taken = node_type
+            .is_some_and(|node_type| row.takes.iter().any(|takes| takes.strip_prefix("asset:") == Some(node_type)));
+        return if taken {
+            Ok(format!("Attach it to {}", row.label))
+        } else {
+            Err(format!("{} does not take it", row.label))
+        };
     }
-    let Dragged::Row { asset, id, what, .. } = dragged else { return Err("Only what is inside it goes here".to_string()) };
+    let Dragged::Row { asset, id, what, .. } = dragged else {
+        return Err("Only what is inside it goes here".to_string());
+    };
     if asset != of {
         return Err("It stays in its asset".to_string());
     }
@@ -178,7 +195,14 @@ fn says(row: &ContentRow, of: &str, dragged: &Dragged, place: ContentPlace, ws: 
 }
 
 /// A row as a place to drop on: its top and foot where it reorders, the rest where it takes something.
-fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ws: &Workspace, ask: &mut Option<ContentRequest>) {
+fn row_target(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    row: &ContentRow,
+    of: &str,
+    ws: &Workspace,
+    ask: &mut Option<ContentRequest>,
+) {
     let (reorders, holds) = (row.drag.as_ref().is_some_and(|drag| drag.reorders), !row.takes.is_empty());
     let edge = rect.height() / if holds { 3.0 } else { 2.0 };
     let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + edge));
@@ -192,7 +216,9 @@ fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ws: &
     };
     for (rect, place) in places {
         match dnd::target(ui, rect, |dragged| says(row, of, dragged, place, ws)) {
-            Some(Dragged::Row { id, .. }) => *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place }),
+            Some(Dragged::Row { id, .. }) => {
+                *ask = Some(ContentRequest::Moved { row: id, onto: row.id.clone(), place });
+            }
             Some(Dragged::Asset(asset)) => *ask = Some(ContentRequest::Dropped { row: row.id.clone(), asset }),
             _ => {}
         }
@@ -200,7 +226,13 @@ fn row_target(ui: &egui::Ui, rect: egui::Rect, row: &ContentRow, of: &str, ws: &
 }
 
 /// A row's picture, once uploaded: one new one a frame, the rest following, so that an atlas of hundreds does not stall a frame.
-fn picture_of(ws: &mut Workspace, ui: &egui::Ui, asset: &Asset, id: &str, fresh: &mut bool) -> Option<(egui::TextureId, egui::Vec2)> {
+fn picture_of(
+    ws: &mut Workspace,
+    ui: &egui::Ui,
+    asset: &Asset,
+    id: &str,
+    fresh: &mut bool,
+) -> Option<(egui::TextureId, egui::Vec2)> {
     if !ws.parts.has(asset, id) {
         if !*fresh {
             ui.ctx().request_repaint();
@@ -221,7 +253,8 @@ fn rename_ui(ui: &mut egui::Ui, ws: &mut Workspace, row: &ContentRow, ask: &mut 
     let response = output.response.response.clone();
     // The whole name at first: what is typed replaces it.
     if !response.has_focus() {
-        let whole = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(typed.chars().count()));
+        let whole =
+            egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(typed.chars().count()));
         output.state.cursor.set_char_range(Some(whole));
         output.state.store(ui.ctx(), response.id);
     }
@@ -264,7 +297,8 @@ fn rows_ui(
         }
         let picture = row.picture.then(|| picture_of(ws, ui, asset, &row.id, &mut fresh)).flatten();
         let inner = format!("#{}", row.id);
-        let (icon, tint) = row.icon.map_or((icons::PACKAGE, theme::weak()), |(icon, tint)| (icons::glyph(icon), icons::tint(tint)));
+        let (icon, tint) =
+            row.icon.map_or((icons::PACKAGE, theme::weak()), |(icon, tint)| (icons::glyph(icon), icons::tint(tint)));
         let on_row = row.actions.iter().filter(|action| action.on_row).count();
         #[expect(clippy::cast_precision_loss, reason = "a row's few buttons")]
         let room = (ROW_BUTTON + ui.spacing().item_spacing.x) * on_row as f32;
@@ -365,7 +399,8 @@ fn stack_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, layers: &[Valu
         let icon = if name == graph::GRAPH { icons::TREE_STRUCTURE } else { icons::STACK_SIMPLE };
         let label = label_of(ws, &name);
         let outputs = layers[at + 1..].iter().take_while(|below| taken(&op_of(below)));
-        let details: Vec<&str> = std::iter::once(detail_of(layer)).chain(outputs.map(detail_of)).filter(|d| !d.is_empty()).collect();
+        let details: Vec<&str> =
+            std::iter::once(detail_of(layer)).chain(outputs.map(detail_of)).filter(|d| !d.is_empty()).collect();
         let details = details.join(", ");
         let row = Line::plain(right, 0, selected.as_deref() == Some(&inner), icon, &label, &details);
         let clicked = ui.horizontal(|ui| line(ui, &row).0.clicked()).inner;
@@ -399,9 +434,11 @@ pub fn contents_ui(
     ws.show_contents_views(ui, &asset.path, nav);
     let contents = ws.contents_of(&asset);
     if let Some(problem) = &contents.problem {
-        ui.colored_label(ui.visuals().error_fg_color, "Its extension could not say what is inside it").on_hover_text(problem);
+        ui.colored_label(ui.visuals().error_fg_color, "Its extension could not say what is inside it")
+            .on_hover_text(problem);
     }
-    let layers = asset.fields().get("stack").and_then(Value::as_array).filter(|_| contents.stack).map_or(&[][..], Vec::as_slice);
+    let layers =
+        asset.fields().get("stack").and_then(Value::as_array).filter(|_| contents.stack).map_or(&[][..], Vec::as_slice);
     let has_views = !ws.extensions.contents_views(&asset).is_empty();
     if layers.is_empty() && contents.rows.is_empty() && contents.actions.is_empty() {
         if !has_views && contents.problem.is_none() {
@@ -416,7 +453,9 @@ pub fn contents_ui(
     if !contents.actions.is_empty() {
         ui.horizontal_wrapped(|ui| {
             for action in &contents.actions {
-                let text = action.icon.map_or_else(|| action.label.clone(), |icon| format!("{}  {}", icons::glyph(icon), action.label));
+                let text = action
+                    .icon
+                    .map_or_else(|| action.label.clone(), |icon| format!("{}  {}", icons::glyph(icon), action.label));
                 if ui.add_enabled(editable, egui::Button::selectable(action.on, text)).clicked() {
                     ask = Some(ContentRequest::Action { row: String::new(), action: action.id.clone() });
                 }

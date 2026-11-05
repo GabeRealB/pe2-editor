@@ -7,7 +7,8 @@ use super::{Fixture, Scenario};
 /// The project, turned to leave this extension off, as the Extensions pane does.
 fn turn_off(editor: &mut Scenario, id: &str) {
     let ws = editor.workspace();
-    let written = project::switches::set_disabled(&ws.project, &[id.to_string()], &mut ws.history, "Turn it off".to_string());
+    let written =
+        project::switches::set_disabled(&ws.project, &[id.to_string()], &mut ws.history, "Turn it off".to_string());
     written.expect("project.toml written");
 }
 

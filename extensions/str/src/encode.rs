@@ -23,7 +23,8 @@ fn parts(item: Data) -> (Option<VideoFrame>, Option<AudioData>) {
 
 /// Whether two pictures are the same.
 fn same(ours: &VideoFrame, theirs: &VideoFrame) -> bool {
-    (ours.format, ours.width, ours.height) == (theirs.format, theirs.width, theirs.height) && ours.buffer.read() == theirs.buffer.read()
+    (ours.format, ours.width, ours.height) == (theirs.format, theirs.width, theirs.height)
+        && ours.buffer.read() == theirs.buffer.read()
 }
 
 /// What of a stream differs from a movie.
@@ -95,7 +96,9 @@ pub fn encode(call: &Call<'_>, stream: &StreamInput, original: &Typed) -> Result
     let frames = differences.frames.len();
     let first = differences.frames.first().map_or_else(|| "none".to_string(), ToString::to_string);
     let sound = differences.sound.map_or_else(|| "the same".to_string(), |byte| format!("different from byte {byte}"));
-    bail!("{frames} of {at} frames differ, the first {first}, and the sound is {sound}: encoding BS and XA is not built")
+    bail!(
+        "{frames} of {at} frames differ, the first {first}, and the sound is {sound}: encoding BS and XA is not built"
+    )
 }
 
 #[cfg(test)]

@@ -124,7 +124,8 @@ impl<'a> Editor<'a> {
     /// # Errors
     /// It could not be written where the host keeps it.
     pub fn drop_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        let arguments = [("text".to_string(), Value::String(name.to_string())), ("bytes".to_string(), Value::String(hex(bytes)))];
+        let arguments =
+            [("text".to_string(), Value::String(name.to_string())), ("bytes".to_string(), Value::String(hex(bytes)))];
         self.call("drop_file", Table::from_iter(arguments)).map(drop)
     }
 
@@ -211,7 +212,10 @@ impl<'a> Editor<'a> {
     /// There is no such asset.
     pub fn pictured(&self, path: &str, address: &str) -> Result<bool> {
         let text = |text: &str| Value::String(text.to_string());
-        let answer = self.call("pictured", Table::from_iter([("text".to_string(), text(path)), ("address".to_string(), text(address))]))?;
+        let answer = self.call(
+            "pictured",
+            Table::from_iter([("text".to_string(), text(path)), ("address".to_string(), text(address))]),
+        )?;
         Ok(answer.as_bool().unwrap_or(false))
     }
 
@@ -246,7 +250,11 @@ impl<'a> Editor<'a> {
     /// It cannot be written.
     pub fn declare(&self, path: &str, uid: &str, declaration: &str) -> Result<()> {
         let arguments = [("text", path), ("uid", uid), ("declaration", declaration)];
-        self.call("declare", arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect()).map(drop)
+        self.call(
+            "declare",
+            arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect(),
+        )
+        .map(drop)
     }
 
     /// Make an output of a node, as a view asking for it does, nothing kept: what went wrong, if anything did.
@@ -255,7 +263,10 @@ impl<'a> Editor<'a> {
     /// There is no such node.
     pub fn made(&self, path: &str, address: &str) -> Result<Option<String>> {
         let arguments = [("text", path), ("address", address)];
-        let answer = self.call("made", arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect())?;
+        let answer = self.call(
+            "made",
+            arguments.iter().map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string()))).collect(),
+        )?;
         Ok(answer.as_str().filter(|why| !why.is_empty()).map(str::to_string))
     }
 }

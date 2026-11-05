@@ -9,7 +9,11 @@ fn or<T>(value: Option<T>, default: T) -> T {
 }
 
 pub fn extent(size: webgpu::GpuExtent3D) -> wgpu::Extent3d {
-    wgpu::Extent3d { width: size.width, height: or(size.height, 1), depth_or_array_layers: or(size.depth_or_array_layers, 1) }
+    wgpu::Extent3d {
+        width: size.width,
+        height: or(size.height, 1),
+        depth_or_array_layers: or(size.depth_or_array_layers, 1),
+    }
 }
 
 pub fn origin(origin: Option<webgpu::GpuOrigin3D>) -> wgpu::Origin3d {
@@ -52,7 +56,11 @@ pub fn depth_stencil(state: webgpu::GpuDepthStencilState) -> wasmtime::Result<wg
             read_mask: or(state.stencil_read_mask, u32::MAX),
             write_mask: or(state.stencil_write_mask, u32::MAX),
         },
-        bias: wgpu::DepthBiasState { constant: or(state.depth_bias, 0), slope_scale: or(state.depth_bias_slope_scale, 0.0), clamp: or(state.depth_bias_clamp, 0.0) },
+        bias: wgpu::DepthBiasState {
+            constant: or(state.depth_bias, 0),
+            slope_scale: or(state.depth_bias_slope_scale, 0.0),
+            clamp: or(state.depth_bias_clamp, 0.0),
+        },
     })
 }
 
@@ -79,13 +87,19 @@ fn blend_component(component: webgpu::GpuBlendComponent) -> wgpu::BlendComponent
 pub fn color_target(target: webgpu::GpuColorTargetState) -> wasmtime::Result<wgpu::ColorTargetState> {
     Ok(wgpu::ColorTargetState {
         format: format(target.format)?,
-        blend: target.blend.map(|blend| wgpu::BlendState { color: blend_component(blend.color), alpha: blend_component(blend.alpha) }),
+        blend: target
+            .blend
+            .map(|blend| wgpu::BlendState { color: blend_component(blend.color), alpha: blend_component(blend.alpha) }),
         write_mask: target.write_mask.map_or(Ok(wgpu::ColorWrites::ALL), TryInto::try_into)?,
     })
 }
 
 pub fn vertex_attribute(attribute: &webgpu::GpuVertexAttribute) -> wgpu::VertexAttribute {
-    wgpu::VertexAttribute { format: attribute.format.into(), offset: attribute.offset, shader_location: attribute.shader_location }
+    wgpu::VertexAttribute {
+        format: attribute.format.into(),
+        offset: attribute.offset,
+        shader_location: attribute.shader_location,
+    }
 }
 
 fn binding_type(entry: webgpu::GpuBindGroupLayoutEntry) -> wasmtime::Result<wgpu::BindingType> {
@@ -95,7 +109,9 @@ fn binding_type(entry: webgpu::GpuBindGroupLayoutEntry) -> wasmtime::Result<wgpu
             has_dynamic_offset: or(buffer.has_dynamic_offset, false),
             min_binding_size: buffer.min_binding_size.and_then(wgpu::BufferSize::new),
         },
-        (None, Some(sampler), None, None) => wgpu::BindingType::Sampler(sampler.type_.map_or(wgpu::SamplerBindingType::Filtering, Into::into)),
+        (None, Some(sampler), None, None) => {
+            wgpu::BindingType::Sampler(sampler.type_.map_or(wgpu::SamplerBindingType::Filtering, Into::into))
+        }
         (None, None, Some(texture), None) => wgpu::BindingType::Texture {
             sample_type: texture.sample_type.map_or(wgpu::TextureSampleType::Float { filterable: true }, Into::into),
             view_dimension: texture.view_dimension.map_or(wgpu::TextureViewDimension::D2, Into::into),
@@ -120,7 +136,11 @@ pub fn layout_entry(entry: webgpu::GpuBindGroupLayoutEntry) -> wasmtime::Result<
 }
 
 pub fn texel_layout(layout: &webgpu::GpuTexelCopyBufferLayout) -> wgpu::TexelCopyBufferLayout {
-    wgpu::TexelCopyBufferLayout { offset: or(layout.offset, 0), bytes_per_row: layout.bytes_per_row, rows_per_image: layout.rows_per_image }
+    wgpu::TexelCopyBufferLayout {
+        offset: or(layout.offset, 0),
+        bytes_per_row: layout.bytes_per_row,
+        rows_per_image: layout.rows_per_image,
+    }
 }
 
 pub fn aspect(aspect: Option<webgpu::GpuTextureAspect>) -> wgpu::TextureAspect {
@@ -131,6 +151,9 @@ pub fn clear_color(color: webgpu::GpuColor) -> wgpu::Color {
     wgpu::Color { r: color.r, g: color.g, b: color.b, a: color.a }
 }
 
-pub fn get<'t, T: 'static>(table: &'t ResourceTable, handle: &wasmtime::component::Resource<T>) -> wasmtime::Result<&'t T> {
+pub fn get<'t, T: 'static>(
+    table: &'t ResourceTable,
+    handle: &wasmtime::component::Resource<T>,
+) -> wasmtime::Result<&'t T> {
     Ok(table.get(handle)?)
 }

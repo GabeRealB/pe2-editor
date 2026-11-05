@@ -19,10 +19,10 @@ mod nodes;
 #[cfg(test)]
 mod onboarding;
 #[cfg(test)]
+mod reading_again;
+#[cfg(test)]
 mod registered;
 pub mod suite;
-#[cfg(test)]
-mod reading_again;
 #[cfg(test)]
 mod taking_in;
 #[cfg(all(test, unix))]
@@ -66,7 +66,10 @@ fn isolate() {
 
 /// Bytes as they cross as text.
 fn from_hex(text: &str) -> Result<Vec<u8>, String> {
-    let pairs = text.as_bytes().chunks(2).map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()));
+    let pairs = text
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| std::str::from_utf8(pair).ok().and_then(|pair| u8::from_str_radix(pair, 16).ok()));
     pairs.collect::<Option<Vec<u8>>>().ok_or_else(|| "not hex".to_string())
 }
 
@@ -200,12 +203,25 @@ impl Scenario {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
             }
-            let start = Start { project: Some(root), select: None, show, screenshot: None, max_surface: None, agents_drive: false, unattended, monitors: Vec::new() };
+            let start = Start {
+                project: Some(root),
+                select: None,
+                show,
+                screenshot: None,
+                max_surface: None,
+                agents_drive: false,
+                unattended,
+                monitors: Vec::new(),
+            };
             Editor::new(cc, start)
         });
         let mut scenario = Scenario { harness, fixture, held: None, _alone: alone };
         scenario.settle();
-        assert!(scenario.harness.state_mut().workspace().is_some(), "the project did not open: {:?}", scenario.harness.state().error());
+        assert!(
+            scenario.harness.state_mut().workspace().is_some(),
+            "the project did not open: {:?}",
+            scenario.harness.state().error()
+        );
         scenario
     }
 
@@ -248,7 +264,13 @@ impl Scenario {
     /// # Errors
     /// There is no such entry.
     pub fn override_entry(&mut self, path: &str) -> Result<(), String> {
-        let uid = self.workspace().index.entries.get(path).map(|entry| entry.uid.clone()).ok_or_else(|| format!("no entry {path}"))?;
+        let uid = self
+            .workspace()
+            .index
+            .entries
+            .get(path)
+            .map(|entry| entry.uid.clone())
+            .ok_or_else(|| format!("no entry {path}"))?;
         self.harness.state_mut().ask(&crate::workspace::EditRequest::Override(uid));
         self.settle();
         Ok(())
@@ -306,7 +328,10 @@ impl Scenario {
         match found.len() {
             1 => found.remove(0),
             0 => panic!("nothing says {text:?}"),
-            many => panic!("{many} things say {text:?}: {:?}", found.iter().filter_map(|node| node.accesskit_node().label()).collect::<Vec<_>>()),
+            many => panic!(
+                "{many} things say {text:?}: {:?}",
+                found.iter().filter_map(|node| node.accesskit_node().label()).collect::<Vec<_>>()
+            ),
         }
     }
 
@@ -374,7 +399,13 @@ impl Scenario {
         let name = name.to_string();
         let running = name.clone();
         let test = std::thread::spawn(move || {
-            let lens = project::ext::Lens { index: &index, extensions: &extensions, selection: None, chosen: None, revision: 0 };
+            let lens = project::ext::Lens {
+                index: &index,
+                extensions: &extensions,
+                selection: None,
+                chosen: None,
+                revision: 0,
+            };
             let service = extensions.service(&name).ok_or_else(|| format!("no test {name}"))?;
             (service.run)(&lens, &toml::Value::Table(toml::Table::new())).map(drop).map_err(|why| format!("{why:#}"))
         });
@@ -398,13 +429,16 @@ impl Scenario {
         use toml::Value;
         let said = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
         if name == "data" {
-            return self.data_of(test, said).map(|bytes| Value::String(bytes.iter().fold(String::new(), |mut out, byte| {
-                let _ = write!(out, "{byte:02x}");
-                out
-            })));
+            return self.data_of(test, said).map(|bytes| {
+                Value::String(bytes.iter().fold(String::new(), |mut out, byte| {
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                }))
+            });
         }
         let strings = |list: Vec<String>| Value::Array(list.into_iter().map(Value::String).collect());
-        let one = |found: usize, said: &str| if found == 1 { Ok(()) } else { Err(format!("{found} things say {said:?}")) };
+        let one =
+            |found: usize, said: &str| if found == 1 { Ok(()) } else { Err(format!("{found} things say {said:?}")) };
         match name {
             "show" if !self.assets().iter().any(|path| path == said) => return Err(format!("no asset {said}")),
             "show" => self.show(said),
@@ -431,12 +465,26 @@ impl Scenario {
             }
             "node" => self.new_node(arguments)?,
             "make_every_template" => return self.make_every_template().map(Value::Integer),
-            "expect" if !self.says(said) => return Err(format!("nothing says {said:?}; there is:\n{}", self.shown().join("\n"))),
-            "expect_not" if self.says(said) => return Err(format!("something says {said:?}: {:?}", self.shown().into_iter().filter(|line| line.contains(said)).collect::<Vec<_>>())),
+            "expect" if !self.says(said) => {
+                return Err(format!("nothing says {said:?}; there is:\n{}", self.shown().join("\n")));
+            }
+            "expect_not" if self.says(said) => {
+                return Err(format!(
+                    "something says {said:?}: {:?}",
+                    self.shown().into_iter().filter(|line| line.contains(said)).collect::<Vec<_>>()
+                ));
+            }
             "expect" | "expect_not" => {}
             "problems" => return Ok(strings(self.problems())),
             "assets" => return Ok(strings(self.assets())),
-            "selected" => return self.workspace().selected.clone().map(Value::String).ok_or_else(|| "nothing is selected".to_string()),
+            "selected" => {
+                return self
+                    .workspace()
+                    .selected
+                    .clone()
+                    .map(Value::String)
+                    .ok_or_else(|| "nothing is selected".to_string());
+            }
             "override_entry" => self.override_entry(said)?,
             "declare" => {
                 let given = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or_default();
@@ -453,7 +501,9 @@ impl Scenario {
                 let address = arguments.get("address").and_then(Value::as_str).unwrap_or_default();
                 let ws = self.workspace();
                 let asset = ws.index.assets.get(said).cloned().ok_or_else(|| format!("no asset {said}"))?;
-                return Ok(Value::Boolean(ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok())));
+                return Ok(Value::Boolean(
+                    ws.extensions.output_image(&asset, address).is_some_and(|image| image.is_ok()),
+                ));
             }
             other => return Err(format!("no step {other}")),
         }
@@ -461,7 +511,11 @@ impl Scenario {
     }
 
     /// What the window showed, kept where it can be looked at: a file of what it said, and a picture where one can be made.
-    fn keep_failure(&mut self, folder: &std::path::Path, test: &str) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    fn keep_failure(
+        &mut self,
+        folder: &std::path::Path,
+        test: &str,
+    ) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
         let name: String = test.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
         if std::fs::create_dir_all(folder).is_err() {
             return (None, None);
@@ -469,7 +523,8 @@ impl Scenario {
         let said = folder.join(format!("{name}.txt"));
         let said = std::fs::write(&said, self.shown().join("\n")).is_ok().then_some(said);
         let picture = self.harness.render().ok().and_then(|image| {
-            let png = codecs::texture::rgba_png(image.width() as usize, image.height() as usize, image.as_raw()).ok()?;
+            let png =
+                codecs::texture::rgba_png(image.width() as usize, image.height() as usize, image.as_raw()).ok()?;
             let file = folder.join(format!("{name}.png"));
             std::fs::write(&file, png).is_ok().then_some(file)
         });
@@ -480,7 +535,9 @@ impl Scenario {
     fn data_of(&mut self, test: &str, name: &str) -> Result<Vec<u8>, String> {
         let id = test.split('@').next().unwrap_or_default();
         let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
-        let Some(project::ext::Origin::Project { file, .. } | project::ext::Origin::Component(file)) = present.map(|present| present.origin) else {
+        let Some(project::ext::Origin::Project { file, .. } | project::ext::Origin::Component(file)) =
+            present.map(|present| present.origin)
+        else {
             return Err(format!("{id} has no folder"));
         };
         let at = file.with_file_name("data").join(name);
@@ -490,7 +547,8 @@ impl Scenario {
     /// A node a test asked for, as its template makes one, in the active layer: a step of the history, so that it can go.
     fn new_node(&mut self, arguments: &toml::Value) -> Result<(), String> {
         let text = |key: &str| arguments.get(key).and_then(toml::Value::as_str).unwrap_or_default();
-        let (path, uid, template, file, settings) = (text("path"), text("uid"), text("template"), text("file"), text("settings"));
+        let (path, uid, template, file, settings) =
+            (text("path"), text("uid"), text("template"), text("file"), text("settings"));
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for (name, bytes) in arguments.get("files").and_then(toml::Value::as_table).into_iter().flatten() {
             files.push((name.clone(), from_hex(bytes.as_str().unwrap_or_default())?));
@@ -498,7 +556,8 @@ impl Scenario {
         let ws = self.workspace();
         let found = ws.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
         let stack = ws.extensions.stamp(found, file)?;
-        let text = project::graph::layers::settings_on_layers(&format!("{settings}\n\n{stack}")).map_err(|e| format!("{e:#}"))?;
+        let text = project::graph::layers::settings_on_layers(&format!("{settings}\n\n{stack}"))
+            .map_err(|e| format!("{e:#}"))?;
         let declaration = format!("uid = \"{uid}\"\n\n{text}");
         let held: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
         ws.make_node(uid, path, (&declaration, &held))?;
@@ -509,7 +568,10 @@ impl Scenario {
     /// A node of every template that needs no file: how many.
     fn make_every_template(&mut self) -> Result<i64, String> {
         let ws = self.workspace();
-        let made = ws.extensions.templates().filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
+        let made = ws
+            .extensions
+            .templates()
+            .filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
         let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
         for template in &templates {
             self.workspace().new_node(template, None).map_err(|why| format!("{template}: {why}"))?;
@@ -585,7 +647,9 @@ impl Scenario {
     /// Everything the window says.
     fn shown(&self) -> Vec<String> {
         let all = self.harness.query_all(By::new().predicate(|_| true).include_labels());
-        all.filter_map(|node| node.accesskit_node().label().or_else(|| node.accesskit_node().value())).filter(|text| !text.trim().is_empty()).collect()
+        all.filter_map(|node| node.accesskit_node().label().or_else(|| node.accesskit_node().value()))
+            .filter(|text| !text.trim().is_empty())
+            .collect()
     }
 
     /// Whether something says this.
@@ -597,13 +661,20 @@ impl Scenario {
     /// Of the numbers in the row under a label, this one (from 0), clicked and so being typed in; what it shows now.
     #[track_caller]
     pub fn number(&mut self, row: &str, at: usize) -> String {
-        let under = self.harness.query_all(By::new().label(row).include_labels()).next().unwrap_or_else(|| panic!("no row {row:?}")).rect();
+        let under = self
+            .harness
+            .query_all(By::new().label(row).include_labels())
+            .next()
+            .unwrap_or_else(|| panic!("no row {row:?}"))
+            .rect();
         let mut numbers: Vec<Node<'_>> = self
             .harness
             .query_all(By::new().role(egui::accesskit::Role::SpinButton))
             .filter(|node| node.rect().top() >= under.top())
             .collect();
-        numbers.sort_by(|a, b| (a.rect().top(), a.rect().left()).partial_cmp(&(b.rect().top(), b.rect().left())).expect("a place"));
+        numbers.sort_by(|a, b| {
+            (a.rect().top(), a.rect().left()).partial_cmp(&(b.rect().top(), b.rect().left())).expect("a place")
+        });
         let number = numbers.get(at).unwrap_or_else(|| panic!("no number {at} under {row:?}"));
         number.click();
         let value = number.value().unwrap_or_default();

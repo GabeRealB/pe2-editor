@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use toml::Value;
 
 use crate::inspector;
-use crate::workspace::{EditRequest, GraphAsk, Workspace};
 use crate::theme;
+use crate::workspace::{EditRequest, GraphAsk, Workspace};
 
 const WIDTH: f32 = 172.0;
 /// The boxes at either end, which say little.
@@ -127,7 +127,8 @@ fn arrangement(nodes: &[Node]) -> HashMap<String, Pos2> {
             .iter()
             .filter(|n| depth[n.id.as_str()] == column)
             .map(|node| {
-                let heights: Vec<f32> = node.wired.iter().flatten().filter_map(|s| places.get(s)).map(|p| p.y).collect();
+                let heights: Vec<f32> =
+                    node.wired.iter().flatten().filter_map(|s| places.get(s)).map(|p| p.y).collect();
                 (node, heights.iter().sum::<f32>() / rows(heights.len().max(1)))
             })
             .collect();
@@ -155,7 +156,12 @@ fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, at: usize) -> Vec
             let from = op.get("from");
             let wired = ports.iter().map(|p| sources(from.and_then(|f| f.get(&p.name)))).collect();
             let here = format!("stack[{at}].ops.{id}");
-            let made = plan.steps.iter().find(|s| s.at == here).map(|s| s.ty.clone()).or_else(|| def.and_then(|d| d.output.clone()));
+            let made = plan
+                .steps
+                .iter()
+                .find(|s| s.at == here)
+                .map(|s| s.ty.clone())
+                .or_else(|| def.and_then(|d| d.output.clone()));
             let place = op.get(layers::POS).and_then(Value::as_array);
             let number = |i: usize| place.and_then(|p| p.get(i)?.as_float());
             #[expect(clippy::cast_possible_truncation, reason = "a place on a canvas")]
@@ -173,7 +179,9 @@ fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, at: usize) -> Vec
 
 /// A type as a box has room for it: without the extensions it comes from (`pe2.images@texels` is `texels`).
 fn short(ty: &str) -> String {
-    ty.split_inclusive(|c: char| " <>|".contains(c)).map(|word| word.rsplit_once('@').map_or(word, |(_, local)| local)).collect()
+    ty.split_inclusive(|c: char| " <>|".contains(c))
+        .map(|word| word.rsplit_once('@').map_or(word, |(_, local)| local))
+        .collect()
 }
 
 /// What a value of a type is drawn in, so what can be wired together looks it.
@@ -192,7 +200,12 @@ fn type_color(ty: Option<&Type>) -> Color32 {
 fn wire(painter: &egui::Painter, from: Pos2, to: Pos2, color: Color32) {
     let reach = ((to.x - from.x).abs() * 0.5).max(40.0);
     let points = [from, from + vec2(reach, 0.0), to - vec2(reach, 0.0), to];
-    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, egui::Stroke::new(2.0, color)));
+    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+        points,
+        false,
+        Color32::TRANSPARENT,
+        egui::Stroke::new(2.0, color),
+    ));
 }
 
 /// Text cut to fit, set from a point.
@@ -205,8 +218,21 @@ fn text_at(painter: &egui::Painter, at: Pos2, align: egui::Align2, text: &str, f
 }
 
 /// A box: its frame and its title on a band of what it makes.
-fn box_at(painter: &egui::Painter, rect: Rect, title: &str, tint: Color32, (selected, wrong): (bool, bool), ui: &egui::Ui) {
-    let edge = if wrong { ui.visuals().error_fg_color } else if selected { theme::accent() } else { theme::border() };
+fn box_at(
+    painter: &egui::Painter,
+    rect: Rect,
+    title: &str,
+    tint: Color32,
+    (selected, wrong): (bool, bool),
+    ui: &egui::Ui,
+) {
+    let edge = if wrong {
+        ui.visuals().error_fg_color
+    } else if selected {
+        theme::accent()
+    } else {
+        theme::border()
+    };
     let stroke = egui::Stroke::new(if selected || wrong { 2.0 } else { 1.0 }, edge);
     painter.rect_filled(rect, 7.0, ui.visuals().extreme_bg_color);
     let band = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER));
@@ -232,11 +258,20 @@ fn port_response(ui: &egui::Ui, salt: (&str, &str, &str), at: Pos2, says: &str) 
 }
 
 /// What the add menu offers, narrowed by what is typed: choosing one adds it where the menu was opened.
-fn add_menu(ui: &mut egui::Ui, ws: &Workspace, asset: &Asset, (at, layer): (usize, &Value), state: &mut State, edit: &mut Option<EditRequest>) {
-    let response = ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter operations").desired_width(220.0));
+fn add_menu(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    asset: &Asset,
+    (at, layer): (usize, &Value),
+    state: &mut State,
+    edit: &mut Option<EditRequest>,
+) {
+    let response =
+        ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter operations").desired_width(220.0));
     response.request_focus();
     let filter = state.filter.to_lowercase();
-    let taken: Vec<&str> = layer.get("ops").and_then(Value::as_table).into_iter().flatten().map(|(id, _)| id.as_str()).collect();
+    let taken: Vec<&str> =
+        layer.get("ops").and_then(Value::as_table).into_iter().flatten().map(|(id, _)| id.as_str()).collect();
     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
         for (op, label) in ws.extensions.graph_operations() {
             if !label.to_lowercase().contains(&filter) && !op.to_lowercase().contains(&filter) {
@@ -249,7 +284,8 @@ fn add_menu(ui: &mut egui::Ui, ws: &Workspace, asset: &Asset, (at, layer): (usiz
                 // What it cannot do without, for the sheet to change.
                 match op.as_str() {
                     graph::FILE => {
-                        let stored = asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
+                        let stored =
+                            asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
                         table.insert("file".into(), stored.map_or("", |f| f.name.as_str()).into());
                     }
                     graph::OUTPUT | graph::PREVIEW => {
@@ -258,7 +294,11 @@ fn add_menu(ui: &mut egui::Ui, ws: &Workspace, asset: &Asset, (at, layer): (usiz
                     _ => {}
                 }
                 let place = [f64::from(state.adding.x), f64::from(state.adding.y)];
-                *edit = inspector::layers_edit(asset, format!("Add {label}"), layers::add_operation(asset.text(), at, &id, table, place));
+                *edit = inspector::layers_edit(
+                    asset,
+                    format!("Add {label}"),
+                    layers::add_operation(asset.text(), at, &id, table, place),
+                );
                 state.selected = Some(id);
                 state.filter.clear();
                 ui.close();
@@ -342,12 +382,21 @@ impl Canvas<'_> {
     }
 
     /// A box and its ports: what dragging them does.
-    fn operation(&self, ui: &egui::Ui, node: &Node, state: &mut State, drawing: Option<&Option<Type>>, edit: &mut Option<EditRequest>) {
+    fn operation(
+        &self,
+        ui: &egui::Ui,
+        node: &Node,
+        state: &mut State,
+        drawing: Option<&Option<Type>>,
+        edit: &mut Option<EditRequest>,
+    ) {
         let painter = ui.painter();
         let small = egui::TextStyle::Small.resolve(ui.style());
         let response = ui.interact(node.rect(), egui::Id::unique(("graph box", &node.id)), Sense::click_and_drag());
         let says = format!("operation {}: {}", node.id, node.label);
-        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, state.selected.as_deref() == Some(&node.id), &says));
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::Role::Button, true, state.selected.as_deref() == Some(&node.id), &says)
+        });
         if response.clicked() || response.drag_started() {
             state.selected = Some(node.id.clone());
         }
@@ -383,7 +432,9 @@ impl Canvas<'_> {
         port_dot(painter, place, type_color(node.made.as_ref()), false);
         let made = node.made.as_ref().map_or_else(|| "any".to_string(), ToString::to_string);
         text_at(painter, place - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, &short(&made), small, theme::text());
-        if port_response(ui, ("graph out", &node.id, ""), place, &format!("output of {}: makes {made}", node.id)).drag_started() {
+        if port_response(ui, ("graph out", &node.id, ""), place, &format!("output of {}: makes {made}", node.id))
+            .drag_started()
+        {
             state.wire = Some((node.id.clone(), None));
         }
     }
@@ -396,7 +447,14 @@ impl Canvas<'_> {
             box_at(painter, end_rect(above), "From above", type_color(Some(ty)), (false, false), ui);
             let place = above + vec2(END_WIDTH, HEADER + ROW * 0.5);
             let text = ty.to_string();
-            text_at(painter, place - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, &short(&text), small.clone(), theme::text());
+            text_at(
+                painter,
+                place - vec2(12.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                &short(&text),
+                small.clone(),
+                theme::text(),
+            );
             port_dot(painter, place, type_color(Some(ty)), false);
             if port_response(ui, ("graph out", ABOVE, ""), place, &format!("from above: {text}")).drag_started() {
                 state.wire = Some((ABOVE.to_string(), None));
@@ -414,15 +472,30 @@ impl Canvas<'_> {
     }
 
     /// A wire let go: where it ended says what it does.
-    fn dropped(&self, at: Pos2, sink: Pos2, (source, off): (String, Option<(String, String)>), outs: &HashMap<&str, (Pos2, Option<Type>)>, state: &mut State) -> Option<EditRequest> {
+    fn dropped(
+        &self,
+        at: Pos2,
+        sink: Pos2,
+        (source, off): (String, Option<(String, String)>),
+        outs: &HashMap<&str, (Pos2, Option<Type>)>,
+        state: &mut State,
+    ) -> Option<EditRequest> {
         let (layer, mut text) = (self.at, Ok(self.asset.text().to_string()));
         let mut label = format!("Unplug {source}");
         let mut wrote = off.is_some();
         // What it is pulled off goes first: both one step.
         if let Some((to, port)) = &off {
-            text = text.and_then(|t| if to == "result" { layers::set_result(&t, layer, None) } else { layers::disconnect(&t, layer, (to, port), &source) });
+            text = text.and_then(|t| {
+                if to == "result" {
+                    layers::set_result(&t, layer, None)
+                } else {
+                    layers::disconnect(&t, layer, (to, port), &source)
+                }
+            });
         }
-        let port = self.nodes.iter().find_map(|node| (0..node.ports.len()).find(|i| node.input(*i).distance(at) <= PORT).map(|i| (node, &node.ports[i])));
+        let port = self.nodes.iter().find_map(|node| {
+            (0..node.ports.len()).find(|i| node.input(*i).distance(at) <= PORT).map(|i| (node, &node.ports[i]))
+        });
         if sink.distance(at) <= PORT {
             text = text.and_then(|t| layers::set_result(&t, layer, Some(&source)));
             label = format!("Pass {source} on down");
@@ -435,7 +508,8 @@ impl Canvas<'_> {
                 wrote = true;
                 state.refused = None;
             } else {
-                state.refused = made.map(|ty| format!("{} of {} takes {}, and {source} makes {ty}", port.name, node.id, port.ty));
+                state.refused =
+                    made.map(|ty| format!("{} of {} takes {}, and {source} makes {ty}", port.name, node.id, port.ty));
             }
         }
         wrote.then(|| self.edit(label, text)).flatten()
@@ -447,7 +521,8 @@ impl Canvas<'_> {
         let (above, below) = ends(&self.nodes);
         let source = above + vec2(END_WIDTH, HEADER + ROW * 0.5);
         let sink = below + vec2(0.0, HEADER + ROW * 0.5);
-        let mut outs: HashMap<&str, (Pos2, Option<Type>)> = self.nodes.iter().map(|n| (n.id.as_str(), (n.output(), n.made.clone()))).collect();
+        let mut outs: HashMap<&str, (Pos2, Option<Type>)> =
+            self.nodes.iter().map(|n| (n.id.as_str(), (n.output(), n.made.clone()))).collect();
         outs.insert(ABOVE, (source, self.above.clone()));
         let passed = self.layer.get("result").and_then(Value::as_str);
         self.wires(ui, &outs, passed.map(|p| (sink, p)));
@@ -506,7 +581,11 @@ fn toolbar_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &
             state.view = None;
         }
         let editable = inspector::edit_target(canvas.ws, canvas.asset).is_ok();
-        if ui.add_enabled(editable, egui::Button::new("Arrange")).on_hover_text("Put the boxes in columns, by what feeds what").clicked() {
+        if ui
+            .add_enabled(editable, egui::Button::new("Arrange"))
+            .on_hover_text("Put the boxes in columns, by what feeds what")
+            .clicked()
+        {
             arrange(canvas, state, edit);
         }
     });
@@ -530,14 +609,22 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
         return;
     };
     let Some(at) = layer_of(ws, &asset) else {
-        ui.label(RichText::new("This asset's stack has no graph layer. Add one in the Inspector.").color(theme::weak()));
+        ui.label(
+            RichText::new("This asset's stack has no graph layer. Add one in the Inspector.").color(theme::weak()),
+        );
         return;
     };
-    let Some(layer) = asset.fields().get("stack").and_then(Value::as_array).and_then(|l| l.get(at)).cloned() else { return };
+    let Some(layer) = asset.fields().get("stack").and_then(Value::as_array).and_then(|l| l.get(at)).cloned() else {
+        return;
+    };
     let id = egui::Id::unique(("graph pane", &asset.path, at));
     let mut state: State = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     // What is selected of it is the workspace's: every pane shows the same.
-    state.selected = ws.inner_of(&asset.path).and_then(inspector::layer_of_inner).filter(|(of, _)| *of == at).and_then(|(_, op)| op.map(str::to_string));
+    state.selected = ws
+        .inner_of(&asset.path)
+        .and_then(inspector::layer_of_inner)
+        .filter(|(of, _)| *of == at)
+        .and_then(|(_, op)| op.map(str::to_string));
     let before = state.selected.clone();
     let (plan, wrong) = ws.extensions.plan_written(&asset);
     let mut nodes = nodes_of(ws, &layer, &plan, at);
@@ -551,7 +638,9 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
     let canvas = Canvas { ws, asset: &asset, at, layer: &layer, nodes, above, wrong };
     match ask {
         Some(GraphAsk::Fit) => state.view = None,
-        Some(GraphAsk::Arrange) if inspector::edit_target(canvas.ws, canvas.asset).is_ok() => arrange(&canvas, &mut state, edit),
+        Some(GraphAsk::Arrange) if inspector::edit_target(canvas.ws, canvas.asset).is_ok() => {
+            arrange(&canvas, &mut state, edit);
+        }
         _ => {}
     }
     egui::Panel::top(("graph tools", id)).show(ui, |ui| toolbar_ui(ui, &canvas, &mut state, edit));

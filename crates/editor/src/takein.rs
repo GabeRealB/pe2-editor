@@ -395,13 +395,7 @@ impl Worker {
     }
 
     /// The index as it is now, handed over: the tree built again where anything changed.
-    fn snapshot(
-        &mut self,
-        ticket: u64,
-        changed: BTreeSet<String>,
-        all: bool,
-        error: Option<String>,
-    ) -> Snapshot {
+    fn snapshot(&mut self, ticket: u64, changed: BTreeSet<String>, all: bool, error: Option<String>) -> Snapshot {
         if all || !changed.is_empty() {
             self.tree = Arc::new(Node::build(&self.index, &self.extensions));
         }

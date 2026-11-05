@@ -61,7 +61,14 @@ fn text<'a>(table: &'a Table, key: &str) -> &'a str {
 }
 
 fn words(table: &Table, key: &str) -> Vec<String> {
-    table.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    table
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 fn is_package(slot: &Table) -> bool {
@@ -91,7 +98,9 @@ fn sections(list: &[Table]) -> Vec<(&str, Vec<&Table>)> {
 fn default_shown(option: &Table) -> Option<String> {
     let default = option.get("default")?;
     let shown = match (text(option, "type"), default.as_str()) {
-        ("string", Some(text)) => text.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(text).to_string(),
+        ("string", Some(text)) => {
+            text.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(text).to_string()
+        }
         ("bool", Some(text)) => (if text == "1" { "true" } else { "false" }).to_string(),
         (_, Some(text)) => text.to_string(),
         (_, None) => default.to_string(),
@@ -116,7 +125,10 @@ fn wrong(option: &Table, value: Option<&Value>) -> Option<String> {
 
 /// Whether an option is a struct or an array, which opens into groups; a single integer is a field.
 fn is_grouped(option: &Table) -> bool {
-    option.get("shape").and_then(Value::as_table).is_some_and(|shape| shape.contains_key("count") || shape.contains_key("fields"))
+    option
+        .get("shape")
+        .and_then(Value::as_table)
+        .is_some_and(|shape| shape.contains_key("count") || shape.contains_key("fields"))
 }
 
 /// A value as an input shows it.
@@ -140,7 +152,13 @@ fn without(field: Option<&Value>, key: &str) -> Option<Value> {
 /// What a package holds that no source reads: what it says is left from a source since changed.
 fn unread(field: Option<&Value>, named: &[Table]) -> Vec<String> {
     let read: BTreeSet<&str> = named.iter().map(|table| text(table, "name")).collect();
-    field.and_then(Value::as_table).into_iter().flatten().map(|(key, _)| key.clone()).filter(|key| !read.contains(key.as_str())).collect()
+    field
+        .and_then(Value::as_table)
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key.clone())
+        .filter(|key| !read.contains(key.as_str()))
+        .collect()
 }
 
 /// How wide a column of names is.
@@ -162,7 +180,9 @@ impl View for Slots {
             None => return,
         };
         // A slot kept out of the editor is filled without it: by default, by the package itself.
-        let shown = tables(&reflected, "slots").into_iter().filter(|slot| !slot.get("hidden").and_then(Value::as_bool).unwrap_or(false));
+        let shown = tables(&reflected, "slots")
+            .into_iter()
+            .filter(|slot| !slot.get("hidden").and_then(Value::as_bool).unwrap_or(false));
         let (dependencies, slots): (Vec<Table>, Vec<Table>) = shown.partition(is_package);
         if self.sheet {
             self.inputs(ui, &slots, &tables(&reflected, "options"));
@@ -211,7 +231,14 @@ fn detail(ui: &mut Ui, slots: &[Table]) {
         for given in tables(slot, "args") {
             let at = text(&given, "path");
             let values = words(&given, "values").join(", ");
-            ui.styled(&format!("{}{} = {values}", if at.is_empty() { String::new() } else { format!("{at} ") }, text(&given, "arg")), Style::Note);
+            ui.styled(
+                &format!(
+                    "{}{} = {values}",
+                    if at.is_empty() { String::new() } else { format!("{at} ") },
+                    text(&given, "arg")
+                ),
+                Style::Note,
+            );
         }
     });
 }
@@ -220,7 +247,9 @@ fn detail(ui: &mut Ui, slots: &[Table]) {
 fn leftovers(ui: &mut Ui, slots: &[Table], options: &[Table]) {
     let Some(asset) = ui.asset() else { return };
     let (bind, option) = (asset.field("bind").cloned(), asset.field("option").cloned());
-    let stale = |field: &'static str, held: &Option<Value>, named: &[Table]| unread(held.as_ref(), named).into_iter().map(move |key| (field, key));
+    let stale = |field: &'static str, held: &Option<Value>, named: &[Table]| {
+        unread(held.as_ref(), named).into_iter().map(move |key| (field, key))
+    };
     let listed: Vec<(&str, String)> = stale("bind", &bind, slots).chain(stale("option", &option, options)).collect();
     if listed.is_empty() {
         return;
@@ -314,7 +343,8 @@ impl Slots {
                                 }
                             }
                             // Set, it can go back to its default, or to having no value.
-                            let back = if input.contains_key("default") { "Back to its default" } else { "Leave it not set" };
+                            let back =
+                                if input.contains_key("default") { "Back to its default" } else { "Leave it not set" };
                             if value.is_some() && ui.icon_button(Icon::Cross, back) {
                                 cleared = Some(input_name.to_string());
                             }
@@ -368,7 +398,9 @@ impl Slots {
                 // A box says true or false, and this is neither yet: both are offered, as false would take two clicks.
                 let Some(mut on) = held else {
                     let choices = ["false".to_string(), "true".to_string()];
-                    return ui.combo(&format!("option.{name}"), "", &choices).map(|chosen| Edit::Set(Value::Boolean(chosen == 1)));
+                    return ui
+                        .combo(&format!("option.{name}"), "", &choices)
+                        .map(|chosen| Edit::Set(Value::Boolean(chosen == 1)));
                 };
                 let changed = ui.checkbox("", &mut on).then_some(Edit::Set(Value::Boolean(on)));
                 if value.is_none() {
@@ -379,11 +411,13 @@ impl Slots {
             "enum" => {
                 let members = words(option, "members");
                 let shown = value.and_then(Value::as_str).unwrap_or_default();
-                ui.combo(&format!("option.{name}"), shown, &members).map(|chosen| Edit::Set(Value::String(members[chosen].clone())))
+                ui.combo(&format!("option.{name}"), shown, &members)
+                    .map(|chosen| Edit::Set(Value::String(members[chosen].clone())))
             }
             ty => {
                 let held = value.map_or_else(String::new, shown);
-                let typed = self.typing(ui, &format!("option.{name}"), &held, default.as_deref().unwrap_or_default(), 0.0)?;
+                let typed =
+                    self.typing(ui, &format!("option.{name}"), &held, default.as_deref().unwrap_or_default(), 0.0)?;
                 if typed.is_empty() {
                     self.refused.remove(name);
                     return value.is_some().then_some(Edit::Clear);
@@ -391,7 +425,10 @@ impl Slots {
                 if ty == "string" {
                     return Some(Edit::Set(Value::String(typed)));
                 }
-                let range = option.get("shape").and_then(Value::as_table).and_then(|shape| Some((shape.get("low")?.as_integer()?, shape.get("high")?.as_integer()?)));
+                let range = option
+                    .get("shape")
+                    .and_then(Value::as_table)
+                    .and_then(|shape| Some((shape.get("low")?.as_integer()?, shape.get("high")?.as_integer()?)));
                 let (low, high) = range.unwrap_or((i64::MIN, i64::MAX));
                 match typed::checked(&typed, ty, low, high) {
                     Ok(number) => {
@@ -418,7 +455,13 @@ impl Slots {
         let mut at = Members { option: &name, whole: &shape, value, default, full: &full, path: vec![], edit: None };
         self.members(ui, &shape, &mut at);
         let prefix = format!("option.{name}.");
-        for why in self.refused.iter().filter(|(id, _)| id.starts_with(&prefix)).map(|(_, why)| why.clone()).collect::<Vec<_>>() {
+        for why in self
+            .refused
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .map(|(_, why)| why.clone())
+            .collect::<Vec<_>>()
+        {
             ui.styled(&why, Style::Error);
         }
         at.edit
@@ -431,7 +474,12 @@ impl Slots {
         let dynamic = typed::is_dynamic(shape);
         let elements = children.len();
         #[expect(clippy::cast_precision_loss, reason = "a name's length")]
-        let label = children.iter().filter(|(.., child)| typed::range_of(child).is_some()).map(|(_, title, _)| title.len()).max().unwrap_or(0) as f32;
+        let label = children
+            .iter()
+            .filter(|(.., child)| typed::range_of(child).is_some())
+            .map(|(_, title, _)| title.len())
+            .max()
+            .unwrap_or(0) as f32;
         let label = label * CHARACTER + GAP;
         for (step, title, child) in children {
             at.path.push(step);
@@ -456,17 +504,20 @@ impl Slots {
                         }
                     };
                     self.refused.remove(&id);
-                    at.edit = Some(typed::set(at.whole, at.value, at.default, &at.path, new).map_or(Edit::Clear, Edit::Set));
+                    at.edit =
+                        Some(typed::set(at.whole, at.value, at.default, &at.path, new).map_or(Edit::Clear, Edit::Set));
                 });
             } else {
                 // A group says when the package sets something in it, so that a change shows while it is closed.
-                let holds = typed::at(at.value, &at.path).is_some_and(|value| value.as_table().is_none_or(|table| !table.is_empty()));
+                let holds = typed::at(at.value, &at.path)
+                    .is_some_and(|value| value.as_table().is_none_or(|table| !table.is_empty()));
                 let removable = dynamic && elements > 1;
                 ui.collapsing(&id, &title, if holds { "set" } else { "" }, |ui| {
                     self.members(ui, &child, at);
                     if removable && ui.icon_button(Icon::Cross, "Remove this element") {
                         let Some(Step::Index(index)) = at.path.last() else { return };
-                        at.edit = Some(typed::remove(at.whole, at.value, at.default, *index).map_or(Edit::Clear, Edit::Set));
+                        at.edit =
+                            Some(typed::remove(at.whole, at.value, at.default, *index).map_or(Edit::Clear, Edit::Set));
                     }
                 });
                 ui.tooltip(&typed::about(&child));
@@ -511,7 +562,10 @@ impl View for Tokens {
     fn show(&mut self, ui: &mut Ui) {
         if self.told.is_none() {
             let Some(path) = ui.asset().map(|asset| asset.path().to_string()) else { return };
-            let own = ui.project().target().and_then(|target| ui.project().table(&path, &format!("{}.{target}", pe2_ext::tokens::DECLARED))?.ok());
+            let own = ui
+                .project()
+                .target()
+                .and_then(|target| ui.project().table(&path, &format!("{}.{target}", pe2_ext::tokens::DECLARED))?.ok());
             let told = own.map(Ok).or_else(|| ui.project().table(&path, pe2_ext::tokens::DECLARED));
             self.told = told.map(|told| told.map_err(|e| format!("{e:#}")));
         }
@@ -536,7 +590,11 @@ fn row(entry: &Table) -> Vec<Cell> {
     let name = if text(entry, "name").is_empty() { "(whole)".to_string() } else { format!("_{}", text(entry, "name")) };
     let args = words(entry, "args");
     let needs = if args.is_empty() { String::new() } else { format!("needs {}", args.join(", ")) };
-    vec![Cell::Text(name, Style::Strong), Cell::Text(text(entry, "yields").to_string(), Style::Weak), Cell::Text(needs, Style::Note)]
+    vec![
+        Cell::Text(name, Style::Strong),
+        Cell::Text(text(entry, "yields").to_string(), Style::Weak),
+        Cell::Text(needs, Style::Note),
+    ]
 }
 
 #[cfg(test)]
@@ -570,7 +628,10 @@ mod tests {
         list[1].insert("label".to_string(), "Face".into());
         list[3].insert("label".to_string(), "Face".into());
         let found = sections(&list);
-        let names: Vec<(&str, Vec<&str>)> = found.iter().map(|(label, tables)| (*label, tables.iter().map(|table| text(table, "name")).collect())).collect();
+        let names: Vec<(&str, Vec<&str>)> = found
+            .iter()
+            .map(|(label, tables)| (*label, tables.iter().map(|table| text(table, "name")).collect()))
+            .collect();
         assert_eq!(names, [("", vec!["a", "c"]), ("Face", vec!["b", "d"])]);
     }
 
@@ -598,6 +659,9 @@ mod tests {
 
     #[test]
     fn a_number_is_typed_either_way() {
-        assert_eq!((typed::typed_number("31"), typed::typed_number(" 0x1F "), typed::typed_number("x")), (Some(31), Some(31), None));
+        assert_eq!(
+            (typed::typed_number("31"), typed::typed_number(" 0x1F "), typed::typed_number("x")),
+            (Some(31), Some(31), None)
+        );
     }
 }

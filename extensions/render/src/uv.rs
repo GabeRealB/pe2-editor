@@ -51,7 +51,9 @@ fn reflections(assembled: &Assembled) -> Vec<(Bound, String)> {
     let mut out: Vec<(Bound, String)> = Vec::new();
     for face in &assembled.model.faces {
         let slot = assembled.slots.get(face.material);
-        let Some((slot, bound)) = slot.and_then(|slot| Some((slot, slot.drawn.as_ref()?.environment.clone()?))) else { continue };
+        let Some((slot, bound)) = slot.and_then(|slot| Some((slot, slot.drawn.as_ref()?.environment.clone()?))) else {
+            continue;
+        };
         let name = format!("{} (reflection)", slot.name);
         if !out.iter().any(|(known, named)| *known == bound && *named == name) {
             out.push((bound, name));
@@ -119,7 +121,12 @@ pub fn layout(assembled: &Assembled, selected: Option<usize>) -> Layout {
     (out.width, out.height) = laid_out(&mut out.tiles);
     for (at, face) in placed {
         let [left, top] = out.tiles[at].place;
-        let corners = face.corners.iter().filter_map(|corner| corner.uv).map(|[u, v]| (left + f32::from(u), top + f32::from(v))).collect();
+        let corners = face
+            .corners
+            .iter()
+            .filter_map(|corner| corner.uv)
+            .map(|[u, v]| (left + f32::from(u), top + f32::from(v)))
+            .collect();
         let part = face.part_in(&owners);
         let strong = selected.is_some() && part == selected;
         out.faces += 1;
@@ -164,11 +171,19 @@ impl UvView {
         for tile in &layout.tiles {
             let ([left, top], [width, height]) = (tile.place, tile.size);
             let rect = Rect { x: left, y: top, width, height };
-            let texture = tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
+            let texture =
+                tile.bound.as_ref().and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
             match texture {
-                Some(texture) => canvas.pictures.push(Placed { texture, rect, label: Some(tile.names.join(", ")), link: None }),
+                Some(texture) => {
+                    canvas.pictures.push(Placed { texture, rect, label: Some(tile.names.join(", ")), link: None });
+                }
                 // Nothing to lie on but where it would be.
-                None => canvas.traces.push(Traced { corners: vec![(left, top), (left + width, top), (left + width, top + height), (left, top + height)], strong: false, label: None, link: None }),
+                None => canvas.traces.push(Traced {
+                    corners: vec![(left, top), (left + width, top), (left + width, top + height), (left, top + height)],
+                    strong: false,
+                    label: None,
+                    link: None,
+                }),
             }
         }
         canvas.traces.extend(layout.traces);
@@ -223,7 +238,14 @@ mod tests {
     }
 
     fn slot(name: &str, main: Option<Bound>) -> Slot {
-        let drawn = main.map(|main| Drawn { transparent: false, blend: Blend::Mix, main: Some(main), environment: None, strength: 0, effect: 0 });
+        let drawn = main.map(|main| Drawn {
+            transparent: false,
+            blend: Blend::Mix,
+            main: Some(main),
+            environment: None,
+            strength: 0,
+            effect: 0,
+        });
         Slot { name: name.to_string(), material: None, reference: None, drawn, node: None, overrides: None }
     }
 
@@ -233,7 +255,12 @@ mod tests {
     }
 
     fn assembled(slots: Vec<Slot>, faces: Vec<Face>) -> Assembled {
-        let part = |parent| Part { parent, rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], translation: [0; 3], vertices: vec![[0; 3]] };
+        let part = |parent| Part {
+            parent,
+            rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            translation: [0; 3],
+            vertices: vec![[0; 3]],
+        };
         let materials = vec![Material { transparent: false, slot: None, blend: None }; slots.len()];
         let model = Model { parts: vec![part(0), part(0)], materials, faces, ..Model::default() };
         let node = |name: &str| Node { name: name.to_string(), attached: None, place: None };
@@ -243,7 +270,10 @@ mod tests {
     #[test]
     fn faces_lie_on_their_texture_where_it_was_laid() {
         let slots = vec![slot("x", Some(bound("one", 100))), slot("y", Some(bound("two", 50)))];
-        let shown = layout(&assembled(slots, vec![face(1, 0, &[[1, 2], [3, 4], [5, 6]]), face(0, 0, &[[7, 8], [9, 9], [1, 1]])]), None);
+        let shown = layout(
+            &assembled(slots, vec![face(1, 0, &[[1, 2], [3, 4], [5, 6]]), face(0, 0, &[[7, 8], [9, 9], [1, 1]])]),
+            None,
+        );
         assert_eq!(shown.tiles.len(), 2);
         assert_eq!(shown.tiles[0].names, ["y"], "in the order faces read them");
         assert_eq!(shown.tiles[1].place, [50.0 + GAP, 0.0]);
@@ -290,7 +320,8 @@ mod tests {
     fn a_reflection_has_its_texture_and_no_faces() {
         let mut reflective = slot("x", Some(bound("one", 10)));
         reflective.drawn.as_mut().unwrap().environment = Some(bound("sky", 20));
-        let shown = layout(&assembled(vec![reflective], vec![face(0, 0, &[[1, 1]; 3]), face(0, 0, &[[2, 2]; 3])]), None);
+        let shown =
+            layout(&assembled(vec![reflective], vec![face(0, 0, &[[1, 1]; 3]), face(0, 0, &[[2, 2]; 3])]), None);
         assert_eq!(shown.tiles.len(), 2);
         assert_eq!(shown.tiles[1].names, ["x (reflection)"]);
         assert_eq!(shown.traces.len(), 2, "both on the main texture");
@@ -299,7 +330,8 @@ mod tests {
 
     #[test]
     fn four_textures_lie_two_by_two() {
-        let mut tiles: Vec<Tile> = (0..4).map(|_| Tile { bound: None, names: Vec::new(), place: [0.0; 2], size: [10.0; 2] }).collect();
+        let mut tiles: Vec<Tile> =
+            (0..4).map(|_| Tile { bound: None, names: Vec::new(), place: [0.0; 2], size: [10.0; 2] }).collect();
         assert_eq!(laid_out(&mut tiles), (20.0 + GAP, 20.0 + GAP));
         assert_eq!(tiles[3].place, [10.0 + GAP, 10.0 + GAP]);
     }

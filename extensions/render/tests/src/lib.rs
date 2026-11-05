@@ -24,24 +24,74 @@ const RIG: &str = r#"joints = [
 /// A doll: a texture from a file, a skeleton, a mesh on it, a material, a model and a prefab holding it.
 fn doll(editor: &Editor) -> Result<()> {
     let painting = pe2_test_data::painting();
-    editor.node(&NewNode { path: "doll/skin", uid: "uid://skin", template: "texture", file: "skin.ora", settings: "", files: &[("skin.ora", &painting)] })?;
-    editor.node(&NewNode { path: "doll/skeleton", uid: "uid://bones", template: "skeleton", file: "", settings: JOINTS, files: &[] })?;
+    editor.node(&NewNode {
+        path: "doll/skin",
+        uid: "uid://skin",
+        template: "texture",
+        file: "skin.ora",
+        settings: "",
+        files: &[("skin.ora", &painting)],
+    })?;
+    editor.node(&NewNode {
+        path: "doll/skeleton",
+        uid: "uid://bones",
+        template: "skeleton",
+        file: "",
+        settings: JOINTS,
+        files: &[],
+    })?;
     let on_it = "skeleton = { slot = \"uid://bones\" }";
     // A square and a triangle, one on each joint, with one slot.
     let mesh = editor.data("doll.usda")?;
-    editor.node(&NewNode { path: "doll/shape", uid: "uid://shape", template: "mesh", file: "", settings: on_it, files: &[("mesh.usda", &mesh)] })?;
-    let paint = "shader = \"textured\"\nsurface = \"opaque\"\nblend = \"add\"\nmain = \"uid://skin#cells/page_0@default\"";
-    editor.node(&NewNode { path: "doll/paint", uid: "uid://paint", template: "material", file: "", settings: paint, files: &[] })?;
+    editor.node(&NewNode {
+        path: "doll/shape",
+        uid: "uid://shape",
+        template: "mesh",
+        file: "",
+        settings: on_it,
+        files: &[("mesh.usda", &mesh)],
+    })?;
+    let paint =
+        "shader = \"textured\"\nsurface = \"opaque\"\nblend = \"add\"\nmain = \"uid://skin#cells/page_0@default\"";
+    editor.node(&NewNode {
+        path: "doll/paint",
+        uid: "uid://paint",
+        template: "material",
+        file: "",
+        settings: paint,
+        files: &[],
+    })?;
     let body = "mesh = { slot = \"uid://shape\" }\nmaterials.page_0 = { slot = \"uid://paint\" }";
-    editor.node(&NewNode { path: "doll/body", uid: "uid://body", template: "model", file: "", settings: body, files: &[] })?;
-    editor.node(&NewNode { path: "doll/doll", uid: "uid://doll", template: "prefab", file: "", settings: PREFAB, files: &[] })
+    editor.node(&NewNode {
+        path: "doll/body",
+        uid: "uid://body",
+        template: "model",
+        file: "",
+        settings: body,
+        files: &[],
+    })?;
+    editor.node(&NewNode {
+        path: "doll/doll",
+        uid: "uid://doll",
+        template: "prefab",
+        file: "",
+        settings: PREFAB,
+        files: &[],
+    })
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.test("a_joint_selected_shows_its_translation", "Selecting a joint shows what it holds", |project, _| {
         let editor = Editor::of(project);
-        editor.node(&NewNode { path: "rig/skeleton", uid: "uid://rig", template: "skeleton", file: "", settings: RIG, files: &[] })?;
+        editor.node(&NewNode {
+            path: "rig/skeleton",
+            uid: "uid://rig",
+            template: "skeleton",
+            file: "",
+            settings: RIG,
+            files: &[],
+        })?;
         editor.show("rig/skeleton")?;
         editor.click("pelvis")?;
         editor.expect("Translation")?;
@@ -58,22 +108,37 @@ fn register(r: &mut Registry) -> Result<()> {
         editor.expect("2 faces")?;
         Ok(Value::Boolean(true))
     });
-    let _ = r.test("a_usda_file_makes_a_mesh", "A mesh dropped on the window is a node holding it as its own", |project, _| {
-        let editor = Editor::of(project);
-        editor.drop_file("anything.usda", &editor.data("doll.usda")?)?;
-        editor.click_label("New node: Mesh")?;
-        editor.expect("2 faces")?;
-        editor.expect_no_problems()?;
-        Ok(Value::Boolean(true))
-    });
-    let _ = r.test("a_model_with_no_mesh_says_so_plainly", "What is short of a setting is told without the stack's place in it", |project, _| {
-        let editor = Editor::of(project);
-        editor.node(&NewNode { path: "plain/body", uid: "uid://plain", template: "model", file: "", settings: "", files: &[] })?;
-        editor.show("plain/body")?;
-        editor.expect("no mesh")?;
-        editor.expect_not("stack[5]")?;
-        Ok(Value::Boolean(true))
-    });
+    let _ = r.test(
+        "a_usda_file_makes_a_mesh",
+        "A mesh dropped on the window is a node holding it as its own",
+        |project, _| {
+            let editor = Editor::of(project);
+            editor.drop_file("anything.usda", &editor.data("doll.usda")?)?;
+            editor.click_label("New node: Mesh")?;
+            editor.expect("2 faces")?;
+            editor.expect_no_problems()?;
+            Ok(Value::Boolean(true))
+        },
+    );
+    let _ = r.test(
+        "a_model_with_no_mesh_says_so_plainly",
+        "What is short of a setting is told without the stack's place in it",
+        |project, _| {
+            let editor = Editor::of(project);
+            editor.node(&NewNode {
+                path: "plain/body",
+                uid: "uid://plain",
+                template: "model",
+                file: "",
+                settings: "",
+                files: &[],
+            })?;
+            editor.show("plain/body")?;
+            editor.expect("no mesh")?;
+            editor.expect_not("stack[5]")?;
+            Ok(Value::Boolean(true))
+        },
+    );
     let _ = r.test("every_type_of_node_shows", "What every template makes opens with nothing failing", |project, _| {
         let editor = Editor::of(project);
         doll(&editor)?;

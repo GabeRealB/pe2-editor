@@ -13,7 +13,9 @@ use crate::{Asset, Image, Result, Value};
 pub enum Requested {
     Ready(Vec<u8>),
     /// On its way, for so many milliseconds.
-    Pending { waited: u32 },
+    Pending {
+        waited: u32,
+    },
     /// Why it cannot be.
     Failed(String),
 }

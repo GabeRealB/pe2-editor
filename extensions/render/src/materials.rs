@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use pe2_ext::{Asset, Icon, Image, Project, Style, Table, Texture, Ui, Value, View};
 
 use crate::assembly::{self, Assembled, Slot};
-use crate::prefab::{self, Filled};
 use crate::material;
 use crate::material_panel::{Pictures, choices_of};
 use crate::parts;
+use crate::prefab::{self, Filled};
 
 /// How wide and tall a slot's picture is at most.
 const THUMBNAIL: f32 = 56.0;
@@ -41,12 +41,21 @@ fn faces_with(assembled: &Assembled, slot: &Slot, part: Option<usize>) -> usize 
 /// The slots to list: each once, and of a part those its faces use.
 fn listed(assembled: &Assembled, part: Option<usize>) -> Vec<usize> {
     let slots = assembled.slots.iter().enumerate();
-    slots.filter(|(index, slot)| first_of(assembled, slot) == *index && (part.is_none() || faces_with(assembled, slot, part) > 0)).map(|(index, _)| index).collect()
+    slots
+        .filter(|(index, slot)| {
+            first_of(assembled, slot) == *index && (part.is_none() || faces_with(assembled, slot, part) > 0)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Whether two nodes' slots read as one row: a node's own override makes it its own.
 fn one_row(a: &Slot, b: &Slot) -> bool {
-    a.name == b.name && a.material == b.material && a.reference == b.reference && a.overrides.is_none() && b.overrides.is_none()
+    a.name == b.name
+        && a.material == b.material
+        && a.reference == b.reference
+        && a.overrides.is_none()
+        && b.overrides.is_none()
 }
 
 /// The rows: each the slots it stands for.
@@ -121,7 +130,11 @@ fn written(asset: &Asset, project: &dyn Project, slots: &[&Slot], change: &Chang
         let Some(root) = roots.get(key).or_else(|| asset.field(key)).cloned() else { continue };
         let fill = steps.iter().try_fold(&root, |value, step| value.get(step));
         let all = fill.and_then(|fill| fill.get("overrides")).and_then(Value::as_table).cloned().unwrap_or_default();
-        let Some(entry) = entry_with(project, slot, all.get(name).and_then(Value::as_table).cloned().unwrap_or_default(), change) else { continue };
+        let Some(entry) =
+            entry_with(project, slot, all.get(name).and_then(Value::as_table).cloned().unwrap_or_default(), change)
+        else {
+            continue;
+        };
         let overrides = overrides_with(all, name, entry);
         let Some(new) = prefab::changed(root, steps, |fill| set_overrides(fill, overrides)) else { continue };
         roots.insert(key.clone(), new);
@@ -145,7 +158,11 @@ fn fitted(ui: &Ui, texture: &Value) -> Option<Value> {
     let held = |name: &str, known: &[String]| known.iter().any(|known| known == name);
     let cell = material::cell_of(texture).filter(|cell| held(cell, &choices.cells)).unwrap_or(&choices.cells[0]);
     let palette = material::palette_of(texture).map(|palette| {
-        if held(palette, &choices.palettes) { palette } else { choices.palettes.first().map_or(palette, String::as_str) }
+        if held(palette, &choices.palettes) {
+            palette
+        } else {
+            choices.palettes.first().map_or(palette, String::as_str)
+        }
     });
     Some(material::reading(texture, cell, palette))
 }
@@ -175,7 +192,10 @@ impl Bindings {
                         asked = Some((part.within.clone(), new));
                     }
                     ui.tab(chip);
-                    let shown = assembled.slots.iter().any(|slot| slot.node.as_ref().is_some_and(|(node, _)| *node == part.part));
+                    let shown = assembled
+                        .slots
+                        .iter()
+                        .any(|slot| slot.node.as_ref().is_some_and(|(node, _)| *node == part.part));
                     match &part.node {
                         Some(node) => ui.styled(&format!("on {node}"), Style::Note),
                         None if shown => ui.styled("the skeleton's", Style::Note),
@@ -191,7 +211,8 @@ impl Bindings {
         let bound = slot.drawn.as_ref().and_then(|drawn| drawn.main.as_ref());
         let picture = bound.and_then(|bound| self.pictures.get(ui, &bound.image, &bound.output()).cloned());
         // Nothing to show keeps the place, so that the rows' text lines up.
-        let picture = picture.unwrap_or_else(|| Texture::new("no texture", Image { width: 1, height: 2, rgba: vec![0; 8] }));
+        let picture =
+            picture.unwrap_or_else(|| Texture::new("no texture", Image { width: 1, height: 2, rgba: vec![0; 8] }));
         #[expect(clippy::cast_precision_loss, reason = "a picture is far smaller than floats lose pixels at")]
         let (wide, tall) = (picture.width() as f32, picture.height().max(1) as f32);
         let fit = THUMBNAIL / wide.max(tall);
@@ -205,11 +226,16 @@ impl Bindings {
         }
         let Some(choices) = choices_of(ui, texture) else { return };
         let cell = material::cell_of(texture).unwrap_or_default().to_string();
-        let palette = material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
+        let palette =
+            material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
         ui.horizontal(|ui| {
             ui.styled("Cell", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.cell"), &cell, &choices.cells) {
-                *change = Some(Change::Texture(material::reading(texture, &choices.cells[chosen], material::palette_of(texture))));
+                *change = Some(Change::Texture(material::reading(
+                    texture,
+                    &choices.cells[chosen],
+                    material::palette_of(texture),
+                )));
             }
             ui.styled("Palette", Style::Weak);
             if let Some(chosen) = ui.combo(&format!("{id}.palette"), &palette, &choices.palettes) {
@@ -225,7 +251,8 @@ impl Bindings {
         let (index, slot) = (row[0], &assembled.slots[row[0]]);
         let faces: usize = row.iter().map(|at| faces_with(assembled, &assembled.slots[*at], part)).sum();
         let overridden = slot.overrides.is_some();
-        let nodes: Vec<&str> = row.iter().filter_map(|at| assembled.slots[*at].node.as_ref()).map(|(node, _)| node.as_str()).collect();
+        let nodes: Vec<&str> =
+            row.iter().filter_map(|at| assembled.slots[*at].node.as_ref()).map(|(node, _)| node.as_str()).collect();
         let detail = match nodes.as_slice() {
             [] => format!("{faces} faces"),
             [node] if overridden => format!("{node}  ·  {faces} faces  ·  overridden"),
@@ -296,7 +323,9 @@ impl View for Bindings {
         let listed_parts = self.parts.take().unwrap_or_default();
         let model = if listed_parts.is_empty() { None } else { Self::parts(ui, &listed_parts, &assembled) };
         self.parts = Some(listed_parts);
-        let title = part.and_then(|part| assembled.nodes.get(part)).map_or_else(|| "Materials".to_string(), |node| format!("Materials of {}", node.name));
+        let title = part
+            .and_then(|part| assembled.nodes.get(part))
+            .map_or_else(|| "Materials".to_string(), |node| format!("Materials of {}", node.name));
         let mut asked = None;
         ui.section(&title, |ui| {
             if rows.is_empty() {
@@ -313,7 +342,9 @@ impl View for Bindings {
             Some(written(&ui.asset()?, ui.project(), &slots, &change))
         });
         self.assembled = Some(Ok(assembled));
-        let filled_part = model.and_then(|(within, new)| prefab::edited(&ui.asset()?, &within, |fill| drop(fill.insert("model".to_string(), filled(&new)))));
+        let filled_part = model.and_then(|(within, new)| {
+            prefab::edited(&ui.asset()?, &within, |fill| drop(fill.insert("model".to_string(), filled(&new))))
+        });
         for (key, value) in written.into_iter().flatten().chain(filled_part.map(|(key, value)| (key, Some(value)))) {
             ui.set_step(&key, value.as_ref());
         }
@@ -331,16 +362,35 @@ mod tests {
     }
 
     fn face(material: usize, part: usize) -> Face {
-        Face { material, shading: Shading::Unlit, part: Some(part), normal: None, color: None, corners: vec![Corner::default(); 3] }
+        Face {
+            material,
+            shading: Shading::Unlit,
+            part: Some(part),
+            normal: None,
+            color: None,
+            corners: vec![Corner::default(); 3],
+        }
     }
 
     fn slot(name: &str, material: &str) -> Slot {
         let attached = Attached { path: material.to_string(), reference: material.to_string() };
-        Slot { name: name.to_string(), material: Some(attached), reference: None, drawn: None, node: None, overrides: None }
+        Slot {
+            name: name.to_string(),
+            material: Some(attached),
+            reference: None,
+            drawn: None,
+            node: None,
+            overrides: None,
+        }
     }
 
     fn two_parts() -> Assembled {
-        let part = |parent| Part { parent, rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], translation: [0; 3], vertices: vec![[0; 3]] };
+        let part = |parent| Part {
+            parent,
+            rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            translation: [0; 3],
+            vertices: vec![[0; 3]],
+        };
         let model = Model {
             parts: vec![part(0), part(0)],
             materials: vec![Material { transparent: false, slot: None, blend: None }; 3],
@@ -348,7 +398,12 @@ mod tests {
             ..Model::default()
         };
         let node = |name: &str| Node { name: name.to_string(), attached: None, place: None };
-        Assembled { posed: Vec::new(), model, nodes: vec![node("a"), node("b")], slots: vec![slot("x", "m"), slot("y", "n"), slot("x", "m")] }
+        Assembled {
+            posed: Vec::new(),
+            model,
+            nodes: vec![node("a"), node("b")],
+            slots: vec![slot("x", "m"), slot("y", "n"), slot("x", "m")],
+        }
     }
 
     #[test]

@@ -121,7 +121,8 @@ impl ApplicationHandler<eframe::UserEvent> for PointerGate<'_> {
             WindowEvent::CursorMoved { .. } => self.held = None,
             WindowEvent::MouseInput { state, .. } => {
                 self.release(event_loop);
-                self.buttons = if state == ElementState::Pressed { self.buttons + 1 } else { self.buttons.saturating_sub(1) };
+                self.buttons =
+                    if state == ElementState::Pressed { self.buttons + 1 } else { self.buttons.saturating_sub(1) };
             }
             // A frame would only ask for another: the widget under the pointer is the same, wherever on it egui thinks it is.
             WindowEvent::RedrawRequested => {}

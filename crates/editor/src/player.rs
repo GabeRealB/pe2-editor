@@ -17,11 +17,11 @@ use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use eframe::egui::{self, RichText};
+use pe2_ext::media::{PixelFormat, SampleFormat, VideoFrame};
 use project::ext::Extensions;
 use project::graph::Value;
 use project::graph::stream::{Poll, Reader, Stream};
 use project::index::Index;
-use pe2_ext::media::{PixelFormat, SampleFormat, VideoFrame};
 
 use crate::settings::{Preview, Upscale};
 use crate::{icons, theme};
@@ -66,7 +66,9 @@ impl Sound<'_> {
 /// What an item holds to play, of what the player shows: its picture and its sound, either or both.
 fn parts(item: &Value) -> (Option<Picture<'_>>, Option<Sound<'_>>) {
     match item {
-        Value::Image(image) => (Some(Picture::Rgba { width: image.width, height: image.height, rgba: &image.rgba }), None),
+        Value::Image(image) => {
+            (Some(Picture::Rgba { width: image.width, height: image.height, rgba: &image.rgba }), None)
+        }
         Value::Video(frame) => match frame.format {
             PixelFormat::Rgba8888 => {
                 let (width, height) = (frame.width as usize, frame.height as usize);
@@ -75,9 +77,14 @@ fn parts(item: &Value) -> (Option<Picture<'_>>, Option<Sound<'_>>) {
             PixelFormat::Yuv420p => (Some(Picture::Yuv(frame)), None),
             PixelFormat::Bgra8888 | PixelFormat::Nv12 => (None, None),
         },
-        Value::Pcm(pcm) => {
-            (None, Some(Sound { rate: pcm.rate, channels: usize::from(pcm.channels.max(1)), samples: Samples::S16(&pcm.samples) }))
-        }
+        Value::Pcm(pcm) => (
+            None,
+            Some(Sound {
+                rate: pcm.rate,
+                channels: usize::from(pcm.channels.max(1)),
+                samples: Samples::S16(&pcm.samples),
+            }),
+        ),
         Value::Audio(sound) if sound.format == SampleFormat::S16Interleaved => {
             let channels = (sound.channels as usize).max(1);
             (None, Some(Sound { rate: sound.sample_rate, channels, samples: Samples::Le(sound.buffer.bytes()) }))
@@ -182,7 +189,12 @@ struct SoundClock {
 
 impl SoundClock {
     fn new() -> SoundClock {
-        SoundClock { begun: Instant::now(), at: AtomicU64::new(0f64.to_bits()), len: AtomicU64::new(0), taken: AtomicU64::new(0) }
+        SoundClock {
+            begun: Instant::now(),
+            at: AtomicU64::new(0f64.to_bits()),
+            len: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+        }
     }
 
     fn took(&self, at: f64, len: f64) {
@@ -197,7 +209,8 @@ impl SoundClock {
     fn now(&self, rate: f64) -> f64 {
         let at = f64::from_bits(self.at.load(Ordering::Relaxed));
         let len = f64::from_bits(self.len.load(Ordering::Relaxed));
-        let since = self.begun.elapsed().saturating_sub(std::time::Duration::from_nanos(self.taken.load(Ordering::Relaxed)));
+        let since =
+            self.begun.elapsed().saturating_sub(std::time::Duration::from_nanos(self.taken.load(Ordering::Relaxed)));
         at + (since.as_secs_f64() * rate).min(len)
     }
 }
@@ -225,7 +238,15 @@ impl Drop for Player {
 impl Player {
     pub fn new(extensions: Arc<Extensions>) -> Player {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Player { extensions, id: NEXT.fetch_add(1, Ordering::Relaxed), shown: None, texture: None, keys: 0, gain: Arc::new(AtomicU32::new(1f32.to_bits())), device: Arc::default() }
+        Player {
+            extensions,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            shown: None,
+            texture: None,
+            keys: 0,
+            gain: Arc::new(AtomicU32::new(1f32.to_bits())),
+            device: Arc::default(),
+        }
     }
 
     /// Stop where it is: its tab is not shown, and what is not seen is not heard.
@@ -300,9 +321,15 @@ impl Player {
             shown.opening = match opened {
                 Ok(stream) => {
                     let header = stream.header();
-                    shown.rate = header.get("rate").and_then(toml::Value::as_float).filter(|r| *r > 0.0).unwrap_or(15.0);
-                    shown.count = header.get("count").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok());
-                    shown.first = header.get("first").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok()).unwrap_or(0);
+                    shown.rate =
+                        header.get("rate").and_then(toml::Value::as_float).filter(|r| *r > 0.0).unwrap_or(15.0);
+                    shown.count =
+                        header.get("count").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok());
+                    shown.first = header
+                        .get("first")
+                        .and_then(toml::Value::as_integer)
+                        .and_then(|c| u64::try_from(c).ok())
+                        .unwrap_or(0);
                     Opening::Open { picture: stream.reader(), sound: stream.reader() }
                 }
                 Err(e) => Opening::Failed(e),
@@ -405,9 +432,40 @@ fn show_centered(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::Textur
     }
 }
 
+/// Sounding started from where it is: the item it is on whole, the clock left to the sound, or why it is silent.
+fn start_sounding(shown: &mut Shown, gain: &Arc<AtomicU32>, failed: &Arc<Mutex<Option<String>>>) {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an item's place")]
+    let from = shown.at.max(0.0).floor() as u64;
+    match sound(gain, failed.clone()) {
+        Ok((device, queue, clock, source_rate)) => {
+            let spans = VecDeque::new();
+            shown.sounding = Some(Sounding {
+                _device: device,
+                queue,
+                clock,
+                rate: 0,
+                source_rate,
+                fed: from,
+                spans,
+                total: 0.0,
+                started: false,
+            });
+            shown.at = shown.at.floor();
+            shown.playing = None;
+        }
+        Err(e) => shown.silent = Some(e),
+    }
+}
+
 /// Where it is: by the sound while it sounds - fed half a second ahead - else by the clock; sounding started while it
 /// plays, unless muted or silent.
-fn keep_time(shown: &mut Shown, muted: bool, device: Option<String>, gain: &Arc<AtomicU32>, failed: &Arc<Mutex<Option<String>>>) {
+fn keep_time(
+    shown: &mut Shown,
+    muted: bool,
+    device: Option<String>,
+    gain: &Arc<AtomicU32>,
+    failed: &Arc<Mutex<Option<String>>>,
+) {
     if let Some(device) = device {
         shown.silent = Some(format!("the device: {device}"));
         if shown.sounding.is_some() {
@@ -422,20 +480,8 @@ fn keep_time(shown: &mut Shown, muted: bool, device: Option<String>, gain: &Arc<
         shown.sounding = None;
         return;
     }
-    // Sounding from where it is.
     if shown.sounding.is_none() && !muted && shown.silent.is_none() {
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an item's place")]
-        let from = shown.at.max(0.0).floor() as u64;
-        match sound(gain, failed.clone()) {
-            Ok((device, queue, clock, source_rate)) => {
-                let spans = VecDeque::new();
-                shown.sounding =
-                    Some(Sounding { _device: device, queue, clock, rate: 0, source_rate, fed: from, spans, total: 0.0, started: false });
-                shown.at = shown.at.floor();
-                shown.playing = None;
-            }
-            Err(e) => shown.silent = Some(e),
-        }
+        start_sounding(shown, gain, failed);
     }
     let Some(sounding) = &mut shown.sounding else {
         if let Some((since, from)) = shown.playing {
@@ -551,14 +597,20 @@ fn controls(ui: &mut egui::Ui, shown: &mut Shown, number: u64, view: &mut Previe
                 ui.add(egui::Slider::new(&mut view.volume, 0.0..=1.0).step_by(0.05).show_value(false))
                     .on_hover_text(format!("Volume {percent}%"));
             });
-            let (glyph, says) = if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
+            let (glyph, says) =
+                if view.muted { (icons::SPEAKER_X, "Sound off") } else { (icons::SPEAKER_HIGH, "Sound on") };
             if ui.button(RichText::new(glyph).size(16.0)).on_hover_text(says).clicked() {
                 view.muted = !view.muted;
             }
             ui.add_space(8.0);
             let rate = shown.rate;
             let time = |item: u64| {
-                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss, reason = "seconds of a stream")]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss,
+                    reason = "seconds of a stream"
+                )]
                 let seconds = (item as f64 / rate) as u64;
                 format!("{}:{:02}", seconds / 60, seconds % 60)
             };
@@ -632,7 +684,8 @@ fn sound(gain: &Arc<AtomicU32>, failed: Arc<Mutex<Option<String>>>) -> Result<Op
 /// where ALSA has no card of its own (WSL) - else the default.
 fn output_device() -> Option<cpal::Device> {
     let host = cpal::default_host();
-    let pulse = host.output_devices().ok().and_then(|mut devices| devices.find(|d| d.name().is_ok_and(|n| n == "pulse")));
+    let pulse =
+        host.output_devices().ok().and_then(|mut devices| devices.find(|d| d.name().is_ok_and(|n| n == "pulse")));
     pulse.or_else(|| host.default_output_device())
 }
 

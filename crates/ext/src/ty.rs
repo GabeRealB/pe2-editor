@@ -490,8 +490,16 @@ mod tests {
     fn constraints_relate_ports_taking_anything() {
         let mut r = Registry::new("x.ext");
         let _ = r.value_type::<Texture>();
-        let _ = r.op("select").input::<Any>("a").input::<Any>("b").output::<Any>().same("a", "b").output_same_as("a").run(|call| call.take::<Any>(0));
-        let _ = r.op("join").inputs::<Any>("parts").output::<Any>().output_list_of("parts").run(|call| call.take::<Any>(0));
+        let _ = r
+            .op("select")
+            .input::<Any>("a")
+            .input::<Any>("b")
+            .output::<Any>()
+            .same("a", "b")
+            .output_same_as("a")
+            .run(|call| call.take::<Any>(0));
+        let _ =
+            r.op("join").inputs::<Any>("parts").output::<Any>().output_list_of("parts").run(|call| call.take::<Any>(0));
         let _ = r.op("wrong").input::<Texture>("t").output::<Any>().output_same_as("t").run(|call| call.take::<Any>(0));
         let parts = r.into_parts();
         let select = &parts.ops[0];

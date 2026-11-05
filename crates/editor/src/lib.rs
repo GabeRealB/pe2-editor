@@ -26,8 +26,8 @@ mod aside;
 mod commands;
 mod contents;
 mod dnd;
-mod events_pane;
 mod drive;
+mod events_pane;
 mod ext_ui;
 mod extensions_pane;
 mod external;
@@ -40,17 +40,17 @@ mod layers;
 mod onboarding;
 mod panes;
 mod perf;
+mod pictures;
 mod player;
 mod pointer_gate;
-mod settings;
-mod theme;
-mod pictures;
 mod runner;
 #[cfg(any(test, feature = "tests"))]
 #[allow(clippy::missing_panics_doc, reason = "what fails in a test panics")]
 pub mod scenario;
+mod settings;
 mod takein;
 mod tests_pane;
+mod theme;
 mod thumbs;
 mod upscale;
 mod viewer;
@@ -59,17 +59,18 @@ mod windows;
 mod workspace;
 mod yuv;
 
-use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
 use std::path::PathBuf;
 use std::sync::Arc;
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 
 /// eframe's wgpu setup, but with the adapter's own texture size limit: eframe asks for 8192, and a window surface
 /// beyond the device's limit is a panic in `Surface::configure`.
 fn wgpu_options(x11: bool) -> WgpuConfiguration {
     // A frame queued is a frame's more wait between the pointer moving and the window showing it.
-    let mut config = WgpuConfiguration { surface: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY, ..WgpuConfiguration::default() };
+    let mut config =
+        WgpuConfiguration { surface: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY, ..WgpuConfiguration::default() };
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         // wgpu hides drivers that are not conformant, and Mesa's Dozen, the Vulkan of WSL, is not. It is the fastest way
         // to Wayland there, and the slowest to X11, where OpenGL is left to be chosen.
@@ -82,7 +83,8 @@ fn wgpu_options(x11: bool) -> WgpuConfiguration {
             // Extensions draw on this device: what the hardware has is theirs to use, the standard's optional features among it.
             descriptor.required_limits = adapter.limits();
             let offered = adapter.features();
-            descriptor.required_features |= wgpu::Features { features_wgpu: wgpu::FeaturesWGPU::empty(), features_webgpu: offered.features_webgpu };
+            descriptor.required_features |=
+                wgpu::Features { features_wgpu: wgpu::FeaturesWGPU::empty(), features_webgpu: offered.features_webgpu };
             descriptor
         });
     }
@@ -136,13 +138,22 @@ impl winit::application::ApplicationHandler<eframe::UserEvent> for Monitors {
         #[expect(clippy::cast_precision_loss, reason = "a desktop's pixels are far below f32's exact integers")]
         let rect = |monitor: winit::monitor::MonitorHandle| {
             let (at, size) = (monitor.position(), monitor.size());
-            egui::Rect::from_min_size(egui::pos2(at.x as f32, at.y as f32), egui::vec2(size.width as f32, size.height as f32))
+            egui::Rect::from_min_size(
+                egui::pos2(at.x as f32, at.y as f32),
+                egui::vec2(size.width as f32, size.height as f32),
+            )
         };
         self.0 = event_loop.available_monitors().map(rect).collect();
         event_loop.exit();
     }
 
-    fn window_event(&mut self, _: &winit::event_loop::ActiveEventLoop, _: winit::window::WindowId, _: winit::event::WindowEvent) {}
+    fn window_event(
+        &mut self,
+        _: &winit::event_loop::ActiveEventLoop,
+        _: winit::window::WindowId,
+        _: winit::event::WindowEvent,
+    ) {
+    }
 }
 
 /// The monitors, in pixels of the desktop: none where they cannot be told.
@@ -192,7 +203,8 @@ pub fn run() -> Result {
     });
     // Kept here rather than by eframe: under WSLg it would read back a place a decoration off, and a window closed filling the
     // screen would come back that size.
-    let mut viewport = egui::ViewportBuilder::default().with_title("Parasite Eve II editor").with_inner_size([1400.0, 900.0]);
+    let mut viewport =
+        egui::ViewportBuilder::default().with_title("Parasite Eve II editor").with_inner_size([1400.0, 900.0]);
     let saved = settings::EditorSettings::load().0;
     let x11 = talks_x11(saved.startup.display_server);
     let mut event_loop = event_loop(x11)?;
@@ -226,7 +238,16 @@ pub fn run() -> Result {
                 install_gpu(state);
             }
             let max_surface = cc.wgpu_render_state.as_ref().map(|s| s.device.limits().max_texture_dimension_2d);
-            let start = app::Start { project, select, show, screenshot, max_surface, agents_drive, unattended: false, monitors };
+            let start = app::Start {
+                project,
+                select,
+                show,
+                screenshot,
+                max_surface,
+                agents_drive,
+                unattended: false,
+                monitors,
+            };
             Ok(Box::new(app::Editor::new(cc, start)) as Box<dyn eframe::App>)
         }),
         &event_loop,

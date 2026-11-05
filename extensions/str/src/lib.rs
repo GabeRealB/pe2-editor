@@ -11,8 +11,8 @@
 //! a movie plays without one: without one a movie has no `video` output, nothing else changing.
 
 use formats::str::{Coding, Form, HEADER, SECTORS_A_SECOND, Sector};
-use pe2_ext::ty::{self, Files, Registered};
 use pe2_ext::media::VideoFrame;
+use pe2_ext::ty::{self, Files, Registered};
 use pe2_ext::{Asset, Data, Image, Name, Registry, Result, Signature, Table, Value, anyhow};
 
 mod encode;
@@ -127,11 +127,17 @@ fn register(r: &mut Registry) -> Result<()> {
         Ok(Box::new(frames::Frames::start(call, clip)?))
     });
     // A movie made of a stream, with the one it replaces, as the layer below has it: an import's last step.
-    let _ = r.op("encode").label("STR").input::<ty::Stream<ty::Playback>>("frames").input::<Str>("original").output::<Str>().run(|call| {
-        let stream = call.take::<ty::Stream<ty::Playback>>(0)?;
-        let original = call.take::<Str>(1)?;
-        encode::encode(call, &stream, &original)
-    });
+    let _ = r
+        .op("encode")
+        .label("STR")
+        .input::<ty::Stream<ty::Playback>>("frames")
+        .input::<Str>("original")
+        .output::<Str>()
+        .run(|call| {
+            let stream = call.take::<ty::Stream<ty::Playback>>(0)?;
+            let original = call.take::<Str>(1)?;
+            encode::encode(call, &stream, &original)
+        });
     // Shown by a frame a quarter in: the first are often black.
     let _ = r
         .op("frame")
@@ -139,7 +145,9 @@ fn register(r: &mut Registry) -> Result<()> {
         .input::<ty::Stream<ty::Playback>>("frames")
         .output::<ty::Image>()
         .parameter::<u32>("frame")
-        .members(|asset| timing(asset).map(|t| (t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect())
+        .members(|asset| {
+            timing(asset).map(|t| (t.count / 4, format!("Frame {}", t.first + t.count / 4))).into_iter().collect()
+        })
         .run(|call| {
             let number = call.parameter::<u32>()?;
             let frames = call.take::<ty::Stream<ty::Playback>>(0)?;
@@ -147,7 +155,11 @@ fn register(r: &mut Registry) -> Result<()> {
             let item = frames.next()?.ok_or_else(|| anyhow!("no frame {number}"))?;
             picture(&item).ok_or_else(|| anyhow!("frame {number} has no picture"))?
         });
-    drop(r.template("movie_from_video", MOVIE, &format!("{IMPORT}{OFFERS}")).label("Movie, from a video file").files(&VIDEO));
+    drop(
+        r.template("movie_from_video", MOVIE, &format!("{IMPORT}{OFFERS}"))
+            .label("Movie, from a video file")
+            .files(&VIDEO),
+    );
     let _ = r.extend(MOVIE).of(Str::NAME).stack(&format!("{STACK}{OFFERS}")).register();
     let movie = Name::parse(MOVIE).ok_or_else(|| anyhow!("{MOVIE}: not a qualified type"))?;
     let _ = r.extractor("clips", &movie, &[], extract::begin);
@@ -244,7 +256,8 @@ fn stream(asset: &Asset) -> Table {
     });
     if let (Some(first), Some(last)) = (first, last) {
         stream.insert("frames".into(), integer(u64::from(last.frame)));
-        stream.insert("frame_size".into(), Value::Array(vec![integer(first.width.into()), integer(first.height.into())]));
+        stream
+            .insert("frame_size".into(), Value::Array(vec![integer(first.width.into()), integer(first.height.into())]));
         stream.insert("sectors_per_frame".into(), integer(first.chunks.into()));
     }
     let audio = near(0, true).filter_map(read).find_map(|s| match form.sector(&s) {

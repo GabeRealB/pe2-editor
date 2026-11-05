@@ -301,7 +301,17 @@ mod tests {
             noise.push(x.to_le_bytes()[2]);
         }
         let text = b"the game's tools made every stream with this, and this is what they made ".repeat(20);
-        vec![Vec::new(), vec![7], b"ABABA".to_vec(), vec![0; 3000], vec![0x55; 17], vec![0x55; 18], (0..=255).collect(), text, noise]
+        vec![
+            Vec::new(),
+            vec![7],
+            b"ABABA".to_vec(),
+            vec![0; 3000],
+            vec![0x55; 17],
+            vec![0x55; 18],
+            (0..=255).collect(),
+            text,
+            noise,
+        ]
     }
 
     #[test]

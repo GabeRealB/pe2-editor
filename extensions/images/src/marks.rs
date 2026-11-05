@@ -10,7 +10,12 @@ pub(crate) fn of(asset: &Asset) -> Marks {
     if is_atlas(asset) {
         let boxes: Vec<Mark> = cells(asset).into_iter().map(|c| Mark { name: c.name, rect: c.rect }).collect();
         let n = boxes.len();
-        Marks { boxes, summary: format!("{n} cell{}", if n == 1 { "" } else { "s" }), toggle: "Cells".into(), legend: true }
+        Marks {
+            boxes,
+            summary: format!("{n} cell{}", if n == 1 { "" } else { "s" }),
+            toggle: "Cells".into(),
+            legend: true,
+        }
     } else if is_texture(asset) && width > page_width {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a page count")]
         let n = (width / page_width).ceil() as usize;

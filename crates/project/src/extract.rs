@@ -183,7 +183,11 @@ impl OpenDisc {
         let e = &self.files[name];
         let first = u32::try_from(offset / sector)?;
         let count = u32::try_from(end.div_ceil(sector))? - first;
-        let bytes = if ty == "data" { self.image.data(e.lba + first, count)? } else { self.image.mode2(e.lba + first, count)? };
+        let bytes = if ty == "data" {
+            self.image.data(e.lba + first, count)?
+        } else {
+            self.image.mode2(e.lba + first, count)?
+        };
         let skip = usize::try_from(offset % sector)?;
         Ok(bytes[skip..skip + usize::try_from(end - offset)?].to_vec())
     }
@@ -259,7 +263,8 @@ impl Containers {
                 let hed = disc.slot("STAGE0.HED")?;
                 let entries = cdf::stage0_files(&hed)?;
                 let end = disc.iso_file("STAGE0.CDF")?.size;
-                for (index, record) in cdf::stage0_streams(&hed)?.iter().enumerate().filter(|(_, r)| stored_in_stage(r)) {
+                for (index, record) in cdf::stage0_streams(&hed)?.iter().enumerate().filter(|(_, r)| stored_in_stage(r))
+                {
                     let start = u64::from(record.start) * cdf::SECTOR;
                     let next = entries.iter().map(|e| e.offset).filter(|&o| o > start).min().unwrap_or(end);
                     streams.insert((None, index), (start, next));
@@ -279,7 +284,8 @@ impl Containers {
                         .collect();
                     for (index, record) in records.iter().enumerate().filter(|(_, r)| stored_in_stage(r)) {
                         let start = folder.offset + u64::from(record.start) * cdf::SECTOR;
-                        let next = starts.iter().copied().filter(|&s| s > start).min().unwrap_or(folder.offset + folder.size);
+                        let next =
+                            starts.iter().copied().filter(|&s| s > start).min().unwrap_or(folder.offset + folder.size);
                         streams.insert((Some(folder.id), index), (start, next));
                     }
                 }
@@ -324,7 +330,13 @@ fn chunk_payload(
 }
 
 /// A stream stored in a stage: the `at`'s place in stage 0's or its folder's table.
-fn stream_payload(decl: &Declarations, discs: &mut Discs, containers: &mut Containers, release: &str, at: &At) -> Result<Vec<u8>> {
+fn stream_payload(
+    decl: &Declarations,
+    discs: &mut Discs,
+    containers: &mut Containers,
+    release: &str,
+    at: &At,
+) -> Result<Vec<u8>> {
     let (Some(stage), Some(index)) = (at.stage, at.stream) else { bail!("not a stored stream") };
     let container = containers.get(decl, discs, release, stage)?;
     let &(start, end) = container
@@ -392,8 +404,7 @@ fn asset_toml(body: &str, originals: &[(String, String)]) -> Result<String> {
     }
     doc.remove("template");
     let body = doc.to_string();
-    let mut lines =
-        vec!["# A node, written by extraction.".to_string(), String::new(), body.trim().to_string()];
+    let mut lines = vec!["# A node, written by extraction.".to_string(), String::new(), body.trim().to_string()];
     for (release, sha1) in originals {
         lines.extend([String::new(), format!("[original.{release}]"), format!("sha1 = {}", quote(sha1))]);
     }
@@ -456,7 +467,9 @@ struct Declared<'a>(&'a Declarations, &'a Extensions);
 impl pe2_ext::Declared for Declared<'_> {
     fn declarations(&self, node_type: &str) -> Vec<(String, toml::Table)> {
         let wanted = self.1.qualify(node_type);
-        let of_it = |a: &&crate::declarations::Asset| self.1.template(&a.template).map(|template| template.node_type.as_str()) == wanted;
+        let of_it = |a: &&crate::declarations::Asset| {
+            self.1.template(&a.template).map(|template| template.node_type.as_str()) == wanted
+        };
         self.0.assets.iter().filter(|(_, a)| of_it(a)).map(|(path, a)| (path.clone(), a.table.clone())).collect()
     }
 }
@@ -595,12 +608,22 @@ impl Sourcing<'_> {
     /// file. What its import says besides is set on the node.
     fn stack(&self, path: &str, template: &str, native: Option<&str>, toml: &str) -> Result<String> {
         let mut doc: toml_edit::DocumentMut = toml.parse()?;
-        let found = self.extensions.template(template).with_context(|| format!("{path}: no extension gives the template {template}"))?;
+        let found = self
+            .extensions
+            .template(template)
+            .with_context(|| format!("{path}: no extension gives the template {template}"))?;
         let import = doc.remove("import");
         let import = import.as_ref().and_then(toml_edit::Item::as_table_like);
         let source = import.and_then(|import| import.get("source")?.as_str());
-        let stack = self.extensions.stamp(found, source.or(native).unwrap_or_default()).map_err(|why| anyhow::anyhow!("{path}: {why}"))?;
-        for (key, item) in import.into_iter().flat_map(|import| import.iter()).filter(|(key, _)| !matches!(*key, "source" | "importer")) {
+        let stack = self
+            .extensions
+            .stamp(found, source.or(native).unwrap_or_default())
+            .map_err(|why| anyhow::anyhow!("{path}: {why}"))?;
+        for (key, item) in import
+            .into_iter()
+            .flat_map(|import| import.iter())
+            .filter(|(key, _)| !matches!(*key, "source" | "importer"))
+        {
             doc.insert(key, item.clone());
         }
         Ok(with_stack(&doc.to_string(), &stack))
@@ -621,21 +644,35 @@ impl Sourcing<'_> {
     /// none, else its import's source alone - written by the operation undoing it from the native files, imported back
     /// by its stack with the declaration less what the import derives, and compared, files and settings both; its
     /// import kept.
-    fn bundle(&mut self, path: &str, asset: &crate::declarations::Asset, toml: String, native: pe2_ext::Made) -> Result<(String, pe2_ext::Made)> {
+    fn bundle(
+        &mut self,
+        path: &str,
+        asset: &crate::declarations::Asset,
+        toml: String,
+        native: pe2_ext::Made,
+    ) -> Result<(String, pe2_ext::Made)> {
         let fields: toml::Table = toml.parse()?;
         let Some(import) = crate::graph::import_of(&fields) else { return Ok((toml, native)) };
         let (op, source) = (import.op.to_string(), import.source.to_string());
         let def = self.extensions.op(&op).with_context(|| format!("{path}: no extension provides {op}"))?;
         let Some(inverse) = def.inverse.clone() else { return Ok((toml, native)) };
-        let pe2_ext::Type::Named(ty) = &def.output else { bail!("{path}: {op} makes {}, no extension's type", def.output) };
-        let lent = Lent { path, uid: Some(&asset.uid), fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
+        let pe2_ext::Type::Named(ty) = &def.output else {
+            bail!("{path}: {op} makes {}, no extension's type", def.output)
+        };
+        let lent =
+            Lent { path, uid: Some(&asset.uid), fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
         let files = native.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.clone())).collect();
         let settings = crate::graph::with_settings(fields.clone());
-        let native_form = crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, settings, ..pe2_ext::Typed::default() });
+        let native_form =
+            crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, settings, ..pe2_ext::Typed::default() });
         let written = self.engine.run(&inverse, vec![vec![native_form]], &toml::Table::new(), &lent);
         // One file, the source itself (`source.ora`); several, a folder of that name (`medium.ufo/glyphs/A_.glif`).
-        let written_files: Vec<(String, Vec<u8>)> = match written.with_context(|| format!("{path}: {inverse} could not write its source"))? {
-            crate::graph::Value::Typed(written) if written.files.len() == 1 => vec![(source.clone(), self.read(&written.file()?.content)?)],
+        let written_files: Vec<(String, Vec<u8>)> = match written
+            .with_context(|| format!("{path}: {inverse} could not write its source"))?
+        {
+            crate::graph::Value::Typed(written) if written.files.len() == 1 => {
+                vec![(source.clone(), self.read(&written.file()?.content)?)]
+            }
             crate::graph::Value::Typed(written) if !written.files.is_empty() => written
                 .files
                 .iter()
@@ -658,7 +695,10 @@ impl Sourcing<'_> {
         if let Some(wrong) = wrong.first() {
             bail!("{path}: {}: {}", wrong.at, wrong.what);
         }
-        let result = plan.result_output().map(|o| plan.outputs[o].name.clone()).with_context(|| format!("{path}: its stack keeps no result"))?;
+        let result = plan
+            .result_output()
+            .map(|o| plan.outputs[o].name.clone())
+            .with_context(|| format!("{path}: its stack keeps no result"))?;
         let given = self
             .engine
             .output(&plan, &lent, &result, true)
@@ -670,11 +710,8 @@ impl Sourcing<'_> {
             made.files.iter().map(|f| Ok((f.name.clone(), self.read(&f.content)?))).collect::<Result<_>>()?;
         let native_map: BTreeMap<String, Vec<u8>> = native.into_iter().collect();
         if made_map != native_map {
-            let differ: Vec<&String> = native_map
-                .keys()
-                .chain(made_map.keys())
-                .filter(|n| native_map.get(*n) != made_map.get(*n))
-                .collect();
+            let differ: Vec<&String> =
+                native_map.keys().chain(made_map.keys()).filter(|n| native_map.get(*n) != made_map.get(*n)).collect();
             bail!("{path}: its {source} does not import back into the disc's files ({differ:?} differ)");
         }
         let resolved = crate::imports::resolve(&lent.fields, &made.settings, &def.derives);
@@ -684,7 +721,10 @@ impl Sourcing<'_> {
             settings
         };
         if settings_of(&resolved.settings) != settings_of(&fields) || !resolved.orphans.is_empty() {
-            bail!("{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})", resolved.orphans);
+            bail!(
+                "{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})",
+                resolved.orphans
+            );
         }
         self.sources += 1;
         Ok((written, written_files))
@@ -694,7 +734,9 @@ impl Sourcing<'_> {
 /// The one folder an extractor's files are all in, where they are (a font's `<name>.ufo/`).
 fn made_folder(made: &pe2_ext::Made) -> Option<String> {
     let first = made.first()?.0.split_once('/')?.0;
-    made.iter().all(|(name, _)| name.split_once('/').is_some_and(|(folder, _)| folder == first)).then(|| first.to_string())
+    made.iter()
+        .all(|(name, _)| name.split_once('/').is_some_and(|(folder, _)| folder == first))
+        .then(|| first.to_string())
 }
 
 /// A bundle's `node.toml` with a stack added, before the originals.
@@ -703,6 +745,21 @@ pub(crate) fn with_stack(toml: &str, stack: &str) -> String {
     let (body, originals) = toml.split_at(body);
     let separator = if originals.is_empty() { "" } else { "\n" };
     format!("{}\n\n{}\n{separator}{originals}", body.trim_end(), stack.trim())
+}
+
+/// Where each file asset is, by release, stage, folder and file: to find a chunk slot's file.
+fn file_assets(decl: &Declarations) -> HashMap<(String, u32, Option<u32>, u32), String> {
+    let mut files = HashMap::new();
+    for (path, asset) in &decl.assets {
+        for (release, loc) in &asset.from {
+            for at in loc.at.iter().filter(|a| a.disc.is_none() && a.slot.is_none()) {
+                if let (Some(stage), Some(file)) = (at.stage, at.file) {
+                    files.insert((release.clone(), stage, at.folder, file), path.clone());
+                }
+            }
+        }
+    }
+    files
 }
 
 /// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count,
@@ -714,17 +771,7 @@ fn write_assets(
     discs: &mut Discs,
     mut sourcing: Sourcing,
 ) -> Result<(usize, usize)> {
-    // Where each file asset is, to find a chunk slot's file.
-    let mut files = HashMap::new();
-    for (path, asset) in &decl.assets {
-        for (release, loc) in &asset.from {
-            for at in loc.at.iter().filter(|a| a.disc.is_none() && a.slot.is_none()) {
-                if let (Some(stage), Some(file)) = (at.stage, at.file) {
-                    files.insert((release.clone(), stage, at.folder, file), path.clone());
-                }
-            }
-        }
-    }
+    let files = file_assets(decl);
     let mut containers = Containers { open: HashMap::new() };
     let extensions = sourcing.extensions;
     // An extractor's session, begun with the first of its assets.
@@ -735,7 +782,8 @@ fn write_assets(
         if let Some(extractor) = extensions.extractor_for(node_type, |field| asset.table.contains_key(field)) {
             let name = extractor.name.to_string();
             if !sessions.contains_key(&name) {
-                let session = (extractor.begin)(&Declared(decl, extensions)).with_context(|| format!("{name} could not begin"))?;
+                let session = (extractor.begin)(&Declared(decl, extensions))
+                    .with_context(|| format!("{name} could not begin"))?;
                 sessions.insert(name.clone(), session);
             }
             let session = sessions.get_mut(&name).context("begun")?;
@@ -751,7 +799,8 @@ fn write_assets(
             }
             // What it made in one folder (a font's `medium.ufo/`) is what the template's file names.
             let folder = made_folder(&made);
-            let toml = sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
+            let toml =
+                sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
             let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
             let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
             files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
@@ -762,10 +811,8 @@ fn write_assets(
         // A container assembled from its movies (a disc's movie file) has no bytes of its own: its stack joins its
         // stages' movies, which `make_assembled` holds to the disc's.
         if asset.template == "stream" {
-            let originals: Vec<(String, String)> = releases
-                .iter()
-                .filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?)))
-                .collect();
+            let originals: Vec<(String, String)> =
+                releases.iter().filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?))).collect();
             let toml = sourcing.stack(path, &asset.template, None, &asset_toml(&asset.body, &originals)?)?;
             write_bundle(layer, path, &[("node.toml", toml.as_bytes())])?;
             written += 1;
@@ -810,7 +857,12 @@ fn write_assets(
             }
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
-        let toml = sourcing.stack(path, &asset.template, native.as_ref().map(|_| name.as_str()), &asset_toml(&asset.body, &originals)?)?;
+        let toml = sourcing.stack(
+            path,
+            &asset.template,
+            native.as_ref().map(|_| name.as_str()),
+            &asset_toml(&asset.body, &originals)?,
+        )?;
         let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
         if let Some(native) = &native {
             files.push((&name, native));
@@ -835,9 +887,18 @@ struct Written {
 impl Written {
     fn open(layer: &Path, path: &str, uid: &str) -> Result<Written> {
         let dir = layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX));
-        let declaration = fs::read_to_string(dir.join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
-        let fields = crate::graph::with_settings(declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
-        Ok(Written { path: path.to_string(), uid: uid.to_string(), dir, declaration, fields, sha1s: std::sync::Mutex::default() })
+        let declaration =
+            fs::read_to_string(dir.join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
+        let fields =
+            crate::graph::with_settings(declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
+        Ok(Written {
+            path: path.to_string(),
+            uid: uid.to_string(),
+            dir,
+            declaration,
+            fields,
+            sha1s: std::sync::Mutex::default(),
+        })
     }
 }
 
@@ -911,10 +972,9 @@ impl<'a> Layer<'a> {
     /// stages by.
     fn new(root: &'a Path, decl: &Declarations, ops: &'a crate::graph::Ops, extensions: &'a Extensions) -> Layer<'a> {
         let assets = decl.assets.iter().map(|(path, a)| (path.clone(), a.uid.clone()));
-        let layouts = decl
-            .layouts
-            .iter()
-            .flat_map(|(release, layouts)| layouts.iter().map(move |(name, l)| (format!("disc/{release}/{name}"), l.uid.clone())));
+        let layouts = decl.layouts.iter().flat_map(|(release, layouts)| {
+            layouts.iter().map(move |(name, l)| (format!("disc/{release}/{name}"), l.uid.clone()))
+        });
         let all: Vec<(String, String)> = assets.chain(layouts).collect();
         let uids = all.iter().map(|(path, uid)| (uid.clone(), path.clone())).collect();
         let nodes = all.into_iter().map(|(path, uid)| (path, (uid, std::sync::OnceLock::new()))).collect();
@@ -954,10 +1014,15 @@ fn make_assembled(
         if asset.template != "stream" {
             continue;
         }
-        let (node, plan) =
-            crate::graph::exec::World::node(&world, &toml::Value::String(path.clone())).with_context(|| format!("{path}: not written"))?;
-        let result = plan.result_output().map(|o| plan.outputs[o].name.clone()).with_context(|| format!("{path}: its stack keeps no result"))?;
-        let given = engine.output_in(Some(reach), &plan, node, &result, None, true).with_context(|| format!("{path}: its movies could not be joined"))?;
+        let (node, plan) = crate::graph::exec::World::node(&world, &toml::Value::String(path.clone()))
+            .with_context(|| format!("{path}: not written"))?;
+        let result = plan
+            .result_output()
+            .map(|o| plan.outputs[o].name.clone())
+            .with_context(|| format!("{path}: its stack keeps no result"))?;
+        let given = engine
+            .output_in(Some(reach), &plan, node, &result, None, true)
+            .with_context(|| format!("{path}: its movies could not be joined"))?;
         let got = match given.value.as_deref() {
             Some(crate::graph::Value::Typed(typed)) => match &typed.file()?.content {
                 crate::graph::Content::Stored { sha1, .. } => sha1.clone(),
@@ -977,7 +1042,13 @@ fn make_assembled(
 }
 
 /// The releases' discs and containers as bundles, their slots filled. Returns their count.
-fn write_layouts(layer: &Path, decl: &Declarations, releases: &[String], discs: &Discs, extensions: &Extensions) -> Result<usize> {
+fn write_layouts(
+    layer: &Path,
+    decl: &Declarations,
+    releases: &[String],
+    discs: &Discs,
+    extensions: &Extensions,
+) -> Result<usize> {
     let mut written = 0;
     for release in releases {
         for (name, layout) in &decl.layouts[release] {
@@ -994,8 +1065,11 @@ fn write_layouts(layer: &Path, decl: &Declarations, releases: &[String], discs: 
                 }
             }
             let template = extensions.template(&layout.template);
-            let template = template.with_context(|| format!("disc/{release}/{name}: no extension gives the template {}", layout.template))?;
-            let stack = extensions.stamp(template, "").map_err(|why| anyhow::anyhow!("disc/{release}/{name}: {why}"))?;
+            let template = template.with_context(|| {
+                format!("disc/{release}/{name}: no extension gives the template {}", layout.template)
+            })?;
+            let stack =
+                extensions.stamp(template, "").map_err(|why| anyhow::anyhow!("disc/{release}/{name}: {why}"))?;
             let toml = layout_toml(&layout.text, &stack)?;
             write_bundle(layer, &format!("disc/{release}/{name}"), &[("node.toml", toml.as_bytes())])?;
             written += 1;

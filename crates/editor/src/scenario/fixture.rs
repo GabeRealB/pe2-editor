@@ -26,7 +26,10 @@ impl Fixture {
     fn new() -> Fixture {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         super::isolate();
-        let fixture = Fixture { root: super::folder().join(format!("project-{}", NEXT.fetch_add(1, Ordering::Relaxed))), given: false };
+        let fixture = Fixture {
+            root: super::folder().join(format!("project-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
+            given: false,
+        };
         fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n"));
         fixture
     }
@@ -91,7 +94,8 @@ impl Fixture {
         const COMPONENT: &str = "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n";
         let declared = &suite.declared;
         let fixture = Fixture::new();
-        let layers: Vec<&str> = if declared.layers.is_empty() { vec![LAYER] } else { declared.layers.iter().map(String::as_str).collect() };
+        let layers: Vec<&str> =
+            if declared.layers.is_empty() { vec![LAYER] } else { declared.layers.iter().map(String::as_str).collect() };
         let mut file = String::new();
         for layer in &layers {
             let _ = writeln!(file, "[[layer]]\nname = \"{layer}\"\n");
@@ -107,7 +111,8 @@ impl Fixture {
         let bundle = |name: &str| fixture.root.join(format!(".layers/{}/{name}.node", layers[0]));
         // What it tests with, and the tests with their data.
         for id in &declared.take {
-            let bytes = extensions::built_apart(&format!("{}.wasm", id.replace('.', "_"))).unwrap_or_else(|| panic!("{id} was not built"));
+            let bytes = extensions::built_apart(&format!("{}.wasm", id.replace('.', "_")))
+                .unwrap_or_else(|| panic!("{id} was not built"));
             let at = bundle(&format!("extensions/{id}"));
             std::fs::create_dir_all(&at).expect("a bundle");
             std::fs::write(at.join("extension.wasm"), bytes).expect("a component");
@@ -131,7 +136,10 @@ impl Fixture {
     pub fn with_tests() -> Fixture {
         let component = extensions::built_apart("pe2_psx.wasm").expect("built with the others");
         let tests = extensions::built_apart("pe2_render_tests.wasm").expect("built with the others");
-        let suite = extensions::built_suites().into_iter().find(|suite| suite.ends_with("render/tests")).expect("built with the others");
+        let suite = extensions::built_suites()
+            .into_iter()
+            .find(|suite| suite.ends_with("render/tests"))
+            .expect("built with the others");
         let at = "extensions/psx";
         let fixture = Fixture::new()
             .node(at, "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n")
@@ -153,7 +161,10 @@ impl Fixture {
     #[must_use]
     pub fn code() -> Fixture {
         let fixture = Fixture::new();
-        fixture.write("project.toml", &format!("[[layer]]\nname = \"code\"\nkind = \"files\"\n\n[[layer]]\nname = \"{LAYER}\"\n"));
+        fixture.write(
+            "project.toml",
+            &format!("[[layer]]\nname = \"code\"\nkind = \"files\"\n\n[[layer]]\nname = \"{LAYER}\"\n"),
+        );
         fixture.write(&format!(".layers/{LAYER}/.keep"), "");
         fixture.write(".layers/code/src/thing.c", "int thing;\n");
         fixture
@@ -195,7 +206,8 @@ retain = "cache"
         let rig = Fixture::rig();
         let file = rig.node_file("rig/skeleton");
         let text = std::fs::read_to_string(&file).expect("its declaration");
-        std::fs::write(file, format!("{text}\n[[stack]]\nop = \"preview\"\nname = \"again\"\n")).expect("its declaration");
+        std::fs::write(file, format!("{text}\n[[stack]]\nop = \"preview\"\nname = \"again\"\n"))
+            .expect("its declaration");
         rig
     }
 

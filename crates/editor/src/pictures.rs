@@ -90,9 +90,10 @@ impl Pictures {
     pub fn set_index(&mut self, index: Arc<Index>) {
         self.slots.retain(|(path, _), slot| match slot {
             Slot::Drawing(_) => true,
-            Slot::Drawn(made) => {
-                made.reads.as_ref().is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset, None)))
-            }
+            Slot::Drawn(made) => made
+                .reads
+                .as_ref()
+                .is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset, None))),
         });
         self.index = index;
     }
@@ -142,14 +143,19 @@ fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request:
     let index = &request.index;
     let failed = |why: String| Made { picture: Err(why), marks: None, reads: None };
     let Some(asset) = index.assets.get(&request.path) else { return failed("it has no picture".to_string()) };
-    let Some(address) = extensions.picture_address(asset, request.look) else { return failed("it has no picture".to_string()) };
+    let Some(address) = extensions.picture_address(asset, request.look) else {
+        return failed("it has no picture".to_string());
+    };
     let given = match extensions.output(engine, index, asset, &address, true) {
         Ok(given) => given,
         Err(e) => return failed(format!("{e:#}")),
     };
-    let Some(project::graph::Value::Image(image)) = given.value.as_deref() else { return failed("it drew no picture".to_string()) };
+    let Some(project::graph::Value::Image(image)) = given.value.as_deref() else {
+        return failed("it drew no picture".to_string());
+    };
     let mut reads = given.reads.clone();
-    let marked = extensions.marks_output(asset).and_then(|name| extensions.output(engine, index, asset, &name, true).ok());
+    let marked =
+        extensions.marks_output(asset).and_then(|name| extensions.output(engine, index, asset, &name, true).ok());
     let marks = marked.and_then(|given| {
         reads.merge(&given.reads);
         match given.value.as_deref() {

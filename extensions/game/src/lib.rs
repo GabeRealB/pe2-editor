@@ -63,7 +63,12 @@ fn stage_files(call: &Call, layout: &Table) -> Result<Vec<String>> {
     } else {
         for folder in list(layout, "folders") {
             let node = asset(&folder).ok_or_else(|| anyhow!("a folder of the layout names nothing"))?;
-            take(list(&call.table_of(&node, SETTINGS)?, "files").iter().filter_map(|f| Some((id(f), asset(f)?))).collect());
+            take(
+                list(&call.table_of(&node, SETTINGS)?, "files")
+                    .iter()
+                    .filter_map(|f| Some((id(f), asset(f)?)))
+                    .collect(),
+            );
         }
     }
     Ok(out)
@@ -84,15 +89,24 @@ fn inter(call: &mut Call) -> Result<Typed> {
             for entry in fields.get("streams").and_then(Value::as_array).into_iter().flatten() {
                 let integer = |key: &str| entry.get(key).and_then(Value::as_integer);
                 let movie = entry.get("type").and_then(Value::as_str) == Some("movie");
-                if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc) {
-                    movies.push(entry.get("asset").and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("{file}: a stream names nothing"))?.to_string());
+                if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc)
+                {
+                    movies.push(
+                        entry
+                            .get("asset")
+                            .and_then(pe2_ext::target_of)
+                            .ok_or_else(|| anyhow!("{file}: a stream names nothing"))?
+                            .to_string(),
+                    );
                 }
             }
         }
     }
     let mut writer = call.writer("native.str")?;
     for movie in &movies {
-        let Data::Typed(native) = call.output_of(movie, "native")? else { pe2_ext::bail!("{movie}: its native is no file") };
+        let Data::Typed(native) = call.output_of(movie, "native")? else {
+            pe2_ext::bail!("{movie}: its native is no file")
+        };
         std::io::Write::write_all(&mut writer, &call.read(native.file()?)?)?;
     }
     Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
@@ -130,13 +144,21 @@ name = "streams"
 /// The names of a file's streams, in its order.
 fn file_streams(asset: &Asset) -> Vec<(String, String)> {
     let streams = asset.field("streams").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    streams.iter().filter_map(|stream| stream.get("name")?.as_str()).map(|name| (name.to_string(), name.to_string())).collect()
+    streams
+        .iter()
+        .filter_map(|stream| stream.get("name")?.as_str())
+        .map(|name| (name.to_string(), name.to_string()))
+        .collect()
 }
 
 /// The names of a file group's files, in its order.
 fn group_files(asset: &Asset) -> Vec<(String, String)> {
     let files = asset.field("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    files.iter().filter_map(|file| file.get("name")?.as_str()).map(|name| (name.to_string(), name.to_string())).collect()
+    files
+        .iter()
+        .filter_map(|file| file.get("name")?.as_str())
+        .map(|name| (name.to_string(), name.to_string()))
+        .collect()
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -161,7 +183,14 @@ fn register(r: &mut Registry) -> Result<()> {
             let name: String = call.parameter()?;
             Ok(pe2_ext::tokens::leads_on(call.host.path(), "file", &[("file", &name)]))
         });
-    r.named_type("file_group").alias("file_group").label("File group").icon(Icon::Grid, Tint::Structure).data().extracted().stack(FILE_GROUP).register();
+    r.named_type("file_group")
+        .alias("file_group")
+        .label("File group")
+        .icon(Icon::Grid, Tint::Structure)
+        .data()
+        .extracted()
+        .stack(FILE_GROUP)
+        .register();
     // What the disc stores as files of their own, known by their names.
     let stored = [
         ("executable", "Executable", Icon::Terminal, Tint::Code, "exe", "*.exe"),
@@ -196,7 +225,20 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("streams").label("Streams"))
         .register();
     // A disc's movie file, made of its stages' movies (`inter`).
-    let _ = r.op("inter").label("Its stages' movies with sound").takes("file", &["pe2.game@stream"]).output::<ty::Bytes>().prepared_by_running().run(inter);
-    r.named_type("stream").alias("stream").label("Movie file").data().extracted().icon(Icon::Stack, Tint::Motion).stack(STREAM).register();
+    let _ = r
+        .op("inter")
+        .label("Its stages' movies with sound")
+        .takes("file", &["pe2.game@stream"])
+        .output::<ty::Bytes>()
+        .prepared_by_running()
+        .run(inter);
+    r.named_type("stream")
+        .alias("stream")
+        .label("Movie file")
+        .data()
+        .extracted()
+        .icon(Icon::Stack, Tint::Motion)
+        .stack(STREAM)
+        .register();
     Ok(())
 }

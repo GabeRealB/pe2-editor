@@ -5,14 +5,14 @@
 //! The same crates are linked in too: `PE2_EXTENSIONS=linked` runs them in the host instead of their components, to
 //! step through one in a debugger or compare the two.
 
-use project::{Imported, Manifest, Project};
 use project::ext::component::Unsandboxed;
 use project::ext::{EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, unsandboxed};
 use project::index::Index;
+use project::{Imported, Manifest, Project};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use toml::{Table, Value};
 use std::sync::{Arc, Mutex, OnceLock};
+use toml::{Table, Value};
 
 pub mod trust;
 
@@ -34,7 +34,8 @@ pub fn built_apart(file: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn built_suites() -> Vec<PathBuf> {
     let entries = std::fs::read_dir(env!("PE2_SUITES")).into_iter().flatten().flatten();
-    let mut suites: Vec<PathBuf> = entries.map(|entry| entry.path().join(unsandboxed::TESTS)).filter(|tests| tests.is_dir()).collect();
+    let mut suites: Vec<PathBuf> =
+        entries.map(|entry| entry.path().join(unsandboxed::TESTS)).filter(|tests| tests.is_dir()).collect();
     suites.sort();
     suites
 }
@@ -42,7 +43,17 @@ pub fn built_suites() -> Vec<PathBuf> {
 /// The built-in extensions linked in.
 #[must_use]
 pub fn linked() -> Vec<pe2_ext::Extension> {
-    vec![pe2_render::extension(), pe2_events::extension(), pe2_fonts::extension(), pe2_formats::extension(), pe2_game::extension(), pe2_images::extension(), pe2_movies::extension(), pe2_packages::extension(), pe2_str::extension()]
+    vec![
+        pe2_render::extension(),
+        pe2_events::extension(),
+        pe2_fonts::extension(),
+        pe2_formats::extension(),
+        pe2_game::extension(),
+        pe2_images::extension(),
+        pe2_movies::extension(),
+        pe2_packages::extension(),
+        pe2_str::extension(),
+    ]
 }
 
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
@@ -95,7 +106,9 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
                 return Err(why);
             }
             // What is kept apart from a project is for it to take in.
-            if let Some(about) = about.as_ref().filter(|about| manifest.is_some_and(|m| !taken_in(m, &about.id, &found.origin))) {
+            if let Some(about) =
+                about.as_ref().filter(|about| manifest.is_some_and(|m| !taken_in(m, &about.id, &found.origin)))
+            {
                 unloadable.push(available(about.clone(), found, &bytes));
                 return Ok(None);
             }
@@ -103,7 +116,8 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, manifest:
             // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
             let held = match about.filter(|a| a.unsandboxed) {
                 Some(about) => {
-                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).map_err(|e| format!("{e:#}"))?;
+                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed)
+                        .map_err(|e| format!("{e:#}"))?;
                     if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
                         unloadable.push(not_enabled(about, found, &bytes, trust, &enabled));
                         return Ok(None);
@@ -182,7 +196,9 @@ static TEST_HOST: OnceLock<fn() -> pe2_ext::Extension> = OnceLock::new();
 /// Whether a project takes in an extension found here: what it holds itself, by being there; from elsewhere, as it says.
 fn taken_in(manifest: &Manifest, id: &str, origin: &Origin) -> bool {
     match origin {
-        Origin::User(_) | Origin::Install(_) => manifest.imported.iter().any(|imported| imported.id == id && imported.from.is_none()),
+        Origin::User(_) | Origin::Install(_) => {
+            manifest.imported.iter().any(|imported| imported.id == id && imported.from.is_none())
+        }
         _ => true,
     }
 }
@@ -191,11 +207,15 @@ fn taken_in(manifest: &Manifest, id: &str, origin: &Origin) -> bool {
 fn unmet(manifest: &Manifest, present: &[Present]) -> Vec<(String, String)> {
     let required = manifest.imported.iter().filter(|imported| imported.required);
     let why = |imported: &Imported| {
-        let found = present.iter().find(|p| p.id == imported.id && !matches!(p.status, Status::Replaced(_) | Status::Available));
+        let found = present
+            .iter()
+            .find(|p| p.id == imported.id && !matches!(p.status, Status::Replaced(_) | Status::Available));
         let Some(found) = found else { return Some("it was not found".to_string()) };
         match &found.status {
             Status::Loaded => match &imported.version {
-                Some(version) if !project::ext::satisfies(&found.version, version) => Some(format!("it is {}, and it asks for {version}", found.version)),
+                Some(version) if !project::ext::satisfies(&found.version, version) => {
+                    Some(format!("it is {}, and it asks for {version}", found.version))
+                }
                 _ => None,
             },
             Status::Disabled => Some("the project leaves it off".to_string()),
@@ -213,7 +233,8 @@ fn unlocked(manifest: &Manifest, found: &[Found]) -> Vec<String> {
         let now = found.iter().find_map(|found| {
             let bytes = std::fs::read(&found.file).ok()?;
             let about = component::about(&bytes)?;
-            (about.id == *id && !matches!(found.origin, Origin::Project { .. })).then(|| unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).ok())?
+            (about.id == *id && !matches!(found.origin, Origin::Project { .. }))
+                .then(|| unsandboxed::trust(&found.file, found.folder.as_deref(), &about.hashed).ok())?
         });
         now.is_some_and(|now| now != *locked).then(|| id.clone())
     };
@@ -258,7 +279,13 @@ fn available(about: component::About, found: &Found, bytes: &[u8]) -> Present {
 }
 
 /// An unsandboxed extension not run, as it is shown: who it says it is, read without running anything.
-fn not_enabled(about: component::About, found: &Found, bytes: &[u8], trust: String, enabled: &BTreeMap<String, String>) -> Present {
+fn not_enabled(
+    about: component::About,
+    found: &Found,
+    bytes: &[u8],
+    trust: String,
+    enabled: &BTreeMap<String, String>,
+) -> Present {
     Present {
         status: Status::NotEnabled { changed: enabled.values().any(|id| *id == about.id) },
         id: about.id,
@@ -348,13 +375,19 @@ pub fn user_settings() -> BTreeMap<String, Table> {
 /// The tests in an extension's folder.
 fn tests_of(folder: &Path) -> Option<Found> {
     let file = folder.join(unsandboxed::TESTS).join("tests.wasm");
-    file.is_file().then(|| Found { origin: Origin::Component(file.clone()), stamp: file_stamp(&file), folder: file.parent().map(PathBuf::from), file })
+    file.is_file().then(|| Found {
+        origin: Origin::Component(file.clone()),
+        stamp: file_stamp(&file),
+        folder: file.parent().map(PathBuf::from),
+        file,
+    })
 }
 
 /// The components a project takes in from places of its own choosing.
 #[must_use]
 pub fn imported_components(project: &Project) -> Vec<Found> {
-    let placed = project.manifest.imported.iter().filter_map(|imported| Some(project.imported_from(imported.from.as_ref()?)));
+    let placed =
+        project.manifest.imported.iter().filter_map(|imported| Some(project.imported_from(imported.from.as_ref()?)));
     placed.filter_map(|place| component_at(place, Origin::Component)).collect()
 }
 
@@ -471,7 +504,8 @@ fn file_stamp(file: &std::path::Path) -> String {
 
 /// The stamps of what an extension's folder holds: its tests are not it.
 fn own_stamp(folder: &Path) -> String {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut entries: Vec<PathBuf> =
+        std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
     entries.retain(|entry| entry.file_name().is_none_or(|name| name != unsandboxed::TESTS));
     entries.sort();
     entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
@@ -479,7 +513,8 @@ fn own_stamp(folder: &Path) -> String {
 
 /// The stamps of what a folder holds, below it too.
 fn folder_stamp(folder: &std::path::Path) -> String {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut entries: Vec<PathBuf> =
+        std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
     entries.sort();
     entries.iter().map(|e| if e.is_dir() { folder_stamp(e) } else { file_stamp(e) }).collect::<Vec<_>>().join(" ")
 }
@@ -487,7 +522,8 @@ fn folder_stamp(folder: &std::path::Path) -> String {
 /// The components in an extensions folder, in name order: each a `*.wasm`, or a folder holding an `extension.wasm`
 /// and what it ships.
 fn components_in(folder: &std::path::Path, origin: fn(PathBuf) -> Origin) -> Vec<Found> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut entries: Vec<PathBuf> =
+        std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
     entries.sort();
     entries.into_iter().filter_map(|entry| component_at(entry, origin)).collect()
 }
@@ -523,7 +559,10 @@ mod tests {
     #[test]
     fn components_are_held_to_the_contract_this_editor_runs() {
         let wit = include_str!("../../crates/ext/wit/extension.wit");
-        assert!(wit.contains(&format!("package pe2:extension@{};", component::CONTRACT)), "the WIT package is the contract");
+        assert!(
+            wit.contains(&format!("package pe2:extension@{};", component::CONTRACT)),
+            "the WIT package is the contract"
+        );
         for (package, bytes) in COMPONENTS {
             assert_eq!(component::contract(bytes).as_deref(), Some(component::CONTRACT), "{package}");
         }
@@ -543,7 +582,8 @@ mod tests {
         let (_, bytes) = COMPONENTS[0];
         let name = format!("pe2:extension/guest@{}", component::CONTRACT);
         let mut older = bytes.to_vec();
-        let ats: Vec<usize> = bytes.windows(name.len()).enumerate().filter(|(_, w)| *w == name.as_bytes()).map(|(at, _)| at).collect();
+        let ats: Vec<usize> =
+            bytes.windows(name.len()).enumerate().filter(|(_, w)| *w == name.as_bytes()).map(|(at, _)| at).collect();
         assert!(!ats.is_empty(), "its export's name");
         for at in ats {
             older[at..at + name.len()].copy_from_slice(format!("pe2:extension/guest@{before}.0").as_bytes());
@@ -560,14 +600,15 @@ mod tests {
         let bytes = COMPONENTS.iter().find(|(package, _)| *package == id).expect("a built-in").1;
         let file = dir.join("x.wasm");
         std::fs::write(&file, bytes).unwrap();
-        let found = super::Found { origin: super::Origin::User(file.clone()), file, folder: None, stamp: String::new() };
+        let found =
+            super::Found { origin: super::Origin::User(file.clone()), file, folder: None, stamp: String::new() };
         (dir, found)
     }
 
     #[test]
     fn what_is_kept_apart_loads_only_as_a_project_takes_it_in() {
-        use project::{Imported, Manifest};
         use project::ext::{Origin, Status};
+        use project::{Imported, Manifest};
         let (dir, found) = users("pe2-events", "takes");
         let id = component::about(&std::fs::read(&found.file).unwrap()).unwrap().id;
         let status = |extensions: &project::ext::Extensions| {
@@ -579,7 +620,10 @@ mod tests {
         assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), None)), Some(Status::Loaded));
         // Not taken in.
         let bare = Manifest::default();
-        assert_eq!(status(&super::load_without(&found, &[], &super::Kept::new(), Some(&bare))), Some(Status::Available));
+        assert_eq!(
+            status(&super::load_without(&found, &[], &super::Kept::new(), Some(&bare))),
+            Some(Status::Available)
+        );
         // Taken in, in place of the built-in of its id; asked for at another version; locked to something else.
         let imported = Imported { id: id.clone(), required: true, version: Some("^7.0".to_string()), from: None };
         let locked = [(id.clone(), "another".to_string())].into();
@@ -590,7 +634,10 @@ mod tests {
         assert!(extensions.unmet[0].1.contains("asks for ^7.0"), "{:?}", extensions.unmet);
         assert_eq!(extensions.unlocked, std::slice::from_ref(&id));
         // Required and found nowhere.
-        let manifest = Manifest { imported: vec![Imported { id: "my.tool".to_string(), required: true, ..Imported::default() }], ..Manifest::default() };
+        let manifest = Manifest {
+            imported: vec![Imported { id: "my.tool".to_string(), required: true, ..Imported::default() }],
+            ..Manifest::default()
+        };
         let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&manifest));
         assert_eq!(extensions.unmet, [("my.tool".to_string(), "it was not found".to_string())]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -700,7 +747,8 @@ mod tests {
         assert_eq!(COMPONENTS.len(), linked().len());
         for (package, bytes) in COMPONENTS {
             let about = component::about(bytes).unwrap_or_else(|| panic!("{package}: no section"));
-            let declared = linked().into_iter().find(|e| e.id == about.id).unwrap_or_else(|| panic!("{}: not linked", about.id));
+            let declared =
+                linked().into_iter().find(|e| e.id == about.id).unwrap_or_else(|| panic!("{}: not linked", about.id));
             assert_eq!(about.version, declared.version, "{package}");
             assert_eq!(about.requires, declared.requires, "{package}");
             assert_eq!(about.weak, declared.weak, "{package}");

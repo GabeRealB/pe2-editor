@@ -116,8 +116,10 @@ pub struct Report {
 /// The triggers that can be planned, and why those that cannot were refused, which are left out.
 #[must_use]
 pub fn order(triggers: Vec<Trigger>) -> (Vec<Trigger>, Vec<(usize, String)>) {
-    let refused: Vec<usize> = (0..triggers.len()).filter(|t| triggers[*t].when.waits() && reaches_itself(&triggers, *t)).collect();
-    let problems = refused.iter().map(|t| (*t, "it waits for what it signals: its gate can never settle".to_string())).collect();
+    let refused: Vec<usize> =
+        (0..triggers.len()).filter(|t| triggers[*t].when.waits() && reaches_itself(&triggers, *t)).collect();
+    let problems =
+        refused.iter().map(|t| (*t, "it waits for what it signals: its gate can never settle".to_string())).collect();
     let kept = triggers.into_iter().enumerate().filter(|(t, _)| !refused.contains(t)).map(|(_, trigger)| trigger);
     (kept.collect(), problems)
 }
@@ -191,7 +193,8 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
                 continue;
             }
         }
-        let hooks: Vec<usize> = ready.iter().copied().filter(|t| matches!(triggers[*t].action, Action::Hook { .. })).collect();
+        let hooks: Vec<usize> =
+            ready.iter().copied().filter(|t| matches!(triggers[*t].action, Action::Hook { .. })).collect();
         let batch = if hooks.is_empty() { ready } else { hooks };
         for t in &batch {
             fired[*t] = true;
@@ -218,7 +221,8 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
     if rounds > 1 {
         // What failed is said to have: it was never current.
         let failed = |t: &usize| report.failed.iter().any(|(asset, _)| *asset == label(&triggers[*t].action).0);
-        let pulled = (0..triggers.len()).filter(|t| fired[*t] && matches!(triggers[*t].action, Action::Pull { .. }) && !failed(t));
+        let pulled = (0..triggers.len())
+            .filter(|t| fired[*t] && matches!(triggers[*t].action, Action::Pull { .. }) && !failed(t));
         let stale: Vec<usize> = pulled.filter(|t| effects.is_stale(&triggers[*t].action)).collect();
         report.stale = stale.into_iter().map(|t| label(&triggers[t].action)).collect();
     }
@@ -229,7 +233,8 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
 fn run_all(triggers: &[Trigger], batch: &[usize], effects: &dyn Effects) -> Vec<Outcome> {
     crate::parallel(batch, |t| {
         let run = std::panic::AssertUnwindSafe(|| effects.run(&triggers[*t].action));
-        std::panic::catch_unwind(run).unwrap_or_else(|_| Outcome { failed: Some("it panicked".into()), ..Outcome::default() })
+        std::panic::catch_unwind(run)
+            .unwrap_or_else(|_| Outcome { failed: Some("it panicked".into()), ..Outcome::default() })
     })
 }
 
@@ -304,14 +309,20 @@ mod tests {
     #[test]
     fn a_gate_that_inverts_is_told_after_what_it_reads_has_settled() {
         // Whether `b` comes is only known once `x` has run.
-        let triggers = [pull(gate("and", vec![event("a"), gate("not", vec![event("b")])]), "late", &[]), pull(event("a"), "x", &["b"])];
+        let triggers = [
+            pull(gate("and", vec![event("a"), gate("not", vec![event("b")])]), "late", &[]),
+            pull(event("a"), "x", &["b"]),
+        ];
         let (ran, _) = run(&triggers, &[("x", "b")], &["a"]);
         assert_eq!(ran, ["x"]);
     }
 
     #[test]
     fn a_gate_with_nothing_against_it_fires_once_settled() {
-        let triggers = [pull(gate("and", vec![event("a"), gate("not", vec![event("b")])]), "late", &[]), pull(event("a"), "x", &[])];
+        let triggers = [
+            pull(gate("and", vec![event("a"), gate("not", vec![event("b")])]), "late", &[]),
+            pull(event("a"), "x", &[]),
+        ];
         let (ran, _) = run(&triggers, &[], &["a"]);
         assert_eq!(ran, ["x", "late"]);
     }

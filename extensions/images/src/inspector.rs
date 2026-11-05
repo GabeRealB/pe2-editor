@@ -1,7 +1,10 @@
 //! The image's parts in the properties pane, each keyed by name: its palettes, each with a swatch of its colors and
 //! where it is uploaded; its variants (a texture's each a palette, an atlas's each the cells it recolors); its cells.
 
-use pe2_ext::{Asset, Canvas, ContentOutcome, ContentPlace, ContentRequest, Icon, Placed, Rect, Result, Style, Table, Texture, Ui, Value, View, bail};
+use pe2_ext::{
+    Asset, Canvas, ContentOutcome, ContentPlace, ContentRequest, Icon, Placed, Rect, Result, Style, Table, Texture, Ui,
+    Value, View, bail,
+};
 use std::collections::HashMap;
 
 use crate::{is_atlas, palette_names, rect};
@@ -55,9 +58,10 @@ impl Shown {
             .into_iter()
             .map(|(name, c)| {
                 let palette = c.get("palette").and_then(Value::as_str).map_or_default(|p| format!(", palette {p}"));
-                let hint = c.get("rect").and_then(rect).map_or_default(|r| {
-                    format!("{} × {} at ({}, {}){palette}", r.width, r.height, r.x, r.y)
-                });
+                let hint = c
+                    .get("rect")
+                    .and_then(rect)
+                    .map_or_default(|r| format!("{} × {} at ({}, {}){palette}", r.width, r.height, r.x, r.y));
                 (name.to_string(), hint)
             })
             .collect();
@@ -354,7 +358,8 @@ impl View for Collections {
 /// What comes of something done in an image's contents: the variants' rows act on them as the inspector's controls do.
 pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentRequest) -> Result<ContentOutcome> {
     let shown = Shown::read(asset);
-    let variant = |row: &str| row.strip_prefix("variants/").and_then(|name| shown.variants.iter().position(|v| v.title == name));
+    let variant =
+        |row: &str| row.strip_prefix("variants/").and_then(|name| shown.variants.iter().position(|v| v.title == name));
     let of_variants = |label: String, change, select| ContentOutcome {
         label,
         sets: vec![(vec!["variants".to_string()], shown.changed(change))],
@@ -362,7 +367,9 @@ pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentReque
         select,
     };
     match request {
-        ContentRequest::Action { action, .. } if action == "add" => Ok(of_variants("Add a variant".to_string(), Change::Add, None)),
+        ContentRequest::Action { action, .. } if action == "add" => {
+            Ok(of_variants("Add a variant".to_string(), Change::Add, None))
+        }
         ContentRequest::Action { row, action } if action == "remove" => match variant(&row) {
             Some(i) => Ok(of_variants(format!("Remove {}", shown.variants[i].title), Change::Remove(i), None)),
             None => bail!("no such variant"),
@@ -373,13 +380,20 @@ pub(crate) fn act(asset: &Asset, _: &dyn pe2_ext::Project, request: ContentReque
                 bail!("a variant needs a name of its own");
             }
             let select = format!("variants/{name}");
-            Ok(of_variants(format!("Rename {} to {name}", shown.variants[i].title), Change::Rename(i, name), Some(select)))
+            Ok(of_variants(
+                format!("Rename {} to {name}", shown.variants[i].title),
+                Change::Rename(i, name),
+                Some(select),
+            ))
         }
         ContentRequest::Moved { row, onto, place } => {
             if let (Some(cell), Some(palette)) = (row.strip_prefix("cells/"), onto.strip_prefix("palettes/")) {
                 return Ok(ContentOutcome {
                     label: format!("Draw {cell} through {palette}"),
-                    sets: vec![(vec!["cells".to_string(), cell.to_string(), "palette".to_string()], Some(Value::String(palette.to_string())))],
+                    sets: vec![(
+                        vec!["cells".to_string(), cell.to_string(), "palette".to_string()],
+                        Some(Value::String(palette.to_string())),
+                    )],
                     writes: None,
                     select: None,
                 });
@@ -402,8 +416,13 @@ impl View for Summary {
         let said = {
             let Some(asset) = ui.asset() else { return };
             let shown = Shown::read(&asset);
-            let counts = [(shown.cells.len(), "cells"), (shown.palette_names.len(), "palettes"), (shown.variants.len(), "variants")];
-            let said: Vec<String> = counts.iter().filter(|(n, _)| *n > 0).map(|(n, plural)| count_of(*n, plural)).collect();
+            let counts = [
+                (shown.cells.len(), "cells"),
+                (shown.palette_names.len(), "palettes"),
+                (shown.variants.len(), "variants"),
+            ];
+            let said: Vec<String> =
+                counts.iter().filter(|(n, _)| *n > 0).map(|(n, plural)| count_of(*n, plural)).collect();
             said.join("  ·  ")
         };
         if !said.is_empty() {

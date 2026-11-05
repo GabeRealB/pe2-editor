@@ -231,10 +231,10 @@ impl Declarations {
                 } else {
                     None
                 };
-                layouts
-                    .entry(release.to_string())
-                    .or_default()
-                    .insert(name.to_string(), Layout { uid: head.uid, template: head.template, disc, at: head.at, text });
+                layouts.entry(release.to_string()).or_default().insert(
+                    name.to_string(),
+                    Layout { uid: head.uid, template: head.template, disc, at: head.at, text },
+                );
                 continue;
             }
             let doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("{}", path.display()))?;

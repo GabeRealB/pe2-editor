@@ -40,7 +40,11 @@ fn said() -> egui::Id {
 }
 
 /// A place something can be dropped: lit while it is over it, by what `verdict` says of it. What was dropped, once it is.
-pub fn target(ui: &egui::Ui, rect: egui::Rect, verdict: impl FnOnce(&Dragged) -> Result<String, String>) -> Option<Dragged> {
+pub fn target(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    verdict: impl FnOnce(&Dragged) -> Result<String, String>,
+) -> Option<Dragged> {
     let ctx = ui.ctx();
     let dragged = DragAndDrop::payload::<Dragged>(ctx)?;
     let pointer = ctx.input(|i| i.pointer.latest_pos())?;
@@ -62,7 +66,8 @@ pub fn target(ui: &egui::Ui, rect: egui::Rect, verdict: impl FnOnce(&Dragged) ->
 /// What is dragged, by the pointer, and what dropping it would do.
 pub fn ghost(ctx: &egui::Context) {
     let says: Option<Says> = ctx.data_mut(|d| d.remove_temp(said()));
-    let (Some(dragged), Some(pointer)) = (DragAndDrop::payload::<Dragged>(ctx), ctx.input(|i| i.pointer.latest_pos())) else {
+    let (Some(dragged), Some(pointer)) = (DragAndDrop::payload::<Dragged>(ctx), ctx.input(|i| i.pointer.latest_pos()))
+    else {
         return;
     };
     egui::Area::new(said().with("ghost"))

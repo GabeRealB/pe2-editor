@@ -117,14 +117,21 @@ fn sample_forever(shared: &Shared) {
             }
         }
         let process = system.as_ref().zip(own).and_then(|(system, own)| system.process(own));
-        let asked = shared.asked.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(|at| at.elapsed() < ASKED_FOR);
-        let wants_gpu = (asked || shared.shown.load(Ordering::Relaxed)) && gpu_at.is_none_or(|at| at.elapsed() >= GPU_EVERY);
+        let asked =
+            shared.asked.lock().unwrap_or_else(PoisonError::into_inner).is_some_and(|at| at.elapsed() < ASKED_FOR);
+        let wants_gpu =
+            (asked || shared.shown.load(Ordering::Relaxed)) && gpu_at.is_none_or(|at| at.elapsed() >= GPU_EVERY);
         let reading = wants_gpu.then(|| gpu.read(shared.vendor.load(Ordering::Relaxed))).flatten();
         if wants_gpu {
             gpu_at = Some(Instant::now());
         }
         let mut sample = shared.sample.lock().unwrap_or_else(PoisonError::into_inner);
-        #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a rate of a second")]
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a rate of a second"
+        )]
         {
             sample.frames_per_second = (frames as f32 / elapsed).round() as u32;
             sample.frame_ms = if frames == 0 { 0.0 } else { busy as f32 / frames as f32 / 1000.0 };
@@ -196,7 +203,8 @@ fn gpu_row(sample: &Sample) -> Option<String> {
         (Some(used), None) => Some(format!("{used} MiB")),
         _ => None,
     };
-    let parts: Vec<String> = sample.gpu_percent.map(|percent| format!("{percent}%")).into_iter().chain(memory).collect();
+    let parts: Vec<String> =
+        sample.gpu_percent.map(|percent| format!("{percent}%")).into_iter().chain(memory).collect();
     (!parts.is_empty()).then(|| parts.join(", ") + if sample.gpu_is_own_use { ", the editor's" } else { "" })
 }
 

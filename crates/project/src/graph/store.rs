@@ -60,14 +60,43 @@ pub enum Kept {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
     },
-    Image { width: usize, height: usize, blob: Blob },
-    Table { table: Table },
-    Pcm { rate: u32, channels: u16, blob: Blob },
-    Video { format: String, width: u32, height: u32, timestamp: u64, blob: Blob },
-    Audio { format: String, sample_rate: u32, channels: u32, timestamp: u64, blob: Blob },
-    Marks { boxes: Vec<KeptMark>, summary: String, toggle: String, legend: bool },
+    Image {
+        width: usize,
+        height: usize,
+        blob: Blob,
+    },
+    Table {
+        table: Table,
+    },
+    Pcm {
+        rate: u32,
+        channels: u16,
+        blob: Blob,
+    },
+    Video {
+        format: String,
+        width: u32,
+        height: u32,
+        timestamp: u64,
+        blob: Blob,
+    },
+    Audio {
+        format: String,
+        sample_rate: u32,
+        channels: u32,
+        timestamp: u64,
+        blob: Blob,
+    },
+    Marks {
+        boxes: Vec<KeptMark>,
+        summary: String,
+        toggle: String,
+        legend: bool,
+    },
     /// Its items, each kept by its own hash.
-    List { items: Vec<String> },
+    List {
+        items: Vec<String>,
+    },
 }
 
 /// A mark as kept.
@@ -239,7 +268,9 @@ impl Store {
                 settings: typed.settings.clone(),
                 notes: typed.notes.clone(),
             },
-            Value::Image(image) => Kept::Image { width: image.width, height: image.height, blob: self.put_blob(&image.rgba)? },
+            Value::Image(image) => {
+                Kept::Image { width: image.width, height: image.height, blob: self.put_blob(&image.rgba)? }
+            }
             Value::Table(table) => Kept::Table { table: table.clone() },
             Value::Pcm(pcm) => {
                 let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -299,7 +330,8 @@ impl Store {
     /// It is not kept, or a blob of it cannot be read.
     pub fn get(&self, hash: &str) -> Result<Value> {
         let kept = self.describe(hash).with_context(|| format!("{hash}: not kept"))?;
-        let file = |f: KeptFile| File { name: f.name, content: Content::Stored { sha1: f.blob.sha1, size: f.blob.size } };
+        let file =
+            |f: KeptFile| File { name: f.name, content: Content::Stored { sha1: f.blob.sha1, size: f.blob.size } };
         Ok(match kept {
             Kept::Typed { ty, also, files, settings, notes } => {
                 // Its contents by reference: each still kept (none removed but by the sweep, with the value).
@@ -310,14 +342,16 @@ impl Store {
             }
             Kept::Image { width, height, blob } => Value::Image(Image { width, height, rgba: self.read_blob(&blob)? }),
             Kept::Video { format, width, height, timestamp, blob } => Value::Video(pe2_ext::media::VideoFrame {
-                format: pe2_ext::media::PixelFormat::named(&format).with_context(|| format!("{hash}: no layout {format}"))?,
+                format: pe2_ext::media::PixelFormat::named(&format)
+                    .with_context(|| format!("{hash}: no layout {format}"))?,
                 buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
                 width,
                 height,
                 timestamp,
             }),
             Kept::Audio { format, sample_rate, channels, timestamp, blob } => Value::Audio(pe2_ext::media::AudioData {
-                format: pe2_ext::media::SampleFormat::named(&format).with_context(|| format!("{hash}: no layout {format}"))?,
+                format: pe2_ext::media::SampleFormat::named(&format)
+                    .with_context(|| format!("{hash}: no layout {format}"))?,
                 buffer: pe2_ext::media::MediaBuffer::new(self.read_blob(&blob)?),
                 sample_rate,
                 channels,
@@ -374,10 +408,16 @@ impl Store {
 
     /// Sweep as `sweep` does what was written before `began`.
     #[must_use = "what was swept is the sweep's report"]
-    pub fn sweep_older(&self, live: &HashSet<String>, used: &HashSet<&String>, began: std::time::SystemTime) -> (usize, usize, usize) {
+    pub fn sweep_older(
+        &self,
+        live: &HashSet<String>,
+        used: &HashSet<&String>,
+        began: std::time::SystemTime,
+    ) -> (usize, usize, usize) {
         let stem = |e: &std::fs::DirEntry| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_string);
         let young = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m >= began);
-        let entries = |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
+        let entries =
+            |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
         let mut swept = (0, 0, 0);
         // Each live output's newest trace, by when it was written.
         let mut newest: HashMap<(String, String), (std::time::SystemTime, String, String)> = HashMap::new();
@@ -427,7 +467,9 @@ impl Store {
         let mut blobs = HashSet::new();
         for entry in entries("values") {
             let Some(hash) = stem(&entry) else { continue };
-            if values.contains(&hash) && let Some(kept) = self.describe(&hash) {
+            if values.contains(&hash)
+                && let Some(kept) = self.describe(&hash)
+            {
                 blobs.extend(kept.blobs().into_iter().map(|b| b.sha1.clone()));
             } else if std::fs::remove_file(entry.path()).is_ok() {
                 swept.1 += 1;

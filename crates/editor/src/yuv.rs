@@ -194,16 +194,21 @@ impl egui_wgpu::CallbackTrait for Draw {
                 })
             });
             let views = planes.each_ref().map(|p| p.create_view(&wgpu::TextureViewDescriptor::default()));
-            let binds = [0, 1].map(|sampler| device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("yuv420p"),
-                layout: &renderer.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&renderer.samplers[sampler]) },
-                ],
-            }));
+            let binds = [0, 1].map(|sampler| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("yuv420p"),
+                    layout: &renderer.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[0]) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[1]) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[2]) },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&renderer.samplers[sampler]),
+                        },
+                    ],
+                })
+            });
             renderer.uploaded.insert(self.player, Uploaded { key: self.key, size: (width, height), planes, binds });
         }
         let Some(uploaded) = renderer.uploaded.get_mut(&self.player) else { return Vec::new() };
@@ -242,4 +247,3 @@ impl egui_wgpu::CallbackTrait for Draw {
         pass.draw(0..3, 0..1);
     }
 }
-

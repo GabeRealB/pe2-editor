@@ -13,22 +13,26 @@ fn next_read(call: &mut Call<'_>) -> Result<Prepared> {
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
-    let _ = r.test("a_file_makes_a_node_that_shows_and_undo_takes_it_away", "A file dropped on the window makes a node", |project, _| {
-        let editor = Editor::of(project);
-        editor.drop_file("casual.ora", &pe2_test_data::painting())?;
-        editor.click_label("New node: Texture, from layers")?;
-        let path = editor.selected()?;
-        if !editor.pictured(&path, "picture/default")? {
-            bail!("{path} has no picture");
-        }
-        editor.expect("page_0")?;
-        editor.expect_no_problems()?;
-        editor.undo()?;
-        if editor.assets()?.contains(&path) {
-            bail!("{path} is still there");
-        }
-        Ok(Value::Boolean(true))
-    });
+    let _ = r.test(
+        "a_file_makes_a_node_that_shows_and_undo_takes_it_away",
+        "A file dropped on the window makes a node",
+        |project, _| {
+            let editor = Editor::of(project);
+            editor.drop_file("casual.ora", &pe2_test_data::painting())?;
+            editor.click_label("New node: Texture, from layers")?;
+            let path = editor.selected()?;
+            if !editor.pictured(&path, "picture/default")? {
+                bail!("{path} has no picture");
+            }
+            editor.expect("page_0")?;
+            editor.expect_no_problems()?;
+            editor.undo()?;
+            if editor.assets()?.contains(&path) {
+                bail!("{path} is still there");
+            }
+            Ok(Value::Boolean(true))
+        },
+    );
     // Each reads the next, holding its instance while that one runs.
     let _ = r.op("chained").label("Reads the next").output::<ty::Table>().prepare(next_read).run(|call| {
         if let Some(next) = call.settings.get("next").and_then(Value::as_str) {
@@ -60,21 +64,25 @@ fn register(r: &mut Registry) -> Result<()> {
         }
         Ok(Value::Boolean(true))
     });
-    let _ = r.test("what_is_undone_while_the_project_is_read_waits_for_it", "Undoing while the project is read waits, and the window goes on", |project: &dyn Project, _: &Value| {
-        let editor = Editor::of(project);
-        editor.drop_file("casual.ora", &pe2_test_data::painting())?;
-        editor.click_label("New node: Texture, from layers")?;
-        let path = editor.selected()?;
-        editor.hold_reading()?;
-        editor.undo()?;
-        if !editor.assets()?.contains(&path) {
-            bail!("{path} went before the project was read");
-        }
-        editor.release_reading()?;
-        if editor.assets()?.contains(&path) {
-            bail!("{path} is still there");
-        }
-        Ok(Value::Boolean(true))
-    });
+    let _ = r.test(
+        "what_is_undone_while_the_project_is_read_waits_for_it",
+        "Undoing while the project is read waits, and the window goes on",
+        |project: &dyn Project, _: &Value| {
+            let editor = Editor::of(project);
+            editor.drop_file("casual.ora", &pe2_test_data::painting())?;
+            editor.click_label("New node: Texture, from layers")?;
+            let path = editor.selected()?;
+            editor.hold_reading()?;
+            editor.undo()?;
+            if !editor.assets()?.contains(&path) {
+                bail!("{path} went before the project was read");
+            }
+            editor.release_reading()?;
+            if editor.assets()?.contains(&path) {
+                bail!("{path} is still there");
+            }
+            Ok(Value::Boolean(true))
+        },
+    );
     Ok(())
 }

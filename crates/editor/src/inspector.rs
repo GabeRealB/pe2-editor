@@ -179,7 +179,11 @@ impl Tab {
 
 /// What a part's sheet shows: the table it is in, its fields and their values. Its type's where it says, else what its table
 /// holds, by the part's fragment.
-fn part_fields(ws: &mut Workspace, asset: &Arc<Asset>, id: &str) -> (Vec<String>, Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+fn part_fields(
+    ws: &mut Workspace,
+    asset: &Arc<Asset>,
+    id: &str,
+) -> (Vec<String>, Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     let live = ws.live_fields(&asset.path, id);
     if let Some(sheet) = ws.part_sheet_of(asset, id).as_ref() {
         let mut fields = vec![];
@@ -197,7 +201,8 @@ fn part_fields(ws: &mut Workspace, asset: &Arc<Asset>, id: &str) -> (Vec<String>
     }
     let Some((group, name)) = id.split_once('/') else { return Default::default() };
     let held = asset.settings().get(group).and_then(|table| table.get(name)).and_then(toml::Value::as_table);
-    let values = held.map_or_else(Vec::new, |table| table.iter().map(|(key, value)| (key.clone(), value.clone())).collect());
+    let values =
+        held.map_or_else(Vec::new, |table| table.iter().map(|(key, value)| (key.clone(), value.clone())).collect());
     (vec![group.to_string(), name.to_string()], vec![], values)
 }
 
@@ -207,7 +212,10 @@ fn derived_of_part(ws: &Workspace, asset: &Asset, within: &[String]) -> Option<(
     let op = ws.extensions.import_op(asset)?;
     let of_part = |pattern: &String| {
         let mut steps = pattern.split('.');
-        (steps.next() == Some(group.as_str()) && steps.next() == Some("*")).then(|| steps.next()).flatten().map(str::to_string)
+        (steps.next() == Some(group.as_str()) && steps.next() == Some("*"))
+            .then(|| steps.next())
+            .flatten()
+            .map(str::to_string)
     };
     Some((op.label.clone(), op.derives.iter().filter_map(of_part).collect()))
 }
@@ -225,9 +233,13 @@ fn part_ui(
     let contents = ws.contents_of(asset);
     let row = contents.rows.iter().find(|row| row.id == id && !row.is_heading());
     // A row standing for a look shows that look.
-    let output = row.and_then(|row| row.look.as_ref()).map_or_else(|| id.clone(), |look| format!("{}/{look}", project::ext::PICTURE));
+    let output = row
+        .and_then(|row| row.look.as_ref())
+        .map_or_else(|| id.clone(), |look| format!("{}/{look}", project::ext::PICTURE));
     let row = row.map(|row| row.label.clone());
-    let Some(label) = row.or_else(|| ws.extensions.addresses(asset).into_iter().find(|(address, _)| *address == id).map(|(_, label)| label)) else {
+    let Some(label) = row.or_else(|| {
+        ws.extensions.addresses(asset).into_iter().find(|(address, _)| *address == id).map(|(_, label)| label)
+    }) else {
         return;
     };
     let ctx = ui.ctx().clone();
@@ -249,11 +261,16 @@ fn part_ui(
         // A strip (a palette) as a swatch, anything else as large as the row allows.
         if let Some((texture, size)) = picture {
             let room = ui.available_width();
-            let shown = if size.y <= 1.0 { egui::vec2(room.min(160.0), 10.0) } else { size * (96.0 / size.y).min(room / size.x.max(1.0)) };
+            let shown = if size.y <= 1.0 {
+                egui::vec2(room.min(160.0), 10.0)
+            } else {
+                size * (96.0 / size.y).min(room / size.x.max(1.0))
+            };
             ui.add(egui::Image::new(egui::load::SizedTexture::new(texture, shown)));
         }
         if let Some(problem) = &problem {
-            ui.colored_label(ui.visuals().error_fg_color, "Its extension could not say what this holds").on_hover_text(problem);
+            ui.colored_label(ui.visuals().error_fg_color, "Its extension could not say what this holds")
+                .on_hover_text(problem);
         }
         if !shown.is_empty() {
             ui.add_space(4.0);
@@ -277,9 +294,11 @@ fn properties_ui(
             extensions: &ws.extensions,
             fields: ws.extensions.fields(asset).into_iter().cloned().collect(),
             within: vec![],
-            derived: ws.extensions.import_op(asset).filter(|op| !op.derives.is_empty()).map(|op| {
-                (op.label.clone(), op.derives.iter().filter(|p| !p.contains('.')).cloned().collect())
-            }),
+            derived: ws
+                .extensions
+                .import_op(asset)
+                .filter(|op| !op.derives.is_empty())
+                .map(|op| (op.label.clone(), op.derives.iter().filter(|p| !p.contains('.')).cloned().collect())),
         };
         // The settings as resolved: what the import derives in its place.
         let fields: Vec<(&String, &toml::Value)> = asset
@@ -494,9 +513,7 @@ fn property_sheet(
         } else {
             value_ui(ui, sheet, key, value, nav);
         }
-        if editable
-            && let Some(new) = reference_dropped(ui, ui.min_rect(), sheet, asset, key, value)
-        {
+        if editable && let Some(new) = reference_dropped(ui, ui.min_rect(), sheet, asset, key, value) {
             *edit = set_field(asset, &sheet.within, key, inline(&new), &sheet.label(key));
         }
         if chooses.is_some() {
@@ -521,17 +538,28 @@ fn property_sheet(
     }
     // Named for what it shows: a grid keeps its rows' heights by its id, and one shared with a grid inside a cell would
     // be given that one's.
-    egui::Grid::new(("properties", &asset.path, &sheet.within)).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
-        for (key, value) in fields {
-            ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
-            cell(ui, value, |ui| value_of(ui, key, value));
-            ui.end_row();
-        }
-    });
+    egui::Grid::new(("properties", &asset.path, &sheet.within))
+        .num_columns(2)
+        .spacing([18.0, 6.0])
+        .min_row_height(ROW_HEIGHT)
+        .show(ui, |ui| {
+            for (key, value) in fields {
+                ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
+                cell(ui, value, |ui| value_of(ui, key, value));
+                ui.end_row();
+            }
+        });
 }
 
 /// What a reference field at `rect` holds after something dropped on it, where something was: its other keys kept.
-pub fn reference_dropped(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, asset: &Asset, key: &str, value: &toml::Value) -> Option<toml::Value> {
+pub fn reference_dropped(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    sheet: &Sheet,
+    asset: &Asset,
+    key: &str,
+    value: &toml::Value,
+) -> Option<toml::Value> {
     reference_in(value)?;
     let name = sheet.label(key).to_lowercase();
     let verdict = |dragged: &Dragged| match dragged {
@@ -543,11 +571,24 @@ pub fn reference_dropped(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, ass
 }
 
 /// The uid of an asset of `type` dropped at `rect`, where there is no reference yet to say what goes there.
-pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, holder: &Asset, node_type: &str) -> Option<toml::Value> {
-    let of_type = |asset: &Asset| sheet.extensions.node_types_of(asset).iter().any(|known| known.name.local() == node_type);
+pub fn reference_filling(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    sheet: &Sheet,
+    holder: &Asset,
+    node_type: &str,
+) -> Option<toml::Value> {
+    let of_type =
+        |asset: &Asset| sheet.extensions.node_types_of(asset).iter().any(|known| known.name.local() == node_type);
     let verdict = |dragged: &Dragged| match dragged {
         Dragged::Asset(path) if *path == holder.path => Err("It would name itself".to_string()),
-        Dragged::Asset(path) => sheet.index.assets.get(path).filter(|asset| of_type(asset)).map(|_| format!("Fill it with this {node_type}")).ok_or_else(|| format!("It takes a {node_type}")),
+        Dragged::Asset(path) => sheet
+            .index
+            .assets
+            .get(path)
+            .filter(|asset| of_type(asset))
+            .map(|_| format!("Fill it with this {node_type}"))
+            .ok_or_else(|| format!("It takes a {node_type}")),
         Dragged::Layer(..) | Dragged::Row { .. } => Err("Only an asset goes here".to_string()),
     };
     let Some(Dragged::Asset(path)) = dnd::target(ui, rect.expand(4.0), verdict) else { return None };
@@ -555,15 +596,25 @@ pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, hol
 }
 
 /// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
-fn nested_sheet(ui: &mut egui::Ui, sheet: &Sheet, key: &str, fields: &[(&String, &toml::Value)], nav: &mut Option<String>) {
+fn nested_sheet(
+    ui: &mut egui::Ui,
+    sheet: &Sheet,
+    key: &str,
+    fields: &[(&String, &toml::Value)],
+    nav: &mut Option<String>,
+) {
     // Its own id, under the cell it is in: see `property_sheet`.
-    egui::Grid::new(ui.scope_id().with(("nested sheet", key))).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
-        for (key, value) in fields {
-            ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
-            cell(ui, value, |ui| value_ui(ui, sheet, key, value, nav));
-            ui.end_row();
-        }
-    });
+    egui::Grid::new(ui.scope_id().with(("nested sheet", key)))
+        .num_columns(2)
+        .spacing([18.0, 6.0])
+        .min_row_height(ROW_HEIGHT)
+        .show(ui, |ui| {
+            for (key, value) in fields {
+                ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
+                cell(ui, value, |ui| value_ui(ui, sheet, key, value, nav));
+                ui.end_row();
+            }
+        });
 }
 
 /// How many characters a text holds before it may wrap in a cell.
@@ -647,13 +698,7 @@ fn field_editor(
 
 /// The edit setting a field of an asset's declaration - its own, or one of a table of it (`import`) - its layout kept;
 /// none where it changes nothing. Edits of the same field in a row merge into one step.
-fn set_field(
-    asset: &Asset,
-    within: &[String],
-    key: &str,
-    new: toml_edit::Value,
-    label: &str,
-) -> Option<EditRequest> {
+fn set_field(asset: &Asset, within: &[String], key: &str, new: toml_edit::Value, label: &str) -> Option<EditRequest> {
     let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
     let label = format!("Set {} of {name}", label.to_lowercase());
     change_field(asset, within, key, Some(toml_edit::Item::Value(new)), label)
@@ -661,7 +706,13 @@ fn set_field(
 
 /// A field of a table of an asset's declaration set or, with no value, removed, its layout kept; none where it changes
 /// nothing. Edits of the same field in a row merge into one step.
-fn change_field(asset: &Asset, within: &[String], key: &str, new: Option<toml_edit::Item>, label: String) -> Option<EditRequest> {
+fn change_field(
+    asset: &Asset,
+    within: &[String],
+    key: &str,
+    new: Option<toml_edit::Item>,
+    label: String,
+) -> Option<EditRequest> {
     let mut document = asset.text().parse::<toml_edit::DocumentMut>().ok()?;
     if within.is_empty() {
         let table = project::graph::layers::settings_table(&mut document, key);
@@ -691,7 +742,8 @@ fn change_field(asset: &Asset, within: &[String], key: &str, new: Option<toml_ed
 
 /// A declaration with an extension's values set in it, by their paths, its layout kept: all of them, or why not.
 fn with_sets(text: &str, sets: &[(Vec<String>, Option<toml::Value>)]) -> Result<String, String> {
-    let mut document = text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("The declaration does not parse: {e}"))?;
+    let mut document =
+        text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("The declaration does not parse: {e}"))?;
     for (path, value) in sets {
         let (key, within) = path.split_last().ok_or("It sets a value with no path")?;
         if within.is_empty() {
@@ -702,7 +754,8 @@ fn with_sets(text: &str, sets: &[(Vec<String>, Option<toml::Value>)]) -> Result<
             }
             continue;
         }
-        let table = table_at(&mut document, within).ok_or_else(|| format!("The declaration has no {}", within.join(".")))?;
+        let table =
+            table_at(&mut document, within).ok_or_else(|| format!("The declaration has no {}", within.join(".")))?;
         match value {
             Some(value) => drop(table.insert(key, item(value))),
             None => drop(table.remove(key)),
@@ -721,7 +774,12 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
         if file == project::index::NODE_FILE {
             return Err(format!("It would write {file} whole, which only its settings change"));
         }
-        let unchanged = asset.files.iter().find(|f| f.name == *file).and_then(|f| std::fs::read(&f.path).ok()).is_some_and(|now| now == *bytes);
+        let unchanged = asset
+            .files
+            .iter()
+            .find(|f| f.name == *file)
+            .and_then(|f| std::fs::read(&f.path).ok())
+            .is_some_and(|now| now == *bytes);
         return Ok((!unchanged).then(|| EditRequest::Write {
             uid: asset.uid.clone().unwrap_or_default(),
             file: file.clone(),
@@ -779,7 +837,9 @@ fn takes(sheet: &Sheet, holder: &Asset, value: &toml::Value, path: &str) -> Resu
     let held = held.and_then(|(uid, path)| sheet.index.resolve(&uid, path.as_deref().unwrap_or_default()));
     let dropped = sheet.index.assets.get(path).ok_or("It is gone")?;
     match held.and_then(|held| sheet.extensions.type_name(held)) {
-        Some(node_type) if sheet.extensions.type_name(dropped) != Some(node_type) => Err(format!("It takes a {node_type}")),
+        Some(node_type) if sheet.extensions.type_name(dropped) != Some(node_type) => {
+            Err(format!("It takes a {node_type}"))
+        }
         _ => Ok(()),
     }
 }
@@ -791,11 +851,18 @@ fn table_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String]) -> Op
 }
 
 /// The same, making what is missing of it: for a sheet, which says itself where a part's fields are kept.
-fn table_made_at<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String]) -> Option<&'a mut dyn toml_edit::TableLike> {
+fn table_made_at<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    path: &[String],
+) -> Option<&'a mut dyn toml_edit::TableLike> {
     walk_to(document, path, true)
 }
 
-fn walk_to<'a>(document: &'a mut toml_edit::DocumentMut, path: &[String], make: bool) -> Option<&'a mut dyn toml_edit::TableLike> {
+fn walk_to<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    path: &[String],
+    make: bool,
+) -> Option<&'a mut dyn toml_edit::TableLike> {
     let mut steps = path.iter();
     // What is set on the node is on a layer of its stack; a stack's own paths begin at its name.
     let first = path.first().filter(|first| *first != "stack").map(String::as_str);
@@ -891,7 +958,8 @@ fn choice_ui(
     edit: &mut Option<EditRequest>,
 ) {
     let left_out = field.absent.as_ref().filter(|_| value.as_str() == Some(""));
-    let current = left_out.cloned().or_else(|| field.choice(value).map(str::to_string)).unwrap_or_else(|| raw_text(value));
+    let current =
+        left_out.cloned().or_else(|| field.choice(value).map(str::to_string)).unwrap_or_else(|| raw_text(value));
     let mut chosen = None;
     let mut remove = false;
     egui::ComboBox::from_id_salt(("choice", &asset.path, sheet.path(key))).selected_text(current).show_ui(ui, |ui| {
@@ -932,7 +1000,11 @@ fn three_numbers(value: &toml::Value) -> Option<[f64; 3]> {
     }
 }
 
-const AXES: [(&str, Color32); 3] = [("X", Color32::from_rgb(232, 69, 82)), ("Y", Color32::from_rgb(122, 201, 67)), ("Z", Color32::from_rgb(66, 140, 237))];
+const AXES: [(&str, Color32); 3] = [
+    ("X", Color32::from_rgb(232, 69, 82)),
+    ("Y", Color32::from_rgb(122, 201, 67)),
+    ("Z", Color32::from_rgb(66, 140, 237)),
+];
 /// What a row of axes is high from the start: one growing as its boxes are laid out would center each lower than the last.
 const AXES_ROW: f32 = 22.0;
 
@@ -954,7 +1026,13 @@ fn pressed_away(ui: &egui::Ui, field: &egui::Response) -> bool {
 }
 
 /// A vector to edit, by axis: dragged or typed, and what it comes to once that ends, whole numbers staying whole.
-fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), value: &toml::Value, axes: [f64; 3]) -> Option<toml::Value> {
+fn axes_editor(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    (asset, key): (&str, &str),
+    value: &toml::Value,
+    axes: [f64; 3],
+) -> Option<toml::Value> {
     let whole = value.as_array().is_some_and(|values| values.iter().all(toml::Value::is_integer));
     let mut held: [f64; 3] = ui.data(|data| data.get_temp(id)).unwrap_or(axes);
     let (mut active, mut ended) = (false, false);
@@ -962,7 +1040,9 @@ fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), valu
         ui.set_min_height(AXES_ROW);
         for (at, (axis, color)) in AXES.into_iter().enumerate() {
             ui.label(RichText::new(axis).small().strong().color(color));
-            let drag = egui::DragValue::new(&mut held[at]).speed(if whole { 1.0 } else { 0.5 }).fixed_decimals(usize::from(!whole));
+            let drag = egui::DragValue::new(&mut held[at])
+                .speed(if whole { 1.0 } else { 0.5 })
+                .fixed_decimals(usize::from(!whole));
             let response = ui.add_sized([52.0, 18.0], drag);
             active |= response.dragged() || response.has_focus();
             ended |= response.drag_stopped() || response.lost_focus() || pressed_away(ui, &response);
@@ -971,7 +1051,12 @@ fn axes_editor(ui: &mut egui::Ui, id: egui::Id, (asset, key): (&str, &str), valu
     if active {
         let frame = ui.ctx().cumulative_frame_nr();
         let differs = held.iter().zip(&axes).any(|(now, was)| (now - was).abs() > 1e-9);
-        let moved = differs.then(|| Edited { asset: asset.to_string(), key: key.to_string(), value: vector(&held, whole), frame });
+        let moved = differs.then(|| Edited {
+            asset: asset.to_string(),
+            key: key.to_string(),
+            value: vector(&held, whole),
+            frame,
+        });
         ui.data_mut(|data| {
             data.insert_temp(id, held);
             data.insert_temp(editing_id(), moved);
@@ -1012,7 +1097,8 @@ fn editing_id() -> egui::Id {
 /// What is being edited of an asset in the sheet: what ended, or went with its pane, stops showing the frame after.
 pub fn being_edited(ctx: &egui::Context, asset: &str) -> Option<(String, toml::Value)> {
     let edited: Edited = ctx.data(|data| data.get_temp::<Option<Edited>>(editing_id())).flatten()?;
-    (edited.asset == asset && ctx.cumulative_frame_nr().saturating_sub(edited.frame) <= 1).then_some((edited.key, edited.value))
+    (edited.asset == asset && ctx.cumulative_frame_nr().saturating_sub(edited.frame) <= 1)
+        .then_some((edited.key, edited.value))
 }
 
 /// A value by its field's meaning: a depth, a size, an offset, a rectangle, a placement, a reference, a list.
@@ -1126,7 +1212,8 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
                 None => short,
             };
             // Whole on hover, its output with it: the chip may be cut short.
-            let whole = pe2_ext::output_of(value).map_or_else(|| asset.path.clone(), |output| format!("{}#{output}", asset.path));
+            let whole = pe2_ext::output_of(value)
+                .map_or_else(|| asset.path.clone(), |output| format!("{}#{output}", asset.path));
             if chip(ui, icon, &short, tint).on_hover_text(whole).clicked() {
                 *nav = Some(asset.path.clone());
             }
@@ -1148,13 +1235,16 @@ pub fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::R
     let text = if ui.layout().main_wrap {
         text
     } else {
-        let measure = |ui: &mut egui::Ui, text: &str| ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x);
+        let measure = |ui: &mut egui::Ui, text: &str| {
+            ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x)
+        };
         let room = ui.available_width() - 12.0 - 4.0 - measure(ui, icon);
         // At a step of its path where one fits, else at a character.
         let steps = text.match_indices(['/', '#']).map(|(at, _)| at);
         let cuts: Vec<usize> = std::iter::once(0).chain(steps).chain(text.char_indices().map(|(at, _)| at)).collect();
         let shown = |at: usize| if at == 0 { text.to_string() } else { format!("…{}", &text[at..]) };
-        fitted = cuts.into_iter().map(shown).find(|shown| measure(ui, shown) <= room).unwrap_or_else(|| "…".to_string());
+        fitted =
+            cuts.into_iter().map(shown).find(|shown| measure(ui, shown) <= room).unwrap_or_else(|| "…".to_string());
         fitted.as_str()
     };
     job.append(icon, 0.0, egui::text::TextFormat::simple(font.clone(), tint));
@@ -1212,7 +1302,9 @@ fn collection_ui(
                     for (k, v) in table.iter().filter(|(_, v)| is_table_list(v)) {
                         let list = v.as_array().map_or(&[][..], Vec::as_slice);
                         ui.label(
-                            RichText::new(format!("{}  ·  {}", sheet.label(k), list.len())).small().color(theme::weak()),
+                            RichText::new(format!("{}  ·  {}", sheet.label(k), list.len()))
+                                .small()
+                                .color(theme::weak()),
                         );
                         ui.indent((key, i, k.as_str()), |ui| collection_ui(ui, sheet, parts, k, list, nav));
                     }
@@ -1303,7 +1395,13 @@ fn count(n: usize, plural: &str) -> String {
 
 /// Where an asset's settings changed and are not applied: what applying makes again, and Apply, Revert, and Apply all
 /// where others wait too.
-fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
+fn unapplied_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    asset: &Asset,
+    nav: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
+) {
     if !ws.unapplied(&asset.path) {
         return;
     }
@@ -1322,12 +1420,17 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut 
         let says = if outputs.is_empty() {
             "Its settings changed; it makes nothing from them.".to_string()
         } else {
-            format!("Its outputs are made from its settings as last applied. Applying makes again: {}.", outputs.join(", "))
+            format!(
+                "Its outputs are made from its settings as last applied. Applying makes again: {}.",
+                outputs.join(", ")
+            )
         };
         ui.label(RichText::new(says).color(theme::weak()));
         if !dependents.is_empty() {
             let count = dependents.len();
-            ui.label(RichText::new(format!("And what read{} them:", if count == 1 { "s" } else { "" })).color(theme::weak()));
+            ui.label(
+                RichText::new(format!("And what read{} them:", if count == 1 { "s" } else { "" })).color(theme::weak()),
+            );
             ui.horizontal_wrapped(|ui| {
                 for path in &dependents {
                     if ui.link(path).on_hover_text("Show it").clicked() {
@@ -1338,7 +1441,8 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut 
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            apply = ui.button("Apply").on_hover_text("Make its outputs again from its settings as they are now").clicked();
+            apply =
+                ui.button("Apply").on_hover_text("Make its outputs again from its settings as they are now").clicked();
             if ui.button("Revert").on_hover_text("Put its settings back as last applied (an undoable step)").clicked() {
                 *edit = ws.revert_settings(&asset.path);
             }
@@ -1353,6 +1457,21 @@ fn unapplied_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, nav: &mut 
     } else if apply {
         ws.apply_settings(&asset.path);
     }
+}
+
+/// What each layer's stored file is recognized as, by the layer: nothing for one that stores no file.
+fn recognized_files(extensions: &project::ext::Extensions, asset: &Asset, layers: &[toml::Value]) -> Vec<Vec<String>> {
+    layers
+        .iter()
+        .map(|layer| {
+            let name = layer
+                .get("file")
+                .and_then(toml::Value::as_str)
+                .filter(|_| layer.get("op").and_then(toml::Value::as_str) == Some(project::graph::FILE));
+            let file = name.and_then(|n| asset.files.iter().find(|f| f.name == n && f.made_by.is_none()));
+            file.map_or_default(|f| extensions.recognize(f).into_iter().map(|(ty, _)| ty.label.clone()).collect())
+        })
+        .collect()
 }
 
 /// An asset's stack, top to bottom in the order it runs: each layer's operation and what sets it - a stored file with
@@ -1372,21 +1491,17 @@ fn stack_ui(
     let name = import.as_ref().map_or("", |i| i.op);
     let source = import.as_ref().map(|i| i.source);
     let importer = ws.extensions.op(name);
-    let fits: Vec<(String, String)> = ws.extensions.ops_for(asset).into_iter().map(|op| (op.name.to_string(), op.label.clone())).collect();
-    // What each stored file is recognized as, by its layer.
-    let recognized: Vec<Vec<String>> = layers
-        .iter()
-        .map(|layer| {
-            let name = layer.get("file").and_then(toml::Value::as_str).filter(|_| layer.get("op").and_then(toml::Value::as_str) == Some(project::graph::FILE));
-            let file = name.and_then(|n| asset.files.iter().find(|f| f.name == n && f.made_by.is_none()));
-            file.map_or_default(|f| ws.extensions.recognize(f).into_iter().map(|(ty, _)| ty.label.clone()).collect())
-        })
-        .collect();
+    let fits: Vec<(String, String)> =
+        ws.extensions.ops_for(asset).into_iter().map(|op| (op.name.to_string(), op.label.clone())).collect();
+    let recognized = recognized_files(&ws.extensions, asset, layers);
     // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
     let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
     let active = ws.editable_layer().map(|l| l.name.clone());
     // The importer's settings, as it describes them, in its layer.
-    let importing = layers.iter().position(|l| l.get("op").and_then(toml::Value::as_str) == Some(name)).filter(|_| import.is_some());
+    let importing = layers
+        .iter()
+        .position(|l| l.get("op").and_then(toml::Value::as_str) == Some(name))
+        .filter(|_| import.is_some());
     let sheet = Sheet {
         index: &ws.index,
         extensions: &ws.extensions,
@@ -1407,59 +1522,55 @@ fn stack_ui(
     let (plan, wrong) = ws.extensions.plan_written(asset);
     let editable = target.is_ok();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
-        egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
-            for (i, layer) in layers.iter().enumerate() {
-                let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
-                let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
-                let number = ui.horizontal(|ui| {
-                    let number = layer_number(ui, selected, i);
-                    if number.clicked() {
-                        ws.inner = (selected != Some(i)).then(|| (asset.path.clone(), format!("stack.{i}")));
-                    }
-                    if editable {
-                        number.dnd_set_drag_payload(Dragged::Layer(asset.path.clone(), i));
-                        let around = |at: usize| plan.above.get(at).cloned().flatten();
-                        let (above, below) = (around(i), around(i + 1));
-                        layer_menu(ui, &ws.extensions, &ws.index, &Place { asset, at: i, count: layers.len(), above: above.as_ref(), below: below.as_ref() }, edit);
-                    }
-                });
-                layer_target(ui, asset, number.response.rect.with_max_x(ui.clip_rect().right()), i, edit);
-                match op {
-                    project::graph::FILE => {
-                        ui.label(RichText::new("Stored file").color(theme::weak()));
-                        let source_layer = Some(i) == importing.map(|j| j - 1);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(text("file").unwrap_or_default()).monospace());
-                            for ty in &recognized[i] {
-                                badge(ui, ty);
+        egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(
+            ui,
+            |ui| {
+                for (i, layer) in layers.iter().enumerate() {
+                    let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
+                    let text = |key: &str| layer.get(key).and_then(toml::Value::as_str);
+                    let parts = (&*ws.extensions, &*ws.index, &mut ws.inner);
+                    let number =
+                        layer_cell(ui, parts, (asset, i, layers.len()), (selected, &plan.above), editable, edit);
+                    layer_target(ui, asset, number.rect.with_max_x(ui.clip_rect().right()), i, edit);
+                    match op {
+                        project::graph::FILE => {
+                            ui.label(RichText::new("Stored file").color(theme::weak()));
+                            let source_layer = Some(i) == importing.map(|j| j - 1);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(text("file").unwrap_or_default()).monospace());
+                                for ty in &recognized[i] {
+                                    badge(ui, ty);
+                                }
+                            });
+                            // Edited in its tool: a row of its own, under the file.
+                            if let (true, Some((category, home)), Some(uid), Some(source)) =
+                                (source_layer, &tool, &asset.uid, source)
+                            {
+                                ui.end_row();
+                                ui.label("");
+                                ui.label("");
+                                edit_in_button(ui, *category, home, &active, source, uid, edit);
                             }
-                        });
-                        // Edited in its tool: a row of its own, under the file.
-                        if let (true, Some((category, home)), Some(uid), Some(source)) = (source_layer, &tool, &asset.uid, source) {
-                            ui.end_row();
-                            ui.label("");
-                            ui.label("");
-                            edit_in_button(ui, *category, home, &active, source, uid, edit);
                         }
-                    }
-                    project::graph::OUTPUT | project::graph::PREVIEW => output_row(ui, layer),
-                    project::graph::GRAPH => {
-                        if graph_row(ui, layer) {
-                            // What is selected within it stays, the graph opening on it.
-                            let place = Some((asset.path.clone(), format!("stack.{i}")));
-                            ws.inner = ws.inner.take().filter(|_| selected == Some(i)).or(place);
-                            *edit = Some(EditRequest::ShowGraph);
+                        project::graph::OUTPUT | project::graph::PREVIEW => output_row(ui, layer),
+                        project::graph::GRAPH => {
+                            if graph_row(ui, layer) {
+                                // What is selected within it stays, the graph opening on it.
+                                let place = Some((asset.path.clone(), format!("stack.{i}")));
+                                ws.inner = ws.inner.take().filter(|_| selected == Some(i)).or(place);
+                                *edit = Some(EditRequest::ShowGraph);
+                            }
                         }
+                        _ if Some(i) == importing => {
+                            ui.label(RichText::new("Importer").color(theme::weak()));
+                            importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
+                        }
+                        _ => operation_row(ui, &ops, op, layer),
                     }
-                    _ if Some(i) == importing => {
-                        ui.label(RichText::new("Importer").color(theme::weak()));
-                        importer_row(ui, asset, i, name, importer, &fits, target.is_ok(), edit);
-                    }
-                    _ => operation_row(ui, &ops, op, layer),
+                    ui.end_row();
                 }
-                ui.end_row();
-            }
-        });
+            },
+        );
         if editable {
             ui.menu_button(format!("{}  Add layer", icons::PLUS), |ui| {
                 let end = plan.above.last().cloned().flatten();
@@ -1521,8 +1632,38 @@ fn layer_target(ui: &egui::Ui, asset: &Asset, row: egui::Rect, at: usize, edit: 
     };
     if let Some(Dragged::Layer(_, from)) = dnd::target(ui, row, verdict) {
         let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
-        *edit = layers_edit(asset, format!("Move a layer of {name}"), project::graph::layers::shift(asset.text(), from, at));
+        *edit = layers_edit(
+            asset,
+            format!("Move a layer of {name}"),
+            project::graph::layers::shift(asset.text(), from, at),
+        );
     }
+}
+
+/// A layer's number, selecting it (`inner`) or dragged to move it, and - where the stack can be edited - its menu, which
+/// offers what fits between the types made above and below it (`above`). Returns the cell.
+fn layer_cell(
+    ui: &mut egui::Ui,
+    (extensions, index, inner): (&project::ext::Extensions, &project::index::Index, &mut Option<(String, String)>),
+    (asset, at, count): (&Asset, usize, usize),
+    (selected, above): (Option<usize>, &[Option<pe2_ext::Type>]),
+    editable: bool,
+    edit: &mut Option<EditRequest>,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let number = layer_number(ui, selected, at);
+        if number.clicked() {
+            *inner = (selected != Some(at)).then(|| (asset.path.clone(), format!("stack.{at}")));
+        }
+        if editable {
+            number.dnd_set_drag_payload(Dragged::Layer(asset.path.clone(), at));
+            let around = |at: usize| above.get(at).cloned().flatten();
+            let (over, under) = (around(at), around(at + 1));
+            let place = Place { asset, at, count, above: over.as_ref(), below: under.as_ref() };
+            layer_menu(ui, extensions, index, &place, edit);
+        }
+    })
+    .response
 }
 
 /// A layer's number, choosing the layer selected; whether it was clicked.
@@ -1530,8 +1671,11 @@ fn layer_number(ui: &mut egui::Ui, selected: Option<usize>, at: usize) -> egui::
     let text = RichText::new(format!("{at}")).color(theme::weak());
     // One width for every number, so that the menus beside them line up past layer 9.
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let two = ui.fonts_mut(|fonts| fonts.layout_no_wrap("00".into(), font, Color32::WHITE).size().x) + 2.0 * ui.spacing().button_padding.x;
-    let number = egui::Button::selectable(selected == Some(at), text).min_size(egui::vec2(two, 0.0)).sense(egui::Sense::click_and_drag());
+    let two = ui.fonts_mut(|fonts| fonts.layout_no_wrap("00".into(), font, Color32::WHITE).size().x)
+        + 2.0 * ui.spacing().button_padding.x;
+    let number = egui::Button::selectable(selected == Some(at), text)
+        .min_size(egui::vec2(two, 0.0))
+        .sense(egui::Sense::click_and_drag());
     ui.add(number).on_hover_text("Select this layer, or drag it to move it")
 }
 
@@ -1546,19 +1690,25 @@ fn selected_ui(
 ) {
     let Some(inner) = ws.inner_of(&asset.path).map(str::to_string) else { return };
     let Some((at, op)) = layer_of_inner(&inner) else { return };
-    let Some(layer) = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|l| l.get(at)) else { return };
+    let Some(layer) = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|l| l.get(at)) else {
+        return;
+    };
     let chosen = op.map_or(Some(layer), |id| layer.get("ops")?.get(id));
     let Some(chosen) = chosen else { return };
     // An importer's settings are the stack's own, and a graph's are its boxes.
     let name = chosen.get("op").and_then(toml::Value::as_str).unwrap_or_default();
-    if op.is_none() && (name == project::graph::GRAPH || project::graph::import_of(asset.fields()).is_some_and(|i| i.op == name)) {
+    if op.is_none()
+        && (name == project::graph::GRAPH || project::graph::import_of(asset.fields()).is_some_and(|i| i.op == name))
+    {
         return;
     }
     let (fields, values) = layer_settings(&ws.extensions, asset, chosen);
-    let values: Vec<(String, toml::Value)> = values.into_iter().filter(|(key, _)| key != "from" && key != project::graph::layers::POS).collect();
+    let values: Vec<(String, toml::Value)> =
+        values.into_iter().filter(|(key, _)| key != "from" && key != project::graph::layers::POS).collect();
     let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
     let label = ws.extensions.operations().get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
-    let sheet = Sheet { index: &ws.index, extensions: &ws.extensions, fields, within: steps_of_layer(at, op), derived: None };
+    let sheet =
+        Sheet { index: &ws.index, extensions: &ws.extensions, fields, within: steps_of_layer(at, op), derived: None };
     let field_edit = &mut ws.field_edit;
     theme::section(ui, "Selected", |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -1574,8 +1724,10 @@ fn selected_ui(
         ui.horizontal(|ui| {
             use project::graph::layers;
             let button = |ui: &mut egui::Ui, text: String| ui.add_enabled(target.is_ok(), egui::Button::new(text));
-            if button(ui, "Pass on down".to_string()).on_hover_text("Make this what the layer gives the next").clicked() {
-                *edit = layers_edit(asset, format!("Pass {id} on down"), layers::set_result(asset.text(), at, Some(id)));
+            if button(ui, "Pass on down".to_string()).on_hover_text("Make this what the layer gives the next").clicked()
+            {
+                *edit =
+                    layers_edit(asset, format!("Pass {id} on down"), layers::set_result(asset.text(), at, Some(id)));
             }
             if button(ui, format!("{}  Remove", icons::TRASH)).clicked() {
                 *edit = layers_edit(asset, format!("Remove {id}"), layers::remove_operation(asset.text(), at, id));
@@ -1588,12 +1740,24 @@ fn selected_ui(
 fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     use pe2_ext::Field;
     let set = |key: &str, unset: &str| (key.to_string(), layer.get(key).cloned().unwrap_or_else(|| unset.into()));
-    let retain = Field::new("retain").label("Kept").choices([("transient", "Not kept"), ("cache", "In the cache"), ("build", "With the build")]);
-    let when = Field::new("when").label("Made").choices([("lazy", "When asked for"), ("eager", "As soon as it can be")]);
+    let retain = Field::new("retain").label("Kept").choices([
+        ("transient", "Not kept"),
+        ("cache", "In the cache"),
+        ("build", "With the build"),
+    ]);
+    let when =
+        Field::new("when").label("Made").choices([("lazy", "When asked for"), ("eager", "As soon as it can be")]);
     let mut fields = vec![Field::new("name").label("Name"), retain, when];
     let mut values = vec![set("name", ""), set("retain", "transient"), set("when", "lazy")];
     // What it has to do with events, where it has.
-    for (key, label) in [("pull", "Made on"), ("listen", "Stale on"), ("deploy", "Goes to"), ("ran", "Ran"), ("changed", "Changed"), ("failed", "Failed")] {
+    for (key, label) in [
+        ("pull", "Made on"),
+        ("listen", "Stale on"),
+        ("deploy", "Goes to"),
+        ("ran", "Ran"),
+        ("changed", "Changed"),
+        ("failed", "Failed"),
+    ] {
         if let Some(value) = layer.get(key) {
             fields.push(Field::new(key).label(label));
             values.push((key.to_string(), value.clone()));
@@ -1603,7 +1767,11 @@ fn output_settings(layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, to
 }
 
 /// A layer's settings, for its sheet: its fields, and what each is, what a setting left out comes to where that is known.
-fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &toml::Value) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
+fn layer_settings(
+    extensions: &project::ext::Extensions,
+    asset: &Asset,
+    layer: &toml::Value,
+) -> (Vec<pe2_ext::Field>, Vec<(String, toml::Value)>) {
     use pe2_ext::Field;
     use project::graph;
     let op = layer.get("op").and_then(toml::Value::as_str).unwrap_or_default();
@@ -1624,7 +1792,11 @@ fn layer_settings(extensions: &project::ext::Extensions, asset: &Asset, layer: &
         _ => {
             let fields = extensions.op(op).map_or_default(|def| def.fields.clone());
             let declared = fields.iter().filter(|f| !f.custom).map(|f| set(&f.key, ""));
-            let others = layer.as_table().into_iter().flatten().filter(|(k, _)| k.as_str() != "op" && !fields.iter().any(|f| f.key == **k));
+            let others = layer
+                .as_table()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| k.as_str() != "op" && !fields.iter().any(|f| f.key == **k));
             let values = declared.chain(others.map(|(k, v)| (k.clone(), v.clone()))).collect();
             (fields, values)
         }
@@ -1660,7 +1832,13 @@ pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<Str
 }
 
 /// A layer's menu: moving it, removing it, and adding one over or under it.
-fn layer_menu(ui: &mut egui::Ui, extensions: &project::ext::Extensions, index: &project::index::Index, place: &Place, edit: &mut Option<EditRequest>) {
+fn layer_menu(
+    ui: &mut egui::Ui,
+    extensions: &project::ext::Extensions,
+    index: &project::index::Index,
+    place: &Place,
+    edit: &mut Option<EditRequest>,
+) {
     use project::graph::layers;
     let (asset, at) = (place.asset, place.at);
     let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
@@ -1668,7 +1846,10 @@ fn layer_menu(ui: &mut egui::Ui, extensions: &project::ext::Extensions, index: &
         if ui.add_enabled(at > 0, egui::Button::new(format!("{}  Move up", icons::ARROW_UP))).clicked() {
             *edit = layers_edit(asset, format!("Move a layer of {name} up"), layers::shift(asset.text(), at, at - 1));
         }
-        if ui.add_enabled(at + 1 < place.count, egui::Button::new(format!("{}  Move down", icons::ARROW_DOWN))).clicked() {
+        if ui
+            .add_enabled(at + 1 < place.count, egui::Button::new(format!("{}  Move down", icons::ARROW_DOWN)))
+            .clicked()
+        {
             *edit = layers_edit(asset, format!("Move a layer of {name} down"), layers::shift(asset.text(), at, at + 1));
         }
         if ui.button(format!("{}  Remove", icons::TRASH)).clicked() {
@@ -1703,19 +1884,38 @@ fn add_items(
             ui.close();
         }
     };
-    let table = |entries: &[(&str, &str)]| -> toml::Table { entries.iter().map(|(k, v)| ((*k).to_string(), toml::Value::from(*v))).collect() };
+    let table = |entries: &[(&str, &str)]| -> toml::Table {
+        entries.iter().map(|(k, v)| ((*k).to_string(), toml::Value::from(*v))).collect()
+    };
     if let Some(above) = above {
         for (op, label) in extensions.layers_taking(above) {
             add(ui, &label, &op, table(&[("op", op.as_str())]));
         }
         ui.separator();
-        let taken: Vec<&str> = asset.fields().get("stack").and_then(toml::Value::as_array).into_iter().flatten().filter_map(|l| l.get("name")?.as_str()).collect();
+        let taken: Vec<&str> = asset
+            .fields()
+            .get("stack")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.get("name")?.as_str())
+            .collect();
         let names = std::iter::once("output".to_string()).chain((2..=taken.len() + 2).map(|n| format!("output_{n}")));
         let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
-        add(ui, "Output", "A tap: what is here, as an output of this node", table(&[("op", graph::OUTPUT), ("name", free.as_str())]));
+        add(
+            ui,
+            "Output",
+            "A tap: what is here, as an output of this node",
+            table(&[("op", graph::OUTPUT), ("name", free.as_str())]),
+        );
         let names = std::iter::once("preview".to_string()).chain((2..=taken.len() + 2).map(|n| format!("preview_{n}")));
         let free = names.into_iter().find(|n| !taken.contains(&n.as_str())).unwrap_or_default();
-        add(ui, "Preview", "A tap: what is here, shown in a tab of its own", table(&[("op", graph::PREVIEW), ("name", free.as_str())]));
+        add(
+            ui,
+            "Preview",
+            "A tap: what is here, shown in a tab of its own",
+            table(&[("op", graph::PREVIEW), ("name", free.as_str())]),
+        );
     } else {
         for file in asset.files.iter().filter(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE) {
             add(ui, &file.name, "A stored file", table(&[("op", graph::FILE), ("file", file.name.as_str())]));
@@ -1755,7 +1955,8 @@ fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: 
     let own = layer.as_table().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "op" | "id"));
     let wire = |value: &toml::Value| value.get("from").and_then(toml::Value::as_str).map(str::to_string);
     let (wires, settings): (Vec<_>, Vec<_>) = own.partition(|(_, value)| wire(value).is_some());
-    let mut said: Vec<String> = wires.iter().filter_map(|(port, value)| Some(format!("{port} from {}", wire(value)?))).collect();
+    let mut said: Vec<String> =
+        wires.iter().filter_map(|(port, value)| Some(format!("{port} from {}", wire(value)?))).collect();
     if !settings.is_empty() {
         said.push(format!("{} setting{}", settings.len(), if settings.len() == 1 { "" } else { "s" }));
     }
@@ -1781,9 +1982,12 @@ fn edit_in_button(
     let tool = category.label().to_lowercase();
     let label = format!("{}  Edit in {tool}", icons::PENCIL_SIMPLE);
     let (enabled, says) = match active {
-        Ok(l) if l == home => {
-            (true, format!("Open {source} in the {tool} set in the settings (External tools); what it saves is imported again"))
-        }
+        Ok(l) if l == home => (
+            true,
+            format!(
+                "Open {source} in the {tool} set in the settings (External tools); what it saves is imported again"
+            ),
+        ),
         Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
         Err(why) => (false, why.clone()),
     };
@@ -1836,7 +2040,8 @@ fn importer_row(
                     }
                 }
             });
-            let switched = chosen.and_then(|fit| set_field(asset, &steps_of_layer(at, None), "op", fit.as_str().into(), "importer"));
+            let switched = chosen
+                .and_then(|fit| set_field(asset, &steps_of_layer(at, None), "op", fit.as_str().into(), "importer"));
             if let Some(switched) = switched {
                 *edit = Some(switched);
             }
@@ -2014,7 +2219,9 @@ mod path_tests {
 
     #[test]
     fn a_list_is_stepped_into_by_place() {
-        let mut document = "[[stack]]\nop = \"a\"\n\n[[stack]]\nop = \"b\"\n[stack.ops.\"x.y\"]\nop = \"c\"\n".parse::<toml_edit::DocumentMut>().unwrap();
+        let mut document = "[[stack]]\nop = \"a\"\n\n[[stack]]\nop = \"b\"\n[stack.ops.\"x.y\"]\nop = \"c\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
         let table = table_at(&mut document, &steps(&["stack", "1", "ops", "x.y"])).unwrap();
         assert_eq!(table.get("op").and_then(toml_edit::Item::as_str), Some("c"));
     }
@@ -2024,7 +2231,8 @@ mod path_tests {
 mod tests {
     #[test]
     fn a_reference_is_retargeted_as_it_is_written() {
-        let asset: toml::Table = "a = \"uid://old#palettes/x\"\nb = { slot = \"uid://old\", at = [1, 2] }\n".parse().unwrap();
+        let asset: toml::Table =
+            "a = \"uid://old#palettes/x\"\nb = { slot = \"uid://old\", at = [1, 2] }\n".parse().unwrap();
         let (a, b) = (&asset["a"], &asset["b"]);
         assert_eq!(super::reference_in(b).and_then(toml::Value::as_str), Some("uid://old"));
         let retarget = |value| super::retarget_to(value, "uid://new", "g/new");

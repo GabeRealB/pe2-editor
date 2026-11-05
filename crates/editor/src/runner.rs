@@ -37,7 +37,13 @@ impl Finished {
     /// What to say of it, where someone asked for it.
     pub fn said(&self) -> Option<String> {
         let asked = |event: &str| self.roots.iter().any(|root| root == event);
-        let what = if asked(Build::NAME) { "Built" } else if asked(Clean::NAME) { "Cleaned" } else { return None };
+        let what = if asked(Build::NAME) {
+            "Built"
+        } else if asked(Clean::NAME) {
+            "Cleaned"
+        } else {
+            return None;
+        };
         Some(match self.report.failed.first() {
             _ if self.report.cancelled => "Cancelled".to_string(),
             Some((path, _)) => format!("{path} failed: see Problems"),
@@ -72,14 +78,13 @@ fn same(job: &Job, next: &Job) -> bool {
 fn text(report: &Report) -> mcp::Reply {
     let mut lines: Vec<String> = report.made.iter().map(|(asset, output)| format!("{asset}: {output}")).collect();
     let failed = report.failed.iter().chain(&report.notes).map(|(asset, why)| format!("{asset}: {why}"));
-    let stale = report.stale.iter().map(|(asset, output)| format!("{asset}: {output} is stale: what it reads changed after it ran"));
+    let stale = report
+        .stale
+        .iter()
+        .map(|(asset, output)| format!("{asset}: {output} is stale: what it reads changed after it ran"));
     lines.extend(failed.chain(stale));
     let answer = lines.join("\n");
-    if report.failed.is_empty() && !report.cancelled {
-        mcp::Reply::text(answer)
-    } else {
-        mcp::Reply::failed(answer)
-    }
+    if report.failed.is_empty() && !report.cancelled { mcp::Reply::text(answer) } else { mcp::Reply::failed(answer) }
 }
 
 impl Runner {
@@ -122,13 +127,27 @@ impl Runner {
                     }
                     stop.store(false, Ordering::Relaxed);
                     let wiring = project::build::wiring(&job.index, &extensions, &job.config);
-                    let report = project::build::epoch(&project, &job.index, &extensions, &wiring, &job.config, &job.roots, &stop);
+                    let report = project::build::epoch(
+                        &project,
+                        &job.index,
+                        &extensions,
+                        &wiring,
+                        &job.config,
+                        &job.roots,
+                        &stop,
+                    );
                     if let Some(reply) = &job.reply {
                         let _ = reply.send(text(&report));
                     }
                     left.fetch_sub(1, Ordering::Relaxed);
                     let wired = wiring.counts();
-                    let ended = Finished { roots: job.roots, config: job.config.name, report, problems: wiring.problems, wired };
+                    let ended = Finished {
+                        roots: job.roots,
+                        config: job.config.name,
+                        report,
+                        problems: wiring.problems,
+                        wired,
+                    };
                     if done.send(ended).is_err() {
                         return;
                     }

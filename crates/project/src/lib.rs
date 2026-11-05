@@ -216,7 +216,8 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let threads: Vec<_> = (0..lent).map(|_| scope.spawn(worker)).collect();
         let own = worker();
-        let rest = threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+        let rest =
+            threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
         own.into_iter().chain(rest.flatten()).collect()
     });
     LENT.fetch_sub(lent, Ordering::AcqRel);
@@ -354,7 +355,8 @@ impl Project {
             });
         }
         let disabled_extensions = file.extensions.disabled;
-        let locked = std::fs::read_to_string(root.join(EXTENSIONS_LOCK)).ok().and_then(|text| toml::from_str(&text).ok());
+        let locked =
+            std::fs::read_to_string(root.join(EXTENSIONS_LOCK)).ok().and_then(|text| toml::from_str(&text).ok());
         let manifest = Manifest { imported: file.extension, locked: locked.unwrap_or_default() };
         let extension_settings = file
             .extensions
@@ -366,7 +368,11 @@ impl Project {
             })
             .collect();
         let links = file.build.links;
-        let configs = file.config.into_iter().map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled }).collect();
+        let configs = file
+            .config
+            .into_iter()
+            .map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled })
+            .collect();
         Ok(Project { root, game, layers, mounts, disabled_extensions, manifest, extension_settings, configs, links })
     }
 

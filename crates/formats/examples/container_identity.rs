@@ -66,7 +66,12 @@ fn main() {
                 let own: Vec<&cdf::FileEntry> = files.iter().filter(|f| f.folder == Some(folder.id)).collect();
                 let end = folder.offset + folder.size;
                 let owned: Vec<(u32, Vec<u8>)> = own.iter().map(|f| (f.id, file_at(&bytes, f.offset, end))).collect();
-                let files_end = own.iter().zip(&owned).map(|(f, (_, b))| f.offset + b.len() as u64).max().unwrap_or(folder.offset + SECTOR);
+                let files_end = own
+                    .iter()
+                    .zip(&owned)
+                    .map(|(f, (_, b))| f.offset + b.len() as u64)
+                    .max()
+                    .unwrap_or(folder.offset + SECTOR);
                 let tail = &bytes[usize::try_from(files_end).unwrap_or(0)..usize::try_from(end).unwrap_or(0)];
                 let entries: Vec<cdf::FileEntry> = own.iter().map(|f| **f).collect();
                 let borrowed = places(&entries, &owned);

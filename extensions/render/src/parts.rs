@@ -1,6 +1,9 @@
 //! What is inside a model, as every pane shows it: its bones as a tree, each a part of the asset, selected as `bones/<n>` wherever it is.
 
-use pe2_ext::{Asset, ContentAction, ContentOutcome, ContentRequest, ContentRow, Contents, Icon, PartField, PartSheet, Project, Result, Tint, Value, anyhow, bail};
+use pe2_ext::{
+    Asset, ContentAction, ContentOutcome, ContentRequest, ContentRow, Contents, Icon, PartField, PartSheet, Project,
+    Result, Tint, Value, anyhow, bail,
+};
 
 use crate::assembly::{self, Assembled, Place};
 use crate::material::{self, Definition};
@@ -31,19 +34,32 @@ fn counted(model: &Model, part: usize) -> String {
 fn node_rows(assembled: &Assembled, index: usize, depth: u32, rows: &mut Vec<ContentRow>) {
     let node = &assembled.nodes[index];
     // A model's own name is long enough: what it counts is in the inspector.
-    let (icon, tint, detail) = if node.attached.is_some() { (Icon::Package, Tint::Picture, String::new()) } else { (Icon::Bone, Tint::Structure, counted(&assembled.model, index)) };
+    let (icon, tint, detail) = if node.attached.is_some() {
+        (Icon::Package, Tint::Picture, String::new())
+    } else {
+        (Icon::Bone, Tint::Structure, counted(&assembled.model, index))
+    };
     let mut row = ContentRow::new(&format!("{BONE}{index}"), &node.name).detail(&detail).depth(depth).icon(icon, tint);
     match &node.place {
         Some(Place::Fill(_)) if node.attached.is_some() => {
-            row = row.drags(ATTACHMENT).takes(&[ATTACHMENT, "asset:model"]).action(ContentAction::new(DETACH, "Detach").icon(Icon::Cross).on_row());
+            row = row
+                .drags(ATTACHMENT)
+                .takes(&[ATTACHMENT, "asset:model"])
+                .action(ContentAction::new(DETACH, "Detach").icon(Icon::Cross).on_row());
         }
         Some(Place::Fill(_)) => {
-            row = row.detail("open").drags(ATTACHMENT).takes(&[ATTACHMENT, "asset:model"]).action(ContentAction::new(REMOVE, "Remove the part").icon(Icon::Cross).on_row());
+            row = row
+                .detail("open")
+                .drags(ATTACHMENT)
+                .takes(&[ATTACHMENT, "asset:model"])
+                .action(ContentAction::new(REMOVE, "Remove the part").icon(Icon::Cross).on_row());
         }
         Some(Place::Pose(name)) => {
             row = row.takes(&[ATTACHMENT, "asset:model"]);
             if assembled.posed.contains(name) {
-                row = row.detail(&format!("{detail}  moved")).action(ContentAction::new(REVERT, "Revert to the skeleton").icon(Icon::Cross).on_row());
+                row = row
+                    .detail(&format!("{detail}  moved"))
+                    .action(ContentAction::new(REVERT, "Revert to the skeleton").icon(Icon::Cross).on_row());
             }
         }
         _ => {}
@@ -67,10 +83,13 @@ fn material_contents(asset: &Asset) -> Contents {
     let mut rows = vec![ContentRow::heading("shader", read.shader.label)];
     for (key, label) in read.shader.textures {
         let held = asset.field(key);
-        let detail = held.map_or_else(|| "Empty".to_string(), |texture| {
-            let cell = material::cell_of(texture).unwrap_or("?");
-            material::palette_of(texture).map_or_else(|| cell.to_string(), |palette| format!("{cell}  {palette}"))
-        });
+        let detail = held.map_or_else(
+            || "Empty".to_string(),
+            |texture| {
+                let cell = material::cell_of(texture).unwrap_or("?");
+                material::palette_of(texture).map_or_else(|| cell.to_string(), |palette| format!("{cell}  {palette}"))
+            },
+        );
         rows.push(ContentRow::new(&format!("textures/{key}"), label).detail(&detail).icon(Icon::Image, Tint::Picture));
     }
     Contents { rows, stack: false, ..Contents::default() }
@@ -122,14 +141,29 @@ fn remove(asset: &Asset, project: &dyn Project, name: &str, within: &[String]) -
     if prefab::filled(asset, project)?.iter().any(|part| part.node.as_deref() == Some(name)) {
         bail!("something hangs on {name}");
     }
-    let members = asset.parts("groups").into_iter().filter_map(|(_, members)| members.as_table()).flat_map(|members| members.values());
+    let members = asset
+        .parts("groups")
+        .into_iter()
+        .filter_map(|(_, members)| members.as_table())
+        .flat_map(|members| members.values());
     if members.into_iter().any(|member| member.get(name).is_some()) {
         bail!("a member of a group fills {name}");
     }
-    Ok(ContentOutcome { label: format!("Remove {name}"), sets: vec![(within.to_vec(), None)], writes: None, select: None })
+    Ok(ContentOutcome {
+        label: format!("Remove {name}"),
+        sets: vec![(within.to_vec(), None)],
+        writes: None,
+        select: None,
+    })
 }
 
-fn act_on_node(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &str, action: &str) -> Result<ContentOutcome> {
+fn act_on_node(
+    asset: &Asset,
+    project: &dyn Project,
+    assembled: &Assembled,
+    row: &str,
+    action: &str,
+) -> Result<ContentOutcome> {
     let node = &assembled.nodes[node_at(assembled, row)?];
     match (&node.place, action) {
         (Some(Place::Fill(within)), DETACH) => Ok(detach(asset, &node.name, within)),
@@ -138,32 +172,59 @@ fn act_on_node(asset: &Asset, project: &dyn Project, assembled: &Assembled, row:
             let mut poses = asset.field("pose").and_then(Value::as_table).cloned().unwrap_or_default();
             poses.remove(name);
             let sets = vec![(vec!["pose".to_string()], (!poses.is_empty()).then_some(Value::Table(poses)))];
-            Ok(ContentOutcome { label: format!("Revert {name} to the skeleton"), sets, writes: None, select: Some(row.to_string()) })
+            Ok(ContentOutcome {
+                label: format!("Revert {name} to the skeleton"),
+                sets,
+                writes: None,
+                select: Some(row.to_string()),
+            })
         }
         _ => bail!("no action {action} on {}", node.name),
     }
 }
 
 /// A part moved onto another node: what fills it comes along.
-fn reattach(asset: &Asset, project: &dyn Project, assembled: &Assembled, row: &str, onto: &str) -> Result<ContentOutcome> {
+fn reattach(
+    asset: &Asset,
+    project: &dyn Project,
+    assembled: &Assembled,
+    row: &str,
+    onto: &str,
+) -> Result<ContentOutcome> {
     let (node, target) = (&assembled.nodes[node_at(assembled, row)?], &assembled.nodes[node_at(assembled, onto)?]);
-    let (Some(Place::Fill(_)), Some(Place::Pose(_) | Place::Fill(_))) = (&node.place, &target.place) else { bail!("only a part moves, and onto a joint or a part") };
+    let (Some(Place::Fill(_)), Some(Place::Pose(_) | Place::Fill(_))) = (&node.place, &target.place) else {
+        bail!("only a part moves, and onto a joint or a part")
+    };
     if prefab::hangs_from(&prefab::filled(asset, project)?, &target.name, &node.name) {
         bail!("{} hangs from {}", target.name, node.name);
     }
     let path = vec!["parts".to_string(), node.name.clone(), "node".to_string()];
-    Ok(ContentOutcome { label: format!("Attach {} to {}", node.name, target.name), sets: vec![(path, Some(target.name.as_str().into()))], writes: None, select: None })
+    Ok(ContentOutcome {
+        label: format!("Attach {} to {}", node.name, target.name),
+        sets: vec![(path, Some(target.name.as_str().into()))],
+        writes: None,
+        select: None,
+    })
 }
 
 /// A part's name from a model's, kept apart from those there are.
 fn new_part(asset: &Asset, name: &str) -> String {
     let taken = |candidate: &str| asset.field("parts").is_some_and(|parts| parts.get(candidate).is_some());
     let held = asset.parts("parts").len() + 1;
-    (1..=held).map(|at| if at == 1 { name.to_string() } else { format!("{name}_{at}") }).find(|candidate| !taken(candidate)).unwrap_or_else(|| name.to_string())
+    (1..=held)
+        .map(|at| if at == 1 { name.to_string() } else { format!("{name}_{at}") })
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// A model from the assets: it fills an open part, or becomes a new part on what it was dropped on.
-fn attach_model(asset: &Asset, project: &dyn Project, assembled: &Assembled, onto: &str, path: &str) -> Result<ContentOutcome> {
+fn attach_model(
+    asset: &Asset,
+    project: &dyn Project,
+    assembled: &Assembled,
+    onto: &str,
+    path: &str,
+) -> Result<ContentOutcome> {
     let target = &assembled.nodes[node_at(assembled, onto)?];
     let dropped = project.asset(path).ok_or_else(|| anyhow!("{path} is not in the project"))?;
     let uid = dropped.uid().ok_or_else(|| anyhow!("{path} has no uid"))?;
@@ -171,13 +232,23 @@ fn attach_model(asset: &Asset, project: &dyn Project, assembled: &Assembled, ont
     if let (Some(Place::Fill(within)), None) = (&target.place, &target.attached) {
         let mut at = within.clone();
         at.push("model".to_string());
-        return Ok(ContentOutcome { label: format!("Fill {} with {name}", target.name), sets: vec![(at, Some(reference(uid)))], writes: None, select: None });
+        return Ok(ContentOutcome {
+            label: format!("Fill {} with {name}", target.name),
+            sets: vec![(at, Some(reference(uid)))],
+            writes: None,
+            select: None,
+        });
     }
     let mut part = pe2_ext::Table::new();
     part.insert("node".to_string(), target.name.as_str().into());
     part.insert("model".to_string(), reference(uid));
     let at = vec!["parts".to_string(), new_part(asset, name)];
-    Ok(ContentOutcome { label: format!("Attach {name} to {}", target.name), sets: vec![(at, Some(Value::Table(part)))], writes: None, select: None })
+    Ok(ContentOutcome {
+        label: format!("Attach {name} to {}", target.name),
+        sets: vec![(at, Some(Value::Table(part)))],
+        writes: None,
+        select: None,
+    })
 }
 
 /// Something done in a prefab's contents.
@@ -194,12 +265,23 @@ pub fn act(asset: &Asset, project: &dyn Project, request: ContentRequest) -> Res
 /// Euler angles in degrees, the order the game applies them: Rx Ry Rz.
 pub fn euler_degrees(m: &[[f32; 3]; 3]) -> [f32; 3] {
     let y = m[0][2].clamp(-1.0, 1.0).asin();
-    let (x, z) = if m[0][2].abs() < 0.999_9 { ((-m[1][2]).atan2(m[2][2]), (-m[0][1]).atan2(m[0][0])) } else { (m[2][1].atan2(m[1][1]), 0.0) };
+    let (x, z) = if m[0][2].abs() < 0.999_9 {
+        ((-m[1][2]).atan2(m[2][2]), (-m[0][1]).atan2(m[0][0]))
+    } else {
+        (m[2][1].atan2(m[1][1]), 0.0)
+    };
     [x.to_degrees(), y.to_degrees(), z.to_degrees()]
 }
 
 fn field(key: &str, label: &str, value: impl Into<Value>) -> PartField {
-    PartField { key: key.to_string(), label: label.to_string(), value: Some(value.into()), absent: None, choices: Vec::new(), read_only: true }
+    PartField {
+        key: key.to_string(),
+        label: label.to_string(),
+        value: Some(value.into()),
+        absent: None,
+        choices: Vec::new(),
+        read_only: true,
+    }
 }
 
 /// Three numbers, as the inspector lays them out by axis; a tenth rounded to nothing reads as nothing.
@@ -225,7 +307,8 @@ fn vector(key: &str, label: &str, value: Value, editable: bool) -> PartField {
 fn node_sheet(assembled: &Assembled, asset: &Asset, index: usize) -> Option<PartSheet> {
     let model = &assembled.model;
     let (node, part) = (assembled.nodes.get(index)?, model.parts.get(index)?);
-    let parent = if part.parent == index { "None (root)".to_string() } else { assembled.nodes.get(part.parent)?.name.clone() };
+    let parent =
+        if part.parent == index { "None (root)".to_string() } else { assembled.nodes.get(part.parent)?.name.clone() };
     let matrix = part.rotation.map(|row| row.map(|x| f32::from(x) / 4096.0));
     let length = |axis: usize| (0..3).map(|row| matrix[row][axis] * matrix[row][axis]).sum::<f32>().sqrt();
     let mut fields = vec![field("name", "Name", node.name.clone()), field("parent", "Parent", parent)];
@@ -242,7 +325,8 @@ fn node_sheet(assembled: &Assembled, asset: &Asset, index: usize) -> Option<Part
             let fill = prefab::fill_at(asset, within)?;
             translation = whole(skeleton::translation_of(fill).unwrap_or_default());
             #[expect(clippy::cast_possible_truncation, reason = "what is shown of a number stored wider")]
-            let held = |key: &str, none: f64| axes(skeleton::numbers_of(fill, key).unwrap_or([none; 3]).map(|x| x as f32));
+            let held =
+                |key: &str, none: f64| axes(skeleton::numbers_of(fill, key).unwrap_or([none; 3]).map(|x| x as f32));
             (rotation, scale) = (held("rotation", 0.0), held("scale", 1.0));
             within.clone()
         }

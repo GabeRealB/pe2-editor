@@ -55,7 +55,8 @@ const PLAIN: [f32; 3] = [0.55, 0.55, 0.58];
 
 impl Paint {
     /// What a view offers.
-    pub const ALL: [(Paint, &'static str); 3] = [(Paint::Off, "Textures"), (Paint::Shading, "Shading"), (Paint::Source, "Color source")];
+    pub const ALL: [(Paint, &'static str); 3] =
+        [(Paint::Off, "Textures"), (Paint::Shading, "Shading"), (Paint::Source, "Color source")];
 
     /// How a view's note keeps it.
     #[must_use]
@@ -93,7 +94,11 @@ impl Paint {
         let by_source = |source: Source| model.faces.iter().filter(|face| face.source() == source).count();
         let all = match self {
             Paint::Off => Vec::new(),
-            Paint::Shading => vec![(SMOOTH, "Smooth", by_shading(Shading::Smooth)), (FLAT, "Flat", by_shading(Shading::Flat)), (UNLIT, "Unlit", by_shading(Shading::Unlit))],
+            Paint::Shading => vec![
+                (SMOOTH, "Smooth", by_shading(Shading::Smooth)),
+                (FLAT, "Flat", by_shading(Shading::Flat)),
+                (UNLIT, "Unlit", by_shading(Shading::Unlit)),
+            ],
             Paint::Source => vec![
                 (TEXTURED, "Textured", by_source(Source::Textured)),
                 (VERTEX, "Vertex colors", by_source(Source::Vertex)),
@@ -210,7 +215,11 @@ pub struct Scene {
 fn rest(model: &Model) -> Vec<Local> {
     let fixed = |x: i16| f32::from(x) / 4096.0;
     #[expect(clippy::cast_precision_loss, reason = "a model's coordinates are far from where floats lose them")]
-    model.parts.iter().map(|p| Local { rotation: p.rotation.map(|row| row.map(fixed)), translation: p.translation.map(|x| x as f32) }).collect()
+    model
+        .parts
+        .iter()
+        .map(|p| Local { rotation: p.rotation.map(|row| row.map(fixed)), translation: p.translation.map(|x| x as f32) })
+        .collect()
 }
 
 impl Scene {
@@ -218,7 +227,18 @@ impl Scene {
     pub fn new(model: Model) -> Scene {
         let rest = rest(&model);
         let owners = model.owners();
-        let mut scene = Scene { model, regions: Vec::new(), layers: Vec::new(), only: None, pose: rest.clone(), rest, paint: Paint::Off, owners, center: [0.0; 3], radius: 1.0 };
+        let mut scene = Scene {
+            model,
+            regions: Vec::new(),
+            layers: Vec::new(),
+            only: None,
+            pose: rest.clone(),
+            rest,
+            paint: Paint::Off,
+            owners,
+            center: [0.0; 3],
+            radius: 1.0,
+        };
         // A skeleton has no vertices: its joints are what there is to frame.
         let mut positions = scene.positions();
         if positions.is_empty() {
@@ -253,7 +273,10 @@ impl Scene {
             World { rotation: local.rotation, position: local.translation }
         } else {
             let above = self.world(parent, out, depth + 1);
-            World { rotation: compose(&above.rotation, &local.rotation), position: add(rotate(&above.rotation, local.translation), above.position) }
+            World {
+                rotation: compose(&above.rotation, &local.rotation),
+                position: add(rotate(&above.rotation, local.translation), above.position),
+            }
         };
         out[index] = Some(world);
         world
@@ -273,7 +296,9 @@ impl Scene {
     /// The part a face belongs to: its own, or for one spanning parts its first corner's.
     #[must_use]
     fn shows(&self, face: &Face) -> bool {
-        self.only.as_ref().is_none_or(|only| self.part_of(face).is_some_and(|part| only.get(part).copied().unwrap_or(false)))
+        self.only
+            .as_ref()
+            .is_none_or(|only| self.part_of(face).is_some_and(|part| only.get(part).copied().unwrap_or(false)))
     }
 
     /// Show a part and what hangs from it, or everything.
@@ -328,7 +353,9 @@ impl Scene {
                 Some(paint) => paint,
                 None => color,
             };
-            let place = region.map_or([0.0; 3], |(region, uv)| [region[0] + f32::from(uv[0]) * region[2], region[1] + f32::from(uv[1]) * region[3], 1.0]);
+            let place = region.map_or([0.0; 3], |(region, uv)| {
+                [region[0] + f32::from(uv[0]) * region[2], region[1] + f32::from(uv[1]) * region[3], 1.0]
+            });
             for value in at(i).into_iter().chain(normal).chain(color.map(|x| x * weight)).chain(place) {
                 out.extend_from_slice(&value.to_le_bytes());
             }
@@ -414,7 +441,9 @@ impl Scene {
                     Shading::Flat => face.normal,
                     Shading::Unlit => None,
                 };
-                let found = stored.filter(|index| seen.insert((corner.vertex, *index))).and_then(|index| self.normal(&worlds, corner.vertex, index));
+                let found = stored
+                    .filter(|index| seen.insert((corner.vertex, *index)))
+                    .and_then(|index| self.normal(&worlds, corner.vertex, index));
                 if let (Some(at), Some(normal)) = (positions.get(corner.vertex), found) {
                     out.push((*at, normal));
                 }
@@ -430,7 +459,11 @@ impl Scene {
         let at = |index: usize| upright(worlds[index].position);
         let shown = |index: &usize| self.only.as_ref().is_none_or(|only| only.get(*index).copied().unwrap_or(false));
         let links = self.model.parts.iter().enumerate().filter(|(index, _)| shown(index));
-        links.map(|(index, part)| (at(index), (part.parent != index && part.parent < worlds.len()).then(|| at(part.parent)))).collect()
+        links
+            .map(|(index, part)| {
+                (at(index), (part.parent != index && part.parent < worlds.len()).then(|| at(part.parent)))
+            })
+            .collect()
     }
 
     /// The part a ray hits first.
@@ -519,11 +552,28 @@ mod tests {
         let fixed = [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]];
         Model {
             parts: vec![
-                Part { parent: 0, rotation: fixed, translation: [0, 0, 0], vertices: vec![[-10, 0, -10], [10, 0, -10], [10, 0, 10], [-10, 0, 10]] },
-                Part { parent: 0, rotation: [[0, -4096, 0], [4096, 0, 0], [0, 0, 4096]], translation: [0, -100, 0], vertices: vec![[50, 0, 0]] },
+                Part {
+                    parent: 0,
+                    rotation: fixed,
+                    translation: [0, 0, 0],
+                    vertices: vec![[-10, 0, -10], [10, 0, -10], [10, 0, 10], [-10, 0, 10]],
+                },
+                Part {
+                    parent: 0,
+                    rotation: [[0, -4096, 0], [4096, 0, 0], [0, 0, 4096]],
+                    translation: [0, -100, 0],
+                    vertices: vec![[50, 0, 0]],
+                },
             ],
             materials: vec![Material { transparent: false, slot: None, blend: None }],
-            faces: vec![Face { material: 0, shading: Shading::Unlit, part: Some(0), normal: None, color: None, corners: vec![corner(0), corner(1), corner(2), corner(3)] }],
+            faces: vec![Face {
+                material: 0,
+                shading: Shading::Unlit,
+                part: Some(0),
+                normal: None,
+                color: None,
+                corners: vec![corner(0), corner(1), corner(2), corner(3)],
+            }],
             ..Model::default()
         }
     }
@@ -605,7 +655,8 @@ mod tests {
         let face = scene.model.faces[0].clone();
         let model = &mut scene.model;
         model.faces = vec![face.clone(), Face { material: 1, ..face.clone() }, Face { material: 2, ..face }];
-        model.materials = blends.iter().map(|blend| Material { transparent: true, slot: None, blend: Some(*blend) }).collect();
+        model.materials =
+            blends.iter().map(|blend| Material { transparent: true, slot: None, blend: Some(*blend) }).collect();
         scene
     }
 
@@ -615,7 +666,11 @@ mod tests {
 
     #[test]
     fn what_blends_is_drawn_from_the_back_and_not_by_blend() {
-        let faces = [blended(Blend::Add, 5.0, 0, false), blended(Blend::Mix, 1.0, 1, false), blended(Blend::Add, 3.0, 2, false)];
+        let faces = [
+            blended(Blend::Add, 5.0, 0, false),
+            blended(Blend::Mix, 1.0, 1, false),
+            blended(Blend::Add, 3.0, 2, false),
+        ];
         let (_, runs) = in_depth_order(&faces, [0.0, 0.0, 1.0]);
         let blends: Vec<_> = runs.iter().map(|run| (run.blend, run.first)).collect();
         assert_eq!(blends, [(Blend::Mix, 0), (Blend::Add, 3)]);
@@ -625,14 +680,21 @@ mod tests {
 
     #[test]
     fn of_faces_at_one_depth_the_later_is_drawn_first_and_a_layer_after_its_base() {
-        let faces = [blended(Blend::Mix, 1.0, 0, false), blended(Blend::Subtract, 1.0, 1, false), blended(Blend::Add, 1.0, 1, true)];
+        let faces = [
+            blended(Blend::Mix, 1.0, 0, false),
+            blended(Blend::Subtract, 1.0, 1, false),
+            blended(Blend::Add, 1.0, 1, true),
+        ];
         let (_, runs) = in_depth_order(&faces, [0.0, 0.0, 1.0]);
         assert_eq!(runs.iter().map(|run| run.blend).collect::<Vec<_>>(), [Blend::Subtract, Blend::Add, Blend::Mix]);
     }
 
     #[test]
     fn a_layer_is_added_by_the_bit_the_game_sets() {
-        assert_eq!([Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter].map(layer_blend), [Blend::Add, Blend::Add, Blend::AddQuarter, Blend::AddQuarter]);
+        assert_eq!(
+            [Blend::Mix, Blend::Add, Blend::Subtract, Blend::AddQuarter].map(layer_blend),
+            [Blend::Add, Blend::Add, Blend::AddQuarter, Blend::AddQuarter]
+        );
     }
 
     #[test]
@@ -664,14 +726,16 @@ mod tests {
         scene.layers = vec![Some(([0.0; 4], 0.25))];
         let triangles = scene.triangles(None);
         assert_eq!(triangles.vertices, [6, 6]);
-        let color = |vertex: usize| f32::from_le_bytes(triangles.bytes[vertex * 48 + 24..vertex * 48 + 28].try_into().unwrap());
+        let color =
+            |vertex: usize| f32::from_le_bytes(triangles.bytes[vertex * 48 + 24..vertex * 48 + 28].try_into().unwrap());
         assert_eq!((color(0), color(6)), (0.75, 0.25));
     }
 
     #[test]
     fn isolating_a_part_keeps_it_and_what_hangs_from_it() {
         let mut scene = Scene::new(square());
-        let part = |parent, vertices| Part { parent, rotation: scene.model.parts[0].rotation, translation: [0; 3], vertices };
+        let part =
+            |parent, vertices| Part { parent, rotation: scene.model.parts[0].rotation, translation: [0; 3], vertices };
         let parts = vec![part(0, Vec::new()), part(0, Vec::new()), part(1, Vec::new())];
         scene.model.parts = parts;
         scene.isolate(Some(1));

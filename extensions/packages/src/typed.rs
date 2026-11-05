@@ -52,7 +52,10 @@ pub fn children(shape: &Table, value: Option<&Value>) -> Vec<(Step, String, Tabl
         let one = element(shape);
         return (0..count).map(|index| (Step::Index(index), format!("Element {index}"), one.clone())).collect();
     }
-    fields(shape).into_iter().map(|field| (Step::Field(text(field, "name").to_string()), text(field, "name").to_string(), field.clone())).collect()
+    fields(shape)
+        .into_iter()
+        .map(|field| (Step::Field(text(field, "name").to_string()), text(field, "name").to_string(), field.clone()))
+        .collect()
 }
 
 /// What a row's name says when pointed at: a field's comment, and what an integer's type holds.
@@ -63,7 +66,13 @@ pub fn about(shape: &Table) -> String {
     match (doc.is_empty(), range) {
         (true, Some(range)) => range,
         (false, Some(range)) => format!("{doc}\n{range}"),
-        (_, None) => if doc.is_empty() { text(shape, "type").to_string() } else { format!("{doc}\n{}", text(shape, "type")) },
+        (_, None) => {
+            if doc.is_empty() {
+                text(shape, "type").to_string()
+            } else {
+                format!("{doc}\n{}", text(shape, "type"))
+            }
+        }
     }
 }
 
@@ -86,14 +95,21 @@ pub fn effective(shape: &Table, default: Option<&Value>, given: Option<&Value>) 
         let defaults = default.and_then(Value::as_array).cloned().unwrap_or_default();
         let set = given.and_then(Value::as_array);
         let length = if dynamic { set.map_or(defaults.len().max(1), Vec::len) } else { count };
-        return Value::Array((0..length).map(|index| effective(&one, defaults.get(index), set.and_then(|list| list.get(index)))).collect());
+        return Value::Array(
+            (0..length)
+                .map(|index| effective(&one, defaults.get(index), set.and_then(|list| list.get(index))))
+                .collect(),
+        );
     }
     if range_of(shape).is_some() {
         return given.filter(|value| value.is_integer()).or(default).cloned().unwrap_or(Value::Integer(0));
     }
     let table = fields(shape).into_iter().map(|field| {
         let name = text(field, "name");
-        (name.to_string(), effective(field, default.and_then(|value| value.get(name)), given.and_then(|value| value.get(name))))
+        (
+            name.to_string(),
+            effective(field, default.and_then(|value| value.get(name)), given.and_then(|value| value.get(name))),
+        )
     });
     Value::Table(table.collect())
 }
@@ -118,7 +134,8 @@ pub fn minimal(shape: &Table, default: Option<&Value>, full: &Value) -> Option<V
                 None => item.clone(),
             })
             .collect();
-        let unchanged = items.len() == defaults.len() && list.iter().all(|value| value.as_table().is_some_and(Table::is_empty));
+        let unchanged =
+            items.len() == defaults.len() && list.iter().all(|value| value.as_table().is_some_and(Table::is_empty));
         return (!unchanged).then_some(Value::Array(list));
     }
     if range_of(shape).is_some() {
@@ -169,7 +186,13 @@ pub fn remove(shape: &Table, given: Option<&Value>, default: Option<&Value>, ind
 /// What a package's value becomes with one integer set (or, with none, taken back to the default): the least that differs from the
 /// default (`minimal`), none where nothing does.
 #[must_use]
-pub fn set(shape: &Table, given: Option<&Value>, default: Option<&Value>, path: &[Step], new: Option<i64>) -> Option<Value> {
+pub fn set(
+    shape: &Table,
+    given: Option<&Value>,
+    default: Option<&Value>,
+    path: &[Step],
+    new: Option<i64>,
+) -> Option<Value> {
     let mut full = effective(shape, default, given);
     let back = at(default, path).cloned().unwrap_or(Value::Integer(0));
     if let Some(slot) = at_mut(&mut full, path) {
@@ -200,12 +223,16 @@ pub fn checked(typed: &str, leaf_ty: &str, low: i64, high: i64) -> Result<i64, S
 #[must_use]
 pub fn wrong(shape: &Table, given: &Value) -> Option<String> {
     if is_dynamic(shape) {
-        let Some(list) = given.as_array().filter(|list| !list.is_empty()) else { return Some(format!("is one or more of {}", text(shape, "type"))) };
+        let Some(list) = given.as_array().filter(|list| !list.is_empty()) else {
+            return Some(format!("is one or more of {}", text(shape, "type")));
+        };
         let one = element(shape);
         return list.iter().find_map(|value| wrong(&one, value));
     }
     if let Some(count) = count_of(shape) {
-        let Some(list) = given.as_array().filter(|list| list.len() == count) else { return Some(format!("is {count} of {}", text(shape, "type"))) };
+        let Some(list) = given.as_array().filter(|list| list.len() == count) else {
+            return Some(format!("is {count} of {}", text(shape, "type")));
+        };
         let one = element(shape);
         return list.iter().find_map(|value| wrong(&one, value));
     }
@@ -213,7 +240,9 @@ pub fn wrong(shape: &Table, given: &Value) -> Option<String> {
         let fits = given.as_integer().is_some_and(|number| (low..=high).contains(&number));
         return (!fits).then(|| format!("a {} is {low} to {high}", text(shape, "type")));
     }
-    let Some(table) = given.as_table() else { return Some(format!("a {} is set by a table of its fields", text(shape, "type"))) };
+    let Some(table) = given.as_table() else {
+        return Some(format!("a {} is set by a table of its fields", text(shape, "type")));
+    };
     let known = fields(shape);
     if let Some(name) = table.keys().find(|name| !known.iter().any(|field| text(field, "name") == name.as_str())) {
         return Some(format!("a {} has no field {name}", text(shape, "type")));

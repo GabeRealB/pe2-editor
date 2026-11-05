@@ -56,10 +56,14 @@ fn model_as(call: &Call, fields: &Table, fill: Option<&Value>, pose: Option<&Val
     let mut bindings = Vec::with_capacity(slots.len());
     for slot in &slots {
         let overrides = fill.and_then(|fill| fill.get("overrides")?.get(slot));
-        let named = overrides.and_then(|overrides| overrides.get("material")).or_else(|| materials.and_then(|materials| materials.get(slot)));
+        let named = overrides
+            .and_then(|overrides| overrides.get("material"))
+            .or_else(|| materials.and_then(|materials| materials.get(slot)));
         let filled = named.and_then(pe2_ext::target_of).ok_or_else(|| anyhow!("its slot {slot} is empty"))?;
         let mut settings = call.table_of(filled, SETTINGS)?;
-        for (key, value) in overrides.and_then(Value::as_table).into_iter().flatten().filter(|(key, _)| *key != "material") {
+        for (key, value) in
+            overrides.and_then(Value::as_table).into_iter().flatten().filter(|(key, _)| *key != "material")
+        {
             settings.insert(key.clone(), value.clone());
         }
         bindings.push(binding_of(call, &settings).map_err(|why| anyhow!("{slot}: {why:#}"))?);
@@ -108,7 +112,10 @@ fn items(values: impl IntoIterator<Item = Value>) -> String {
 pub fn definition(symbol: &str, arrays: &Arrays) -> String {
     let triple = |row: &[i16; 3]| numbers(row.iter().copied().map(i64::from));
     let bone = |bone: &pe2_model::model::Bone| {
-        let matrix = Value::Array(vec![Value::Array(bone.rotation.iter().map(triple).collect()), numbers(bone.translation.iter().copied().map(i64::from))]);
+        let matrix = Value::Array(vec![
+            Value::Array(bone.rotation.iter().map(triple).collect()),
+            numbers(bone.translation.iter().copied().map(i64::from)),
+        ]);
         Value::Array(vec![matrix, Value::Integer(i64::from(bone.parent))])
     };
     let point = |point: &[i16; 3]| numbers(point.iter().copied().map(i64::from).chain([0]));
@@ -171,8 +178,11 @@ fn material_clut(call: &Call, _: &Args) -> Result<String> {
 
 /// An image's texels, as the initializer of a C array of its words.
 fn image_words(call: &Call, _: &Args) -> Result<String> {
-    let Some(Data::Typed(native)) = call.inputs.first().and_then(|port| port.first()) else { bail!("it is given no image") };
-    let texels = native.files.iter().find(|file| file.name == "native.texels").ok_or_else(|| anyhow!("it has no texels"))?;
+    let Some(Data::Typed(native)) = call.inputs.first().and_then(|port| port.first()) else {
+        bail!("it is given no image")
+    };
+    let texels =
+        native.files.iter().find(|file| file.name == "native.texels").ok_or_else(|| anyhow!("it has no texels"))?;
     let bytes = call.read(texels)?;
     let (words, rest) = bytes.as_chunks::<4>();
     if !rest.is_empty() {
@@ -245,7 +255,8 @@ fn image_depth(call: &Call, _: &Args) -> Result<String> {
 fn image_palette(call: &Call) -> Result<[i64; 2]> {
     let given = call.given();
     let palettes = given.get("palettes").and_then(Value::as_table).ok_or_else(|| anyhow!("it has no palettes"))?;
-    let palette = palettes.get("default").or_else(|| palettes.values().next()).ok_or_else(|| anyhow!("it has no palettes"))?;
+    let palette =
+        palettes.get("default").or_else(|| palettes.values().next()).ok_or_else(|| anyhow!("it has no palettes"))?;
     placed(call, palette).ok_or_else(|| anyhow!("its palette is placed nowhere"))
 }
 
@@ -261,9 +272,15 @@ fn image_palette_y(call: &Call, _: &Args) -> Result<String> {
 fn image_cell(call: &Call, args: &Args) -> Result<[i64; 4]> {
     let name = args.one("cell")?;
     let given = call.given();
-    let rect = given.get("cells").and_then(|cells| cells.get(name)).and_then(|cell| cell.get("rect")).and_then(Value::as_array);
+    let rect = given
+        .get("cells")
+        .and_then(|cells| cells.get(name))
+        .and_then(|cell| cell.get("rect"))
+        .and_then(Value::as_array);
     let rect = rect.ok_or_else(|| anyhow!("it has no cell {name}"))?;
-    let side = |at: usize| rect.get(at).and_then(Value::as_integer).ok_or_else(|| anyhow!("cell {name}'s rect is no four numbers"));
+    let side = |at: usize| {
+        rect.get(at).and_then(Value::as_integer).ok_or_else(|| anyhow!("cell {name}'s rect is no four numbers"))
+    };
     let ([x, y], [page_x, page_y]) = (image_placed(call)?, image_page(call)?);
     Ok([(x - page_x) * (16 / image_bits(call)) + side(0)?, (y - page_y) + side(1)?, side(2)?, side(3)?])
 }
@@ -293,7 +310,8 @@ fn list_count(call: &Call, _: &Args) -> Result<String> {
 /// An item's `id`, as its own tokenizer reads it: the item's output leads to it, with the args it is read by.
 fn item_id(call: &Call, at: usize) -> Result<i64> {
     let led = call.table_of(call.host.path(), &format!("items/{at}"))?;
-    let node = led.get(pe2_ext::tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("item {at} leads nowhere"))?;
+    let node =
+        led.get(pe2_ext::tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("item {at} leads nowhere"))?;
     let held = led.get(pe2_ext::tokens::ARGS).and_then(Value::as_table).into_iter().flatten();
     let args = Args(held.filter_map(|(name, value)| Some((name.clone(), vec![value.as_str()?.to_string()]))).collect());
     let output = crate::gather::tokenizer_of(call, node)?;
@@ -320,7 +338,10 @@ fn group_file_id(call: &Call, args: &Args) -> Result<String> {
     let given = call.given();
     let files = given.get("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let file = files.iter().find(|file| file.get("name").and_then(Value::as_str) == Some(name));
-    let id = file.and_then(|file| file.get("id")).and_then(Value::as_integer).ok_or_else(|| anyhow!("it has no file {name}"))?;
+    let id = file
+        .and_then(|file| file.get("id"))
+        .and_then(Value::as_integer)
+        .ok_or_else(|| anyhow!("it has no file {name}"))?;
     let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
     let layout = call.table_of(&format!("disc/{release}/stage0"), SETTINGS)?;
     let groups = layout.get("groups").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
@@ -329,7 +350,10 @@ fn group_file_id(call: &Call, args: &Args) -> Result<String> {
         let named = group.get("asset").and_then(pe2_ext::target_of).and_then(|asset| call.node_named(asset));
         named.is_some_and(|named| named.path == here)
     });
-    let group = mine.and_then(|group| group.get("id")).and_then(Value::as_integer).ok_or_else(|| anyhow!("stage 0 of {release} lists no {here}"))?;
+    let group = mine
+        .and_then(|group| group.get("id"))
+        .and_then(Value::as_integer)
+        .ok_or_else(|| anyhow!("stage 0 of {release} lists no {here}"))?;
     Ok((group * 10_000 + id).to_string())
 }
 
@@ -343,7 +367,11 @@ fn file_stream_id(call: &Call, args: &Args) -> Result<String> {
     for stream in streams {
         let integer = |key: &str| stream.get(key).and_then(Value::as_integer);
         let movie = stream.get("type").and_then(Value::as_str) == Some("movie");
-        let id = if movie { integer("view").unwrap_or(100 + cutscenes) } else { integer("id").ok_or_else(|| anyhow!("a scene with no id"))? };
+        let id = if movie {
+            integer("view").unwrap_or(100 + cutscenes)
+        } else {
+            integer("id").ok_or_else(|| anyhow!("a scene with no id"))?
+        };
         if stream.get("name").and_then(Value::as_str) == Some(name) {
             return Ok(id.to_string());
         }
@@ -396,11 +424,17 @@ pub fn register(r: &mut Registry) {
         .derived("step", Yields::IntLiteral, &[], list_step)
         .register();
     // A file of a group, as the group reads it (`files/<name>`).
-    r.tokenizer(&["pe2.game@file_group"]).follows().derived("id", Yields::IntLiteral, &["file"], group_file_id).register();
+    r.tokenizer(&["pe2.game@file_group"])
+        .follows()
+        .derived("id", Yields::IntLiteral, &["file"], group_file_id)
+        .register();
     // A stream of a file, as the file reads it (`streams/<name>`).
     r.tokenizer(&["pe2.game@file"]).follows().derived("id", Yields::IntLiteral, &["stream"], file_stream_id).register();
     for node_type in ["pe2.render@model", "pe2.render@material", "pe2.images@image"] {
-        let _ = r.extend(node_type).inspector_tab("Tokens", pe2_ext::Icon::Text, &[], |_| Box::new(crate::views::Tokens::default())).register();
+        let _ = r
+            .extend(node_type)
+            .inspector_tab("Tokens", pe2_ext::Icon::Text, &[], |_| Box::new(crate::views::Tokens::default()))
+            .register();
     }
 }
 
@@ -419,7 +453,12 @@ mod tests {
 
     #[test]
     fn a_definition_holds_the_arrays_before_the_record() {
-        let part = Part { parent: 0, rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], translation: [1, -2, 3], vertices: vec![[1, 2, 3]] };
+        let part = Part {
+            parent: 0,
+            rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            translation: [1, -2, 3],
+            vertices: vec![[1, 2, 3]],
+        };
         let held = Model { parts: vec![part], ..Model::default() };
         let text = definition("gBody", &arrays(&held, &[]).unwrap());
         assert!(text.starts_with("static TmdBone _gBodySkeleton[] = { { { { { 4096, 0, 0 }, { 0, 4096, 0 }, { 0, 0, 4096 } }, { 1, -2, 3 } }, 0 } };"), "{text}");

@@ -713,7 +713,8 @@ impl Workspace {
         // Reading every folder of a project to watch it takes more than a frame has.
         let (ctx, (started, starting)) = (ctx.clone(), mpsc::channel());
         let start = move || {
-            let watch = Watch::start(&roots, &shallow, ignore, ctx.clone()).map_err(|e| format!("the layers are not watched: {e}"));
+            let watch = Watch::start(&roots, &shallow, ignore, ctx.clone())
+                .map_err(|e| format!("the layers are not watched: {e}"));
             let _ = started.send(watch);
             ctx.request_repaint();
         };
@@ -796,12 +797,23 @@ impl Workspace {
     /// No layer takes it, or it cannot be written.
     pub fn new_event(&mut self, name: &str) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
-        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id))).map_err(|e| e.to_string())?;
+        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
+            .map_err(|e| e.to_string())?;
         let uid = project::uid::text(id);
-        let slug: String = name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        let slug: String =
+            name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let quoted = toml::Value::String(name.to_string());
         let declaration = format!("uid = \"{uid}\"\n\n[[stack]]\nop = \"pe2.events@event\"\nlabel = {quoted}\n");
-        project::edit::create(&self.project, &self.index, &layer, &uid, &format!("events/{slug}"), (&declaration, &[]), &mut self.history).map_err(|e| format!("{e:#}"))?;
+        project::edit::create(
+            &self.project,
+            &self.index,
+            &layer,
+            &uid,
+            &format!("events/{slug}"),
+            (&declaration, &[]),
+            &mut self.history,
+        )
+        .map_err(|e| format!("{e:#}"))?;
         Ok(())
     }
 
@@ -812,23 +824,38 @@ impl Workspace {
     pub fn new_node(&mut self, template: &str, file: Option<&Path>) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let found = self.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
-        let name = file.and_then(|file| file.file_name()).and_then(|name| name.to_str()).unwrap_or_default().to_string();
+        let name =
+            file.and_then(|file| file.file_name()).and_then(|name| name.to_str()).unwrap_or_default().to_string();
         let stem = file.and_then(|file| file.file_stem()).and_then(|stem| stem.to_str()).unwrap_or(template);
-        let slug: String = stem.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        let slug: String =
+            stem.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let at = |n: usize| {
             let leaf = if n == 0 { slug.clone() } else { format!("{slug}_{n}") };
             if self.asset_folder.is_empty() { leaf } else { format!("{}/{leaf}", self.asset_folder) }
         };
-        let path = (0..=self.index.assets.len()).map(at).find(|path| !self.index.assets.contains_key(path)).unwrap_or_default();
+        let path = (0..=self.index.assets.len())
+            .map(at)
+            .find(|path| !self.index.assets.contains_key(path))
+            .unwrap_or_default();
         let stack = self.extensions.stamp(found, &name)?;
         // A stack naming its own file has the file under that name.
         let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
-        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id))).map_err(|e| e.to_string())?;
+        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
+            .map_err(|e| e.to_string())?;
         let uid = project::uid::text(id);
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
         let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
         let files: Vec<(&str, &[u8])> = bytes.as_deref().map(|bytes| (name.as_str(), bytes)).into_iter().collect();
-        project::edit::create(&self.project, &self.index, &layer, &uid, &path, (&declaration, &files), &mut self.history).map_err(|e| format!("{e:#}"))?;
+        project::edit::create(
+            &self.project,
+            &self.index,
+            &layer,
+            &uid,
+            &path,
+            (&declaration, &files),
+            &mut self.history,
+        )
+        .map_err(|e| format!("{e:#}"))?;
         // Shown once it is taken in: until then nothing is there to open.
         let ticket = self.take_written();
         self.selection_after = ticket.map(|ticket| (ticket, path));
@@ -842,7 +869,9 @@ impl Workspace {
     #[cfg(any(test, feature = "tests"))]
     pub fn make_node(&mut self, uid: &str, path: &str, node: (&str, &[(&str, &[u8])])) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
-        project::edit::create(&self.project, &self.index, &layer, uid, path, node, &mut self.history).map(drop).map_err(|e| format!("{e:#}"))
+        project::edit::create(&self.project, &self.index, &layer, uid, path, node, &mut self.history)
+            .map(drop)
+            .map_err(|e| format!("{e:#}"))
     }
 
     /// Leave an asset out of the config in use, or take it back. It is the project's, so written in its `project.toml`, as a step.
@@ -878,7 +907,12 @@ impl Workspace {
         self.runner.busy()
     }
 
-    fn signal_all(&mut self, roots: Vec<String>, config: Option<project::Config>, reply: Option<mpsc::Sender<mcp::Reply>>) {
+    fn signal_all(
+        &mut self,
+        roots: Vec<String>,
+        config: Option<project::Config>,
+        reply: Option<mpsc::Sender<mcp::Reply>>,
+    ) {
         if !self.attached() {
             self.held_events.push((roots, config, reply));
             return;
@@ -919,7 +953,8 @@ impl Workspace {
         let arrived: Vec<_> = requests.try_iter().collect();
         for (request, reply) in arrived {
             if let mcp::Request::Signal { events, config } = &request {
-                let config = config.as_ref().and_then(|name| self.project.configs.iter().find(|c| c.name == *name)).cloned();
+                let config =
+                    config.as_ref().and_then(|name| self.project.configs.iter().find(|c| c.name == *name)).cloned();
                 self.signal_all(events.clone(), config, Some(reply));
                 continue;
             }
@@ -940,7 +975,12 @@ impl Workspace {
         let selection = self.selected.clone();
         let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
         let editor = mcp::EditorState { selection, variant, show: None, performance: crate::perf::read() };
-        let mut view = mcp::View { project: &self.project, index: &self.index, extensions: &self.extensions, editor: Some(editor) };
+        let mut view = mcp::View {
+            project: &self.project,
+            index: &self.index,
+            extensions: &self.extensions,
+            editor: Some(editor),
+        };
         let answer = mcp::answer(&mut view, request);
         let show = view.editor.and_then(|e| e.show);
         if let Some(path) = show {
@@ -1062,7 +1102,8 @@ impl Workspace {
             if let Some(said) = snapshot.said {
                 self.outcome = Update::Said(said);
             }
-            let before = (std::mem::replace(&mut self.index, snapshot.index), std::mem::replace(&mut self.tree, snapshot.tree));
+            let before =
+                (std::mem::replace(&mut self.index, snapshot.index), std::mem::replace(&mut self.tree, snapshot.tree));
             self.revision += 1;
             if let Some(reloaded) = snapshot.reloaded {
                 self.take_up(reloaded, snapshot.all);
@@ -1218,7 +1259,9 @@ impl Workspace {
         if let Some(part) = inner.strip_prefix('#') {
             let row = self.contents_of(&asset).rows.iter().any(|row| row.id == part && !row.is_heading());
             // A view may hold what it selected; only it could say whether that is still there.
-            return row || self.extensions.addresses(&asset).iter().any(|(address, _)| address == part) || !self.extensions.contents_views(&asset).is_empty();
+            return row
+                || self.extensions.addresses(&asset).iter().any(|(address, _)| address == part)
+                || !self.extensions.contents_views(&asset).is_empty();
         }
         crate::inspector::layer_of_inner(&inner).is_none_or(|(at, op)| {
             let layer = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
@@ -1418,7 +1461,13 @@ impl Workspace {
         let text = self.applied.text(&uid)?;
         let name = path.rsplit('/').next().unwrap_or(path);
         let label = format!("Revert the settings of {name}");
-        Some(EditRequest::Write { uid, file: project::index::NODE_FILE.to_string(), bytes: text.into_bytes(), label, merge: None })
+        Some(EditRequest::Write {
+            uid,
+            file: project::index::NODE_FILE.to_string(),
+            bytes: text.into_bytes(),
+            label,
+            merge: None,
+        })
     }
 
     /// Make an edit in the active layer: a step of the history, the index taking it in at once. Returns what was done.
@@ -1498,9 +1547,11 @@ impl Workspace {
         let asset = self.index.assets.get(path)?;
         let name = project::graph::import_of(asset.fields())?.source;
         let file = asset.files.iter().find(|f| f.name == name && f.made_by.is_none())?;
-        let category = self.extensions.recognize(file).into_iter().find_map(|(format, _)| {
-            crate::external::Category::of_media_type(format.media_type.as_deref()?)
-        })?;
+        let category = self
+            .extensions
+            .recognize(file)
+            .into_iter()
+            .find_map(|(format, _)| crate::external::Category::of_media_type(format.media_type.as_deref()?))?;
         Some((category, file))
     }
 
@@ -1511,7 +1562,8 @@ impl Workspace {
     /// # Errors
     /// No such asset, no source or tool for it, the active layer cannot take it, or the tool cannot be started.
     pub fn edit_in(&mut self, uid: &str, tools: &crate::settings::Tools) -> anyhow::Result<String> {
-        let path_of = |ws: &Workspace| ws.index.assets.values().find(|a| a.uid.as_deref() == Some(uid)).map(|a| a.path.clone());
+        let path_of =
+            |ws: &Workspace| ws.index.assets.values().find(|a| a.uid.as_deref() == Some(uid)).map(|a| a.path.clone());
         let path = path_of(self).with_context(|| format!("{uid}: no such asset"))?;
         let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
         let (_, source) = self.source_tool(&path).context("it has no source a tool of the settings edits")?;
@@ -1601,8 +1653,19 @@ impl Workspace {
     /// # Errors
     /// It is gone, or it fails.
     pub fn run_tool(&self, name: &str) -> std::result::Result<String, String> {
-        let tool = self.extensions.tools().iter().find(|t| t.name.to_string() == name).ok_or_else(|| format!("no tool {name}"))?;
-        let lens = Lens { index: &self.index, extensions: &self.extensions, chosen: Some(&self.chosen), selection: self.selected.as_deref(), revision: self.revision };
+        let tool = self
+            .extensions
+            .tools()
+            .iter()
+            .find(|t| t.name.to_string() == name)
+            .ok_or_else(|| format!("no tool {name}"))?;
+        let lens = Lens {
+            index: &self.index,
+            extensions: &self.extensions,
+            chosen: Some(&self.chosen),
+            selection: self.selected.as_deref(),
+            revision: self.revision,
+        };
         let answer = (tool.run)(&lens, &toml::Value::Table(toml::Table::new())).map_err(|e| format!("{e:#}"))?;
         Ok(answer.to_string())
     }
@@ -1665,7 +1728,13 @@ impl Workspace {
     }
 
     /// A document tab's asset, played.
-    pub fn play(&mut self, ui: &mut egui::Ui, pane: crate::panes::Pane, path: &str, view: &mut crate::settings::Preview) {
+    pub fn play(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: crate::panes::Pane,
+        path: &str,
+        view: &mut crate::settings::Preview,
+    ) {
         self.played.insert(pane);
         let (extensions, index) = (self.extensions.clone(), self.index.clone());
         let player = self.players.entry(pane).or_insert_with(|| crate::player::Player::new(extensions.clone()));
@@ -1707,20 +1776,27 @@ impl Workspace {
     /// folder does not.
     #[must_use]
     pub fn is_document(&self, path: &str) -> bool {
-        self.index.assets.contains_key(path) || self.entry_at(path).is_some_and(|(_, e)| e.kind == project::index::Kind::File)
+        self.index.assets.contains_key(path)
+            || self.entry_at(path).is_some_and(|(_, e)| e.kind == project::index::Kind::File)
     }
 
     /// What is inside an asset, as its type says.
     pub fn contents_of(&mut self, asset: &Asset) -> Arc<pe2_ext::Contents> {
         let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
-        self.contents.entry(asset.path.clone()).or_insert_with(|| Arc::new(extensions.contents(index, asset, chosen))).clone()
+        self.contents
+            .entry(asset.path.clone())
+            .or_insert_with(|| Arc::new(extensions.contents(index, asset, chosen)))
+            .clone()
     }
 
     /// A part's sheet, where its asset's type says what it holds.
     pub fn part_sheet_of(&mut self, asset: &Asset, part: &str) -> Arc<Option<pe2_ext::PartSheet>> {
         let (extensions, index, chosen) = (&self.extensions, &self.index, &self.chosen);
         let key = (asset.path.clone(), part.to_string());
-        self.part_sheets.entry(key).or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, chosen, part))).clone()
+        self.part_sheets
+            .entry(key)
+            .or_insert_with(|| Arc::new(extensions.part_sheet(index, asset, chosen, part)))
+            .clone()
     }
 
     /// Look at an asset in a member of a family: all that shows it is made again.
@@ -1746,7 +1822,8 @@ impl Workspace {
         let is_it = |id: &str| id == name || part_name(id) == name;
         let part = self.extensions.addresses(&asset).into_iter().map(|(address, _)| address).find(|id| is_it(id));
         let contents = self.contents_of(&asset);
-        let row = || contents.rows.iter().filter(|row| !row.is_heading()).map(|row| row.id.clone()).find(|id| is_it(id));
+        let row =
+            || contents.rows.iter().filter(|row| !row.is_heading()).map(|row| row.id.clone()).find(|id| is_it(id));
         if let Some(id) = part.or_else(row) {
             self.inner = Some((asset.path.clone(), format!("#{id}")));
         }
@@ -1867,7 +1944,8 @@ impl Workspace {
     /// Whether the preview shows an asset: by its picture, or - its type drawing none - by its type's views.
     pub fn has_view(&self, path: &str) -> bool {
         self.index.assets.get(path).is_some_and(|a| {
-            self.extensions.has_picture(a) || (!self.extensions.shows_pictures(a) && !self.extensions.views(a).is_empty())
+            self.extensions.has_picture(a)
+                || (!self.extensions.shows_pictures(a) && !self.extensions.views(a).is_empty())
         })
     }
 
@@ -1932,13 +2010,24 @@ impl Workspace {
     }
 
     /// Show an editor an extension gives an asset, made when first shown.
-    pub fn show_editor(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: &str, name: &str, preview: Preview, nav: &mut Option<String>) {
+    pub fn show_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: egui::Id,
+        path: &str,
+        name: &str,
+        preview: Preview,
+        nav: &mut Option<String>,
+    ) {
         let Some(asset) = self.index.assets.get(path) else { return };
         // After its views, in the numbers the pane keeps views by.
         let views = self.extensions.views(asset).len();
         let editors = self.extensions.editors(asset);
         let shown = self.extensions.previews(asset);
-        let viewer = shown.iter().enumerate().find_map(|(at, shown)| Some((at, shown.viewer.filter(|def| def.name == name)?, &shown.output)));
+        let viewer = shown
+            .iter()
+            .enumerate()
+            .find_map(|(at, shown)| Some((at, shown.viewer.filter(|def| def.name == name)?, &shown.output)));
         if let Some((at, def, output)) = viewer {
             let (at, make, output) = (views + editors.len() + at, def.make.clone(), output.clone());
             self.draw_view(ui, (pane, path.to_string(), at), &*make, (preview, 1), nav, Some(&output));
@@ -1950,7 +2039,15 @@ impl Workspace {
     }
 
     /// Show a preview an asset's stack asks for: by a viewer of what it is, else - a picture - as the host draws one.
-    pub fn show_tap(&mut self, ui: &mut egui::Ui, pane: egui::Id, path: Option<&str>, output: &str, preview: Preview, nav: &mut Option<String>) {
+    pub fn show_tap(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: egui::Id,
+        path: Option<&str>,
+        output: &str,
+        preview: Preview,
+        nav: &mut Option<String>,
+    ) {
         let Some(asset) = path.and_then(|path| self.index.assets.get(path)) else { return };
         let path = asset.path.clone();
         let path = path.as_str();
@@ -1974,7 +2071,9 @@ impl Workspace {
         }
         match self.tapped.as_ref().map(|(_, made)| made) {
             Some(Ok(texture)) => {
-                ui.centered_and_justified(|ui| ui.add(egui::Image::new(texture).max_size(ui.available_size()).shrink_to_fit()));
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Image::new(texture).max_size(ui.available_size()).shrink_to_fit())
+                });
             }
             Some(Err(why)) => {
                 ui.label(why.as_str());
@@ -2026,7 +2125,14 @@ impl Workspace {
     }
 
     /// Show an asset's picture in its look on the host's canvas, with what its type marks on it over it.
-    fn show_picture(&mut self, ui: &mut egui::Ui, path: &str, preview: Preview, count: usize, nav: &mut Option<String>) {
+    fn show_picture(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &str,
+        preview: Preview,
+        count: usize,
+        nav: &mut Option<String>,
+    ) {
         let look = self.variant(path);
         let Some(pictures) = self.textures.pictures.as_mut() else { return };
         let image = match pictures.get(path, look) {
@@ -2050,7 +2156,11 @@ impl Workspace {
             id: path.to_string(),
             size,
             pictures: vec![(id, egui::Rect::from_min_size(egui::Pos2::ZERO, size), None, None)],
-            boxes: marks.boxes.iter().map(|m| (m.name.clone(), crate::ext_ui::to_rect(m.rect), selected.as_ref() == Some(&m.name))).collect(),
+            boxes: marks
+                .boxes
+                .iter()
+                .map(|m| (m.name.clone(), crate::ext_ui::to_rect(m.rect), selected.as_ref() == Some(&m.name)))
+                .collect(),
             summary: marks.summary.clone(),
             toggle: marks.toggle.clone(),
             legend: marks.legend,
@@ -2064,7 +2174,13 @@ impl Workspace {
 
     /// Show an asset's inspector views - what its type draws of it after the property sheet - made when first
     /// shown: those of a tab, or those with none.
-    pub fn show_inspector_views(&mut self, ui: &mut egui::Ui, path: &str, tab: Option<usize>, nav: &mut Option<String>) {
+    pub fn show_inspector_views(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &str,
+        tab: Option<usize>,
+        nav: &mut Option<String>,
+    ) {
         self.show_lent_views(ui, path, nav, |extensions, asset| {
             let shown = extensions.inspector(asset).into_iter().enumerate();
             shown.filter(|(i, def)| tab.map_or(def.tab.is_none(), |tab| tab == *i)).collect()
@@ -2102,7 +2218,14 @@ impl Workspace {
         for (i, def) in chosen(&self.extensions, asset) {
             let key = (path.to_string(), i);
             let view = self.inspector_views.entry(key).or_insert_with(|| (def.make)(&self.extensions.lend(asset)));
-            let frame = crate::ext_ui::Frame { asset: Some(asset), shown: None, preview: Preview::default(), count: 1, editable, part: part.as_deref() };
+            let frame = crate::ext_ui::Frame {
+                asset: Some(asset),
+                shown: None,
+                preview: Preview::default(),
+                count: 1,
+                editable,
+                part: part.as_deref(),
+            };
             let mut sets = crate::ext_ui::Sets::default();
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
             view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -2114,7 +2237,14 @@ impl Workspace {
     }
 
     /// Show a panel in a pane, its view made when the pane first shows it.
-    pub fn show_panel(&mut self, ui: &mut egui::Ui, pane: egui::Id, name: &str, preview: Preview, nav: &mut Option<String>) {
+    pub fn show_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: egui::Id,
+        name: &str,
+        preview: Preview,
+        nav: &mut Option<String>,
+    ) {
         let Some(panel) = self.extensions.panel(name) else {
             ui.label(egui::RichText::new(format!("No extension provides {name}")).color(crate::theme::weak()));
             return;

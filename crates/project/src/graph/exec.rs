@@ -117,7 +117,6 @@ impl Node for crate::index::Asset {
         }
         head
     }
-
 }
 
 /// What operations read of their node: its stored files by their hashes (empty where it had none of the name), its
@@ -161,9 +160,13 @@ impl Reads {
         self.files.iter().all(|(name, sha1)| node.file_sha1(name).unwrap_or_default() == *sha1)
             && self.declaration.as_ref().is_none_or(|d| *d == node.declaration_sha1())
             && (self.outputs.is_empty()
-                || reach.is_some_and(|reach| self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))))
+                || reach.is_some_and(|reach| {
+                    self.outputs.iter().all(|(read, hash)| reach.hash(read).is_some_and(|h| h == *hash))
+                }))
             && (self.entries.is_empty()
-                || reach.is_some_and(|reach| self.entries.iter().all(|(read, hash)| reach.entry_hash(read).as_deref() == Some(hash))))
+                || reach.is_some_and(|reach| {
+                    self.entries.iter().all(|(read, hash)| reach.entry_hash(read).as_deref() == Some(hash))
+                }))
     }
 }
 
@@ -174,7 +177,11 @@ pub trait World: Sync {
     /// The node a reference names, as what reads it is told.
     fn named(&self, reference: &toml::Value) -> Option<pe2_ext::NodeNamed> {
         let (node, _) = self.node(reference)?;
-        Some(pe2_ext::NodeNamed { path: node.path().to_string(), uid: node.uid().map(str::to_string), types: Vec::new() })
+        Some(pe2_ext::NodeNamed {
+            path: node.path().to_string(),
+            uid: node.uid().map(str::to_string),
+            types: Vec::new(),
+        })
     }
     /// The plain files under a folder of the project, by their paths, in order.
     fn entries(&self, folder: &str) -> Vec<String> {
@@ -286,7 +293,6 @@ impl<'a> Recorder<'a> {
         self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).declaration = Some(sha1);
     }
 
-
     #[must_use]
     pub fn node(&self) -> &'a dyn Node {
         self.node
@@ -387,7 +393,8 @@ fn only_files(input: &Input, files: &[String]) -> std::result::Result<Input, Str
         return Ok(input.clone());
     }
     let Value::Typed(typed) = input.value() else { return Err(format!("it holds no files: {}", input.value().ty())) };
-    let wanted = |name: &str| files.iter().any(|file| name == file || (file.ends_with('/') && name.starts_with(file.as_str())));
+    let wanted =
+        |name: &str| files.iter().any(|file| name == file || (file.ends_with('/') && name.starts_with(file.as_str())));
     let mut typed = typed.clone();
     typed.files.retain(|file| wanted(&file.name));
     Ok(Input(Arc::new(Value::Typed(typed))))
@@ -500,7 +507,12 @@ impl<'a> Call<'a> {
                 }
             }
         };
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).outputs.insert(got.read, got.hash);
+        self.recorder
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outputs
+            .insert(got.read, got.hash);
         Ok(got.value)
     }
 
@@ -511,7 +523,12 @@ impl<'a> Call<'a> {
     pub fn entries(&self, folder: &str) -> Result<Vec<String>> {
         let files = self.reach.context("the project is not reachable here")?.world.entries(folder);
         let read = format!("{}/", folder.trim_end_matches('/'));
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, list_hash(&files));
+        self.recorder
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .insert(read, list_hash(&files));
         Ok(files)
     }
 
@@ -520,10 +537,20 @@ impl<'a> Call<'a> {
     /// # Errors
     /// Nothing beyond its node is reachable here, the project holds no such file, or it cannot be read.
     pub fn read_entry(&self, path: &str) -> Result<Vec<u8>> {
-        let disk = self.reach.context("the project is not reachable here")?.world.entry(path).with_context(|| format!("{path}: no such file"))?;
+        let disk = self
+            .reach
+            .context("the project is not reachable here")?
+            .world
+            .entry(path)
+            .with_context(|| format!("{path}: no such file"))?;
         let bytes = std::fs::read(&disk).with_context(|| disk.display().to_string())?;
         let hash = crate::extract::sha1_hex(&bytes);
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(path.to_string(), hash);
+        self.recorder
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .insert(path.to_string(), hash);
         Ok(bytes)
     }
 
@@ -534,7 +561,12 @@ impl<'a> Call<'a> {
     pub fn assets_of(&self, node_type: &str) -> Result<Vec<(String, String)>> {
         let assets = self.reach.context("the project is not reachable here")?.world.assets_of(node_type);
         let read = format!("{TYPE_READ}{node_type}");
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.insert(read, type_hash(&assets));
+        self.recorder
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .insert(read, type_hash(&assets));
         Ok(assets)
     }
 
@@ -554,7 +586,8 @@ impl<'a> Call<'a> {
     #[must_use]
     pub fn config(&self) -> Option<pe2_ext::data::BuildConfig> {
         let config = self.reach?.engine.config.clone()?;
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config = Some(config.name.clone());
+        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config =
+            Some(config.name.clone());
         Some(config)
     }
 
@@ -569,7 +602,14 @@ impl<'a> Call<'a> {
     /// there is a store), and finished into a file whose content is inline or stored - which readers cannot tell.
     #[must_use]
     pub fn writer(&self, name: &str) -> Writer {
-        Writer { name: name.to_string(), store: self.store.cloned(), memory: Vec::new(), spilled: None, hasher: Sha1::new(), size: 0 }
+        Writer {
+            name: name.to_string(),
+            store: self.store.cloned(),
+            memory: Vec::new(),
+            spilled: None,
+            hasher: Sha1::new(),
+            size: 0,
+        }
     }
 
     /// A path in the store for a program to write to.
@@ -690,7 +730,13 @@ pub(crate) fn stored_contents(value: &Value, out: &mut Vec<String>) {
             Content::Inline(_) => None,
         })),
         Value::List(items) => items.iter().for_each(|item| stored_contents(item, out)),
-        Value::Image(_) | Value::Table(_) | Value::Pcm(_) | Value::Video(_) | Value::Audio(_) | Value::Marks(_) | Value::Stream(_) => {}
+        Value::Image(_)
+        | Value::Table(_)
+        | Value::Pcm(_)
+        | Value::Video(_)
+        | Value::Audio(_)
+        | Value::Marks(_)
+        | Value::Stream(_) => {}
     }
 }
 
@@ -870,14 +916,29 @@ impl Evaluation<'_> {
 
     /// Run a step: what it is given checked against its ports (their variables bound by it), what it makes against
     /// what it says it makes.
-    fn step(&self, step: &super::Step, mut inputs: Vec<Vec<Input>>, parameter: Option<&str>, recorder: Recorder<'_>) -> Made {
+    fn step(
+        &self,
+        step: &super::Step,
+        mut inputs: Vec<Vec<Input>>,
+        parameter: Option<&str>,
+        recorder: Recorder<'_>,
+    ) -> Made {
         let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
         let Some(def) = self.ops.get(&step.op) else { return fail(format!("`{}`: no extension provides it", step.op)) };
         let Some(run) = def.run.as_ref() else {
             let Some(start) = def.start.as_ref() else { return fail(format!("`{}` makes nothing", step.op)) };
             // A stream, for what takes it from here: opened, and read in turn.
             let others = self.others;
-            let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: None };
+            let mut call = Call {
+                inputs,
+                settings: &step.settings,
+                parameter,
+                recorder,
+                store: self.store,
+                reach: self.reach,
+                others,
+                needs: None,
+            };
             return match start(&mut call) {
                 Ok(producer) => {
                     let stream = super::stream::Stream::open(producer);
@@ -916,7 +977,16 @@ impl Evaluation<'_> {
             return self.split(step, &inputs, &micros, parameter);
         }
         let held = def.strict.then_some(&needs);
-        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: held };
+        let mut call = Call {
+            inputs,
+            settings: &step.settings,
+            parameter,
+            recorder,
+            store: self.store,
+            reach: self.reach,
+            others,
+            needs: held,
+        };
         let value = match run(&mut call) {
             Ok(value) => value,
             Err(e) => return fail(format!("{e:#}")),
@@ -943,11 +1013,22 @@ impl Evaluation<'_> {
     ) -> Result<Vec<pe2_ext::Micro>> {
         for _ in 0..MOST_ROUNDS {
             let others = self.others;
-            let mut call = Call { inputs: inputs.to_vec(), settings: &step.settings, parameter, recorder, store: self.store, reach: self.reach, others, needs: Some(needs) };
+            let mut call = Call {
+                inputs: inputs.to_vec(),
+                settings: &step.settings,
+                parameter,
+                recorder,
+                store: self.store,
+                reach: self.reach,
+                others,
+                needs: Some(needs),
+            };
             let prepared = prepare(&mut call);
             let mut asked = std::mem::take(&mut *needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             if let Ok(prepared) = &prepared {
-                asked.extend(prepared.needs.iter().map(|need| (toml::Value::String(need.node.clone()), need.address.clone())));
+                asked.extend(
+                    prepared.needs.iter().map(|need| (toml::Value::String(need.node.clone()), need.address.clone())),
+                );
             }
             let new = self.reach.map_or_else(Vec::new, |reach| {
                 let held = needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -967,7 +1048,10 @@ impl Evaluation<'_> {
             let others = self.others;
             let reach = self.reach.context("no other node is reachable here")?;
             let made = crate::parallel(&new, |(key, reference, address)| {
-                (key.clone(), making_as(&chain, || fetch(reach, others, reference, address)).map_err(|e| format!("{e:#}")))
+                (
+                    key.clone(),
+                    making_as(&chain, || fetch(reach, others, reference, address)).map_err(|e| format!("{e:#}")),
+                )
             });
             needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(made);
         }
@@ -976,15 +1060,26 @@ impl Evaluation<'_> {
 
     /// An operation's work in micro ops, each once those it takes from are made, those with nothing between them at the same
     /// time. What the last one makes is what it makes.
-    fn split(&self, step: &super::Step, inputs: &[Vec<Input>], micros: &[pe2_ext::Micro], parameter: Option<&str>) -> Made {
+    fn split(
+        &self,
+        step: &super::Step,
+        inputs: &[Vec<Input>],
+        micros: &[pe2_ext::Micro],
+        parameter: Option<&str>,
+    ) -> Made {
         let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
-        let after = |micro: &pe2_ext::Micro| micro.ports.iter().flatten().filter_map(|from| from.micro).map(|at| at as usize).collect::<Vec<_>>();
+        let after = |micro: &pe2_ext::Micro| {
+            micro.ports.iter().flatten().filter_map(|from| from.micro).map(|at| at as usize).collect::<Vec<_>>()
+        };
         let mut rounds: Vec<Vec<usize>> = Vec::new();
         let mut round_of = vec![0; micros.len()];
         for (at, micro) in micros.iter().enumerate() {
             let deps = after(micro);
             if let Some(later) = deps.iter().find(|from| **from >= at) {
-                return Err(Arc::from(format!("{}: {} takes from {later}, which comes after it", step.at, micro.label)));
+                return Err(Arc::from(format!(
+                    "{}: {} takes from {later}, which comes after it",
+                    step.at, micro.label
+                )));
             }
             let round = deps.iter().map(|from| round_of[*from] + 1).max().unwrap_or(0);
             round_of[at] = round;
@@ -1046,7 +1141,11 @@ impl Evaluation<'_> {
         let version = self.ops.get(&op).map_or("?", |def| def.version.as_str());
         let settings = toml::to_string(&micro.settings).unwrap_or_default();
         let taken: Vec<String> = ports.iter().flatten().map(|input| super::hash(input.value())).collect();
-        let text = format!("{VALUES}\n{}\n{op}@{version}\n{}\n{settings}\n{taken:?}\n{parameter:?}", id(self.node), micro.label);
+        let text = format!(
+            "{VALUES}\n{}\n{op}@{version}\n{}\n{settings}\n{taken:?}\n{parameter:?}",
+            id(self.node),
+            micro.label
+        );
         let key = crate::extract::sha1_hex(text.as_bytes());
         let store = self.store.filter(|_| micro.keep);
         if let Some(store) = store
@@ -1058,13 +1157,19 @@ impl Evaluation<'_> {
         }
         let reads = Mutex::new(Reads::default());
         let own = Evaluation { reads: &reads, ..*self };
-        let piece = super::Step { op, settings: micro.settings.clone(), inputs: Vec::new(), ty: pe2_ext::Type::Any, at };
+        let piece =
+            super::Step { op, settings: micro.settings.clone(), inputs: Vec::new(), ty: pe2_ext::Type::Any, at };
         let value = own.step(&piece, ports, parameter, Recorder { node: self.node, reads: &reads })?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(store) = store {
             let hash = super::hash(&value);
             let keep = store.put(&hash, &value, &|sha1| self.node.read_content(sha1).ok()).and_then(|()| {
-                let trace = Trace { value: hash, reads: reads.clone(), node: id(self.node).to_string(), output: format!("micro/{}", micro.label) };
+                let trace = Trace {
+                    value: hash,
+                    reads: reads.clone(),
+                    node: id(self.node).to_string(),
+                    output: format!("micro/{}", micro.label),
+                };
                 store.put_trace(&key, &trace)
             });
             if let Err(why) = keep {
@@ -1154,11 +1259,23 @@ impl Engine {
 
     /// An output's trace as `kept` finds it, what it read of other nodes told in `reach`.
     #[must_use]
-    pub fn kept_in(&self, reach: Option<Reach<'_>>, plan: &Plan, node: &dyn Node, output: usize, parameter: Option<&str>) -> Option<Trace> {
+    pub fn kept_in(
+        &self,
+        reach: Option<Reach<'_>>,
+        plan: &Plan,
+        node: &dyn Node,
+        output: usize,
+        parameter: Option<&str>,
+    ) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
-        let same_config = trace.reads.config.as_ref().is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
-        (trace.node == id(node) && same_config && trace.reads.hold(node, reach) && store.has(&trace.value)).then_some(trace)
+        let same_config = trace
+            .reads
+            .config
+            .as_ref()
+            .is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
+        (trace.node == id(node) && same_config && trace.reads.hold(node, reach) && store.has(&trace.value))
+            .then_some(trace)
     }
 
     /// An output by its address (`native`, `picture/night`): found kept where its trace holds - its value then read only
@@ -1175,7 +1292,14 @@ impl Engine {
     ///
     /// # Errors
     /// As `output`.
-    pub fn output_with(&self, plan: &Plan, node: &dyn Node, address: &str, supplied: Option<&str>, read: bool) -> Result<Given> {
+    pub fn output_with(
+        &self,
+        plan: &Plan,
+        node: &dyn Node,
+        address: &str,
+        supplied: Option<&str>,
+        read: bool,
+    ) -> Result<Given> {
         self.output_in(None, plan, node, address, supplied, read)
     }
 
@@ -1192,7 +1316,8 @@ impl Engine {
         supplied: Option<&str>,
         read: bool,
     ) -> Result<Given> {
-        let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
+        let (output, parameter) =
+            plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
         let parameter = parameter.as_deref().or(supplied);
         let retained = plan.outputs[output].retain != Retain::Transient;
         if retained && let Some(trace) = self.kept_in(reach, plan, node, output, parameter) {
@@ -1205,7 +1330,8 @@ impl Engine {
                 return Ok(Given { value, hash: trace.value, kept: true, reads: trace.reads });
             }
         }
-        let remembered = self.run.as_ref().filter(|_| !retained).map(|run| (run, self.key(plan, node, output, parameter)));
+        let remembered =
+            self.run.as_ref().filter(|_| !retained).map(|run| (run, self.key(plan, node, output, parameter)));
         if let Some((run, key)) = &remembered {
             let held = run.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned();
             // Those of a run can change under it: a later round makes again what an earlier one read.
@@ -1214,15 +1340,23 @@ impl Engine {
             }
         }
         let known = self.known(reach, plan, node, output);
-        let (mut made, reads) = evaluate(plan, &self.ops, node, &[(output, parameter)], &known, (self.store.as_ref(), reach));
+        let (mut made, reads) =
+            evaluate(plan, &self.ops, node, &[(output, parameter)], &known, (self.store.as_ref(), reach));
         let value = made.pop().unwrap_or_else(|| Err("not made".into())).map_err(|e| anyhow!("{e}"))?;
         let hash = super::hash(&value);
         if let Some((run, key)) = remembered {
-            run.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (value.clone(), hash.clone(), reads.clone()));
+            run.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, (value.clone(), hash.clone(), reads.clone()));
         }
         if retained && let Some(store) = &self.store {
             store.put(&hash, &value, &|sha1| node.read_content(sha1).ok())?;
-            let trace = Trace { value: hash.clone(), reads: reads.clone(), node: id(node).to_string(), output: address.to_string() };
+            let trace = Trace {
+                value: hash.clone(),
+                reads: reads.clone(),
+                node: id(node).to_string(),
+                output: address.to_string(),
+            };
             store.put_trace(&self.key(plan, node, output, parameter), &trace)?;
         }
         Ok(Given { value: Some(value), hash, kept: false, reads })
@@ -1240,7 +1374,8 @@ impl Engine {
         node: &dyn Node,
         address: &str,
     ) -> Result<(Box<dyn super::stream::Producer>, Reads, String)> {
-        let (output, parameter) = plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
+        let (output, parameter) =
+            plan.output(address).with_context(|| format!("{} has no output `{address}`", node.path()))?;
         let parameter = parameter.as_deref();
         let step = &plan.steps[plan.outputs[output].from];
         let def = self.ops.get(&step.op).with_context(|| format!("`{}`: no extension provides it", step.op))?;
@@ -1248,14 +1383,34 @@ impl Engine {
         let known = self.known(reach, plan, node, output);
         let reads = Mutex::new(Reads::default());
         let others = Mutex::default();
-        let context = Evaluation { plan, ops: &self.ops, node, known: &known, store: self.store.as_ref(), reach, reads: &reads, others: &others };
+        let context = Evaluation {
+            plan,
+            ops: &self.ops,
+            node,
+            known: &known,
+            store: self.store.as_ref(),
+            reach,
+            reads: &reads,
+            others: &others,
+        };
         let mut inputs = Vec::with_capacity(step.inputs.len());
         for port in &step.inputs {
             let values = context.run_steps(port, parameter);
-            inputs.push(values.into_iter().map(|v| v.map(Input).map_err(|e| anyhow!("{e}"))).collect::<Result<Vec<_>>>()?);
+            inputs.push(
+                values.into_iter().map(|v| v.map(Input).map_err(|e| anyhow!("{e}"))).collect::<Result<Vec<_>>>()?,
+            );
         }
         let recorder = Recorder { node, reads: &reads };
-        let mut call = Call { inputs, settings: &step.settings, parameter, recorder, store: self.store.as_ref(), reach, others: &others, needs: None };
+        let mut call = Call {
+            inputs,
+            settings: &step.settings,
+            parameter,
+            recorder,
+            store: self.store.as_ref(),
+            reach,
+            others: &others,
+            needs: None,
+        };
         let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()))?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok((producer, reads, self.key(plan, node, output, parameter)))
@@ -1274,21 +1429,41 @@ impl Engine {
     ///
     /// # Errors
     /// No extension provides it, or it failed.
-    pub fn run_in(&self, reach: Option<Reach<'_>>, op: &str, inputs: Vec<Vec<Value>>, settings: &Table, node: &dyn Node) -> Result<Value> {
+    pub fn run_in(
+        &self,
+        reach: Option<Reach<'_>>,
+        op: &str,
+        inputs: Vec<Vec<Value>>,
+        settings: &Table,
+        node: &dyn Node,
+    ) -> Result<Value> {
         let def = self.ops.get(op).with_context(|| format!("`{op}`: no extension provides it"))?;
         let run = def.run.as_ref().with_context(|| format!("`{op}` makes nothing"))?;
         let reads = Mutex::new(Reads::default());
         let inputs = inputs.into_iter().map(|port| port.into_iter().map(|v| Input(Arc::new(v))).collect()).collect();
         let recorder = Recorder { node, reads: &reads };
         let others = &Mutex::default();
-        let mut call = Call { inputs, settings, parameter: None, recorder, store: self.store.as_ref(), reach, others, needs: None };
+        let mut call = Call {
+            inputs,
+            settings,
+            parameter: None,
+            recorder,
+            store: self.store.as_ref(),
+            reach,
+            others,
+            needs: None,
+        };
         run(&mut call)
     }
 
     /// The plan's cached outputs found kept - but `except` - as what the steps making them are known to make.
     fn known(&self, reach: Option<Reach<'_>>, plan: &Plan, node: &dyn Node, except: usize) -> Known {
         let Some(store) = &self.store else { return Vec::new() };
-        let cached = plan.outputs.iter().enumerate().filter(|(i, o)| *i != except && o.retain != Retain::Transient && o.parameter.is_none());
+        let cached = plan
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| *i != except && o.retain != Retain::Transient && o.parameter.is_none());
         cached
             .filter_map(|(i, o)| {
                 let trace = self.kept_in(reach, plan, node, i, None)?;

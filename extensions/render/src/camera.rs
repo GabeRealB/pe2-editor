@@ -57,7 +57,8 @@ impl Camera {
     /// The camera's axes: right, up and back.
     pub fn axes(&self) -> (V3, V3, V3) {
         let back = self.back();
-        let world_up = if self.pitch.cos().abs() < 1e-4 { [-self.yaw.sin(), 0.0, -self.yaw.cos()] } else { [0.0, 1.0, 0.0] };
+        let world_up =
+            if self.pitch.cos().abs() < 1e-4 { [-self.yaw.sin(), 0.0, -self.yaw.cos()] } else { [0.0, 1.0, 0.0] };
         let right = normalized(cross(world_up, back));
         (right, cross(back, right), back)
     }
@@ -78,9 +79,19 @@ impl Camera {
         let depth = far / (near - far);
         if self.orthographic {
             let scale_y = FOCAL / self.distance;
-            return [[scale_y / aspect, 0.0, 0.0, 0.0], [0.0, scale_y, 0.0, 0.0], [0.0, 0.0, 1.0 / (near - far), 0.0], [0.0, 0.0, near / (near - far) + 0.5, 1.0]];
+            return [
+                [scale_y / aspect, 0.0, 0.0, 0.0],
+                [0.0, scale_y, 0.0, 0.0],
+                [0.0, 0.0, 1.0 / (near - far), 0.0],
+                [0.0, 0.0, near / (near - far) + 0.5, 1.0],
+            ];
         }
-        [[FOCAL / aspect, 0.0, 0.0, 0.0], [0.0, FOCAL, 0.0, 0.0], [0.0, 0.0, depth, -1.0], [0.0, 0.0, near * depth, 0.0]]
+        [
+            [FOCAL / aspect, 0.0, 0.0, 0.0],
+            [0.0, FOCAL, 0.0, 0.0],
+            [0.0, 0.0, depth, -1.0],
+            [0.0, 0.0, near * depth, 0.0],
+        ]
     }
 
     pub fn view_projection(&self, aspect: f32) -> M4 {
@@ -92,7 +103,9 @@ impl Camera {
         let matrix = self.view_projection(size.0 / size.1);
         move |point| {
             let clip = transform(&matrix, point);
-            (clip[3] > 1e-6).then(|| (f32::midpoint(clip[0] / clip[3], 1.0) * size.0, f32::midpoint(1.0, -clip[1] / clip[3]) * size.1))
+            (clip[3] > 1e-6).then(|| {
+                (f32::midpoint(clip[0] / clip[3], 1.0) * size.0, f32::midpoint(1.0, -clip[1] / clip[3]) * size.1)
+            })
         }
     }
 
@@ -112,7 +125,8 @@ impl Camera {
 
     /// World units a pixel covers at a point.
     pub fn units_per_pixel(&self, point: V3, height: f32) -> f32 {
-        let depth = if self.orthographic { self.distance } else { dot(sub(self.eye(), point), self.axes().2).max(1e-3) };
+        let depth =
+            if self.orthographic { self.distance } else { dot(sub(self.eye(), point), self.axes().2).max(1e-3) };
         depth * 2.0 / (FOCAL * height)
     }
 
@@ -202,7 +216,8 @@ mod tests {
 
     #[test]
     fn a_camera_comes_back_as_it_was_written() {
-        let camera = Camera { target: [1.5, -2.25, 300.0], yaw: 0.125, pitch: -0.5, distance: 42.0, orthographic: true };
+        let camera =
+            Camera { target: [1.5, -2.25, 300.0], yaw: 0.125, pitch: -0.5, distance: 42.0, orthographic: true };
         assert_eq!(Camera::resumed(&camera.written()), Some(camera));
         assert_eq!(Camera::resumed("not one"), None);
     }

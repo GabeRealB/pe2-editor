@@ -95,7 +95,9 @@ impl Tests {
 
     fn runner(&self) -> Option<PathBuf> {
         let found = || {
-            let beside = std::env::current_exe().ok()?.with_file_name(format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX));
+            let beside = std::env::current_exe()
+                .ok()?
+                .with_file_name(format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX));
             beside.is_file().then_some(beside)
         };
         self.runner.clone().or_else(found)
@@ -147,7 +149,11 @@ impl Tests {
                 Err(TryRecvError::Disconnected) => break true,
             }
         };
-        let errors: Vec<String> = job.errors.try_iter().filter(|line| !line.starts_with("MESA") && !line.contains("dzn") && !line.starts_with("TU:")).collect();
+        let errors: Vec<String> = job
+            .errors
+            .try_iter()
+            .filter(|line| !line.starts_with("MESA") && !line.contains("dzn") && !line.starts_with("TU:"))
+            .collect();
         for line in said {
             self.heard(&line);
         }
@@ -209,7 +215,13 @@ impl Tests {
     fn run(&mut self, ctx: &egui::Context, runner: &Path, mut arguments: Vec<String>, names: &[String]) {
         for test in self.suites.values_mut().flatten() {
             if names.is_empty() || names.contains(&test.name) {
-                *test = Test { name: std::mem::take(&mut test.name), state: State::Waiting, why: String::new(), said: None, picture: None };
+                *test = Test {
+                    name: std::mem::take(&mut test.name),
+                    state: State::Waiting,
+                    why: String::new(),
+                    said: None,
+                    picture: None,
+                };
             }
         }
         self.shown = None;
@@ -226,7 +238,12 @@ impl Tests {
     }
 
     fn failed(&self) -> Vec<String> {
-        self.suites.values().flatten().filter(|test| matches!(test.state, State::Failed(_))).map(|test| test.name.clone()).collect()
+        self.suites
+            .values()
+            .flatten()
+            .filter(|test| matches!(test.state, State::Failed(_)))
+            .map(|test| test.name.clone())
+            .collect()
     }
 }
 
@@ -252,7 +269,9 @@ fn reading(from: Option<impl std::io::Read + Send + 'static>, ctx: &egui::Contex
 fn suites_of(ws: &Workspace) -> Vec<String> {
     let mut arguments = vec!["--built".to_string()];
     let file = |origin: &Origin| match origin {
-        Origin::Project { file, .. } | Origin::User(file) | Origin::Install(file) | Origin::Component(file) => Some(file.clone()),
+        Origin::Project { file, .. } | Origin::User(file) | Origin::Install(file) | Origin::Component(file) => {
+            Some(file.clone())
+        }
         Origin::Builtin | Origin::Linked => None,
     };
     let folders: Vec<String> = ws
@@ -296,7 +315,9 @@ fn row(ui: &mut egui::Ui, test: &Test, selected: bool, can_run: bool, names: f32
     });
     let clicked = clicked.inner;
     match test.state {
-        State::Passed(seconds) | State::Failed(seconds) => drop(ui.label(RichText::new(format!("{seconds:.1} s")).small().color(theme::weak()))),
+        State::Passed(seconds) | State::Failed(seconds) => {
+            drop(ui.label(RichText::new(format!("{seconds:.1} s")).small().color(theme::weak())));
+        }
         _ => drop(ui.label("")),
     }
     let run = can_run && ui.small_button("Run").on_hover_text("Run this test").clicked();
@@ -316,7 +337,8 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     // Built apart from the editor (`--features tests`), the runner can be left behind it, and then speaks an older contract
     // to the extensions than they do.
     let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let behind = std::env::current_exe().ok().and_then(|editor| Some(modified(&runner)? < modified(&editor)?)).unwrap_or(false);
+    let behind =
+        std::env::current_exe().ok().and_then(|editor| Some(modified(&runner)? < modified(&editor)?)).unwrap_or(false);
     let arguments = suites_of(ws);
     if !ws.tests.asked {
         ws.tests.asked = true;
@@ -343,7 +365,10 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
         ui.add(egui::TextEdit::singleline(&mut ws.tests.filter).hint_text("Filter tests").desired_width(180.0));
     });
     if behind {
-        theme::warning(ui, "The test runner is older than the editor, and may not load what the editor does. Build it again:");
+        theme::warning(
+            ui,
+            "The test runner is older than the editor, and may not load what the editor does. Build it again:",
+        );
         ui.label(RichText::new("cargo build --release -p editor --features tests --bin pe2-test-runner").code());
     }
     if let Some(trouble) = &ws.tests.trouble {
@@ -352,7 +377,9 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     let filter = ws.tests.filter.to_lowercase();
     let font = egui::TextStyle::Button.resolve(ui.style());
     let names = ws.tests.suites.values().flatten().map(|test| {
-        ui.fonts_mut(|fonts| fonts.layout_no_wrap(short(&test.name).to_string(), font.clone(), egui::Color32::WHITE).size().x)
+        ui.fonts_mut(|fonts| {
+            fonts.layout_no_wrap(short(&test.name).to_string(), font.clone(), egui::Color32::WHITE).size().x
+        })
     });
     let names = names.fold(0.0, f32::max) + 2.0 * ui.spacing().button_padding.x;
     let selected = ws.tests.selected.clone();
@@ -373,17 +400,21 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
                 format!("{suite}  ·  {} test{}", tests.len(), if tests.len() == 1 { "" } else { "s" })
             };
             egui::CollapsingHeader::new(said).id_salt(suite).default_open(true).show(ui, |ui| {
-                egui::Grid::new(("tests", suite)).num_columns(4).spacing([10.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
-                    for test in tests.iter().filter(|test| test.name.to_lowercase().contains(&filter)) {
-                        let (run, clicked) = row(ui, test, selected.as_deref() == Some(test.name.as_str()), !busy, names);
-                        if run {
-                            asked = Some(vec![test.name.clone()]);
+                egui::Grid::new(("tests", suite)).num_columns(4).spacing([10.0, 4.0]).min_col_width(0.0).show(
+                    ui,
+                    |ui| {
+                        for test in tests.iter().filter(|test| test.name.to_lowercase().contains(&filter)) {
+                            let (run, clicked) =
+                                row(ui, test, selected.as_deref() == Some(test.name.as_str()), !busy, names);
+                            if run {
+                                asked = Some(vec![test.name.clone()]);
+                            }
+                            if clicked {
+                                chosen = Some(test.name.clone());
+                            }
                         }
-                        if clicked {
-                            chosen = Some(test.name.clone());
-                        }
-                    }
-                });
+                    },
+                );
             });
         }
     });

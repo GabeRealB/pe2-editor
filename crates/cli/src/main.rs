@@ -297,7 +297,9 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
 fn whole(extensions: &project::ext::Extensions) -> Result<()> {
     untrusted(extensions);
     for id in &extensions.unlocked {
-        eprintln!("warning: {id} is not what the project took in: `pe2-cli project extension lock` keeps what it is now");
+        eprintln!(
+            "warning: {id} is not what the project took in: `pe2-cli project extension lock` keeps what it is now"
+        );
     }
     let said: Vec<String> = extensions.unmet.iter().map(|(id, why)| format!("{id}: {why}")).collect();
     anyhow::ensure!(said.is_empty(), "the project requires what it does not have:\n  {}", said.join("\n  "));
@@ -305,7 +307,9 @@ fn whole(extensions: &project::ext::Extensions) -> Result<()> {
 }
 
 /// A project's extensions as it says, with what its index holds.
-fn extensions_of(p: &project::Project) -> Result<(project::lock::Lock, project::index::Index, std::sync::Arc<project::ext::Extensions>)> {
+fn extensions_of(
+    p: &project::Project,
+) -> Result<(project::lock::Lock, project::index::Index, std::sync::Arc<project::ext::Extensions>)> {
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
@@ -318,7 +322,10 @@ fn extensions_of(p: &project::Project) -> Result<(project::lock::Lock, project::
 /// `pe2-cli project extension`.
 fn extension(command: ExtensionCommand) -> Result<()> {
     use project::ext::Status;
-    let (ExtensionCommand::List { project } | ExtensionCommand::Add { project, .. } | ExtensionCommand::Remove { project, .. } | ExtensionCommand::Lock { project }) = &command;
+    let (ExtensionCommand::List { project }
+    | ExtensionCommand::Add { project, .. }
+    | ExtensionCommand::Remove { project, .. }
+    | ExtensionCommand::Lock { project }) = &command;
     let project = project.clone();
     let p = project::Project::load(&project)?;
     let (lock, index, extensions) = extensions_of(&p)?;
@@ -334,8 +341,15 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                     Status::Available => "available".to_string(),
                     Status::Replaced(by) => format!("replaced by {by}"),
                 };
-                let required = p.manifest.imported.iter().any(|imported| imported.id == present.id && imported.required);
-                println!("{} {}  {}{status}  ({})", present.id, present.version, if required { "required, " } else { "" }, present.origin.said());
+                let required =
+                    p.manifest.imported.iter().any(|imported| imported.id == present.id && imported.required);
+                println!(
+                    "{} {}  {}{status}  ({})",
+                    present.id,
+                    present.version,
+                    if required { "required, " } else { "" },
+                    present.origin.said()
+                );
             }
         }
         ExtensionCommand::Add { what, required, .. } => {
@@ -344,14 +358,24 @@ fn extension(command: ExtensionCommand) -> Result<()> {
             let at = (place.exists() || what.starts_with("res://")).then_some(&place);
             let about = if let Some(place) = at {
                 let file = if place.is_dir() { place.join(project::ext::EXTENSION_COMPONENT) } else { place.clone() };
-                project::ext::component::about(&std::fs::read(&file).with_context(|| file.display().to_string())?).context("it is no extension")?
+                project::ext::component::about(&std::fs::read(&file).with_context(|| file.display().to_string())?)
+                    .context("it is no extension")?
             } else {
                 let found = extensions.present.iter().find(|present| present.id == what);
                 let found = found.with_context(|| format!("{what} is not among those found: give where it is"))?;
-                project::ext::component::About { id: found.id.clone(), version: found.version.clone(), ..Default::default() }
+                project::ext::component::About {
+                    id: found.id.clone(),
+                    version: found.version.clone(),
+                    ..Default::default()
+                }
             };
             let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
-            let imported = project::Imported { id: about.id.clone(), version: Some(format!("^{line}")), required, from: at.map(|_| what.clone()) };
+            let imported = project::Imported {
+                id: about.id.clone(),
+                version: Some(format!("^{line}")),
+                required,
+                from: at.map(|_| what.clone()),
+            };
             project::switches::import(&p, &imported, &mut history, format!("Take {} in", about.id))?;
             let p = project::Project::load(&project)?;
             project::switches::write_lock(&p, &extensions::locked(&p, Some(&index)))?;
@@ -430,12 +454,16 @@ fn main() -> Result<()> {
             let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
             signal(&project, config.as_deref(), events)?;
         }
-        Tool::Project { command: ProjectCommand::Clean { project, config } } => signal(&project, config.as_deref(), &[Clean::NAME])?,
+        Tool::Project { command: ProjectCommand::Clean { project, config } } => {
+            signal(&project, config.as_deref(), &[Clean::NAME])?;
+        }
         Tool::Project { command: ProjectCommand::Trust { project, all, layer, path, revoke } } => {
             trust(&project, all, &layer, path, revoke)?;
         }
         Tool::Project { command: ProjectCommand::Extension { command } } => extension(command)?,
-        Tool::Project { command: ProjectCommand::Signal { event, project, config } } => signal(&project, config.as_deref(), &[event.as_str()])?,
+        Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
+            signal(&project, config.as_deref(), &[event.as_str()])?;
+        }
         Tool::Project { command: ProjectCommand::Extract { project, release, roms, declarations } } => {
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
@@ -446,7 +474,8 @@ fn main() -> Result<()> {
             }
             let options = project::extract::Options { releases: release, roms, declarations };
             // Its own extensions (`extension` assets, in its layers above the game's) and the user's.
-            let index = project::cache::Cache::open(&p, &lock).and_then(|cache| project::index::Index::open(&p, &cache));
+            let index =
+                project::cache::Cache::open(&p, &lock).and_then(|cache| project::index::Index::open(&p, &cache));
             let extensions = extensions::for_project(&p, index.as_ref().ok());
             drop(index);
             for problem in &extensions.problems {

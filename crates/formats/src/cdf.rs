@@ -247,7 +247,8 @@ fn records(bytes: &[u8], count: usize) -> Vec<StreamRecord> {
 /// # Errors
 /// The table is short.
 pub fn stage0_streams(hed: &[u8]) -> io::Result<Vec<StreamRecord>> {
-    let table = hed.get(..HED_STREAMS).ok_or_else(|| invalid("STAGE0.HED is shorter than its stream records".into()))?;
+    let table =
+        hed.get(..HED_STREAMS).ok_or_else(|| invalid("STAGE0.HED is shorter than its stream records".into()))?;
     Ok(records(table, HED_STREAMS / STREAM_RECORD))
 }
 
@@ -309,7 +310,9 @@ fn lay_out(files: &[(u32, Place<'_>)]) -> (Vec<u8>, Vec<(u32, u64)>) {
                 out.extend_from_slice(bytes);
                 at
             }
-            Place::Shares(other) => places.iter().find(|p| p.0 == other).map(|p| p.1).expect("a file it shares the place of"),
+            Place::Shares(other) => {
+                places.iter().find(|p| p.0 == other).map(|p| p.1).expect("a file it shares the place of")
+            }
         };
         places.push((id, at));
     }
@@ -327,7 +330,10 @@ fn sectors(bytes: u64) -> u32 {
 /// More files or stream records than a folder holds.
 #[must_use]
 pub fn pack_folder(files: &[(u32, Place<'_>)], streams: &[StreamRecord], tail: &[u8]) -> Vec<u8> {
-    assert!(files.len() <= FOLDER_FILES && streams.len() <= FOLDER_STREAM_COUNT, "a folder holds 162 files, 18 streams");
+    assert!(
+        files.len() <= FOLDER_FILES && streams.len() <= FOLDER_STREAM_COUNT,
+        "a folder holds 162 files, 18 streams"
+    );
     let (body, places) = lay_out(files);
     let mut out = vec![0u8; usize::try_from(SECTOR).unwrap_or(0x800)];
     for (k, (id, at)) in places.iter().enumerate() {
@@ -335,7 +341,8 @@ pub fn pack_folder(files: &[(u32, Place<'_>)], streams: &[StreamRecord], tail: &
         out[k * 8 + 4..k * 8 + 8].copy_from_slice(&(sectors(*at) + 1).to_le_bytes());
     }
     for (k, record) in streams.iter().enumerate() {
-        out[FOLDER_STREAMS + k * STREAM_RECORD..FOLDER_STREAMS + (k + 1) * STREAM_RECORD].copy_from_slice(&record.bytes());
+        out[FOLDER_STREAMS + k * STREAM_RECORD..FOLDER_STREAMS + (k + 1) * STREAM_RECORD]
+            .copy_from_slice(&record.bytes());
     }
     out.extend_from_slice(&body);
     out.extend_from_slice(tail);
@@ -492,7 +499,8 @@ mod tests {
 
     #[test]
     fn image_strips_decode_back_in_order() {
-        let strips: Vec<Vec<u8>> = (0..10u8).map(|k| (0..0x1000u32).map(|i| i.to_le_bytes()[0].wrapping_mul(k)).collect()).collect();
+        let strips: Vec<Vec<u8>> =
+            (0..10u8).map(|k| (0..0x1000u32).map(|i| i.to_le_bytes()[0].wrapping_mul(k)).collect()).collect();
         let table = [0u8; 0x20];
         let payload = image_payload(&table, &strips, 0x800);
         assert_eq!(crate::lzss::decode_streams(&payload, table.len()), strips);

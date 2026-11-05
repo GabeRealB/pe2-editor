@@ -53,7 +53,8 @@ impl Uploads {
             if let (Some((x, y)), Some((w, h))) =
                 (asset.field("page").and_then(|p| place(project, p)), pair(asset.field("size")))
             {
-                self.pages.push(Upload { image: asset.path().to_string(), rect: Rect { x, y, width: w / per, height: h } });
+                self.pages
+                    .push(Upload { image: asset.path().to_string(), rect: Rect { x, y, width: w / per, height: h } });
             }
             for palette in 0..palette_names(asset).len() {
                 self.palette(project, asset, palette);
@@ -170,7 +171,9 @@ impl View for Vram {
         let mut drawing = 0;
         for (image, look, rect) in pages {
             match ui.picture(&image, look.as_deref()) {
-                Some(Ok(texture)) => placed.push(Placed { texture, rect, label: Some(image.clone()), link: Some(image) }),
+                Some(Ok(texture)) => {
+                    placed.push(Placed { texture, rect, label: Some(image.clone()), link: Some(image) });
+                }
                 None => drawing += 1,
                 Some(Err(_)) => {}
             }

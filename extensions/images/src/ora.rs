@@ -167,10 +167,13 @@ pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
     let (places, document_width) = regions(width, bpp, cells(asset).iter().map(|cell| cell.bpp));
     for cell in cells(asset) {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
-        let (sx, sy, cw, ch) = (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
+        let (sx, sy, cw, ch) =
+            (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
         let dx = places[&cell.bpp] + sx;
-        let values: Vec<u16> =
-            (sy..sy + ch).flat_map(|y| (0..cw).map(move |i| (sx + i, y))).map(|(x, y)| texels.cell_texel(cell.bpp, x, y)).collect();
+        let values: Vec<u16> = (sy..sy + ch)
+            .flat_map(|y| (0..cw).map(move |i| (sx + i, y)))
+            .map(|(x, y)| texels.cell_texel(cell.bpp, x, y))
+            .collect();
         let png = codecs::texture::png(cw, ch, cell.bpp, &values, &padded(palette(cell.palette), cell.bpp))
             .map_err(png_error)?;
         cell_layers.push(layer(&cell.name, dx, sy, true, png));
@@ -209,7 +212,13 @@ pub fn export(asset: &Asset, image: &TexelImage) -> Result<Vec<u8>> {
 }
 
 /// The document as a viewer shows it: the image, with the cells of other depths in their stretches beside it.
-fn merged_picture(asset: &Asset, image: &TexelImage, page: &Image, width: usize, places: &BTreeMap<u8, usize>) -> Image {
+fn merged_picture(
+    asset: &Asset,
+    image: &TexelImage,
+    page: &Image,
+    width: usize,
+    places: &BTreeMap<u8, usize>,
+) -> Image {
     if width == page.width {
         return Image { width, height: page.height, rgba: page.rgba.clone() };
     }
@@ -319,7 +328,8 @@ impl Matcher {
     fn index(&mut self, pixel: [u8; 4]) -> u16 {
         let colors = &self.colors;
         let (index, exact) = *self.known.entry(pixel).or_insert_with(|| {
-            let distance = |c: &[u8; 4]| c.iter().zip(pixel).map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2)).sum::<i32>();
+            let distance =
+                |c: &[u8; 4]| c.iter().zip(pixel).map(|(&a, b)| (i32::from(a) - i32::from(b)).pow(2)).sum::<i32>();
             let best = colors.iter().enumerate().min_by_key(|(_, c)| distance(c));
             best.map_or((0, false), |(i, c)| (u16::try_from(i).unwrap_or(0), distance(c) == 0))
         });
@@ -377,20 +387,30 @@ pub fn import(asset: &Asset, source: &[u8]) -> Result<TexelImage> {
     let picture = ora::decode_png(&base.png).map_err(|e| anyhow!("layer {TEXELS_LAYER}: {e}"))?;
     let (width, height) = (picture.width, picture.height);
     let indices = document.group(INDICES);
-    let known = indices.and_then(|g| g.layers().find(|l| l.name == TEXELS_LAYER)).map(|l| Known::read(l, bpp)).transpose()?;
+    let known =
+        indices.and_then(|g| g.layers().find(|l| l.name == TEXELS_LAYER)).map(|l| Known::read(l, bpp)).transpose()?;
     let mut painted = vec![painting(base, bpp, 0, &palette(Some(0), bpp), known.as_ref(), &mut notes)?];
     let declared: HashMap<&str, &Value> = asset.parts("cells").into_iter().collect();
     let mut settings = Table::new();
-    settings.insert("size".into(), Value::Array(vec![Value::Integer(i64::try_from(width)?), Value::Integer(i64::try_from(height)?)]));
+    settings.insert(
+        "size".into(),
+        Value::Array(vec![Value::Integer(i64::try_from(width)?), Value::Integer(i64::try_from(height)?)]),
+    );
     if !declared_mode {
-        settings.insert("mode".into(), Value::String(format!("{}_{bpp}bpp", if bpp == 16 { "direct" } else { "indexed" })));
+        settings
+            .insert("mode".into(), Value::String(format!("{}_{bpp}bpp", if bpp == 16 { "direct" } else { "indexed" })));
     }
     if found_palettes && !names.is_empty() {
-        settings.insert("palettes".into(), Value::Table(names.iter().map(|name| (name.clone(), Value::Table(Table::new()))).collect()));
+        settings.insert(
+            "palettes".into(),
+            Value::Table(names.iter().map(|name| (name.clone(), Value::Table(Table::new()))).collect()),
+        );
     }
     let mut rects = Table::new();
     let cell_layers: Vec<&Layer> = document.group(CELLS).map_or_default(|g| g.layers().collect());
-    let depth_of_layer = |name: &str| declared.get(name).and_then(|c| c.get("mode")).and_then(Value::as_str).and_then(crate::depth_of).unwrap_or(bpp);
+    let depth_of_layer = |name: &str| {
+        declared.get(name).and_then(|c| c.get("mode")).and_then(Value::as_str).and_then(crate::depth_of).unwrap_or(bpp)
+    };
     let (places, _) = regions(width, bpp, cell_layers.iter().map(|layer| depth_of_layer(&layer.name)));
     for layer in cell_layers.iter().rev() {
         let own = depth_of_layer(&layer.name);
@@ -471,7 +491,9 @@ fn painting(
     let repainted = values
         .iter()
         .enumerate()
-        .map(|(i, &v)| known.and_then(|k| k.at(layer.x, layer.y, i % width.max(1), i / width.max(1))).is_none_or(|k| k != v))
+        .map(|(i, &v)| {
+            known.and_then(|k| k.at(layer.x, layer.y, i % width.max(1), i / width.max(1))).is_none_or(|k| k != v)
+        })
         .collect();
     let base = layer.name == TEXELS_LAYER;
     let y = usize::try_from(layer.y).unwrap_or(0);
@@ -586,7 +608,9 @@ mod tests {
         let lent = Lent { fields, files: HashMap::new() };
         let image = import(&Asset::new(&lent, Some("pe2.images@image")), source).unwrap();
         // As it is stored: its files, as its type encodes them.
-        let pe2_ext::Data::Typed(typed) = <crate::Texels as pe2_ext::ty::ValueType>::encode(image) else { panic!("no files") };
+        let pe2_ext::Data::Typed(typed) = <crate::Texels as pe2_ext::ty::ValueType>::encode(image) else {
+            panic!("no files")
+        };
         let files = typed
             .files
             .into_iter()
@@ -609,7 +633,9 @@ mod tests {
                     Node::Layer(l) => {
                         let picture = ora::decode_png(&l.png).unwrap();
                         let mut pixels = match picture.pixels {
-                            Pixels::Indexed { indices, palette } => indices.iter().map(|&i| palette[usize::from(i)]).collect(),
+                            Pixels::Indexed { indices, palette } => {
+                                indices.iter().map(|&i| palette[usize::from(i)]).collect()
+                            }
                             Pixels::Rgba(pixels) => pixels,
                         };
                         paint(&format!("{path}{}", l.name), &mut pixels, picture.width);

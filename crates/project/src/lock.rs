@@ -159,7 +159,8 @@ impl Lock {
             Err(LockError::Held(owner)) => {
                 waiting(&owner);
                 let file = open(root).map_err(LockError::Io)?;
-                file.lock().map_err(|e| LockError::Io(anyhow::Error::new(e).context(paths(root).0.display().to_string())))?;
+                file.lock()
+                    .map_err(|e| LockError::Io(anyhow::Error::new(e).context(paths(root).0.display().to_string())))?;
                 claim(root, file, who)
             }
             other => other,
@@ -197,7 +198,8 @@ mod tests {
         let e = std::io::Error::from(std::io::ErrorKind::Unsupported);
         assert!(super::unsupported(&e));
         assert!(!super::unsupported(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-        let held = super::unprotected(&root, &root.join(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
+        let held =
+            super::unprotected(&root, &root.join(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
         assert!(held.unprotected().is_some_and(|why| why.contains("nothing keeps another editor")));
         drop(held);
         std::fs::remove_dir_all(&root).unwrap();

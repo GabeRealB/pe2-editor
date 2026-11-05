@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use toml_edit::{Array, ArrayOfTables, Item, Table, value};
 
-use crate::{Imported, Project};
 use crate::history::History;
 use crate::stack::{read, write};
+use crate::{Imported, Project};
 
 /// Leave these extensions off, and every other on.
 ///
@@ -85,7 +85,10 @@ pub fn remove(project: &Project, id: &str, history: &mut History, label: String)
 /// # Errors
 /// It cannot be written.
 pub fn write_lock(project: &Project, locked: &BTreeMap<String, String>) -> Result<()> {
-    let text = format!("# What each extension from outside the project was when it was taken in.\n\n{}", toml::to_string(locked)?);
+    let text = format!(
+        "# What each extension from outside the project was when it was taken in.\n\n{}",
+        toml::to_string(locked)?
+    );
     crate::cache::write_atomic(&project.root.join(crate::EXTENSIONS_LOCK), text.as_bytes())
 }
 
@@ -136,17 +139,18 @@ pub fn set_setting(
 #[cfg(test)]
 mod tests {
     use super::{import, remove, set_disabled, set_setting, write_lock};
-    use crate::{Imported, Project};
     use crate::cache::Cache;
     use crate::history::History;
     use crate::lock::Lock;
+    use crate::{Imported, Project};
 
     #[test]
     fn writes_what_the_project_says_of_its_extensions_in_place() {
         let root = std::env::temp_dir().join(format!("pe2-switches-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let text = "# the project\n[game]\nlayer = \"game\"\ndeclarations = \"res://d\"\n\n[[layer]]\nname = \"game\"\n";
+        let text =
+            "# the project\n[game]\nlayer = \"game\"\ndeclarations = \"res://d\"\n\n[[layer]]\nname = \"game\"\n";
         std::fs::write(root.join("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
@@ -156,7 +160,10 @@ mod tests {
         set_disabled(&project, &["pe2.game".to_string()], &mut history, "off".into()).unwrap();
         let written = std::fs::read_to_string(root.join("project.toml")).unwrap();
         // Its own header, the comment kept.
-        assert!(written.starts_with("# the project\n") && written.contains("[extensions.\"pe2.images\"]\ndepth = 8"), "{written}");
+        assert!(
+            written.starts_with("# the project\n") && written.contains("[extensions.\"pe2.images\"]\ndepth = 8"),
+            "{written}"
+        );
         let read = Project::load(&root).unwrap();
         assert_eq!(read.extension_settings["pe2.images"]["depth"], depth);
         assert_eq!(read.disabled_extensions, ["pe2.game"]);

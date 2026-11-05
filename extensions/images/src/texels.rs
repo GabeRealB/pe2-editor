@@ -98,6 +98,12 @@ impl ValueType for Texels {
 
     fn encode(image: TexelImage) -> Data {
         let files = image.files();
-        Data::Typed(Typed { ty: Texels::NAME.to_string(), files, settings: image.derived, notes: image.notes, ..Typed::default() })
+        Data::Typed(Typed {
+            ty: Texels::NAME.to_string(),
+            files,
+            settings: image.derived,
+            notes: image.notes,
+            ..Typed::default()
+        })
     }
 }

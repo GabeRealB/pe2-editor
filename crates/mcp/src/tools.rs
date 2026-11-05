@@ -155,7 +155,8 @@ fn acting<T: JsonSchema + 'static>(name: &'static str, description: &'static str
 }
 
 /// The tools that use the editor's window: only the editor answers them, across frames.
-pub const EDITOR_UI: [&str; 6] = ["editor_ui", "editor_act", "editor_type", "editor_screenshot", "editor_commands", "editor_run"];
+pub const EDITOR_UI: [&str; 6] =
+    ["editor_ui", "editor_act", "editor_type", "editor_screenshot", "editor_commands", "editor_run"];
 
 /// An extension's tool as agents see it: by its name within its extension (`palette`), its arguments as it declares
 /// them.
@@ -215,7 +216,7 @@ fn own() -> Vec<Tool> {
             "One of an asset's outputs (get_asset lists them), made now or found kept: a table (a movie's facts) as \
              JSON; a picture as PNG; a value of an extension's type as its files (name, size, sha1) and the settings \
              made with it; a stream (a movie's frames) as its header. A family's member by its parameter's value: \
-             `picture/default`, `palettes/default`."
+             `picture/default`, `palettes/default`.",
         ),
         tool::<PreviewArgs>(
             "preview",
@@ -281,7 +282,9 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
     let result = match name {
         "project" => Ok(project(view)),
         "find_assets" => parse(arguments).map(|a| find_assets(view.index, view.extensions, &a)),
-        "list_folder" => parse(arguments).map(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref())),
+        "list_folder" => {
+            parse(arguments).map(|a: FolderArgs| list_folder(view.index, view.extensions, a.path.as_deref()))
+        }
         "get_asset" => parse(arguments).and_then(|a: AssetArgs| get_asset(view.index, view.extensions, &a.asset)),
         "references" => parse(arguments).and_then(|a: AssetArgs| references(view.index, &a.asset)),
         "problems" => parse(arguments).map(|a: ProblemsArgs| problems(view.index, a.limit.unwrap_or(100))),
@@ -292,7 +295,9 @@ pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> Call
             return parse(arguments).and_then(|a| get_output(view.index, view.extensions, &a)).unwrap_or_else(failure);
         }
         "editor_selection" => editor_selection(view),
-        "editor_performance" => view.editor.as_ref().map(|editor| editor.performance.clone()).ok_or_else(|| NO_EDITOR.to_string()),
+        "editor_performance" => {
+            view.editor.as_ref().map(|editor| editor.performance.clone()).ok_or_else(|| NO_EDITOR.to_string())
+        }
         "editor_show" => parse(arguments).and_then(|a: AssetArgs| editor_show(view, &a.asset)),
         name if EDITOR_UI.contains(&name) => Err(NO_EDITOR.to_string()),
         _ => run_extension_tool(view, name, arguments),
@@ -458,18 +463,27 @@ fn get_asset(index: &Index, extensions: &Extensions, name: &str) -> Result<Value
         fields.insert("outputs".into(), json!(outputs));
     }
     if !wrong.is_empty() {
-        fields.insert("stack_problems".into(), json!(wrong.iter().map(|p| format!("{}: {}", p.at, p.what)).collect::<Vec<_>>()));
+        fields.insert(
+            "stack_problems".into(),
+            json!(wrong.iter().map(|p| format!("{}: {}", p.at, p.what)).collect::<Vec<_>>()),
+        );
     }
     if let Some(op) = extensions.import_op(asset) {
         fields.insert("import".into(), json!({ "name": op.name.to_string(), "label": op.label }));
     }
-    let fits: Vec<Value> =
-        extensions.ops_for(asset).into_iter().map(|op| json!({ "name": op.name.to_string(), "label": op.label })).collect();
+    let fits: Vec<Value> = extensions
+        .ops_for(asset)
+        .into_iter()
+        .map(|op| json!({ "name": op.name.to_string(), "label": op.label }))
+        .collect();
     if !fits.is_empty() {
         fields.insert("imports".into(), json!(fits));
     }
-    let addresses: Vec<Value> =
-        extensions.addresses(asset).into_iter().map(|(address, label)| json!({ "address": address, "label": label })).collect();
+    let addresses: Vec<Value> = extensions
+        .addresses(asset)
+        .into_iter()
+        .map(|(address, label)| json!({ "address": address, "label": label }))
+        .collect();
     if !addresses.is_empty() {
         fields.insert("addresses".into(), json!(addresses));
     }
@@ -599,7 +613,9 @@ fn preview(index: &Index, extensions: &Extensions, args: &PreviewArgs) -> Result
         let ids: Vec<String> = extensions.addresses(asset).into_iter().map(|(address, _)| address).collect();
         let image = extensions
             .output_image(asset, output)
-            .ok_or_else(|| format!("{}: no output {output} that is a picture; its outputs: {}", asset.path, ids.join(", ")))?
+            .ok_or_else(|| {
+                format!("{}: no output {output} that is a picture; its outputs: {}", asset.path, ids.join(", "))
+            })?
             .map_err(|e| format!("{e:#}"))?;
         let image = upscale(image, args.scale.unwrap_or(1).clamp(1, 8));
         let png = project::ext::png(&image).map_err(|e| format!("{e:#}"))?;
@@ -656,7 +672,8 @@ fn upscale(image: Image, scale: usize) -> Image {
 /// An extension's tool, by its name within its extension: its arguments as TOML, its answer back as JSON.
 fn run_extension_tool(view: &View, name: &str, arguments: &Map<String, Value>) -> Result<Value, String> {
     let extensions = view.extensions;
-    let tool = extensions.tools().iter().find(|t| t.name.local() == name).ok_or_else(|| format!("no tool is named {name}"))?;
+    let tool =
+        extensions.tools().iter().find(|t| t.name.local() == name).ok_or_else(|| format!("no tool is named {name}"))?;
     let arguments: toml::Value =
         serde_json::from_value(Value::Object(arguments.clone())).map_err(|e| format!("arguments: {e}"))?;
     let selection = view.editor.as_ref().and_then(|e| e.selection.as_deref());

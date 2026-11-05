@@ -81,7 +81,9 @@ fn reading_of(adapter: &sysinfo::Gpu) -> Reading {
 
 /// Of what the adapters say, the busiest: the one at work. One saying nothing is no reading.
 fn at_work(readings: impl Iterator<Item = Reading>) -> Option<Reading> {
-    readings.filter(|reading| reading.percent.is_some() || reading.memory_mib.is_some()).max_by_key(|reading| reading.percent)
+    readings
+        .filter(|reading| reading.percent.is_some() || reading.memory_mib.is_some())
+        .max_by_key(|reading| reading.percent)
 }
 
 fn nvidia_smi() -> Option<Reading> {
@@ -99,7 +101,13 @@ fn nvidia_smi() -> Option<Reading> {
 fn parse_nvidia_smi(text: &str) -> Option<Reading> {
     let mut numbers = text.lines().next()?.split(',').map(|n| n.trim().parse::<u32>().ok());
     let (percent, used, total) = (numbers.next()??, numbers.next()??, numbers.next()??);
-    Some(Reading { percent: Some(percent), memory_mib: Some(used), memory_total_mib: Some(total), source: "nvidia-smi", own: false })
+    Some(Reading {
+        percent: Some(percent),
+        memory_mib: Some(used),
+        memory_total_mib: Some(total),
+        source: "nvidia-smi",
+        own: false,
+    })
 }
 
 /// One connection to a GPU, as `/proc/<pid>/fdinfo` tells of it (the kernel's `drm-usage-stats`).
@@ -154,9 +162,11 @@ impl FdInfo {
     fn read(&mut self) -> Option<Reading> {
         let mut clients: HashMap<String, Client> = HashMap::new();
         for entry in std::fs::read_dir("/proc/self/fdinfo").ok()?.flatten() {
-            let is_gpu = std::fs::read_link(Path::new("/proc/self/fd").join(entry.file_name())).is_ok_and(|to| to.starts_with("/dev/dri"));
+            let is_gpu = std::fs::read_link(Path::new("/proc/self/fd").join(entry.file_name()))
+                .is_ok_and(|to| to.starts_with("/dev/dri"));
             // A connection opened twice is one client.
-            if is_gpu && let Some(client) = std::fs::read_to_string(entry.path()).ok().as_deref().and_then(parse_fdinfo) {
+            if is_gpu && let Some(client) = std::fs::read_to_string(entry.path()).ok().as_deref().and_then(parse_fdinfo)
+            {
                 clients.insert(client.id.clone(), client);
             }
         }
@@ -166,9 +176,12 @@ impl FdInfo {
         let now = Instant::now();
         let counts: HashMap<_, _> = clients
             .values()
-            .flat_map(|client| client.engines.iter().map(|(engine, &count)| ((client.id.clone(), engine.clone()), count)))
+            .flat_map(|client| {
+                client.engines.iter().map(|(engine, &count)| ((client.id.clone(), engine.clone()), count))
+            })
             .collect();
-        let percent = self.last.as_ref().map(|(then, before)| busiest(before, &counts, now.duration_since(*then).as_secs_f64()));
+        let percent =
+            self.last.as_ref().map(|(then, before)| busiest(before, &counts, now.duration_since(*then).as_secs_f64()));
         self.last = Some((now, counts));
         let memory_mib = u32::try_from(video_memory_kib(clients.values()) / 1024).ok();
         Some(Reading { percent, memory_mib, memory_total_mib: None, source: "drm-fdinfo", own: true })
@@ -182,14 +195,17 @@ fn busiest(before: &Counts, now: &Counts, seconds: f64) -> u32 {
         let Some(&(busy_before, total_before)) = before.get(key) else { continue };
         #[expect(clippy::cast_precision_loss, reason = "a share of a few seconds")]
         let share = match total.zip(total_before) {
-            Some((total, total_before)) if total > total_before => busy.saturating_sub(busy_before) as f64 / (total - total_before) as f64,
+            Some((total, total_before)) if total > total_before => {
+                busy.saturating_sub(busy_before) as f64 / (total - total_before) as f64
+            }
             None if seconds > 0.0 => busy.saturating_sub(busy_before) as f64 / (seconds * 1e9),
             _ => 0.0,
         };
         *by_engine.entry(&key.1).or_default() += share;
     }
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to a percent")]
-    let percent = (by_engine.values().fold(0.0, |most: f64, &share| most.max(share)) * 100.0).round().clamp(0.0, 100.0) as u32;
+    let percent =
+        (by_engine.values().fold(0.0, |most: f64, &share| most.max(share)) * 100.0).round().clamp(0.0, 100.0) as u32;
     percent
 }
 
@@ -198,7 +214,12 @@ fn video_memory_kib<'a>(clients: impl Iterator<Item = &'a Client>) -> u64 {
     let clients: Vec<_> = clients.collect();
     let sum = |local: bool| -> u64 {
         let local_region = |region: &str| region.starts_with("vram") || region.starts_with("local");
-        clients.iter().flat_map(|client| &client.memory).filter(|(region, _)| !local || local_region(region)).map(|(_, kib)| kib).sum()
+        clients
+            .iter()
+            .flat_map(|client| &client.memory)
+            .filter(|(region, _)| !local || local_region(region))
+            .map(|(_, kib)| kib)
+            .sum()
     };
     match sum(true) {
         0 => sum(false),
@@ -213,7 +234,10 @@ mod tests {
     #[test]
     fn nvidia_smi_gives_all_three() {
         let reading = parse_nvidia_smi("32, 3437, 24576\n").unwrap();
-        assert_eq!((reading.percent, reading.memory_mib, reading.memory_total_mib), (Some(32), Some(3437), Some(24576)));
+        assert_eq!(
+            (reading.percent, reading.memory_mib, reading.memory_total_mib),
+            (Some(32), Some(3437), Some(24576))
+        );
         assert_eq!(parse_nvidia_smi("[N/A], 3437, 24576\n"), None);
         assert_eq!(parse_nvidia_smi(""), None);
     }
@@ -255,7 +279,8 @@ mod tests {
     #[test]
     fn the_busiest_engine_is_the_rate() {
         let key = |client: &str, engine: &str| (client.to_string(), engine.to_string());
-        let before = HashMap::from([(key("1", "gfx"), (0, None)), (key("2", "gfx"), (0, None)), (key("1", "video"), (0, None))]);
+        let before =
+            HashMap::from([(key("1", "gfx"), (0, None)), (key("2", "gfx"), (0, None)), (key("1", "video"), (0, None))]);
         let now = HashMap::from([
             (key("1", "gfx"), (250_000_000, None)),
             (key("2", "gfx"), (250_000_000, None)),
@@ -269,7 +294,10 @@ mod tests {
 
     #[test]
     fn video_memory_is_preferred_over_the_system_kind() {
-        let both = Client { memory: HashMap::from([("vram".to_string(), 4096), ("gtt".to_string(), 1024)]), ..Client::default() };
+        let both = Client {
+            memory: HashMap::from([("vram".to_string(), 4096), ("gtt".to_string(), 1024)]),
+            ..Client::default()
+        };
         assert_eq!(video_memory_kib([&both].into_iter()), 4096);
         let system = Client { memory: HashMap::from([("system".to_string(), 1024)]), ..Client::default() };
         assert_eq!(video_memory_kib([&system].into_iter()), 1024);

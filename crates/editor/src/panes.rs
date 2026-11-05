@@ -140,7 +140,8 @@ impl PaneKind {
     /// The panes it opens among, where no layout holds it: the area it belongs with. What takes the room a document does
     /// has none, and opens among the documents.
     pub fn home(self) -> &'static [PaneKind] {
-        const BAND: &[PaneKind] = &[PaneKind::Assets, PaneKind::Layers, PaneKind::History, PaneKind::Problems, PaneKind::Project];
+        const BAND: &[PaneKind] =
+            &[PaneKind::Assets, PaneKind::Layers, PaneKind::History, PaneKind::Problems, PaneKind::Project];
         match self {
             PaneKind::Assets | PaneKind::Layers | PaneKind::History | PaneKind::Problems | PaneKind::Project => BAND,
             PaneKind::Contents => &[PaneKind::Contents],
@@ -173,7 +174,11 @@ impl PaneKind {
 
     /// The editor's own panes, then the extensions' panels.
     pub fn with_panels() -> Vec<PaneKind> {
-        let panels = extensions::shared().panels().iter().map(|p| PaneKind::Panel(PanelName::new(p.name.as_str()))).collect::<Vec<_>>();
+        let panels = extensions::shared()
+            .panels()
+            .iter()
+            .map(|p| PaneKind::Panel(PanelName::new(p.name.as_str())))
+            .collect::<Vec<_>>();
         PaneKind::ALL.into_iter().chain(panels).collect()
     }
 
@@ -190,7 +195,15 @@ impl PaneKind {
     /// Whether it lays out its own scrolling - a fixed filter over a scrolled tree, a canvas that pans, a sidebar
     /// beside a scrolled page. Every other pane scrolls whole, so none is ever cut off.
     fn scrolls_itself(self) -> bool {
-        matches!(self, PaneKind::Assets | PaneKind::Inspector | PaneKind::Panel(_) | PaneKind::Settings | PaneKind::Document | PaneKind::Extensions)
+        matches!(
+            self,
+            PaneKind::Assets
+                | PaneKind::Inspector
+                | PaneKind::Panel(_)
+                | PaneKind::Settings
+                | PaneKind::Document
+                | PaneKind::Extensions
+        )
     }
 
     pub fn title(self) -> String {
@@ -210,7 +223,9 @@ impl PaneKind {
             PaneKind::Tests => "Tests",
             PaneKind::Events => "Events",
             PaneKind::Panel(name) => {
-                return extensions::shared().panel(name.as_str()).map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
+                return extensions::shared()
+                    .panel(name.as_str())
+                    .map_or_else(|| name.as_str().to_string(), |p| p.label.clone());
             }
         }
         .to_string()
@@ -274,7 +289,15 @@ impl EditorKind {
                 .index
                 .assets
                 .get(path)
-                .and_then(|asset| ws.extensions.tabs(asset).into_iter().find(|def| def.name == name.as_str())?.tab.as_ref().map(|tab| icons::glyph(tab.icon)))
+                .and_then(|asset| {
+                    ws.extensions
+                        .tabs(asset)
+                        .into_iter()
+                        .find(|def| def.name == name.as_str())?
+                        .tab
+                        .as_ref()
+                        .map(|tab| icons::glyph(tab.icon))
+                })
                 .unwrap_or(icons::SQUARES_FOUR),
         }
     }
@@ -307,7 +330,8 @@ pub fn editors_of(ws: &Workspace, path: &str) -> Vec<EditorKind> {
             editors.push(editor);
         }
     }
-    editors.extend(ws.extensions.editors(asset).into_iter().map(|def| EditorKind::Extension(PanelName::new(&def.name))));
+    editors
+        .extend(ws.extensions.editors(asset).into_iter().map(|def| EditorKind::Extension(PanelName::new(&def.name))));
     if !asset.files.is_empty() {
         editors.push(EditorKind::Files);
     }
@@ -523,7 +547,9 @@ fn waiting_ui(ui: &mut egui::Ui) -> UiResponse {
 
 fn no_project_ui(ui: &mut egui::Ui, opening: bool) {
     if !opening {
-        ui.centered_and_justified(|ui| ui.label(RichText::new("No project open - File, Open project").color(theme::weak())));
+        ui.centered_and_justified(|ui| {
+            ui.label(RichText::new("No project open - File, Open project").color(theme::weak()))
+        });
     }
 }
 
@@ -532,7 +558,10 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let pane = *pane;
         let number = if pane.instance > 0 { format!(" {}", pane.instance + 1) } else { String::new() };
         crate::drive::note_pane(ui, format!("{}{number}", pane.kind.title()));
-        if pane.kind == PaneKind::Document && ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(ui.max_rect()) {
+        if pane.kind == PaneKind::Document
+            && ui.input(|i| i.pointer.any_pressed())
+            && ui.rect_contains_pointer(ui.max_rect())
+        {
             self.focus = Some(pane);
         }
         if pane.kind == PaneKind::Settings {
@@ -590,22 +619,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Assets => assets_ui(ui, ws, pick, edit),
                     PaneKind::Contents => crate::contents::contents_ui(ui, ws, subject, nav, message, edit),
                     PaneKind::Document => {
-                        let editors = subject.map_or_default(|path| editors_of(ws, path));
-                        match editor.filter(|e| editors.contains(e)).or(editors.first().copied()) {
-                            Some(EditorKind::Graph) => crate::graph_pane::graph_ui(ui, ws, subject, edit),
-                            Some(EditorKind::Files) => {
-                                if let Some(asset) = subject.and_then(|path| ws.index.assets.get(path)).cloned() {
-                                    files_view_ui(ui, ws, &asset);
-                                }
-                            }
-                            Some(EditorKind::Extension(name)) => {
-                                if let Some(path) = subject {
-                                    ws.show_editor(ui, egui::Id::unique(pane), path, name.as_str(), settings.preview, nav);
-                                }
-                            }
-                            Some(EditorKind::Tap(output)) => ws.show_tap(ui, egui::Id::unique(pane), subject, output.as_str(), settings.preview, nav),
-                            Some(EditorKind::Preview) | None => preview_ui(ui, ws, pane, subject, nav, &mut settings.preview),
-                        }
+                        document_ui(ui, ws, pane, (editor, subject), &mut settings.preview, nav, edit);
                     }
                     PaneKind::Panel(name) => {
                         ws.show_panel(ui, egui::Id::unique(pane), name.as_str(), settings.preview, nav);
@@ -621,7 +635,9 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::History => history_ui(ui, ws, steps),
                     PaneKind::Events => crate::events_pane::events_ui(ui, ws, nav, message),
                     PaneKind::Tests => crate::tests_pane::tests_ui(ui, ws),
-                    PaneKind::Extensions => crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message),
+                    PaneKind::Extensions => {
+                        crate::extensions_pane::extensions_ui(ui, ws, &mut settings.extensions, message);
+                    }
                     PaneKind::Settings => {}
                 }
             });
@@ -642,11 +658,17 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         {
             let name = path.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(path);
             let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path.as_str())?)));
-            let icon = asset.map_or(icons::FILE, |(ws, asset)| icons::for_type(&ws.extensions, ws.extensions.type_name(asset)).0);
+            let icon = asset
+                .map_or(icons::FILE, |(ws, asset)| icons::for_type(&ws.extensions, ws.extensions.type_name(asset)).0);
             // As its graph where it is shown as one: the view asked for, where the asset has it.
-            let graph = state.editor == Some(EditorKind::Graph) && asset.is_some_and(|(_, asset)| crate::graph_pane::has_graph(asset));
+            let graph = state.editor == Some(EditorKind::Graph)
+                && asset.is_some_and(|(_, asset)| crate::graph_pane::has_graph(asset));
             let icon = if graph { icons::TREE_STRUCTURE } else { icon };
-            let others = self.states.iter().filter(|(p, _)| p.kind == PaneKind::Document).filter_map(|(_, s)| s.pinned.as_deref());
+            let others = self
+                .states
+                .iter()
+                .filter(|(p, _)| p.kind == PaneKind::Document)
+                .filter_map(|(_, s)| s.pinned.as_deref());
             let text = match telling_apart(path, others) {
                 Some(folder) => RichText::new(format!("{icon}  {name}  ·  {folder}")),
                 None => RichText::new(format!("{icon}  {name}")),
@@ -672,7 +694,14 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
     }
 
     /// At the end of a strip, the editors of the document in front, where it has more than one.
-    fn top_bar_right_ui(&mut self, tiles: &Tiles<Pane>, ui: &mut egui::Ui, _tile_id: TileId, tabs: &egui_tiles::Tabs, _scroll_offset: &mut f32) {
+    fn top_bar_right_ui(
+        &mut self,
+        tiles: &Tiles<Pane>,
+        ui: &mut egui::Ui,
+        _tile_id: TileId,
+        tabs: &egui_tiles::Tabs,
+        _scroll_offset: &mut f32,
+    ) {
         let Some(active) = tabs.active else { return };
         let Some(Tile::Pane(pane)) = tiles.get(active) else { return };
         let Some(ws) = self.workspace.as_deref() else { return };
@@ -750,7 +779,12 @@ impl Panes<'_> {
         }
         if pane.kind == PaneKind::Document {
             let previewed = self.states.get(&pane).is_some_and(|s| s.preview);
-            if previewed && ui.button(format!("{}  Keep open", icons::PUSH_PIN)).on_hover_text("The next asset opened takes another tab").clicked() {
+            if previewed
+                && ui
+                    .button(format!("{}  Keep open", icons::PUSH_PIN))
+                    .on_hover_text("The next asset opened takes another tab")
+                    .clicked()
+            {
                 ask(PaneAction::Keep);
             }
         } else if pane.kind.shows_subject() {
@@ -851,7 +885,13 @@ fn assets_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<Pick>, edi
     let mut chosen = None;
     scroll(ui, "assets", |ui| {
         if filter.is_empty() {
-            let view = TreeView { ws, reveal: ws.reveal.as_deref(), edit: std::cell::RefCell::new(None), folders: None, follow: false };
+            let view = TreeView {
+                ws,
+                reveal: ws.reveal.as_deref(),
+                edit: std::cell::RefCell::new(None),
+                folders: None,
+                follow: false,
+            };
             view.ui(ui, &ws.tree, "", pick, &mut chosen);
             *edit = view.edit.into_inner().or(edit.take());
         } else {
@@ -872,7 +912,13 @@ fn filter_field(filter: &mut String) -> egui::TextEdit<'_> {
 }
 
 /// The folders down one side and what is in the one chosen as a grid: the assets where they have the width for it.
-fn browser_ui(ui: &mut egui::Ui, ws: &mut Workspace, pick: &mut Option<Pick>, edit: &mut Option<EditRequest>, mut opened: Option<Opened>) {
+fn browser_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    pick: &mut Option<Pick>,
+    edit: &mut Option<EditRequest>,
+    mut opened: Option<Opened>,
+) {
     let reveal = ws.reveal.take();
     if let Some((folder, _)) = reveal.as_deref().and_then(|path| path.rsplit_once('/')) {
         ws.open_folder(folder.to_string());
@@ -978,7 +1024,13 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
 }
 
 /// What is in the folder chosen, as a grid: a picture and a name each, folders opening.
-fn assets_grid_ui(ui: &mut egui::Ui, ws: &Workspace, pick: &mut Option<Pick>, edit: &mut Option<EditRequest>, opened: &mut Option<Opened>) {
+fn assets_grid_ui(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    pick: &mut Option<Pick>,
+    edit: &mut Option<EditRequest>,
+    opened: &mut Option<Opened>,
+) {
     let folder = ws.asset_folder.as_str();
     let Some(node) = ws.tree.at(folder) else { return };
     ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
@@ -997,7 +1049,8 @@ fn assets_grid_ui(ui: &mut egui::Ui, ws: &Workspace, pick: &mut Option<Pick>, ed
             // A click chooses, as anywhere; a double click goes in, or keeps a tab open.
             if response.clicked() {
                 let entry = child.asset.as_deref().or(child.path.as_deref().filter(|_| !is_folder));
-                *pick = entry.map(|path| Pick { path: path.to_string(), keep: response.double_clicked() && !is_folder });
+                *pick =
+                    entry.map(|path| Pick { path: path.to_string(), keep: response.double_clicked() && !is_folder });
                 if is_folder && entry.is_none() {
                     *opened = Some(Opened::Marked(path.clone()));
                 }
@@ -1036,8 +1089,13 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
     if selected || response.hovered() {
         ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
     }
-    let picture = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 6.0 + PICTURE / 2.0), egui::Vec2::splat(PICTURE));
-    let thumbnail = asset.filter(|a| ws.attached() && ws.extensions.has_thumbnail(a)).and_then(|a| ws.thumbs.get(ui.ctx(), &ws.extensions, a));
+    let picture = egui::Rect::from_center_size(
+        rect.center_top() + egui::vec2(0.0, 6.0 + PICTURE / 2.0),
+        egui::Vec2::splat(PICTURE),
+    );
+    let thumbnail = asset
+        .filter(|a| ws.attached() && ws.extensions.has_thumbnail(a))
+        .and_then(|a| ws.thumbs.get(ui.ctx(), &ws.extensions, a));
     if let Some(texture) = thumbnail {
         let image = egui::Image::new((texture, egui::Vec2::splat(PICTURE))).maintain_aspect_ratio(true);
         image.paint_at(ui, picture);
@@ -1050,7 +1108,11 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         let font = egui::FontId::proportional(30.0);
         ui.painter().text(picture.center(), egui::Align2::CENTER_CENTER, icon, font, tint);
     }
-    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), egui::TextStyle::Small.resolve(ui.style()), theme::text());
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name.to_string(),
+        egui::TextStyle::Small.resolve(ui.style()),
+        theme::text(),
+    );
     job.wrap = egui::text::TextWrapping::truncate_at_width(CELL.x - 8.0);
     let galley = ui.painter().layout_job(job);
     let at = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.bottom() - galley.size().y - 4.0);
@@ -1213,8 +1275,9 @@ impl TreeView<'_> {
         let dim = !self.ws.is_editable(asset);
         let selected = self.ws.selected.as_deref() == Some(asset);
         // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.
-        let thumbnail =
-            found.filter(|a| self.ws.attached() && self.ws.extensions.has_thumbnail(a)).and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
+        let thumbnail = found
+            .filter(|a| self.ws.attached() && self.ws.extensions.has_thumbnail(a))
+            .and_then(|a| self.ws.thumbs.get(ui.ctx(), &self.ws.extensions, a));
         let button = match thumbnail {
             Some(texture) => {
                 let side = ui.text_style_height(&egui::TextStyle::Body);
@@ -1356,7 +1419,13 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
     ui.label(RichText::new(format!("{} matches", matches.len())).small().color(theme::weak()));
     for asset in matches.iter().take(SHOWN) {
         let selected = ws.selected.as_deref() == Some(asset.path.as_str());
-        let job = labelled(&ws.extensions, ui.style(), ws.extensions.type_name(asset), &asset.path, !ws.is_editable(&asset.path));
+        let job = labelled(
+            &ws.extensions,
+            ui.style(),
+            ws.extensions.type_name(asset),
+            &asset.path,
+            !ws.is_editable(&asset.path),
+        );
         let response = ui.add(egui::Button::selectable(selected, job).truncate().sense(egui::Sense::click_and_drag()));
         response.dnd_set_drag_payload(Dragged::Asset(asset.path.clone()));
         if response.clicked() {
@@ -1369,6 +1438,37 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
 }
 
 // --- preview ----------------------------------------------------------------------------------------------------------
+
+/// A document's body: its subject in the editor chosen for it where it can show it, else in the first that can, else
+/// its preview.
+fn document_ui(
+    ui: &mut egui::Ui,
+    ws: &mut Workspace,
+    pane: Pane,
+    (editor, subject): (Option<EditorKind>, Option<&str>),
+    preview: &mut Preview,
+    nav: &mut Option<String>,
+    edit: &mut Option<EditRequest>,
+) {
+    let editors = subject.map_or_default(|path| editors_of(ws, path));
+    match editor.filter(|e| editors.contains(e)).or(editors.first().copied()) {
+        Some(EditorKind::Graph) => crate::graph_pane::graph_ui(ui, ws, subject, edit),
+        Some(EditorKind::Files) => {
+            if let Some(asset) = subject.and_then(|path| ws.index.assets.get(path)).cloned() {
+                files_view_ui(ui, ws, &asset);
+            }
+        }
+        Some(EditorKind::Extension(name)) => {
+            if let Some(path) = subject {
+                ws.show_editor(ui, egui::Id::unique(pane), path, name.as_str(), *preview, nav);
+            }
+        }
+        Some(EditorKind::Tap(output)) => {
+            ws.show_tap(ui, egui::Id::unique(pane), subject, output.as_str(), *preview, nav);
+        }
+        Some(EditorKind::Preview) | None => preview_ui(ui, ws, pane, subject, nav, preview),
+    }
+}
 
 fn preview_ui(
     ui: &mut egui::Ui,
@@ -1545,8 +1645,16 @@ fn trace_at(traces: &[pe2_ext::Traced], at: (f32, f32)) -> Option<usize> {
 
 /// The polygons of an overlay: thin over what they lie on, what is selected filled, so that the pixels it covers show;
 /// the one under the pointer on top.
-fn traces_ui(painter: &egui::Painter, traces: &[pe2_ext::Traced], hovered: Option<usize>, origin: egui::Pos2, scale: f32) {
-    let points = |trace: &pe2_ext::Traced| trace.corners.iter().map(|&(x, y)| origin + egui::vec2(x, y) * scale).collect::<Vec<_>>();
+fn traces_ui(
+    painter: &egui::Painter,
+    traces: &[pe2_ext::Traced],
+    hovered: Option<usize>,
+    origin: egui::Pos2,
+    scale: f32,
+) {
+    let points = |trace: &pe2_ext::Traced| {
+        trace.corners.iter().map(|&(x, y)| origin + egui::vec2(x, y) * scale).collect::<Vec<_>>()
+    };
     let thin = egui::Stroke::new(1.0, Color32::from_white_alpha(110));
     for trace in traces.iter().filter(|trace| !trace.strong) {
         painter.add(egui::Shape::closed_line(points(trace), thin));
@@ -1556,7 +1664,26 @@ fn traces_ui(painter: &egui::Painter, traces: &[pe2_ext::Traced], hovered: Optio
         painter.add(egui::Shape::convex_polygon(points(trace), theme::accent().gamma_multiply(0.3), strong));
     }
     if let Some(trace) = hovered.and_then(|at| traces.get(at)) {
-        painter.add(egui::Shape::convex_polygon(points(trace), Color32::from_white_alpha(50), egui::Stroke::new(2.0, Color32::WHITE)));
+        painter.add(egui::Shape::convex_polygon(
+            points(trace),
+            Color32::from_white_alpha(50),
+            egui::Stroke::new(2.0, Color32::WHITE),
+        ));
+    }
+}
+
+/// An overlay's summary, and the toggle showing its boxes where it has one and boxes to show; without one, always shown.
+fn boxes_toggle(ui: &mut egui::Ui, overlay: &Overlay, show_boxes: &mut bool) {
+    if overlay.toggle.is_empty() {
+        *show_boxes = true;
+        if !overlay.summary.is_empty() {
+            ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
+        }
+    } else if !overlay.boxes.is_empty() {
+        ui.horizontal(|ui| {
+            ui.checkbox(show_boxes, &overlay.toggle);
+            ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
+        });
     }
 }
 
@@ -1565,23 +1692,21 @@ fn traces_ui(painter: &egui::Painter, traces: &[pe2_ext::Traced], hovered: Optio
 pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: usize) -> Option<String> {
     let (path, boxes, layout_size) = (overlay.id.as_str(), &overlay.boxes, overlay.size);
     let plain = theme::weak().gamma_multiply(0.6);
-    let color = |i: usize, highlight: bool| if overlay.legend { box_color(i) } else if highlight { theme::accent() } else { plain };
+    let color = |i: usize, highlight: bool| {
+        if overlay.legend {
+            box_color(i)
+        } else if highlight {
+            theme::accent()
+        } else {
+            plain
+        }
+    };
     let shown_id = egui::Id::unique(("overlay boxes", path));
     let hover_id = egui::Id::unique(("overlay hovered", path));
     let mut show_boxes = ui.data(|d| d.get_temp::<bool>(shown_id)).unwrap_or(true);
     let hovered: Option<usize> = ui.data(|d| d.get_temp(hover_id)).flatten();
     let mut now_hovered = None;
-    if overlay.toggle.is_empty() {
-        show_boxes = true;
-        if !overlay.summary.is_empty() {
-            ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
-        }
-    } else if !boxes.is_empty() {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut show_boxes, &overlay.toggle);
-            ui.label(RichText::new(&overlay.summary).small().color(theme::weak()));
-        });
-    }
+    boxes_toggle(ui, overlay, &mut show_boxes);
     ui.data_mut(|d| d.insert_temp(shown_id, show_boxes));
     let legend = overlay.legend && show_boxes && !boxes.is_empty();
     #[expect(clippy::cast_precision_loss, reason = "a handful of pictures")]
@@ -1613,20 +1738,14 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
     if show_boxes {
         let font = egui::TextStyle::Small.resolve(ui.style());
         for (i, (name, rect, highlight)) in boxes.iter().enumerate() {
-            let strong = hovered == Some(i) || *highlight;
-            let width = if strong { if overlay.legend { 3.0 } else { 2.0 } } else { 1.0 };
-            let screen = to_screen(*rect);
-            painter.rect_stroke(screen, 0.0, egui::Stroke::new(width, color(i, *highlight)), egui::StrokeKind::Inside);
-            if !overlay.legend {
-                continue;
-            }
-            // The name, on a dark band in the box's corner, where the box is large enough to hold it.
-            let galley = painter.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE);
-            let band = egui::Rect::from_min_size(screen.min, galley.size() + egui::vec2(6.0, 2.0));
-            if band.width() <= screen.width() && band.height() <= screen.height() || hovered == Some(i) {
-                painter.rect_filled(band, 2.0, Color32::from_black_alpha(170));
-                painter.galley(band.min + egui::vec2(3.0, 1.0), galley, Color32::WHITE);
-            }
+            let named = overlay.legend.then_some(name.as_str());
+            box_ui(
+                &painter,
+                &font,
+                (to_screen(*rect), color(i, *highlight)),
+                named,
+                (hovered == Some(i) || *highlight, hovered == Some(i)),
+            );
         }
     }
     let mut clicked = None;
@@ -1667,6 +1786,26 @@ pub fn overlay_ui(ui: &mut egui::Ui, overlay: &Overlay, view: Preview, count: us
     clicked
 }
 
+/// A box of an overlay drawn: its outline, broad where `strong`, and its name (where given) on a dark band in its
+/// corner, where the box is large enough to hold it or it is hovered.
+fn box_ui(
+    painter: &egui::Painter,
+    font: &egui::FontId,
+    (screen, color): (egui::Rect, Color32),
+    name: Option<&str>,
+    (strong, hovered): (bool, bool),
+) {
+    let width = if strong { if name.is_some() { 3.0 } else { 2.0 } } else { 1.0 };
+    painter.rect_stroke(screen, 0.0, egui::Stroke::new(width, color), egui::StrokeKind::Inside);
+    let Some(name) = name else { return };
+    let galley = painter.layout_no_wrap(name.to_string(), font.clone(), Color32::WHITE);
+    let band = egui::Rect::from_min_size(screen.min, galley.size() + egui::vec2(6.0, 2.0));
+    if band.width() <= screen.width() && band.height() <= screen.height() || hovered {
+        painter.rect_filled(band, 2.0, Color32::from_black_alpha(170));
+        painter.galley(band.min + egui::vec2(3.0, 1.0), galley, Color32::WHITE);
+    }
+}
+
 /// Lines every so many units across and down a canvas drawn at `scale`: VRAM's texture pages.
 fn page_grid(painter: &egui::Painter, whole: egui::Rect, size: egui::Vec2, scale: f32, (across, down): (f32, f32)) {
     let stroke = egui::Stroke::new(1.0, theme::border().gamma_multiply(0.5));
@@ -1686,7 +1825,12 @@ fn page_grid(painter: &egui::Painter, whole: egui::Rect, size: egui::Vec2, scale
 
 /// An overlay's legend: each box's color and name in columns; hovering an entry highlights its box. Returns the entry
 /// hovered.
-fn legend_ui(ui: &mut egui::Ui, path: &str, boxes: &[(String, egui::Rect, bool)], hovered: Option<usize>) -> Option<usize> {
+fn legend_ui(
+    ui: &mut egui::Ui,
+    path: &str,
+    boxes: &[(String, egui::Rect, bool)],
+    hovered: Option<usize>,
+) -> Option<usize> {
     let color = box_color;
     let mut now_hovered = None;
     ui.add_space(6.0);
@@ -1859,6 +2003,34 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
 
 // --- problems ---------------------------------------------------------------------------------------------------------
 
+/// What the last build found wrong, where it did: its wiring, what failed and what is stale, each a link to where.
+fn build_problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
+    if let Some(epoch) = ws.last_epoch.as_ref().filter(|epoch| epoch.is_wrong()) {
+        theme::section(ui, &format!("Build  ·  {}", epoch.config), |ui| {
+            let wiring = epoch.problems.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
+            let failed = epoch.report.failed.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
+            let stale_why = "is stale: what it reads changed after it ran";
+            let stale = epoch
+                .report
+                .stale
+                .iter()
+                .map(|(at, output)| (at, format!("{output} {stale_why}"), ui.visuals().warn_fg_color));
+            let shown: Vec<_> = wiring.chain(failed).chain(stale).collect();
+            for (at, why, tint) in shown {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(icons::WARNING).color(tint));
+                        if ui.link(at.as_str()).clicked() {
+                            *nav = Some(at.clone());
+                        }
+                    });
+                    ui.label(RichText::new(why).monospace().color(theme::weak()));
+                });
+            }
+        });
+    }
+}
+
 /// What the index finds wrong, each with the assets it is about; the references that resolve to nothing; whether the
 /// layers are watched and agents can connect.
 fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
@@ -1891,26 +2063,7 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
             }
         });
     }
-    if let Some(epoch) = ws.last_epoch.as_ref().filter(|epoch| epoch.is_wrong()) {
-        theme::section(ui, &format!("Build  ·  {}", epoch.config), |ui| {
-            let wiring = epoch.problems.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
-            let failed = epoch.report.failed.iter().map(|(at, why)| (at, why.clone(), ui.visuals().error_fg_color));
-            let stale_why = "is stale: what it reads changed after it ran";
-            let stale = epoch.report.stale.iter().map(|(at, output)| (at, format!("{output} {stale_why}"), ui.visuals().warn_fg_color));
-            let shown: Vec<_> = wiring.chain(failed).chain(stale).collect();
-            for (at, why, tint) in shown {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(icons::WARNING).color(tint));
-                        if ui.link(at.as_str()).clicked() {
-                            *nav = Some(at.clone());
-                        }
-                    });
-                    ui.label(RichText::new(why).monospace().color(theme::weak()));
-                });
-            }
-        });
-    }
+    build_problems_ui(ui, ws, nav);
     let problems = &ws.index.problems;
     theme::section(ui, &format!("Problems ({})", problems.len()), |ui| {
         if problems.is_empty() {
@@ -1922,7 +2075,11 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                 let tint = if problem.is_warning() { ui.visuals().warn_fg_color } else { ui.visuals().error_fg_color };
                 for (at, path) in problem.paths().iter().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(icons::WARNING).color(if at == 0 { tint } else { Color32::TRANSPARENT }));
+                        ui.label(RichText::new(icons::WARNING).color(if at == 0 {
+                            tint
+                        } else {
+                            Color32::TRANSPARENT
+                        }));
                         let asset = path.strip_suffix(project::index::BUNDLE_SUFFIX);
                         if theme::short_link(ui, path).clicked()
                             && let Some(asset) = asset
@@ -1937,7 +2094,10 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                 if let project::index::Problem::Missing { layer, path } = problem
                     && ws.layers.iter().any(|l| l.name == *layer && l.writable)
                     && let Some(uid) = ws.index.listed(layer, path)
-                    && ui.small_button("Forget it").on_hover_text("Take it out of the layer's list (an undoable step)").clicked()
+                    && ui
+                        .small_button("Forget it")
+                        .on_hover_text("Take it out of the layer's list (an undoable step)")
+                        .clicked()
                 {
                     *edit = Some(EditRequest::Forget(layer.clone(), uid.to_string()));
                 }
@@ -1964,6 +2124,56 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
 }
 
 // --- project ----------------------------------------------------------------------------------------------------------
+
+/// The extensions loaded: each one's name, version, where it comes from and the memory its instances hold.
+fn project_extensions_ui(ui: &mut egui::Ui, ws: &Workspace) {
+    theme::section(ui, "Extensions", |ui| {
+        let memory = ws.extensions.memory();
+        // A column each - name, version, origin, memory - aligned across the rows.
+        egui::Grid::new("project extensions").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
+            for extension in &ws.extensions.loaded {
+                ui.label(RichText::new(&extension.id).strong());
+                ui.label(RichText::new(&extension.version).color(theme::weak()));
+                match &extension.origin {
+                    project::ext::Origin::Builtin => {
+                        ui.label(RichText::new("built in").small().color(theme::weak()));
+                    }
+                    project::ext::Origin::Linked => {
+                        ui.label(RichText::new("linked in").small().color(ui.visuals().warn_fg_color))
+                            .on_hover_text("PE2_EXTENSIONS=linked: its crate runs in the editor, not its component");
+                    }
+                    project::ext::Origin::Project { asset, .. } => {
+                        ui.label(RichText::new("project").small().color(theme::weak())).on_hover_text(asset);
+                    }
+                    project::ext::Origin::User(path)
+                    | project::ext::Origin::Install(path)
+                    | project::ext::Origin::Component(path) => {
+                        let text = path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
+                        ui.label(RichText::new(text).small().color(theme::weak()))
+                            .on_hover_text(path.display().to_string());
+                    }
+                }
+                // What its instances hold now: a guest's memory only grows, until its instance is reclaimed.
+                match memory.iter().find(|(id, _)| *id == extension.id).filter(|(_, m)| m.instances > 0) {
+                    Some((_, m)) => {
+                        let mib = |bytes: usize| bytes.div_ceil(1 << 20);
+                        let s = if m.instances == 1 { "" } else { "s" };
+                        ui.label(RichText::new(format!("{} MiB", mib(m.bytes))).small().color(theme::weak()))
+                            .on_hover_text(format!(
+                                "Held by {} instance{s}; the most one has held: {} MiB",
+                                m.instances,
+                                mib(m.peak)
+                            ));
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    });
+}
 
 fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
     let p = &ws.project;
@@ -1997,46 +2207,7 @@ fn project_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>) {
             }
         });
     }
-    theme::section(ui, "Extensions", |ui| {
-        let memory = ws.extensions.memory();
-        // A column each - name, version, origin, memory - aligned across the rows.
-        egui::Grid::new("project extensions").num_columns(4).spacing([14.0, 4.0]).show(ui, |ui| {
-            for extension in &ws.extensions.loaded {
-                ui.label(RichText::new(&extension.id).strong());
-                ui.label(RichText::new(&extension.version).color(theme::weak()));
-                match &extension.origin {
-                    project::ext::Origin::Builtin => {
-                        ui.label(RichText::new("built in").small().color(theme::weak()));
-                    }
-                    project::ext::Origin::Linked => {
-                        ui.label(RichText::new("linked in").small().color(ui.visuals().warn_fg_color))
-                            .on_hover_text("PE2_EXTENSIONS=linked: its crate runs in the editor, not its component");
-                    }
-                    project::ext::Origin::Project { asset, .. } => {
-                        ui.label(RichText::new("project").small().color(theme::weak())).on_hover_text(asset);
-                    }
-                    project::ext::Origin::User(path) | project::ext::Origin::Install(path) | project::ext::Origin::Component(path) => {
-                        let text = path.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
-                        ui.label(RichText::new(text).small().color(theme::weak())).on_hover_text(path.display().to_string());
-                    }
-                }
-                // What its instances hold now: a guest's memory only grows, until its instance is reclaimed.
-                match memory.iter().find(|(id, _)| *id == extension.id).filter(|(_, m)| m.instances > 0) {
-                    Some((_, m)) => {
-                        let mib = |bytes: usize| bytes.div_ceil(1 << 20);
-                        let s = if m.instances == 1 { "" } else { "s" };
-                        ui.label(RichText::new(format!("{} MiB", mib(m.bytes))).small().color(theme::weak())).on_hover_text(
-                            format!("Held by {} instance{s}; the most one has held: {} MiB", m.instances, mib(m.peak)),
-                        );
-                    }
-                    None => {
-                        ui.label("");
-                    }
-                }
-                ui.end_row();
-            }
-        });
-    });
+    project_extensions_ui(ui, ws);
     theme::section(ui, "Layers", |ui| {
         for layer in &p.layers {
             ui.horizontal(|ui| {
@@ -2404,7 +2575,12 @@ mod tests {
     use pe2_ext::Traced;
 
     fn square(left: f32, strong: bool) -> Traced {
-        Traced { corners: vec![(left, 0.0), (left + 10.0, 0.0), (left + 10.0, 10.0), (left, 10.0)], strong, label: None, link: None }
+        Traced {
+            corners: vec![(left, 0.0), (left + 10.0, 0.0), (left + 10.0, 10.0), (left, 10.0)],
+            strong,
+            label: None,
+            link: None,
+        }
     }
 
     #[test]

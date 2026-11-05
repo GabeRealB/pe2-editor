@@ -20,7 +20,8 @@ fn rows(ui: &mut egui::Ui, id: &str, shown: &[Row], ws: &mut Workspace, nav: &mu
     let fired = ws.last_epoch.as_ref().map(|epoch| &epoch.report.signaled);
     egui::Grid::new(id).num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
         for row in shown {
-            let tint = if fired.is_some_and(|f| f.contains(&row.id)) { theme::accent() } else { ui.visuals().text_color() };
+            let tint =
+                if fired.is_some_and(|f| f.contains(&row.id)) { theme::accent() } else { ui.visuals().text_color() };
             let name = RichText::new(&row.label).color(tint);
             match &row.asset {
                 Some(path) => {
@@ -63,10 +64,14 @@ pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>
                 rows(ui, "own events", &own, ws, nav);
             }
             ui.horizontal(|ui| {
-                let entered = ui.add(egui::TextEdit::singleline(&mut ws.new_event_name).hint_text("A new event").desired_width(180.0));
+                let entered = ui.add(
+                    egui::TextEdit::singleline(&mut ws.new_event_name).hint_text("A new event").desired_width(180.0),
+                );
                 let submitted = entered.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let name = ws.new_event_name.trim().to_string();
-                if (ui.add_enabled(!name.is_empty(), egui::Button::new("Add")).clicked() || submitted) && !name.is_empty() {
+                if (ui.add_enabled(!name.is_empty(), egui::Button::new("Add")).clicked() || submitted)
+                    && !name.is_empty()
+                {
                     match ws.new_event(&name) {
                         Ok(()) => ws.new_event_name.clear(),
                         Err(why) => *message = Some(why),
@@ -74,11 +79,19 @@ pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>
                 }
             });
         });
-        let theirs: Vec<Row> = ws.extensions.events.iter().map(|(id, label)| Row { id: id.clone(), label: label.clone(), asset: None }).collect();
+        let theirs: Vec<Row> = ws
+            .extensions
+            .events
+            .iter()
+            .map(|(id, label)| Row { id: id.clone(), label: label.clone(), asset: None })
+            .collect();
         if !theirs.is_empty() {
             theme::section(ui, "Extensions", |ui| rows(ui, "their events", &theirs, ws, nav));
         }
-        let built_in: Vec<Row> = BUILT_IN.iter().map(|(id, label)| Row { id: (*id).to_string(), label: (*label).to_string(), asset: None }).collect();
+        let built_in: Vec<Row> = BUILT_IN
+            .iter()
+            .map(|(id, label)| Row { id: (*id).to_string(), label: (*label).to_string(), asset: None })
+            .collect();
         theme::section(ui, "Built in", |ui| rows(ui, "built-in events", &built_in, ws, nav));
     });
 }

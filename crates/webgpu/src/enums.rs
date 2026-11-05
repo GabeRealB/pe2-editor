@@ -6,9 +6,7 @@ impl From<webgpu::GpuPowerPreference> for wgpu_types::PowerPreference {
     fn from(value: webgpu::GpuPowerPreference) -> Self {
         match value {
             webgpu::GpuPowerPreference::LowPower => wgpu_types::PowerPreference::LowPower,
-            webgpu::GpuPowerPreference::HighPerformance => {
-                wgpu_types::PowerPreference::HighPerformance
-            }
+            webgpu::GpuPowerPreference::HighPerformance => wgpu_types::PowerPreference::HighPerformance,
         }
     }
 }
@@ -62,13 +60,9 @@ impl From<webgpu::GpuTextureFormat> for wgpu_types::TextureFormat {
             webgpu::GpuTextureFormat::Stencil8 => wgpu_types::TextureFormat::Stencil8,
             webgpu::GpuTextureFormat::Depth16unorm => wgpu_types::TextureFormat::Depth16Unorm,
             webgpu::GpuTextureFormat::Depth24plus => wgpu_types::TextureFormat::Depth24Plus,
-            webgpu::GpuTextureFormat::Depth24plusStencil8 => {
-                wgpu_types::TextureFormat::Depth24PlusStencil8
-            }
+            webgpu::GpuTextureFormat::Depth24plusStencil8 => wgpu_types::TextureFormat::Depth24PlusStencil8,
             webgpu::GpuTextureFormat::Depth32float => wgpu_types::TextureFormat::Depth32Float,
-            webgpu::GpuTextureFormat::Depth32floatStencil8 => {
-                wgpu_types::TextureFormat::Depth32FloatStencil8
-            }
+            webgpu::GpuTextureFormat::Depth32floatStencil8 => wgpu_types::TextureFormat::Depth32FloatStencil8,
             compressed => block_compressed(compressed),
         }
     }
@@ -77,17 +71,11 @@ impl From<webgpu::GpuTextureFormat> for wgpu_types::TextureFormat {
 fn block_compressed(value: webgpu::GpuTextureFormat) -> wgpu_types::TextureFormat {
     match value {
         webgpu::GpuTextureFormat::Bc1RgbaUnorm => wgpu_types::TextureFormat::Bc1RgbaUnorm,
-        webgpu::GpuTextureFormat::Bc1RgbaUnormSrgb => {
-                wgpu_types::TextureFormat::Bc1RgbaUnormSrgb
-            }
+        webgpu::GpuTextureFormat::Bc1RgbaUnormSrgb => wgpu_types::TextureFormat::Bc1RgbaUnormSrgb,
         webgpu::GpuTextureFormat::Bc2RgbaUnorm => wgpu_types::TextureFormat::Bc2RgbaUnorm,
-        webgpu::GpuTextureFormat::Bc2RgbaUnormSrgb => {
-                wgpu_types::TextureFormat::Bc2RgbaUnormSrgb
-            }
+        webgpu::GpuTextureFormat::Bc2RgbaUnormSrgb => wgpu_types::TextureFormat::Bc2RgbaUnormSrgb,
         webgpu::GpuTextureFormat::Bc3RgbaUnorm => wgpu_types::TextureFormat::Bc3RgbaUnorm,
-        webgpu::GpuTextureFormat::Bc3RgbaUnormSrgb => {
-                wgpu_types::TextureFormat::Bc3RgbaUnormSrgb
-            }
+        webgpu::GpuTextureFormat::Bc3RgbaUnormSrgb => wgpu_types::TextureFormat::Bc3RgbaUnormSrgb,
         webgpu::GpuTextureFormat::Bc4RUnorm => wgpu_types::TextureFormat::Bc4RUnorm,
         webgpu::GpuTextureFormat::Bc4RSnorm => wgpu_types::TextureFormat::Bc4RSnorm,
         webgpu::GpuTextureFormat::Bc5RgUnorm => wgpu_types::TextureFormat::Bc5RgUnorm,
@@ -95,21 +83,13 @@ fn block_compressed(value: webgpu::GpuTextureFormat) -> wgpu_types::TextureForma
         webgpu::GpuTextureFormat::Bc6hRgbUfloat => wgpu_types::TextureFormat::Bc6hRgbUfloat,
         webgpu::GpuTextureFormat::Bc6hRgbFloat => wgpu_types::TextureFormat::Bc6hRgbFloat,
         webgpu::GpuTextureFormat::Bc7RgbaUnorm => wgpu_types::TextureFormat::Bc7RgbaUnorm,
-        webgpu::GpuTextureFormat::Bc7RgbaUnormSrgb => {
-                wgpu_types::TextureFormat::Bc7RgbaUnormSrgb
-            }
+        webgpu::GpuTextureFormat::Bc7RgbaUnormSrgb => wgpu_types::TextureFormat::Bc7RgbaUnormSrgb,
         webgpu::GpuTextureFormat::Etc2Rgb8unorm => wgpu_types::TextureFormat::Etc2Rgb8Unorm,
-        webgpu::GpuTextureFormat::Etc2Rgb8unormSrgb => {
-                wgpu_types::TextureFormat::Etc2Rgb8UnormSrgb
-            }
+        webgpu::GpuTextureFormat::Etc2Rgb8unormSrgb => wgpu_types::TextureFormat::Etc2Rgb8UnormSrgb,
         webgpu::GpuTextureFormat::Etc2Rgb8a1unorm => wgpu_types::TextureFormat::Etc2Rgb8A1Unorm,
-        webgpu::GpuTextureFormat::Etc2Rgb8a1unormSrgb => {
-                wgpu_types::TextureFormat::Etc2Rgb8A1UnormSrgb
-            }
+        webgpu::GpuTextureFormat::Etc2Rgb8a1unormSrgb => wgpu_types::TextureFormat::Etc2Rgb8A1UnormSrgb,
         webgpu::GpuTextureFormat::Etc2Rgba8unorm => wgpu_types::TextureFormat::Etc2Rgba8Unorm,
-        webgpu::GpuTextureFormat::Etc2Rgba8unormSrgb => {
-                wgpu_types::TextureFormat::Etc2Rgba8UnormSrgb
-            }
+        webgpu::GpuTextureFormat::Etc2Rgba8unormSrgb => wgpu_types::TextureFormat::Etc2Rgba8UnormSrgb,
         webgpu::GpuTextureFormat::EacR11unorm => wgpu_types::TextureFormat::EacR11Unorm,
         webgpu::GpuTextureFormat::EacR11snorm => wgpu_types::TextureFormat::EacR11Snorm,
         webgpu::GpuTextureFormat::EacRg11unorm => wgpu_types::TextureFormat::EacRg11Unorm,
@@ -124,12 +104,8 @@ impl From<webgpu::GpuPrimitiveTopology> for wgpu_types::PrimitiveTopology {
             webgpu::GpuPrimitiveTopology::PointList => wgpu_types::PrimitiveTopology::PointList,
             webgpu::GpuPrimitiveTopology::LineList => wgpu_types::PrimitiveTopology::LineList,
             webgpu::GpuPrimitiveTopology::LineStrip => wgpu_types::PrimitiveTopology::LineStrip,
-            webgpu::GpuPrimitiveTopology::TriangleList => {
-                wgpu_types::PrimitiveTopology::TriangleList
-            }
-            webgpu::GpuPrimitiveTopology::TriangleStrip => {
-                wgpu_types::PrimitiveTopology::TriangleStrip
-            }
+            webgpu::GpuPrimitiveTopology::TriangleList => wgpu_types::PrimitiveTopology::TriangleList,
+            webgpu::GpuPrimitiveTopology::TriangleStrip => wgpu_types::PrimitiveTopology::TriangleStrip,
         }
     }
 }
@@ -210,9 +186,7 @@ impl From<webgpu::GpuSamplerBindingType> for wgpu_types::SamplerBindingType {
     fn from(value: webgpu::GpuSamplerBindingType) -> Self {
         match value {
             webgpu::GpuSamplerBindingType::Filtering => wgpu_types::SamplerBindingType::Filtering,
-            webgpu::GpuSamplerBindingType::NonFiltering => {
-                wgpu_types::SamplerBindingType::NonFiltering
-            }
+            webgpu::GpuSamplerBindingType::NonFiltering => wgpu_types::SamplerBindingType::NonFiltering,
             webgpu::GpuSamplerBindingType::Comparison => wgpu_types::SamplerBindingType::Comparison,
         }
     }
@@ -221,9 +195,7 @@ impl From<webgpu::GpuSamplerBindingType> for wgpu_types::SamplerBindingType {
 impl From<webgpu::GpuTextureSampleType> for wgpu_types::TextureSampleType {
     fn from(value: webgpu::GpuTextureSampleType) -> Self {
         match value {
-            webgpu::GpuTextureSampleType::Float => {
-                wgpu_types::TextureSampleType::Float { filterable: true }
-            }
+            webgpu::GpuTextureSampleType::Float => wgpu_types::TextureSampleType::Float { filterable: true },
             webgpu::GpuTextureSampleType::UnfilterableFloat => {
                 wgpu_types::TextureSampleType::Float { filterable: false }
             }
@@ -241,9 +213,7 @@ impl From<webgpu::GpuTextureViewDimension> for wgpu_types::TextureViewDimension 
             webgpu::GpuTextureViewDimension::D2 => wgpu_types::TextureViewDimension::D2,
             webgpu::GpuTextureViewDimension::D2Array => wgpu_types::TextureViewDimension::D2Array,
             webgpu::GpuTextureViewDimension::Cube => wgpu_types::TextureViewDimension::Cube,
-            webgpu::GpuTextureViewDimension::CubeArray => {
-                wgpu_types::TextureViewDimension::CubeArray
-            }
+            webgpu::GpuTextureViewDimension::CubeArray => wgpu_types::TextureViewDimension::CubeArray,
             webgpu::GpuTextureViewDimension::D3 => wgpu_types::TextureViewDimension::D3,
         }
     }
@@ -253,12 +223,8 @@ impl From<webgpu::GpuBufferBindingType> for wgpu_types::BufferBindingType {
     fn from(value: webgpu::GpuBufferBindingType) -> Self {
         match value {
             webgpu::GpuBufferBindingType::Uniform => wgpu_types::BufferBindingType::Uniform,
-            webgpu::GpuBufferBindingType::Storage => {
-                wgpu_types::BufferBindingType::Storage { read_only: false }
-            }
-            webgpu::GpuBufferBindingType::ReadOnlyStorage => {
-                wgpu_types::BufferBindingType::Storage { read_only: true }
-            }
+            webgpu::GpuBufferBindingType::Storage => wgpu_types::BufferBindingType::Storage { read_only: false },
+            webgpu::GpuBufferBindingType::ReadOnlyStorage => wgpu_types::BufferBindingType::Storage { read_only: true },
         }
     }
 }
@@ -274,12 +240,7 @@ impl From<webgpu::GpuStoreOp> for wgpu_types::StoreOp {
 
 impl From<webgpu::GpuColor> for wgpu_types::Color {
     fn from(value: webgpu::GpuColor) -> Self {
-        wgpu_types::Color {
-            r: value.r,
-            g: value.g,
-            b: value.b,
-            a: value.a,
-        }
+        wgpu_types::Color { r: value.r, g: value.g, b: value.b, a: value.a }
     }
 }
 
@@ -397,9 +358,7 @@ impl From<webgpu::GpuBlendOperation> for wgpu_types::BlendOperation {
         match value {
             webgpu::GpuBlendOperation::Add => wgpu_types::BlendOperation::Add,
             webgpu::GpuBlendOperation::Subtract => wgpu_types::BlendOperation::Subtract,
-            webgpu::GpuBlendOperation::ReverseSubtract => {
-                wgpu_types::BlendOperation::ReverseSubtract
-            }
+            webgpu::GpuBlendOperation::ReverseSubtract => wgpu_types::BlendOperation::ReverseSubtract,
             webgpu::GpuBlendOperation::Min => wgpu_types::BlendOperation::Min,
             webgpu::GpuBlendOperation::Max => wgpu_types::BlendOperation::Max,
         }
@@ -413,18 +372,10 @@ impl From<webgpu::GpuStencilOperation> for wgpu_types::StencilOperation {
             webgpu::GpuStencilOperation::Zero => wgpu_types::StencilOperation::Zero,
             webgpu::GpuStencilOperation::Replace => wgpu_types::StencilOperation::Replace,
             webgpu::GpuStencilOperation::Invert => wgpu_types::StencilOperation::Invert,
-            webgpu::GpuStencilOperation::IncrementClamp => {
-                wgpu_types::StencilOperation::IncrementClamp
-            }
-            webgpu::GpuStencilOperation::DecrementClamp => {
-                wgpu_types::StencilOperation::DecrementClamp
-            }
-            webgpu::GpuStencilOperation::IncrementWrap => {
-                wgpu_types::StencilOperation::IncrementWrap
-            }
-            webgpu::GpuStencilOperation::DecrementWrap => {
-                wgpu_types::StencilOperation::DecrementWrap
-            }
+            webgpu::GpuStencilOperation::IncrementClamp => wgpu_types::StencilOperation::IncrementClamp,
+            webgpu::GpuStencilOperation::DecrementClamp => wgpu_types::StencilOperation::DecrementClamp,
+            webgpu::GpuStencilOperation::IncrementWrap => wgpu_types::StencilOperation::IncrementWrap,
+            webgpu::GpuStencilOperation::DecrementWrap => wgpu_types::StencilOperation::DecrementWrap,
         }
     }
 }
@@ -443,9 +394,7 @@ impl From<webgpu::GpuCanvasAlphaMode> for wgpu_types::CompositeAlphaMode {
     fn from(value: webgpu::GpuCanvasAlphaMode) -> Self {
         match value {
             webgpu::GpuCanvasAlphaMode::Opaque => wgpu_types::CompositeAlphaMode::Opaque,
-            webgpu::GpuCanvasAlphaMode::Premultiplied => {
-                wgpu_types::CompositeAlphaMode::PreMultiplied
-            }
+            webgpu::GpuCanvasAlphaMode::Premultiplied => wgpu_types::CompositeAlphaMode::PreMultiplied,
         }
     }
 }
@@ -498,25 +447,15 @@ impl From<wgpu_types::TextureFormat> for webgpu::GpuTextureFormat {
             wgpu_types::TextureFormat::Stencil8 => webgpu::GpuTextureFormat::Stencil8,
             wgpu_types::TextureFormat::Depth16Unorm => webgpu::GpuTextureFormat::Depth16unorm,
             wgpu_types::TextureFormat::Depth24Plus => webgpu::GpuTextureFormat::Depth24plus,
-            wgpu_types::TextureFormat::Depth24PlusStencil8 => {
-                webgpu::GpuTextureFormat::Depth24plusStencil8
-            }
+            wgpu_types::TextureFormat::Depth24PlusStencil8 => webgpu::GpuTextureFormat::Depth24plusStencil8,
             wgpu_types::TextureFormat::Depth32Float => webgpu::GpuTextureFormat::Depth32float,
-            wgpu_types::TextureFormat::Depth32FloatStencil8 => {
-                webgpu::GpuTextureFormat::Depth32floatStencil8
-            }
+            wgpu_types::TextureFormat::Depth32FloatStencil8 => webgpu::GpuTextureFormat::Depth32floatStencil8,
             wgpu_types::TextureFormat::Bc1RgbaUnorm => webgpu::GpuTextureFormat::Bc1RgbaUnorm,
-            wgpu_types::TextureFormat::Bc1RgbaUnormSrgb => {
-                webgpu::GpuTextureFormat::Bc1RgbaUnormSrgb
-            }
+            wgpu_types::TextureFormat::Bc1RgbaUnormSrgb => webgpu::GpuTextureFormat::Bc1RgbaUnormSrgb,
             wgpu_types::TextureFormat::Bc2RgbaUnorm => webgpu::GpuTextureFormat::Bc2RgbaUnorm,
-            wgpu_types::TextureFormat::Bc2RgbaUnormSrgb => {
-                webgpu::GpuTextureFormat::Bc2RgbaUnormSrgb
-            }
+            wgpu_types::TextureFormat::Bc2RgbaUnormSrgb => webgpu::GpuTextureFormat::Bc2RgbaUnormSrgb,
             wgpu_types::TextureFormat::Bc3RgbaUnorm => webgpu::GpuTextureFormat::Bc3RgbaUnorm,
-            wgpu_types::TextureFormat::Bc3RgbaUnormSrgb => {
-                webgpu::GpuTextureFormat::Bc3RgbaUnormSrgb
-            }
+            wgpu_types::TextureFormat::Bc3RgbaUnormSrgb => webgpu::GpuTextureFormat::Bc3RgbaUnormSrgb,
             wgpu_types::TextureFormat::Bc4RUnorm => webgpu::GpuTextureFormat::Bc4RUnorm,
             wgpu_types::TextureFormat::Bc4RSnorm => webgpu::GpuTextureFormat::Bc4RSnorm,
             wgpu_types::TextureFormat::Bc5RgUnorm => webgpu::GpuTextureFormat::Bc5RgUnorm,
@@ -524,21 +463,13 @@ impl From<wgpu_types::TextureFormat> for webgpu::GpuTextureFormat {
             wgpu_types::TextureFormat::Bc6hRgbUfloat => webgpu::GpuTextureFormat::Bc6hRgbUfloat,
             wgpu_types::TextureFormat::Bc6hRgbFloat => webgpu::GpuTextureFormat::Bc6hRgbFloat,
             wgpu_types::TextureFormat::Bc7RgbaUnorm => webgpu::GpuTextureFormat::Bc7RgbaUnorm,
-            wgpu_types::TextureFormat::Bc7RgbaUnormSrgb => {
-                webgpu::GpuTextureFormat::Bc7RgbaUnormSrgb
-            }
+            wgpu_types::TextureFormat::Bc7RgbaUnormSrgb => webgpu::GpuTextureFormat::Bc7RgbaUnormSrgb,
             wgpu_types::TextureFormat::Etc2Rgb8Unorm => webgpu::GpuTextureFormat::Etc2Rgb8unorm,
-            wgpu_types::TextureFormat::Etc2Rgb8UnormSrgb => {
-                webgpu::GpuTextureFormat::Etc2Rgb8unormSrgb
-            }
+            wgpu_types::TextureFormat::Etc2Rgb8UnormSrgb => webgpu::GpuTextureFormat::Etc2Rgb8unormSrgb,
             wgpu_types::TextureFormat::Etc2Rgb8A1Unorm => webgpu::GpuTextureFormat::Etc2Rgb8a1unorm,
-            wgpu_types::TextureFormat::Etc2Rgb8A1UnormSrgb => {
-                webgpu::GpuTextureFormat::Etc2Rgb8a1unormSrgb
-            }
+            wgpu_types::TextureFormat::Etc2Rgb8A1UnormSrgb => webgpu::GpuTextureFormat::Etc2Rgb8a1unormSrgb,
             wgpu_types::TextureFormat::Etc2Rgba8Unorm => webgpu::GpuTextureFormat::Etc2Rgba8unorm,
-            wgpu_types::TextureFormat::Etc2Rgba8UnormSrgb => {
-                webgpu::GpuTextureFormat::Etc2Rgba8unormSrgb
-            }
+            wgpu_types::TextureFormat::Etc2Rgba8UnormSrgb => webgpu::GpuTextureFormat::Etc2Rgba8unormSrgb,
             wgpu_types::TextureFormat::EacR11Unorm => webgpu::GpuTextureFormat::EacR11unorm,
             wgpu_types::TextureFormat::EacR11Snorm => webgpu::GpuTextureFormat::EacR11snorm,
             wgpu_types::TextureFormat::EacRg11Unorm => webgpu::GpuTextureFormat::EacRg11unorm,
@@ -555,13 +486,8 @@ impl From<wgpu_types::PrimitiveTopology> for webgpu::GpuPrimitiveTopology {
             wgpu_types::PrimitiveTopology::PointList => webgpu::GpuPrimitiveTopology::PointList,
             wgpu_types::PrimitiveTopology::LineList => webgpu::GpuPrimitiveTopology::LineList,
             wgpu_types::PrimitiveTopology::LineStrip => webgpu::GpuPrimitiveTopology::LineStrip,
-            wgpu_types::PrimitiveTopology::TriangleList => {
-                webgpu::GpuPrimitiveTopology::TriangleList
-            }
-            wgpu_types::PrimitiveTopology::TriangleStrip => {
-                webgpu::GpuPrimitiveTopology::TriangleStrip
-            }
+            wgpu_types::PrimitiveTopology::TriangleList => webgpu::GpuPrimitiveTopology::TriangleList,
+            wgpu_types::PrimitiveTopology::TriangleStrip => webgpu::GpuPrimitiveTopology::TriangleStrip,
         }
     }
 }
-

@@ -24,9 +24,10 @@ pub(crate) fn palette(project: &dyn Project, arguments: &Value) -> Result<Value>
         .or_else(|| project.resolve(&Value::String(name.to_string())))
         .ok_or_else(|| anyhow!("no asset is named {name}"))?;
     let names = palette_names(&asset);
-    let chosen = names.iter().position(|n| n == wanted).ok_or_else(|| {
-        anyhow!("{}: no palette is named {wanted}; its palettes: {}", asset.path(), names.join(", "))
-    })?;
+    let chosen = names
+        .iter()
+        .position(|n| n == wanted)
+        .ok_or_else(|| anyhow!("{}: no palette is named {wanted}; its palettes: {}", asset.path(), names.join(", ")))?;
     let colors = palette_colors(&asset, chosen)
         .ok_or_else(|| anyhow!("{}: palette {wanted} has no stored colors", asset.path()))??;
     let colors = colors

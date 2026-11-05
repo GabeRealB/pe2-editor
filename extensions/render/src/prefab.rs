@@ -64,19 +64,34 @@ pub fn filled_from(parts: Option<&Table>, groups: Option<&Table>, shown: &[Group
         let fixed = held.get("model").is_some().then(|| (vec!["parts".to_string(), part.clone()], held.clone()));
         let mut found = fixed;
         for group in shown {
-            let member = table(groups.and_then(|groups| groups.get(&group.name)).and_then(|members| members.get(&group.chosen)), &group.chosen)?;
+            let member = table(
+                groups.and_then(|groups| groups.get(&group.name)).and_then(|members| members.get(&group.chosen)),
+                &group.chosen,
+            )?;
             let Some(fill) = member.and_then(|member| member.get(part)) else { continue };
             if found.is_some() {
                 bail!("{part} is filled twice");
             }
-            found = Some((vec!["groups".to_string(), group.name.clone(), group.chosen.clone(), part.clone()], fill.clone()));
+            found = Some((
+                vec!["groups".to_string(), group.name.clone(), group.chosen.clone(), part.clone()],
+                fill.clone(),
+            ));
         }
-        let (within, fill) = found.map_or_else(|| (vec!["parts".to_string(), part.clone()], None), |(within, fill)| (within, Some(fill)));
+        let (within, fill) = found
+            .map_or_else(|| (vec!["parts".to_string(), part.clone()], None), |(within, fill)| (within, Some(fill)));
         out.push(Filled { part: part.clone(), node, within, fill });
     }
     for group in shown {
-        let member = groups.and_then(|groups| groups.get(&group.name)).and_then(|members| members.get(&group.chosen)).and_then(Value::as_table);
-        if let Some(unknown) = member.into_iter().flatten().map(|(part, _)| part).find(|part| !parts.is_some_and(|parts| parts.contains_key(*part))) {
+        let member = groups
+            .and_then(|groups| groups.get(&group.name))
+            .and_then(|members| members.get(&group.chosen))
+            .and_then(Value::as_table);
+        if let Some(unknown) = member
+            .into_iter()
+            .flatten()
+            .map(|(part, _)| part)
+            .find(|part| !parts.is_some_and(|parts| parts.contains_key(*part)))
+        {
             bail!("{} of {} fills {unknown}, which is no part", group.chosen, group.name);
         }
     }
@@ -125,7 +140,10 @@ pub fn member(call: &mut Call) -> Result<Table> {
     let group = call.settings.get("each").and_then(Value::as_str).unwrap_or_default();
     let address = format!("{group}/{asked}");
     let fields = call.given();
-    address.split('/').fold(fields.get("groups"), |at, step| at?.get(step)).ok_or_else(|| anyhow!("it has no member {address}"))?;
+    address
+        .split('/')
+        .fold(fields.get("groups"), |at, step| at?.get(step))
+        .ok_or_else(|| anyhow!("it has no member {address}"))?;
     Ok(pe2_ext::tokens::leads_on(call.host.path(), "model", &[("member", &address)]))
 }
 
@@ -204,7 +222,11 @@ mod tests {
     ";
 
     fn shown(member: &str) -> Vec<Group> {
-        vec![Group { name: "outfit".to_string(), members: vec!["a".to_string(), "b".to_string()], chosen: member.to_string() }]
+        vec![Group {
+            name: "outfit".to_string(),
+            members: vec!["a".to_string(), "b".to_string()],
+            chosen: member.to_string(),
+        }]
     }
 
     fn fills(member: &str) -> Vec<Filled> {
@@ -258,7 +280,8 @@ mod tests {
     fn a_change_reaches_where_it_is_said_and_only_there() {
         let root = parsed(PREFAB).remove("groups").unwrap();
         let steps = ["outfit".to_string(), "b".to_string(), "body".to_string()];
-        let new = changed(root.clone(), &steps, |fill| drop(fill.insert("translation".to_string(), Value::Integer(1)))).unwrap();
+        let new = changed(root.clone(), &steps, |fill| drop(fill.insert("translation".to_string(), Value::Integer(1))))
+            .unwrap();
         assert!(new["outfit"]["b"]["body"].get("translation").is_some());
         assert!(new["outfit"]["a"]["body"].get("translation").is_none());
         assert!(changed(root, &["outfit".to_string(), "gone".to_string()], |_| ()).is_none());

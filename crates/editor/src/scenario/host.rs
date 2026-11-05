@@ -26,7 +26,9 @@ fn step(name: &str, arguments: &Value) -> Result<Value> {
     let (done, answer) = channel();
     let steps = STEPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let steps = steps.ok_or_else(|| anyhow!("no test is running"))?;
-    steps.send(Step { name: name.to_string(), arguments: arguments.clone(), done }).map_err(|_| anyhow!("the editor is gone"))?;
+    steps
+        .send(Step { name: name.to_string(), arguments: arguments.clone(), done })
+        .map_err(|_| anyhow!("the editor is gone"))?;
     answer.recv().map_err(|_| anyhow!("the editor is gone"))?.map_err(|why| anyhow!(why))
 }
 
@@ -58,7 +60,8 @@ const STEPS_OFFERED: [&str; 21] = [
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     for name in STEPS_OFFERED {
-        let _ = r.service(name, "A step of a test", "{}", move |_: &dyn Project, arguments: &Value| step(name, arguments));
+        let _ =
+            r.service(name, "A step of a test", "{}", move |_: &dyn Project, arguments: &Value| step(name, arguments));
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
 use std::cell::Cell;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -18,9 +18,13 @@ struct Bundle {
 impl Bundle {
     fn new(declaration: &str, files: &[(&str, &str)]) -> Bundle {
         let files = files.iter().map(|(n, b)| (n.to_string(), b.as_bytes().to_vec())).collect();
-        Bundle { path: "test/bundle", declaration: declaration.to_string(), fields: toml::from_str(declaration).unwrap(), files: Mutex::new(files) }
+        Bundle {
+            path: "test/bundle",
+            declaration: declaration.to_string(),
+            fields: toml::from_str(declaration).unwrap(),
+            files: Mutex::new(files),
+        }
     }
-
 }
 
 impl Node for Bundle {
@@ -145,12 +149,15 @@ fn ops() -> Ops {
         }
         Ok(file(parts))
     }));
-    ops.add(OpDef::new("t.repeat", "Repeat", "1").input(port("in", file_type())).parameter("times").makes(file_type(), |call| {
-        ran(3);
-        let n: usize = call.parameter().unwrap_or("1").parse()?;
-        let input = call.take(0)?;
-        Ok(file(bytes(call, input.value())?.repeat(n)))
-    }));
+    ops.add(OpDef::new("t.repeat", "Repeat", "1").input(port("in", file_type())).parameter("times").makes(
+        file_type(),
+        |call| {
+            ran(3);
+            let n: usize = call.parameter().unwrap_or("1").parse()?;
+            let input = call.take(0)?;
+            Ok(file(bytes(call, input.value())?.repeat(n)))
+        },
+    ));
     ops
 }
 
@@ -220,7 +227,9 @@ fn what_is_wrong_with_a_stack() {
     );
     assert_eq!(problems("[[stack]]\nop = \"x.nothing\""), ["stack[0]: `x.nothing`: no extension provides it"]);
     assert_eq!(
-        problems("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\""),
+        problems(
+            "[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\"\n[[stack]]\nop = \"output\"\nname = \"a\""
+        ),
         ["stack[2]: a second output named `a`"]
     );
     assert_eq!(problems("[[stack]]\nop = \"t.join\""), ["stack[0]: its `parts` is connected to nothing"]);
@@ -280,7 +289,10 @@ fn a_cycle_in_a_graph_layer() {
                  ops.y = { op = \"t.upper\", from = { in = \"x\" } }";
     assert_eq!(
         problems(cycle),
-        ["stack[0].ops.x: is in a cycle: it takes, through others, from itself", "stack[0].ops.y: is in a cycle: it takes, through others, from itself"]
+        [
+            "stack[0].ops.x: is in a cycle: it takes, through others, from itself",
+            "stack[0].ops.y: is in a cycle: it takes, through others, from itself"
+        ]
     );
 }
 
@@ -306,7 +318,10 @@ fn a_value_taken_once_is_moved() {
     let (source, _) = plan.output("source").unwrap();
     let (upper, _) = plan.output("upper").unwrap();
     let (made, _) = evaluate(&plan, &ops, &node, &[(source, None), (upper, None)], &Vec::new(), (None, None));
-    assert_eq!((data(&node, made[0].as_ref().unwrap()), data(&node, made[1].as_ref().unwrap())), (b"abc".to_vec(), b"ABC".to_vec()));
+    assert_eq!(
+        (data(&node, made[0].as_ref().unwrap()), data(&node, made[1].as_ref().unwrap())),
+        (b"abc".to_vec(), b"ABC".to_vec())
+    );
     assert!(shared() > before);
 }
 
@@ -325,7 +340,8 @@ fn a_stored_folder_is_every_file_in_it_named_within_it() {
     let stack = "[[stack]]\nop = \"file\"\nfile = \"face.ufo\"\n\n[[stack]]\nop = \"output\"\nname = \"source\"\n";
     let ops = ops();
     let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
-    let node = Bundle::new(stack, &[("face.ufo/metainfo.plist", "m"), ("face.ufo/glyphs/A_.glif", "a"), ("other.txt", "o")]);
+    let node =
+        Bundle::new(stack, &[("face.ufo/metainfo.plist", "m"), ("face.ufo/glyphs/A_.glif", "a"), ("other.txt", "o")]);
     let (source, _) = plan.output("source").unwrap();
     let (made, _) = evaluate(&plan, &ops, &node, &[(source, None)], &Vec::new(), (None, None));
     let made = made[0].as_ref().unwrap();
@@ -356,7 +372,10 @@ fn an_optional_stored_file_is_none_where_the_node_lacks_it_and_read_once_it_is_t
     assert!(!reads.hold(&there, None));
     assert_eq!(made_of(&there).0, ["under.png"]);
     // `optional` is how the stack is put together, not a setting of the node's.
-    assert!(!super::set_on(super::FILE, &toml::from_str("file = \"under.png\"\noptional = true").unwrap()).contains_key("optional"));
+    assert!(
+        !super::set_on(super::FILE, &toml::from_str("file = \"under.png\"\noptional = true").unwrap())
+            .contains_key("optional")
+    );
 }
 
 #[test]
@@ -410,7 +429,16 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let node = Bundle::new(stack, &[("a.txt", "abc"), ("b.txt", "unread")]);
-    let tail = [Tail { name: "counted".into(), fixed: false, op: "t.count".into(), retain: Retain::Cache, from: None, step: None, preview: false, settings: toml::Table::new() }];
+    let tail = [Tail {
+        name: "counted".into(),
+        fixed: false,
+        op: "t.count".into(),
+        retain: Retain::Cache,
+        from: None,
+        step: None,
+        preview: false,
+        settings: toml::Table::new(),
+    }];
     let (plan, problems) = Plan::of(&node.fields, &engine.ops, &tail);
     assert!(problems.is_empty(), "{problems:?}");
     // The kept native form is taken as made: `upper` runs once, for it, and not again for what is made of it.
@@ -447,21 +475,37 @@ fn a_nodes_result_is_kept_by_its_stack_or_the_host() {
     assert_eq!(names(&plan), [(super::RESULT.to_string(), Retain::Cache)]);
     assert_eq!(plan.result_output(), Some(0));
     // Kept by its stack, under any name: the host adds nothing.
-    let (plan, _) = Plan::of(&toml::from_str(&format!("{made}\n[[stack]]\nop = \"output\"\nname = \"upper\"\nretain = \"cache\"")).unwrap(), &ops(), &[]);
+    let (plan, _) = Plan::of(
+        &toml::from_str(&format!("{made}\n[[stack]]\nop = \"output\"\nname = \"upper\"\nretain = \"cache\"")).unwrap(),
+        &ops(),
+        &[],
+    );
     assert_eq!(names(&plan), [("upper".to_string(), Retain::Cache)]);
 }
 
 #[test]
 fn an_output_is_a_family_of_the_parameter_it_reaches() {
     let mut ops = ops();
-    ops.add(OpDef::new("t.pick", "Pick", "1").input(port("in", Type::File(Box::new(Type::Any)))).parameter("which").makes(Type::Any, |call| Ok(call.take(0)?.take())));
-    let stack = |below: &str| format!("[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"t.repeat\"\n{below}[[stack]]\nop = \"output\"\nname = \"made\"");
+    ops.add(
+        OpDef::new("t.pick", "Pick", "1")
+            .input(port("in", Type::File(Box::new(Type::Any))))
+            .parameter("which")
+            .makes(Type::Any, |call| Ok(call.take(0)?.take())),
+    );
+    let stack = |below: &str| {
+        format!(
+            "[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"t.repeat\"\n{below}[[stack]]\nop = \"output\"\nname = \"made\""
+        )
+    };
     let (plan, problems) = Plan::of(&toml::from_str(&stack("")).unwrap(), &ops, &[]);
     assert!(problems.is_empty(), "{problems:?}");
     assert_eq!(plan.outputs[0].parameter.as_deref(), Some("times"));
     assert_eq!(plan.output("made/3").map(|(o, p)| (o, p.unwrap())), Some((0, "3".to_string())));
     let (_, problems) = Plan::of(&toml::from_str(&stack("[[stack]]\nop = \"t.pick\"\n")).unwrap(), &ops, &[]);
-    assert_eq!(problems.iter().map(|p| p.what.as_str()).collect::<Vec<_>>(), ["`made` reaches operations of `times` and `which`: an output is one family"]);
+    assert_eq!(
+        problems.iter().map(|p| p.what.as_str()).collect::<Vec<_>>(),
+        ["`made` reaches operations of `times` and `which`: an output is one family"]
+    );
 }
 
 /// Nodes reaching each other's outputs, by path.
@@ -483,7 +527,10 @@ impl super::exec::World for Tree {
     }
 
     fn entries(&self, folder: &str) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.2.join(folder)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> = std::fs::read_dir(self.2.join(folder))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
         names.into_iter().map(|name| format!("{folder}/{name}")).collect()
     }
@@ -655,7 +702,8 @@ fn gates_are_boxes_of_a_graph_and_what_they_come_to_wires_an_output() {
 
 #[test]
 fn what_holds_with_nothing_signaled_is_no_trigger() {
-    let refused = WIRED.replace(r#"from = { value = "text", pull = "ready" }"#, r#"from = { value = "text", pull = "not_busy" }"#);
+    let refused = WIRED
+        .replace(r#"from = { value = "text", pull = "ready" }"#, r#"from = { value = "text", pull = "not_busy" }"#);
     let (plan, problems) = events_plan(&refused);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].what.contains("every epoch"));
@@ -664,9 +712,12 @@ fn what_holds_with_nothing_signaled_is_no_trigger() {
 
 #[test]
 fn deployed_outside_the_build_folder_is_refused() {
-    let elsewhere = WIRED.replace(r#"retain = "cache"
-from"#, r#"deploy = "../somewhere"
-from"#);
+    let elsewhere = WIRED.replace(
+        r#"retain = "cache"
+from"#,
+        r#"deploy = "../somewhere"
+from"#,
+    );
     let (_, problems) = events_plan(&elsewhere);
     assert!(problems.iter().any(|p| p.what.contains("under `build/`")), "{problems:?}");
 }
@@ -682,7 +733,11 @@ fn a_preview_shows_what_a_viewer_takes_or_what_turns_into_it() {
     let mut ops = ops();
     ops.viewers = std::sync::Arc::new(vec![Type::Image]);
     let raw = Type::Named("t@raw".to_string());
-    ops.add(OpDef::new("t.read", "Read", "1").input(port("in", Type::Table)).makes(raw.clone(), |_| anyhow::bail!("not run")));
+    ops.add(
+        OpDef::new("t.read", "Read", "1")
+            .input(port("in", Type::Table))
+            .makes(raw.clone(), |_| anyhow::bail!("not run")),
+    );
     ops.add(OpDef::new("t.draw", "Draw", "1").input(port("in", raw)).makes(Type::Image, |_| anyhow::bail!("not run")));
     let stack = "[[stack]]\nop = \"constant\"\nvalue = {}\n\n[[stack]]\nop = \"preview\"\nname = \"shown\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\n";
@@ -722,11 +777,19 @@ fn a_wire_names_a_layer_and_one_of_its_outputs() {
     });
     pair.also = vec![("second".to_string(), Type::Table)];
     ops.add(pair);
-    ops.add(OpDef::new("t.add", "Add", "1").input(port("a", Type::Table)).input(port("b", Type::Table)).makes(Type::Table, |call| {
-        let read = |value: &Value| value.settings().and_then(|table| table.get("n")).and_then(toml::Value::as_integer).unwrap_or(0);
-        let (a, b) = (call.take(0)?, call.take(1)?);
-        Ok(Value::Table(toml::Table::from_iter([("n".to_string(), toml::Value::Integer(read(a.value()) * 10 + read(b.value())))])))
-    }));
+    ops.add(OpDef::new("t.add", "Add", "1").input(port("a", Type::Table)).input(port("b", Type::Table)).makes(
+        Type::Table,
+        |call| {
+            let read = |value: &Value| {
+                value.settings().and_then(|table| table.get("n")).and_then(toml::Value::as_integer).unwrap_or(0)
+            };
+            let (a, b) = (call.take(0)?, call.take(1)?);
+            Ok(Value::Table(toml::Table::from_iter([(
+                "n".to_string(),
+                toml::Value::Integer(read(a.value()) * 10 + read(b.value())),
+            )])))
+        },
+    ));
     let stack = "[[stack]]\nid = \"made\"\nop = \"t.pair\"\n\n\
                  [[stack]]\nop = \"t.add\"\nb = { from = \"made.second\" }\n\n\
                  [[stack]]\nop = \"output\"\nname = \"sum\"\n\n\
@@ -741,8 +804,15 @@ fn a_wire_names_a_layer_and_one_of_its_outputs() {
     let second = engine.output(&plan, &node, "second", true).unwrap();
     assert_eq!(second.value.as_deref(), Some(&Value::Table(toml::from_str("n = 2").unwrap())));
     // What names nothing is told, and what is left connected to nothing.
-    let wrong = Bundle::new("[[stack]]\nid = \"made\"\nop = \"t.pair\"\n\n[[stack]]\nop = \"t.add\"\nb = { from = \"made.third\" }\n", &[]);
-    assert!(Plan::of(&wrong.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("no output `third`")));
+    let wrong = Bundle::new(
+        "[[stack]]\nid = \"made\"\nop = \"t.pair\"\n\n[[stack]]\nop = \"t.add\"\nb = { from = \"made.third\" }\n",
+        &[],
+    );
+    assert!(
+        Plan::of(&wrong.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("no output `third`"))
+    );
     let open = Bundle::new("[[stack]]\nop = \"t.pair\"\n\n[[stack]]\nop = \"t.add\"\n", &[]);
-    assert!(Plan::of(&open.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("connected to nothing")));
+    assert!(
+        Plan::of(&open.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("connected to nothing"))
+    );
 }

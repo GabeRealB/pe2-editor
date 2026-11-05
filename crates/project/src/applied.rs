@@ -123,7 +123,11 @@ impl Applied {
                 written.applied = None;
                 let written = Arc::new(written);
                 let declaration = applied.map(|text| {
-                    Arc::new(AppliedDeclaration { written: written.clone(), fields: crate::graph::with_settings(toml::from_str(text).unwrap_or_default()), text: text.clone() })
+                    Arc::new(AppliedDeclaration {
+                        written: written.clone(),
+                        fields: crate::graph::with_settings(toml::from_str(text).unwrap_or_default()),
+                        text: text.clone(),
+                    })
                 });
                 Arc::make_mut(asset).applied = declaration;
             }
@@ -155,7 +159,8 @@ mod tests {
         assert_eq!(a.pending(), Vec::<String>::new());
         // Kept in the cache: opened again, it is as left.
         assert!(a.changed("uid://y", "a = 1", "a = 2"));
-        let again: BTreeMap<String, String> = toml::from_str(&std::fs::read_to_string(dir.join("applied.toml")).unwrap()).unwrap();
+        let again: BTreeMap<String, String> =
+            toml::from_str(&std::fs::read_to_string(dir.join("applied.toml")).unwrap()).unwrap();
         assert_eq!(again.get("uid://y").map(String::as_str), Some("a = 1"));
         assert!(a.apply("uid://y") && !a.apply("uid://y"));
         assert!(a.changed("uid://z", "b = 1", "b = 2") && a.apply_all() == ["uid://z"]);

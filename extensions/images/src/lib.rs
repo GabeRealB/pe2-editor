@@ -8,28 +8,27 @@
 
 mod extract;
 mod inspector;
+mod marks;
 mod ora;
 mod texels;
 mod tools;
-mod marks;
 mod vram;
 
 use pe2_ext::ty::{self, Files, Registered};
-pub use texels::{TexelImage, Texels};
-use pe2_ext::{Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result, Setting, Signature, Tint, Typed, Value};
+use pe2_ext::{
+    Asset, ContentAction, ContentRow, Contents, Field, Icon, Image, PartField, PartSheet, Rect, Registry, Result,
+    Setting, Signature, Tint, Typed, Value,
+};
 use std::collections::HashMap;
+pub use texels::{TexelImage, Texels};
 
 pe2_ext::extension!("pe2.images", "0.1.0", register);
 
 /// What an image is.
 const IMAGE: &str = "pe2.images@image";
 
-#[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
-fn register(r: &mut Registry) -> Result<()> {
-    // An image's native form, as stored: a background's BS picture, or a texture's or atlas's texels and palettes.
-    let _ = r.value_type::<BsPicture>();
-    let _ = r.value_type::<Texels>();
-    // A texture or an atlas as layers a painting program opens, made back into its texels and palettes exactly.
+/// A texture or an atlas as layers a painting program opens, made back into its texels and palettes exactly.
+fn ora_ops(r: &mut Registry) {
     let ora_source = r
         .op("ora_source")
         .label("OpenRaster layers, written")
@@ -62,27 +61,47 @@ fn register(r: &mut Registry) -> Result<()> {
             call.make("settings", pe2_ext::Data::Table(image.derived.clone()));
             Ok(image)
         });
+}
+
+#[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
+fn register(r: &mut Registry) -> Result<()> {
+    // An image's native form, as stored: a background's BS picture, or a texture's or atlas's texels and palettes.
+    let _ = r.value_type::<BsPicture>();
+    let _ = r.value_type::<Texels>();
+    ora_ops(r);
     // An image in one of its looks, by name: `default`, or a variant's.
-    let _ = r.op("draw").label("Picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("look").priority(10)
-        .field(Field::new("mode").label("Mode").choices(MODES).brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))))
+    let _ = r
+        .op("draw")
+        .label("Picture")
+        .input::<NativeForm>("native")
+        .output::<ty::Image>()
+        .parameter::<String>("look")
+        .priority(10)
+        .field(
+            Field::new("mode").label("Mode").choices(MODES).brief(|v| Some(format!("{} bpp", depth_of(v.as_str()?)?))),
+        )
         .field(Field::new("size").read_only())
         .field(Field::new("palettes").custom())
         .field(Field::new("cells").custom())
         .field(Field::new("variants").custom())
-        .members(|asset| if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] }).run(|call| {
-        let look: String = call.parameter()?;
-        match call.take::<NativeForm>(0)? {
-            ty::Either::First(bs) => decode_bs(&call.read(bs.file()?)?),
-            ty::Either::Second(image) => {
-                let lent = call.lend_settings(&image.derived);
-                let asset = lent.asset();
-                let names = look_names(&asset);
-                let index = names.iter().position(|n| *n == look);
-                let index = index.ok_or_else(|| pe2_ext::anyhow!("it has no look {look}; its looks: {}", names.join(", ")))?;
-                Ok(draw(&asset, &image, index))
+        .members(|asset| {
+            if has_picture(asset) { look_names(asset).into_iter().map(|n| (n.clone(), n)).collect() } else { vec![] }
+        })
+        .run(|call| {
+            let look: String = call.parameter()?;
+            match call.take::<NativeForm>(0)? {
+                ty::Either::First(bs) => decode_bs(&call.read(bs.file()?)?),
+                ty::Either::Second(image) => {
+                    let lent = call.lend_settings(&image.derived);
+                    let asset = lent.asset();
+                    let names = look_names(&asset);
+                    let index = names.iter().position(|n| *n == look);
+                    let index = index
+                        .ok_or_else(|| pe2_ext::anyhow!("it has no look {look}; its looks: {}", names.join(", ")))?;
+                    Ok(draw(&asset, &image, index))
+                }
             }
-        }
-    });
+        });
     part_outputs(r);
     // What is marked on it: an atlas's cells, a wide texture's pages.
     let _ = r.op("marks").label("Cells and pages").input::<NativeForm>("native").output::<ty::Marks>().run(|call| {
@@ -98,8 +117,12 @@ fn register(r: &mut Registry) -> Result<()> {
         .of(BsPicture::NAME)
         .of(Texels::NAME)
         .icon(Icon::Image, Tint::Picture)
-        .inspector_tab("Palettes", Icon::Palette, &["palettes", "variants"], |_| Box::new(inspector::Collections::of(inspector::Shows::Palettes)))
-        .inspector_tab("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::Collections::of(inspector::Shows::Cells)))
+        .inspector_tab("Palettes", Icon::Palette, &["palettes", "variants"], |_| {
+            Box::new(inspector::Collections::of(inspector::Shows::Palettes))
+        })
+        .inspector_tab("Cells", Icon::Grid, &["cells"], |_| {
+            Box::new(inspector::Collections::of(inspector::Shows::Cells))
+        })
         .editor("Cells", Icon::Grid, &["cells"], |_| Box::new(inspector::CellSheet::default()))
         .contents(contents)
         .content_act(inspector::act)
@@ -107,10 +130,18 @@ fn register(r: &mut Registry) -> Result<()> {
         .contents_view("Summary", |_| Box::new(inspector::Summary))
         .register();
     drop(r.template("texture", IMAGE, &format!("{TEXTURE}{OFFERS}")).label("Texture, from layers").files(&["*.ora"]));
-    drop(r.template("background", IMAGE, &format!("{BACKGROUND}{OFFERS}")).label("Background picture").files(&["*.bs"]));
+    drop(
+        r.template("background", IMAGE, &format!("{BACKGROUND}{OFFERS}")).label("Background picture").files(&["*.bs"]),
+    );
     // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
     let _ = r.extractor("textures", &image, &["mode"], extract::begin);
-    r.named_type("vram_slot").alias("vram_slot").label("VRAM slot").icon(Icon::Grid, Tint::Picture).data().field(Field::new("rect").label("Rectangle").required()).register();
+    r.named_type("vram_slot")
+        .alias("vram_slot")
+        .label("VRAM slot")
+        .icon(Icon::Grid, Tint::Picture)
+        .data()
+        .field(Field::new("rect").label("Rectangle").required())
+        .register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)
             .label("VRAM page grid")
@@ -127,22 +158,52 @@ fn register(r: &mut Registry) -> Result<()> {
 fn part_outputs(r: &mut Registry) {
     // A palette as a strip of its colors, and a cell where it is drawn, through a palette of its image's where one is
     // named (`skin@night`).
-    let _ = r.op("palette_picture").label("A palette's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").members(|asset| palette_names(asset).into_iter().map(|name| (name.clone(), name)).collect()).run(|call| {
-        let name: String = call.parameter()?;
-        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no palettes") };
-        palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
-    });
+    let _ = r
+        .op("palette_picture")
+        .label("A palette's picture")
+        .input::<NativeForm>("native")
+        .output::<ty::Image>()
+        .parameter::<String>("name")
+        .members(|asset| palette_names(asset).into_iter().map(|name| (name.clone(), name)).collect())
+        .run(|call| {
+            let name: String = call.parameter()?;
+            let ty::Either::Second(image) = call.take::<NativeForm>(0)? else {
+                pe2_ext::bail!("a background has no palettes")
+            };
+            palette_picture(&image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no palette {name}"))
+        });
     // A cell as what reads its values sees it: the image again, told which cell (`tokens::leads_on`), so that
     // `PE2_VALUE(chrome, cell, prompt, _v)` reads the prompt's row of the chrome.
-    let _ = r.op("cell").label("A cell, as what reads it").input::<NativeForm>("native").output::<ty::Table>().parameter::<String>("name").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
-        let name: String = call.parameter()?;
-        Ok(pe2_ext::tokens::leads_on(call.host.path(), "image", &[("cell", &name)]))
-    });
-    let _ = r.op("cell_picture").label("A cell's picture").input::<NativeForm>("native").output::<ty::Image>().parameter::<String>("name").members(|asset| asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()).run(|call| {
-        let name: String = call.parameter()?;
-        let ty::Either::Second(image) = call.take::<NativeForm>(0)? else { pe2_ext::bail!("a background has no cells") };
-        cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name).ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
-    });
+    let _ = r
+        .op("cell")
+        .label("A cell, as what reads it")
+        .input::<NativeForm>("native")
+        .output::<ty::Table>()
+        .parameter::<String>("name")
+        .members(|asset| {
+            asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()
+        })
+        .run(|call| {
+            let name: String = call.parameter()?;
+            Ok(pe2_ext::tokens::leads_on(call.host.path(), "image", &[("cell", &name)]))
+        });
+    let _ = r
+        .op("cell_picture")
+        .label("A cell's picture")
+        .input::<NativeForm>("native")
+        .output::<ty::Image>()
+        .parameter::<String>("name")
+        .members(|asset| {
+            asset.parts("cells").into_iter().map(|(name, _)| (name.to_string(), name.to_string())).collect()
+        })
+        .run(|call| {
+            let name: String = call.parameter()?;
+            let ty::Either::Second(image) = call.take::<NativeForm>(0)? else {
+                pe2_ext::bail!("a background has no cells")
+            };
+            cell_picture(&call.lend_settings(&image.derived).asset(), &image, &name)
+                .ok_or_else(|| pe2_ext::anyhow!("it has no cell {name}"))
+        });
 }
 
 /// What an image offers, whichever way it is stored: each hanging off the layer named `image`.
@@ -273,7 +334,8 @@ pub fn looks(asset: &Asset) -> Vec<String> {
 /// What is inside an image, by group: a palette and a cell shown by their pictures. A cell is dropped on the palette
 /// that draws it, a variant renamed, moved and removed; a cell's name and rectangle are its source's.
 fn contents(asset: &Asset, _: &dyn pe2_ext::Project) -> Contents {
-    let palette_of: HashMap<String, Option<usize>> = cells(asset).into_iter().map(|cell| (cell.name, cell.palette)).collect();
+    let palette_of: HashMap<String, Option<usize>> =
+        cells(asset).into_iter().map(|cell| (cell.name, cell.palette)).collect();
     let names = palette_names(asset);
     let has_cells = !palette_of.is_empty();
     let shown_looks = looks(asset);
@@ -334,7 +396,11 @@ fn part_sheet(asset: &Asset, _: &dyn pe2_ext::Project, part: &str) -> Option<Par
         within: vec!["cells".to_string(), name.to_string()],
         fields: vec![
             PartField { choices: palettes, absent: Some("None".to_string()), ..field("palette", "Palette") },
-            PartField { choices: modes, absent: Some(format!("As the image ({} bpp)", depth.unwrap_or_default())), ..field("mode", "Mode") },
+            PartField {
+                choices: modes,
+                absent: Some(format!("As the image ({} bpp)", depth.unwrap_or_default())),
+                ..field("mode", "Mode")
+            },
             PartField { read_only: true, ..field("rect", "Rectangle") },
         ],
         problem: None,
@@ -549,7 +615,13 @@ fn cell_picture(asset: &Asset, image: &TexelImage, name: &str) -> Option<Image> 
 
 /// A cell's pixels, each of its texels one: not cut from the image, where a cell of fewer bits a texel has less room than it
 /// has texels.
-pub(crate) fn decode_cell(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], cell: &Cell, through: Option<(&str, usize)>) -> Image {
+pub(crate) fn decode_cell(
+    asset: &Asset,
+    texels: &[u8],
+    colors: &[Option<Vec<u16>>],
+    cell: &Cell,
+    through: Option<(&str, usize)>,
+) -> Image {
     let gray = codecs::texture::gray_ramp(cell.bpp);
     let (_, overrides) = look(asset, 0);
     let asked = through.filter(|(name, _)| *name == cell.name).map(|(_, palette)| palette);
@@ -574,7 +646,8 @@ fn cell_rows(asset: &Asset, texels: &[u8], cell: &Cell, palette: &[u16]) -> Vec<
     let values: Vec<u16> = if bpp == 16 { halfwords(texels) } else { texels.iter().map(|&b| u16::from(b)).collect() };
     let at = |x: usize, y: usize| values.get(y * w + x).copied().unwrap_or(0);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
-    let (sx, sy, cw, ch) = (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
+    let (sx, sy, cw, ch) =
+        (cell.source.x as usize, cell.source.y as usize, cell.source.width as usize, cell.source.height as usize);
     let mut rows = Vec::with_capacity(cw * ch);
     for y in sy..(sy + ch).min(h) {
         for i in 0..cw {
@@ -602,7 +675,13 @@ pub(crate) fn draw(asset: &Asset, image: &TexelImage, look: usize) -> Image {
 /// palette, and each of its cells through its own - the variant's where it gives the cell one - a deeper cell's texels
 /// taken from the same halfwords at its depth. Where no colors are extracted (an executable uploads them) or none are
 /// known, in gray.
-fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], variant: usize, through: Option<(&str, usize)>) -> Image {
+fn decode_texels(
+    asset: &Asset,
+    texels: &[u8],
+    colors: &[Option<Vec<u16>>],
+    variant: usize,
+    through: Option<(&str, usize)>,
+) -> Image {
     const CLEAR: [u8; 4] = [0; 4];
     let bpp = bpp(asset);
     let (width, height) = pair(asset.field("size")).unwrap_or_default();
@@ -637,7 +716,8 @@ fn decode_texels(asset: &Asset, texels: &[u8], colors: &[Option<Vec<u16>>], vari
             let colors = palette(asked.or_else(|| overrides.get(&cell.name).copied()).or(cell.palette));
             let rows = cell_rows(asset, texels, cell, colors);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "texel coordinates")]
-            let (sy, cw, dx, span) = (cell.source.y as usize, cell.source.width as usize, cell.rect.x as usize, cell.rect.width as usize);
+            let (sy, cw, dx, span) =
+                (cell.source.y as usize, cell.source.width as usize, cell.rect.x as usize, cell.rect.width as usize);
             for (row, texels) in rows.chunks(cw.max(1)).enumerate() {
                 let y = sy + row;
                 if y >= h {

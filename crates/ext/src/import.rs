@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use crate::registry::{ActOnContents, Field, Icon, ListContents, SheetOfPart, Tint, ViewDef};
 use crate::Name;
+use crate::registry::{ActOnContents, Field, Icon, ListContents, SheetOfPart, Tint, ViewDef};
 
 /// How the host recognizes a type in a file without calling the extension.
 #[derive(Clone, Debug, PartialEq, Eq)]

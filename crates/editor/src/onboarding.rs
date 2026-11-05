@@ -48,7 +48,12 @@ pub enum Answer {
 /// The place an extension is in: the layer or mount holding it, else its own folder.
 pub fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
     let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    let holding = ws.project.layers.iter().filter_map(|layer| Some((layer, layer.path.canonicalize().ok()?))).find(|(_, path)| real.starts_with(path));
+    let holding = ws
+        .project
+        .layers
+        .iter()
+        .filter_map(|layer| Some((layer, layer.path.canonicalize().ok()?)))
+        .find(|(_, path)| real.starts_with(path));
     if let Some((layer, path)) = holding {
         return (path, format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));
     }
@@ -80,7 +85,13 @@ pub fn asked(ws: &Workspace, config_chosen: bool) -> Option<Onboarding> {
         if declined.contains(&path) && !required(&present.id) {
             continue;
         }
-        let place = places.entry(path.clone()).or_insert_with(|| Place { path, label, extensions: Vec::new(), required: false, trust: false });
+        let place = places.entry(path.clone()).or_insert_with(|| Place {
+            path,
+            label,
+            extensions: Vec::new(),
+            required: false,
+            trust: false,
+        });
         place.extensions.push(present.id.clone());
         place.required |= required(&present.id);
     }
@@ -102,7 +113,9 @@ impl Onboarding {
     /// # Errors
     /// What is trusted cannot be written.
     pub fn apply(&self, answer: &Answer) -> std::io::Result<()> {
-        let chosen = |trusted: bool| self.places.iter().filter(move |place| place.trust == trusted).map(|place| place.path.clone());
+        let chosen = |trusted: bool| {
+            self.places.iter().filter(move |place| place.trust == trusted).map(|place| place.path.clone())
+        };
         let mut trusting: Vec<PathBuf> = chosen(true).collect();
         if matches!(answer, Answer::Everything) {
             trusting.push(self.root.clone());

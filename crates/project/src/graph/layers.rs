@@ -36,8 +36,13 @@ pub fn stored_file(stack: &str) -> Option<String> {
 /// file's opening comment is held by that layer.
 fn without_stack(text: &str) -> Result<String> {
     let mut document: toml_edit::DocumentMut = text.parse().context("its declaration")?;
-    let opening = document.get("stack").and_then(toml_edit::Item::as_array_of_tables).and_then(|layers| layers.iter().next());
-    let opening = opening.and_then(|layer| layer.decor().prefix()).and_then(toml_edit::RawString::as_str).unwrap_or_default().to_string();
+    let opening =
+        document.get("stack").and_then(toml_edit::Item::as_array_of_tables).and_then(|layers| layers.iter().next());
+    let opening = opening
+        .and_then(|layer| layer.decor().prefix())
+        .and_then(toml_edit::RawString::as_str)
+        .unwrap_or_default()
+        .to_string();
     document.remove("stack");
     let rest = document.to_string();
     Ok(if opening.trim().is_empty() || !document.is_empty() { rest } else { format!("{opening}{rest}") })
@@ -48,7 +53,8 @@ fn without_stack(text: &str) -> Result<String> {
 fn home(layers: &toml_edit::ArrayOfTables) -> Option<usize> {
     let op = |layer: &toml_edit::Table| layer.get("op").and_then(toml_edit::Item::as_str).map(str::to_string);
     let taken = layers.iter().position(|layer| matches!(op(layer).as_deref(), Some(super::OUTPUT | super::PREVIEW)));
-    let own = layers.iter().take(taken.unwrap_or(usize::MAX)).position(|layer| op(layer).as_deref() != Some(super::FILE));
+    let own =
+        layers.iter().take(taken.unwrap_or(usize::MAX)).position(|layer| op(layer).as_deref() != Some(super::FILE));
     own.or_else(|| (!layers.is_empty()).then_some(0))
 }
 
@@ -58,7 +64,10 @@ pub fn settings_table<'a>(document: &'a mut toml_edit::DocumentMut, key: &str) -
     use toml_edit::Item;
     let layers = document.get("stack").and_then(Item::as_array_of_tables);
     let at = layers.and_then(|layers| {
-        layers.iter().position(|layer| layer.contains_key(key) && !matches!(key, "op" | "name" | "file")).or_else(|| home(layers))
+        layers
+            .iter()
+            .position(|layer| layer.contains_key(key) && !matches!(key, "op" | "name" | "file"))
+            .or_else(|| home(layers))
     });
     let Some(at) = at else { return document.as_table_mut() };
     let Some(layer) = document["stack"].as_array_of_tables_mut().and_then(|layers| layers.get_mut(at)) else {
@@ -92,10 +101,14 @@ pub fn settings_on_layers(text: &str) -> Result<String> {
     let head: Vec<&str> = declared.lines().take_while(|line| line.starts_with('#') || line.is_empty()).collect();
     let fields = declared.lines().skip(head.len()).collect::<Vec<_>>().join("\n");
     let mut document: toml_edit::DocumentMut = fields.parse().context("its declaration")?;
-    let Some(at) = document.get("stack").and_then(Item::as_array_of_tables).and_then(home) else { return Ok(text.to_string()) };
+    let Some(at) = document.get("stack").and_then(Item::as_array_of_tables).and_then(home) else {
+        return Ok(text.to_string());
+    };
     let keys: Vec<String> = document.iter().map(|(key, _)| key.to_string()).filter(|key| key != "stack").collect();
     let moved: Vec<(String, Item)> = keys.iter().filter_map(|key| Some((key.clone(), document.remove(key)?))).collect();
-    let Some(Ok(mut layers)) = document.remove("stack").map(Item::into_array_of_tables) else { return Ok(text.to_string()) };
+    let Some(Ok(mut layers)) = document.remove("stack").map(Item::into_array_of_tables) else {
+        return Ok(text.to_string());
+    };
     if let Some(layer) = layers.get_mut(at) {
         for (key, item) in moved {
             layer.insert(&key, item);
@@ -127,8 +140,10 @@ pub fn with_new_stack(text: &str, stack: &str) -> Result<String> {
     let settings = super::with_settings(fields.clone());
     let bare = without_stack(text)?;
     let rest: Table = toml::from_str(&bare).context("its declaration")?;
-    let held = settings.iter().filter(|(key, _)| !matches!(key.as_str(), "stack" | "original") && !rest.contains_key(*key));
-    let mut lines = toml::to_string(&held.map(|(key, value)| (key.clone(), value.clone())).collect::<Table>()).context("its settings")?;
+    let held =
+        settings.iter().filter(|(key, _)| !matches!(key.as_str(), "stack" | "original") && !rest.contains_key(*key));
+    let mut lines = toml::to_string(&held.map(|(key, value)| (key.clone(), value.clone())).collect::<Table>())
+        .context("its settings")?;
     lines.push_str(&bare);
     settings_on_layers(&crate::extract::with_stack(&lines, stack))
 }
@@ -172,7 +187,8 @@ pub fn shift(text: &str, from: usize, to: usize) -> Result<String> {
 
 /// A graph layer's table, in a stack's layers.
 fn graph_layer(layers: &mut [Value], at: usize) -> Result<&mut Table> {
-    let layer = layers.get_mut(at).and_then(Value::as_table_mut).with_context(|| format!("the stack has no layer {at}"))?;
+    let layer =
+        layers.get_mut(at).and_then(Value::as_table_mut).with_context(|| format!("the stack has no layer {at}"))?;
     anyhow::ensure!(layer.get("op").and_then(Value::as_str) == Some(super::GRAPH), "layer {at} is no graph");
     Ok(layer)
 }
@@ -344,7 +360,11 @@ sha1 = "ab"
     #[test]
     fn the_head_is_written_once_whatever_setting_comes_first() {
         let stack = "[[stack]]\nop = \"x@package\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
-        for first in ["headers.public = \"include\"\n", "[[slots]]\nname = \"s\"\n\n[[slots]]\nname = \"t\"\n", "[target.psx]\nlink = 1\n"] {
+        for first in [
+            "headers.public = \"include\"\n",
+            "[[slots]]\nname = \"s\"\n\n[[slots]]\nname = \"t\"\n",
+            "[target.psx]\nlink = 1\n",
+        ] {
             let text = format!("# A node, written by extraction.\n\n{first}\n{stack}");
             let placed = super::settings_on_layers(&text).unwrap();
             assert_eq!(placed.matches("# A node").count(), 1, "{placed}");
@@ -376,7 +396,15 @@ sha1 = "ab"
     #[test]
     fn an_opening_comment_outlives_a_stack_edit() {
         let text = "# Who made this.\n\n[[stack]]\nop = \"file\"\nfile = \"a\"\n";
-        let edited = super::add(text, 1, Table::from_iter([("op".to_string(), toml::Value::from("output")), ("name".to_string(), toml::Value::from("native"))])).unwrap();
+        let edited = super::add(
+            text,
+            1,
+            Table::from_iter([
+                ("op".to_string(), toml::Value::from("output")),
+                ("name".to_string(), toml::Value::from("native")),
+            ]),
+        )
+        .unwrap();
         assert!(edited.starts_with("# Who made this."), "{edited}");
         assert!(edited.contains("name = \"native\""), "{edited}");
     }

@@ -31,7 +31,9 @@ impl PixelFormat {
     /// One by its name.
     #[must_use]
     pub fn named(name: &str) -> Option<PixelFormat> {
-        [PixelFormat::Rgba8888, PixelFormat::Bgra8888, PixelFormat::Yuv420p, PixelFormat::Nv12].into_iter().find(|f| f.name() == name)
+        [PixelFormat::Rgba8888, PixelFormat::Bgra8888, PixelFormat::Yuv420p, PixelFormat::Nv12]
+            .into_iter()
+            .find(|f| f.name() == name)
     }
 
     /// The bytes a frame of a size takes.
@@ -190,7 +192,12 @@ impl VideoFrame {
                         let at = row / 2 * half_w + column / 2;
                         let l = f64::from(y[row * width + column]);
                         let (b, r) = (f64::from(cb[at]) - 128.0, f64::from(cr[at]) - 128.0);
-                        rgba.extend([channel(l + 1.402 * r), channel(l - 0.3437 * b - 0.7143 * r), channel(l + 1.772 * b), 255]);
+                        rgba.extend([
+                            channel(l + 1.402 * r),
+                            channel(l - 0.3437 * b - 0.7143 * r),
+                            channel(l + 1.772 * b),
+                            255,
+                        ]);
                     }
                 }
                 Ok(rgba)

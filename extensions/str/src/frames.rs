@@ -56,8 +56,11 @@ impl Frames {
         header.insert("rate".into(), Value::Float(timing.rate));
         header.insert("first".into(), Value::Integer(timing.first.into()));
         header.insert("holds".into(), Value::String("a frame's picture, and the sound up to it".into()));
-        let format =
-            if pe2_ext::media::pixel_formats().contains(&PixelFormat::Yuv420p) { PixelFormat::Yuv420p } else { PixelFormat::Rgba8888 };
+        let format = if pe2_ext::media::pixel_formats().contains(&PixelFormat::Yuv420p) {
+            PixelFormat::Yuv420p
+        } else {
+            PixelFormat::Rgba8888
+        };
         header.insert("video".into(), Value::String(format.name().into()));
         header.insert("audio".into(), Value::String(SampleFormat::S16Interleaved.name().into()));
         let (first, rate) = (timing.first, timing.rate);
@@ -114,14 +117,19 @@ impl Frames {
                     _ => decoded.rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
                 };
                 let (width, height) = (u32::from(first.width), u32::from(first.height));
-                let picture = VideoFrame { buffer: MediaBuffer::new(bytes), format: self.format, width, height, timestamp };
+                let picture =
+                    VideoFrame { buffer: MediaBuffer::new(bytes), format: self.format, width, height, timestamp };
                 let mut items = vec![Data::Video(picture)];
                 if let Some(coding) = self.coding {
                     let channels = if coding.stereo { 2 } else { 1 };
                     let samples = std::mem::take(&mut self.heard);
                     #[expect(clippy::cast_precision_loss, reason = "samples of a movie")]
                     let begins = self.since + self.heard_since as f64 / f64::from(coding.rate);
-                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "microseconds of a movie")]
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "microseconds of a movie"
+                    )]
                     let timestamp = (begins * 1e6) as u64;
                     self.heard_since += samples.len() as u64 / channels;
                     let bytes = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -173,7 +181,10 @@ impl Generator for Frames {
     fn seek(&mut self, call: &Call<'_>, position: u64) -> Result<bool> {
         let lent = call.lend(&self.clip);
         let asset = lent.asset();
-        let number = u32::try_from(position).ok().and_then(|p| p.checked_add(self.first)).ok_or_else(|| anyhow!("no frame {position}"))?;
+        let number = u32::try_from(position)
+            .ok()
+            .and_then(|p| p.checked_add(self.first))
+            .ok_or_else(|| anyhow!("no frame {position}"))?;
         // The first sector whose next video chunk is of this frame or after.
         let (mut low, mut high) = (0, self.sectors);
         while low < high {

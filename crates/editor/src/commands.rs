@@ -55,22 +55,60 @@ impl Command {
     /// Every command but the modes, which are the user's: a list that changes.
     pub fn all() -> Vec<Command> {
         use Command::{
-            ActualSize, PerformanceOverlay, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward, Fullscreen, GraphArrange, GraphFit,
-            Import, KeepTab, Maximize, NewMode, NextTab, OpenProject, Palette, PreviousTab, Quit, Redo, Refresh, ReloadProject,
-            ResetLayout, ResetMode, Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
+            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward,
+            Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NextTab, OpenProject, Palette,
+            PerformanceOverlay, PreviousTab, Quit, Redo, Refresh, ReloadProject, ResetLayout, ResetMode, Settings,
+            ShowIn, Undo, Up, ZoomIn, ZoomOut,
         };
         let fixed = [
-            Palette, OpenProject, Import, ReloadProject, Quit, Settings, Undo, Redo, Refresh, DeleteSelected, Build, Clean, CancelEpoch, Back, Forward, Up,
-            CloseTab, KeepTab, NextTab, PreviousTab, ShowIn(EditorKind::Preview), ShowIn(EditorKind::Files),
-            ShowIn(EditorKind::Graph), GraphFit, GraphArrange, DocumentsOnly, Maximize, Fullscreen, ResetLayout, NewMode,
-            ResetMode, DeleteMode, ZoomIn, ZoomOut, ActualSize, PerformanceOverlay,
+            Palette,
+            OpenProject,
+            Import,
+            ReloadProject,
+            Quit,
+            Settings,
+            Undo,
+            Redo,
+            Refresh,
+            DeleteSelected,
+            Build,
+            Clean,
+            CancelEpoch,
+            Back,
+            Forward,
+            Up,
+            CloseTab,
+            KeepTab,
+            NextTab,
+            PreviousTab,
+            ShowIn(EditorKind::Preview),
+            ShowIn(EditorKind::Files),
+            ShowIn(EditorKind::Graph),
+            GraphFit,
+            GraphArrange,
+            DocumentsOnly,
+            Maximize,
+            Fullscreen,
+            ResetLayout,
+            NewMode,
+            ResetMode,
+            DeleteMode,
+            ZoomIn,
+            ZoomOut,
+            ActualSize,
+            PerformanceOverlay,
         ];
         // Settings is a command of its own, and a document is opened, not shown.
         let shown = |kind: &PaneKind| !matches!(kind, PaneKind::Document | PaneKind::Settings);
         let panes = PaneKind::with_panels().into_iter().filter(shown).map(Command::Pane);
         let registered = extensions::shared();
-        let editors = registered.editor_names().into_iter().map(|name| ShowIn(EditorKind::Extension(PanelName::new(name))));
-        let offered = extensions::shared().commands().iter().map(|c| Command::Extension(PanelName::new(&c.tool.to_string()))).collect::<Vec<_>>();
+        let editors =
+            registered.editor_names().into_iter().map(|name| ShowIn(EditorKind::Extension(PanelName::new(name))));
+        let offered = extensions::shared()
+            .commands()
+            .iter()
+            .map(|c| Command::Extension(PanelName::new(&c.tool.to_string())))
+            .collect::<Vec<_>>();
         fixed.into_iter().chain(editors).chain(panes).chain(offered).collect()
     }
 
@@ -232,7 +270,11 @@ impl Binding {
             Binding::Key(shortcut) => {
                 let modifiers = shortcut.modifiers;
                 let mut spec = String::new();
-                for (held, name) in [(modifiers.command || modifiers.ctrl, "ctrl+"), (modifiers.shift, "shift+"), (modifiers.alt, "alt+")] {
+                for (held, name) in [
+                    (modifiers.command || modifiers.ctrl, "ctrl+"),
+                    (modifiers.shift, "shift+"),
+                    (modifiers.alt, "alt+"),
+                ] {
                     if held {
                         spec.push_str(name);
                     }
@@ -251,7 +293,11 @@ impl Binding {
             Binding::Key(shortcut) => {
                 let modifiers = shortcut.modifiers;
                 let mut text = String::new();
-                for (held, name) in [(modifiers.command || modifiers.ctrl, "Ctrl+"), (modifiers.shift, "Shift+"), (modifiers.alt, "Alt+")] {
+                for (held, name) in [
+                    (modifiers.command || modifiers.ctrl, "Ctrl+"),
+                    (modifiers.shift, "Shift+"),
+                    (modifiers.alt, "Alt+"),
+                ] {
                     if held {
                         text.push_str(name);
                     }
@@ -319,9 +365,14 @@ pub fn is_taking(ctx: &egui::Context) -> bool {
 fn pressed(ctx: &egui::Context) -> Option<Binding> {
     ctx.input(|i| {
         i.events.iter().find_map(|event| match event {
-            egui::Event::Key { key, pressed: true, modifiers, .. } => Some(Binding::Key(egui::KeyboardShortcut::new(*modifiers, *key))),
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                Some(Binding::Key(egui::KeyboardShortcut::new(*modifiers, *key)))
+            }
             egui::Event::PointerButton { button, pressed: true, .. }
-                if matches!(button, egui::PointerButton::Middle | egui::PointerButton::Extra1 | egui::PointerButton::Extra2) =>
+                if matches!(
+                    button,
+                    egui::PointerButton::Middle | egui::PointerButton::Extra1 | egui::PointerButton::Extra2
+                ) =>
             {
                 Some(Binding::Mouse(*button))
             }
@@ -351,9 +402,19 @@ pub fn shortcuts_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
                 let bound: Vec<Binding> = command.bindings(settings);
                 let text = bound.iter().copied().map(Binding::text).collect::<Vec<_>>().join(", ");
                 let taken = being_taken.as_ref() == Some(&id);
-                let shown = if taken { "Press a key…" } else if text.is_empty() { "None" } else { text.as_str() };
+                let shown = if taken {
+                    "Press a key…"
+                } else if text.is_empty() {
+                    "None"
+                } else {
+                    text.as_str()
+                };
                 // What is bound reads as it is pressed; nothing bound, faintly.
-                let shown = if text.is_empty() && !taken { RichText::new(shown).color(theme::weak()) } else { RichText::new(shown).monospace() };
+                let shown = if text.is_empty() && !taken {
+                    RichText::new(shown).color(theme::weak())
+                } else {
+                    RichText::new(shown).monospace()
+                };
                 if ui.add(egui::Button::selectable(taken, shown)).clicked() {
                     being_taken = Some(id.clone());
                 }

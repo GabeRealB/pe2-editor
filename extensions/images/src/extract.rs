@@ -236,7 +236,10 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
         let mut note = |slot: &str, resource: Option<usize>, in_pages: bool, entries: &[PaletteEntry]| {
             for e in entries {
                 let source = || PaletteSource { file: path.clone(), slot: slot.to_string(), resource, in_pages };
-                let named = e.palette.as_ref().and_then(|p| Some((p.target(), p.output.as_deref()?.strip_prefix("palettes/")?)));
+                let named = e
+                    .palette
+                    .as_ref()
+                    .and_then(|p| Some((p.target(), p.output.as_deref()?.strip_prefix("palettes/")?)));
                 match (named, &e.slot, e.at) {
                     (Some((image, palette)), ..) => {
                         palettes.entry((image.to_string(), palette.to_string())).or_insert_with(source);
@@ -407,7 +410,8 @@ impl Textures {
         n: usize,
     ) -> Result<Vec<u16>> {
         let file = self.files.get(&source.file).ok_or_else(|| anyhow!("no file {}", source.file))?;
-        let place = file.from.get(release).and_then(|l| l.at.first()).ok_or_else(|| anyhow!("the file is in no place"))?;
+        let place =
+            file.from.get(release).and_then(|l| l.at.first()).ok_or_else(|| anyhow!("the file is in no place"))?;
         let payload = read(discs, &At { slot: Some(source.slot.clone()), ..place.clone() })?;
         if source.in_pages {
             for p in codecs::texture::pages(&payload)? {

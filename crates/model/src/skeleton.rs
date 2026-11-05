@@ -51,7 +51,11 @@ pub fn held(part: &mut crate::model::Part, child: &Value) {
     let wide = |row: &[i16; 3]| row.map(f64::from);
     let (turned, rest) = (turned.map(|row| wide(&row)), part.rotation.map(|row| wide(&row)));
     #[expect(clippy::cast_possible_truncation, reason = "clamped to what the game's fixed point holds")]
-    let cell = |row: usize, column: usize| ((0..3).map(|k| turned[row][k] * scale[k] * rest[k][column]).sum::<f64>() / 4096.0).clamp(-32768.0, 32767.0).round() as i16;
+    let cell = |row: usize, column: usize| {
+        ((0..3).map(|k| turned[row][k] * scale[k] * rest[k][column]).sum::<f64>() / 4096.0)
+            .clamp(-32768.0, 32767.0)
+            .round() as i16
+    };
     part.rotation = std::array::from_fn(|row| std::array::from_fn(|column| cell(row, column)));
 }
 
@@ -64,7 +68,9 @@ pub fn parse(joints: &[Value]) -> Result<Vec<Joint>> {
     for joint in joints {
         let name = joint.get("name").and_then(Value::as_str).ok_or_else(|| anyhow!("a joint has no name"))?;
         let parent = match joint.get("parent").and_then(Value::as_str) {
-            Some(parent) => Some(out.iter().position(|j| j.name == parent).ok_or_else(|| anyhow!("{name}: no parent {parent}"))?),
+            Some(parent) => {
+                Some(out.iter().position(|j| j.name == parent).ok_or_else(|| anyhow!("{name}: no parent {parent}"))?)
+            }
             None => None,
         };
         let whole = |x: &Value| x.as_integer().and_then(|x| i32::try_from(x).ok());
@@ -116,7 +122,10 @@ mod tests {
 
     #[test]
     fn a_parent_comes_first() {
-        assert!(parse(&[joint(r#"{ name = "arm", parent = "root", translation = [0, 0, 0], rotation = [0, 0, 0] }"#)]).is_err());
+        assert!(
+            parse(&[joint(r#"{ name = "arm", parent = "root", translation = [0, 0, 0], rotation = [0, 0, 0] }"#)])
+                .is_err()
+        );
     }
 
     #[test]

@@ -5,14 +5,16 @@
 //! It is what a node's `scene` output is, so that what reads it reads a value: `scene` makes it from what the graph
 //! holds, read as any operation reads other nodes, and `assemble` asks for it.
 
-use pe2_ext::{Asset, Call, Data, File, Project, Requested, Result, Source, Style, Table, Typed, Ui, Value, anyhow, bail};
+use pe2_ext::{
+    Asset, Call, Data, File, Project, Requested, Result, Source, Style, Table, Typed, Ui, Value, anyhow, bail,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::material::{self, Definition};
 use crate::mesh;
-use crate::prefab::{self, Filled};
 use crate::model::{Blend, Corner, Face, Model, Part, Shading};
+use crate::prefab::{self, Filled};
 use crate::skeleton;
 
 /// What fills a texture slot: a cell of an image, through a palette of its or the cell's own.
@@ -147,7 +149,9 @@ impl Source for Held<'_, '_> {
 
     /// The stored file a node makes as itself.
     fn read(&self, _: &str) -> Result<Vec<u8>> {
-        let Data::Typed(stored) = self.call.output_of(&self.path, "native")? else { bail!("{}: it makes no file", self.path) };
+        let Data::Typed(stored) = self.call.output_of(&self.path, "native")? else {
+            bail!("{}: it makes no file", self.path)
+        };
         self.call.read(stored.file()?)
     }
 }
@@ -157,7 +161,13 @@ impl<'c, 'a> Nodes<'c, 'a> {
     fn named(&self, reference: &str) -> Result<Held<'c, 'a>> {
         let named = self.call.node_named(reference).ok_or_else(|| anyhow!("{reference}: no such node"))?;
         let settings = self.call.table_of(&named.path, "settings")?;
-        Ok(Held { call: self.call, path: named.path, uid: named.uid, node_type: named.types.into_iter().next(), settings })
+        Ok(Held {
+            call: self.call,
+            path: named.path,
+            uid: named.uid,
+            node_type: named.types.into_iter().next(),
+            settings,
+        })
     }
 
     fn shown(&self, asset: &Asset) -> Vec<prefab::Group> {
@@ -169,7 +179,12 @@ fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn resolved<'c, 'a>(nodes: &Nodes<'c, 'a>, holder: &Asset, key: &str, reference: Option<&Value>) -> Result<Held<'c, 'a>> {
+fn resolved<'c, 'a>(
+    nodes: &Nodes<'c, 'a>,
+    holder: &Asset,
+    key: &str,
+    reference: Option<&Value>,
+) -> Result<Held<'c, 'a>> {
     let reference = reference.ok_or_else(|| anyhow!("{}: no {key}", holder.path()))?;
     let target = pe2_ext::target_of(reference.get("slot").unwrap_or(reference));
     let target = target.ok_or_else(|| anyhow!("{}: its {key} is no reference", holder.path()))?;
@@ -180,10 +195,21 @@ fn bound_of(nodes: &Nodes, holder: &Asset, texture: &Value) -> Result<Bound> {
     let image = resolved(nodes, holder, "image", Some(texture))?;
     let image = image.asset();
     let cell = material::cell_of(texture).ok_or_else(|| anyhow!("{}: a texture has no cell", holder.path()))?;
-    let held = image.parts("cells").into_iter().find(|(name, _)| *name == cell).ok_or_else(|| anyhow!("{}: {} has no cell {cell}", holder.path(), image.path()))?;
-    let rect = held.1.get("rect").and_then(Value::as_array).ok_or_else(|| anyhow!("{}: {cell} has no size", image.path()))?;
-    let side = |at: usize| rect.get(at).and_then(Value::as_integer).and_then(|side| u32::try_from(side).ok()).unwrap_or(1);
-    Ok(Bound { image: image.path().to_string(), cell: cell.to_string(), palette: material::palette_of(texture).map(str::to_string), size: [side(2), side(3)] })
+    let held = image
+        .parts("cells")
+        .into_iter()
+        .find(|(name, _)| *name == cell)
+        .ok_or_else(|| anyhow!("{}: {} has no cell {cell}", holder.path(), image.path()))?;
+    let rect =
+        held.1.get("rect").and_then(Value::as_array).ok_or_else(|| anyhow!("{}: {cell} has no size", image.path()))?;
+    let side =
+        |at: usize| rect.get(at).and_then(Value::as_integer).and_then(|side| u32::try_from(side).ok()).unwrap_or(1);
+    Ok(Bound {
+        image: image.path().to_string(),
+        cell: cell.to_string(),
+        palette: material::palette_of(texture).map(str::to_string),
+        size: [side(2), side(3)],
+    })
 }
 
 fn drawn_of<'a>(nodes: &Nodes, holder: &Asset, field: impl Fn(&str) -> Option<&'a Value>) -> Result<Drawn> {
@@ -192,7 +218,14 @@ fn drawn_of<'a>(nodes: &Nodes, holder: &Asset, field: impl Fn(&str) -> Option<&'
         let taken = read.shader.textures.iter().any(|(known, _)| *known == key);
         field(key).filter(|_| taken).map(|texture| bound_of(nodes, holder, texture)).transpose()
     };
-    Ok(Drawn { transparent: read.transparent, blend: read.blend, main: texture(material::MAIN)?, environment: texture(material::ENVIRONMENT)?, strength: read.strength, effect: read.effect })
+    Ok(Drawn {
+        transparent: read.transparent,
+        blend: read.blend,
+        main: texture(material::MAIN)?,
+        environment: texture(material::ENVIRONMENT)?,
+        strength: read.strength,
+        effect: read.effect,
+    })
 }
 
 /// A slot of a model, with what the prefab node holding it overrides: the same keys as a material's, and `material`.
@@ -203,16 +236,25 @@ fn slot_of(nodes: &Nodes, model: &Asset, name: &str, overrides: Option<&Value>) 
     };
     let held = resolved(nodes, model, name, Some(reference))?;
     let held = held.asset();
-    let drawn = drawn_of(nodes, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
+    let drawn =
+        drawn_of(nodes, &held, |key| overrides.and_then(|overrides| overrides.get(key)).or_else(|| held.field(key)))?;
     let attached = Attached { path: held.path().to_string(), reference: held.uid().unwrap_or_default().to_string() };
-    Ok(Slot { material: Some(attached), reference: Some(reference.clone()), drawn: Some(drawn), overrides: overrides.cloned(), ..Slot::empty(name) })
+    Ok(Slot {
+        material: Some(attached),
+        reference: Some(reference.clone()),
+        drawn: Some(drawn),
+        overrides: overrides.cloned(),
+        ..Slot::empty(name)
+    })
 }
 
 /// A mesh, posed by its skeleton where it has one, with its parts named.
 fn mesh_of(nodes: &Nodes, mesh: &Asset) -> Result<Assembled> {
     let (mut model, names) = mesh::read(&String::from_utf8_lossy(&mesh.read(mesh::FILE)?))?;
     let slots = names.iter().map(|name| Slot::empty(name)).collect();
-    let mut shown: Vec<Node> = (0..model.parts.len()).map(|_| Node { name: leaf(mesh.path()).to_string(), attached: None, place: None }).collect();
+    let mut shown: Vec<Node> = (0..model.parts.len())
+        .map(|_| Node { name: leaf(mesh.path()).to_string(), attached: None, place: None })
+        .collect();
     if mesh.field("skeleton").is_some() {
         let skeleton = resolved(nodes, mesh, "skeleton", mesh.field("skeleton"))?;
         let skeleton = skeleton.asset();
@@ -223,7 +265,12 @@ fn mesh_of(nodes: &Nodes, mesh: &Asset) -> Result<Assembled> {
     Ok(Assembled { posed: Vec::new(), model, nodes: shown, slots })
 }
 
-fn model_of(nodes: &Nodes, asset: &Asset, overrides: Option<&Value>, node: Option<(&str, &[String])>) -> Result<Assembled> {
+fn model_of(
+    nodes: &Nodes,
+    asset: &Asset,
+    overrides: Option<&Value>,
+    node: Option<(&str, &[String])>,
+) -> Result<Assembled> {
     let mesh = resolved(nodes, asset, "mesh", asset.field("mesh"))?;
     let mesh = mesh.asset();
     let mut assembled = mesh_of(nodes, &mesh)?;
@@ -238,10 +285,16 @@ fn model_of(nodes: &Nodes, asset: &Asset, overrides: Option<&Value>, node: Optio
 /// A skeleton alone: its joints, as parts without vertices.
 fn skeleton_of(asset: &Asset) -> Result<Assembled> {
     let joints = skeleton::of(asset)?;
-    let part = |(at, joint): (usize, &skeleton::Joint)| Part { parent: joint.parent.unwrap_or(at), rotation: skeleton::matrix(joint.rotation), translation: joint.translation, vertices: Vec::new() };
+    let part = |(at, joint): (usize, &skeleton::Joint)| Part {
+        parent: joint.parent.unwrap_or(at),
+        rotation: skeleton::matrix(joint.rotation),
+        translation: joint.translation,
+        vertices: Vec::new(),
+    };
     let parts = joints.iter().enumerate().map(part).collect();
     let named = joints.into_iter().enumerate();
-    let nodes = named.map(|(at, joint)| Node { name: joint.name, attached: None, place: Some(Place::Joint(at)) }).collect();
+    let nodes =
+        named.map(|(at, joint)| Node { name: joint.name, attached: None, place: Some(Place::Joint(at)) }).collect();
     Ok(Assembled { posed: Vec::new(), model: Model { parts, ..Model::default() }, nodes, slots: Vec::new() })
 }
 
@@ -253,9 +306,16 @@ const BALL_COLUMNS: usize = 36;
 fn ball(size: Option<[u32; 2]>) -> Model {
     let across = BALL_COLUMNS + 1;
     let (mut vertices, mut normals) = (Vec::new(), Vec::new());
-    #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation, reason = "a dozen rows, of coordinates well within a short")]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "a dozen rows, of coordinates well within a short"
+    )]
     for (row, column) in (0..=BALL_ROWS).flat_map(|row| (0..=BALL_COLUMNS).map(move |column| (row, column))) {
-        let (down, around) = (std::f64::consts::PI * row as f64 / BALL_ROWS as f64, std::f64::consts::TAU * column as f64 / BALL_COLUMNS as f64);
+        let (down, around) = (
+            std::f64::consts::PI * row as f64 / BALL_ROWS as f64,
+            std::f64::consts::TAU * column as f64 / BALL_COLUMNS as f64,
+        );
         let unit = [down.sin() * around.cos(), -down.cos(), down.sin() * around.sin()];
         vertices.push(unit.map(|x| (x * BALL_RADIUS) as i16));
         normals.push(unit.map(|x| (x * 4096.0) as i16));
@@ -266,14 +326,32 @@ fn ball(size: Option<[u32; 2]>) -> Model {
         let place = |at: usize, of: usize, side: u32| (at * (side.min(256) as usize - 1) / of) as u8;
         Some([place(vertex % across, BALL_COLUMNS, width), place(vertex / across, BALL_ROWS, height)])
     };
-    let corner = |vertex: usize| Corner { vertex, normal: Some(vertex), color: size.is_none().then_some([200, 200, 205]), uv: uv(vertex) };
+    let corner = |vertex: usize| Corner {
+        vertex,
+        normal: Some(vertex),
+        color: size.is_none().then_some([200, 200, 205]),
+        uv: uv(vertex),
+    };
     let face = |(row, column): (usize, usize)| {
         let at = row * across + column;
-        Face { material: 0, shading: Shading::Smooth, part: Some(0), normal: None, color: None, corners: vec![corner(at), corner(at + 1), corner(at + across + 1), corner(at + across)] }
+        Face {
+            material: 0,
+            shading: Shading::Smooth,
+            part: Some(0),
+            normal: None,
+            color: None,
+            corners: vec![corner(at), corner(at + 1), corner(at + across + 1), corner(at + across)],
+        }
     };
     let faces = (0..BALL_ROWS).flat_map(|row| (0..BALL_COLUMNS).map(move |column| (row, column))).map(face).collect();
     let part = Part { parent: 0, rotation: skeleton::matrix([0.0; 3]), translation: [0, -500, 0], vertices };
-    Model { parts: vec![part], normals, materials: vec![crate::model::Material { transparent: false, slot: None, blend: None }], faces, ..Model::default() }
+    Model {
+        parts: vec![part],
+        normals,
+        materials: vec![crate::model::Material { transparent: false, slot: None, blend: None }],
+        faces,
+        ..Model::default()
+    }
 }
 
 /// A material alone, on a ball.
@@ -281,7 +359,12 @@ fn material_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     let drawn = drawn_of(nodes, asset, |key| asset.field(key))?;
     let model = ball(drawn.main.as_ref().map(|main| main.size));
     let slot = Slot { drawn: Some(drawn), ..Slot::empty(leaf(asset.path())) };
-    Ok(Assembled { posed: Vec::new(), model, nodes: vec![Node { name: leaf(asset.path()).to_string(), attached: None, place: None }], slots: vec![slot] })
+    Ok(Assembled {
+        posed: Vec::new(),
+        model,
+        nodes: vec![Node { name: leaf(asset.path()).to_string(), attached: None, place: None }],
+        slots: vec![slot],
+    })
 }
 
 /// Whether what fills a part is built on a skeleton: its parts are that skeleton's joints, not something to hang on them.
@@ -290,7 +373,8 @@ fn on_skeleton(nodes: &Nodes, asset: &Asset, skeleton: &Asset, fill: &Value) -> 
     let model = model.asset();
     let mesh = resolved(nodes, &model, "mesh", model.field("mesh"))?;
     let mesh = mesh.asset();
-    let named = mesh.field("skeleton").map(|reference| resolved(nodes, &mesh, "skeleton", Some(reference))).transpose()?;
+    let named =
+        mesh.field("skeleton").map(|reference| resolved(nodes, &mesh, "skeleton", Some(reference))).transpose()?;
     Ok(named.is_some_and(|named| named.path == skeleton.path()))
 }
 
@@ -306,14 +390,16 @@ fn hang(nodes: &Nodes, asset: &Asset, tree: &mut Assembled, part: &Filled, on: u
     };
     let model = resolved(nodes, asset, "model", fill.get("model"))?;
     let model = model.asset();
-    let Assembled { model: mut built, mut nodes, mut slots, .. } = model_of(nodes, &model, fill.get("overrides"), Some((&part.part, &part.within)))?;
+    let Assembled { model: mut built, mut nodes, mut slots, .. } =
+        model_of(nodes, &model, fill.get("overrides"), Some((&part.part, &part.within)))?;
     if let Some(root) = built.parts.first_mut() {
         skeleton::held(root, fill);
     }
     // What it hangs by is the part; a part of it deeper down keeps its own name.
     if let Some(first) = nodes.first_mut() {
         part.part.clone_into(&mut first.name);
-        first.attached = Some(Attached { path: model.path().to_string(), reference: model.uid().unwrap_or_default().to_string() });
+        first.attached =
+            Some(Attached { path: model.path().to_string(), reference: model.uid().unwrap_or_default().to_string() });
         first.place = place;
     }
     attach(&mut tree.model, built, on);
@@ -328,8 +414,11 @@ fn prefab_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     let parts = prefab::filled_as(asset, &nodes.shown(asset))?;
     let mut waiting: Vec<&Filled> = Vec::new();
     let mut root = None;
-    for part in parts.iter().filter(|part| part.node.is_some() || part.within.first().is_some_and(|step| step == "groups")) {
-        let built_on = part.fill.as_ref().map(|fill| on_skeleton(nodes, asset, &frame, fill)).transpose()?.unwrap_or(false);
+    for part in
+        parts.iter().filter(|part| part.node.is_some() || part.within.first().is_some_and(|step| step == "groups"))
+    {
+        let built_on =
+            part.fill.as_ref().map(|fill| on_skeleton(nodes, asset, &frame, fill)).transpose()?.unwrap_or(false);
         match (built_on, part.node.as_deref()) {
             (true, _) if root.is_some() => bail!("{}: {} is a second model on its skeleton", asset.path(), part.part),
             (true, _) => root = Some(part),
@@ -410,7 +499,10 @@ pub fn attach(tree: &mut Model, mut child: Model, node: usize) {
 /// It is none of what shows in 3D, or something it refers to is missing or unreadable.
 pub fn scene(call: &mut Call) -> Result<Typed> {
     let chosen: String = call.parameter()?;
-    let chosen = chosen.split(',').filter_map(|pair| pair.split_once('=')).map(|(group, member)| (group.to_string(), member.to_string()));
+    let chosen = chosen
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(group, member)| (group.to_string(), member.to_string()));
     let nodes = Nodes { call, chosen: chosen.collect() };
     let own = nodes.named(call.host.path())?;
     let assembled = built(&nodes, &own.asset())?;
@@ -440,7 +532,8 @@ fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
             material.blend = Some(drawn.blend);
         }
     }
-    assembled.model.effect = assembled.slots.iter().find_map(|slot| slot.drawn.as_ref()).map_or(0, |drawn| drawn.effect);
+    assembled.model.effect =
+        assembled.slots.iter().find_map(|slot| slot.drawn.as_ref()).map_or(0, |drawn| drawn.effect);
     Ok(assembled)
 }
 
@@ -450,7 +543,8 @@ fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
 /// It has no such output, or it could not be made.
 pub fn assemble(project: &dyn Project, asset: &Asset) -> Result<Assembled> {
     let address = scene_address(project, asset);
-    let bytes = project.bytes(asset.path(), &address).ok_or_else(|| anyhow!("{}: it shows nothing in 3D", asset.path()))??;
+    let bytes =
+        project.bytes(asset.path(), &address).ok_or_else(|| anyhow!("{}: it shows nothing in 3D", asset.path()))??;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -465,7 +559,8 @@ pub enum Scene {
 /// What `assemble` gives, without waiting: a view shows what it has meanwhile, and is shown again when this is there.
 pub fn requested(project: &dyn Project, asset: &Asset) -> Scene {
     match project.request(asset.path(), &scene_address(project, asset)) {
-        Requested::Ready(bytes) => serde_json::from_slice(&bytes).map_or_else(|why| Scene::Failed(why.to_string()), |made| Scene::Ready(Box::new(made))),
+        Requested::Ready(bytes) => serde_json::from_slice(&bytes)
+            .map_or_else(|why| Scene::Failed(why.to_string()), |made| Scene::Ready(Box::new(made))),
         Requested::Pending { waited } => Scene::Waiting(waited),
         Requested::Failed(why) => Scene::Failed(why),
     }
@@ -480,7 +575,8 @@ pub fn say_waiting(ui: &mut Ui, waited: u32) {
 }
 
 fn scene_address(project: &dyn Project, asset: &Asset) -> String {
-    let chosen: Vec<String> = prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
+    let chosen: Vec<String> =
+        prefab::groups(asset, project).iter().map(|group| format!("{}={}", group.name, group.chosen)).collect();
     let chosen = if chosen.is_empty() { NONE_CHOSEN.to_string() } else { chosen.join(",") };
     format!("scene/{chosen}")
 }
@@ -491,12 +587,24 @@ mod tests {
     use crate::model::Material;
 
     fn part(parent: usize, vertices: usize) -> Part {
-        Part { parent, rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]], translation: [0; 3], vertices: vec![[1, 2, 3]; vertices] }
+        Part {
+            parent,
+            rotation: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            translation: [0; 3],
+            vertices: vec![[1, 2, 3]; vertices],
+        }
     }
 
     fn face(material: usize, part: usize, vertex: usize) -> Face {
         let corner = Corner { vertex, normal: Some(0), color: None, uv: None };
-        Face { material, shading: Shading::Smooth, part: Some(part), normal: None, color: None, corners: vec![corner.clone(), corner.clone(), corner] }
+        Face {
+            material,
+            shading: Shading::Smooth,
+            part: Some(part),
+            normal: None,
+            color: None,
+            corners: vec![corner.clone(), corner.clone(), corner],
+        }
     }
 
     fn material() -> Material {
@@ -505,8 +613,20 @@ mod tests {
 
     #[test]
     fn a_child_hangs_under_its_node() {
-        let mut tree = Model { parts: vec![part(0, 2), part(0, 3)], normals: vec![[0; 3]; 4], materials: vec![material(), material()], faces: vec![face(1, 1, 4)], ..Model::default() };
-        let child = Model { parts: vec![part(0, 5)], normals: vec![[0; 3]; 2], materials: vec![material()], faces: vec![face(0, 0, 4)], ..Model::default() };
+        let mut tree = Model {
+            parts: vec![part(0, 2), part(0, 3)],
+            normals: vec![[0; 3]; 4],
+            materials: vec![material(), material()],
+            faces: vec![face(1, 1, 4)],
+            ..Model::default()
+        };
+        let child = Model {
+            parts: vec![part(0, 5)],
+            normals: vec![[0; 3]; 2],
+            materials: vec![material()],
+            faces: vec![face(0, 0, 4)],
+            ..Model::default()
+        };
         attach(&mut tree, child, 1);
         assert_eq!(tree.parts.len(), 3);
         assert_eq!(tree.parts[2].parent, 1, "its root hangs under the node");
@@ -529,7 +649,12 @@ mod tests {
 
     #[test]
     fn vertices_that_were_loose_stay_after_the_parts() {
-        let mut tree = Model { parts: vec![part(0, 1)], loose_vertices: vec![[0; 3]], faces: vec![face(0, 0, 1)], ..Model::default() };
+        let mut tree = Model {
+            parts: vec![part(0, 1)],
+            loose_vertices: vec![[0; 3]],
+            faces: vec![face(0, 0, 1)],
+            ..Model::default()
+        };
         let child = Model { parts: vec![part(0, 2)], ..Model::default() };
         attach(&mut tree, child, 0);
         assert_eq!(tree.faces[0].corners[0].vertex, 3);

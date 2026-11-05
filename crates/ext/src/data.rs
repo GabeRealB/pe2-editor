@@ -91,7 +91,9 @@ impl Type {
             "file" => Type::File(Box::new(Type::Any)),
             _ if inner("file<").is_some() => Type::File(Box::new(Type::parse(inner("file<").unwrap_or_default(), id)?)),
             _ if inner("list<").is_some() => Type::List(Box::new(Type::parse(inner("list<").unwrap_or_default(), id)?)),
-            _ if inner("stream<").is_some() => Type::Stream(Box::new(Type::parse(inner("stream<").unwrap_or_default(), id)?)),
+            _ if inner("stream<").is_some() => {
+                Type::Stream(Box::new(Type::parse(inner("stream<").unwrap_or_default(), id)?))
+            }
             _ if text.len() == 1 && text.chars().all(|c| c.is_ascii_uppercase()) => Type::Var(text.to_string()),
             _ if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "_.@-/+".contains(c)) => {
                 Type::Named(qualify(text, id))
@@ -127,7 +129,10 @@ impl Type {
             (port, Type::Union(given)) => given.iter().any(|g| port.unify(g, bound)),
             (Type::File(port), Type::File(given)) => port.unify(given, bound),
             // What the host holds in memory alone is no file.
-            (Type::File(_), Type::Image | Type::Table | Type::Pcm | Type::Video | Type::Audio | Type::Marks | Type::List(_)) => false,
+            (
+                Type::File(_),
+                Type::Image | Type::Table | Type::Pcm | Type::Video | Type::Audio | Type::Marks | Type::List(_),
+            ) => false,
             (Type::File(port), given) => port.unify(given, bound),
             (port, Type::File(given)) => port.unify(given.as_ref(), bound),
             (Type::List(a), Type::List(b)) | (Type::Stream(a), Type::Stream(b)) => a.unify(b, bound),
@@ -632,7 +637,8 @@ impl Call<'_> {
     /// # Errors
     /// It was given none, or one not of the type.
     pub fn take<T: crate::ty::ValueType>(&mut self, port: usize) -> Result<T::Value> {
-        let data = self.inputs.get_mut(port).and_then(Vec::pop).ok_or_else(|| anyhow!("its port {port} was given nothing"))?;
+        let data =
+            self.inputs.get_mut(port).and_then(Vec::pop).ok_or_else(|| anyhow!("its port {port} was given nothing"))?;
         T::decode(data, self)
     }
 
@@ -795,7 +801,8 @@ pub fn merged(declared: &Table, derived: &Table) -> Table {
 /// with no target, nothing is added.
 #[must_use]
 pub fn targeted(declared: &Table, target: Option<&str>) -> Table {
-    let mut out: Table = declared.iter().filter(|(key, _)| key.as_str() != "target").map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut out: Table =
+        declared.iter().filter(|(key, _)| key.as_str() != "target").map(|(k, v)| (k.clone(), v.clone())).collect();
     if let Some(own) = target.and_then(|target| declared.get("target")?.get(target)?.as_table()) {
         merge(&mut out, own);
     }
@@ -1065,8 +1072,12 @@ mod tests {
         assert_eq!(targeted(&declared, Some("psx")), psx);
         assert_eq!(targeted(&declared, None), none);
         assert_eq!(targeted(&declared, Some("n64")), none);
-        let declared: crate::Table = toml::from_str("sources.private = [\"a.c\"]\n[target.psx]\nsources.private = [\"b.s\"]\nsources.public = [\"c.s\"]\n").unwrap();
-        let psx: crate::Table = toml::from_str("sources.private = [\"a.c\", \"b.s\"]\nsources.public = [\"c.s\"]\n").unwrap();
+        let declared: crate::Table = toml::from_str(
+            "sources.private = [\"a.c\"]\n[target.psx]\nsources.private = [\"b.s\"]\nsources.public = [\"c.s\"]\n",
+        )
+        .unwrap();
+        let psx: crate::Table =
+            toml::from_str("sources.private = [\"a.c\", \"b.s\"]\nsources.public = [\"c.s\"]\n").unwrap();
         assert_eq!(targeted(&declared, Some("psx")), psx);
     }
 
@@ -1091,12 +1102,21 @@ mod tests {
     #[test]
     fn where_a_value_lives_is_no_part_of_its_type() {
         // Recognized as several things, as one file: it fits a port naming any, and one asking for a file.
-        let source = Typed { also: vec!["x.ext@zip".into(), "image/openraster".into()], ..Typed::new("x.ext@ora", vec![File::new("s.ora", vec![])]) };
+        let source = Typed {
+            also: vec!["x.ext@zip".into(), "image/openraster".into()],
+            ..Typed::new("x.ext@ora", vec![File::new("s.ora", vec![])])
+        };
         let given = Value::Typed(source).ty();
-        assert!(fits("image/openraster", &given) && fits("zip", &given) && fits("file<ora>", &given) && fits("file", &given));
+        assert!(
+            fits("image/openraster", &given)
+                && fits("zip", &given)
+                && fits("file<ora>", &given)
+                && fits("file", &given)
+        );
         assert!(!fits("png", &given));
         // Two files: still of its type; that it is no one file is found when it is given.
-        let indexed = Value::Typed(Typed::new("x.ext@indexed", vec![File::new("a", vec![]), File::new("b", vec![])])).ty();
+        let indexed =
+            Value::Typed(Typed::new("x.ext@indexed", vec![File::new("a", vec![]), File::new("b", vec![])])).ty();
         assert!(fits("bs_picture | indexed", &indexed) && fits("file<indexed>", &indexed));
         // What the host holds in memory is no file.
         assert!(fits("any", &Type::Table) && !fits("file", &Type::Table) && !fits("file<any>", &Type::Image));

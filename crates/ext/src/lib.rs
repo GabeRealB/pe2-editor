@@ -15,8 +15,6 @@
 mod asset;
 pub mod data;
 pub mod events;
-pub mod tokens;
-pub mod ty;
 mod extract;
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
@@ -24,22 +22,30 @@ pub mod guest;
 mod image;
 mod import;
 pub mod media;
-mod project;
 pub mod process;
+mod project;
 mod registry;
 pub mod test;
+pub mod tokens;
+pub mod ty;
 mod ui;
 
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
+pub use data::{
+    BuildConfig, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, Micro, MicroInput, Need,
+    NodeNamed, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp, StartStream, StreamInput,
+    StreamSource, Type, Typed, Value as Data, Writer, merged, targeted,
+};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
-pub use data::{BuildConfig, NodeNamed, Provides, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, Micro, MicroInput, Need, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Retain, RunOp, StartStream, StreamInput, StreamSource, targeted, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::{Project, Requested};
-pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, SheetOfPart, TabDef, TemplateDef, 
-    Extension, Field, Format, Icon, MakePanel, MakeView, Name, OpBuilder, PanelDef, Parts,
-    Registry, Run, Scope, Setting, Tint, ToolDef, TypeBuilder, ViewDef, section,
+pub use registry::{
+    ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow,
+    ContentStyle, Contents, Extension, Field, Format, HookBuilder, HookDef, Icon, MakePanel, MakeView, Name, OpBuilder,
+    PanelDef, PartField, PartSheet, Parts, Registry, Run, Scope, Setting, SheetOfPart, TabDef, TemplateDef, Tint,
+    ToolDef, TypeBuilder, ViewDef, section,
 };
 pub use toml::{Table, Value};
 

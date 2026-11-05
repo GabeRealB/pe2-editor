@@ -145,20 +145,23 @@ impl Tracker {
         let contents = inner.min.to_vec2() * scale;
         let landed = *self.landed.get_or_insert(contents);
         // Where it should be: where it stands, for a window with no place to go back to.
-        let target = *self.target.get_or_insert(self.wanted.map_or(contents, |wanted| egui::Vec2::from(wanted.contents)));
+        let target =
+            *self.target.get_or_insert(self.wanted.map_or(contents, |wanted| egui::Vec2::from(wanted.contents)));
         if self.settled.is_none() {
             let moved = target - contents;
             let size = self.wanted.map_or(inner.size() * scale, |wanted| egui::Vec2::from(wanted.size) * wanted.scale);
             // Its monitor is known once it is on it.
             let room = monitor.filter(|_| moved.length() <= NEAR).map(|monitor| monitor * scale);
-            let size = room.filter(|room| size.x > room.x || size.y > room.y).map_or(size, |room| size.min(room * FITTED));
+            let size =
+                room.filter(|room| size.x > room.x || size.y > room.y).map_or(size, |room| size.min(room * FITTED));
             let resized = size - inner.size() * scale;
             if self.corrections < CORRECTIONS && (moved.length() > NEAR || resized.length() > NEAR) {
                 self.corrections += 1;
                 self.waiting = SETTLING;
                 // From what was last asked for: the outer position read back is what may be off.
                 if moved.length() > NEAR
-                    && let Some(from) = self.requested.or(outer.map(|outer| egui::pos2(outer.min.x * scale, outer.min.y * scale)))
+                    && let Some(from) =
+                        self.requested.or(outer.map(|outer| egui::pos2(outer.min.x * scale, outer.min.y * scale)))
                 {
                     let to = from + moved;
                     self.requested = Some(to);
@@ -176,7 +179,12 @@ impl Tracker {
         // What to ask for to land there, by how far from it the last one landed.
         let asked = egui::Vec2::from(self.asked.unwrap_or([0.0, 0.0]));
         let position = asked + (contents - landed) / scale;
-        Some(Place { position: [position.x, position.y], size: [inner.width(), inner.height()], contents: [contents.x, contents.y], scale })
+        Some(Place {
+            position: [position.x, position.y],
+            size: [inner.width(), inner.height()],
+            contents: [contents.x, contents.y],
+            scale,
+        })
     }
 }
 
@@ -253,13 +261,25 @@ pub struct Mode {
 
 /// The modes there are at first, the first in use.
 pub fn first_modes() -> Vec<Mode> {
-    let mode = |(at, name): (usize, &&str)| Mode { name: (*name).to_string(), tree: (at > 0).then(|| crate::panes::preset(name)) };
+    let mode = |(at, name): (usize, &&str)| Mode {
+        name: (*name).to_string(),
+        tree: (at > 0).then(|| crate::panes::preset(name)),
+    };
     MODES.iter().enumerate().map(mode).collect()
 }
 
 impl Layouts {
     pub fn new(main: Tree<Pane>) -> Layouts {
-        Layouts { main, windows: vec![], states: BTreeMap::new(), homes: BTreeMap::new(), focused: None, reveal: None, modes: first_modes(), mode: 0 }
+        Layouts {
+            main,
+            windows: vec![],
+            states: BTreeMap::new(),
+            homes: BTreeMap::new(),
+            focused: None,
+            reveal: None,
+            modes: first_modes(),
+            mode: 0,
+        }
     }
 
     /// Where a pane is: its window (none: the main one) and its tile.
@@ -317,7 +337,8 @@ impl Layouts {
     /// The document tabs, in the order they were opened.
     fn documents(&self) -> Vec<Pane> {
         let trees = std::iter::once(&self.main).chain(self.windows.iter().map(|w| &w.tree));
-        let mut documents: Vec<Pane> = trees.flat_map(panes_of).map(|(_, p)| p).filter(|p| p.kind == PaneKind::Document).collect();
+        let mut documents: Vec<Pane> =
+            trees.flat_map(panes_of).map(|(_, p)| p).filter(|p| p.kind == PaneKind::Document).collect();
         documents.sort();
         documents
     }
@@ -335,7 +356,10 @@ impl Layouts {
     /// A pane a new tab of the document kind joins.
     fn anchor(&self) -> Option<Pane> {
         let open = |pane: &Pane| self.find(*pane).is_some();
-        self.focused.filter(open).or_else(|| self.documents().first().copied()).or(Some(Pane::first(PaneKind::Layer)).filter(open))
+        self.focused
+            .filter(open)
+            .or_else(|| self.documents().first().copied())
+            .or(Some(Pane::first(PaneKind::Layer)).filter(open))
     }
 
     /// The pane one no layout holds joins: what belongs in its area, else the documents.
@@ -346,11 +370,14 @@ impl Layouts {
 
     /// The group in use and the tab in front of it: of the document in use, else of the group holding the first document.
     fn tab_in_use(&self) -> Option<(Option<u64>, TileId, TileId)> {
-        let anchor = self.focused.filter(|pane| self.find(*pane).is_some()).or_else(|| self.documents().first().copied())?;
+        let anchor =
+            self.focused.filter(|pane| self.find(*pane).is_some()).or_else(|| self.documents().first().copied())?;
         let (window, tile) = self.find(anchor)?;
         let tree = self.windows.iter().find(|w| Some(w.id) == window).map_or(&self.main, |w| &w.tree);
         let group = tree.tiles.parent_of(tile)?;
-        let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get(group) else { return Some((window, group, tile)) };
+        let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get(group) else {
+            return Some((window, group, tile));
+        };
         Some((window, group, tabs.active.filter(|active| tree.tiles.is_visible(*active)).unwrap_or(tile)))
     }
 
@@ -410,7 +437,8 @@ impl Layouts {
         let is_document = |(_, pane): &(TileId, Pane)| pane.kind == PaneKind::Document;
         let held: Vec<(TileId, Pane)> = panes_of(tree).into_iter().filter(is_document).collect();
         let group = held.first().and_then(|(tile, _)| tree.tiles.parent_of(*tile));
-        let mut documents: Vec<Pane> = panes_of(&self.main).into_iter().filter(is_document).map(|(_, pane)| pane).collect();
+        let mut documents: Vec<Pane> =
+            panes_of(&self.main).into_iter().filter(is_document).map(|(_, pane)| pane).collect();
         documents.sort();
         for (tile, _) in held {
             take(tree, tile);
@@ -516,7 +544,8 @@ impl Layouts {
             Some(Tile::Container(Container::Tabs(tabs))) => tabs.children.clone(),
             _ => vec![],
         };
-        let is_document = |tile: &TileId| matches!(tree.tiles.get(*tile), Some(Tile::Pane(p)) if p.kind == PaneKind::Document);
+        let is_document =
+            |tile: &TileId| matches!(tree.tiles.get(*tile), Some(Tile::Pane(p)) if p.kind == PaneKind::Document);
         if let Some(tile) = children.iter().rev().find(|tile| is_document(tile)).copied() {
             activate(tree, tile);
             self.focused = panes_of(tree).into_iter().find_map(|(id, pane)| (id == tile).then_some(pane));
@@ -532,7 +561,11 @@ impl Layouts {
     /// Close the document tabs an entry is gone from: a layout outlives the project its tabs were opened in.
     pub fn close_documents(&mut self, gone: impl Fn(&str) -> bool) {
         // A state outlives a layout that could not be read.
-        let open: Vec<Pane> = std::iter::once(&self.main).chain(self.windows.iter().map(|w| &w.tree)).flat_map(panes_of).map(|(_, p)| p).collect();
+        let open: Vec<Pane> = std::iter::once(&self.main)
+            .chain(self.windows.iter().map(|w| &w.tree))
+            .flat_map(panes_of)
+            .map(|(_, p)| p)
+            .collect();
         self.states.retain(|pane, _| open.contains(pane));
         for pane in self.documents() {
             if self.subject(pane).is_some_and(&gone)
@@ -727,7 +760,13 @@ mod tests {
         sized(ctx, tracker, at, [800.0, 600.0], [2560.0, 1440.0])
     }
 
-    fn sized(ctx: &egui::Context, tracker: &mut Tracker, at: [f32; 2], size: [f32; 2], monitor: [f32; 2]) -> Option<Place> {
+    fn sized(
+        ctx: &egui::Context,
+        tracker: &mut Tracker,
+        at: [f32; 2],
+        size: [f32; 2],
+        monitor: [f32; 2],
+    ) -> Option<Place> {
         let mut input = egui::RawInput::default();
         let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
         info.inner_rect = Some(egui::Rect::from_min_size(at.into(), size.into()));
@@ -923,7 +962,11 @@ mod tests {
         assert_eq!(layouts.main.tiles.parent_of(layouts.find(second).unwrap().1), group);
         assert_eq!(front(&layouts).as_deref(), Some("g/c"));
         // It opens next to the one in use, not after what else is in the group.
-        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) = layouts.main.tiles.get(group.unwrap()) else { panic!() };
+        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+            layouts.main.tiles.get(group.unwrap())
+        else {
+            panic!()
+        };
         let at = |tile| tabs.children.iter().position(|t| *t == tile).unwrap();
         assert_eq!(at(layouts.find(second).unwrap().1), at(layouts.find(first).unwrap().1) + 1);
         // One open comes to the front, and the preview tab stays what it was.
@@ -938,7 +981,11 @@ mod tests {
         let (window, at) = layouts.find(second).unwrap();
         layouts.act(window, at, PaneAction::Another);
         let copy = Pane { kind: PaneKind::Document, instance: 2 };
-        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) = layouts.main.tiles.get(group.unwrap()) else { panic!() };
+        let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+            layouts.main.tiles.get(group.unwrap())
+        else {
+            panic!()
+        };
         let order = |pane| tabs.children.iter().position(|t| *t == layouts.find(pane).unwrap().1).unwrap();
         assert_eq!(order(copy), order(second) + 1);
         assert_eq!((layouts.states[&copy].editor, layouts.subject(copy)), (Some(EditorKind::Graph), Some("g/c")));

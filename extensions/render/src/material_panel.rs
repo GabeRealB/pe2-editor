@@ -17,7 +17,10 @@ pub struct Pictures(HashMap<String, Option<Texture>>);
 impl Pictures {
     pub fn get(&mut self, ui: &Ui, image: &str, part: &str) -> Option<&Texture> {
         let key = format!("{image}#{part}");
-        self.0.entry(key.clone()).or_insert_with(|| ui.project().image(image, part)?.ok().map(|picture| Texture::new(key, picture))).as_ref()
+        self.0
+            .entry(key.clone())
+            .or_insert_with(|| ui.project().image(image, part)?.ok().map(|picture| Texture::new(key, picture)))
+            .as_ref()
     }
 }
 
@@ -39,9 +42,15 @@ pub struct Choices {
 pub fn choices_of(ui: &Ui, texture: &Value) -> Option<Choices> {
     let image = ui.project().resolve(texture.get("slot").unwrap_or(texture))?;
     let named = |list: Vec<(&str, &Value)>| list.into_iter().map(|(name, _)| name.to_string()).collect();
-    let cell = material::cell_of(texture).and_then(|cell| image.parts("cells").into_iter().find(|(name, _)| *name == cell));
+    let cell =
+        material::cell_of(texture).and_then(|cell| image.parts("cells").into_iter().find(|(name, _)| *name == cell));
     let own = cell.and_then(|(_, cell)| cell.get("palette")).and_then(Value::as_str).map(str::to_string);
-    Some(Choices { image: image.path().to_string(), cells: named(image.parts("cells")), palettes: named(image.parts("palettes")), own })
+    Some(Choices {
+        image: image.path().to_string(),
+        cells: named(image.parts("cells")),
+        palettes: named(image.parts("palettes")),
+        own,
+    })
 }
 
 impl Panel {
@@ -52,7 +61,8 @@ impl Panel {
             return;
         };
         let cell = material::cell_of(texture).unwrap_or_default().to_string();
-        let palette = material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
+        let palette =
+            material::palette_of(texture).map(str::to_string).or_else(|| choices.own.clone()).unwrap_or_default();
         let part = material::cell_address(&cell, Some(&palette));
         if let Some(picture) = self.pictures.get(ui, &choices.image, &part).cloned() {
             #[expect(clippy::cast_precision_loss, reason = "a picture is far smaller than floats lose pixels at")]
@@ -80,7 +90,9 @@ impl Panel {
             ui.horizontal(|ui| {
                 let changed = ui.text_edit("strength", typed);
                 ui.styled(&format!("of {LAYER_FULL}"), Style::Note);
-                if let Some(new) = typed.trim().parse::<u8>().ok().filter(|new| changed && *new <= LAYER_FULL && *new != strength) {
+                if let Some(new) =
+                    typed.trim().parse::<u8>().ok().filter(|new| changed && *new <= LAYER_FULL && *new != strength)
+                {
                     ui.set(STRENGTH, Some(&Value::Integer(i64::from(new))));
                 }
             });
@@ -92,7 +104,8 @@ impl View for Panel {
     fn show(&mut self, ui: &mut Ui) {
         let Some(asset) = ui.asset() else { return };
         let read = Definition::read(|key| asset.field(key));
-        let slots: Vec<(&str, &str, Option<Value>)> = read.shader.textures.iter().map(|(key, label)| (*key, *label, asset.field(key).cloned())).collect();
+        let slots: Vec<(&str, &str, Option<Value>)> =
+            read.shader.textures.iter().map(|(key, label)| (*key, *label, asset.field(key).cloned())).collect();
         let main = asset.field(MAIN).cloned();
         let strength = read.shader.reflective.then_some(read.strength);
         for (key, label, texture) in slots {

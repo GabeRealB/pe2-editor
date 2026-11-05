@@ -38,7 +38,8 @@ fn containers(listing: &str) -> Vec<Value> {
             let mut words = line.split_whitespace();
             let (flags, name) = (words.next()?, words.next()?);
             let label = words.collect::<Vec<_>>().join(" ");
-            (flags.contains('E') && !flags.contains('d')).then(|| table([("name", text(name)), ("label", text(&label))]))
+            (flags.contains('E') && !flags.contains('d'))
+                .then(|| table([("name", text(name)), ("label", text(&label))]))
         })
         .collect()
 }
@@ -69,7 +70,8 @@ fn after<'a>(help: &'a str, name: &str) -> Option<&'a str> {
 
 /// What `ffmpeg -h muxer=<name>` says of a container.
 fn container(help: &str) -> Value {
-    let words = |name: &str| after(help, name).map_or_default(|v| v.split(',').map(|w| text(w.trim())).collect::<Vec<_>>());
+    let words =
+        |name: &str| after(help, name).map_or_default(|v| v.split(',').map(|w| text(w.trim())).collect::<Vec<_>>());
     let one = |name: &str| text(after(help, name).unwrap_or_default());
     table([
         ("extensions", Value::Array(words("Common extensions:"))),
@@ -138,7 +140,10 @@ fn number(arguments: &Value, name: &str) -> Result<i64> {
 
 /// Where a trial may write: what the system says, a path a program can open.
 fn scratch() -> String {
-    let folder = ["TMPDIR", "TEMP", "TMP"].iter().find_map(|name| std::env::var(name).ok()).unwrap_or_else(|| "/tmp".to_string());
+    let folder = ["TMPDIR", "TEMP", "TMP"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_else(|| "/tmp".to_string());
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_nanos());
     format!("{}/pe2-ffmpeg-check-{stamp}", folder.trim_end_matches('/'))
 }
@@ -149,8 +154,21 @@ fn check(arguments: &Value) -> Result<Value> {
     let size = format!("{}x{}", number(arguments, "width")?, number(arguments, "height")?);
     let file = scratch();
     let mut args = strings(&[
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &format!("color=black:s={size}:r=15:d=0.07"),
-        "-f", "lavfi", "-i", "anullsrc=r=37800:cl=stereo:d=0.07", "-frames:v", "1",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=black:s={size}:r=15:d=0.07"),
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=37800:cl=stereo:d=0.07",
+        "-frames:v",
+        "1",
     ]);
     args.extend(encoding.video.args("v"));
     args.extend(encoding.audio.args("a"));
@@ -174,13 +192,25 @@ pub fn register(r: &mut Registry) {
             ("audio", Value::Array(encoders(&encoded, 'A'))),
         ]))
     });
-    let _ = r.service("container", "A container: its extensions, media type and default codecs", empty, |_: &dyn Project, arguments| {
-        Ok(container(&printed(&["-h", &format!("muxer={}", argument(arguments, "name")?)])?))
+    let _ = r.service(
+        "container",
+        "A container: its extensions, media type and default codecs",
+        empty,
+        |_: &dyn Project, arguments| {
+            Ok(container(&printed(&["-h", &format!("muxer={}", argument(arguments, "name")?)])?))
+        },
+    );
+    let _ = r.service(
+        "encoder",
+        "An encoder: the formats it takes and its options",
+        empty,
+        |_: &dyn Project, arguments| {
+            Ok(encoder(&printed(&["-h", &format!("encoder={}", argument(arguments, "name")?)])?))
+        },
+    );
+    let _ = r.service("check", "Whether an encoding works, at a frame's size", empty, |_: &dyn Project, arguments| {
+        check(arguments)
     });
-    let _ = r.service("encoder", "An encoder: the formats it takes and its options", empty, |_: &dyn Project, arguments| {
-        Ok(encoder(&printed(&["-h", &format!("encoder={}", argument(arguments, "name")?)])?))
-    });
-    let _ = r.service("check", "Whether an encoding works, at a frame's size", empty, |_: &dyn Project, arguments| check(arguments));
 }
 
 #[cfg(test)]
@@ -213,7 +243,10 @@ mod tests {
         let help = "Muxer mp4 [MP4]:\n    Common extensions: mp4.\n    Mime type: video/mp4.\n    Default video codec: h264.\n    Default audio codec: aac.\n";
         let read = container(help);
         assert_eq!(read.get("extensions").unwrap().as_array().unwrap()[0].as_str(), Some("mp4"));
-        assert_eq!((word(&read, "media_type"), word(&read, "video"), word(&read, "audio")), ("video/mp4", "h264", "aac"));
+        assert_eq!(
+            (word(&read, "media_type"), word(&read, "video"), word(&read, "audio")),
+            ("video/mp4", "h264", "aac")
+        );
         let help = "Encoder libx264 [H.264]:\n    Supported pixel formats: yuv420p yuvj420p\nlibx264 AVOptions:\n  -preset            <string>     E..V....... Set the encoding preset (default \"medium\")\n  -aq-mode           <int>        E..V....... AQ method (from -1 to INT_MAX) (default -1)\n     none            0            E..V.......\n     variance        1            E..V....... Variance AQ\n";
         let read = encoder(help);
         assert_eq!(read.get("formats").unwrap().as_array().unwrap().len(), 2);

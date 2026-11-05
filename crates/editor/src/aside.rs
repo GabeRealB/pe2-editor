@@ -10,7 +10,11 @@ pub fn drop_later<T: Send + 'static>(value: T) {
     static LATER: OnceLock<Option<Sender<Box<dyn Any + Send>>>> = OnceLock::new();
     let later = LATER.get_or_init(|| {
         let (to, from) = channel::<Box<dyn Any + Send>>();
-        std::thread::Builder::new().name("let go".into()).spawn(move || from.into_iter().for_each(drop)).ok().map(|_| to)
+        std::thread::Builder::new()
+            .name("let go".into())
+            .spawn(move || from.into_iter().for_each(drop))
+            .ok()
+            .map(|_| to)
     });
     if let Some(later) = later {
         let _ = later.send(Box::new(value));

@@ -109,7 +109,9 @@ pub fn address(entry: Option<&str>, args: &Args) -> String {
 fn parsed(text: &str) -> (Option<&str>, Args) {
     let mut pieces = text.split(';');
     let entry = pieces.next().filter(|entry| !entry.is_empty());
-    let args = pieces.filter_map(|piece| piece.split_once('=')).map(|(name, values)| (name.to_string(), values.split(',').map(str::to_string).collect()));
+    let args = pieces
+        .filter_map(|piece| piece.split_once('='))
+        .map(|(name, values)| (name.to_string(), values.split(',').map(str::to_string).collect()));
     (entry, Args(args.collect()))
 }
 
@@ -171,18 +173,18 @@ impl Tokenizer<'_> {
             .provides(&names(OUTPUT))
             .keeps(Retain::Cache);
         let op = if follows { op.prepared_by_running() } else { op };
-        let _ = op
-            .run(move |call| {
-                let asked: String = call.parameter()?;
-                let (name, args) = parsed(&asked);
-                let call: &Call<'_> = call;
-                let entry = held.iter().find(|entry| entry.name == name).ok_or_else(|| anyhow!("{}", unknown(&held, name)))?;
-                if let Some(missing) = entry.args.iter().find(|arg| !args.0.contains_key(**arg)) {
-                    bail!("it needs {missing}");
-                }
-                let tokens = (entry.make)(call, &args)?;
-                Ok(Typed::new(ty::Tokens::NAME, vec![File::new(ty::Tokens::FILE, tokens.into_bytes())]))
-            });
+        let _ = op.run(move |call| {
+            let asked: String = call.parameter()?;
+            let (name, args) = parsed(&asked);
+            let call: &Call<'_> = call;
+            let entry =
+                held.iter().find(|entry| entry.name == name).ok_or_else(|| anyhow!("{}", unknown(&held, name)))?;
+            if let Some(missing) = entry.args.iter().find(|arg| !args.0.contains_key(**arg)) {
+                bail!("it needs {missing}");
+            }
+            let tokens = (entry.make)(call, &args)?;
+            Ok(Typed::new(ty::Tokens::NAME, vec![File::new(ty::Tokens::FILE, tokens.into_bytes())]))
+        });
         let _ = registry
             .op(&format!("tokenizer_{local}{suffix}"))
             .label("What it tokenizes to")
@@ -218,7 +220,13 @@ fn declaration(entries: &[Entry]) -> Table {
 impl Registry {
     /// A tokenizer of values of these types, which this extension's dependencies register.
     pub fn tokenizer(&mut self, values: &[&str]) -> Tokenizer<'_> {
-        Tokenizer { registry: self, values: values.iter().map(|value| (*value).to_string()).collect(), target: None, entries: Vec::new(), follows: false }
+        Tokenizer {
+            registry: self,
+            values: values.iter().map(|value| (*value).to_string()).collect(),
+            target: None,
+            entries: Vec::new(),
+            follows: false,
+        }
     }
 }
 
