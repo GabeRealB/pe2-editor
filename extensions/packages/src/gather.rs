@@ -159,7 +159,9 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let own_name = name.clone();
-    let units = selected(&own_fields(call), &own_path, &own_files)?;
+    // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
+    let fields = own_fields(call);
+    let units = if strings(&fields, "sources").is_empty() { vec![] } else { selected(&fields, &own_path, &own_files)? };
     let within = format!("{own_path}/");
     let mut listed = String::new();
     for unit in &units {

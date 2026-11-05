@@ -72,6 +72,34 @@ listen = ["pe2.events@clean"]
 deploy = "build/{config}/"
 "#;
 
+/// A library's stack: a package's up to its objects, which what depends on it links - none, where it has nothing to
+/// compile and no objects of its own (headers alone).
+const LIBRARY_STACK: &str = r#"[[stack]]
+op = "pe2.packages@package"
+
+[[stack]]
+op = "pe2.packages@gather"
+
+[[stack]]
+op = "package-target@preprocess"
+
+[[stack]]
+op = "pe2.packages@resolve"
+
+[[stack]]
+op = "output"
+name = "resolved"
+retain = "transient"
+
+[[stack]]
+op = "package-target@compile"
+
+[[stack]]
+op = "output"
+name = "objects"
+retain = "cache"
+"#;
+
 /// What a language server reads, for the config in use, wherever any of it may have changed.
 const DATABASE_STACK: &str = r#"[[stack]]
 op = "pe2.packages@compile-database"
@@ -190,6 +218,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .inspector_tab("Slots", Icon::Grid, &[], |_| Box::new(views::Slots::sheet()))
         .register();
     // A package compiling nothing: others' headers and libraries.
-    drop(r.template("library", PACKAGE, "[[stack]]\nop = \"pe2.packages@package\"\n").label("Library"));
+    drop(r.template("library", PACKAGE, LIBRARY_STACK).label("Library"));
     Ok(())
 }

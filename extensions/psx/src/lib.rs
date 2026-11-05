@@ -21,7 +21,9 @@ const TARGET: &str = "psx";
 pe2_ext::extension!("pe2.psx", "0.1.0", register, requires = ["pe2.packages@^0.1"], provides = ["package-target@1.0.0"], unsandboxed = true, hashed = ["linux-x86_64"]);
 
 /// The places a package loads into, by the names packages give them.
-const SLOTS: [(&str, u32); 12] = [
+const SLOTS: [(&str, u32); 13] = [
+    // The image the BIOS loads, which `exe_header` heads.
+    (EXECUTABLE, 0x8001_0000),
     ("resident", 0x8009_3800),
     ("weapon", 0x8011_D1C0),
     ("aya", 0x8011_5770),
@@ -35,6 +37,43 @@ const SLOTS: [(&str, u32); 12] = [
     ("actor_2", 0x8014_9E20),
     ("actor_3", 0x8016_1E20),
 ];
+
+/// The slot that is the executable.
+const EXECUTABLE: &str = "executable";
+
+/// A sector of the disc, which the executable's header and image fill whole.
+const SECTOR: usize = 0x800;
+
+/// Where the BIOS puts the stack: the top of the 2 MB of RAM, less a few words.
+const STACK: u32 = 0x801F_FFF0;
+
+/// The license string a release's region carries in its executable's header, at 0x4C.
+const REGIONS: [(&str, &str); 3] = [
+    ("USA", "Sony Computer Entertainment Inc. for North America area"),
+    ("JAP", "Sony Computer Entertainment Inc. for Japan area"),
+    ("PAL", "Sony Computer Entertainment Inc. for Europe area"),
+];
+
+/// The executable: its header, every field of which follows from the link or this target - the entry point (the ELF's),
+/// where the image loads and how much of it, padded to whole sectors, the stack, the region's license string - then the
+/// image, padded. `tools/buildsteps/psx_exe.py` writes the same bytes.
+fn exe_header(image: &[u8], elf: &[u8], address: u32, release: &str) -> Result<Vec<u8>> {
+    if elf.get(..6) != Some(b"\x7fELF\x01\x01".as_slice()) {
+        bail!("the linked image is no 32-bit little-endian ELF");
+    }
+    let entry = u32::from_le_bytes(elf[0x18..0x1C].try_into()?);
+    let (_, region) = REGIONS.iter().find(|(known, _)| *known == release).ok_or_else(|| anyhow!("no region for the release {release}"))?;
+    let size = image.len().div_ceil(SECTOR) * SECTOR;
+    let mut out = b"PS-X EXE".to_vec();
+    for field in [0, 0, entry, 0, address, u32::try_from(size)?, 0, 0, 0, 0, STACK, 0, 0, 0, 0, 0, 0] {
+        out.extend(field.to_le_bytes());
+    }
+    out.extend(region.as_bytes());
+    out.resize(SECTOR, 0);
+    out.extend(image);
+    out.resize(SECTOR + size, 0);
+    Ok(out)
+}
 
 /// The preprocessor: GCC 14.2.0's `cc1`, which the extension ships for each platform at this path, run without a driver
 /// (`tools/<os>/cpp/README.md`). A package is preprocessed with `-Werror`, so a macro defined twice stops it.
@@ -394,10 +433,17 @@ fn link_image(call: &mut Call) -> Result<Typed> {
             fs::write(&written, call.read(symbols.file()?)?)?;
             published.push(written);
         }
-        link(address, &script_of(&tree, &name)?, &published, &objects, &scratch, &name)
+        let image = link(address, &script_of(&tree, &name)?, &published, &objects, &scratch, &name)?;
+        if pe2_ext::targeted(&fields, Some(TARGET)).get("slot").and_then(Value::as_str) != Some(EXECUTABLE) {
+            return Ok((image, format!("{name}.pe2pkg")));
+        }
+        let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
+        let exe = scratch.join(format!("{name}.exe"));
+        fs::write(&exe, exe_header(&fs::read(&image)?, &fs::read(scratch.join("image.elf"))?, address, &release)?)?;
+        Ok((exe, format!("{name}.exe")))
     });
-    let result = made.and_then(|image| {
-        let kept = call.keep(&image.display().to_string(), &format!("{name}.pe2pkg"))?;
+    let result = made.and_then(|(image, kept_as)| {
+        let kept = call.keep(&image.display().to_string(), &kept_as)?;
         Ok(Typed { notes: notes.clone(), ..Typed::new(Package::NAME, vec![kept]) })
     });
     let _ = fs::remove_dir_all(&scratch);
@@ -532,6 +578,19 @@ fn link(address: u32, script: &Path, published: &[PathBuf], objects: &[PathBuf],
 #[cfg(test)]
 mod tests {
     use pe2_ext::anyhow;
+
+    #[test]
+    fn an_executable_is_headed_as_the_bios_reads_it() {
+        let mut elf = b"\x7fELF\x01\x01".to_vec();
+        elf.resize(0x34, 0);
+        elf[0x18..0x1C].copy_from_slice(&0x8001_4358u32.to_le_bytes());
+        let made = super::exe_header(&[1, 2, 3], &elf, 0x8001_0000, "USA").unwrap();
+        let word = |at: usize| u32::from_le_bytes(made[at..at + 4].try_into().unwrap());
+        assert_eq!(&made[..8], b"PS-X EXE");
+        assert_eq!((word(0x10), word(0x18), word(0x1C), word(0x30)), (0x8001_4358, 0x8001_0000, 0x800, 0x801F_FFF0));
+        assert!(made[0x4C..].starts_with(b"Sony Computer Entertainment Inc. for North America area\0"));
+        assert_eq!((made.len(), &made[0x800..0x803]), (0x1000, &[1, 2, 3][..]));
+    }
 
     #[test]
     fn an_option_with_no_value_is_told_at_the_line_asking() {

@@ -90,7 +90,8 @@ pub fn database(call: &mut Call) -> Result<Typed> {
         let searched = include_path(call, &graph, name).unwrap_or_default();
         let path: Vec<String> = searched.iter().filter_map(|searched| call.place(&searched.folder)).map(|place| format!("-I{place}")).collect();
         let sources = reflected.get("sources").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-        for source in sources.iter().filter_map(Value::as_str) {
+        // C, as a language server reads it: assembly is assembled as it is written, and is no C unit.
+        for source in sources.iter().filter_map(Value::as_str).filter(|source| std::path::Path::new(source).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("c"))) {
             let Some(place) = call.place(&format!("{}/{source}", package.path)) else { continue };
             let mut arguments = args.clone();
             let at = arguments.len() - 3;
