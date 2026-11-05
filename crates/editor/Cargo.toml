@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "pe2-editor"
-path = "src/main.rs"
+path = "src/engine.rs"
 
 [[bin]]
 name = "pe2-test-runner"

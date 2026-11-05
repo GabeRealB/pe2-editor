@@ -7,7 +7,7 @@ publish.workspace = true
 
 [[bin]]
 name = "pe2-cli"
-path = "src/main.rs"
+path = "src/engine.rs"
 
 [lints]
 workspace = true
