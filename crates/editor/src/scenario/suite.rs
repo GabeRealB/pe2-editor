@@ -69,8 +69,20 @@ impl Suite {
         let mut editor = Scenario::open_with(self.scratch(), None, true);
         let tests = editor.workspace().extensions.tests();
         if tests.is_empty() {
-            let present = editor.workspace().extensions.present.iter().map(|p| format!("{}: {:?}", p.id, p.status)).collect::<Vec<_>>();
-            return Err(format!("{}: it has no tests: {present:?}", self.name));
+            // What did not load, and why: what loaded says nothing of where the tests went.
+            let unloaded: Vec<String> = editor
+                .workspace()
+                .extensions
+                .present
+                .iter()
+                .filter_map(|p| match &p.status {
+                    project::ext::Status::Loaded => None,
+                    project::ext::Status::Refused(why) => Some(format!("{} was refused: {why}", p.id)),
+                    other => Some(format!("{} is {other:?}", p.id)),
+                })
+                .collect();
+            let why = if unloaded.is_empty() { "none of its extensions gives any".to_string() } else { unloaded.join("; ") };
+            return Err(format!("{}: no tests, {why}", self.name));
         }
         Ok(tests)
     }

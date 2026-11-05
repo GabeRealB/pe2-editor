@@ -294,6 +294,9 @@ pub enum EditRequest {
     /// Rename to this real path.
     RenameTo(String, String),
     Delete(String),
+    /// Take an entry gone from this layer out of its list: the layer and the uid. Any layer whose list can be written,
+    /// its content read-only or not.
+    Forget(String, String),
     Resolve(String, project::edit::Resolution),
     /// Edit the asset's source in the tool its format is edited in: copied into the active layer first where it is
     /// below it, and imported again when the tool saves it.
@@ -1436,6 +1439,14 @@ impl Workspace {
                 }
                 layer.clone()
             }
+            // Only the list is written: its own, whether it is the active layer or not.
+            EditRequest::Forget(layer, _) => {
+                let chosen = self.layers.iter().find(|l| l.name == *layer);
+                if !chosen.with_context(|| format!("the project has no layer {layer}"))?.writable {
+                    anyhow::bail!("{layer}'s list cannot be written");
+                }
+                layer.clone()
+            }
             _ => self.editable_layer().map_err(anyhow::Error::msg)?.name.clone(),
         };
         let uid = match request {
@@ -1444,6 +1455,7 @@ impl Workspace {
             | EditRequest::Rename(uid, _)
             | EditRequest::RenameTo(uid, _)
             | EditRequest::Delete(uid)
+            | EditRequest::Forget(_, uid)
             | EditRequest::Resolve(uid, _)
             | EditRequest::EditIn(uid)
             | EditRequest::Write { uid, .. } => uid.clone(),
@@ -1465,6 +1477,7 @@ impl Workspace {
                 edit::override_entry(project, index, &name, uid, history)?
             }
             EditRequest::Delete(uid) => edit::delete(project, index, &name, uid, history)?,
+            EditRequest::Forget(_, uid) => edit::forget(project, index, &name, uid, history)?,
             EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, uid, to, history)?,
             EditRequest::Resolve(uid, resolution) => edit::resolve(project, index, &name, uid, *resolution, history)?,
             EditRequest::Write { uid, file, bytes, label, merge } => {

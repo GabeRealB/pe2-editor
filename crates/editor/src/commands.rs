@@ -352,7 +352,9 @@ pub fn shortcuts_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
                 let text = bound.iter().copied().map(Binding::text).collect::<Vec<_>>().join(", ");
                 let taken = being_taken.as_ref() == Some(&id);
                 let shown = if taken { "Press a key…" } else if text.is_empty() { "None" } else { text.as_str() };
-                if ui.add(egui::Button::selectable(taken, RichText::new(shown).monospace())).clicked() {
+                // What is bound reads as it is pressed; nothing bound, faintly.
+                let shown = if text.is_empty() && !taken { RichText::new(shown).color(theme::weak()) } else { RichText::new(shown).monospace() };
+                if ui.add(egui::Button::selectable(taken, shown)).clicked() {
                     being_taken = Some(id.clone());
                 }
                 if settings.shortcuts.contains_key(&id) && ui.small_button("Default").clicked() {

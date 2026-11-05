@@ -272,6 +272,23 @@ pub fn delete(
     tx.commit()
 }
 
+/// Take an entry the layer lists but no longer holds out of its list: deleted outside the editor, it is kept listed (its
+/// uid held should its path come back) until this says it is gone. Nothing is written but the list, so a layer whose
+/// content is its maker's alone (a read-only mount) can forget too.
+///
+/// # Errors
+/// The layer does not list the uid, or still holds its path.
+pub fn forget(project: &Project, index: &Index, layer_name: &str, uid: &str, history: &mut History) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    let path = changeset.entries.get(uid).cloned().with_context(|| format!("{layer_name} does not list {uid}"))?;
+    anyhow::ensure!(!layer.disk(&path).exists(), "{layer_name} still holds {path}");
+    let mut tx = history.begin(format!("Forget {}", name(&path)));
+    let inside = format!("{path}/");
+    changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
+    save(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
 /// What a rename is called: of the name, or of the folder where the name stays.
 fn rename_label(from: &str, to: &str) -> String {
     if name(from) != name(to) {
@@ -392,7 +409,7 @@ pub fn resolve(
 
 #[cfg(test)]
 mod tests {
-    use super::{Resolution, delete, override_entry, rename, resolve};
+    use super::{Resolution, delete, forget, override_entry, rename, resolve};
     use crate::Project;
     use crate::cache::Cache;
     use crate::changeset::Op;
@@ -552,6 +569,32 @@ mod tests {
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert!(o.op("g/a.node").is_none());
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_mount_forgets_what_is_gone_from_it() {
+        let root = project("forget");
+        let mounted = root.join("mounted");
+        std::fs::create_dir_all(&mounted).unwrap();
+        std::fs::write(mounted.join("kept.c"), "kept").unwrap();
+        std::fs::write(mounted.join("gone.c"), "gone").unwrap();
+        std::fs::write(
+            root.join("project.toml"),
+            "[[mount]]\nat = \"code\"\npath = \"mounted\"\nread_only = true\n\n[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"top\"\n",
+        )
+        .unwrap();
+        let mut o = open(&root);
+        let (gone, kept) = (o.uid("code/gone.c"), o.uid("code/kept.c"));
+        std::fs::remove_file(mounted.join("gone.c")).unwrap();
+        o.refresh(&[mounted.join("gone.c")]);
+        assert!(o.index.problems.contains(&Problem::Missing { layer: "code".into(), path: "code/gone.c".into() }), "{:?}", o.index.problems);
+        assert!(forget(&o.project, &o.index, "code", &kept, &mut o.history).is_err(), "what is there is not forgotten");
+        let paths = forget(&o.project, &o.index, "code", &gone, &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
+        assert!(mounted.join("kept.c").exists());
         drop(o);
         std::fs::remove_dir_all(&root).unwrap();
     }

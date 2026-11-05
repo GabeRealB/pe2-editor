@@ -37,7 +37,8 @@ fn it_lists_what_the_runner_says_there_is() {
     let editor = with_runner();
     editor.expect("draws");
     editor.expect("breaks");
-    editor.expect("0 of 2 passed");
+    // Nothing run yet: how many there are, not how many passed.
+    editor.expect("2 tests");
 }
 
 #[test]

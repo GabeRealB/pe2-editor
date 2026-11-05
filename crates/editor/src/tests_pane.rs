@@ -281,7 +281,7 @@ fn picture(ctx: &egui::Context, file: &Path) -> Option<egui::TextureHandle> {
 }
 
 /// A test's row of the grid; whether it asked to run, and whether it was clicked.
-fn row(ui: &mut egui::Ui, test: &Test, selected: bool, can_run: bool) -> (bool, bool) {
+fn row(ui: &mut egui::Ui, test: &Test, selected: bool, can_run: bool, names: f32) -> (bool, bool) {
     let (icon, color) = match test.state {
         State::Passed(_) => (icons::CHECK_CIRCLE, theme::accent()),
         State::Failed(_) => (icons::X_CIRCLE, ui.visuals().error_fg_color),
@@ -289,7 +289,12 @@ fn row(ui: &mut egui::Ui, test: &Test, selected: bool, can_run: bool) -> (bool, 
         State::Waiting | State::Idle => (icons::PLAY, theme::weak()),
     };
     ui.label(RichText::new(icon).color(color));
-    let clicked = ui.selectable_label(selected, short(&test.name)).clicked();
+    // As wide as the widest name of every suite, so that the columns after it line up from one suite to the next.
+    let clicked = ui.scope(|ui| {
+        ui.set_min_width(names);
+        ui.selectable_label(selected, short(&test.name)).clicked()
+    });
+    let clicked = clicked.inner;
     match test.state {
         State::Passed(seconds) | State::Failed(seconds) => drop(ui.label(RichText::new(format!("{seconds:.1} s")).small().color(theme::weak()))),
         _ => drop(ui.label("")),
@@ -305,9 +310,13 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     ws.tests.take_in();
     let Some(runner) = ws.tests.runner() else {
         ui.label(RichText::new("There is no pe2-test-runner beside the editor.").color(theme::weak()));
-        ui.label(RichText::new("cargo build -p editor --features tests --bin pe2-test-runner").monospace().small());
+        ui.label(RichText::new("cargo build --release -p editor --features tests --bin pe2-test-runner").code());
         return;
     };
+    // Built apart from the editor (`--features tests`), the runner can be left behind it, and then speaks an older contract
+    // to the extensions than they do.
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let behind = std::env::current_exe().ok().and_then(|editor| Some(modified(&runner)? < modified(&editor)?)).unwrap_or(false);
     let arguments = suites_of(ws);
     if !ws.tests.asked {
         ws.tests.asked = true;
@@ -333,21 +342,40 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
         }
         ui.add(egui::TextEdit::singleline(&mut ws.tests.filter).hint_text("Filter tests").desired_width(180.0));
     });
+    if behind {
+        theme::warning(ui, "The test runner is older than the editor, and may not load what the editor does. Build it again:");
+        ui.label(RichText::new("cargo build --release -p editor --features tests --bin pe2-test-runner").code());
+    }
+    if let Some(trouble) = &ws.tests.trouble {
+        theme::warning(ui, trouble.trim_end());
+    }
     let filter = ws.tests.filter.to_lowercase();
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let names = ws.tests.suites.values().flatten().map(|test| {
+        ui.fonts_mut(|fonts| fonts.layout_no_wrap(short(&test.name).to_string(), font.clone(), egui::Color32::WHITE).size().x)
+    });
+    let names = names.fold(0.0, f32::max) + 2.0 * ui.spacing().button_padding.x;
     let selected = ws.tests.selected.clone();
     let mut chosen = None;
-    egui::ScrollArea::vertical().auto_shrink(false).max_height(ui.available_height() * 0.6).show(ui, |ui| {
+    egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() * 0.6).show(ui, |ui| {
         if ws.tests.suites.is_empty() && !busy {
             ui.label(RichText::new("No tests were found").color(theme::weak()));
         }
         for (suite, tests) in &ws.tests.suites {
             let passed = tests.iter().filter(|test| matches!(test.state, State::Passed(_))).count();
             let failed = tests.iter().filter(|test| matches!(test.state, State::Failed(_))).count();
-            let said = if failed > 0 { format!("{suite}  ·  {failed} failed, {passed} passed") } else { format!("{suite}  ·  {passed} of {} passed", tests.len()) };
+            let ran = tests.iter().any(|test| matches!(test.state, State::Passed(_) | State::Failed(_)));
+            let said = if failed > 0 {
+                format!("{suite}  ·  {failed} failed, {passed} passed")
+            } else if ran {
+                format!("{suite}  ·  {passed} of {} passed", tests.len())
+            } else {
+                format!("{suite}  ·  {} test{}", tests.len(), if tests.len() == 1 { "" } else { "s" })
+            };
             egui::CollapsingHeader::new(said).id_salt(suite).default_open(true).show(ui, |ui| {
-                egui::Grid::new(("tests", suite)).num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
+                egui::Grid::new(("tests", suite)).num_columns(4).spacing([10.0, 4.0]).min_col_width(0.0).show(ui, |ui| {
                     for test in tests.iter().filter(|test| test.name.to_lowercase().contains(&filter)) {
-                        let (run, clicked) = row(ui, test, selected.as_deref() == Some(test.name.as_str()), !busy);
+                        let (run, clicked) = row(ui, test, selected.as_deref() == Some(test.name.as_str()), !busy, names);
                         if run {
                             asked = Some(vec![test.name.clone()]);
                         }
@@ -365,9 +393,6 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     }
     if let Some(names) = asked {
         ws.tests.run(&ctx, &runner, arguments, &names);
-    }
-    if let Some(trouble) = &ws.tests.trouble {
-        ui.label(RichText::new(trouble).small().color(ui.visuals().warn_fg_color));
     }
     details(ui, ws);
 }

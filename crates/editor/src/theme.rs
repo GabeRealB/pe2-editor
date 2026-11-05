@@ -102,7 +102,9 @@ pub fn apply(ctx: &egui::Context, appearance: &Appearance) {
     let mut visuals = if p.dark { Visuals::dark() } else { Visuals::light() };
     visuals.panel_fill = p.panel;
     visuals.window_fill = p.panel;
-    visuals.extreme_bg_color = p.background;
+    // Where text is typed: set into a section's background (which is `background`) in the dark palette, a sheet of paper
+    // on it in the light one - never the section's own tone, or an empty field shows as nothing.
+    visuals.extreme_bg_color = if p.dark { mix(p.background, Color32::BLACK, 0.3) } else { p.raised };
     visuals.faint_bg_color = p.raised;
     visuals.code_bg_color = p.background;
     visuals.hyperlink_color = p.link;
@@ -176,6 +178,24 @@ pub fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut eg
             add_contents(ui);
         },
     );
+}
+
+/// Something wrong said where it happened: a warning sign and the text, on a tint of the warning color, wrapped to the
+/// pane.
+pub fn warning(ui: &mut egui::Ui, text: &str) {
+    let color = ui.visuals().warn_fg_color;
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.08))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.35)))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.label(egui::RichText::new(crate::icons::WARNING).color(color));
+                ui.add(egui::Label::new(egui::RichText::new(text).color(ui.visuals().text_color())).wrap());
+            });
+        });
 }
 
 /// The steps of a path that fit a width with what separates them, from the end: the first step to show.

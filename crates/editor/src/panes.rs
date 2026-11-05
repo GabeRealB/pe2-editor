@@ -643,7 +643,9 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
             let name = path.trim_end_matches(project::index::BUNDLE_SUFFIX).rsplit('/').next().unwrap_or(path);
             let asset = self.workspace.as_ref().and_then(|ws| Some((ws, ws.index.assets.get(path.as_str())?)));
             let icon = asset.map_or(icons::FILE, |(ws, asset)| icons::for_type(&ws.extensions, ws.extensions.type_name(asset)).0);
-            let icon = if state.editor == Some(EditorKind::Graph) { icons::TREE_STRUCTURE } else { icon };
+            // As its graph where it is shown as one: the view asked for, where the asset has it.
+            let graph = state.editor == Some(EditorKind::Graph) && asset.is_some_and(|(_, asset)| crate::graph_pane::has_graph(asset));
+            let icon = if graph { icons::TREE_STRUCTURE } else { icon };
             let others = self.states.iter().filter(|(p, _)| p.kind == PaneKind::Document).filter_map(|(_, s)| s.pinned.as_deref());
             let text = match telling_apart(path, others) {
                 Some(folder) => RichText::new(format!("{icon}  {name}  ·  {folder}")),
@@ -1835,8 +1837,13 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
             }
         }
     });
-    let outgoing: Vec<(String, &Asset)> =
-        asset.fields().iter().flat_map(|(key, value)| outgoing_refs(ws, key, value)).collect();
+    // As the declaration makes them, each once: its fields hold the settings both on their layers and lifted out.
+    let outgoing: Vec<(String, &Asset)> = ws
+        .index
+        .references_from(&asset.path)
+        .into_iter()
+        .filter_map(|r| Some((r.slot, ws.index.resolve(&r.uid, &r.target)?)))
+        .collect();
     theme::section(ui, &format!("References ({})", outgoing.len()), |ui| {
         if outgoing.is_empty() {
             ui.label(RichText::new("This asset references nothing").color(theme::weak()));
@@ -1848,27 +1855,6 @@ pub(crate) fn references_ui(ui: &mut egui::Ui, ws: &Workspace, subject: Option<&
             }
         }
     });
-}
-
-/// The assets a field references, with the slot (or field) each sits in.
-fn outgoing_refs<'a>(ws: &'a Workspace, field: &str, value: &toml::Value) -> Vec<(String, &'a Asset)> {
-    let mut out = Vec::new();
-    match value {
-        _ if project::index::reference(value).is_some() => {
-            if let Some(asset) = ws.target(value) {
-                out.push((field.to_string(), asset));
-            }
-        }
-        toml::Value::Table(t) => {
-            let name = t.get("name").and_then(toml::Value::as_str);
-            for (k, v) in t {
-                out.extend(outgoing_refs(ws, name.unwrap_or(k), v));
-            }
-        }
-        toml::Value::Array(a) => a.iter().for_each(|v| out.extend(outgoing_refs(ws, field, v))),
-        _ => {}
-    }
-    out
 }
 
 // --- problems ---------------------------------------------------------------------------------------------------------
@@ -1946,13 +1932,14 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                     });
                 }
                 ui.label(RichText::new(problem.describe()).color(theme::weak()));
-                // An entry gone from the active layer: left listed until it is said to be gone, as its path may come back.
+                // An entry gone from a layer: left listed until it is said to be gone, as its path may come back. Only the
+                // list is written, so a read-only mount forgets too.
                 if let project::index::Problem::Missing { layer, path } = problem
-                    && ws.editable_layer().is_ok_and(|active| active.name == *layer)
+                    && ws.layers.iter().any(|l| l.name == *layer && l.writable)
                     && let Some(uid) = ws.index.listed(layer, path)
                     && ui.small_button("Forget it").on_hover_text("Take it out of the layer's list (an undoable step)").clicked()
                 {
-                    *edit = Some(EditRequest::Delete(uid.to_string()));
+                    *edit = Some(EditRequest::Forget(layer.clone(), uid.to_string()));
                 }
                 ui.add_space(4.0);
             });
@@ -2327,18 +2314,15 @@ fn project_settings_ui(
     let raw: toml::Table =
         std::fs::read_to_string(&file).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
     let grid = |ui: &mut egui::Ui, id: &str, rows: Vec<(String, String)>| {
+        // Each value beside its name, in the font of the name so the two share a line; a path too long for the pane
+        // cut short, the whole of it on hover.
         egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
             for (key, value) in &rows {
                 ui.label(RichText::new(key).color(theme::weak()));
-                // The values (paths) go below the grid where they would not fit beside it.
-                ui.label(RichText::new(if value.len() > 48 { "" } else { value.as_str() }).monospace());
+                theme::short(ui, value.as_str());
                 ui.end_row();
             }
         });
-        for (key, value) in rows.iter().filter(|(_, v)| v.len() > 48) {
-            ui.label(RichText::new(key).small().color(theme::weak()));
-            theme::short(ui, RichText::new(value).monospace());
-        }
     };
     match page {
         SettingsPage::ProjectGeneral => match &p.game {
@@ -2385,7 +2369,9 @@ fn project_settings_ui(
                     .iter()
                     .map(|m| {
                         let access = if m.read_only { "  (read only)" } else { "" };
-                        (format!("res://{}", m.at), format!("{}{access}", m.path.display()))
+                        // Where it is, as the layers above name theirs: resolved, not as project.toml reaches it.
+                        let path = std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone());
+                        (format!("res://{}", m.at), format!("{}{access}", path.display()))
                     })
                     .collect();
                 grid(ui, "mounts", rows);

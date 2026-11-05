@@ -705,19 +705,21 @@ impl Editor {
             Command::Forward => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_forward() } else { ws.can_go_forward() }),
             Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_empty()),
             Command::CloseTab | Command::NextTab | Command::PreviousTab => self.layouts.has_tab(),
-            // An extension's is an editor of some assets.
-            Command::ShowIn(editor @ EditorKind::Extension(_)) => {
+            // A view the document's asset has: not every asset has a graph, a preview or an extension's editor.
+            Command::ShowIn(editor) => {
                 let path = document.and_then(|pane| self.layouts.states.get(&pane)?.pinned.as_deref());
                 path.zip(ws).is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&editor))
             }
-            Command::KeepTab | Command::ShowIn(_) => document.is_some(),
+            Command::KeepTab => document.is_some(),
             Command::Import | Command::ReloadProject | Command::Refresh | Command::Extension(_) => ws.is_some(),
             Command::Build | Command::Clean => ws.is_some_and(|ws| !ws.project.configs.is_empty()),
             Command::CancelEpoch => ws.is_some_and(Workspace::in_epoch),
             Command::DeleteSelected => ws.is_some_and(|ws| ws.removing_selected().is_some()),
-            Command::GraphFit | Command::GraphArrange => {
-                document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| state.editor == Some(EditorKind::Graph))
-            }
+            // Its graph shown: asked for, and the asset having one.
+            Command::GraphFit | Command::GraphArrange => document.and_then(|pane| self.layouts.states.get(&pane)).is_some_and(|state| {
+                state.editor == Some(EditorKind::Graph)
+                    && state.pinned.as_deref().zip(ws).is_some_and(|(path, ws)| panes::editors_of(ws, path).contains(&EditorKind::Graph))
+            }),
         }
     }
 

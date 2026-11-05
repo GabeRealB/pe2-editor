@@ -87,7 +87,11 @@ pub fn settings_on_layers(text: &str) -> Result<String> {
     use toml_edit::Item;
     let split = text.find("\n[original.").map_or(text.len(), |at| at + 1);
     let (declared, originals) = text.split_at(split);
-    let mut document: toml_edit::DocumentMut = declared.parse().context("its declaration")?;
+    // The head - the comment over the declaration - is written back over the stack below; parsed, it would be held by
+    // whatever field comes first, a table or a dotted key, and moved with it.
+    let head: Vec<&str> = declared.lines().take_while(|line| line.starts_with('#') || line.is_empty()).collect();
+    let fields = declared.lines().skip(head.len()).collect::<Vec<_>>().join("\n");
+    let mut document: toml_edit::DocumentMut = fields.parse().context("its declaration")?;
     let Some(at) = document.get("stack").and_then(Item::as_array_of_tables).and_then(home) else { return Ok(text.to_string()) };
     let keys: Vec<String> = document.iter().map(|(key, _)| key.to_string()).filter(|key| key != "stack").collect();
     let moved: Vec<(String, Item)> = keys.iter().filter_map(|key| Some((key.clone(), document.remove(key)?))).collect();
@@ -109,7 +113,6 @@ pub fn settings_on_layers(text: &str) -> Result<String> {
         body.push_str(alone.to_string().trim());
         body.push_str("\n\n");
     }
-    let head: Vec<&str> = declared.lines().take_while(|line| line.starts_with('#') || line.is_empty()).collect();
     let head = head.join("\n");
     let originals = if originals.is_empty() { String::new() } else { format!("\n{originals}") };
     Ok(format!("{}\n\n{}\n{originals}", head.trim(), body.trim_end()).trim_start().to_string())
@@ -336,6 +339,19 @@ sha1 = "ab"
         let fields: Table = toml::from_str(text).unwrap();
         let layers = fields["stack"].as_array().unwrap();
         layers.iter().map(|l| l["op"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn the_head_is_written_once_whatever_setting_comes_first() {
+        let stack = "[[stack]]\nop = \"x@package\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n";
+        for first in ["headers.public = \"include\"\n", "[[slots]]\nname = \"s\"\n\n[[slots]]\nname = \"t\"\n", "[target.psx]\nlink = 1\n"] {
+            let text = format!("# A node, written by extraction.\n\n{first}\n{stack}");
+            let placed = super::settings_on_layers(&text).unwrap();
+            assert_eq!(placed.matches("# A node").count(), 1, "{placed}");
+            assert!(placed.starts_with("# A node"), "{placed}");
+            let fields: Table = toml::from_str(&placed).unwrap();
+            assert_eq!(fields.keys().map(String::as_str).collect::<Vec<_>>(), ["stack"], "{placed}");
+        }
     }
 
     #[test]

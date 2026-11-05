@@ -519,10 +519,12 @@ fn property_sheet(
         }
         return;
     }
-    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
+    // Named for what it shows: a grid keeps its rows' heights by its id, and one shared with a grid inside a cell would
+    // be given that one's.
+    egui::Grid::new(("properties", &asset.path, &sheet.within)).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
         for (key, value) in fields {
             ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
-            ui.horizontal_wrapped(|ui| value_of(ui, key, value));
+            cell(ui, value, |ui| value_of(ui, key, value));
             ui.end_row();
         }
     });
@@ -553,14 +555,31 @@ pub fn reference_filling(ui: &mut egui::Ui, rect: egui::Rect, sheet: &Sheet, hol
 }
 
 /// A table inside a field, shown as its own sheet: edited in the declaration's text, not in place.
-fn nested_sheet(ui: &mut egui::Ui, sheet: &Sheet, fields: &[(&String, &toml::Value)], nav: &mut Option<String>) {
-    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
+fn nested_sheet(ui: &mut egui::Ui, sheet: &Sheet, key: &str, fields: &[(&String, &toml::Value)], nav: &mut Option<String>) {
+    // Its own id, under the cell it is in: see `property_sheet`.
+    egui::Grid::new(ui.scope_id().with(("nested sheet", key))).num_columns(2).spacing([18.0, 6.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
         for (key, value) in fields {
             ui.label(RichText::new(sheet.label(key)).color(theme::weak()));
-            ui.horizontal_wrapped(|ui| value_ui(ui, sheet, key, value, nav));
+            cell(ui, value, |ui| value_ui(ui, sheet, key, value, nav));
             ui.end_row();
         }
     });
+}
+
+/// A value's cell of a sheet: a line that wraps, for a value and what goes beside it; top down for a list or a table,
+/// which a line would center on itself, over the rows above and below.
+fn cell(ui: &mut egui::Ui, value: &toml::Value, add: impl FnOnce(&mut egui::Ui)) {
+    let tall = match value {
+        toml::Value::Array(items) => items.len() > 1 && ints(value).is_none(),
+        // A reference, or a placement (a slot and where in it), reads on a line.
+        toml::Value::Table(table) => !is_reference(value) && !table.contains_key("slot"),
+        _ => false,
+    };
+    if tall {
+        ui.vertical(add);
+    } else {
+        ui.horizontal_wrapped(add);
+    }
 }
 
 /// A value the inspector edits in place: a string, a number, a truth.
@@ -1012,13 +1031,20 @@ pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value
         toml::Value::String(s) if key == "sha1" || s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) => {
             hash_ui(ui, s);
         }
+        // A reference by its uid alone, as a declaration writes it.
+        toml::Value::String(_) if is_reference(value) => {
+            reference_chip(ui, sheet, value, nav);
+        }
         toml::Value::String(s) => {
             ui.label(s);
         }
+        // One under another, in the cell the field has: side by side they would run over the rows below.
         toml::Value::Array(items) => {
-            for item in items {
-                value_ui(ui, sheet, key, item, nav);
-            }
+            ui.vertical(|ui| {
+                for item in items {
+                    value_ui(ui, sheet, key, item, nav);
+                }
+            });
         }
         toml::Value::Table(t) => {
             if is_reference(value) {
@@ -1038,7 +1064,7 @@ pub fn value_ui(ui: &mut egui::Ui, sheet: &Sheet, key: &str, value: &toml::Value
             } else {
                 ui.vertical(|ui| {
                     let fields: Vec<(&String, &toml::Value)> = t.iter().collect();
-                    nested_sheet(ui, sheet, &fields, nav);
+                    nested_sheet(ui, sheet, key, &fields, nav);
                 });
             }
         }
@@ -1078,7 +1104,9 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
                 Some(output) => format!("{short}#{output}"),
                 None => short,
             };
-            if chip(ui, icon, &short, tint).on_hover_text(&asset.path).clicked() {
+            // Whole on hover, its output with it: the chip may be cut short.
+            let whole = pe2_ext::output_of(value).map_or_else(|| asset.path.clone(), |output| format!("{}#{output}", asset.path));
+            if chip(ui, icon, &short, tint).on_hover_text(whole).clicked() {
                 *nav = Some(asset.path.clone());
             }
         }
@@ -1092,6 +1120,22 @@ pub fn reference_chip(ui: &mut egui::Ui, sheet: &Sheet, value: &toml::Value, nav
 pub fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     let font = egui::TextStyle::Body.resolve(ui.style());
+    // Its own width, whole, where the row wraps: it moves it to the next line rather than fold its text. A row that does not
+    // wrap (a slot's) has only what is left of it, and the chip loses its start there, not its end, which tells references
+    // to one asset apart (`…/stored_hand_left`); hovered, it is shown whole.
+    let fitted;
+    let text = if ui.layout().main_wrap {
+        text
+    } else {
+        let measure = |ui: &mut egui::Ui, text: &str| ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x);
+        let room = ui.available_width() - 12.0 - 4.0 - measure(ui, icon);
+        // At a step of its path where one fits, else at a character.
+        let steps = text.match_indices(['/', '#']).map(|(at, _)| at);
+        let cuts: Vec<usize> = std::iter::once(0).chain(steps).chain(text.char_indices().map(|(at, _)| at)).collect();
+        let shown = |at: usize| if at == 0 { text.to_string() } else { format!("…{}", &text[at..]) };
+        fitted = cuts.into_iter().map(shown).find(|shown| measure(ui, shown) <= room).unwrap_or_else(|| "…".to_string());
+        fitted.as_str()
+    };
     job.append(icon, 0.0, egui::text::TextFormat::simple(font.clone(), tint));
     job.append(text, 4.0, egui::text::TextFormat::simple(font, theme::link()));
     let chip = egui::Button::new(job)
@@ -1099,7 +1143,6 @@ pub fn chip(ui: &mut egui::Ui, icon: &str, text: &str, tint: Color32) -> egui::R
         .stroke(egui::Stroke::new(1.0, tint.gamma_multiply(0.35)))
         .corner_radius(egui::CornerRadius::same(5))
         .min_size(egui::Vec2::ZERO)
-        // Its own width, whole: the row moves it to the next line rather than fold its text.
         .wrap_mode(egui::TextWrapMode::Extend);
     // Its padding set on the row itself and put back: a child Ui (a scope, a frame) is placed where the row is, and is
     // never moved to the next line.
@@ -1464,7 +1507,10 @@ fn layer_target(ui: &egui::Ui, asset: &Asset, row: egui::Rect, at: usize, edit: 
 /// A layer's number, choosing the layer selected; whether it was clicked.
 fn layer_number(ui: &mut egui::Ui, selected: Option<usize>, at: usize) -> egui::Response {
     let text = RichText::new(format!("{at}")).color(theme::weak());
-    let number = egui::Button::selectable(selected == Some(at), text).sense(egui::Sense::click_and_drag());
+    // One width for every number, so that the menus beside them line up past layer 9.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let two = ui.fonts_mut(|fonts| fonts.layout_no_wrap("00".into(), font, Color32::WHITE).size().x) + 2.0 * ui.spacing().button_padding.x;
+    let number = egui::Button::selectable(selected == Some(at), text).min_size(egui::vec2(two, 0.0)).sense(egui::Sense::click_and_drag());
     ui.add(number).on_hover_text("Select this layer, or drag it to move it")
 }
 

@@ -193,7 +193,9 @@ fn depth_of(id: &str, present: &[Present], depth: &mut HashMap<String, usize>, s
     if !seen.insert(id.to_string()) {
         return 0; // a cycle: its members on one row
     }
-    let needs = present.iter().find(|p| p.id == id).map_or_default(|p| p.requires.clone());
+    // Every way it depends on another, by id: what depends on another, weakly or not, sits above it.
+    let needs: Vec<String> =
+        present.iter().find(|p| p.id == id).map_or_default(|p| p.dependencies().map(|(text, _)| requirement(text).0.to_string()).collect());
     let d = needs.iter().map(|r| depth_of(r, present, depth, seen) + 1).max().unwrap_or(0);
     depth.insert(id.to_string(), d);
     d
@@ -207,6 +209,51 @@ fn edge(painter: &egui::Painter, ends: [egui::Pos2; 2], stroke: egui::Stroke, de
         }
         Dependency::Weak => painter.extend(egui::Shape::dashed_line(&ends, stroke, 6.0, 4.0)),
         Dependency::Optional => painter.extend(egui::Shape::dashed_line(&ends, stroke, 2.0, 4.0)),
+    }
+}
+
+/// Where each edge between two placed nodes starts and ends, by the ids at its ends: it leaves its node's bottom and
+/// enters the other's top at a place of its own, spread along the side in the order of the nodes at their other ends,
+/// so that edges sharing a node do not meet before it.
+fn edge_ends(present: &[Present], places: &HashMap<&String, egui::Rect>) -> HashMap<(String, String), [egui::Pos2; 2]> {
+    let edges: Vec<(&String, String)> = present
+        .iter()
+        .flat_map(|p| p.dependencies().map(|(text, _)| (&p.id, requirement(text).0.to_string())))
+        .filter(|(from, to)| places.contains_key(from) && places.contains_key(to))
+        .collect();
+    let port = |rect: &egui::Rect, at: usize, of: usize, top: bool| {
+        #[expect(clippy::cast_precision_loss, reason = "a handful of edges")]
+        let x = rect.left() + rect.width() * (0.2 + 0.6 * (at as f32 + 1.0) / (of as f32 + 1.0));
+        egui::pos2(x, if top { rect.top() } else { rect.bottom() })
+    };
+    let x_of = |id: &String| places.get(id).map_or(0.0, |r| r.center().x);
+    let mut ends = HashMap::new();
+    for (from, to) in &edges {
+        let mut leaving: Vec<&String> = edges.iter().filter(|e| e.0 == *from).map(|e| &e.1).collect();
+        leaving.sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
+        let mut entering: Vec<&String> = edges.iter().filter(|e| e.1 == *to).map(|e| e.0).collect();
+        entering.sort_by(|a, b| x_of(a).total_cmp(&x_of(b)));
+        let (Some(out), Some(into)) = (leaving.iter().position(|id| *id == to), entering.iter().position(|id| id == from)) else { continue };
+        let (Some(start), Some(end)) = (places.get(from), places.get(to)) else { continue };
+        ends.insert(((*from).clone(), to.clone()), [port(start, out, leaving.len(), false), port(end, into, entering.len(), true)]);
+    }
+    ends
+}
+
+/// An edge's label where it covers no node and no other label (`taken`, which it joins): along the edge from its middle
+/// outward, on a chip of the pane's own color that hides the lines it lies across. Left out where there is no room;
+/// the details say it.
+fn edge_label(painter: &egui::Painter, [a, b]: [egui::Pos2; 2], galley: std::sync::Arc<egui::Galley>, fill: Color32, taken: &mut Vec<egui::Rect>) {
+    let size = galley.size() + egui::vec2(8.0, 2.0);
+    let chip = [0.5, 0.35, 0.65, 0.25, 0.75]
+        .into_iter()
+        .map(|t| egui::Rect::from_center_size(a.lerp(b, t), size))
+        .find(|r| !taken.iter().any(|o| o.intersects(*r)));
+    if let Some(chip) = chip {
+        painter.rect_filled(chip, 3.0, fill);
+        // Laid out in its color: nothing in it is left to the fallback.
+        painter.galley(chip.center() - galley.size() / 2.0, galley, Color32::PLACEHOLDER);
+        taken.push(chip);
     }
 }
 
@@ -259,11 +306,14 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
     let lit = |id: &str| chosen.as_deref() == Some(id) || needs.contains(id) || needed.contains(id);
     let painter = ui.painter_at(area);
     let font = egui::TextStyle::Small.resolve(ui.style());
+    let ends = edge_ends(present, &places);
+    // What the labels cover, so that none covers another: the nodes first.
+    let mut taken: Vec<egui::Rect> = places.values().map(|r| r.expand(2.0)).collect();
     // Edges first, under the nodes.
     for p in present {
         for (text, dependency) in p.dependencies() {
             let id = requirement(text).0;
-            let (Some(from), Some(to)) = (places.get(&p.id), places.get(&id.to_string())) else { continue };
+            let Some(&[a, b]) = ends.get(&(p.id.clone(), id.to_string())) else { continue };
             let found = present.iter().find(|q| q.id == id);
             // Met: what it needs is loaded, and it was not refused over it (a version too old).
             let refused = matches!(&p.status, Status::Refused(why) if why.contains(id));
@@ -271,7 +321,6 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
             let met = there || dependency != Dependency::Required;
             let on = lit(&p.id) && lit(id);
             let color = if !met { ui.visuals().error_fg_color } else if on { theme::accent() } else { theme::border().gamma_multiply(2.0) };
-            let (a, b) = (from.center_bottom(), to.center_top());
             let stroke = egui::Stroke::new(if on { 2.0 } else { 1.0 }, color);
             edge(&painter, [a, b], stroke, dependency);
             let tip = b - (b - a).normalized() * 9.0;
@@ -280,7 +329,7 @@ fn graph_ui(ui: &mut egui::Ui, present: &[Present], state: &mut State) {
             // Short, on a line of its own beside the edge: the details name the service.
             let (wanted, service) = (requirement(text).1, asked_for(state, text).1);
             let label = format!("{}  ·  has {}", wanted.unwrap_or("any"), service.or(found.map(|q| q.version.as_str())).unwrap_or("none"));
-            painter.text(a.lerp(b, 0.5) + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, label, font.clone(), color);
+            edge_label(&painter, [a, b], painter.layout_no_wrap(label, font.clone(), color), ui.visuals().panel_fill, &mut taken);
         }
     }
     for (id, rect) in &places {

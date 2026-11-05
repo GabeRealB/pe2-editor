@@ -359,12 +359,16 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
         let declared: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
         let fields = pe2_ext::targeted(&declared, target.as_deref());
         shaped(&path, &fields)?;
-        let files = call.entries(&path)?.into_iter().collect();
+        let files: BTreeSet<String> = call.entries(&path)?.into_iter().collect();
         read.push((path, fields, declared, files));
     }
-    let names = package_names(&read.iter().map(|(path, ..)| path.clone()).collect::<Vec<_>>());
+    let paths: Vec<String> = read.iter().map(|(path, ..)| path.clone()).collect();
+    let names = package_names(&paths);
     let mut packages = HashMap::new();
-    for (path, fields, declared, files) in read {
+    for (path, fields, declared, mut files) in read {
+        // Its own files: a package inside its folder holds what is in its own (`aya`'s are not `aya/mist`'s).
+        let inner: Vec<String> = paths.iter().filter(|other| other.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/'))).map(|other| format!("{other}/")).collect();
+        files.retain(|file| !inner.iter().any(|folder| file.starts_with(folder.as_str())));
         let mut dependencies = vec![];
         for reference in fields.get("dependencies").and_then(Value::as_array).into_iter().flatten() {
             let target = pe2_ext::target_of(reference).ok_or_else(|| anyhow!("{path}: a dependency names nothing"))?;
