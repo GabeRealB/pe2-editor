@@ -207,7 +207,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .data()
         .of(SourceTree::NAME)
         .icon(Icon::Stack, Tint::Code)
-        .field(Field::new("slot").label("Slot"))
         .field(Field::new("headers").label("Headers"))
         .field(Field::new("sources").label("Sources"))
         .field(Field::new("objects").label("Objects"))

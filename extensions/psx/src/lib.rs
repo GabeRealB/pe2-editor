@@ -1,10 +1,9 @@
 //! pe2.psx, an unsandboxed extension: the PS1 target, as a toolchain file is `CMake`'s, and the last steps of a package. It provides
 //! `package-target`, given the files `pe2.packages` gathered: `compile` makes the package's objects - its C units with the tools it ships, its
 //! assembly as written, its own prebuilt objects as they are - each named by its package and its place in it (`title/src/package.o`), as a
-//! link script names it; `symbols` lays an image out alone and says what it exports; `link` makes its image by the package's `link_script` at the
-//! address of its slot, with what its dependencies' objects add and against what the images it binds publish. A target that links packages
-//! otherwise takes their objects and leaves the last two out. Slots are named by packages and mapped here, as what a target calls a place in
-//! memory is no package's to say.
+//! link script names it; `symbols` lays an image out alone and says what it exports; `link` makes its image by the package's `link_script`,
+//! which places it in memory, with what its dependencies' objects add and against what the images it binds publish. A target that links
+//! packages otherwise takes their objects and leaves the last two out.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -20,27 +19,6 @@ const TARGET: &str = "psx";
 
 pe2_ext::extension!("pe2.psx", "0.1.0", register, requires = ["pe2.packages@^0.1"], provides = ["package-target@1.0.0"], unsandboxed = true, hashed = ["linux-x86_64"]);
 
-/// The places a package loads into, by the names packages give them.
-const SLOTS: [(&str, u32); 13] = [
-    // The image the BIOS loads, which `exe_header` heads.
-    (EXECUTABLE, 0x8001_0000),
-    ("resident", 0x8009_3800),
-    ("weapon", 0x8011_D1C0),
-    ("aya", 0x8011_5770),
-    ("kyle", 0x8016_7A70),
-    ("stage", 0x8017_9950),
-    ("overlay", 0x8012_EF30),
-    ("options", 0x801D_4000),
-    ("debug", 0x801D_6000),
-    ("room", 0x8017_D5C0),
-    ("actor_1", 0x8013_1E20),
-    ("actor_2", 0x8014_9E20),
-    ("actor_3", 0x8016_1E20),
-];
-
-/// The slot that is the executable.
-const EXECUTABLE: &str = "executable";
-
 /// A sector of the disc, which the executable's header and image fill whole.
 const SECTOR: usize = 0x800;
 
@@ -53,6 +31,20 @@ const REGIONS: [(&str, &str); 3] = [
     ("JAP", "Sony Computer Entertainment Inc. for Japan area"),
     ("PAL", "Sony Computer Entertainment Inc. for Europe area"),
 ];
+
+/// Where an ELF's first loaded segment goes: the executable's load address, which its link script gives.
+fn load_address(elf: &[u8]) -> Result<u32> {
+    let word = |at: usize| -> Result<u32> { Ok(u32::from_le_bytes(elf.get(at..at + 4).ok_or_else(|| anyhow!("the ELF is cut short"))?.try_into()?)) };
+    let half = |at: usize| -> Result<usize> { Ok(usize::from(u16::from_le_bytes(elf.get(at..at + 2).ok_or_else(|| anyhow!("the ELF is cut short"))?.try_into()?))) };
+    let (table, size, count) = (usize::try_from(word(0x1C)?)?, half(0x2A)?, half(0x2C)?);
+    for index in 0..count {
+        let header = table + index * size;
+        if word(header)? == 1 {
+            return word(header + 8);
+        }
+    }
+    bail!("the ELF loads nothing")
+}
 
 /// The executable: its header, every field of which follows from the link or this target - the entry point (the ELF's),
 /// where the image loads and how much of it, padded to whole sectors, the stack, the region's license string - then the
@@ -381,14 +373,6 @@ fn linked(tree: &Path, kind: &str) -> Vec<String> {
     listed.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' ')).map(str::to_string).collect()
 }
 
-/// Where an image's slot is, by its package's declaration as this target reads it.
-fn slot_of(declared: &Table, name: &str) -> Result<u32> {
-    let fields = pe2_ext::targeted(declared, Some(TARGET));
-    let slot = fields.get("slot").and_then(Value::as_str).ok_or_else(|| anyhow!("{name} names no slot"))?;
-    let (_, address) = SLOTS.iter().find(|(known, _)| *known == slot).ok_or_else(|| anyhow!("no slot {slot} on this target"))?;
-    Ok(*address)
-}
-
 /// The package's own link script, from the gathered tree.
 fn script_of(tree: &Path, name: &str) -> Result<PathBuf> {
     only_file(&tree.join("target").join(TARGET).join(name).join("link_script")).map_err(|_| anyhow!("{name} has no link_script"))
@@ -398,19 +382,16 @@ fn script_of(tree: &Path, name: &str) -> Result<PathBuf> {
 /// on from, the addresses being what this is for - and of its names those its sections hold.
 fn symbols(call: &mut Call) -> Result<Typed> {
     let path = call.host.path().to_string();
-    let fields = call.given();
     let sources = call.take::<SourceTree>(0)?;
     let objects = call.take::<Objects>(1)?;
     let scratch = PathBuf::from(format!("{}.symbols", call.temp()?));
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
         let name = name_in(&tree)?;
-        let address = slot_of(&fields, &name)?;
         let objects = write_objects(call, &objects.files, &scratch)?;
         let layout = scratch.join("layout.elf");
         let mut args: Vec<String> =
-            ["-EL", "-nostdlib", "--no-check-sections", "--unresolved-symbols=ignore-all", "--noinhibit-exec", "--defsym"].map(ToString::to_string).to_vec();
-        args.push(format!("SLOT={address:#x}"));
+            ["-EL", "-nostdlib", "--no-check-sections", "--unresolved-symbols=ignore-all", "--noinhibit-exec"].map(ToString::to_string).to_vec();
         args.extend(["-T".to_string(), text(&script_of(&tree, &name)?), "-o".to_string(), text(&layout)]);
         args.extend(objects.iter().map(|object| text(object)));
         output("mips-linux-gnu-ld", &args)?;
@@ -444,7 +425,6 @@ fn link_image(call: &mut Call) -> Result<Typed> {
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
         let name = name_in(&tree)?;
-        let address = slot_of(&fields, &name)?;
         let mut files = own.files.clone();
         for dependency in linked(&tree, "dependency") {
             let pe2_ext::Data::Typed(objects) = call.output_of(&dependency, "objects")? else { bail!("{dependency}: its objects are no files") };
@@ -467,13 +447,14 @@ fn link_image(call: &mut Call) -> Result<Typed> {
             fs::write(&written, call.read(symbols.file()?)?)?;
             published.push(written);
         }
-        let image = link(address, &script_of(&tree, &name)?, &published, &objects, &scratch, &name)?;
-        if pe2_ext::targeted(&fields, Some(TARGET)).get("slot").and_then(Value::as_str) != Some(EXECUTABLE) {
+        let image = link(&script_of(&tree, &name)?, &published, &objects, &scratch, &name)?;
+        if pe2_ext::targeted(&fields, Some(TARGET)).get("executable").and_then(Value::as_bool) != Some(true) {
             return Ok((image, format!("{}.pe2pkg", file_name(&name))));
         }
         let release = call.config().and_then(|config| config.release).ok_or_else(|| anyhow!("no release is built"))?;
         let exe = scratch.join(format!("{}.exe", file_name(&name)));
-        fs::write(&exe, exe_header(&fs::read(&image)?, &fs::read(scratch.join("image.elf"))?, address, &release)?)?;
+        let elf = fs::read(scratch.join("image.elf"))?;
+        fs::write(&exe, exe_header(&fs::read(&image)?, &elf, load_address(&elf)?, &release)?)?;
         Ok((exe, format!("{}.exe", file_name(&name))))
     });
     let result = made.and_then(|(image, kept_as)| {
@@ -601,11 +582,10 @@ fn compile(expanded: &Path, tree: &Path, scratch: &Path) -> Result<PathBuf> {
     Ok(object)
 }
 
-/// The image: the package's script for where things land, this target for where its slot is, what its dependencies publish for the rest.
-fn link(address: u32, script: &Path, published: &[PathBuf], objects: &[PathBuf], scratch: &Path, name: &str) -> Result<PathBuf> {
+/// The image: the package's script for where things land, what its dependencies publish for the rest.
+fn link(script: &Path, published: &[PathBuf], objects: &[PathBuf], scratch: &Path, name: &str) -> Result<PathBuf> {
     let linked = scratch.join("image.elf");
-    let mut args: Vec<String> = ["-EL", "-nostdlib", "--no-check-sections", "--defsym"].map(ToString::to_string).to_vec();
-    args.push(format!("SLOT={address:#x}"));
+    let mut args: Vec<String> = ["-EL", "-nostdlib", "--no-check-sections"].map(ToString::to_string).to_vec();
     args.extend(["-T".to_string(), text(script)]);
     for file in published {
         args.extend(["-T".to_string(), text(file)]);
