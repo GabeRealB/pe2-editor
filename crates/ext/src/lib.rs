@@ -34,7 +34,7 @@ pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
-pub use data::{BuildConfig, NodeNamed, Provides, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, Micro, MicroInput, Need, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Retain, RunOp, StartStream, StreamInput, StreamSource, Type, Typed, Value as Data, Writer};
+pub use data::{BuildConfig, NodeNamed, Provides, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, merged, Micro, MicroInput, Need, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Retain, RunOp, StartStream, StreamInput, StreamSource, targeted, Type, Typed, Value as Data, Writer};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use project::{Project, Requested};
 pub use registry::{ActOnContents, CommandDef, HookBuilder, HookDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow, ContentStyle, Contents, PartField, PartSheet, SheetOfPart, TabDef, TemplateDef, 

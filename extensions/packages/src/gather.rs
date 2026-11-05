@@ -28,7 +28,10 @@ const LINE: usize = 32_000;
 /// A package of the build graph: the graph has one, by name.
 pub struct Package {
     pub path: String,
+    /// What it declares, as its target reads it (`pe2_ext::targeted`) ...
     fields: Table,
+    /// ... and as written, every target's part with it.
+    declared: Table,
     /// Its files, by their paths, as the stack resolves them.
     files: BTreeSet<String>,
 }
@@ -143,7 +146,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let mut gathering = Gathering { call, packages, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new(), path: searched };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
-    let units = selected(&call.given(), &own_path, &own_files)?;
+    let units = selected(&own_fields(call), &own_path, &own_files)?;
     let within = format!("{own_path}/");
     let mut listed = String::new();
     for unit in &units {
@@ -176,7 +179,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
     // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
-    let unset = gathering.options.unset(&call.given());
+    let unset = gathering.options.unset(&own_fields(call));
     let settings = Table::from_iter([("unset".to_string(), Value::Array(unset.into_iter().map(Value::String).collect()))]);
     Ok(Typed { notes, settings: pe2_ext::merged(&call.given(), &settings), ..Typed::new(SourceTree::NAME, files) })
 }
@@ -185,14 +188,26 @@ fn name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The target the config builds for, which a package is read as (`pe2_ext::targeted`); none outside a build.
+fn target_of(call: &Call) -> Option<String> {
+    call.config().and_then(|config| config.target)
+}
+
+/// What this package's node declares, as its target reads it.
+fn own_fields(call: &Call) -> Table {
+    pe2_ext::targeted(&call.given(), target_of(call).as_deref())
+}
+
 /// The build graph's one table: every `package` asset by its name, with its files.
 pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
     let mut packages = HashMap::new();
+    let target = target_of(call);
     for (path, declaration) in call.assets_of("package")? {
-        let fields: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
+        let declared: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
+        let fields = pe2_ext::targeted(&declared, target.as_deref());
         let files = call.entries(&path)?.into_iter().collect();
         let name = name_of(&path).to_string();
-        let package = Package { path: path.clone(), fields, files };
+        let package = Package { path: path.clone(), fields, declared, files };
         if let Some(other) = packages.insert(name.clone(), package) {
             bail!("two packages are named {name}: {}, {path}", other.path);
         }
@@ -294,7 +309,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     }
     let Walk { slots, options, .. } = walk;
     let within = format!("{path}/");
-    let fields = &call.given();
+    let fields = &own_fields(call);
     let sources = if strings(fields, "sources").is_empty() { vec![] } else { selected(fields, &path, &own.files)? };
     let sources = sources.iter().map(|file| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
     let mut table = Table::new();
@@ -571,7 +586,7 @@ impl Options {
 
     /// What `pe2.h` includes in both passes.
     fn header(&self, call: &Call) -> Result<String> {
-        let fields = &call.given();
+        let fields = &own_fields(call);
         self.check(fields)?;
         let mut header = String::new();
         let mut unwritten = String::new();
@@ -757,7 +772,7 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
 
 /// What a binding holds: the reference filling it.
 fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet<Query>) -> (String, Vec<String>) {
-    let fields = &call.given();
+    let fields = &own_fields(call);
     let mut header = String::new();
     let mut failed = Vec::new();
     for (name, slot) in &slots.held {
@@ -1058,7 +1073,7 @@ impl Gathering<'_> {
     fn take_target_files(&mut self) -> Result<()> {
         for name in self.reached.clone() {
             let Some(package) = self.packages.get(&name) else { continue };
-            let Some(targets) = package.fields.get("target").and_then(Value::as_table) else { continue };
+            let Some(targets) = package.declared.get("target").and_then(Value::as_table) else { continue };
             let mut files = vec![];
             for (target, values) in targets {
                 for (key, value) in values.as_table().into_iter().flatten() {

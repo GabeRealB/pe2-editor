@@ -286,7 +286,8 @@ fn write_out(call: &Call, sources: &Typed, scratch: &Path) -> Result<PathBuf> {
     Ok(tree)
 }
 
-fn image_of(fields: &Table, tree: &Path, objects: &[PathBuf], scratch: &Path, name: &str) -> Result<PathBuf> {
+fn image_of(declared: &Table, tree: &Path, objects: &[PathBuf], scratch: &Path, name: &str) -> Result<PathBuf> {
+    let fields = pe2_ext::targeted(declared, Some(TARGET));
     let slot = fields.get("slot").and_then(Value::as_str).ok_or_else(|| anyhow!("{name} names no slot"))?;
     let (_, address) = SLOTS.iter().find(|(known, _)| *known == slot).ok_or_else(|| anyhow!("no slot {slot} on this target"))?;
     let own = tree.join("target/psx").join(name);
