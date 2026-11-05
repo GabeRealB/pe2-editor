@@ -1,10 +1,13 @@
 //! pe2.packages: a package, the game's code as it is built, declared as `CMake` declares a target: the files it compiles (`sources`, globs
-//! and paths, a leading `!` leaving out what a glob took), what its dependents may include (`public`), and the slot it loads into, a
-//! name, whose address is the target's. A target adds what it alone needs under `target.<name>`.
+//! and paths, a leading `!` leaving out what a glob took), what its dependents may include (`public`). A target adds what it alone needs
+//! under `target.<name>` (`pe2_ext::targeted`): the PS1 the slot a package loads into, a name whose address is the target's, its link
+//! script, and objects it links as they are.
 //!
 //! Everything about what a package is lives here. `gather` finds its sources and follows what they request, reading through the host so that
 //! what is read is the stack as resolved and is recorded: a package is made again when what it reaches changes, and only then. A target
-//! is one step after that, `package-target@compile`, given the files reached; which target it is, a package does not know.
+//! takes over after that, given the files reached: `package-target@compile` makes its `objects`, and the last two steps, `symbols` and
+//! `link`, link it as the PS1 does, one image a package; a target linking packages otherwise removes them in a layer of its own and takes
+//! the `objects`. Which target it is, a package does not know.
 
 mod database;
 mod gather;
@@ -28,6 +31,7 @@ op = "pe2.packages@gather"
 op = "package-target@preprocess"
 
 [[stack]]
+id = "resolved"
 op = "pe2.packages@resolve"
 
 [[stack]]
@@ -36,7 +40,28 @@ name = "resolved"
 retain = "transient"
 
 [[stack]]
+id = "objects"
 op = "package-target@compile"
+
+[[stack]]
+op = "output"
+name = "objects"
+retain = "cache"
+
+[[stack]]
+op = "package-target@symbols"
+sources = { from = "resolved" }
+objects = { from = "objects" }
+
+[[stack]]
+op = "output"
+name = "symbols"
+retain = "cache"
+
+[[stack]]
+op = "package-target@link"
+sources = { from = "resolved" }
+objects = { from = "objects" }
 
 [[stack]]
 op = "output"

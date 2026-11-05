@@ -20,6 +20,8 @@ pub const VALUES: &str = "pe2_values.h";
 pub const OPTIONS: &str = "pe2_options.h";
 /// The folders of the tree its plain includes are found in, in order, one a line: what a target puts on its include path.
 pub const INCLUDES: &str = "includes";
+/// What a gathered package links besides its own objects, a line each: `dependency <path>` and `bound <path>`.
+pub const LINKED: &str = "linked";
 /// Where a first pass leaves what it made of each unit.
 const FIRST: &str = "first/";
 /// The most a line of a macro takes, as a preprocessor may limit one, so a long value is a chain of macros.
@@ -40,6 +42,16 @@ impl Package {
     /// Whether it has anything of its own to build.
     pub fn compiles(&self) -> bool {
         !strings(&self.fields, "sources").is_empty()
+    }
+
+    /// Whether it makes objects for what links it: sources compiled, or objects it links as they are.
+    fn makes_objects(&self) -> bool {
+        self.compiles() || !strings(&self.fields, "objects").is_empty()
+    }
+
+    /// Whether its target makes it an image of its own, which says what it exports: it has a link script.
+    fn makes_image(&self) -> bool {
+        self.fields.contains_key("link_script")
     }
 
     pub fn public_folders(&self) -> Vec<&str> {
@@ -146,6 +158,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let mut gathering = Gathering { call, packages, tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], packaged: BTreeSet::new(), included: vec![], options: Options::default(), open: BTreeSet::new(), path: searched };
     let own = gathering.packages.get(&name).ok_or_else(|| anyhow!("{path} is no package of the graph"))?;
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
+    let own_name = name.clone();
     let units = selected(&own_fields(call), &own_path, &own_files)?;
     let within = format!("{own_path}/");
     let mut listed = String::new();
@@ -168,14 +181,30 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
         let open: Vec<&str> = gathering.open.iter().map(String::as_str).collect();
         bail!("{path} asks for {}, which no package answers", open.join(", "));
     }
-    gathering.take_target_files()?;
+    gathering.take_target_files(&own_name)?;
     let mut dirs: Vec<&str> = vec![];
     for searched in &gathering.path {
         if !dirs.contains(&searched.dir.as_str()) {
             dirs.push(&searched.dir);
         }
     }
-    let mut files: Vec<File> = vec![File::new("units", listed.into_bytes()), File::new(INCLUDES, dirs.join("\n").into_bytes())];
+    // What its image links besides its own: each dependency's objects, and what each package it binds publishes.
+    let mut linked = String::new();
+    for searched in &gathering.path {
+        if let Some(package) = gathering.packages.get(&searched.owner).filter(|package| package.makes_objects() && searched.owner != own_name) {
+            let line = format!("dependency {}\n", package.path);
+            if !linked.contains(&line) {
+                linked.push_str(&line);
+            }
+        }
+    }
+    for name in &gathering.packaged {
+        if let Some(package) = gathering.packages.get(name).filter(|package| package.makes_image() && *name != own_name) {
+            let _ = writeln!(linked, "bound {}", package.path);
+        }
+    }
+    let mut files: Vec<File> =
+        vec![File::new("units", listed.into_bytes()), File::new(INCLUDES, dirs.join("\n").into_bytes()), File::new(LINKED, linked.into_bytes())];
     let notes = gathering.options.notes(call);
     files.extend(gathering.tree.into_iter().map(|(place, bytes)| File::new(&place, bytes)));
     // For a first pass stopped by one of these in `#if`, whose preprocessor can only say it divided by zero.
@@ -217,7 +246,17 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
 
 /// The files `sources` names, in order: a path or a glob of `*` within a step, a leading `!` leaving out what is matched.
 fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<String>> {
-    let patterns = strings(fields, "sources");
+    let kept = listed(fields, "sources", path, files);
+    if kept.is_empty() {
+        bail!("{path}: its sources name no file");
+    }
+    Ok(kept)
+}
+
+/// The files a list of a package's names (`sources`, `objects`): globs from its folder, a leading `!` leaving out what
+/// is matched.
+fn listed(fields: &Table, key: &str, path: &str, files: &BTreeSet<String>) -> Vec<String> {
+    let patterns = strings(fields, key);
     let within = format!("{path}/");
     let matched = |file: &str, wanted: bool| {
         patterns.iter().filter(|p| p.starts_with('!') != wanted).any(|p| matches(p.trim_start_matches('!'), file))
@@ -227,10 +266,7 @@ fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<
         .filter(|file| file.strip_prefix(&within).is_some_and(|inside| matched(inside, true) && !matched(inside, false)))
         .cloned()
         .collect();
-    if kept.is_empty() {
-        bail!("{path}: its sources name no file");
-    }
-    Ok(kept)
+    kept
 }
 
 /// A path against a pattern, step by step.
@@ -1069,8 +1105,19 @@ impl Gathering<'_> {
         }
     }
 
-    /// What the packages reached name under `target.<target>`: each target takes what it knows.
-    fn take_target_files(&mut self) -> Result<()> {
+    /// What the packages reached name under `target.<target>`: each target takes what it knows - a file by its key, and
+    /// the package's own `objects`, as the target reads it, under `objects/`.
+    fn take_target_files(&mut self, own: &str) -> Result<()> {
+        if let Some(package) = self.packages.get(own) {
+            let within = format!("{}/", package.path);
+            let objects = listed(&package.fields, "objects", &package.path, &package.files);
+            let target = target_of(self.call).unwrap_or_default();
+            for entry in objects {
+                let place = format!("target/{target}/{own}/objects/{}", entry.strip_prefix(&within).unwrap_or(&entry));
+                let bytes = self.call.read_entry(&entry)?;
+                self.tree.insert(place, bytes);
+            }
+        }
         for name in self.reached.clone() {
             let Some(package) = self.packages.get(&name) else { continue };
             let Some(targets) = package.declared.get("target").and_then(Value::as_table) else { continue };
