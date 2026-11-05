@@ -184,7 +184,13 @@ fn split_build(call: &mut Call) -> Result<Prepared> {
     let name = Value::String(String::from_utf8(call.read(name)?)?);
     let mut micros = vec![Micro { op: "expand".into(), label: "expand".into(), ports: vec![vec![MicroInput::port(0)]], ..Micro::default() }];
     let mut objects = vec![];
-    for unit in units.lines() {
+    // The objects what links the package takes: its public units'.
+    let mut public = vec![];
+    for (visibility, unit) in units_of(&units) {
+        let unit = unit.as_str();
+        if visibility == "public" {
+            public.push(Value::String(object_name(name.as_str().unwrap_or_default(), unit)));
+        }
         objects.push(MicroInput::micro(micros.len()));
         if is_assembly(unit) {
             micros.push(Micro {
@@ -205,9 +211,14 @@ fn split_build(call: &mut Call) -> Result<Prepared> {
         });
     }
     let prebuilt = format!("target/{TARGET}/");
-    let settings = Table::from_iter([("package".to_string(), name)]);
+    let settings = Table::from_iter([("package".to_string(), name), ("public".to_string(), Value::Array(public))]);
     micros.push(Micro { op: "collect".into(), label: "objects".into(), settings, ports: vec![objects, vec![MicroInput::port(0).only(&[&prebuilt])]], ..Micro::default() });
     Ok(Prepared { needs: Vec::new(), micros })
+}
+
+/// The units a gathered tree lists, each with its visibility (`public self/lib/libsn/snmain.s`).
+fn units_of(listed: &str) -> Vec<(String, String)> {
+    listed.lines().filter_map(|line| line.split_once(' ')).map(|(visibility, unit)| (visibility.to_string(), unit.to_string())).collect()
 }
 
 /// Whether a unit is assembly, assembled as it is written.
@@ -249,7 +260,7 @@ fn expand(call: &mut Call) -> Result<Typed> {
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
         let mut made = vec![];
-        for unit in fs::read_to_string(tree.join("units"))?.lines().filter(|unit| !is_assembly(unit)) {
+        for (_, unit) in units_of(&fs::read_to_string(tree.join("units"))?).iter().filter(|(_, unit)| !is_assembly(unit)) {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
             args.extend(searched(&tree));
@@ -323,22 +334,30 @@ fn assemble(call: &mut Call) -> Result<Typed> {
     Ok(Typed::new(Object::NAME, vec![in_project(made, &scratch, &path)?]))
 }
 
-/// The package's objects: its units', and its prebuilt ones (`target/psx/<package>/objects/<place>`) by their place in it.
+/// The package's objects: its units', and its prebuilt ones (`target/psx/<package>/objects/<visibility>/<place>`) by their place in
+/// it - all of them, for its own image, and which are public (`public`), for what links it.
 fn collect(call: &mut Call) -> Result<Typed> {
     let name = package_name(call)?;
+    let mut public: Vec<Value> = call.settings.get("public").and_then(Value::as_array).cloned().unwrap_or_default();
     let compiled = call.take_all::<ty::File<Object>>(0)?;
     let prebuilt = call.take::<SourceTree>(1)?;
     let mut files = vec![];
     for object in &compiled {
         files.push(object.file()?.clone());
     }
-    let own = format!("target/{TARGET}/{name}/objects/");
-    for file in prebuilt.files.iter().filter(|file| file.name.starts_with(&own)) {
-        let mut file = file.clone();
-        file.name = format!("{name}/{}", &file.name[own.len()..]);
-        files.push(file);
+    for visibility in ["private", "public"] {
+        let own = format!("target/{TARGET}/{name}/objects/{visibility}/");
+        for file in prebuilt.files.iter().filter(|file| file.name.starts_with(&own)) {
+            let mut file = file.clone();
+            file.name = format!("{name}/{}", &file.name[own.len()..]);
+            if visibility == "public" {
+                public.push(Value::String(file.name.clone()));
+            }
+            files.push(file);
+        }
     }
-    Ok(Typed::new(Objects::NAME, files))
+    let settings = Table::from_iter([("public".to_string(), Value::Array(public))]);
+    Ok(Typed { settings, ..Typed::new(Objects::NAME, files) })
 }
 
 /// Objects on disk under `objects/`, each by its name, as a link script names them.
@@ -429,7 +448,9 @@ fn link_image(call: &mut Call) -> Result<Typed> {
         let mut files = own.files.clone();
         for dependency in linked(&tree, "dependency") {
             let pe2_ext::Data::Typed(objects) = call.output_of(&dependency, "objects")? else { bail!("{dependency}: its objects are no files") };
-            files.extend(objects.files);
+            // What it gives what links it: its public objects.
+            let public: Vec<&str> = objects.settings.get("public").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            files.extend(objects.files.into_iter().filter(|file| public.contains(&file.name.as_str())));
         }
         let objects = write_objects(call, &files, &scratch)?;
         let mut published = vec![];
@@ -478,7 +499,7 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
     fs::create_dir_all(&scratch)?;
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
         let mut made = vec![];
-        for unit in fs::read_to_string(tree.join("units"))?.lines().filter(|unit| !is_assembly(unit)) {
+        for (_, unit) in units_of(&fs::read_to_string(tree.join("units"))?).iter().filter(|(_, unit)| !is_assembly(unit)) {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
             args.extend(searched(&tree));

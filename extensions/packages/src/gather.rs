@@ -53,12 +53,12 @@ pub struct Package {
 impl Package {
     /// Whether it has anything of its own to build.
     pub fn compiles(&self) -> bool {
-        !strings(&self.fields, "sources").is_empty()
+        VISIBILITIES.iter().any(|visibility| !declared(&self.fields, "sources", visibility).is_empty())
     }
 
-    /// Whether it makes objects for what links it: sources compiled, or objects it links as they are.
+    /// Whether it gives what links it objects: public sources compiled, or public objects as they are.
     fn makes_objects(&self) -> bool {
-        self.compiles() || !strings(&self.fields, "objects").is_empty()
+        ["sources", "objects"].iter().any(|key| !declared(&self.fields, key, PUBLIC).is_empty())
     }
 
     /// Whether its target makes it an image, which others link against by the symbols it publishes: it has a link script, or,
@@ -67,13 +67,18 @@ impl Package {
         self.fields.contains_key("link_script") || self.fields.contains_key("symbols")
     }
 
-    pub fn public_folders(&self) -> Vec<&str> {
-        strings(&self.fields, "public")
+    /// The folders its own quoted includes are found in, within it: its public one (`headers.public`), then its private ones
+    /// (`headers.private`).
+    pub fn header_folders(&self) -> Vec<&str> {
+        let headers = self.fields.get("headers");
+        let public = headers.and_then(|headers| headers.get(PUBLIC)).and_then(Value::as_str);
+        public.into_iter().chain(declared(&self.fields, "headers", PRIVATE)).collect()
     }
 
-    /// The folder of what others may include of it, from the project's root, if it has one.
-    fn public_folder(&self) -> Option<String> {
-        self.public_folders().first().map(|folder| format!("{}/{folder}", self.path))
+    /// The folder of what others may include of it, from the project's root, if it has one: one, which its name stands for.
+    pub fn public_folder(&self) -> Option<String> {
+        let headers = self.fields.get("headers");
+        headers.and_then(|headers| headers.get(PUBLIC)).and_then(Value::as_str).map(|folder| format!("{}/{folder}", self.path))
     }
 
     /// Whether a file is one of its.
@@ -82,8 +87,30 @@ impl Package {
     }
 }
 
-fn strings<'a>(fields: &'a Table, key: &str) -> Vec<&'a str> {
-    fields.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect()
+/// What a package's files are for, which its declaration says of each kind: `private`, its own build's; `public`, its own and, as
+/// far as an image, what links it.
+const PRIVATE: &str = "private";
+const PUBLIC: &str = "public";
+const VISIBILITIES: [&str; 2] = [PRIVATE, PUBLIC];
+
+/// The names a package declares of a kind, of one visibility (`sources.public`).
+fn declared<'a>(fields: &'a Table, key: &str, visibility: &str) -> Vec<&'a str> {
+    fields.get(key).and_then(|kind| kind.get(visibility)).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// Whether a package declares its kinds as both builds read them: each by visibility, its public headers one folder.
+fn shaped(path: &str, fields: &Table) -> Result<()> {
+    for key in ["headers", "sources", "objects"] {
+        let Some(kind) = fields.get(key) else { continue };
+        let by_visibility = kind.as_table().is_some_and(|kind| kind.keys().all(|visibility| VISIBILITIES.contains(&visibility.as_str())));
+        if !by_visibility {
+            bail!("{path}: {key} is declared by visibility: {key}.{PRIVATE}, {key}.{PUBLIC}");
+        }
+    }
+    if fields.get("headers").and_then(|headers| headers.get(PUBLIC)).is_some_and(|public| public.as_str().is_none()) {
+        bail!("{path}: headers.public is one folder, which its name stands for");
+    }
+    Ok(())
 }
 
 /// A file to take in: where it is in the project, where it goes in the tree, and whose it is.
@@ -223,8 +250,7 @@ fn resolved(packages: &HashMap<String, Package>, owner: &str, from: &str, writte
         let in_public = public.as_ref().is_some_and(|public| from.starts_with(&format!("{public}/")));
         let mut folders = vec![folder_of(from).to_string()];
         if !in_public {
-            folders.extend(public.clone());
-            folders.push(format!("{}/src", package.path));
+            folders.extend(package.header_folders().into_iter().map(|folder| format!("{}/{folder}", package.path)));
         }
         let within = if in_public { public.unwrap_or_default() } else { package.path.clone() };
         for folder in folders {
@@ -268,14 +294,14 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::default(), declaring: Declaring::of(&name, &[]) };
     // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
     let fields = own_fields(call);
-    let units = if strings(&fields, "sources").is_empty() { vec![] } else { selected(&fields, &own_path, &own_files)? };
-    gathering.declaring = Declaring::of(&name, &units);
+    let units = if gathering.packages[&name].compiles() { selected(&fields, &own_path, &own_files)? } else { vec![] };
+    gathering.declaring = Declaring::of(&name, &units.iter().map(|(unit, _)| unit.clone()).collect::<Vec<_>>());
     let within = format!("{own_path}/");
+    // Each unit by its visibility and place: what the target compiles, and whether what it makes goes to what links the package.
     let mut listed = String::new();
-    for unit in &units {
+    for (unit, visibility) in &units {
         let place = format!("self/{}", unit.strip_prefix(&within).unwrap_or(unit));
-        listed.push_str(&place);
-        listed.push('\n');
+        let _ = writeln!(listed, "{visibility} {place}");
         gathering.pending.push(Taken { entry: unit.clone(), place, owner: name.clone() });
     }
     gathering.reached.insert(name.clone());
@@ -286,7 +312,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     gathering.take_target_files(&name)?;
     // Where its includes are found: in quotes, its own folders; in angle brackets, its dependencies, each under its name.
     let own = &gathering.packages[&name];
-    let mut dirs: Vec<String> = own.public_folders().into_iter().chain(["src"]).map(|folder| format!("quote self/{folder}")).collect();
+    let mut dirs: Vec<String> = own.header_folders().into_iter().map(|folder| format!("quote self/{folder}")).collect();
     dirs.push(format!("angle {DEP}"));
     // What its image links besides its own: the objects of the libraries it takes, and what the images it depends on publish.
     let mut linked = String::new();
@@ -331,6 +357,7 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
     for (path, declaration) in call.assets_of("package")? {
         let declared: Table = declaration.parse().map_err(|e| anyhow!("{path}: {e}"))?;
         let fields = pe2_ext::targeted(&declared, target.as_deref());
+        shaped(&path, &fields)?;
         let files = call.entries(&path)?.into_iter().collect();
         read.push((path, fields, declared, files));
     }
@@ -358,19 +385,21 @@ pub fn packages(call: &Call) -> Result<HashMap<String, Package>> {
     Ok(packages)
 }
 
-/// The files `sources` names, in order: a path or a glob of `*` within a step, a leading `!` leaving out what is matched.
-fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<String>> {
-    let kept = listed(fields, "sources", path, files);
+/// The files `sources` names, of every visibility, each with its visibility: a path or a glob of `*` within a step, a leading `!`
+/// leaving out what is matched.
+fn selected(fields: &Table, path: &str, files: &BTreeSet<String>) -> Result<Vec<(String, &'static str)>> {
+    let kept: Vec<(String, &'static str)> =
+        VISIBILITIES.iter().flat_map(|visibility| listed(fields, "sources", visibility, path, files).into_iter().map(move |file| (file, *visibility))).collect();
     if kept.is_empty() {
         bail!("{path}: its sources name no file");
     }
     Ok(kept)
 }
 
-/// The files a list of a package's names (`sources`, `objects`): globs from its folder, a leading `!` leaving out what
-/// is matched.
-fn listed(fields: &Table, key: &str, path: &str, files: &BTreeSet<String>) -> Vec<String> {
-    let patterns = strings(fields, key);
+/// The files a package declares of a kind and visibility (`sources.private`, `objects.public`): globs from its folder, a leading
+/// `!` leaving out what is matched.
+fn listed(fields: &Table, key: &str, visibility: &str, path: &str, files: &BTreeSet<String>) -> Vec<String> {
+    let patterns = declared(fields, key, visibility);
     let within = format!("{path}/");
     let matched = |file: &str, wanted: bool| {
         patterns.iter().filter(|p| p.starts_with('!') != wanted).any(|p| matches(p.trim_start_matches('!'), file))
@@ -448,7 +477,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     let packages = packages(call)?;
     let name = name_at(&packages, &path)?;
     let own = &packages[&name];
-    let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
+    let units: Vec<String> = if own.compiles() { selected(&own.fields, &path, &own.files)?.into_iter().map(|(unit, _)| unit).collect() } else { vec![] };
     let mut walk = Walk {
         call,
         packages: &packages,
@@ -467,8 +496,8 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
     let Walk { slots, options, .. } = walk;
     let within = format!("{path}/");
     let fields = &own_fields(call);
-    let sources = if strings(fields, "sources").is_empty() { vec![] } else { selected(fields, &path, &own.files)? };
-    let sources = sources.iter().map(|file| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
+    let sources = if own.compiles() { selected(fields, &path, &own.files)? } else { vec![] };
+    let sources = sources.iter().map(|(file, _)| Value::String(file.strip_prefix(&within).unwrap_or(file).to_string())).collect();
     let mut table = Table::new();
     table.insert("sources".into(), Value::Array(sources));
     table.insert("slots".into(), Value::Array(slots.described(&packages)));
@@ -1173,16 +1202,17 @@ impl Gathering<'_> {
     }
 
     /// What the packages reached name under `target.<target>`: each target takes what it knows - a file by its key, and
-    /// the package's own `objects`, as the target reads it, under `objects/`.
+    /// the package's own `objects`, as the target reads them, under `objects/<visibility>/`.
     fn take_target_files(&mut self, own: &str) -> Result<()> {
         if let Some(package) = self.packages.get(own) {
             let within = format!("{}/", package.path);
-            let objects = listed(&package.fields, "objects", &package.path, &package.files);
             let target = target_of(self.call).unwrap_or_default();
-            for entry in objects {
-                let place = format!("target/{target}/{own}/objects/{}", entry.strip_prefix(&within).unwrap_or(&entry));
-                let bytes = self.call.read_entry(&entry)?;
-                self.tree.insert(place, bytes);
+            for visibility in VISIBILITIES {
+                for entry in listed(&package.fields, "objects", visibility, &package.path, &package.files) {
+                    let place = format!("target/{target}/{own}/objects/{visibility}/{}", entry.strip_prefix(&within).unwrap_or(&entry));
+                    let bytes = self.call.read_entry(&entry)?;
+                    self.tree.insert(place, bytes);
+                }
             }
         }
         for name in self.reached.clone() {

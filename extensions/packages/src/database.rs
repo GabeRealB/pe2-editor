@@ -32,10 +32,8 @@ pub fn overlay(call: &mut Call) -> Result<Typed> {
     let root = format!("{}/virtual", folder(call)?);
     let mut roots = vec![];
     for (name, package) in sorted(call)? {
-        for place in package.public_folders() {
-            if let Some(disk) = call.place(&format!("{}/{place}", package.path)) {
-                roots.push(json!({ "type": "directory-remap", "name": format!("{root}/{name}"), "external-contents": disk }));
-            }
+        if let Some(disk) = package.public_folder().and_then(|folder| call.place(&folder)) {
+            roots.push(json!({ "type": "directory-remap", "name": format!("{root}/{name}"), "external-contents": disk }));
         }
     }
     file("overlay.yaml", &json!({ "version": 0, "case-sensitive": "true", "fallthrough": "true", "roots": roots }))
@@ -90,7 +88,7 @@ pub fn database(call: &mut Call) -> Result<Typed> {
     for (name, package) in &packages {
         let Ok(reflected) = call.table_of(&package.path, "reflection") else { continue };
         // What it includes in quotes is in its own folders; in angle brackets, in the virtual folder, every package under its name.
-        let own = package.public_folders().into_iter().chain(["src"]).map(|folder| format!("{}/{folder}", package.path));
+        let own = package.header_folders().into_iter().map(|folder| format!("{}/{folder}", package.path));
         let path: Vec<String> = own.filter_map(|folder| call.place(&folder)).flat_map(|place| ["-iquote".to_string(), place]).collect();
         let sources = reflected.get("sources").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
         // C, as a language server reads it: assembly is assembled as it is written, and is no C unit.

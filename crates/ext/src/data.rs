@@ -790,21 +790,29 @@ pub fn merged(declared: &Table, derived: &Table) -> Table {
     out
 }
 
-/// A declaration as a target reads it: its own values, then what it says under `target.<target>` - a list appended to the
-/// list it has, any other value replacing. What it says for other targets is not there; with no target, nothing is added.
+/// A declaration as a target reads it: its own values, then what it says under `target.<target>` - a table merged into the
+/// table it has, a list appended to the list it has, any other value replacing. What it says for other targets is not there;
+/// with no target, nothing is added.
 #[must_use]
 pub fn targeted(declared: &Table, target: Option<&str>) -> Table {
     let mut out: Table = declared.iter().filter(|(key, _)| key.as_str() != "target").map(|(k, v)| (k.clone(), v.clone())).collect();
-    let own = target.and_then(|target| declared.get("target")?.get(target)?.as_table());
-    for (key, value) in own.into_iter().flatten() {
-        match (out.get_mut(key), value) {
-            (Some(crate::Value::Array(into)), crate::Value::Array(more)) => into.extend(more.iter().cloned()),
+    if let Some(own) = target.and_then(|target| declared.get("target")?.get(target)?.as_table()) {
+        merge(&mut out, own);
+    }
+    out
+}
+
+/// `more` over `into`: tables merged, lists appended, other values replacing.
+fn merge(into: &mut Table, more: &Table) {
+    for (key, value) in more {
+        match (into.get_mut(key), value) {
+            (Some(crate::Value::Table(held)), crate::Value::Table(more)) => merge(held, more),
+            (Some(crate::Value::Array(held)), crate::Value::Array(more)) => held.extend(more.iter().cloned()),
             _ => {
-                out.insert(key.clone(), value.clone());
+                into.insert(key.clone(), value.clone());
             }
         }
     }
-    out
 }
 
 /// Files lent as an asset (`Call::lend`): the node's path, settings as lent, the files' contents read through the host.
@@ -1057,6 +1065,9 @@ mod tests {
         assert_eq!(targeted(&declared, Some("psx")), psx);
         assert_eq!(targeted(&declared, None), none);
         assert_eq!(targeted(&declared, Some("n64")), none);
+        let declared: crate::Table = toml::from_str("sources.private = [\"a.c\"]\n[target.psx]\nsources.private = [\"b.s\"]\nsources.public = [\"c.s\"]\n").unwrap();
+        let psx: crate::Table = toml::from_str("sources.private = [\"a.c\", \"b.s\"]\nsources.public = [\"c.s\"]\n").unwrap();
+        assert_eq!(targeted(&declared, Some("psx")), psx);
     }
 
     fn ty(text: &str) -> Type {
