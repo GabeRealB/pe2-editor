@@ -13,6 +13,8 @@ mod database;
 mod gather;
 mod scan;
 mod tokenizers;
+mod typed;
+mod types;
 mod views;
 
 use pe2_ext::ty::{self, Registered, SourceTree};

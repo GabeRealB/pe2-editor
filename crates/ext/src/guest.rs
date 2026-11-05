@@ -463,8 +463,8 @@ impl UiHost for Frame<'_> {
         self.ui().tooltip(text);
     }
 
-    fn text_edit(&mut self, id: &str, text: &mut String) -> bool {
-        let (edited, committed) = self.ui().text_edit(id, text);
+    fn text_edit(&mut self, id: &str, text: &mut String, hint: &str, width: f32) -> bool {
+        let (edited, committed) = self.ui().text_edit(id, text, hint, width);
         *text = edited;
         committed
     }

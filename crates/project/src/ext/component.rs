@@ -1068,9 +1068,9 @@ impl host::HostUi for State {
         Ok(())
     }
 
-    fn text_edit(&mut self, ui: Resource<Frame>, id: String, text: String) -> wasmtime::Result<(String, bool)> {
+    fn text_edit(&mut self, ui: Resource<Frame>, id: String, text: String, hint: String, width: f32) -> wasmtime::Result<(String, bool)> {
         let mut text = text;
-        let committed = self.frame(&ui)?.text_edit(&id, &mut text);
+        let committed = self.frame(&ui)?.text_edit(&id, &mut text, &hint, width);
         Ok((text, committed))
     }
 

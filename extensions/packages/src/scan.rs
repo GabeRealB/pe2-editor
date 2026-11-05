@@ -2,7 +2,7 @@
 //! left, finding each anywhere on a line, comments and strings left out.
 
 /// Every macro read.
-const KNOWN: [&str; 11] = [
+const KNOWN: [&str; 14] = [
     "PE2_BIND",
     "PE2_BIND_ARG",
     "PE2_BIND_SELF",
@@ -12,6 +12,9 @@ const KNOWN: [&str; 11] = [
     "PE2_OPTION_DEF",
     "PE2_OPTION",
     "PE2_OPTION_IS",
+    "PE2_OPTION_AT",
+    "PE2_OPTION_COUNT",
+    "PE2_TYPE",
     "PE2_CONFIG",
     "PE2_CONFIG_IS",
 ];
@@ -22,6 +25,8 @@ pub struct Use<'a> {
     pub name: &'a str,
     pub args: Vec<&'a str>,
     pub line: usize,
+    /// Where its name starts in the text.
+    pub offset: usize,
 }
 
 /// Past a string or a character, from its opening quote.
@@ -38,7 +43,7 @@ fn is_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// A call's arguments, from its opening parenthesis; and where it ends.
+/// A call's arguments, from its opening parenthesis; and where it ends. A comma in braces is an initializer's.
 fn arguments(text: &str, open: usize) -> Option<(Vec<&str>, usize)> {
     let bytes = text.as_bytes();
     let (mut at, mut depth, mut start, mut args) = (open + 1, 0, open + 1, Vec::new());
@@ -48,12 +53,12 @@ fn arguments(text: &str, open: usize) -> Option<(Vec<&str>, usize)> {
                 at = quoted(bytes, at);
                 continue;
             }
-            b'(' => depth += 1,
+            b'(' | b'{' => depth += 1,
             b')' if depth == 0 => {
                 args.push(text[start..at].trim());
                 return Some((args, at + 1));
             }
-            b')' => depth -= 1,
+            b')' | b'}' => depth -= 1,
             b',' if depth == 0 => {
                 args.push(text[start..at].trim());
                 start = at + 1;
@@ -115,7 +120,7 @@ pub fn uses(text: &str) -> Vec<Use<'_>> {
                 if KNOWN.contains(&word) && bytes.get(open) == Some(&b'(') && !defining(text, start) && !in_taking(text, start)
                     && let Some((args, end)) = arguments(text, open)
                 {
-                    found.push(Use { name: word, args, line });
+                    found.push(Use { name: word, args, line, offset: start });
                     line += text[at..end].matches('\n').count();
                     at = end;
                 }

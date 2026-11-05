@@ -148,7 +148,7 @@ pub trait UiHost {
     fn tooltip(&mut self, text: &str);
     /// A one-line text field over `text`, `id` keeping it apart; whether it was committed this frame (Enter, or the
     /// keyboard taken elsewhere).
-    fn text_edit(&mut self, id: &str, text: &mut String) -> bool;
+    fn text_edit(&mut self, id: &str, text: &mut String, hint: &str, width: f32) -> bool;
     /// A dropdown showing `selected`; the option chosen this frame.
     fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize>;
     /// Whether the asset shown can be edited: its layer is not locked, nor outside a solo.
@@ -292,7 +292,13 @@ impl<'a> Ui<'a> {
 
     /// A one-line text field; whether it was committed this frame.
     pub fn text_edit(&mut self, id: &str, text: &mut String) -> bool {
-        self.host.text_edit(id, text)
+        self.host.text_edit(id, text, "", 0.0)
+    }
+
+    /// A one-line text field showing `hint`, greyed, while it is empty, as a field shows what holds until something is typed,
+    /// `width` points wide (the host's width at 0); whether it was committed this frame.
+    pub fn text_edit_hinted(&mut self, id: &str, text: &mut String, hint: &str, width: f32) -> bool {
+        self.host.text_edit(id, text, hint, width)
     }
 
     /// A dropdown; the option chosen this frame.

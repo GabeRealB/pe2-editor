@@ -10,6 +10,7 @@ use pe2_ext::tokens::{self, Args};
 use pe2_ext::ty::{Registered, SourceTree};
 use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
 
+use crate::types::{Shape, Tree, Types};
 use crate::{scan, tokenizers};
 
 /// The package holding what every unit includes first, and what the assembler reads.
@@ -291,7 +292,7 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let own = &packages[&name];
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let (objects, images) = linked(&packages, &name);
-    let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::default(), declaring: Declaring::of(&name, &[]) };
+    let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::new(&target_of(call).unwrap_or_default()), declaring: Declaring::of(&name, &[]) };
     // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
     let fields = own_fields(call);
     let units = if gathering.packages[&name].compiles() { selected(&fields, &own_path, &own_files)? } else { vec![] };
@@ -485,7 +486,7 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
         label: String::new(),
         order: 0,
         slots: Slots::default(),
-        options: Options::default(),
+        options: Options::new(&target_of(call).unwrap_or_default()),
         declaring: Declaring::of(&name, &units),
     };
     // As a compile reads them, then whatever only dependents read.
@@ -533,7 +534,7 @@ impl Walk<'_> {
             }
             self.declaring.check(&found, file)?;
             self.order += 1;
-            self.options.read(&found, &format!("{file}:{}", found.line));
+            self.options.read(&found, &format!("{file}:{}", found.line), &text);
             if let ("PE2_EDITOR_LABEL", [label]) = (found.name, found.args.as_slice()) {
                 self.label = label_in(label).unwrap_or_default();
             }
@@ -657,11 +658,15 @@ struct Option_ {
 }
 
 /// What sources say of options and the build config.
-#[derive(Default)]
 pub struct Options {
+    types: Types,
     defined: BTreeMap<String, Option_>,
     /// Each read, with where.
     read: Vec<(String, Option<String>, String)>,
+    /// Each `PE2_OPTION_AT`, its arguments with where.
+    at_read: Vec<(Vec<String>, String)>,
+    /// Each `PE2_OPTION_COUNT`, the option it reads with where.
+    count_read: Vec<(String, String)>,
     config: Vec<(String, Option<String>, String)>,
     wrong: Vec<String>,
 }
@@ -671,16 +676,20 @@ const CONFIG_KEYS: [&str; 3] = ["name", "release", "target"];
 const UNSET: &str = "pe2_unset_";
 
 impl Options {
-    fn read(&mut self, found: &scan::Use, at: &str) {
+    fn new(target: &str) -> Options {
+        Options { types: Types::new(target), defined: BTreeMap::new(), read: vec![], at_read: vec![], count_read: vec![], config: vec![], wrong: vec![] }
+    }
+
+    fn read(&mut self, found: &scan::Use, at: &str, text: &str) {
         let args = &found.args;
         match (found.name, args.as_slice()) {
+            ("PE2_TYPE", [name]) => self.types.register(name, text, found.offset, at),
+            ("PE2_OPTION_AT", [_, _, ..]) => self.at_read.push((args.iter().map(ToString::to_string).collect(), at.to_string())),
+            ("PE2_OPTION_COUNT", [name]) => self.count_read.push(((*name).to_string(), at.to_string())),
             ("PE2_EDITOR_LABEL", [label]) if label_in(label).is_none() => self.wrong.push(format!("{at}: a label is a string literal: {label}")),
             ("PE2_OPTION_DEF", [name, ty, members @ ..]) => {
                 let members: Vec<String> = members.iter().map(ToString::to_string).collect();
                 let def = Option_ { ty: (*ty).to_string(), members, at: at.to_string(), label: String::new(), order: 0 };
-                if !["int", "bool", "string", "enum"].contains(ty) {
-                    self.wrong.push(format!("{at}: {name}: there is no option type {ty}"));
-                }
                 if *ty != "enum" && def.members.len() > 1 {
                     self.wrong.push(format!("{at}: {name}: an option has one default"));
                 }
@@ -704,6 +713,35 @@ impl Options {
         if let Some(wrong) = self.wrong.first() {
             bail!("{wrong}");
         }
+        self.types.check()?;
+        for (name, def) in &self.defined {
+            let shape = shape_of(def);
+            if !BUILT_IN.contains(&def.ty.as_str()) && !shape.as_ref().is_some_and(|shape| self.types.knows(shape)) {
+                bail!(
+                    "{}: {name}: there is no option type {}; an option is int, bool, string, enum, an integer primitive or a registered type, or a fixed array of either",
+                    def.at,
+                    def.ty
+                );
+            }
+        }
+        for (name, at) in &self.count_read {
+            let shape = self.defined.get(name).and_then(shape_of);
+            if !shape.is_some_and(|shape| shape.dynamic || shape.count.is_some()) {
+                bail!("{at}: PE2_OPTION_COUNT reads an array option, and {name} is none");
+            }
+        }
+        for (args, at) in &self.at_read {
+            let name = &args[0];
+            let Some(def) = self.defined.get(name).filter(|def| shape_of(def).is_some()) else {
+                bail!("{at}: PE2_OPTION_AT reads an option of a registered type or an array, and {name} is none");
+            };
+            if let Some(value) = shaped_value(name, def, fields, &self.types)? {
+                let path = &args[1..];
+                if !value.leaves().iter().any(|(leaf, _)| leaf.as_slice() == path) {
+                    bail!("{at}: {name} has no integer at {}", path.join(", "));
+                }
+            }
+        }
         for (name, member, at) in &self.read {
             let Some(def) = self.defined.get(name) else { bail!("{at}: {name} has no PE2_OPTION_DEF") };
             if member.is_some() && def.ty != "enum" {
@@ -718,14 +756,14 @@ impl Options {
         }
         // One not set is no problem until something evaluates it; one set wrongly is one already.
         for (name, def) in &self.defined {
-            value_of(name, def, fields)?;
+            value_of(name, def, fields, &self.types)?;
         }
         Ok(())
     }
 
     /// The options this package has no value for.
     fn unset(&self, fields: &Table) -> Vec<String> {
-        let unset = self.defined.iter().filter(|(name, def)| matches!(value_of(name, def, fields), Ok(None)));
+        let unset = self.defined.iter().filter(|(name, def)| matches!(value_of(name, def, fields, &self.types), Ok(None)));
         unset.map(|(name, _)| name.clone()).collect()
     }
 
@@ -752,7 +790,7 @@ impl Options {
         let mut header = String::new();
         let mut unwritten = String::new();
         for (name, def) in &self.defined {
-            let value = value_of(name, def, fields)?;
+            let value = value_of(name, def, fields, &self.types)?;
             // With no value it divides by zero wherever `#if` evaluates it, and only there, as a skipped branch is not; and in code it is
             // an error wherever it is expanded. Nothing has to find out which are read: what is not expanded says nothing.
             let unset = format!("(0/{UNSET}{name})");
@@ -760,6 +798,12 @@ impl Options {
                 unwritten.push_str(&failing(&format!("{UNSET}{name}"), &format!("{name} has no value on this package")));
             }
             let _ = writeln!(header, "#define pe2_option_{name} {}", value.as_deref().unwrap_or(&unset));
+            if let Some(tree) = shaped_value(name, def, fields, &self.types)? {
+                if let Tree::List(items) = &tree {
+                    let _ = writeln!(header, "#define pe2_option_{name}_count {}", items.len());
+                }
+                header.push_str(&tree.leaf_macros(name));
+            }
             if def.ty == "enum" {
                 for (at, member) in def.members.iter().enumerate() {
                     let is = value.as_ref().map_or_else(|| unset.clone(), |value| i32::from(*value == at.to_string()).to_string());
@@ -793,7 +837,12 @@ impl Options {
             out.insert("type".into(), def.ty.clone().into());
             let members = if def.ty == "enum" { def.members.clone() } else { Vec::new() };
             out.insert("members".into(), Value::Array(members.into_iter().map(Value::String).collect()));
-            if let Ok(Some(default)) = default_of(name, def) {
+            if let Some(shape) = shape_of(def).filter(|shape| self.types.knows(shape)) {
+                out.insert("shape".into(), self.types.describe(&shape));
+                if let Ok(Some(default)) = shaped_value(name, def, &Table::new(), &self.types) {
+                    out.insert("default".into(), default.value());
+                }
+            } else if let Ok(Some(default)) = default_of(name, def, &self.types) {
                 out.insert("default".into(), Value::String(default));
             }
             out.insert("name".into(), name.clone().into());
@@ -803,11 +852,31 @@ impl Options {
     }
 }
 
+/// The option types that are no primitive and no registered type.
+const BUILT_IN: [&str; 4] = ["int", "bool", "string", "enum"];
+
+/// An option's shape when it is of a primitive or a registered type, or a fixed array of one.
+fn shape_of(def: &Option_) -> Option<Shape> {
+    if BUILT_IN.contains(&def.ty.as_str()) { None } else { crate::types::spelled(&def.ty) }
+}
+
+/// A typed option's value: its default merged with what its package sets; none where it has no default and is not set, or is no typed
+/// option.
+fn shaped_value(name: &str, def: &Option_, fields: &Table, types: &Types) -> Result<Option<Tree>> {
+    let Some(shape) = shape_of(def).filter(|shape| types.knows(shape)) else { return Ok(None) };
+    let default = def.members.first().map(|written| types.parsed(&shape, written, &format!("{}: {name}", def.at))).transpose()?;
+    let Some(given) = fields.get("option").and_then(|options| options.get(name)) else { return Ok(default) };
+    types.merged(&shape, default.as_ref(), given, &format!("{}: {name}, as this package sets it", def.at), "").map(Some)
+}
+
 /// An option's value for this package, as C reads it: what its package sets, else the default its source gives; none where it has
 /// neither.
-fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>> {
+fn value_of(name: &str, def: &Option_, fields: &Table, types: &Types) -> Result<Option<String>> {
+    if shape_of(def).is_some() {
+        return Ok(shaped_value(name, def, fields, types)?.map(|tree| tree.initializer()));
+    }
     let at = &def.at;
-    let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return default_of(name, def) };
+    let Some(value) = fields.get("option").and_then(|options| options.get(name)) else { return default_of(name, def, types) };
     let wrong = |what: &str| anyhow!("{at}: {name} is {what}, and this package gives it {value}");
     let read = match def.ty.as_str() {
         "int" => value.as_integer().map(|number| number.to_string()).ok_or_else(|| wrong("an int")),
@@ -823,7 +892,10 @@ fn value_of(name: &str, def: &Option_, fields: &Table) -> Result<Option<String>>
 
 /// The default a source gives an option after its type, as C reads it: an integer (`900`, `0x38`, `-1`), `true` or `false`, or a
 /// string literal.
-fn default_of(name: &str, def: &Option_) -> Result<Option<String>> {
+fn default_of(name: &str, def: &Option_, types: &Types) -> Result<Option<String>> {
+    if shape_of(def).is_some() {
+        return Ok(shaped_value(name, def, &Table::new(), types)?.map(|tree| tree.initializer()));
+    }
     let (Some(written), false) = (def.members.first(), def.ty == "enum") else { return Ok(None) };
     let wrong = || anyhow!("{}: {name} is {}, and its default is {written}", def.at, def.ty);
     let read = match def.ty.as_str() {
@@ -1179,7 +1251,7 @@ impl Gathering<'_> {
             self.tree.insert(taken.place.clone(), bytes);
             for found in scan::uses(&text) {
                 self.declaring.check(&found, &taken.entry)?;
-                self.options.read(&found, &format!("{}:{}", taken.entry, found.line));
+                self.options.read(&found, &format!("{}:{}", taken.entry, found.line), &text);
             }
             for (at, line) in text.lines().enumerate() {
                 let Some((written, quoted)) = included(line) else { continue };
@@ -1238,33 +1310,33 @@ impl Gathering<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Option_, value_of};
+    use super::{Option_, Types, value_of};
 
     #[test]
     fn a_string_option_is_a_string_to_the_compiler() {
         let def = Option_ { ty: "string".to_string(), members: Vec::new(), at: "here".to_string(), label: String::new(), order: 0 };
         let fields: toml::Table = "option.title = 'a \"name\"'".parse().unwrap();
-        assert_eq!(value_of("title", &def, &fields).unwrap().as_deref(), Some("\"a \\\"name\\\"\""));
-        assert_eq!(value_of("other", &def, &fields).unwrap(), None);
+        assert_eq!(value_of("title", &def, &fields, &Types::new("psx")).unwrap().as_deref(), Some("\"a \\\"name\\\"\""));
+        assert_eq!(value_of("other", &def, &fields, &Types::new("psx")).unwrap(), None);
         let wrong: toml::Table = "option.title = 3".parse().unwrap();
-        assert!(value_of("title", &def, &wrong).is_err());
+        assert!(value_of("title", &def, &wrong, &Types::new("psx")).is_err());
     }
 
     #[test]
     fn a_default_is_what_a_package_does_not_set() {
         let def = |ty: &str, default: &str| Option_ { ty: ty.to_string(), members: vec![default.to_string()], at: "here".to_string(), label: String::new(), order: 0 };
         let unset = toml::Table::new();
-        assert_eq!(value_of("ticks", &def("int", "900"), &unset).unwrap().as_deref(), Some("900"));
-        assert_eq!(value_of("y", &def("int", "0x38"), &unset).unwrap().as_deref(), Some("56"));
-        assert_eq!(value_of("n", &def("int", "-1"), &unset).unwrap().as_deref(), Some("-1"));
-        assert_eq!(value_of("on", &def("bool", "true"), &unset).unwrap().as_deref(), Some("1"));
-        assert_eq!(value_of("s", &def("string", "\"a\""), &unset).unwrap().as_deref(), Some("\"a\""));
+        assert_eq!(value_of("ticks", &def("int", "900"), &unset, &Types::new("psx")).unwrap().as_deref(), Some("900"));
+        assert_eq!(value_of("y", &def("int", "0x38"), &unset, &Types::new("psx")).unwrap().as_deref(), Some("56"));
+        assert_eq!(value_of("n", &def("int", "-1"), &unset, &Types::new("psx")).unwrap().as_deref(), Some("-1"));
+        assert_eq!(value_of("on", &def("bool", "true"), &unset, &Types::new("psx")).unwrap().as_deref(), Some("1"));
+        assert_eq!(value_of("s", &def("string", "\"a\""), &unset, &Types::new("psx")).unwrap().as_deref(), Some("\"a\""));
         let set: toml::Table = "option.ticks = 600".parse().unwrap();
-        assert_eq!(value_of("ticks", &def("int", "900"), &set).unwrap().as_deref(), Some("600"));
-        assert!(value_of("ticks", &def("int", "fast"), &unset).is_err());
-        assert!(value_of("s", &def("string", "a"), &unset).is_err());
+        assert_eq!(value_of("ticks", &def("int", "900"), &set, &Types::new("psx")).unwrap().as_deref(), Some("600"));
+        assert!(value_of("ticks", &def("int", "fast"), &unset, &Types::new("psx")).is_err());
+        assert!(value_of("s", &def("string", "a"), &unset, &Types::new("psx")).is_err());
         let members = Option_ { ty: "enum".to_string(), members: vec!["matte".into(), "gloss".into()], at: "here".into(), label: String::new(), order: 0 };
-        assert_eq!(value_of("finish", &members, &unset).unwrap(), None);
+        assert_eq!(value_of("finish", &members, &unset, &Types::new("psx")).unwrap(), None);
     }
 
     use super::label_in;

@@ -388,8 +388,9 @@ interface host {
         /// A field, the host's way: its label and its reading (TOML value).
         field: func(key: string, value: string);
         tooltip: func(text: string);
-        /// A one-line text field showing `text`; its text after this frame, and whether it was committed.
-        text-edit: func(id: string, text: string) -> tuple<string, bool>;
+        /// A one-line text field showing `text`, or `hint` greyed while it is empty, `width` points wide (the host's width at 0); its
+        /// text after this frame, and whether it was committed.
+        text-edit: func(id: string, text: string, hint: string, width: f32) -> tuple<string, bool>;
         /// A dropdown; the option chosen this frame.
         combo: func(id: string, selected: string, options: list<string>) -> option<u32>;
         /// Whether the asset shown can be edited.

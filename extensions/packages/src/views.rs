@@ -7,9 +7,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use pe2_ext::{Cell, Icon, Style, Table, Ui, Value, View};
 
+use crate::typed::{self, Step};
+
 /// How rows line up: a character of a name, and the room after it.
 const CHARACTER: f32 = 8.0;
 const GAP: f32 = 16.0;
+/// How wide an integer's field is: room for one of any primitive up to 32 bits, sign and all.
+const CELL: f32 = 80.0;
 
 /// A package's slots and options, as the head of the contents pane or the inspector's sheet.
 #[derive(Default)]
@@ -18,8 +22,17 @@ pub struct Slots {
     told: Option<Result<Table, String>>,
     /// The project's revision it was told at: its sources change outside any edit of the asset it shows.
     revision: u64,
-    /// What is being typed in an option.
-    typed: HashMap<String, String>,
+    /// What is being typed in an input, by its id: with what was held when typing began, so that a change made elsewhere (an undo)
+    /// shows through.
+    typed: HashMap<String, (String, String)>,
+    /// What was typed and refused, by input: why it cannot be held.
+    refused: HashMap<String, String>,
+}
+
+/// What an input asks for: a value written, or none, back to the default.
+enum Edit {
+    Set(Value),
+    Clear,
 }
 
 impl Slots {
@@ -74,16 +87,41 @@ fn sections(list: &[Table]) -> Vec<(&str, Vec<&Table>)> {
     found
 }
 
-/// Why an option's value cannot be read; none where it can.
-fn wrong(option: &Table, value: Option<&Value>) -> Option<&'static str> {
-    let Some(value) = value else { return Some("not set") };
+/// An option's default as an input shows it, if its source gives one: a string without its quotes, a bool as true or false.
+fn default_shown(option: &Table) -> Option<String> {
+    let default = option.get("default")?;
+    let shown = match (text(option, "type"), default.as_str()) {
+        ("string", Some(text)) => text.strip_prefix('"').and_then(|text| text.strip_suffix('"')).unwrap_or(text).to_string(),
+        ("bool", Some(text)) => (if text == "1" { "true" } else { "false" }).to_string(),
+        (_, Some(text)) => text.to_string(),
+        (_, None) => default.to_string(),
+    };
+    Some(shown)
+}
+
+/// Why an option's value cannot be read; none where it can. One the package leaves unset is its default, where its source gives one.
+fn wrong(option: &Table, value: Option<&Value>) -> Option<String> {
+    let Some(value) = value else { return (!option.contains_key("default")).then(|| "not set".to_string()) };
+    if let Some(shape) = option.get("shape").and_then(Value::as_table) {
+        return typed::wrong(shape, value);
+    }
     let right = match text(option, "type") {
         "int" => value.is_integer(),
         "bool" => value.is_bool(),
         "string" => value.is_str(),
         _ => value.as_str().is_some_and(|member| words(option, "members").iter().any(|known| known == member)),
     };
-    (!right).then_some("not of its type")
+    (!right).then(|| "not of its type".to_string())
+}
+
+/// Whether an option is a struct or an array, which opens into groups; a single integer is a field.
+fn is_grouped(option: &Table) -> bool {
+    option.get("shape").and_then(Value::as_table).is_some_and(|shape| shape.contains_key("count") || shape.contains_key("fields"))
+}
+
+/// A value as an input shows it.
+fn shown(value: &Value) -> String {
+    value.as_str().map_or_else(|| value.to_string(), str::to_string)
 }
 
 /// A value of a table of a package's, the rest kept: what a change writes.
@@ -103,12 +141,6 @@ fn without(field: Option<&Value>, key: &str) -> Option<Value> {
 fn unread(field: Option<&Value>, named: &[Table]) -> Vec<String> {
     let read: BTreeSet<&str> = named.iter().map(|table| text(table, "name")).collect();
     field.and_then(Value::as_table).into_iter().flatten().map(|(key, _)| key.clone()).filter(|key| !read.contains(key.as_str())).collect()
-}
-
-/// A number as typed.
-fn number(typed: &str) -> Option<i64> {
-    let typed = typed.trim();
-    typed.strip_prefix("0x").map_or_else(|| typed.parse().ok(), |hex| i64::from_str_radix(hex, 16).ok())
 }
 
 /// How wide a column of names is.
@@ -246,6 +278,7 @@ impl Slots {
         let selected = ui.selected();
         let mut asked: Option<(&str, String, Value)> = None;
         let mut cleared = None;
+        let mut grids = vec![];
         for (label, listed) in sections(&tables) {
             let title = if label.is_empty() { format!("Inputs  ·  {}", listed.len()) } else { label.to_string() };
             ui.section(&title, |ui| {
@@ -271,20 +304,37 @@ impl Slots {
                             ui.tab(name);
                             ui.styled(text(input, "type"), Style::Note);
                             ui.tab(name + of_type);
-                            if let Some(new) = self.editor(ui, input, value) {
-                                asked = Some(("option", input_name.to_string(), new));
+                            if is_grouped(input) {
+                                grids.push(input);
+                            } else {
+                                match self.editor(ui, input, value) {
+                                    Some(Edit::Set(new)) => asked = Some(("option", input_name.to_string(), new)),
+                                    Some(Edit::Clear) => cleared = Some(input_name.to_string()),
+                                    None => {}
+                                }
                             }
-                            // Set, it can go back to having no value, which no value of its type says.
-                            if value.is_some() && ui.icon_button(Icon::Cross, "Leave it not set") {
+                            // Set, it can go back to its default, or to having no value.
+                            let back = if input.contains_key("default") { "Back to its default" } else { "Leave it not set" };
+                            if value.is_some() && ui.icon_button(Icon::Cross, back) {
                                 cleared = Some(input_name.to_string());
+                            }
+                            if let Some(why) = self.refused.get(input_name) {
+                                ui.styled(why, Style::Error);
                             }
                             // What is read needs a value, if it is live; what is not read cannot need one.
                             let read = input.get("read").and_then(Value::as_bool).unwrap_or(false);
                             if let Some(why) = wrong(input, value) {
-                                ui.styled(why, if read || value.is_some() { Style::Error } else { Style::Note });
+                                ui.styled(&why, if read || value.is_some() { Style::Error } else { Style::Note });
                             }
                         }
                     });
+                    if grids.last() == Some(&input) {
+                        ui.indented(|ui| match self.grouped(ui, input, held_in(set.as_ref(), input_name)) {
+                            Some(Edit::Set(new)) => asked = Some(("option", input_name.to_string(), new)),
+                            Some(Edit::Clear) => cleared = Some(input_name.to_string()),
+                            None => {}
+                        });
+                    }
                 }
             });
         }
@@ -296,32 +346,159 @@ impl Slots {
         }
     }
 
-    fn editor(&mut self, ui: &mut Ui, option: &Table, value: Option<&Value>) -> Option<Value> {
+    /// A text input, its typing kept across frames: what was typed, or what is held when that changed since typing began; the default
+    /// greyed while it is empty. What was typed, when it is committed.
+    fn typing(&mut self, ui: &mut Ui, id: &str, held: &str, hint: &str, width: f32) -> Option<String> {
+        let entry = self.typed.entry(id.to_string()).or_insert_with(|| (held.to_string(), held.to_string()));
+        if entry.0 != held {
+            *entry = (held.to_string(), held.to_string());
+        }
+        let committed = ui.text_edit_hinted(id, &mut entry.1, hint, width);
+        committed.then(|| entry.1.trim().to_string())
+    }
+
+    /// An option that is one value: a box for a bool, a choice for an enum, a field for the rest, which shows the default while the
+    /// package sets none. An integer is held to its type's range; what is not is refused, and said.
+    fn editor(&mut self, ui: &mut Ui, option: &Table, value: Option<&Value>) -> Option<Edit> {
         let name = text(option, "name");
+        let default = default_shown(option);
         match text(option, "type") {
             "bool" => {
+                let held = value.and_then(Value::as_bool).or_else(|| default.as_deref().map(|shown| shown == "true"));
                 // A box says true or false, and this is neither yet: both are offered, as false would take two clicks.
-                let Some(mut on) = value.and_then(Value::as_bool) else {
+                let Some(mut on) = held else {
                     let choices = ["false".to_string(), "true".to_string()];
-                    return ui.combo(&format!("option.{name}"), "", &choices).map(|chosen| Value::Boolean(chosen == 1));
+                    return ui.combo(&format!("option.{name}"), "", &choices).map(|chosen| Edit::Set(Value::Boolean(chosen == 1)));
                 };
-                ui.checkbox("", &mut on).then_some(Value::Boolean(on))
+                let changed = ui.checkbox("", &mut on).then_some(Edit::Set(Value::Boolean(on)));
+                if value.is_none() {
+                    ui.styled("default", Style::Weak);
+                }
+                changed
             }
             "enum" => {
                 let members = words(option, "members");
                 let shown = value.and_then(Value::as_str).unwrap_or_default();
-                ui.combo(&format!("option.{name}"), shown, &members).map(|chosen| Value::String(members[chosen].clone()))
+                ui.combo(&format!("option.{name}"), shown, &members).map(|chosen| Edit::Set(Value::String(members[chosen].clone())))
             }
             ty => {
-                let held = value.map_or_else(String::new, |value| value.as_str().map_or_else(|| value.to_string(), str::to_string));
-                let typed = self.typed.entry(name.to_string()).or_insert(held);
-                if !ui.text_edit(&format!("option.{name}"), typed) {
-                    return None;
+                let held = value.map_or_else(String::new, shown);
+                let typed = self.typing(ui, &format!("option.{name}"), &held, default.as_deref().unwrap_or_default(), 0.0)?;
+                if typed.is_empty() {
+                    self.refused.remove(name);
+                    return value.is_some().then_some(Edit::Clear);
                 }
-                if ty == "int" { number(typed).map(Value::Integer) } else { Some(Value::String(typed.clone())) }
+                if ty == "string" {
+                    return Some(Edit::Set(Value::String(typed)));
+                }
+                let range = option.get("shape").and_then(Value::as_table).and_then(|shape| Some((shape.get("low")?.as_integer()?, shape.get("high")?.as_integer()?)));
+                let (low, high) = range.unwrap_or((i64::MIN, i64::MAX));
+                match typed::checked(&typed, ty, low, high) {
+                    Ok(number) => {
+                        self.refused.remove(name);
+                        Some(Edit::Set(Value::Integer(number)))
+                    }
+                    Err(why) => {
+                        self.refused.insert(name.to_string(), why);
+                        None
+                    }
+                }
             }
         }
     }
+
+    /// An option of a registered type or an array, as an inspector lists one: an array's elements and a struct's fields each a
+    /// group that opens, down to its integers, each a row with a field showing what the package sets or, greyed, the default. A
+    /// field emptied goes back to the default; an integer out of its type's range is refused, and said.
+    fn grouped(&mut self, ui: &mut Ui, option: &Table, value: Option<&Value>) -> Option<Edit> {
+        let name = text(option, "name").to_string();
+        let shape = option.get("shape").and_then(Value::as_table)?.clone();
+        let default = option.get("default");
+        let full = typed::effective(&shape, default, value);
+        let mut at = Members { option: &name, whole: &shape, value, default, full: &full, path: vec![], edit: None };
+        self.members(ui, &shape, &mut at);
+        let prefix = format!("option.{name}.");
+        for why in self.refused.iter().filter(|(id, _)| id.starts_with(&prefix)).map(|(_, why)| why.clone()).collect::<Vec<_>>() {
+            ui.styled(&why, Style::Error);
+        }
+        at.edit
+    }
+
+    /// What is inside a shape, at the path `at` has reached: an integer a row, anything else a group, which opens; a dynamic array's
+    /// elements each removable, and one more to add, a copy of the last.
+    fn members(&mut self, ui: &mut Ui, shape: &Table, at: &mut Members<'_>) {
+        let children = typed::children(shape, typed::at(Some(at.full), &at.path));
+        let dynamic = typed::is_dynamic(shape);
+        let elements = children.len();
+        #[expect(clippy::cast_precision_loss, reason = "a name's length")]
+        let label = children.iter().filter(|(.., child)| typed::range_of(child).is_some()).map(|(_, title, _)| title.len()).max().unwrap_or(0) as f32;
+        let label = label * CHARACTER + GAP;
+        for (step, title, child) in children {
+            at.path.push(step);
+            let id = format!("option.{}.{}", at.option, path_text(&at.path));
+            if let Some((low, high)) = typed::range_of(&child) {
+                ui.horizontal(|ui| {
+                    ui.styled(&title, Style::Normal);
+                    ui.tooltip(&typed::about(&child));
+                    ui.tab(label);
+                    let held = typed::at(at.value, &at.path).map_or_else(String::new, shown);
+                    let hint = typed::at(at.default, &at.path).map_or_else(String::new, shown);
+                    let Some(typed) = self.typing(ui, &id, &held, &hint, CELL) else { return };
+                    let new = if typed.is_empty() {
+                        None
+                    } else {
+                        match typed::checked(&typed, text(&child, "type"), low, high) {
+                            Ok(number) => Some(number),
+                            Err(why) => {
+                                self.refused.insert(id.clone(), format!("{}: {why}", path_text(&at.path)));
+                                return;
+                            }
+                        }
+                    };
+                    self.refused.remove(&id);
+                    at.edit = Some(typed::set(at.whole, at.value, at.default, &at.path, new).map_or(Edit::Clear, Edit::Set));
+                });
+            } else {
+                // A group says when the package sets something in it, so that a change shows while it is closed.
+                let holds = typed::at(at.value, &at.path).is_some_and(|value| value.as_table().is_none_or(|table| !table.is_empty()));
+                let removable = dynamic && elements > 1;
+                ui.collapsing(&id, &title, if holds { "set" } else { "" }, |ui| {
+                    self.members(ui, &child, at);
+                    if removable && ui.icon_button(Icon::Cross, "Remove this element") {
+                        let Some(Step::Index(index)) = at.path.last() else { return };
+                        at.edit = Some(typed::remove(at.whole, at.value, at.default, *index).map_or(Edit::Clear, Edit::Set));
+                    }
+                });
+                ui.tooltip(&typed::about(&child));
+            }
+            at.path.pop();
+        }
+        if dynamic && ui.icon_button(Icon::Plus, "Add an element: a copy of the last") {
+            at.edit = Some(typed::add(at.whole, at.value, at.default).map_or(Edit::Clear, Edit::Set));
+        }
+    }
+}
+
+/// Where a walk of an option's members is: the option, its whole shape, what its package sets and its default, the path reached,
+/// and what an input there asked for.
+struct Members<'a> {
+    option: &'a str,
+    whole: &'a Table,
+    value: Option<&'a Value>,
+    default: Option<&'a Value>,
+    /// The value in force, which a dynamic array's length is read from.
+    full: &'a Value,
+    path: Vec<Step>,
+    edit: Option<Edit>,
+}
+
+/// A path as an input's id and a message name it: `1.wedges`, `steps.0`.
+fn path_text(path: &[Step]) -> String {
+    let steps = path.iter().map(|step| match step {
+        Step::Field(name) => name.clone(),
+        Step::Index(index) => index.to_string(),
+    });
+    steps.collect::<Vec<_>>().join(".")
 }
 
 /// What a node makes for a package, from what its tokenizer declares: nothing is made, as a value may need args. For the target in use.
@@ -400,16 +577,27 @@ mod tests {
     #[test]
     fn an_option_is_held_to_its_type() {
         let option: Table = "type = 'enum'\nmembers = ['matte', 'gloss']".parse().unwrap();
-        assert_eq!(wrong(&option, None), Some("not set"));
+        assert_eq!(wrong(&option, None).as_deref(), Some("not set"));
         assert_eq!(wrong(&option, Some(&"gloss".into())), None);
-        assert_eq!(wrong(&option, Some(&"satin".into())), Some("not of its type"));
+        assert_eq!(wrong(&option, Some(&"satin".into())).as_deref(), Some("not of its type"));
         let number: Table = "type = 'int'".parse().unwrap();
         assert_eq!(wrong(&number, Some(&Value::Integer(3))), None);
-        assert_eq!(wrong(&number, Some(&"3".into())), Some("not of its type"));
+        assert_eq!(wrong(&number, Some(&"3".into())).as_deref(), Some("not of its type"));
+    }
+
+    #[test]
+    fn a_default_is_no_value_missing_and_shows_as_written() {
+        let option: Table = "type = 'int'\ndefault = '900'".parse().unwrap();
+        assert_eq!(wrong(&option, None), None);
+        assert_eq!(default_shown(&option).as_deref(), Some("900"));
+        let named: Table = "type = 'string'\ndefault = '\"a\"'".parse().unwrap();
+        assert_eq!(default_shown(&named).as_deref(), Some("a"));
+        let flag: Table = "type = 'bool'\ndefault = '1'".parse().unwrap();
+        assert_eq!(default_shown(&flag).as_deref(), Some("true"));
     }
 
     #[test]
     fn a_number_is_typed_either_way() {
-        assert_eq!((number("31"), number(" 0x1F "), number("x")), (Some(31), Some(31), None));
+        assert_eq!((typed::typed_number("31"), typed::typed_number(" 0x1F "), typed::typed_number("x")), (Some(31), Some(31), None));
     }
 }
