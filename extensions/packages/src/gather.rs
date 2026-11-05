@@ -23,6 +23,9 @@ pub const OPTIONS: &str = "pe2_options.h";
 pub const INCLUDES: &str = "includes";
 /// What a gathered package links besides its own objects, a line each: `dependency <path>` and `bound <path>`.
 pub const LINKED: &str = "linked";
+/// What declares a package's slots and options, and how the editor shows them: all of it in one of the package's units, whose order is
+/// the order the editor lists them in.
+const DECLARING: [&str; 5] = ["PE2_BIND", "PE2_BIND_ARG", "PE2_BIND_SELF", "PE2_OPTION_DEF", "PE2_EDITOR_LABEL"];
 /// What a gathered tree is of: the package's name, which names its objects.
 pub const NAME: &str = "package";
 /// Where a package's tree holds what it can include of others, each under its name: what it includes in angle brackets.
@@ -101,6 +104,7 @@ struct Gathering<'a> {
     reached: BTreeSet<String>,
     pending: Vec<Taken>,
     options: Options,
+    declaring: Declaring,
 }
 
 /// Every package's name, by its path: what others include it by (`<engine/fs.h>`) and its objects are named by - its folder's name,
@@ -120,6 +124,38 @@ fn package_names(paths: &[String]) -> HashMap<String, String> {
         names.insert(path.clone(), name);
     }
     names
+}
+
+/// Where a package declares its slots and options: one of its units, the first that does, which any other declaring breaks
+/// (`gen_package_values.py`'s `gathered`) - never a header, which whatever includes it reads.
+struct Declaring {
+    file: Option<String>,
+    /// The package's units, by their paths, and its name.
+    units: BTreeSet<String>,
+    own: String,
+}
+
+impl Declaring {
+    fn of(own: &str, units: &[String]) -> Declaring {
+        Declaring { file: None, units: units.iter().cloned().collect(), own: own.to_string() }
+    }
+
+    fn check(&mut self, found: &scan::Use, file: &str) -> Result<()> {
+        if !DECLARING.contains(&found.name) {
+            return Ok(());
+        }
+        let at = format!("{file}:{}", found.line);
+        if !self.units.contains(file) {
+            bail!("{at}: {} in no unit of {}: a package declares its slots and options in one of its units, never in a header", found.name, self.own);
+        }
+        match &self.file {
+            Some(first) if first != file => {
+                bail!("{at}: {} outside {first}: a package's slots and options are declared in one file, in the order the editor lists them", found.name)
+            }
+            _ => self.file = Some(file.to_string()),
+        }
+        Ok(())
+    }
 }
 
 /// The name of the package at a path, in the graph.
@@ -229,10 +265,11 @@ pub fn gather(call: &mut Call) -> Result<Typed> {
     let own = &packages[&name];
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let (objects, images) = linked(&packages, &name);
-    let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::default() };
+    let mut gathering = Gathering { call, packages, own: name.clone(), tree: BTreeMap::new(), reached: BTreeSet::new(), pending: vec![], options: Options::default(), declaring: Declaring::of(&name, &[]) };
     // A library may have nothing to compile: no units; sources declared and matching nothing are a mistake.
     let fields = own_fields(call);
     let units = if strings(&fields, "sources").is_empty() { vec![] } else { selected(&fields, &own_path, &own_files)? };
+    gathering.declaring = Declaring::of(&name, &units);
     let within = format!("{own_path}/");
     let mut listed = String::new();
     for unit in &units {
@@ -403,17 +440,26 @@ fn is_source(file: &str) -> bool {
     std::path::Path::new(file).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|extension| ["c", "h", "inc"].contains(&extension))
 }
 
-/// What a package's files say, read as text: what it compiles, its slots, each with its type, the addresses read and the args given, public
-/// where a file its dependents read names it, and its options. What it is set to is its asset's, as written: a view shows that.
+/// What a package's files say, read as text: what it compiles, its slots, each with its type, the addresses read and the args given, and
+/// its options. What it is set to is its asset's, as written: a view shows that.
 pub fn reflection(call: &mut Call) -> Result<Table> {
     let call: &Call = call;
     let path = call.host.path().to_string();
     let packages = packages(call)?;
-    let own = &packages[&name_at(&packages, &path)?];
-    let public: Vec<String> = strings(&own.fields, "public").iter().map(|folder| format!("{path}/{folder}/")).collect();
-    let mut walk = Walk { call, own, packages: &packages, public, seen: BTreeSet::new(), label: String::new(), order: 0, slots: Slots::default(), options: Options::default() };
-    // As a compile reads them, then whatever only dependents read.
+    let name = name_at(&packages, &path)?;
+    let own = &packages[&name];
     let units = if strings(&own.fields, "sources").is_empty() { vec![] } else { selected(&own.fields, &path, &own.files)? };
+    let mut walk = Walk {
+        call,
+        packages: &packages,
+        seen: BTreeSet::new(),
+        label: String::new(),
+        order: 0,
+        slots: Slots::default(),
+        options: Options::default(),
+        declaring: Declaring::of(&name, &units),
+    };
+    // As a compile reads them, then whatever only dependents read.
     for file in units.iter().chain(own.files.iter().filter(|file| is_source(file))) {
         walk.label.clear();
         walk.file(file)?;
@@ -434,14 +480,13 @@ pub fn reflection(call: &mut Call) -> Result<Table> {
 /// declare comes in the order a reader of them meets it. A label holds to the end of its file, what a file includes starting under it.
 struct Walk<'a> {
     call: &'a Call<'a>,
-    own: &'a Package,
     packages: &'a HashMap<String, Package>,
-    public: Vec<String>,
     seen: BTreeSet<String>,
     label: String,
     order: i64,
     slots: Slots,
     options: Options,
+    declaring: Declaring,
 }
 
 impl Walk<'_> {
@@ -451,21 +496,19 @@ impl Walk<'_> {
         }
         let bytes = self.call.read_entry(file)?;
         let text = String::from_utf8_lossy(&bytes);
-        // What it reads of a dependency it reads as its own: a slot a header there declares is filled here.
-        let its_own = self.own.owns(file);
-        let in_public = !its_own || self.public.iter().any(|folder| file.starts_with(folder.as_str()));
         let entered = self.label.clone();
         let mut includes = text.lines().enumerate().filter_map(|(at, line)| Some((at + 1, included(line)?))).peekable();
         for found in scan::uses(&text) {
             while let Some((line, (name, quoted))) = includes.next_if(|(line, _)| *line < found.line) {
                 self.include(file, line, name, quoted)?;
             }
+            self.declaring.check(&found, file)?;
             self.order += 1;
             self.options.read(&found, &format!("{file}:{}", found.line));
             if let ("PE2_EDITOR_LABEL", [label]) = (found.name, found.args.as_slice()) {
                 self.label = label_in(label).unwrap_or_default();
             }
-            self.slots.read(&found, in_public, &self.label, self.order);
+            self.slots.read(&found, &self.label, self.order);
             self.options.place(&found, &self.label, self.order);
         }
         for (line, (name, quoted)) in includes {
@@ -507,13 +550,12 @@ struct Slot {
     label: String,
     /// Where it was first declared, among all a package's slots and options: a later declaration of it moves nothing.
     order: i64,
-    public: bool,
     reads: BTreeSet<Vec<String>>,
     args: BTreeMap<(Vec<String>, String), Vec<String>>,
 }
 
 impl Slots {
-    fn read(&mut self, found: &scan::Use, public: bool, label: &str, order: i64) {
+    fn read(&mut self, found: &scan::Use, label: &str, order: i64) {
         let Some(name) = found.args.first().filter(|name| !name.is_empty()) else { return };
         let rest: Vec<String> = found.args[1..].iter().map(ToString::to_string).collect();
         match found.name {
@@ -523,7 +565,6 @@ impl Slots {
                     (slot.ty, slot.label, slot.order) = (rest.first().cloned(), label.to_string(), order);
                 }
                 slot.attributes.extend(rest.iter().skip(1).filter_map(|word| word.strip_prefix('_')).map(str::to_string));
-                slot.public |= public;
             }
             // What `pe2.h` expands it to, as a source reads before a first pass has: a file, and the package built.
             "PE2_BIND_SELF" => {
@@ -531,7 +572,6 @@ impl Slots {
                 if file.ty.is_none() {
                     (file.ty, file.label, file.order) = (Some("file".to_string()), label.to_string(), order);
                 }
-                file.public |= public;
                 let own = self.held.entry(SELF.to_string()).or_default();
                 own.ty.get_or_insert_with(|| "package".to_string());
                 own.attributes.extend(["self".to_string(), HIDDEN.to_string()]);
@@ -556,7 +596,6 @@ impl Slots {
             out.insert("label".into(), slot.label.clone().into());
             out.insert("order".into(), slot.order.into());
             out.insert("type".into(), slot.ty.clone().unwrap_or_default().into());
-            out.insert("public".into(), slot.public.into());
             out.insert(HIDDEN.into(), slot.attributes.contains(HIDDEN).into());
             let reads = slot.reads.iter().map(|read| Value::String(read.join("/")));
             out.insert("reads".into(), Value::Array(reads.collect()));
@@ -848,7 +887,7 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
         let bytes = call.read(file)?;
         let text = String::from_utf8_lossy(&bytes);
         for found in scan::uses(&text) {
-            slots.read(&found, false, "", 0);
+            slots.read(&found, "", 0);
             match found.name {
                 "PE2_VALUE" => reads.extend(Read::of(&found.args)),
                 "PE2_QUERY" => queries.extend(Query::of(&found.args)),
@@ -1110,6 +1149,7 @@ impl Gathering<'_> {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             self.tree.insert(taken.place.clone(), bytes);
             for found in scan::uses(&text) {
+                self.declaring.check(&found, &taken.entry)?;
                 self.options.read(&found, &format!("{}:{}", taken.entry, found.line));
             }
             for (at, line) in text.lines().enumerate() {
