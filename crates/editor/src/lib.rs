@@ -31,6 +31,7 @@ mod events_pane;
 mod ext_ui;
 mod extensions_pane;
 mod external;
+mod fetcher;
 mod gpu_stats;
 mod gpu_view;
 mod graph_pane;

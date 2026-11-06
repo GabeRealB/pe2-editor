@@ -307,7 +307,7 @@ impl Imports {
             | Problem::Orphan { asset, .. }
             | Problem::Taken { asset, .. } => !of(asset),
             Problem::MissingOutput { asset, target, .. } => !of(asset) && !of(target),
-            Problem::Extension { .. } | Problem::Required { .. } | Problem::Unlocked { .. } => false,
+            Problem::Extension { .. } | Problem::Required { .. } => false,
             _ => true,
         });
         index.problems.extend(problems);
@@ -526,18 +526,14 @@ fn known_of(extensions: &Extensions, importer: String, kept: Kept, reads: Reads)
     Ok((reads, Arc::new(Known { importer, files, made: settings, derives, notes, resolved: Mutex::default() })))
 }
 
-/// What is wrong with a project's extensions: those it holds not loaded, as problems of their assets, what it requires and
-/// does not have, and what is no longer what it took in.
+/// What is wrong with a project's extensions: those it holds not loaded, and what it requires and does not have.
 fn extension_problems(extensions: &Extensions) -> Vec<Problem> {
     let refused = extensions.present.iter().filter_map(|p| match (&p.origin, &p.status) {
-        (Origin::Project { asset, .. }, Status::Refused(why)) => {
-            Some(Problem::Extension { asset: asset.clone(), error: why.clone() })
-        }
+        (Origin::Project(_), Status::Refused(why)) => Some(Problem::Extension { id: p.id.clone(), error: why.clone() }),
         _ => None,
     });
     let unmet = extensions.unmet.iter().map(|(id, why)| Problem::Required { id: id.clone(), why: why.clone() });
-    let unlocked = extensions.unlocked.iter().map(|id| Problem::Unlocked { id: id.clone() });
-    refused.chain(unmet).chain(unlocked).collect()
+    refused.chain(unmet).collect()
 }
 
 /// How long a store goes unswept, while something is kept in it, before a sweep is due.

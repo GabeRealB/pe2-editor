@@ -10,7 +10,8 @@ use crate::import::{Recognized, Signature, TypeDef};
 use crate::ty::ValueType;
 use crate::{Asset, Project, Result, Table, Value, View};
 
-/// An extension: its id, its version, how it depends on others and its entry point. `extension!` makes it.
+/// An extension: its id, its version, how it depends on others and its entry point. `extension!` makes it from its
+/// manifest.
 pub struct Extension {
     pub id: &'static str,
     /// Its version, as semver: `0.1.0`.
@@ -34,71 +35,6 @@ pub struct Extension {
     /// until then none of it runs.
     pub unsandboxed: bool,
     pub register: fn(&mut Registry) -> Result<()>,
-}
-
-/// Declares an extension: its id, its version, its entry point and, optionally, what it requires. Defines `ID`, the
-/// id, and `extension()`, which a host linking it in loads it by; built as a component, it exports it.
-///
-/// ```ignore
-/// pe2_ext::extension!("acme.fonts", "0.1.0", register, requires = ["pe2.images@^0.1"]);
-/// ```
-#[macro_export]
-macro_rules! extension {
-    ($id:literal, $version:literal, $register:path
-        $(, requires = [$($requires:literal),* $(,)?])?
-        $(, weak = [$($weak:literal),* $(,)?])?
-        $(, optional = [$($optional:literal),* $(,)?])?
-        $(, provides = [$($provides:literal),* $(,)?])?
-        $(, platforms = [$($platforms:literal),* $(,)?])?
-        $(, unsandboxed = $unsandboxed:literal)?
-        $(, hashed = [$($hashed:literal),* $(,)?])?
-        $(,)?) => {
-        /// This extension's id.
-        pub const ID: &str = $id;
-
-        /// This extension, for the host to load.
-        #[must_use]
-        pub fn extension() -> $crate::Extension {
-            $crate::Extension {
-                id: $id,
-                version: $version,
-                requires: &[$($($requires),*)?],
-                weak: &[$($($weak),*)?],
-                optional: &[$($($optional),*)?],
-                provides: &[$($($provides),*)?],
-                platforms: &[$($($platforms),*)?],
-                unsandboxed: false $(|| $unsandboxed)?,
-                register: $register,
-            }
-        }
-
-        /// This extension, for the SDK's component exports.
-        #[cfg(target_family = "wasm")]
-        #[unsafe(no_mangle)]
-        fn __pe2_extension() -> $crate::Extension {
-            extension()
-        }
-
-        /// Who it is, as its component carries it in the section the host reads without running it
-        /// (`pe2-extension`): as TOML.
-        #[cfg(target_family = "wasm")]
-        const __PE2_ABOUT: &str = concat!(
-            "id = \"", $id, "\"\nversion = \"", $version, "\"\nrequires = [", $($("\"", $requires, "\", ",)*)? "]\nweak = [",
-            $($("\"", $weak, "\", ",)*)? "]\noptional = [", $($("\"", $optional, "\", ",)*)? "]\nprovides = [",
-            $($("\"", $provides, "\", ",)*)? "]\nplatforms = [", $($("\"", $platforms, "\", ",)*)? "]\n"
-            $(, "unsandboxed = ", $unsandboxed, "\n")?
-            $(, "hashed = [", $("\"", $hashed, "\", ",)*  "]\n")?
-        );
-        #[cfg(target_family = "wasm")]
-        #[unsafe(link_section = "pe2-extension")]
-        #[used]
-        static __PE2_ABOUT_SECTION: [u8; __PE2_ABOUT.len()] = $crate::section(__PE2_ABOUT);
-
-        #[cfg(target_family = "wasm")]
-        use $crate::guest::Component as __Pe2Component;
-        #[cfg(target_family = "wasm")]
-        $crate::guest::bindings::export_component!(__Pe2Component with_types_in $crate::guest::bindings);
-    };
 }
 
 /// A text as a custom section's bytes, for `extension!`.

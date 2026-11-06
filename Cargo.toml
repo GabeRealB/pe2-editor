@@ -6,12 +6,15 @@ members = [
     "crates/formats",
     "crates/codecs",
     "crates/ext",
+    "crates/ext-macros",
+    "crates/setup",
     "crates/model",
     "crates/project",
     "crates/webgpu",
     "crates/mcp",
     "crates/cli",
     "crates/editor",
+    "xtask",
     "extensions",
     "extensions/fonts",
     "extensions/formats",
@@ -46,6 +49,8 @@ pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }
+pe2-ext-macros = { path = "crates/ext-macros" }
+pe2-setup = { path = "crates/setup" }
 # The guest side of the extensions' contract (crates/ext/wit), for extensions built as components.
 wit-bindgen = "0.63"
 # The host of the extensions built as components: wasmtime with what WASI 0.3 components need, no more.
@@ -96,6 +101,13 @@ miniz_oxide = "0.8"
 crc32fast = "1"
 quick-xml = "0.41"
 sha1 = "0.10"
+sha2 = "0.10"
+# What an extension's setup fetches (crates/setup): HTTPS, and the archives it comes in.
+ureq = "2"
+flate2 = "1"
+# What a setup's .tar.xz downloads are read with: pure Rust, decoding only.
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "optimization"] }
+tar = "0.4"
 toml = { version = "0.8", features = ["preserve_order"] }
 # Edits to project.toml that keep its comments and layout; the version `toml` reads with.
 toml_edit = "0.22"

@@ -2091,7 +2091,7 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                 ui.label(RichText::new(problem.describe()).color(theme::weak()));
                 // An entry gone from a layer: left listed until it is said to be gone, as its path may come back. Only the
                 // list is written, so a read-only mount forgets too.
-                if let project::index::Problem::Missing { layer, path } = problem
+                if let project::index::Problem::Missing { layer, path, .. } = problem
                     && ws.layers.iter().any(|l| l.name == *layer && l.writable)
                     && let Some(uid) = ws.index.listed(layer, path)
                     && ui
@@ -2142,8 +2142,9 @@ fn project_extensions_ui(ui: &mut egui::Ui, ws: &Workspace) {
                         ui.label(RichText::new("linked in").small().color(ui.visuals().warn_fg_color))
                             .on_hover_text("PE2_EXTENSIONS=linked: its crate runs in the editor, not its component");
                     }
-                    project::ext::Origin::Project { asset, .. } => {
-                        ui.label(RichText::new("project").small().color(theme::weak())).on_hover_text(asset);
+                    project::ext::Origin::Project(folder) => {
+                        ui.label(RichText::new("project").small().color(theme::weak()))
+                            .on_hover_text(folder.display().to_string());
                     }
                     project::ext::Origin::User(path)
                     | project::ext::Origin::Install(path)

@@ -2,3 +2,7 @@
 # about a third faster at decoding the image kinds.
 [target.wasm32-wasip3]
 rustflags = ["-C", "target-feature=+simd128"]
+
+# The editor's own tasks (xtask/): `cargo xtask dist`, `cargo xtask package`.
+[alias]
+xtask = "run --quiet --package xtask --"

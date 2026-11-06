@@ -239,6 +239,8 @@ impl History {
     /// now is left alone.
     fn changed(list: &[Change]) -> Vec<PathBuf> {
         let mut state: std::collections::HashMap<&Path, Option<String>> = std::collections::HashMap::new();
+        // Whether what an earlier move took away or put there is there, as the list leaves it.
+        let mut moved: std::collections::HashMap<&Path, bool> = std::collections::HashMap::new();
         let mut differing = vec![];
         for change in list {
             match change {
@@ -251,9 +253,12 @@ impl History {
                 }
                 Change::Rename { from, to } => {
                     let untouched = !state.contains_key(from.as_path()) && !state.contains_key(to.as_path());
-                    if untouched && (!from.exists() || to.exists()) {
+                    let there = |path: &Path| moved.get(path).copied().unwrap_or_else(|| path.exists());
+                    if untouched && (!there(from) || there(to)) {
                         differing.push(from.clone());
                     }
+                    moved.insert(from, false);
+                    moved.insert(to, true);
                 }
                 Change::MakeDir { path } => {
                     if path.exists() && !path.is_dir() {
@@ -487,6 +492,24 @@ impl Transaction<'_> {
         self.change(Change::Write { path: path.to_path_buf(), before, after: None })
     }
 
+    /// Put a copy of a file or a folder at `to`, where there is nothing: copied whole into the history's trash, each
+    /// file's permissions kept, then moved into place - so that undoing and redoing it moves it, programs still programs.
+    ///
+    /// # Errors
+    /// Something is at `to`, or it cannot be copied or moved.
+    pub fn place(&mut self, from: &Path, to: &Path) -> Result<()> {
+        if to.exists() {
+            bail!("{}: something is there", to.display());
+        }
+        self.history.trashed += 1;
+        let trash = self.history.dir.join("trash");
+        std::fs::create_dir_all(&trash)?;
+        let staged = trash.join(self.history.trashed.to_string());
+        copy_all(from, &staged).with_context(|| format!("{} to {}", from.display(), staged.display()))?;
+        self.make_parents(to)?;
+        self.change(Change::Rename { from: staged, to: to.to_path_buf() })
+    }
+
     /// Move a file or a folder.
     ///
     /// # Errors
@@ -529,6 +552,19 @@ impl Drop for Transaction<'_> {
         }
         let _ = self.history.settle();
     }
+}
+
+/// A file or a folder copied, with everything in it; a file keeps its permissions.
+fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_all(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    std::fs::copy(from, to).map(drop)
 }
 
 fn current_hash(path: &Path) -> Option<String> {

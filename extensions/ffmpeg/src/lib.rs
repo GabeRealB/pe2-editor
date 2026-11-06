@@ -20,7 +20,7 @@ use pe2_ext::{Data, File, Registry, Result, Signature, Table, Typed, Value, anyh
 mod ask;
 mod decode;
 
-pe2_ext::extension!("pe2.ffmpeg", "0.1.0", register, provides = ["video-container@1.0.0"], unsandboxed = true);
+pe2_ext::extension!(register);
 
 /// A video file.
 pub struct Video;

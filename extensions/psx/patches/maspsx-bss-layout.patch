@@ -1,0 +1,12 @@
+diff --git a/maspsx/maspsx/__init__.py b/maspsx/maspsx/__init__.py
+--- a/maspsx/maspsx/__init__.py
++++ b/maspsx/maspsx/__init__.py
+@@ -678,6 +678,8 @@
+                     res.append(f"\t.comm {symbol},{size},{alignment}")
+                     continue
+ 
++                if symbol in self.comm_symbols:  # PSYLINK aligns .comm to 2, 4 or 8 by size
++                    alignment = 8 if size >= 8 else 4 if size >= 4 else 2 if size >= 2 else 1
+                 if alignment > 1:
+                     res.append(f"\t.align {alignment.bit_length() - 1}")
+ 

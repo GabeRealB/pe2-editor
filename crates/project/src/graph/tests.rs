@@ -464,6 +464,42 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
 }
 
 #[test]
+fn an_outputs_newest_trace_of_each_of_the_last_two_builds_is_kept() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-builds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // One project, its operation built three ways: an editor of each version on it in turn.
+    let built = |version: &str| {
+        let mut ops = ops();
+        let upper = (**ops.get("t.upper").unwrap()).clone();
+        ops.add(OpDef { version: version.into(), ..upper });
+        Engine::new(ops, Some(Store::at(dir.clone()).unwrap()))
+    };
+    let (one, two, three) = (built("1"), built("2"), built("3"));
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
+    let node = Bundle::new(stack, &[("a.txt", "abc")]);
+    let live: HashSet<String> = ["test/bundle".to_string()].into();
+    let made = |engine: &Engine| {
+        let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
+        let kept = engine.output(&plan, &node, "native", false).unwrap().kept;
+        // Traces written apart in time, as editors run apart.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        kept
+    };
+    assert!(!made(&one));
+    assert!(!made(&two));
+    // Each build's trace stays, though the other's is newer: each finds what it made.
+    assert_eq!(one.store().unwrap().sweep_older(&live, &HashSet::new(), later()).0, 0);
+    assert!(made(&one), "the first build finds its own");
+    assert!(made(&two), "and the second its own");
+    // A third: the build that made it longest ago goes - its trace, not the value all three share.
+    assert!(!made(&three));
+    assert_eq!(one.store().unwrap().sweep_older(&live, &HashSet::new(), later()), (1, 0, 0));
+    assert!(!made(&one), "made again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_nodes_result_is_kept_by_its_stack_or_the_host() {
     let names = |plan: &Plan| plan.outputs.iter().map(|o| (o.name.clone(), o.retain)).collect::<Vec<_>>();
     // A stored file is seen as it is: nothing keeps it.

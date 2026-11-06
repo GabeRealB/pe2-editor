@@ -1,0 +1,6 @@
+id = "pe2.render.tests"
+version = "0.1.0"
+requires = ["pe2.render@^0.1", "pe2.test@^0.1"]
+description = "Tests of pe2.render."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

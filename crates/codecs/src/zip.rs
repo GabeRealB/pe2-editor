@@ -33,6 +33,9 @@ pub struct Entry<'a> {
     pub data: &'a [u8],
     /// Deflated, or stored as it is (`OpenRaster`'s `mimetype` must be stored, and first).
     pub deflate: bool,
+    /// Its Unix permissions (`0o755` for a program), which unzipping on Unix gives it back; 0 says none, and the
+    /// archive is written as one made anywhere.
+    pub mode: u32,
 }
 
 /// An archive of these entries, in their order.
@@ -68,12 +71,13 @@ pub fn write(entries: &[Entry]) -> Vec<u8> {
         out.extend_from_slice(entry.name.as_bytes());
         out.extend_from_slice(body);
         put32(&mut central, CENTRAL);
-        put16(&mut central, 20); // made by: 2.0
+        // Made by: 2.0, on Unix where it says permissions, which then are the external attributes' high half.
+        put16(&mut central, if entry.mode == 0 { 0x14 } else { 0x0300 | 0x14 });
         header(&mut central);
         put16(&mut central, 0); // comment
         put16(&mut central, 0); // disk
         put16(&mut central, 0); // internal attributes
-        put32(&mut central, 0); // external attributes
+        put32(&mut central, if entry.mode == 0 { 0 } else { (0o100_000 | (entry.mode & 0o7777)) << 16 });
         put32(&mut central, offset);
         central.extend_from_slice(entry.name.as_bytes());
     }
@@ -121,6 +125,8 @@ pub struct Archive<'a> {
 
 #[derive(Clone, Copy)]
 struct Located {
+    /// Its Unix permissions, where it was made on Unix and says them; 0 otherwise.
+    mode: u32,
     method: u16,
     crc: u32,
     compressed: usize,
@@ -150,7 +156,11 @@ impl<'a> Archive<'a> {
             if get32(bytes, at)? != CENTRAL {
                 return error("a broken central directory");
             }
+            // Made on Unix (the high byte 3), the external attributes' high half is the file's mode.
+            let unix = get16(bytes, at + 4)? >> 8 == 3;
+            let mode = if unix { (get32(bytes, at + 38)? >> 16) & 0o7777 } else { 0 };
             let located = Located {
+                mode,
                 method: get16(bytes, at + 10)?,
                 crc: get32(bytes, at + 16)?,
                 compressed: get32(bytes, at + 20)? as usize,
@@ -180,6 +190,14 @@ impl<'a> Archive<'a> {
     pub fn read(&self, name: &str) -> Option<Result<Vec<u8>, Error>> {
         let (_, located) = self.entries.iter().find(|(n, _)| n == name)?;
         Some(self.contents(name, *located))
+    }
+
+    /// An entry's Unix permissions, where its archive was made on Unix and says them; none otherwise, or when it has no
+    /// entry of that name.
+    #[must_use]
+    pub fn mode(&self, name: &str) -> Option<u32> {
+        let (_, located) = self.entries.iter().find(|(n, _)| n == name)?;
+        (located.mode != 0).then_some(located.mode)
     }
 
     fn contents(&self, name: &str, e: Located) -> Result<Vec<u8>, Error> {
@@ -214,8 +232,8 @@ mod tests {
     fn an_archive_reads_back_and_writes_the_same_twice() {
         let big = vec![7u8; 10_000];
         let entries = [
-            Entry { name: "mimetype", data: b"image/openraster", deflate: false },
-            Entry { name: "data/a.png", data: &big, deflate: true },
+            Entry { name: "mimetype", data: b"image/openraster", deflate: false, mode: 0 },
+            Entry { name: "data/a.png", data: &big, deflate: true, mode: 0 },
         ];
         let bytes = write(&entries);
         assert_eq!(bytes, write(&entries));
@@ -225,5 +243,9 @@ mod tests {
         assert_eq!(archive.read("data/a.png").unwrap().unwrap(), big);
         assert_eq!(archive.read("mimetype").unwrap().unwrap(), b"image/openraster");
         assert!(archive.read("missing").is_none());
+        assert_eq!(archive.mode("data/a.png"), None, "made anywhere, it says nothing of permissions");
+        // A program's permissions, kept.
+        let bytes = write(&[Entry { name: "bin/tool", data: b"#!/bin/sh\n", deflate: true, mode: 0o755 }]);
+        assert_eq!(Archive::new(&bytes).unwrap().mode("bin/tool"), Some(0o755));
     }
 }

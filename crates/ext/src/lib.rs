@@ -40,6 +40,7 @@ pub use data::{
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
+pub use pe2_ext_macros::extension;
 pub use project::{Project, Requested};
 pub use registry::{
     ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow,

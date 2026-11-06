@@ -838,11 +838,45 @@ impl host::HostTexture for State {
 }
 
 impl unsandboxed::Host for State {
+    fn set_up(&mut self, name: String) -> wasmtime::Result<Result<(), String>> {
+        let id = self.id.clone();
+        let Some(unsandboxed) = &self.unsandboxed else {
+            return Ok(Err(format!("{id}: it runs in the sandbox, and fetches nothing")));
+        };
+        let Some(setup) = unsandboxed.setup.iter().find(|setup| setup.name == name) else {
+            return Ok(Err(format!("{id} fetches nothing called {name} for this platform")));
+        };
+        let Some(store) = &unsandboxed.store else {
+            return Ok(Err(format!("{name}: there is no place on this computer to keep it")));
+        };
+        if setup.fetched(store) {
+            return Ok(Ok(()));
+        }
+        if unsandboxed.off.contains(&setup.key()) {
+            return Ok(Err(format!(
+                "{name} is turned off on this computer: turn it on in {id}'s Fetches in the editor's Extensions, or \
+                 `pe2-cli project extension setup {id} --enable \"{name}\"`"
+            )));
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let fetched = super::setup::fetch(setup, store, unsandboxed.folder.as_deref(), &mut |_, _| {}, &cancel);
+        Ok(fetched.map_err(|e| format!("{id}: {name}: {e:#}")))
+    }
+
     fn spawn(&mut self, tool: String, args: Vec<String>) -> wasmtime::Result<Result<Resource<HostProcess>, String>> {
         let Some(unsandboxed) = &self.unsandboxed else {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         };
-        let program = super::unsandboxed::program(unsandboxed.folder.as_deref(), &tool);
+        let (folder, fetched) = (unsandboxed.folder.as_deref(), unsandboxed.fetched());
+        // A name it launches is another program with arguments of its own, before those passed.
+        let (program, args) = match unsandboxed.launch.iter().find(|launch| launch.name == tool) {
+            Some(launch) => {
+                let (program, mut before) = launch.resolved(folder, &fetched);
+                before.extend(args);
+                (program, before)
+            }
+            None => (super::unsandboxed::program(folder, &fetched, &tool), args),
+        };
         let spawned = std::process::Command::new(&program)
             .args(&args)
             .stdin(std::process::Stdio::piped())
@@ -851,7 +885,22 @@ impl unsandboxed::Host for State {
             .spawn();
         let mut child = match spawned {
             Ok(child) => child,
-            Err(e) => return Ok(Err(format!("{}: {e}", program.display()))),
+            Err(e) => {
+                let missing = e.kind() == std::io::ErrorKind::NotFound;
+                let notes = unsandboxed.install.as_ref().filter(|_| missing);
+                let mut see = notes
+                    .map_or_default(|notes| format!("; see {}'s installation notes: {}", self.id, notes.display()));
+                // What it fetches may be what is missing.
+                let unset = unsandboxed.unset();
+                if missing && !unset.is_empty() {
+                    let (id, unset) = (&self.id, unset.join(", "));
+                    see = format!(
+                        "; {id} has not fetched what it requires on this machine yet ({unset}): \
+                         `pe2-cli project extension setup {id}`, or its Fetches in the editor's Extensions{see}"
+                    );
+                }
+                return Ok(Err(format!("{}: {e}{see}", program.display())));
+            }
         };
         let (input, output, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (Some(output), Some(mut stderr)) = (output, stderr) else {
@@ -1525,6 +1574,13 @@ impl Shared {
         self.caps.get(&format!("{}@{local}", self.id)).copied().unwrap_or(MEMORY)
     }
 
+    /// Have what an unsandboxed extension requires fetched before it runs (`Unsandboxed::have_required`).
+    fn have_required(&self) -> Result<()> {
+        self.unsandboxed
+            .as_ref()
+            .map_or(Ok(()), |unsandboxed| unsandboxed.have_required().with_context(|| self.id.clone()))
+    }
+
     /// The time a long call of it may take, in ticks.
     fn long(&self) -> u64 {
         if self.unsandboxed.is_some() { UNSANDBOXED_LONG } else { LONG }
@@ -1570,6 +1626,7 @@ impl Shared {
 
     /// A job that may take `cap` bytes: run on an instance made for it, dropped when it returns.
     fn job<R>(&self, cap: u64, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
+        self.have_required()?;
         let mut runner = self.instantiate(cap).with_context(|| self.id.clone())?;
         let out = call(&mut runner).with_context(|| self.id.clone());
         self.peak.fetch_max(runner.bytes(), Ordering::Relaxed);
@@ -1580,6 +1637,7 @@ impl Shared {
     /// on another thread is a job. One that failed, or grew past the budget, goes.
     fn read<R>(&self, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
         let Ok(mut reading) = self.reading.try_lock() else { return self.job(MEMORY, call) };
+        self.have_required()?;
         let mut runner = match reading.take() {
             Some((runner, _)) => runner,
             None => self.instantiate(MEMORY).with_context(|| self.id.clone())?,
@@ -2721,7 +2779,8 @@ pub fn load(path: &Path) -> Result<Loadable> {
 }
 
 /// Who a component is, as `extension!` writes it into the section the host reads without running it
-/// (`pe2-extension`, in its core module): its id, version, dependencies and what it runs as.
+/// (`pe2-extension`, in its core module): its manifest - its id, version, dependencies, what it runs as, and what is said
+/// of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct About {
     pub id: String,
@@ -2738,17 +2797,80 @@ pub struct About {
     pub platforms: Vec<String>,
     #[serde(default)]
     pub unsandboxed: bool,
-    /// What of its folder counts as what it is, beside its component (`unsandboxed::trust`); empty, all of it.
+    /// What it fetches onto a machine before it runs (`setup`): unsandboxed, the programs it starts.
     #[serde(default)]
-    pub hashed: Vec<String>,
+    pub setup: Vec<super::setup::Setup>,
+    /// What it starts by name that is another program with arguments (`unsandboxed::Launch`).
+    #[serde(default)]
+    pub launch: Vec<super::unsandboxed::Launch>,
+    /// What is said of it, which the code does not know.
+    #[serde(flatten)]
+    pub described: Described,
+}
+
+/// What a manifest says of an extension, for people: nothing of it changes what runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Described {
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Its license, as an SPDX expression.
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Its guides' first page, in its folder.
+    #[serde(default)]
+    pub docs: Option<String>,
+    /// What to set up on the machine before it runs, in its folder: where there is nothing, none.
+    #[serde(default)]
+    pub install: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// What it ships of others', each with its license.
+    #[serde(default)]
+    pub bundled: Vec<Bundled>,
+}
+
+/// Something an extension ships of others'.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Bundled {
+    pub name: String,
+    /// Its license, as an SPDX expression.
+    pub license: String,
+    /// The license's text, in the extension's folder.
+    pub text: String,
+}
+
+/// What only an extension running unsandboxed may have: setup, which fetches what the programs it starts are, and
+/// launches, which name them. One in the sandbox starts none.
+///
+/// # Errors
+/// It runs in the sandbox, and fetches or launches.
+pub fn sandboxed_fetches_nothing(about: &About) -> Result<()> {
+    anyhow::ensure!(
+        about.unsandboxed || about.setup.is_empty(),
+        "it fetches onto the machine (setup) and runs in the sandbox, which starts no program: only an unsandboxed \
+         extension fetches"
+    );
+    anyhow::ensure!(
+        about.unsandboxed || about.launch.is_empty(),
+        "it names programs to launch and runs in the sandbox, which starts none: only an unsandboxed extension launches"
+    );
+    Ok(())
 }
 
 /// What a component says it is, read from its section; none where it has none (built by an older SDK).
 #[must_use]
 pub fn about(bytes: &[u8]) -> Option<About> {
+    toml::from_str(&manifest_text(bytes)?).ok()
+}
+
+/// The manifest a component carries, as written; none where it carries none.
+#[must_use]
+pub fn manifest_text(bytes: &[u8]) -> Option<String> {
     wasmparser::Parser::new(0).parse_all(bytes).find_map(|payload| match payload.ok()? {
         wasmparser::Payload::CustomSection(section) if section.name() == SECTION => {
-            toml::from_str(std::str::from_utf8(section.data()).ok()?).ok()
+            String::from_utf8(section.data().to_vec()).ok()
         }
         _ => None,
     })
@@ -2817,6 +2939,49 @@ pub struct Unsandboxed {
     pub folder: Option<std::path::PathBuf>,
     /// Its hash: what the user enabled, and what it makes is kept by.
     pub trust: String,
+    /// Its installation notes, where it has any: what a program it cannot start points to.
+    pub install: Option<std::path::PathBuf>,
+    /// Where what its setup fetches is kept on this machine.
+    pub store: Option<std::path::PathBuf>,
+    /// What its setup fetches for this platform.
+    pub setup: Vec<super::setup::Setup>,
+    /// Of what is optional, what the user turned off on this computer, by key.
+    pub off: std::collections::BTreeSet<String>,
+    /// What it starts by name that is another program, for this platform.
+    pub launch: Vec<super::unsandboxed::Launch>,
+}
+
+impl Unsandboxed {
+    /// What its setup fetched onto this machine: the folders, each laid out as its tree is - looked at as it starts a
+    /// program, so that what was fetched since is found.
+    fn fetched(&self) -> Vec<std::path::PathBuf> {
+        let Some(store) = &self.store else { return vec![] };
+        self.setup.iter().filter(|setup| setup.fetched(store)).map(|setup| setup.place(store)).collect()
+    }
+
+    /// Have what it requires on this machine before anything of it runs - an operation, a service, a reading - as a
+    /// step of what asked for it: what is fetched already is there; what another fetch of this process is downloading (the
+    /// editor's, beside) is waited for; what is not, is fetched now. Trusting it consented to it. What is optional is
+    /// fetched when it asks for it (`set-up`).
+    ///
+    /// # Errors
+    /// What it requires cannot be fetched: downloaded, held to its hashes and kept.
+    fn have_required(&self) -> Result<()> {
+        let Some(store) = &self.store else { return Ok(()) };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for setup in self.setup.iter().filter(|setup| !setup.lazy && !setup.fetched(store)) {
+            super::setup::fetch(setup, store, self.folder.as_deref(), &mut |_, _| {}, &cancel)
+                .with_context(|| format!("fetching {}, which it requires", setup.name))?;
+        }
+        Ok(())
+    }
+
+    /// What it requires and is not fetched yet, by name.
+    fn unset(&self) -> Vec<String> {
+        let store = self.store.as_deref();
+        let missing = |setup: &&super::setup::Setup| !setup.lazy && store.is_none_or(|store| !setup.fetched(store));
+        self.setup.iter().filter(missing).map(|setup| setup.name.clone()).collect()
+    }
 }
 
 /// Load an extension the user enabled to run outside the sandbox.
@@ -2837,6 +3002,7 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
     let contract = Some(contract);
     let cell: Arc<OnceLock<Arc<Shared>>> = Arc::default();
     if let Some(about) = about(bytes) {
+        sandboxed_fetches_nothing(&about)?;
         let (name, bytes, said, kept) = (name.to_string(), bytes.to_vec(), about.clone(), cell.clone());
         return Ok(Loadable {
             id: about.id,
@@ -2850,7 +3016,12 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
                 let settings = Value::Table(registry.stored().clone()).to_string();
                 let (shared, told, registration) = start(&name, &bytes, &settings, unsandboxed.clone())?;
                 // What counts as it is for the section alone: it is read to know the extension, before it runs.
-                let told = About { hashed: said.hashed.clone(), ..told };
+                let told = About {
+                    setup: said.setup.clone(),
+                    launch: said.launch.clone(),
+                    described: said.described.clone(),
+                    ..told
+                };
                 anyhow::ensure!(told == said, "{name}: it says it is {told:?}, its section {said:?}");
                 let shared = kept.get_or_init(|| shared).clone();
                 apply(registry, registration, &shared)
@@ -2861,6 +3032,8 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
             build: build.clone(),
             settings: toml::Table::new(),
             trust,
+            described: about.described,
+            setup: about.setup,
             reaches: Vec::new(),
         });
     }
@@ -2882,6 +3055,8 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
         build,
         settings: toml::Table::new(),
         trust,
+        described: about.described,
+        setup: about.setup,
         reaches: Vec::new(),
     })
 }
@@ -2949,7 +3124,9 @@ fn start(
         provides: told.provides,
         platforms: told.platforms,
         unsandboxed: told.unsandboxed,
-        hashed: Vec::new(),
+        setup: Vec::new(),
+        launch: Vec::new(),
+        described: Described::default(),
     };
     Ok((Arc::new(shared), about, registration))
 }

@@ -285,7 +285,7 @@ pub fn delete(
 /// content is its maker's alone (a read-only mount) can forget too.
 ///
 /// # Errors
-/// The layer does not list the uid, or still holds its path.
+/// The layer does not list the uid, or still holds its path where the index does not leave it out.
 pub fn forget(
     project: &Project,
     index: &Index,
@@ -295,7 +295,11 @@ pub fn forget(
 ) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let path = changeset.entries.get(uid).cloned().with_context(|| format!("{layer_name} does not list {uid}"))?;
-    anyhow::ensure!(!layer.disk(&path).exists(), "{layer_name} still holds {path}");
+    // What the index leaves out is no entry, whatever is on disk: an extension's folder, listed by an older editor.
+    anyhow::ensure!(
+        index.leaves_out(layer_name, &path) || !layer.disk(&path).exists(),
+        "{layer_name} still holds {path}"
+    );
     let mut tx = history.begin(format!("Forget {}", name(&path)));
     let inside = format!("{path}/");
     changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
@@ -604,7 +608,11 @@ mod tests {
         std::fs::remove_file(mounted.join("gone.c")).unwrap();
         o.refresh(&[mounted.join("gone.c")]);
         assert!(
-            o.index.problems.contains(&Problem::Missing { layer: "code".into(), path: "code/gone.c".into() }),
+            o.index.problems.contains(&Problem::Missing {
+                layer: "code".into(),
+                path: "code/gone.c".into(),
+                left_out: false
+            }),
             "{:?}",
             o.index.problems
         );
@@ -613,6 +621,36 @@ mod tests {
         o.refresh(&paths);
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         assert!(mounted.join("kept.c").exists());
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn what_a_layer_lists_of_an_extension_is_forgotten() {
+        let root = project("forget-extension");
+        let held = root.join(".layers/top/extensions/a.extension");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("extension.toml"), "id = \"a\"\n").unwrap();
+        let mut o = open(&root);
+        // As an older editor listed it, before an extension's folder was left out.
+        let listed = ".layers/top.toml";
+        let text = std::fs::read_to_string(root.join(listed)).unwrap_or_default();
+        let entry = "\"uid://1an72qda531m5\" = \"extensions/a.extension/extension.toml\"\n";
+        let text = if text.contains("[entries]") {
+            text.replace("[entries]\n", &format!("[entries]\n{entry}"))
+        } else {
+            format!("{text}\n[entries]\n{entry}")
+        };
+        std::fs::write(root.join(listed), text).unwrap();
+        o.refresh(&[root.join(listed)]);
+        let path = "extensions/a.extension/extension.toml";
+        let problem = Problem::Missing { layer: "top".into(), path: path.into(), left_out: true };
+        assert!(o.index.problems.contains(&problem), "{:?}", o.index.problems);
+        assert!(problem.describe().contains("leaves it out"));
+        let paths = forget(&o.project, &o.index, "top", "uid://1an72qda531m5", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
+        assert!(held.join("extension.toml").exists(), "only the list is written");
         drop(o);
         std::fs::remove_dir_all(&root).unwrap();
     }

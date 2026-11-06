@@ -1,0 +1,7 @@
+id = "pe2.str"
+version = "0.1.0"
+requires = ["pe2.movies@^0.1"]
+optional = ["video-container@^1"]
+description = "Movies kept as STR: extracted, decoded to play, and made into video files through whatever provides the video-container service."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

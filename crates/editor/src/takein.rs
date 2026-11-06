@@ -303,8 +303,8 @@ impl Worker {
         if refreshed.project_file {
             return self.reload(ticket, "project.toml changed", whole);
         }
-        // An `extension` asset came, went or changed.
-        if extensions::found(&self.project, Some(&self.index)) != self.found {
+        // An extension the project holds came, went or changed.
+        if extensions::found(&self.project) != self.found {
             return self.reload(ticket, "an extension changed", whole);
         }
         // The assets the refresh assembled again: their changed declarations noted, their settings as applied given

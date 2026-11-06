@@ -3,7 +3,7 @@
 use pe2_ext::test::Editor;
 use pe2_ext::{Call, Need, Prepared, Project, Registry, Result, Table, Value, bail, ty};
 
-pe2_ext::extension!("pe2.images.tests", "0.1.0", register, requires = ["pe2.images@^0.1", "pe2.test@^0.1"]);
+pe2_ext::extension!(register);
 
 #[expect(clippy::unnecessary_wraps, reason = "what an operation's step is")]
 fn next_read(call: &mut Call<'_>) -> Result<Prepared> {

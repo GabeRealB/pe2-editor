@@ -3,7 +3,7 @@
 
 use pe2_ext::{Field, Icon, Registry, Result, Tint};
 
-pe2_ext::extension!("pe2.events", "0.1.0", register);
+pe2_ext::extension!(register);
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {

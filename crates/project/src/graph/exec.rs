@@ -1175,6 +1175,7 @@ impl Evaluation<'_> {
         }
         let op = format!("{extension}@{}", micro.op);
         let version = self.ops.get(&op).map_or("?", |def| def.version.as_str());
+        let made = format!("{op}@{version}");
         let settings = toml::to_string(&micro.settings).unwrap_or_default();
         let taken: Vec<String> = ports.iter().flatten().map(|input| super::hash(input.value())).collect();
         let text = format!(
@@ -1205,6 +1206,7 @@ impl Evaluation<'_> {
                     reads: reads.clone(),
                     node: id(self.node).to_string(),
                     output: format!("micro/{}", micro.label),
+                    made: made.clone(),
                 };
                 store.put_trace(&key, &trace)
             });
@@ -1392,6 +1394,7 @@ impl Engine {
                 reads: reads.clone(),
                 node: id(node).to_string(),
                 output: address.to_string(),
+                made: plan.made(output, &self.ops),
             };
             store.put_trace(&self.key(plan, node, output, parameter), &trace)?;
         }

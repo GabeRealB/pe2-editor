@@ -19,7 +19,7 @@ mod encode;
 mod extract;
 mod frames;
 
-pe2_ext::extension!("pe2.str", "0.1.0", register, requires = ["pe2.movies@^0.1"], optional = ["video-container@^1"]);
+pe2_ext::extension!(register);
 
 /// A movie's type.
 const MOVIE: &str = "pe2.movies@movie";

@@ -1,0 +1,5 @@
+id = "pe2.render"
+version = "0.1.0"
+description = "Meshes, materials, models and prefabs, and the game's renderer."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

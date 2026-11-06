@@ -151,12 +151,8 @@ pub fn tint(tint: Tint) -> Color32 {
     }
 }
 
-/// An asset type's icon and its tint, as its extension registers it; the host's `extension`, a plug; a type no
-/// extension registers, dashed.
+/// An asset type's icon and its tint, as its extension registers it; a type no extension registers, dashed.
 pub fn for_type(extensions: &Extensions, node_type: Option<&str>) -> (&'static str, Color32) {
-    if node_type == Some(project::ext::EXTENSION_TYPE) {
-        return (PLUGS_CONNECTED, CODE);
-    }
     match node_type.and_then(|k| extensions.icon(k)) {
         Some((icon, family)) => (glyph(icon), tint(family)),
         None => (FILE_DASHED, PLAIN),

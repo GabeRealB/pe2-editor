@@ -153,6 +153,14 @@ fn system_default(file: &Path) -> Command {
     }
 }
 
+/// Open a file in the system's default application, as it is.
+///
+/// # Errors
+/// The system's opener cannot be started.
+pub fn open_default(file: &Path) -> Result<(), String> {
+    system_default(file).spawn().map(drop).map_err(|e| format!("{}: {e}", file.display()))
+}
+
 fn which(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(program).is_file()))
 }

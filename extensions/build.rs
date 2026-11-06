@@ -36,6 +36,7 @@ fn main() {
     // What a component is built from: its crate, the SDK and its contract, the lock file, the cargo configuration.
     let mut inputs: Vec<PathBuf> = vec![
         workspace.join("crates/ext/src"),
+        workspace.join("crates/ext-macros/src"),
         workspace.join("crates/ext/wit"),
         workspace.join("crates/ext/Cargo.toml"),
         workspace.join("crates/codecs"),

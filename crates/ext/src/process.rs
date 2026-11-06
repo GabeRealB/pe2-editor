@@ -27,6 +27,19 @@ pub fn spawn(tool: &str, args: &[String]) -> Result<Process> {
     }
 }
 
+/// Have what this extension's setup names (`name` of a `[[setup]]` entry of its manifest) on this machine: what is
+/// optional (`lazy`) is fetched when asked for, as the user lets it. What uses it fails where it is refused.
+///
+/// # Errors
+/// This extension is not unsandboxed, declares nothing of that name for this platform, the user turned it off on this
+/// computer, or it could not be fetched.
+pub fn set_up(name: &str) -> Result<()> {
+    #[cfg(target_family = "wasm")]
+    return host::set_up(name).map_err(|e| anyhow!(e));
+    #[cfg(not(target_family = "wasm"))]
+    Err(anyhow!("{name}: only an unsandboxed extension's component fetches"))
+}
+
 impl Process {
     /// Write to its input.
     ///

@@ -1,6 +1,6 @@
 [package]
 name = "pe2-render-tests"
-description = "pe2.render.tests: tests of pe2.render, as an extension beside it that a project takes in for testing"
+description = "pe2.render.tests: tests of pe2.render, as an extension beside it that a project holds for testing"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

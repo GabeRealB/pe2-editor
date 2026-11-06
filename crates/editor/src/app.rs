@@ -168,6 +168,20 @@ pub struct Start {
 const CARD_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// An epoch running, in the status bar, and what stops it.
+/// What extensions fetch beside the editor, in the status bar: whether it was clicked, for the Extensions pane.
+fn fetch_status(ui: &mut egui::Ui, ws: &Workspace) -> bool {
+    let Some((said, failed)) = ws.fetcher.status() else { return false };
+    let color = if failed { ui.visuals().warn_fg_color } else { theme::weak() };
+    let label = egui::Label::new(RichText::new(said).small().color(color)).sense(egui::Sense::click());
+    let shown = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let clicked = shown.on_hover_text("What extensions fetch: each in its Fetches, in the Extensions pane").clicked();
+    if !failed {
+        ui.add(egui::Spinner::new().size(10.0));
+    }
+    ui.separator();
+    clicked
+}
+
 fn epoch_status(ui: &mut egui::Ui, ws: &Workspace) {
     if !ws.in_epoch() {
         return;
@@ -1560,6 +1574,35 @@ impl Editor {
     }
 
     /// The status bar; whether its problem count was clicked, whether its unapplied count was, and a pane asked for.
+    /// Whether agents may use the editor, in the status bar, and whether they can connect.
+    fn agents_status(&self, ui: &mut egui::Ui, ws: &Workspace) {
+        if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
+            if extensions::trust::trusts_everything() {
+                ui.label(RichText::new("trusting every extension").small().color(ui.visuals().warn_fg_color))
+                    .on_hover_text("This run was started with --trust-everything: unsandboxed extensions run unasked");
+                ui.separator();
+            }
+            let recent = self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED);
+            let (text, color) = if recent {
+                ("an agent is using the editor", ui.visuals().warn_fg_color)
+            } else {
+                ("agents allowed", theme::weak())
+            };
+            ui.label(RichText::new(text).small().color(color)).on_hover_text(
+                "Agents connected to the project may click, type and press keys here; what they edit is in \
+                 the history. Settings, Agents.",
+            );
+            if recent {
+                ui.ctx().request_repaint_after(AGENT_ACTED);
+            }
+            ui.separator();
+        }
+        if let Some(e) = &ws.link_error {
+            ui.label(RichText::new("agents cannot connect").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
+            ui.separator();
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) -> (bool, bool, Option<PaneKind>) {
         let (mut show_problems, mut apply_all, mut open) = (false, false, None);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1596,6 +1639,9 @@ impl Editor {
                     apply_all = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint).clicked();
                     ui.separator();
                 }
+                if fetch_status(ui, ws) {
+                    open = Some(PaneKind::Extensions);
+                }
                 // Taking changes in, off the window's thread; or other programs' changes waiting for it.
                 epoch_status(ui, ws);
                 let working = ws.reading().or(ws.taking_in().then(|| "taking in changes".to_string()));
@@ -1614,32 +1660,7 @@ impl Editor {
                     ui.label(RichText::new("not locked").small().color(ui.visuals().warn_fg_color)).on_hover_text(why);
                     ui.separator();
                 }
-                if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
-                    if extensions::trust::trusts_everything() {
-                        ui.label(RichText::new("trusting every extension").small().color(ui.visuals().warn_fg_color))
-                            .on_hover_text("This run was started with --trust-everything: unsandboxed extensions run unasked");
-                        ui.separator();
-                    }
-                    let recent = self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED);
-                    let (text, color) = if recent {
-                        ("an agent is using the editor", ui.visuals().warn_fg_color)
-                    } else {
-                        ("agents allowed", theme::weak())
-                    };
-                    ui.label(RichText::new(text).small().color(color)).on_hover_text(
-                        "Agents connected to the project may click, type and press keys here; what they edit is in \
-                         the history. Settings, Agents.",
-                    );
-                    if recent {
-                        ui.ctx().request_repaint_after(AGENT_ACTED);
-                    }
-                    ui.separator();
-                }
-                if let Some(e) = &ws.link_error {
-                    ui.label(RichText::new("agents cannot connect").small().color(ui.visuals().warn_fg_color))
-                        .on_hover_text(e);
-                    ui.separator();
-                }
+                self.agents_status(ui, ws);
                 ui.label(RichText::new(format!("{} assets", ws.index.assets.len())).small().color(theme::weak()));
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1733,6 +1754,18 @@ impl Editor {
             }
         }
         self.onboarding = None;
+    }
+
+    /// What the project's extensions fetch onto this machine, fetched beside the editor as they run: trusting them is
+    /// consenting to it. A run that only looks, as a screenshot does, fetches nothing.
+    fn fetch(&mut self, ctx: &egui::Context) {
+        if self.capture.is_some() {
+            return;
+        }
+        if let Some(ws) = &mut self.workspace {
+            let extensions = ws.extensions.clone();
+            ws.fetcher.tick(&extensions, ctx);
+        }
     }
 
     /// Importing files into the selected asset: from a drop or from the menu, which takes pasted paths.
@@ -1929,11 +1962,25 @@ impl Editor {
 
     /// Whether something it set going has yet to show.
     pub fn busy(&self) -> bool {
-        self.opening.is_some()
-            || !self.deferred.is_empty()
-            || self.workspace.as_ref().is_some_and(|ws| {
-                ws.taking_in() || ws.watch_is_starting() || ws.requests_busy() || ws.in_epoch() || ws.tests.running()
-            })
+        !self.busy_with().is_empty()
+    }
+
+    /// What it is busy with, by name: nothing where it is not.
+    #[must_use]
+    pub fn busy_with(&self) -> Vec<&'static str> {
+        let ws = self.workspace.as_ref();
+        [
+            ("opening", self.opening.is_some()),
+            ("deferred", !self.deferred.is_empty()),
+            ("taking in", ws.is_some_and(Workspace::taking_in)),
+            ("starting its watch", ws.is_some_and(Workspace::watch_is_starting)),
+            ("requests", ws.is_some_and(Workspace::requests_busy)),
+            ("an epoch", ws.is_some_and(Workspace::in_epoch)),
+            ("tests", ws.is_some_and(|ws| ws.tests.running())),
+        ]
+        .into_iter()
+        .filter_map(|(what, busy)| busy.then_some(what))
+        .collect()
     }
 
     /// Undo the last step.
@@ -2041,6 +2088,7 @@ impl eframe::App for Editor {
         self.dropped_files(&ctx);
         self.import_dialog(&ctx);
         self.onboarding_ui(&ctx);
+        self.fetch(&ctx);
         self.in_use_dialog(&ctx);
         self.force_dialog(&ctx);
         self.rename_dialog(&ctx);

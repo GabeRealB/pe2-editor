@@ -5,7 +5,7 @@ use pe2_ext::tokens::{VALUE, link};
 use pe2_ext::ty::{self, Files, Registered};
 use pe2_ext::{Asset, Cell, Field, Icon, Registry, Result, Signature, Style, Table, Tint, Ui, Value, View};
 
-pe2_ext::extension!("pe2.render", "0.1.0", register);
+pe2_ext::extension!(register);
 
 pub(crate) use pe2_model::{material, mesh, model, skeleton};
 

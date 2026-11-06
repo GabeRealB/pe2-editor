@@ -20,12 +20,7 @@ mod views;
 use pe2_ext::ty::{self, Registered, SourceTree};
 use pe2_ext::{Call, Field, Icon, Registry, Result, Retain, Table, Tint, Value, anyhow};
 
-pe2_ext::extension!(
-    "pe2.packages",
-    "0.1.0",
-    register,
-    requires = ["pe2.game@^0.1", "pe2.images@^0.1", "pe2.render@^0.1"]
-);
+pe2_ext::extension!(register);
 
 /// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name.
 const STACK: &str = r#"[[stack]]

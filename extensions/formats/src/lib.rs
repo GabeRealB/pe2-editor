@@ -5,7 +5,7 @@
 use pe2_ext::ty::{Files, Registered};
 use pe2_ext::{Registry, Result, Signature};
 
-pe2_ext::extension!("pe2.formats", "0.1.0", register);
+pe2_ext::extension!(register);
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {

@@ -4,7 +4,7 @@
 use pe2_ext::test::{Editor, NewNode};
 use pe2_ext::{Registry, Result, Value, bail};
 
-pe2_ext::extension!("pe2.render.tests", "0.1.0", register, requires = ["pe2.render@^0.1", "pe2.test@^0.1"]);
+pe2_ext::extension!(register);
 
 const JOINTS: &str = r#"joints = [
     { name = "root", translation = [0, 0, 0], rotation = [0, 0, 0] },

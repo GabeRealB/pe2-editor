@@ -72,26 +72,40 @@ impl Fixture {
         Fixture::new().node("notes", stack).stored("notes", "notes.txt")
     }
 
+    /// An extension held as a layer holds one (`extensions/<id>.extension`): its component, with the manifest it
+    /// carries. Its folder.
+    fn hold(&self, layer: &str, component: &[u8]) -> std::path::PathBuf {
+        let about = project::ext::component::about(component).expect("who it is");
+        let at = self.root.join(format!(".layers/{layer}/extensions/{}.extension", about.id));
+        std::fs::create_dir_all(&at).expect("its folder");
+        std::fs::write(at.join("extension.wasm"), component).expect("a component");
+        let manifest = project::ext::component::manifest_text(component).expect("its manifest");
+        std::fs::write(at.join("extension.toml"), manifest).expect("a manifest");
+        // What it fetches, as though fetched: a test downloads nothing.
+        let store = extensions::setup_folder().expect("a data folder");
+        for setup in about.setup.iter().filter(|setup| setup.here()) {
+            project::ext::setup::as_fetched(setup, &store);
+        }
+        at
+    }
+
     /// What runs outside the sandbox, in a layer of its own beside the first: the project has to be asked about it.
     #[must_use]
     pub fn untrusted(required: bool) -> Fixture {
         let bytes = extensions::built_apart("pe2_psx.wasm").expect("built with the others");
-        let stack = "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n";
         let fixture = Fixture::new();
         let mut file = format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"mods\"\n");
         if required {
-            file.push_str("\n[[extension]]\nid = \"pe2.psx\"\nrequired = true\n");
+            file.push_str("\n[[extension]]\nid = \"pe2.psx\"\n");
         }
         fixture.write("project.toml", &file);
-        fixture.write(".layers/mods/tools/psx.node/node.toml", stack);
-        std::fs::write(fixture.root.join(".layers/mods/tools/psx.node/extension.wasm"), bytes).expect("a component");
+        fixture.hold("mods", &bytes);
         fixture
     }
 
     /// A project of what a suite declares, holding its tests.
     #[must_use]
     pub fn for_suite(suite: &Suite) -> Fixture {
-        const COMPONENT: &str = "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n";
         let declared = &suite.declared;
         let fixture = Fixture::new();
         let layers: Vec<&str> =
@@ -108,20 +122,15 @@ impl Fixture {
             let _ = writeln!(file, "[extensions]\ndisabled = {:?}\n", declared.disabled);
         }
         fixture.write("project.toml", &file);
-        let bundle = |name: &str| fixture.root.join(format!(".layers/{}/{name}.node", layers[0]));
         // What it tests with, and the tests with their data.
         for id in &declared.take {
             let bytes = extensions::built_apart(&format!("{}.wasm", id.replace('.', "_")))
                 .unwrap_or_else(|| panic!("{id} was not built"));
-            let at = bundle(&format!("extensions/{id}"));
-            std::fs::create_dir_all(&at).expect("a bundle");
-            std::fs::write(at.join("extension.wasm"), bytes).expect("a component");
-            std::fs::write(at.join("node.toml"), COMPONENT).expect("a declaration");
+            fixture.hold(layers[0], &bytes);
         }
-        let at = bundle(&format!("tests/{}", suite.name));
-        std::fs::create_dir_all(at.join("data")).expect("a bundle");
-        std::fs::copy(suite.folder.join("tests.wasm"), at.join("extension.wasm")).expect("its tests");
-        std::fs::write(at.join("node.toml"), COMPONENT).expect("a declaration");
+        let tests = std::fs::read(suite.folder.join("tests.wasm")).expect("its tests");
+        let at = fixture.hold(layers[0], &tests);
+        std::fs::create_dir_all(at.join("data")).expect("its data's folder");
         for entry in std::fs::read_dir(suite.folder.join("data")).into_iter().flatten().flatten() {
             std::fs::copy(entry.path(), at.join("data").join(entry.file_name())).expect("its data");
         }
@@ -140,13 +149,12 @@ impl Fixture {
             .into_iter()
             .find(|suite| suite.ends_with("render/tests"))
             .expect("built with the others");
-        let at = "extensions/psx";
-        let fixture = Fixture::new()
-            .node(at, "[[stack]]\nop = \"file\"\nfile = \"extension.wasm\"\n")
-            .bytes(at, "extension.wasm", &component)
-            .bytes(at, "tests/tests.wasm", &tests);
-        let data = std::fs::read(suite.join("data/doll.usda")).expect("its data");
-        fixture.bytes(at, "tests/data/doll.usda", &data)
+        let fixture = Fixture::new();
+        let at = fixture.hold(LAYER, &component);
+        std::fs::create_dir_all(at.join("tests/data")).expect("its tests' folder");
+        std::fs::write(at.join("tests/tests.wasm"), tests).expect("its tests");
+        std::fs::copy(suite.join("data/doll.usda"), at.join("tests/data/doll.usda")).expect("its data");
+        fixture
     }
 
     /// A project of two configs.

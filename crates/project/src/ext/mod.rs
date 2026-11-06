@@ -9,7 +9,9 @@
 //! entry point it calls - the built-ins' fallback while developing.
 
 pub mod component;
+pub mod folder;
 pub mod requests;
+pub use pe2_setup as setup;
 pub mod unsandboxed;
 
 use anyhow::{Context, Result};
@@ -22,10 +24,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{graph, index};
-
-/// The type of an asset holding an extension: the host's own, registered by none. Its bundle holds the component
-/// (`extension.wasm`), which says who it is.
-pub const EXTENSION_TYPE: &str = "extension";
 
 /// What a stack of a shape makes.
 struct Shape {
@@ -46,7 +44,7 @@ pub struct Preview<'a> {
     pub tapped: bool,
 }
 
-/// The file an `extension` asset holds its component in.
+/// The file an extension's folder holds its component in (`folder`).
 pub const EXTENSION_COMPONENT: &str = "extension.wasm";
 
 /// Where an extension runs from.
@@ -54,13 +52,14 @@ pub const EXTENSION_COMPONENT: &str = "extension.wasm";
 pub enum Origin {
     /// A component built into the host: a built-in.
     Builtin,
-    /// A component, from this file.
+    /// A component, from this file: tests, loaded with what they test.
     Component(PathBuf),
-    /// A component the project holds: an `extension` asset, by its path, and its file.
-    Project { asset: String, file: PathBuf },
-    /// A component in the user's own extensions folder.
+    /// An extension the project holds: its folder (`extensions/<id>.extension/` of a layer).
+    Project(PathBuf),
+    /// An extension in the user's own extensions folder, to be added to a project: its folder. It never runs from there.
     User(PathBuf),
-    /// A component in the extensions folder beside the editor.
+    /// An extension in the extensions folder beside the editor, to be added to a project: its folder. It never runs
+    /// from there.
     Install(PathBuf),
     /// Linked into the host, its entry point called directly: a built-in, for debugging.
     Linked,
@@ -95,6 +94,10 @@ pub struct Loadable {
     pub settings: toml::Table,
     /// For an unsandboxed extension, its hash: what the user enabled.
     pub trust: Option<String>,
+    /// What its manifest says of it, for people.
+    pub described: component::Described,
+    /// What it fetches onto a machine before it runs, for every platform (`setup`).
+    pub setup: Vec<setup::Setup>,
     /// What it depends on and has, once it is to register.
     reaches: Vec<String>,
 }
@@ -116,6 +119,8 @@ impl From<Extension> for Loadable {
             build: None,
             settings: toml::Table::new(),
             trust: None,
+            described: component::Described::default(),
+            setup: Vec::new(),
             reaches: Vec::new(),
         }
     }
@@ -160,6 +165,10 @@ pub struct Present {
     pub registers: Registers,
     /// For an unsandboxed extension, its hash: what enabling it records.
     pub trust: Option<String>,
+    /// What its manifest says of it, for people.
+    pub described: component::Described,
+    /// What it fetches onto a machine before it runs, for every platform (`setup`).
+    pub setup: Vec<setup::Setup>,
 }
 
 /// What an extension registered, by what it is (`types`, `services`, ...), each name qualified.
@@ -182,6 +191,8 @@ impl Present {
             load: None,
             registers: vec![],
             trust: extension.trust.clone(),
+            described: extension.described.clone(),
+            setup: extension.setup.clone(),
         }
     }
 }
@@ -244,7 +255,7 @@ pub enum Status {
     NotEnabled {
         changed: bool,
     },
-    /// Found where extensions are kept, and not taken in by the project (`[[extension]]`).
+    /// Found where extensions are kept, to be added to the project: it runs only from there.
     Available,
     /// Not loaded: one of its id from a nearer place (the project before the user's folder before the built-ins) takes
     /// its place, named.
@@ -252,13 +263,23 @@ pub enum Status {
 }
 
 impl Origin {
-    /// How near a project it is: the project's own first, then the user's, then the built-ins (and a file named).
+    /// How near a project it is: the project's own first, then a file named, then the built-ins (and what is only to be
+    /// added, which never runs).
     fn nearness(&self) -> u8 {
         match self {
-            Origin::Project { .. } => 0,
-            Origin::User(_) => 1,
-            Origin::Component(_) | Origin::Install(_) => 2,
-            Origin::Builtin | Origin::Linked => 3,
+            Origin::Project(_) => 0,
+            Origin::Component(_) => 1,
+            Origin::Builtin | Origin::Linked => 2,
+            Origin::User(_) | Origin::Install(_) => 3,
+        }
+    }
+
+    /// The folder it is in, where it is in one of its own.
+    #[must_use]
+    pub fn folder(&self) -> Option<&std::path::Path> {
+        match self {
+            Origin::Project(folder) | Origin::User(folder) | Origin::Install(folder) => Some(folder),
+            Origin::Component(_) | Origin::Builtin | Origin::Linked => None,
         }
     }
 
@@ -283,7 +304,7 @@ impl Origin {
         match self {
             Origin::Builtin => "built in".into(),
             Origin::Linked => "linked in".into(),
-            Origin::Project { asset, .. } => format!("the project's {asset}"),
+            Origin::Project(folder) => format!("the project's {}", file(folder)),
             Origin::User(path) => format!("your {}", file(path)),
             Origin::Install(path) => format!("{}, beside the editor", file(path)),
             Origin::Component(path) => file(path),
@@ -312,8 +333,6 @@ pub struct Extensions {
     pub present: Vec<Present>,
     /// What the project requires and does not have, by id, and why.
     pub unmet: Vec<(String, String)>,
-    /// What is no longer what the project took in, by id.
-    pub unlocked: Vec<String>,
     /// What was refused or disabled, and why.
     pub problems: Vec<String>,
     /// Each loaded extension's settings, by its id: as declared, with the values they took.
@@ -918,11 +937,10 @@ impl Extensions {
         self.node_types_of(asset).first().copied()
     }
 
-    /// The name of what an asset is, qualified. An extension in a project is no output of anything: it is what it holds.
+    /// The name of what an asset is, qualified.
     #[must_use]
     pub fn type_name(&self, asset: &index::Asset) -> Option<&str> {
-        let held = || asset.files.iter().any(|file| file.name == EXTENSION_COMPONENT).then_some(EXTENSION_TYPE);
-        self.node_type_of(asset).map(|node_type| node_type.name.as_str()).or_else(held)
+        self.node_type_of(asset).map(|node_type| node_type.name.as_str())
     }
 
     /// The name of what an asset is, without what registered it.
@@ -2688,8 +2706,8 @@ mod tests {
             images.origin = origin;
             images
         };
-        let user = Origin::User("images.wasm".into());
-        let project = Origin::Project { asset: "extensions/images".into(), file: "extension.wasm".into() };
+        let user = Origin::Component("images.wasm".into());
+        let project = Origin::Project("extensions/test.images.extension".into());
         // The built-in listed first, the project's last: nearness decides, not order.
         let loaded = Extensions::load(vec![from(Origin::Linked), from(user.clone()), from(project.clone())], true);
         assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
@@ -2702,7 +2720,7 @@ mod tests {
         assert_eq!(replaced, [&user, &Origin::Linked]);
         // Two from one place: the second is refused, a problem.
         let mut other = from(user.clone());
-        other.origin = Origin::User("copy.wasm".into());
+        other.origin = Origin::Component("copy.wasm".into());
         let loaded = Extensions::load(vec![from(user), other], false);
         assert!(
             loaded.problems.iter().any(|p| p.contains("another of its id from the same place")),

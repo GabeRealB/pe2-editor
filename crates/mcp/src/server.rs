@@ -50,8 +50,8 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
         let mut index = Index::open(&project, &cache)?;
-        // The extensions as the project has them: its own and the user's, without those it leaves off.
-        let extensions = extensions::for_project(&project, Some(&index));
+        // The extensions as the project has them: those it holds and the built-ins, without those it leaves off.
+        let extensions = extensions::for_project(&project);
         let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
         let store = project::graph::store::Store::open(&cache)?;
         extensions.keep_in(store.clone());

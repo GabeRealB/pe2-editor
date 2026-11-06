@@ -209,6 +209,8 @@ pub struct Workspace {
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
     /// Requests using the editor's window, which the app's driver answers across frames.
     pub window_requests: Vec<crate::drive::Request>,
+    /// What the project's extensions fetch onto this machine, fetched beside the editor.
+    pub fetcher: crate::fetcher::Fetcher,
     /// The take-in worker: it owns the index and the imports, and hands snapshots back.
     takein: crate::takein::TakeIn,
     /// Runs what events set off.
@@ -245,7 +247,7 @@ pub struct Workspace {
     pub link_error: Option<String>,
     /// The components found beside the built-ins when the project was read: another finding has it read again.
     extensions_found: Vec<extensions::Found>,
-    /// When the user's extensions folder was last looked at, which no watcher follows.
+    /// When the project's extensions and where they are kept were last looked at, which no watcher follows.
     extensions_checked: std::time::Instant,
     pub tree: Arc<Node>,
     /// The tree's paths (an asset's without `.node`) that can be modified, and the folders holding one: the rest is
@@ -485,11 +487,10 @@ impl Loaded {
         applied: &project::applied::Applied,
         report: &project::index::Report<'_>,
     ) -> Loaded {
-        // Without those it leaves off (`[extensions] disabled`). Its own (`extension` assets) and the user's before the
-        // built-ins.
+        // Without those it leaves off (`[extensions] disabled`). Those it holds before the built-ins.
         report("Loading the extensions", 0, 0);
-        let found = extensions::found(&project, Some(&index));
-        let extensions = extensions::for_project(&project, Some(&index));
+        let found = extensions::found(&project);
+        let extensions = extensions::for_project(&project);
         // What they are asked in passing reads and keeps what the project's store holds.
         extensions.keep_in(store.clone());
         let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
@@ -634,6 +635,7 @@ impl Workspace {
             link: None,
             requests: None,
             window_requests: Vec::new(),
+            fetcher: crate::fetcher::Fetcher::default(),
             link_error: None,
             extensions_found,
             extensions_checked: std::time::Instant::now(),
@@ -992,10 +994,10 @@ impl Workspace {
     /// Bring in what changed: other programs' changes collected from the watcher, taken in as they happen (`live`) or
     /// when the window regains focus; and the snapshots the worker made since, swapped in. Returns what they did.
     pub fn update(&mut self, focused: bool, live: bool) -> Update {
-        // The user's extensions folder, looked at each second.
+        // The project's extensions, and where they are kept to be added, looked at each second: none is in the index.
         if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
             self.extensions_checked = std::time::Instant::now();
-            let found = extensions::found(&self.project, Some(&self.index));
+            let found = extensions::found(&self.project);
             if found != self.extensions_found {
                 // Asked once: what it is taken for is what was found then, read again or not.
                 self.extensions_found = found;

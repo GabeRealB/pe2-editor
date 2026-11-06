@@ -4,8 +4,9 @@
 //!
 //! - in a place trusted (`pe2-cli project trust`): a project, a layer of one, a mount. What is there may change and goes on
 //!   running, as what `make` runs does after a pull; a layer that moves is another place, and is asked about again.
-//! - in the user's own extensions folder or beside the editor: what can write there can already run as the user.
 //! - anywhere, for a run asked to trust everything (`--trust-everything`), which is written nowhere.
+//!
+//! Nothing runs from where extensions are kept to be added (yours, beside the editor): only from a project.
 //!
 //! A place is compared with where the file really is: what a layer above overrides is the file of that layer, and a link
 //! out of a place is not in it.
@@ -174,13 +175,38 @@ pub fn distrust_place(place: &Path) -> std::io::Result<()> {
     store(&all)
 }
 
+/// What of what extensions fetch optionally (`lazy` setup) the user turned off on this computer, by key: kept with what
+/// they trust, as trusting an extension is consenting to what it fetches.
+#[must_use]
+pub fn optional_off() -> std::collections::BTreeSet<String> {
+    let table = read();
+    let off = table.get("setup").and_then(|setup| setup.get("off")).and_then(Value::as_array);
+    off.into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+}
+
+/// Turn something an extension fetches optionally on or off on this computer, by its key.
+///
+/// # Errors
+/// What is trusted cannot be written.
+pub fn set_optional(key: &str, on: bool) -> std::io::Result<()> {
+    let mut off = optional_off();
+    if on {
+        off.remove(key);
+    } else {
+        off.insert(key.to_string());
+    }
+    let mut table = read();
+    let mut setup = Table::new();
+    setup.insert("off".into(), Value::Array(off.into_iter().map(Value::String).collect()));
+    table.insert("setup".into(), Value::Table(setup));
+    write(&table)
+}
+
 /// Why an extension may run where it is, without being enabled by its hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Allowed {
     /// This run trusts everything.
     Everything,
-    /// It is in the user's folder or beside the editor.
-    Own,
     /// It is in a place trusted.
     Place(PathBuf),
 }
@@ -191,7 +217,6 @@ impl Allowed {
     pub fn said(&self) -> String {
         match self {
             Allowed::Everything => "It runs because this run trusts everything (--trust-everything).".to_string(),
-            Allowed::Own => "It runs because it is in your own extensions, or beside the editor.".to_string(),
             Allowed::Place(place) => format!("It runs because you trust {}.", place.display()),
         }
     }
@@ -208,11 +233,10 @@ fn allowed(origin: &Origin, everything: bool, trusted: &[Trusted]) -> Option<All
         return Some(Allowed::Everything);
     }
     match origin {
-        Origin::User(_) | Origin::Install(_) => Some(Allowed::Own),
-        Origin::Project { file, .. } | Origin::Component(file) => {
+        Origin::Project(file) | Origin::Component(file) => {
             holding(file, trusted.iter().flat_map(|known| &known.places)).map(Allowed::Place)
         }
-        _ => None,
+        Origin::User(_) | Origin::Install(_) | Origin::Builtin | Origin::Linked => None,
     }
 }
 
@@ -232,30 +256,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pe2-trust-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for layer in ["mine", "mine_too", "theirs"] {
-            std::fs::create_dir_all(root.join(layer).join("x.node")).unwrap();
-            std::fs::write(root.join(layer).join("x.node/extension.wasm"), "").unwrap();
+            std::fs::create_dir_all(root.join(layer).join("extensions/x.extension")).unwrap();
         }
         let root = root.canonicalize().unwrap();
-        (root.clone(), root.join("mine"), root.join("theirs/x.node/extension.wasm"))
+        (root.clone(), root.join("mine"), root.join("theirs/extensions/x.extension"))
     }
 
-    fn in_project(file: PathBuf) -> Origin {
-        Origin::Project { asset: "x".to_string(), file }
+    fn in_project(folder: PathBuf) -> Origin {
+        Origin::Project(folder)
     }
 
     #[test]
     fn a_place_holds_what_is_really_in_it() {
         let (root, mine, theirs) = places("place");
         let trusted = [Trusted { project: root.clone(), places: vec![mine.clone()], declined: Vec::new() }];
-        let there = allowed(&in_project(mine.join("x.node/extension.wasm")), false, &trusted);
+        let there = allowed(&in_project(mine.join("extensions/x.extension")), false, &trusted);
         assert_eq!(there, Some(Allowed::Place(mine.clone())));
         // Another layer, and one whose name begins alike.
         assert_eq!(allowed(&in_project(theirs.clone()), false, &trusted), None);
-        assert_eq!(allowed(&in_project(root.join("mine_too/x.node/extension.wasm")), false, &trusted), None);
+        assert_eq!(allowed(&in_project(root.join("mine_too/extensions/x.extension")), false, &trusted), None);
         // A link in a place trusted, to what is not.
         #[cfg(unix)]
         {
-            let link = mine.join("elsewhere.wasm");
+            let link = mine.join("extensions/elsewhere.extension");
             std::os::unix::fs::symlink(&theirs, &link).unwrap();
             assert_eq!(allowed(&in_project(link), false, &trusted), None);
         }
@@ -263,11 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn what_is_the_users_own_needs_no_place_and_a_run_may_trust_everything() {
-        let file = PathBuf::from("/nowhere/x.wasm");
-        assert_eq!(allowed(&Origin::User(file.clone()), false, &[]), Some(Allowed::Own));
-        assert_eq!(allowed(&Origin::Install(file.clone()), false, &[]), Some(Allowed::Own));
-        assert_eq!(allowed(&in_project(file.clone()), false, &[]), None);
-        assert_eq!(allowed(&in_project(file), true, &[]), Some(Allowed::Everything));
+    fn what_is_kept_apart_runs_nowhere_and_a_run_may_trust_everything() {
+        let folder = PathBuf::from("/nowhere/x.extension");
+        assert_eq!(allowed(&Origin::User(folder.clone()), false, &[]), None);
+        assert_eq!(allowed(&in_project(folder.clone()), false, &[]), None);
+        assert_eq!(allowed(&in_project(folder), true, &[]), Some(Allowed::Everything));
     }
 }

@@ -29,6 +29,17 @@ enum Tool {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// What extensions fetched onto this computer, kept for every project: listed, and removed. What no project uses
+    /// for 30 days is removed by itself
+    Fetched {
+        #[command(subcommand)]
+        command: FetchedCommand,
+    },
+    /// Writing extensions
+    Extension {
+        #[command(subcommand)]
+        command: AuthorCommand,
+    },
     /// Asset uids
     Uid {
         #[command(subcommand)]
@@ -40,6 +51,50 @@ enum Tool {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum FetchedCommand {
+    /// What the store holds: each package, its size, when it was last used, and whether the project uses it
+    List {
+        /// The project's directory, whose extensions' packages are marked
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Remove from the store: with nothing named, what is due to go now - unused for 30 days and not the project's,
+    /// and what fetches left unfinished; or what is named, by key (its start) or name. Each is fetched again where
+    /// a project needs it
+    Clean {
+        /// Keys (their start) or names, as `list` says them
+        what: Vec<String>,
+        /// Everything the project does not use, however lately it was used
+        #[arg(long, conflicts_with = "what")]
+        unused: bool,
+        /// The project's directory, whose extensions' packages are kept
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthorCommand {
+    /// The SHA-256s a manifest's `[[setup]]` entries are held to, found by fetching each - every platform's - into a
+    /// place of its own and hashing what it made, patched: its download's and each place it takes. A place may be
+    /// written bare (`"<path>" = "<to>"`, `take = "<file>"`) until then
+    Hash {
+        /// The extension's manifest (`extension.toml`)
+        manifest: PathBuf,
+        /// Write them into the manifest; otherwise only what differs is said
+        #[arg(long)]
+        write: bool,
+    },
+    /// Whether every source a manifest's `[[setup]]` entries name - their URLs and mirrors, every platform's - still
+    /// answers: failing where an entry has none left
+    Pins {
+        /// The extensions' manifests (`extension.toml`)
+        #[arg(required = true)]
+        manifests: Vec<PathBuf>,
     },
 }
 
@@ -137,7 +192,7 @@ enum ProjectCommand {
         #[arg(long)]
         revoke: bool,
     },
-    /// What a project takes in from outside itself
+    /// The extensions a project holds
     Extension {
         #[command(subcommand)]
         command: ExtensionCommand,
@@ -157,33 +212,54 @@ enum ProjectCommand {
 
 #[derive(Subcommand)]
 enum ExtensionCommand {
-    /// Every extension present, and what became of it
+    /// Every extension present, and what became of it: the project's, the built-ins, and those kept to be added
     List {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Take one in: by id, from your own extensions or those beside the editor, or from a folder or component
+    /// Add one to the project, copied whole: an extension's folder (`<id>.extension`) or its archive
+    /// (`<id>-<version>.extension.zip`), or by id from your own extensions or those beside the editor
     Add {
-        /// Its id, or where it is, relative to the project or `res://`
+        /// Its folder or archive, or its id
         what: String,
-        /// Without it, the project is not whole
-        #[arg(long)]
-        required: bool,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Let one go
+    /// Copy one the project holds again, from where it is kept or from a folder
+    Update {
+        /// Its id
+        id: String,
+        /// Its folder (`<id>.extension`) or archive, in place of where it is kept
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// What the project's extensions fetch onto this machine, as their manifests declare: shown, and fetched ahead of
+    /// time - what they require, and what is optional and on. Trusting them is consenting to it
+    Setup {
+        /// Only this one's
+        id: Option<String>,
+        /// Let it fetch this optional package, by name, on this computer
+        #[arg(long)]
+        enable: Vec<String>,
+        /// Do not let it fetch this optional package, by name, on this computer
+        #[arg(long)]
+        disable: Vec<String>,
+        /// Hash what was fetched, every file, and fetch again what is not as its extension declares
+        #[arg(long)]
+        verify: bool,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Remove one from the project
     Remove {
         /// Its id
         id: String,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    /// Keep what each is now, as what the project took in
-    Lock {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -260,7 +336,7 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
     })?;
     let cache = project::cache::Cache::open(&p, &lock)?;
     let index = project::index::Index::open(&p, &cache)?;
-    let extensions = extensions::for_project(&p, Some(&index));
+    let extensions = extensions::for_project(&p);
     for problem in &extensions.problems {
         eprintln!("warning: {problem}");
     }
@@ -296,30 +372,247 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
     Ok(())
 }
 
-/// What was said of a project's extensions, and whether it can go on without what it requires.
+/// What was said of a project's extensions, and whether it can go on without what it requires - what those running
+/// fetch fetched first, as trusting them consents to it.
 fn whole(extensions: &project::ext::Extensions) -> Result<()> {
     untrusted(extensions);
-    for id in &extensions.unlocked {
-        eprintln!(
-            "warning: {id} is not what the project took in: `pe2-cli project extension lock` keeps what it is now"
-        );
-    }
     let said: Vec<String> = extensions.unmet.iter().map(|(id, why)| format!("{id}: {why}")).collect();
     anyhow::ensure!(said.is_empty(), "the project requires what it does not have:\n  {}", said.join("\n  "));
+    fetch(extensions)
+}
+
+/// Megabytes, to a tenth, as the CLI says them.
+fn mb(bytes: u64) -> String {
+    format!("{}.{}", bytes >> 20, ((bytes & 0xF_FFFF) * 10) >> 20)
+}
+
+/// Fetch what the extensions running require and have not fetched yet, saying what, from where, as it goes.
+fn fetch(extensions: &project::ext::Extensions) -> Result<()> {
+    let mut shown: Option<String> = None;
+    let failed = extensions::fetch_required(extensions, &mut |id, setup, done, total| {
+        let named = format!("{id}: {}", setup.name);
+        if shown.as_ref() != Some(&named) {
+            if shown.is_some() {
+                eprintln!();
+            }
+            eprintln!("{named}, from {}", setup.url);
+            shown = Some(named);
+        }
+        let of = total.map_or_default(|total| format!(" of {}", mb(total)));
+        eprint!("\r  {}{of} MB   ", mb(done));
+    });
+    if shown.is_some() {
+        eprintln!();
+    }
+    swept(extensions::sweep_store_if_due(extensions));
+    let said: Vec<String> = failed.iter().map(|(what, why)| format!("{what}: {why}")).collect();
+    anyhow::ensure!(
+        said.is_empty(),
+        "what the project's extensions require could not be fetched:\n  {}",
+        said.join("\n  ")
+    );
     Ok(())
 }
 
-/// A project's extensions as it says, with what its index holds.
-fn extensions_of(
+/// What a sweep of the store of what extensions fetch removed, said on stderr; and what it could not.
+fn swept(swept: Option<project::ext::setup::kept::Swept>) {
+    let Some((removed, failed)) = swept else { return };
+    for kept in &removed {
+        eprintln!("removed from the store, unused: {} ({})", kept.said(), project::ext::setup::kept::size(kept.bytes));
+    }
+    for (kept, why) in &failed {
+        eprintln!("warning: could not remove {} from the store: {why}", kept.said());
+    }
+}
+
+/// `pe2-cli fetched`: what the store of what extensions fetch holds, and removing from it.
+fn fetched(command: FetchedCommand) -> Result<()> {
+    let store = extensions::setup_folder().context("no data folder")?;
+    let (FetchedCommand::List { project } | FetchedCommand::Clean { project, .. }) = &command;
+    // What the project names, where there is one: kept, and marked.
+    let named =
+        project::Project::load(project).map_or_default(|p| extensions::named_in_store(&extensions::for_project(&p)));
+    match command {
+        FetchedCommand::List { .. } => {
+            let kept = project::ext::setup::kept::list(&store);
+            for kept in &kept {
+                let used = if named.contains(&kept.key) { ", used by this project" } else { "" };
+                println!(
+                    "{}  {}, used {}{used}",
+                    kept.said(),
+                    project::ext::setup::kept::size(kept.bytes),
+                    project::ext::setup::kept::ago(kept.used)
+                );
+                println!("  {}", kept.key);
+            }
+            let total: u64 = kept.iter().map(|kept| kept.bytes).sum();
+            println!("{} in {}", project::ext::setup::kept::size(total), store.display());
+            println!(
+                "What no project uses for {} days is removed by itself; `pe2-cli fetched clean` removes it now",
+                project::ext::setup::kept::UNUSED_FOR.as_secs() / 86_400
+            );
+        }
+        FetchedCommand::Clean { what, unused, .. } if what.is_empty() && !unused => {
+            let (removed, failed) = project::ext::setup::kept::sweep(&store, &named);
+            if removed.is_empty() && failed.is_empty() {
+                println!("Nothing to remove: what is there was used lately, or this project uses it");
+            }
+            swept(Some((removed, failed)));
+        }
+        FetchedCommand::Clean { what, unused, .. } => {
+            let kept = project::ext::setup::kept::list(&store);
+            let chosen: Vec<&project::ext::setup::kept::Kept> = if unused {
+                kept.iter().filter(|kept| !named.contains(&kept.key)).collect()
+            } else {
+                let mut chosen = vec![];
+                for asked in &what {
+                    let found: Vec<&project::ext::setup::kept::Kept> = kept
+                        .iter()
+                        .filter(|kept| {
+                            kept.key.starts_with(asked.as_str())
+                                || kept.name.as_ref().is_some_and(|(name, _)| name == asked)
+                        })
+                        .collect();
+                    anyhow::ensure!(!found.is_empty(), "{asked}: nothing in the store: `pe2-cli fetched list`");
+                    chosen.extend(found);
+                }
+                chosen
+            };
+            for kept in chosen {
+                project::ext::setup::kept::remove(&store, &kept.key)?;
+                println!("removed {} ({})", kept.said(), project::ext::setup::kept::size(kept.bytes));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where an extension to add is: a folder or an archive given, or one of that id kept to be added.
+fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
+    let given = Path::new(what);
+    let given = if given.is_absolute() { given.to_path_buf() } else { std::env::current_dir()?.join(given) };
+    if given.is_dir() || extensions::archive::is_archive(&given) {
+        return Ok(given);
+    }
+    extensions::kept_apart(what).with_context(|| {
+        let places: Vec<String> = [extensions::user_folder(), extensions::install_folder()]
+            .into_iter()
+            .flatten()
+            .map(|f| f.display().to_string())
+            .collect();
+        format!(
+            "{what} is no folder or archive, and no extension of that id is kept to be added (in {}); {} holds {}",
+            places.join(" or "),
+            p.root.display(),
+            p.held_extensions().iter().filter_map(|f| project::ext::folder::id_of(f)).collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+/// An extension added to a project from a folder, or from an archive unpacked first.
+fn add_from(
     p: &project::Project,
-) -> Result<(project::lock::Lock, project::index::Index, std::sync::Arc<project::ext::Extensions>)> {
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", |owner| {
-        eprintln!("waiting: the project is in use by {owner}");
-    })?;
-    let cache = project::cache::Cache::open(p, &lock)?;
-    let index = project::index::Index::open(p, &cache)?;
-    let extensions = extensions::for_project(p, Some(&index));
-    Ok((lock, index, extensions))
+    from: &Path,
+    history: &mut project::history::History,
+    label: String,
+) -> Result<project::ext::component::About> {
+    if extensions::archive::is_archive(from) {
+        let unpacked = extensions::archive::unpack(from).with_context(|| from.display().to_string())?;
+        return project::switches::add_extension(p, &unpacked.folder, history, label);
+    }
+    project::switches::add_extension(p, from, history, label)
+}
+
+/// `pe2-cli project extension setup`: what the project's extensions running fetch onto this machine, each shown with
+/// how it stands - hashed whole where asked (`verify`), what is not as declared fetched again; what is optional turned
+/// on or off as asked; then fetched, what is required and what is on.
+fn set_up(p: &project::Project, only: Option<&str>, enable: &[String], disable: &[String], verify: bool) -> Result<()> {
+    let extensions = extensions::for_project(p);
+    let running = extensions.present.iter().filter(|present| present.status == project::ext::Status::Loaded);
+    let chosen: Vec<&project::ext::Present> =
+        running.filter(|present| only.is_none_or(|id| present.id == id)).collect();
+    if let Some(id) = only.filter(|_| chosen.is_empty()) {
+        anyhow::bail!("{id} does not run in this project: `pe2-cli project extension list`");
+    }
+    let here = |present: &&project::ext::Present| -> Vec<project::ext::setup::Setup> {
+        present.setup.iter().filter(|setup| setup.here()).cloned().collect()
+    };
+    for (names, on) in [(enable, true), (disable, false)] {
+        for name in names {
+            let named: Vec<project::ext::setup::Setup> =
+                chosen.iter().flat_map(here).filter(|setup| setup.name == *name).collect();
+            anyhow::ensure!(!named.is_empty(), "nothing the project's extensions fetch here is called {name}");
+            for setup in named {
+                anyhow::ensure!(setup.lazy, "{name} is required: it is fetched whatever is chosen");
+                extensions::trust::set_optional(&setup.key(), on)?;
+            }
+        }
+    }
+    let store = extensions::setup_folder().context("no data folder to keep it in")?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut failed = vec![];
+    for present in &chosen {
+        for setup in here(present) {
+            let kind = if setup.lazy { "optional" } else { "required" };
+            let on = !setup.lazy || extensions::optional_on(&setup);
+            println!("{}: {} ({kind}{})\n  {}", present.id, setup.name, if on { "" } else { ", off" }, setup.url);
+            for mirror in &setup.mirrors {
+                println!("  or {mirror}");
+            }
+            let rights = [setup.license.clone(), setup.copyright.as_ref().map(|c| format!("(c) {c}"))];
+            let rights: Vec<String> = rights.into_iter().flatten().collect();
+            if !rights.is_empty() {
+                println!("  {}", rights.join("; "));
+            }
+            if verify && setup.fetched(&store) {
+                match project::ext::setup::verify(&setup, &store) {
+                    Ok(()) => println!("  fetched, each file as declared"),
+                    Err(e) => println!("  {e:#}: removed, to be fetched again"),
+                }
+            }
+            if !on || setup.fetched(&store) {
+                println!("  {}", if on { "fetched" } else { "turned off on this computer" });
+                continue;
+            }
+            let mut shown = |done: u64, total: Option<u64>| {
+                let of = total.map_or_default(|total| format!(" of {}", mb(total)));
+                eprint!("\r  {}{of} MB   ", mb(done));
+            };
+            match project::ext::setup::fetch(&setup, &store, present.origin.folder(), &mut shown, &cancel) {
+                Ok(()) => eprintln!("\r  fetched{}", " ".repeat(30)),
+                Err(e) => {
+                    eprintln!("\r  {e:#}");
+                    failed.push(setup.name.clone());
+                }
+            }
+        }
+    }
+    println!("Kept in {}, for every project on this computer", store.display());
+    swept(extensions::sweep_store_if_due(&extensions));
+    anyhow::ensure!(failed.is_empty(), "not fetched: {}", failed.join(", "));
+    Ok(())
+}
+
+/// What to know of an extension just added: whether it has to be trusted, and what to set up first.
+fn added(p: &project::Project, about: &project::ext::component::About) {
+    println!("{} {}", about.id, about.version);
+    let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(about.id.as_str()));
+    if let Some(install) = about.described.install.as_ref().zip(held.as_ref()).map(|(page, held)| held.join(page)) {
+        println!("What it needs on this machine, fetched or installed: {}", install.display());
+    }
+    let extensions = extensions::for_project(p);
+    let present = extensions.present.iter().find(|present| present.id == about.id);
+    if present.is_some_and(|present| matches!(present.status, project::ext::Status::NotEnabled { .. })) {
+        println!(
+            "It runs outside the sandbox: nothing of it runs until you trust it (`pe2-cli project trust`, or enable it in the editor)"
+        );
+    }
+    if present.is_some_and(|present| !extensions::required(present).is_empty()) {
+        println!(
+            "It fetches what it runs onto this machine before it runs, as its manifest declares: `pe2-cli project extension setup {}` shows it, and fetches it now",
+            about.id
+        );
+    }
 }
 
 /// `pe2-cli project extension`.
@@ -327,25 +620,28 @@ fn extension(command: ExtensionCommand) -> Result<()> {
     use project::ext::Status;
     let (ExtensionCommand::List { project }
     | ExtensionCommand::Add { project, .. }
-    | ExtensionCommand::Remove { project, .. }
-    | ExtensionCommand::Lock { project }) = &command;
+    | ExtensionCommand::Update { project, .. }
+    | ExtensionCommand::Setup { project, .. }
+    | ExtensionCommand::Remove { project, .. }) = &command;
     let project = project.clone();
     let p = project::Project::load(&project)?;
-    let (lock, index, extensions) = extensions_of(&p)?;
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
     let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
     match command {
         ExtensionCommand::List { .. } => {
+            let extensions = extensions::for_project(&p);
             for present in &extensions.present {
                 let status = match &present.status {
                     Status::Loaded => "loaded".to_string(),
                     Status::Disabled => "left off".to_string(),
                     Status::Refused(why) => format!("not loaded: {why}"),
                     Status::NotEnabled { .. } => "not trusted".to_string(),
-                    Status::Available => "available".to_string(),
+                    Status::Available => format!("to be added: `pe2-cli project extension add {}`", present.id),
                     Status::Replaced(by) => format!("replaced by {by}"),
                 };
-                let required =
-                    p.manifest.imported.iter().any(|imported| imported.id == present.id && imported.required);
+                let required = p.requires.iter().any(|required| required.id == present.id);
                 println!(
                     "{} {}  {}{status}  ({})",
                     present.id,
@@ -355,41 +651,32 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                 );
             }
         }
-        ExtensionCommand::Add { what, required, .. } => {
-            // A place, or who is available.
-            let place = p.imported_from(&what);
-            let at = (place.exists() || what.starts_with("res://")).then_some(&place);
-            let about = if let Some(place) = at {
-                let file = if place.is_dir() { place.join(project::ext::EXTENSION_COMPONENT) } else { place.clone() };
-                project::ext::component::about(&std::fs::read(&file).with_context(|| file.display().to_string())?)
-                    .context("it is no extension")?
-            } else {
-                let found = extensions.present.iter().find(|present| present.id == what);
-                let found = found.with_context(|| format!("{what} is not among those found: give where it is"))?;
-                project::ext::component::About {
-                    id: found.id.clone(),
-                    version: found.version.clone(),
-                    ..Default::default()
-                }
+        ExtensionCommand::Add { what, .. } => {
+            let from = kept_folder(&p, &what)?;
+            let about = add_from(&p, &from, &mut history, format!("Add {what}"))?;
+            added(&project::Project::load(&project)?, &about);
+        }
+        ExtensionCommand::Update { id, from, .. } => {
+            let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(id.as_str()));
+            let held =
+                held.with_context(|| format!("the project holds no {id}: `pe2-cli project extension add {id}`"))?;
+            let was = project::ext::folder::manifest(&held).map_or_default(|about| about.version);
+            let from = match from {
+                Some(from) => from,
+                None => kept_folder(&p, &id)?,
             };
-            let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
-            let imported = project::Imported {
-                id: about.id.clone(),
-                version: Some(format!("^{line}")),
-                required,
-                from: at.map(|_| what.clone()),
-            };
-            project::switches::import(&p, &imported, &mut history, format!("Take {} in", about.id))?;
-            let p = project::Project::load(&project)?;
-            project::switches::write_lock(&p, &extensions::locked(&p, Some(&index)))?;
-            println!("{} {}", about.id, about.version);
+            let about = add_from(&p, &from, &mut history, format!("Update {id}"))?;
+            if was != about.version {
+                println!("{id}: {was} to {}", about.version);
+            }
+            added(&project::Project::load(&project)?, &about);
         }
         ExtensionCommand::Remove { id, .. } => {
-            project::switches::remove(&p, &id, &mut history, format!("Let {id} go"))?;
-            let p = project::Project::load(&project)?;
-            project::switches::write_lock(&p, &extensions::locked(&p, Some(&index)))?;
+            project::switches::remove_extension(&p, &id, &mut history, format!("Remove {id}"))?;
         }
-        ExtensionCommand::Lock { .. } => project::switches::write_lock(&p, &extensions::locked(&p, Some(&index)))?,
+        ExtensionCommand::Setup { id, enable, disable, verify, .. } => {
+            set_up(&p, id.as_deref(), &enable, &disable, verify)?;
+        }
     }
     Ok(())
 }
@@ -432,6 +719,10 @@ fn trust(project: &Path, all: bool, layers: &[String], paths: Vec<PathBuf>, revo
     }
     for place in shown {
         println!("{}", place.display());
+    }
+    // Trusted, what its extensions require is fetched: trusting them is consenting to it.
+    if !revoke && !named.is_empty() {
+        fetch(&extensions::for_project(&p))?;
     }
     Ok(())
 }
@@ -476,11 +767,8 @@ fn main() -> Result<()> {
                 eprintln!("warning: {why}");
             }
             let options = project::extract::Options { releases: release, roms, declarations };
-            // Its own extensions (`extension` assets, in its layers above the game's) and the user's.
-            let index =
-                project::cache::Cache::open(&p, &lock).and_then(|cache| project::index::Index::open(&p, &cache));
-            let extensions = extensions::for_project(&p, index.as_ref().ok());
-            drop(index);
+            // The extensions it holds, in its layers above the game's.
+            let extensions = extensions::for_project(&p);
             for problem in &extensions.problems {
                 eprintln!("warning: {problem}");
             }
@@ -499,6 +787,17 @@ fn main() -> Result<()> {
                 let index = project::index::Index::open(&p, &cache)?;
                 Ok(project::imports::sweep_if_due(&project::graph::store::Store::open(&cache)?, &index))
             });
+        }
+        Tool::Fetched { command } => fetched(command)?,
+        Tool::Extension { command: AuthorCommand::Pins { manifests } } => {
+            let mut gone = Vec::new();
+            for manifest in &manifests {
+                gone.extend(project::ext::setup::check_pins(manifest)?);
+            }
+            anyhow::ensure!(gone.is_empty(), "no source answers for:\n  {}", gone.join("\n  "));
+        }
+        Tool::Extension { command: AuthorCommand::Hash { manifest, write } } => {
+            project::ext::setup::hash_manifest(&manifest, write)?;
         }
         Tool::Mcp { project } => {
             let root = project::Project::load(&project)?.root;

@@ -35,7 +35,7 @@ use pe2_ext::{
 use atlas::{FaceLayout, FaceSpec, Flow, Layout, PageSpec, Record, Row};
 use encoding::Encoding;
 
-pe2_ext::extension!("pe2.fonts", "0.1.0", register, requires = ["pe2.images@^0.1"]);
+pe2_ext::extension!(register);
 
 /// A UFO 3 font: a folder named `*.ufo`.
 pub struct UfoFont;

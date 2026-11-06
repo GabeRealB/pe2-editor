@@ -81,3 +81,31 @@ fn a_no_can_be_taken_back_in_the_extensions_pane() {
     editor.click("Trust layer mods");
     editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
 }
+
+#[test]
+fn trusting_shows_what_it_downloads_and_asks_nothing_more() {
+    let mut editor = Scenario::open(Fixture::untrusted(false));
+    editor.expect("pe2.psx downloads:");
+    editor.expect("GCC 2.8.1 for the PlayStation");
+    editor.expect("https://github.com/decompals/old-gcc");
+    editor.expect("sha256");
+    editor.click_label("Trust the whole project");
+    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    assert!(!editor.asking(), "trusting it was consenting to what it downloads");
+}
+
+/// The Extensions pane, narrow and wide: its overview and the details of the one selected, the choice it asks for in
+/// view without scrolling either way.
+#[test]
+fn the_extensions_pane_fits_a_narrow_window_and_a_wide_one() {
+    for size in [eframe::egui::vec2(760.0, 900.0), eframe::egui::vec2(1900.0, 700.0)] {
+        let mut editor = Scenario::open(Fixture::untrusted(false));
+        editor.click_label("Continue");
+        let mut editor = Scenario::open_sized(editor.into_fixture(), Some("extensions"), size);
+        editor.type_into("Filter extensions", "psx");
+        editor.click("pe2.psx: not enabled");
+        editor.expect("OUTSIDE THE SANDBOX");
+        editor.click("Trust layer mods");
+        editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    }
+}

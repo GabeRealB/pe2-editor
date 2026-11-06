@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+pe2-ext-macros.workspace = true
 toml.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]

@@ -38,9 +38,9 @@ struct ProjectFile {
     mount: Vec<MountFile>,
     #[serde(default)]
     extensions: ExtensionsFile,
-    /// What it uses from outside itself: `[[extension]]`.
+    /// What it requires of extensions: `[[extension]]`.
     #[serde(default)]
-    extension: Vec<Imported>,
+    extension: Vec<Requirement>,
     /// The builds it can be: `[config.<name>]`.
     #[serde(default)]
     config: std::collections::BTreeMap<String, ConfigFile>,
@@ -78,33 +78,15 @@ struct BuildFile {
     links: build::Links,
 }
 
-/// An extension a project has taken in: `[[extension]]`. One held in the project (an `extension` asset) is taken in by being
-/// there, and is listed only to say more of it.
+/// An extension a project requires: `[[extension]]`. Without it, of a version it accepts, the project is not whole. One
+/// it holds (`ext::folder`) or a built-in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-pub struct Imported {
+pub struct Requirement {
     pub id: String,
-    /// The versions it accepts: `^0.1`.
+    /// The versions it accepts: `^0.1`; none, any.
     #[serde(default)]
     pub version: Option<String>,
-    /// Without it, the project is not whole.
-    #[serde(default)]
-    pub required: bool,
-    /// Where it is, as written: a folder or a component, relative to the project, or `res://`. None: the user's own
-    /// extensions, or those beside the editor.
-    #[serde(default)]
-    pub from: Option<String>,
 }
-
-/// What a project says it uses and what it found them to be: all that decides which extensions it loads.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Manifest {
-    pub imported: Vec<Imported>,
-    /// What each from outside the project was when taken in, by id: `extensions.lock`.
-    pub locked: std::collections::BTreeMap<String, String>,
-}
-
-/// The file beside `project.toml` holding what each extension from outside the project was.
-pub const EXTENSIONS_LOCK: &str = "extensions.lock";
 
 /// `[extensions]`: the extensions the project leaves off.
 #[derive(Default, Deserialize)]
@@ -273,8 +255,8 @@ pub struct Project {
     pub mounts: Vec<Mount>,
     /// The extensions it leaves off, by id (`[extensions] disabled`): everyone on it reads its assets the same way.
     pub disabled_extensions: Vec<String>,
-    /// What it uses of extensions from outside itself.
-    pub manifest: Manifest,
+    /// The extensions it requires (`[[extension]]`).
+    pub requires: Vec<Requirement>,
     /// Its extensions' settings, by id (`[extensions."<id>"]`): the same for everyone on it.
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
     /// The builds it can be, by name, in order.
@@ -355,9 +337,7 @@ impl Project {
             });
         }
         let disabled_extensions = file.extensions.disabled;
-        let locked =
-            std::fs::read_to_string(root.join(EXTENSIONS_LOCK)).ok().and_then(|text| toml::from_str(&text).ok());
-        let manifest = Manifest { imported: file.extension, locked: locked.unwrap_or_default() };
+        let requires = file.extension;
         let extension_settings = file
             .extensions
             .settings
@@ -373,16 +353,30 @@ impl Project {
             .into_iter()
             .map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled })
             .collect();
-        Ok(Project { root, game, layers, mounts, disabled_extensions, manifest, extension_settings, configs, links })
+        Ok(Project { root, game, layers, mounts, disabled_extensions, requires, extension_settings, configs, links })
     }
 
-    /// Where an extension taken in from a place is: `from` of `[[extension]]`.
+    /// The extensions it holds: the folders in `extensions/` of its layers (`ext::folder`), each id's from the highest
+    /// layer holding it, in name order.
     #[must_use]
-    pub fn imported_from(&self, from: &str) -> PathBuf {
-        if from.starts_with("res://") {
-            return self.resolve(from).unwrap_or_else(|_| PathBuf::from(from));
+    pub fn held_extensions(&self) -> Vec<PathBuf> {
+        let mut held: std::collections::BTreeMap<std::ffi::OsString, PathBuf> = std::collections::BTreeMap::new();
+        for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
+            let entries = std::fs::read_dir(layer.path.join(ext::folder::HELD)).into_iter().flatten().flatten();
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() && ext::folder::id_of(&path).is_some() {
+                    held.entry(entry.file_name()).or_insert(path);
+                }
+            }
         }
-        self.root.join(from)
+        held.into_values().collect()
+    }
+
+    /// The layer an extension added to it goes in: its highest that is written.
+    #[must_use]
+    pub fn extensions_layer(&self) -> Option<&Layer> {
+        self.layers.iter().rev().find(|layer| !layer.mounted && !layer.read_only)
     }
 
     /// A `res://` path's place on disk, through the mounts (the longest mount point first).

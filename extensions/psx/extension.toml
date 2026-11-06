@@ -1,0 +1,153 @@
+id = "pe2.psx"
+version = "0.1.0"
+requires = ["pe2.packages@^0.1"]
+provides = ["package-target@1.0.0"]
+unsandboxed = true
+description = "The PlayStation target: builds packages into the images the game loads, with the compilers it fetches."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"
+docs = "docs/index.md"
+install = "docs/install.md"
+
+[[setup]]
+name = "GCC 2.8.1 for the PlayStation, from old-gcc"
+license = "GPL-2.0-or-later"
+copyright = "Free Software Foundation; built by the decompals old-gcc project"
+platform = "linux-x86_64"
+url = "https://github.com/decompals/old-gcc/releases/download/0.17/gcc-2.8.1-psx.tar.gz"
+sha256 = "f6f6e883942d4d3289d048236c672e71ed410e546aaae8ff655952f1567e1be0"
+take = { "cc1" = { to = "cc1", sha256 = "1a48ec5ac87a146a074a9d66d7a67734a4d1ad56553d02d91e8b71c7fecc2d52" } }
+
+[[setup]]
+name = "MIPS binutils 2.47 and GCC 16.2.0's C preprocessor, from musl-cross"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation; built by the cross-tools musl-cross project"
+platform = "linux-x86_64"
+url = "https://github.com/cross-tools/musl-cross/releases/download/20261001/mipsel-unknown-linux-musl.tar.xz"
+sha256 = "55e2e2ffbe9fefb81c0cf3b03acf937f2ad000efb3ceaf70041e6052c89ca31b"
+
+[setup.take]
+"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-as" = { to = "mips-linux-gnu-as", sha256 = "9a0403d0a285b377480ba9dc4fddda348f80aa5634b3eed5f2a62680e4643c24" }
+"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-ld.bfd" = { to = "mips-linux-gnu-ld", sha256 = "a73245649583a25f7ca326302ed2a134accdb750bcb35e659ddd23de3b835f48" }
+"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-nm" = { to = "mips-linux-gnu-nm", sha256 = "d8abb9f1501c31fe1db08206c9a7834d3d4e5b0286789788bf42545423e0d77f" }
+"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "ec58b0794248c0da33a23ba3deec3aa13ec649135f4d78deb6f221dd7c427ac4" }
+"mipsel-unknown-linux-musl/libexec/gcc/mipsel-unknown-linux-musl/16.2.0/cc1" = { to = "cpp/libexec/gcc/host/14.2.0/cc1", sha256 = "34b3650fc213ef6b706a129a740876188c313c09da9546bdd55b128dc71ece9d" }
+
+[[setup]]
+name = "GCC 2.8.1 for the PlayStation, from old-gcc"
+license = "GPL-2.0-or-later"
+copyright = "Free Software Foundation; built by the decompals old-gcc project"
+platform = "macos-aarch64"
+url = "https://github.com/decompals/old-gcc/releases/download/0.17/gcc-2.8.1-psx-macos.tar.gz"
+sha256 = "bab0c6ea1f394573d5aabbdd7b37e36aceeb83c522141d946a87a9f58c199ea0"
+take = { "cc1" = { to = "cc1", sha256 = "6895b71b99b7648f44d3aa9adf2119febe9fdfb1cd6da399cfb9a684b2db6d77" } }
+
+[[setup]]
+name = "MIPS binutils 2.45 and GCC 15.2.0's C preprocessor, from macos-cross-toolchains"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation; built by messense's macos-cross-toolchains"
+platform = "macos-aarch64"
+url = "https://github.com/messense/homebrew-macos-cross-toolchains/releases/download/v15.2.0/mipsel-unknown-linux-gnu-aarch64-darwin.tar.gz"
+sha256 = "e3134121655af3995be0c59751b52cfd7a153c6874f745d2bdeca01b4a15d33e"
+
+[setup.take]
+"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-as" = { to = "mips-linux-gnu-as", sha256 = "940b0516aa5a491e38524f9792d9612fee3e210506156f499beccfb5a0e1b800" }
+"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-ld.bfd" = { to = "mips-linux-gnu-ld", sha256 = "68b97e8145b84e429af301f1c045c5191239e3cbff2e91d56e46badacabf7b55" }
+"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-nm" = { to = "mips-linux-gnu-nm", sha256 = "f01ef7d21d054187d6ca95f6ef67281c949379cc1c4d769549bc7cdf3090aaee" }
+"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "90fd80c99dcee90c207244bd443260e3764ea0acb92e29fd4af8415250bd7465" }
+"mipsel-unknown-linux-gnu/libexec/gcc/mipsel-unknown-linux-gnu/15.2.0/cc1" = { to = "cpp/libexec/gcc/host/14.2.0/cc1", sha256 = "8e498b73d756d0460159110ea7525e838f4e2157d2884f9e9dc1218640c100d8" }
+
+[[setup]]
+name = "GCC 2.8.1 for the PlayStation, from Psy-Q 4.4"
+license = "GPL-2.0-or-later"
+copyright = "Free Software Foundation; modified and built by SN Systems, now Sony Interactive Entertainment, and distributed in Sony's PlayStation Psy-Q SDK 4.4 - fetched from a copy of it"
+platform = "windows-x86_64"
+url = "https://raw.githubusercontent.com/FoxdieTeam/psyq_sdk/c2ef6aec5823c6ca3a2ceef4ee370495e92fa4d2/psyq_4.4/bin/cc1psx.exe"
+sha256 = "26eb8259fa3e077d1980eb1e0c942006752135953dd03173200bf99ef6f5b6c9"
+take = { file = "cc1.exe", sha256 = "26eb8259fa3e077d1980eb1e0c942006752135953dd03173200bf99ef6f5b6c9" }
+
+[[setup]]
+name = "MIPS binutils 2.47 and GCC 16.2.0's C preprocessor, from PCSX-Redux"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation; built by the PCSX-Redux project, its libraries each under its own license"
+platform = "windows-x86_64"
+url = "https://distrib.app/storage/assets/8e9/e3f/f17/4e702ee45f3f1447662f057e9a4909c371f0bb2acb6baf3d0cef71e/g++-mipsel-none-elf-16.2.0.zip"
+sha256 = "cf84960f5624829d44b866c5f194094c21c63b30f7cbb8cf3030f1abebd52b75"
+
+[setup.take]
+"bin/mipsel-none-elf-as.exe" = { to = "mips-linux-gnu-as.exe", sha256 = "5323da334c1fcb1ddc3f9ec57c44d3cde550b42496f8dd4ae3ab805ab0e2764f" }
+"bin/mipsel-none-elf-ld.exe" = { to = "mips-linux-gnu-ld.exe", sha256 = "a8c02038fa4e8594b716bce991b6648f333a2855210e9e407219fdc20f53c77e" }
+"bin/mipsel-none-elf-nm.exe" = { to = "mips-linux-gnu-nm.exe", sha256 = "04683ad6421d5b209de09bcc218934d5f3c2f8a0dc309684ae305b25d11ca1b1" }
+"bin/mipsel-none-elf-objcopy.exe" = { to = "mips-linux-gnu-objcopy.exe", sha256 = "8c27a076de0ccb32520ddec445c059fa268cb42c73d173925c1a32449da109ce" }
+"bin/libzstd.dll" = { to = "libzstd.dll", sha256 = "b95c223a9548a9ecf51377c962e0bc8f0c51eb0c6f67a296dbc885996f0dd40d" }
+"libexec/gcc/mipsel-none-elf/16.2.0/cc1.exe" = { to = "cpp/libexec/gcc/host/14.2.0/cc1.exe", sha256 = "3e1d35397cdc8420dd5567711f8771c419ef55647f1f236d0048b29df8ed7e06" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libgcc_s_seh-1.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libgcc_s_seh-1.dll", sha256 = "36ab53dec1027d923b0fce1a6154f193446073739d4365884e5215f1dd63bacc" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libgmp-10.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libgmp-10.dll", sha256 = "37248cda33845e7c5c35a574e57da762dd0a8268f0270d179f30a33746809681" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libiconv-2.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libiconv-2.dll", sha256 = "7a282a854e01be726c6cccfe46f548c716aa45b3014818468253aaa4efbcd067" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libmpc-3.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libmpc-3.dll", sha256 = "3a1d4c692c7a2af929ae043a2c88903304b84917bd84ca46bf75bb5389b11be8" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libmpfr-6.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libmpfr-6.dll", sha256 = "ed5f7bdf777f0f6af00ba193ce4b04e12efa787245a946a631db736e49c0bb1a" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libwinpthread-1.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libwinpthread-1.dll", sha256 = "bd22c23d4ce580c07f183d2bdf2b8edfb255ae1260fa8ae1a8e64dedc7e10575" }
+"libexec/gcc/mipsel-none-elf/16.2.0/libzstd.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libzstd.dll", sha256 = "b95c223a9548a9ecf51377c962e0bc8f0c51eb0c6f67a296dbc885996f0dd40d" }
+
+[[setup]]
+name = "Python 3.13.18, from python-build-standalone"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+platform = "linux-x86_64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+sha256 = "df15fe60d3ff55bf9dcf25824b5572756bb8816ff93865a273d3301d7066a8b7"
+take = { "python/bin/python3.13" = { to = "python/bin/python3.13", sha256 = "e314bd43fc9c17769c3bd276ca7aafa1462af1b2364a7c908a6cf82e60a92281" }, "python/lib" = { to = "python/lib", sha256 = "e9fecdf59b276495d8a0f0176a59079d5159bbb79b39900d38dd6c72e98e14f8" } }
+
+[[setup]]
+name = "Python 3.13.18, from python-build-standalone"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+platform = "macos-aarch64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-aarch64-apple-darwin-install_only_stripped.tar.gz"
+sha256 = "8392b6ea51d94391befb2c31ebe75463f045d0b69dfcf5e1bb3234e1f5fa3405"
+take = { "python/bin/python3.13" = { to = "python/bin/python3.13", sha256 = "747ca8797fea0949368e9e39d0f75b1eeadbae6c24edadda792ae22299e47a01" }, "python/lib" = { to = "python/lib", sha256 = "0a3ddba94223435399519631f6fdb73a7569219ad49e2968873a37ce0df002f1" } }
+
+[[setup]]
+name = "Python 3.13.18, from python-build-standalone"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+platform = "windows-x86_64"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+sha256 = "7369f7a35f261222a6ac8b3a87c1c88eeebee8af945d85346202591a64038dd3"
+take = { "python" = { to = "python", sha256 = "d021c45a51816f4841e60cbe4e32e08d10df3ecf8688e75070699c6fdb1aaaea" } }
+
+[[setup]]
+name = "maspsx, with the decomp's patches"
+license = "MIT"
+copyright = "Mark Street and its contributors"
+url = "https://github.com/mkst/maspsx/archive/4ffa8b5106f9780d5d4aa7609f184949433ddbbc.tar.gz"
+sha256 = "c9d007c88bd2ac7f63ba65e8b7b07732a2b06034eba55b41c3ccfaacc926f464"
+patches = [
+    { file = "patches/maspsx-lo-load-nop.patch", sha256 = "1b53f01c545064d77463777eab58545bfbafcdb347ed35ac6cc12d01b51f188c" },
+    { file = "patches/maspsx-bss-layout.patch", sha256 = "283ac620be70623a64c84df8f595e066f90573f226b99ee89edc14f9fca14a4f" },
+    { file = "patches/maspsx-bss-local.patch", sha256 = "6d5b285d487581d814666cb580acff4f8d718566656472cc2fa152e2f4487bd0" },
+]
+
+[setup.take]
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/maspsx.py" = { to = "maspsx/maspsx.py", sha256 = "7c165d0fd32768b9e9d4ffc6f8cb685721135b2ee275545c5b49c65c9352fd23" }
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/maspsx" = { to = "maspsx/maspsx", sha256 = "6ef9a34b6a046c50fcee89b518db3696144eb9404178a8b70e8f3f36b4877d20" }
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/LICENSE" = { to = "maspsx/LICENSE", sha256 = "4fd8c6ef76afa63ce817a0d6627027e9ecb03c0816fa91964e4544b2119dbfdf" }
+
+# maspsx runs the assembler itself: the one fetched, by the name psx calls it - or, where none was, the system's.
+[[launch]]
+name = "maspsx"
+platform = "linux-x86_64"
+program = "python/bin/python3.13"
+args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as"]
+
+[[launch]]
+name = "maspsx"
+platform = "macos-aarch64"
+program = "python/bin/python3.13"
+args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as"]
+
+[[launch]]
+name = "maspsx"
+platform = "windows-x86_64"
+program = "python/python.exe"
+args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as.exe"]

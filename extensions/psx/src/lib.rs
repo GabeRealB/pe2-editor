@@ -17,15 +17,7 @@ use pe2_ext::{Call, File, Micro, MicroInput, Prepared, Registry, Result, Table, 
 /// The target this is, as a config names it.
 const TARGET: &str = "psx";
 
-pe2_ext::extension!(
-    "pe2.psx",
-    "0.1.0",
-    register,
-    requires = ["pe2.packages@^0.1"],
-    provides = ["package-target@1.0.0"],
-    unsandboxed = true,
-    hashed = ["linux-x86_64"]
-);
+pe2_ext::extension!(register);
 
 /// A sector of the disc, which the executable's header and image fill whole.
 const SECTOR: usize = 0x800;
@@ -219,14 +211,8 @@ fn register(r: &mut Registry) -> Result<()> {
 
 /// The programs a build needs that it does not ship, looked for before anything is compiled: without them each package fails on its own, saying less.
 fn check_tools(_: &mut Call) -> Result<()> {
-    for tool in [
-        PREPROCESSOR,
-        "mips-linux-gnu-as",
-        "mips-linux-gnu-ld",
-        "mips-linux-gnu-nm",
-        "mips-linux-gnu-objcopy",
-        "python3",
-    ] {
+    for tool in [PREPROCESSOR, "mips-linux-gnu-as", "mips-linux-gnu-ld", "mips-linux-gnu-nm", "mips-linux-gnu-objcopy"]
+    {
         run(tool, &["--version".to_string()]).map_err(|e| anyhow!("building for {TARGET} needs {tool}: {e:#}"))?;
     }
     Ok(())

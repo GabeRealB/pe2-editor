@@ -1,0 +1,14 @@
+diff --git a/maspsx/maspsx/__init__.py b/maspsx/maspsx/__init__.py
+--- a/maspsx/maspsx/__init__.py
++++ b/maspsx/maspsx/__init__.py
+@@ -683,8 +683,8 @@
+                 if alignment > 1:
+                     res.append(f"\t.align {alignment.bit_length() - 1}")
+ 
+-                # only mark bss symbols as global
+-                if section == "bss":
++                # Preserve .lcomm's local binding for static BSS objects.
++                if section == "bss" and symbol in self.comm_symbols:
+                     res.append(
+                         f"\t.globl {symbol}",
+                     )

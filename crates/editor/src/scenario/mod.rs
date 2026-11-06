@@ -7,6 +7,8 @@
 //! the editor says it has nothing going on.
 
 // What only the scenarios here use is left over in a build for running a project's tests.
+#[cfg(test)]
+mod fetching;
 #[cfg_attr(not(test), allow(dead_code))]
 mod fixture;
 pub mod host;
@@ -43,6 +45,8 @@ pub use fixture::Fixture;
 const SIZE: egui::Vec2 = egui::vec2(1400.0, 900.0);
 /// How long work off the window's thread may take: a first run compiles the extensions.
 const PATIENCE: Duration = Duration::from_secs(120);
+/// The most frames waited for what is to be clicked to stay put: it has, long before.
+const STEADY_FRAMES: usize = 60;
 /// How many frames with nothing going on make it settled: what comes of a frame shows in the next.
 const QUIET: u32 = 3;
 
@@ -61,6 +65,8 @@ fn isolate() {
         extensions::use_data_folder(data);
         extensions::test_mode(host::extension);
         project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
+        // A test reaches no network: what an extension would fetch, it is told is not there.
+        project::ext::setup::forbid_downloads();
     });
 }
 
@@ -191,15 +197,28 @@ impl Scenario {
         Scenario::open_with(fixture, show, false)
     }
 
+    /// The editor on a fixture, with a pane in front, in a window of this size: how a pane lays itself out.
+    #[track_caller]
+    #[must_use]
+    pub fn open_sized(fixture: Fixture, show: Option<&str>, size: egui::Vec2) -> Scenario {
+        Scenario::open_in(fixture, show, false, size)
+    }
+
     /// The editor on a fixture; `unattended`, with nobody there to answer what a project asks.
     #[track_caller]
     fn open_with(fixture: Fixture, show: Option<&str>, unattended: bool) -> Scenario {
+        Scenario::open_in(fixture, show, unattended, SIZE)
+    }
+
+    /// The editor on a fixture in a window of a size; `unattended`, with nobody there to answer what a project asks.
+    #[track_caller]
+    fn open_in(fixture: Fixture, show: Option<&str>, unattended: bool, size: egui::Vec2) -> Scenario {
         static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // A scenario that failed says so itself: the next has nothing to do with it.
         let alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture.root().to_path_buf();
         let show = show.map(str::to_string);
-        let harness = Harness::builder().with_size(SIZE).wgpu().build_eframe(move |cc| {
+        let harness = Harness::builder().with_size(size).wgpu().build_eframe(move |cc| {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
             }
@@ -301,7 +320,14 @@ impl Scenario {
             self.harness.input_mut().focused = true;
             self.harness.step();
             quiet = if self.harness.state().busy() { 0 } else { quiet + 1 };
-            assert!(started.elapsed() < PATIENCE, "the editor did not settle");
+            if started.elapsed() >= PATIENCE {
+                let busy = self.harness.state().busy_with().join(", ");
+                panic!(
+                    "the editor did not settle in {}s, busy with {busy}; the window:\n{}",
+                    PATIENCE.as_secs(),
+                    self.shown().join("\n")
+                );
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -321,6 +347,23 @@ impl Scenario {
         self.settle();
     }
 
+    /// Frames until what is about to be clicked has stayed where it is for a few of them, as a pointer would find it.
+    /// egui takes a click by where the widgets were the frame before, and a window just shown takes none in the first
+    /// it is drawn (its sizing pass); a modal then centers itself by the size it found, and its contents may still move
+    /// as they settle. Clicked earlier, a click lands where nothing is - more often the slower the machine.
+    fn steady(&mut self, rect: impl Fn(&Scenario) -> Option<egui::Rect>) {
+        let (mut last, mut same) = (None, 0);
+        for _ in 0..STEADY_FRAMES {
+            self.harness.step();
+            let now = rect(self);
+            same = if now.is_some() && now == last { same + 1 } else { 0 };
+            if same >= 2 {
+                return;
+            }
+            last = now;
+        }
+    }
+
     /// The widget saying this, the one there is: a scenario naming two things alike says so.
     #[track_caller]
     fn widget<'a>(&'a self, text: &'a str) -> Node<'a> {
@@ -335,9 +378,17 @@ impl Scenario {
         }
     }
 
-    /// Click what says this.
+    /// Scroll what says this into view, as one scrolls down a pane to what is below it.
+    #[track_caller]
+    pub fn scroll_to(&mut self, text: &str) {
+        self.widget(text).scroll_to_me();
+        self.settle();
+    }
+
+    /// Click what says this: in view, as a click is.
     #[track_caller]
     pub fn click(&mut self, text: &str) {
+        self.steady(|editor| editor.harness.query_all(By::new().label_contains(text)).next().map(|node| node.rect()));
         self.widget(text).click();
         self.settle();
     }
@@ -345,6 +396,7 @@ impl Scenario {
     /// Click what says exactly this: what is open in a menu, say.
     #[track_caller]
     pub fn click_label(&mut self, text: &str) {
+        self.steady(|editor| editor.harness.query_all(By::new().label(text)).next().map(|node| node.rect()));
         let found: Vec<Node<'_>> = self.harness.query_all(By::new().label(text)).collect();
         match found.as_slice() {
             [one] => one.click(),
@@ -372,7 +424,17 @@ impl Scenario {
     pub fn until(&mut self, what: &str, holds: impl Fn(&mut Scenario) -> bool) {
         let started = Instant::now();
         while !holds(self) {
-            assert!(started.elapsed() < PATIENCE, "{what} never came");
+            if started.elapsed() >= PATIENCE {
+                // What there was instead: the extensions as they stood, and what the window showed.
+                let extensions: Vec<String> =
+                    self.workspace().extensions.present.iter().map(|p| format!("{} {:?}", p.id, p.status)).collect();
+                panic!(
+                    "{what} never came, in {}s; the extensions:\n{}\nthe window:\n{}",
+                    PATIENCE.as_secs(),
+                    extensions.join("\n"),
+                    self.shown().join("\n")
+                );
+            }
             self.settle();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -535,12 +597,11 @@ impl Scenario {
     fn data_of(&mut self, test: &str, name: &str) -> Result<Vec<u8>, String> {
         let id = test.split('@').next().unwrap_or_default();
         let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
-        let Some(project::ext::Origin::Project { file, .. } | project::ext::Origin::Component(file)) =
-            present.map(|present| present.origin)
-        else {
-            return Err(format!("{id} has no folder"));
+        let at = match present.map(|present| present.origin) {
+            Some(project::ext::Origin::Project(folder)) => folder.join("data").join(name),
+            Some(project::ext::Origin::Component(file)) => file.with_file_name("data").join(name),
+            _ => return Err(format!("{id} has no folder")),
         };
-        let at = file.with_file_name("data").join(name);
         std::fs::read(&at).map_err(|e| format!("{}: {e}", at.display()))
     }
 

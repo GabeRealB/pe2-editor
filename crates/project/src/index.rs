@@ -274,8 +274,9 @@ pub enum Problem {
     Conflict { path: String, layers: Vec<String> },
     /// An entry a layer holds that its changeset does not list, in a layer that cannot be written.
     Unlisted { layer: String, path: String },
-    /// An entry a changeset lists that its layer does not hold.
-    Missing { layer: String, path: String },
+    /// An entry a changeset lists that its layer does not hold; or holds where the index leaves it out (`left_out`:
+    /// an extension's folder, an ignored name), which no asset is.
+    Missing { layer: String, path: String, left_out: bool },
     /// An operation whose entry no layer below creates.
     Unbound { layer: String, uid: String },
     /// An override whose base changed since it was made.
@@ -284,8 +285,6 @@ pub enum Problem {
     Import { asset: String, error: String },
     /// An extension the project requires and does not have.
     Required { id: String, why: String },
-    /// An extension from outside the project that is no longer what it took in.
-    Unlocked { id: String },
     /// A stack that cannot run as it is written.
     Stack { asset: String, error: String },
     /// A setting the declaration gives that the asset's import derives from its source, which wins.
@@ -294,8 +293,8 @@ pub enum Problem {
     Orphan { asset: String, part: String },
     /// A reference naming an output (`uid://...#palettes/night`) its asset does not have.
     MissingOutput { asset: String, slot: String, target: String, output: String },
-    /// An `extension` asset whose component is not loaded, and why.
-    Extension { asset: String, error: String },
+    /// An extension the project holds that is not loaded, by id, and why.
+    Extension { id: String, error: String },
     /// What an asset's import took otherwise than its source has it (colors matched to the nearest), as its importer
     /// said: the build goes on with it.
     Taken { asset: String, note: String },
@@ -310,11 +309,10 @@ impl Problem {
             | Problem::Import { asset: path, .. }
             | Problem::Stack { asset: path, .. }
             | Problem::Required { id: path, .. }
-            | Problem::Unlocked { id: path }
             | Problem::Overridden { asset: path, .. }
             | Problem::Orphan { asset: path, .. }
             | Problem::MissingOutput { asset: path, .. }
-            | Problem::Extension { asset: path, .. }
+            | Problem::Extension { id: path, .. }
             | Problem::Taken { asset: path, .. }
             | Problem::Conflict { path, .. }
             | Problem::Unlisted { path, .. }
@@ -333,13 +331,15 @@ impl Problem {
             Problem::DuplicateUid { uid, paths } => format!("{uid} is created {} times", paths.len()),
             Problem::Conflict { layers, .. } => format!("in layers {} without a declared override", layers.join(", ")),
             Problem::Unlisted { layer, .. } => format!("not in the changeset of {layer}, which cannot be written"),
-            Problem::Missing { layer, .. } => format!("listed by {layer}, which does not hold it"),
+            Problem::Missing { layer, left_out: false, .. } => format!("listed by {layer}, which does not hold it"),
+            Problem::Missing { layer, left_out: true, .. } => {
+                format!("listed by {layer}, which leaves it out: no asset")
+            }
             Problem::Unbound { layer, uid } => format!("{layer} acts on {uid}, which no layer below creates"),
             Problem::Stale { layer, .. } => format!("{layer}'s override was made from another version of it"),
             Problem::Import { error, .. } => format!("its import failed: {error}"),
             Problem::Stack { error, .. } => format!("its stack: {error}"),
             Problem::Required { why, .. } => format!("the project requires it: {why}"),
-            Problem::Unlocked { .. } => "it is not what the project took in".to_string(),
             Problem::Overridden { setting, .. } => {
                 format!("{setting} is set, but its import derives it from the source, which wins")
             }
@@ -347,7 +347,7 @@ impl Problem {
             Problem::MissingOutput { slot, target, output, .. } => {
                 format!("{slot} names {target}#{output}, which it does not have")
             }
-            Problem::Extension { error, .. } => format!("the extension is not loaded: {error}"),
+            Problem::Extension { error, .. } => format!("the project holds it, and it is not loaded: {error}"),
             Problem::Taken { note, .. } => format!("its import: {note}"),
         }
     }
@@ -366,7 +366,6 @@ impl Problem {
             | Problem::Import { .. }
             | Problem::Stack { .. }
             | Problem::Required { .. }
-            | Problem::Unlocked { .. }
             | Problem::Overridden { .. }
             | Problem::Orphan { .. }
             | Problem::MissingOutput { .. }
@@ -380,11 +379,7 @@ impl Problem {
     pub fn is_warning(&self) -> bool {
         matches!(
             self,
-            Problem::Stale { .. }
-                | Problem::Unlocked { .. }
-                | Problem::Overridden { .. }
-                | Problem::Orphan { .. }
-                | Problem::Taken { .. }
+            Problem::Stale { .. } | Problem::Overridden { .. } | Problem::Orphan { .. } | Problem::Taken { .. }
         )
     }
 }
@@ -530,7 +525,14 @@ impl Place {
     /// Whether a resolved path is left out: by its names within the layer.
     fn ignores(&self, path: &str) -> bool {
         let within = if self.at.is_empty() { path } else { path.strip_prefix(&self.at).unwrap_or(path) };
-        changeset::ignored(&self.ignore, within.trim_start_matches('/'))
+        changeset::ignored(&self.ignore, within.trim_start_matches('/')) || self.holds_extension(path)
+    }
+
+    /// Whether a path is in the folder of a layer holding its extensions (`extensions/`, `ext::folder`): code, which no
+    /// asset is.
+    fn holds_extension(&self, path: &str) -> bool {
+        let held = crate::ext::folder::HELD;
+        self.at.is_empty() && path.strip_prefix(held).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
 }
 
@@ -896,6 +898,12 @@ pub struct Index {
 }
 
 impl Index {
+    /// Whether a layer leaves a path out (an extension's folder, a name it ignores): no asset, whatever is on disk.
+    #[must_use]
+    pub fn leaves_out(&self, layer: &str, path: &str) -> bool {
+        self.layers.iter().find(|l| l.name == layer).is_some_and(|l| l.place.ignores(path))
+    }
+
     /// Index a project's layers, through its cache: only files whose stamp changed are read. Unlisted entries of the
     /// layers that can be written are listed in their changesets.
     ///
@@ -1235,7 +1243,8 @@ impl Index {
             let mut accounted: HashSet<String> = HashSet::new();
             for (uid, path) in &layer.changeset.entries {
                 let Some(kind) = layer.scan.kind(path) else {
-                    problems.push(Problem::Missing { layer: layer.name.clone(), path: path.clone() });
+                    let left_out = layer.place.ignores(path);
+                    problems.push(Problem::Missing { layer: layer.name.clone(), path: path.clone(), left_out });
                     continue;
                 };
                 accounted.insert(path.clone());
@@ -1301,7 +1310,11 @@ impl Index {
                     && let Some(node) = resolved.get_mut(&at)
                 {
                     if node.kind == Kind::Folder || layer.scan.kind(&at) != Some(node.kind) {
-                        problems.push(Problem::Missing { layer: layer.name.clone(), path: at.clone() });
+                        problems.push(Problem::Missing {
+                            layer: layer.name.clone(),
+                            path: at.clone(),
+                            left_out: false,
+                        });
                         status.insert(uid.clone(), (OpStatus::Missing, Some(path)));
                         continue;
                     }
@@ -1927,6 +1940,17 @@ mod tests {
         root
     }
 
+    #[test]
+    fn what_a_layer_holds_of_extensions_is_no_asset() {
+        let root = project("extensions");
+        write(&root, ".layers/top/extensions/my.tool.extension/extension.wasm", "code");
+        write(&root, ".layers/top/extensions/old.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
+        let (_, index) = open(&root);
+        assert!(index.assets.keys().all(|path| !path.starts_with("extensions")), "{:?}", index.assets.keys());
+        assert!(index.base_hash("extensions").is_none(), "not even a folder");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn write(root: &Path, path: &str, text: &str) -> PathBuf {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2041,7 +2065,7 @@ mod tests {
         let has = |p: &Problem| index.problems.contains(p);
         assert!(has(&Problem::Conflict { path: "b.node".into(), layers: vec!["base".into(), "top".into()] }));
         assert!(has(&Problem::Unlisted { layer: "top".into(), path: "new.node".into() }));
-        assert!(has(&Problem::Missing { layer: "top".into(), path: "nowhere".into() }));
+        assert!(has(&Problem::Missing { layer: "top".into(), path: "nowhere".into(), left_out: false }));
         assert!(has(&Problem::Unbound { layer: "top".into(), uid: "uid://unknown".into() }));
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2066,7 +2090,11 @@ mod tests {
         std::fs::remove_dir_all(root.join(".layers/base/f.node")).unwrap();
         index.refresh(&project, &[root.join(".layers/base/f.node")]).unwrap();
         assert!(!index.assets.contains_key("f"));
-        assert!(index.problems.contains(&Problem::Missing { layer: "base".into(), path: "f.node".into() }));
+        assert!(index.problems.contains(&Problem::Missing {
+            layer: "base".into(),
+            path: "f.node".into(),
+            left_out: false
+        }));
         assert!(index.refresh(&project, &[root.join("project.toml")]).unwrap().project_file);
         std::fs::remove_dir_all(&root).unwrap();
     }

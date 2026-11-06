@@ -1,17 +1,22 @@
 //! What a project says of its extensions in `project.toml`: those it leaves off (`[extensions] disabled`, a list of
 //! ids) and their project settings (`[extensions."<id>"]`). Each is written in place (the file's comments and layout
 //! kept) as a step of the project's history, so it can be undone. The editor opens the project again when
-//! `project.toml` changes, loading its extensions as it now says. What it takes in from outside itself is `[[extension]]`,
-//! with what each was beside it in `extensions.lock`.
+//! `project.toml` changes, loading its extensions as it now says.
+//!
+//! The extensions it holds are copies, in `extensions/` of a layer (`ext::folder`): one is added from wherever it is
+//! kept - and updated the same way - and removed, each as one step with what the project requires of it
+//! (`[[extension]]`).
 
-use std::collections::BTreeMap;
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use toml_edit::{Array, ArrayOfTables, Item, Table, value};
+use anyhow::{Context, Result, bail};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
+use crate::ext::component::About;
+use crate::ext::{EXTENSION_COMPONENT, folder};
 use crate::history::History;
 use crate::stack::{read, write};
-use crate::{Imported, Project};
+use crate::{FILE, Project, Requirement};
 
 /// Leave these extensions off, and every other on.
 ///
@@ -38,58 +43,101 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
     write(&project.root, &document, history, label)
 }
 
-/// Take an extension in, or say more of one taken in: what is said of it replaces what was.
+/// Add an extension to the project, or update the one it holds of its id: its folder copied into `extensions/` of the
+/// project's highest layer that is written, whole, in place of what was there, and required at the versions of its
+/// line (`^0.1`). What it is is checked first, as loading checks it.
 ///
 /// # Errors
-/// `project.toml` cannot be read or written.
-pub fn import(project: &Project, imported: &Imported, history: &mut History, label: String) -> Result<()> {
+/// It is no extension's folder, the project has no layer to hold it, or it cannot be copied or `project.toml` written.
+pub fn add_extension(project: &Project, from: &Path, history: &mut History, label: String) -> Result<About> {
+    let component = from.join(EXTENSION_COMPONENT);
+    let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
+    let about = folder::checked(from, &bytes).with_context(|| from.display().to_string())?;
+    let layer = project.extensions_layer().context("the project has no layer it writes to hold it")?;
+    let to = layer.path.join(folder::HELD).join(format!("{}{}", about.id, folder::SUFFIX));
+    if same(from, &to) {
+        bail!("{}: the project holds it there already", from.display());
+    }
     let mut document = read(&project.root)?;
+    let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
+    require(&mut document, &Requirement { id: about.id.clone(), version: Some(format!("^{line}")) })?;
+    let mut tx = history.begin(label);
+    if to.exists() {
+        tx.remove(&to)?;
+    }
+    tx.place(from, &to)?;
+    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.commit()?;
+    Ok(about)
+}
+
+/// Remove an extension from the project: its folder from the layers written that hold it, and what the project requires
+/// of it.
+///
+/// # Errors
+/// The project neither holds nor requires it, one of its layers that cannot be written holds it, or it cannot be
+/// removed or `project.toml` written.
+pub fn remove_extension(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
+    let name = format!("{id}{}", folder::SUFFIX);
+    let holding: Vec<&crate::Layer> = project
+        .layers
+        .iter()
+        .filter(|layer| !layer.mounted && layer.path.join(folder::HELD).join(&name).is_dir())
+        .collect();
+    if let Some(fixed) = holding.iter().find(|layer| layer.read_only) {
+        bail!("{id} is in {}, which the project does not write", fixed.name);
+    }
+    let mut document = read(&project.root)?;
+    let required = unrequire(&mut document, id);
+    if holding.is_empty() && !required {
+        bail!("the project neither holds nor requires {id}");
+    }
+    let mut tx = history.begin(label);
+    for layer in holding {
+        tx.remove(&layer.path.join(folder::HELD).join(&name))?;
+    }
+    if required {
+        tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    }
+    tx.commit().map(drop)
+}
+
+/// Whether two paths are the same place.
+fn same(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Require an extension: what is said of it replaces what was.
+fn require(document: &mut DocumentMut, requirement: &Requirement) -> Result<()> {
     let mut entry = Table::new();
-    entry.insert("id", value(imported.id.as_str()));
-    if let Some(version) = &imported.version {
+    entry.insert("id", value(requirement.id.as_str()));
+    if let Some(version) = &requirement.version {
         entry.insert("version", value(version.as_str()));
-    }
-    if imported.required {
-        entry.insert("required", value(true));
-    }
-    if let Some(from) = &imported.from {
-        entry.insert("from", value(from.as_str()));
     }
     let entries = document.entry("extension").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let entries = entries.as_array_of_tables_mut().context("extension is not [[extension]]")?;
-    let known = entries.iter().position(|known| known.get("id").and_then(Item::as_str) == Some(imported.id.as_str()));
+    let known =
+        entries.iter().position(|known| known.get("id").and_then(Item::as_str) == Some(requirement.id.as_str()));
     match known {
         Some(at) => *entries.get_mut(at).context("what was just found")? = entry,
         None => entries.push(entry),
     }
-    write(&project.root, &document, history, label)
+    Ok(())
 }
 
-/// Let go of an extension taken in. What the project holds itself goes by deleting it.
-///
-/// # Errors
-/// `project.toml` cannot be read or written.
-pub fn remove(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
-    let mut document = read(&project.root)?;
-    if let Some(entries) = document.get_mut("extension").and_then(Item::as_array_of_tables_mut) {
-        entries.retain(|known| known.get("id").and_then(Item::as_str) != Some(id));
-        if entries.is_empty() {
-            document.remove("extension");
-        }
+/// Require an extension no longer: whether it was.
+fn unrequire(document: &mut DocumentMut, id: &str) -> bool {
+    let Some(entries) = document.get_mut("extension").and_then(Item::as_array_of_tables_mut) else { return false };
+    let before = entries.len();
+    entries.retain(|known| known.get("id").and_then(Item::as_str) != Some(id));
+    let removed = entries.len() != before;
+    if entries.is_empty() {
+        document.remove("extension");
     }
-    write(&project.root, &document, history, label)
-}
-
-/// Write what each extension from outside the project is.
-///
-/// # Errors
-/// It cannot be written.
-pub fn write_lock(project: &Project, locked: &BTreeMap<String, String>) -> Result<()> {
-    let text = format!(
-        "# What each extension from outside the project was when it was taken in.\n\n{}",
-        toml::to_string(locked)?
-    );
-    crate::cache::write_atomic(&project.root.join(crate::EXTENSIONS_LOCK), text.as_bytes())
+    removed
 }
 
 /// Keep a project setting of an extension, or (`None`) go back to its default.
@@ -138,11 +186,11 @@ pub fn set_setting(
 
 #[cfg(test)]
 mod tests {
-    use super::{import, remove, set_disabled, set_setting, write_lock};
+    use super::{add_extension, remove_extension, set_disabled, set_setting};
+    use crate::Project;
     use crate::cache::Cache;
     use crate::history::History;
     use crate::lock::Lock;
-    use crate::{Imported, Project};
 
     #[test]
     fn writes_what_the_project_says_of_its_extensions_in_place() {
@@ -178,31 +226,33 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A folder the way an extension is kept, its manifest beside a component carrying another: what the check
+    /// refuses.
+    fn kept(at: &std::path::Path, id: &str) {
+        std::fs::create_dir_all(at.join("linux-x86_64")).unwrap();
+        std::fs::write(at.join("extension.toml"), format!("id = \"{id}\"\nversion = \"0.2.1\"\n")).unwrap();
+        std::fs::write(at.join("extension.wasm"), b"\0asm").unwrap();
+        std::fs::write(at.join("linux-x86_64/tool"), b"a tool").unwrap();
+    }
+
     #[test]
-    fn an_extension_is_taken_in_said_more_of_and_let_go() {
-        let root = std::env::temp_dir().join(format!("pe2-import-{}", std::process::id()));
+    fn an_extension_is_added_only_as_what_it_says_it_is() {
+        let root = std::env::temp_dir().join(format!("pe2-add-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let text = "# the project\n[[layer]]\nname = \"base\"\n";
-        std::fs::write(root.join("project.toml"), text).unwrap();
+        std::fs::write(root.join("project.toml"), "[[layer]]\nname = \"base\"\n").unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let tool = Imported { id: "my.tool".to_string(), version: Some("^0.1".to_string()), ..Imported::default() };
-        import(&project, &tool, &mut history, "take".into()).unwrap();
-        let other = Imported { id: "my.other".to_string(), from: Some("../other".to_string()), ..Imported::default() };
-        import(&project, &other, &mut history, "take".into()).unwrap();
-        import(&project, &Imported { required: true, ..tool.clone() }, &mut history, "require".into()).unwrap();
-        write_lock(&project, &[("my.other".to_string(), "abc".to_string())].into()).unwrap();
-        let read = Project::load(&root).unwrap();
-        assert_eq!(read.manifest.imported.len(), 2);
-        assert!(read.manifest.imported[0].required);
-        assert_eq!(read.manifest.imported[1].from.as_deref(), Some("../other"));
-        assert_eq!(read.manifest.locked["my.other"], "abc");
-        assert_eq!(read.imported_from("../other"), root.join("../other"));
-        remove(&read, "my.tool", &mut history, "go".into()).unwrap();
-        remove(&read, "my.other", &mut history, "go".into()).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text, "nothing is left of it");
+        let source = root.join("kept/my.tool.extension");
+        kept(&source, "my.tool");
+        // Its component carries no manifest: nothing is copied, nothing required.
+        let refused = add_extension(&project, &source, &mut history, "add".into()).unwrap_err();
+        assert!(format!("{refused:#}").contains("carries no manifest"), "{refused:#}");
+        assert!(!root.join(".layers/base/extensions").exists());
+        assert_eq!(Project::load(&root).unwrap().requires, []);
+        // Neither held nor required, it cannot go.
+        assert!(remove_extension(&project, "my.tool", &mut history, "remove".into()).is_err());
         drop(lock);
         std::fs::remove_dir_all(&root).unwrap();
     }

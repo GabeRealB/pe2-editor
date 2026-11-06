@@ -81,6 +81,10 @@ interface unsandboxed {
     /// Start a program: where it ships one (for this platform, in `<platform>/` of its folder, or any), else as the
     /// system finds it.
     spawn: func(tool: string, args: list<string>) -> result<process, string>;
+
+    /// Have what its setup names (`name` of a `[[setup]]` entry of its manifest) on this machine: fetched where it is
+    /// not yet, an optional one only where the user lets it - one they turned off is refused, saying so.
+    set-up: func(name: string) -> result<_, string>;
 }
 
 interface types {

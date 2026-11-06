@@ -114,13 +114,13 @@ pub fn write(document: &Document, merged: &[u8], thumbnail: &[u8]) -> Vec<u8> {
     write_stack(&mut xml, &mut files, None, &document.stack, 1);
     xml.push_str("</image>\n");
     let mut entries = vec![
-        zip::Entry { name: "mimetype", data: MIMETYPE.as_bytes(), deflate: false },
-        zip::Entry { name: "stack.xml", data: xml.as_bytes(), deflate: true },
+        zip::Entry { name: "mimetype", data: MIMETYPE.as_bytes(), deflate: false, mode: 0 },
+        zip::Entry { name: "stack.xml", data: xml.as_bytes(), deflate: true, mode: 0 },
     ];
     // PNGs are compressed already: stored.
-    entries.extend(files.iter().map(|(name, data)| zip::Entry { name, data, deflate: false }));
-    entries.push(zip::Entry { name: "mergedimage.png", data: merged, deflate: false });
-    entries.push(zip::Entry { name: "Thumbnails/thumbnail.png", data: thumbnail, deflate: false });
+    entries.extend(files.iter().map(|(name, data)| zip::Entry { name, data, deflate: false, mode: 0 }));
+    entries.push(zip::Entry { name: "mergedimage.png", data: merged, deflate: false, mode: 0 });
+    entries.push(zip::Entry { name: "Thumbnails/thumbnail.png", data: thumbnail, deflate: false, mode: 0 });
     zip::write(&entries)
 }
 

@@ -63,9 +63,9 @@ fn a_folder_holds_a_suite_or_says_it_does_not() {
 }
 
 #[test]
-fn an_extension_says_what_counts_as_it() {
+fn an_extension_says_what_it_fetches() {
     let about =
         project::ext::component::about(&extensions::built_apart("pe2_psx.wasm").expect("built with the others"))
             .expect("who it is");
-    assert_eq!(about.hashed, ["linux-x86_64"]);
+    assert!(about.setup.iter().any(|setup| setup.platform.as_deref() == Some("linux-x86_64")), "{:?}", about.setup);
 }

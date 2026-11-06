@@ -22,7 +22,7 @@ use pe2_ext::{
 use std::collections::HashMap;
 pub use texels::{TexelImage, Texels};
 
-pe2_ext::extension!("pe2.images", "0.1.0", register);
+pe2_ext::extension!(register);
 
 /// What an image is.
 const IMAGE: &str = "pe2.images@image";

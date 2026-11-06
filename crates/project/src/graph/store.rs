@@ -19,8 +19,9 @@ use crate::extract::sha1_hex;
 
 const DIR: &str = "store";
 
-/// An output's trace: its value's hash, what it read, and whose output it is (its node, as traces name it, and its
-/// address).
+/// An output's trace: its value's hash, what it read, whose output it is (its node, as traces name it, and its
+/// address), and what made it (`made`: the operations and their versions, extensions' builds among them - not their
+/// settings or what they took).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trace {
     pub value: String,
@@ -30,7 +31,16 @@ pub struct Trace {
     pub node: String,
     #[serde(default)]
     pub output: String,
+    #[serde(default)]
+    pub made: String,
 }
+
+/// An output's newest trace of each build that made it (`Trace::made`): when it was written, its key and its value.
+type Builds = HashMap<String, (std::time::SystemTime, String, String)>;
+
+/// How many builds' traces of an output a sweep keeps: two editors of other versions on one project - a development
+/// build beside an installed one - each find what they made.
+const BUILDS_KEPT: usize = 2;
 
 /// A blob as a value names it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,8 +457,9 @@ impl Store {
         let _ = std::fs::remove_file(self.trace_path(key));
     }
 
-    /// Remove the traces of nodes not `live`, and of each live node's output all but the newest (what made it
-    /// before) - never those under the keys `used`, which what swept them reads - then the values no trace left
+    /// Remove the traces of nodes not `live`, and of each live node's output all but the newest of each of the two
+    /// builds that made it last (`Trace::made`: what made it before, of the same build, goes; another build's stays,
+    /// for it to find) - never those under the keys `used`, which what swept them reads - then the values no trace left
     /// names, then the blobs no value left names: what was swept, as (traces, values, blobs). It may run beside what
     /// keeps outputs: what was written since a little before it began is left (a value's blobs are written before it,
     /// it before its trace).
@@ -470,8 +481,8 @@ impl Store {
         let entries =
             |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
         let mut swept = (0, 0, 0);
-        // Each live output's newest trace, by when it was written.
-        let mut newest: HashMap<(String, String), (std::time::SystemTime, String, String)> = HashMap::new();
+        // Each live output's newest trace of each build, by when it was written.
+        let mut newest: HashMap<(String, String), Builds> = HashMap::new();
         let mut gone = Vec::new();
         for entry in entries("traces") {
             let (Some(key), Some(trace)) = (stem(&entry), stem(&entry).and_then(|k| self.trace(&k))) else {
@@ -488,7 +499,8 @@ impl Store {
                 gone.push(entry.path());
                 continue;
             }
-            match newest.entry((trace.node, trace.output)) {
+            let builds = newest.entry((trace.node, trace.output)).or_default();
+            match builds.entry(trace.made) {
                 std::collections::hash_map::Entry::Occupied(mut held) => {
                     if held.get().0 < written {
                         let (_, older, _) = held.insert((written, key, trace.value));
@@ -502,12 +514,22 @@ impl Store {
                 }
             }
         }
+        // Of each output, the builds that made it last; the others' traces go.
+        let mut kept = Vec::new();
+        for builds in newest.into_values() {
+            let mut builds: Vec<(std::time::SystemTime, String, String)> = builds.into_values().collect();
+            builds.sort_by_key(|build| std::cmp::Reverse(build.0));
+            for (_, key, _) in builds.iter().skip(BUILDS_KEPT) {
+                gone.push(self.trace_path(key));
+            }
+            kept.extend(builds.into_iter().take(BUILDS_KEPT));
+        }
         for path in gone {
             if std::fs::remove_file(path).is_ok() {
                 swept.0 += 1;
             }
         }
-        let mut values: HashSet<String> = newest.into_values().map(|(_, _, value)| value).collect();
+        let mut values: HashSet<String> = kept.into_iter().map(|(_, _, value)| value).collect();
         // A kept list keeps its items.
         let mut lists: Vec<String> = values.iter().cloned().collect();
         while let Some(hash) = lists.pop() {

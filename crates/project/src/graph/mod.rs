@@ -810,6 +810,22 @@ impl Plan {
         let _ = writeln!(text, "output {} {:?} from {}", output.name, output.parameter, output.from);
         text
     }
+
+    /// What an output is made with, as a trace keeps it: the operations it reaches and their versions - extensions'
+    /// builds among them - sorted, and not their settings or what they take: what another build made, not an older
+    /// edit of the same node.
+    #[must_use]
+    pub fn made(&self, output: usize, ops: &Ops) -> String {
+        let needed = self.reached(&[output]);
+        let made: std::collections::BTreeSet<String> = self
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| needed[*i])
+            .map(|(_, step)| format!("{}@{}", step.op, ops.get(&step.op).map_or("?", |d| d.version.as_str())))
+            .collect();
+        made.into_iter().collect::<Vec<_>>().join(" ")
+    }
 }
 
 struct Lowering<'a> {

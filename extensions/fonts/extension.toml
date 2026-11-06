@@ -1,0 +1,6 @@
+id = "pe2.fonts"
+version = "0.1.0"
+requires = ["pe2.images@^0.1"]
+description = "Encodings, font faces from UFO 3, and the atlases the game draws them from."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

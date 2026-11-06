@@ -7,7 +7,7 @@
 
 use pe2_ext::{Asset, Call, Data, Field, Icon, Registry, Result, Table, Tint, Typed, Value, anyhow, ty};
 
-pe2_ext::extension!("pe2.game", "0.1.0", register);
+pe2_ext::extension!(register);
 
 /// A number as it is written in the game's tables: in hex.
 fn hex(value: &Value) -> Option<String> {

@@ -268,18 +268,15 @@ fn reading(from: Option<impl std::io::Read + Send + 'static>, ctx: &egui::Contex
 /// What to give the runner for what this project has: the built-ins' tests and those beside its extensions.
 fn suites_of(ws: &Workspace) -> Vec<String> {
     let mut arguments = vec!["--built".to_string()];
-    let file = |origin: &Origin| match origin {
-        Origin::Project { file, .. } | Origin::User(file) | Origin::Install(file) | Origin::Component(file) => {
-            Some(file.clone())
-        }
-        Origin::Builtin | Origin::Linked => None,
-    };
+    // Those the project holds: what is kept to be added is not tested here.
     let folders: Vec<String> = ws
         .extensions
         .present
         .iter()
-        .filter_map(|present| file(&present.origin))
-        .filter_map(|file| Some(file.parent()?.to_path_buf()))
+        .filter_map(|present| match &present.origin {
+            Origin::Project(folder) => Some(folder.clone()),
+            _ => None,
+        })
         .filter(|folder| folder.join("tests").join("tests.wasm").is_file())
         .map(|folder| folder.display().to_string())
         .collect();
