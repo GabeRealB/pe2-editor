@@ -136,6 +136,12 @@ pub struct Store {
     dir: PathBuf,
 }
 
+/// The file whose time is when the store was last swept.
+const SWEPT: &str = "swept";
+
+/// How long a file in `tmp/` goes unwritten before it is taken for a stopped process's and removed.
+const STALE: std::time::Duration = std::time::Duration::from_hours(24);
+
 impl Store {
     /// The project's store.
     ///
@@ -154,7 +160,52 @@ impl Store {
             let path = dir.join(sub);
             std::fs::create_dir_all(&path).with_context(|| path.display().to_string())?;
         }
-        Ok(Store { dir })
+        let store = Store { dir };
+        let _ = store.sweep_tmp(STALE);
+        Ok(store)
+    }
+
+    /// Whether a sweep is due: none was for `every`, and something was kept since the last - every output kept writes a
+    /// trace, which the traces' folder's time says. Never swept, it is.
+    #[must_use]
+    pub fn sweep_due(&self, every: std::time::Duration) -> bool {
+        let time = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        match (time(self.dir.join(SWEPT)), time(self.dir.join("traces"))) {
+            (None, _) => true,
+            (Some(swept), Some(written)) => {
+                written > swept && std::time::SystemTime::now().duration_since(swept).is_ok_and(|age| age >= every)
+            }
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Note that it was swept now, for every process that keeps in it (`sweep_due`).
+    pub fn mark_swept(&self) {
+        let _ = std::fs::write(self.dir.join(SWEPT), b"");
+    }
+
+    /// Remove from `tmp/` what was not written for `stale`: what processes being written into it leave of their own is
+    /// gone with them (an unfinished writer, a path a program did not keep), so what is left that long is a process's
+    /// that stopped without finishing - one killed or crashed. How many were removed.
+    #[must_use = "how many were removed is the sweep's report"]
+    pub fn sweep_tmp(&self, stale: std::time::Duration) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.dir.join("tmp")) else { return 0 };
+        let now = std::time::SystemTime::now();
+        let old = |e: &std::fs::DirEntry| {
+            let modified = e.metadata().and_then(|m| m.modified());
+            modified.is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age >= stale))
+        };
+        let mut removed = 0;
+        for entry in entries.flatten().filter(old) {
+            let path = entry.path();
+            let gone = if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            removed += usize::from(gone);
+        }
+        removed
     }
 
     /// Where a blob is kept.

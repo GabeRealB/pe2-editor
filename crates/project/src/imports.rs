@@ -130,7 +130,7 @@ impl Imports {
     /// (`Store::sweep`): what was swept, as (traces, values, blobs). It reads all the store keeps - a third of a
     /// second for the game - so it is run aside, not on the way to anything.
     pub fn sweep(&self, index: &Index) -> (usize, usize, usize) {
-        self.store.sweep(&live_nodes(index), &HashSet::new())
+        sweep_store(&self.store, &live_nodes(index))
     }
 
     /// The engine imports are made by: the extensions' operations, keeping in the store.
@@ -538,6 +538,28 @@ fn extension_problems(extensions: &Extensions) -> Vec<Problem> {
     let unmet = extensions.unmet.iter().map(|(id, why)| Problem::Required { id: id.clone(), why: why.clone() });
     let unlocked = extensions.unlocked.iter().map(|id| Problem::Unlocked { id: id.clone() });
     refused.chain(unmet).chain(unlocked).collect()
+}
+
+/// How long a store goes unswept, while something is kept in it, before a sweep is due.
+pub const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// Sweep a store of what the nodes `live` no longer make (`Store::sweep`), noted as swept before - so that another
+/// process finds it is not due - and after, what the sweep removed being no news of its own.
+#[must_use = "what was swept is the sweep's report"]
+#[expect(clippy::implicit_hasher, reason = "the store sweeps by a set of the standard hasher's")]
+pub fn sweep_store(store: &Store, live: &HashSet<String>) -> (usize, usize, usize) {
+    store.mark_swept();
+    let swept = store.sweep(live, &HashSet::new());
+    store.mark_swept();
+    swept
+}
+
+/// Sweep a store of what the project's nodes no longer make where it is due (`Store::sweep_due`, every
+/// `SWEEP_EVERY`): what was swept, none where it was not due. For what keeps outputs while the project is open - the
+/// editor, the agents' server, a build - so that the store stays as large as what the project makes now.
+#[must_use = "what was swept is the sweep's report"]
+pub fn sweep_if_due(store: &Store, index: &Index) -> Option<(usize, usize, usize)> {
+    store.sweep_due(SWEEP_EVERY).then(|| sweep_store(store, &live_nodes(index)))
 }
 
 /// The project's nodes, as traces name them: what the store keeps for others goes in a sweep.

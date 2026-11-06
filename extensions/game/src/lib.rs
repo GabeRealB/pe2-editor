@@ -102,12 +102,17 @@ fn inter(call: &mut Call) -> Result<Typed> {
             }
         }
     }
-    let mut writer = call.writer("native.str")?;
+    // Every movie had before a byte is written: run until it has them all (`prepared_by_running`), it writes once.
+    let mut natives = Vec::with_capacity(movies.len());
     for movie in &movies {
         let Data::Typed(native) = call.output_of(movie, "native")? else {
             pe2_ext::bail!("{movie}: its native is no file")
         };
-        std::io::Write::write_all(&mut writer, &call.read(native.file()?)?)?;
+        natives.push(native.file()?.clone());
+    }
+    let mut writer = call.writer("native.str")?;
+    for native in &natives {
+        std::io::Write::write_all(&mut writer, &call.read(native)?)?;
     }
     Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
 }

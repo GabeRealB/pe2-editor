@@ -816,3 +816,86 @@ fn a_wire_names_a_layer_and_one_of_its_outputs() {
         Plan::of(&open.fields, &engine.ops, &[]).1.iter().any(|problem| problem.what.contains("connected to nothing"))
     );
 }
+
+/// What is left in a store's `tmp/`.
+fn left_in_tmp(dir: &std::path::Path) -> Vec<String> {
+    let entries = std::fs::read_dir(dir.join("tmp")).into_iter().flatten().flatten();
+    entries.map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+}
+
+#[test]
+fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut ops = ops();
+    let file_type = || Type::File(Box::new(Type::Any));
+    // Spilled past what a writer holds, then failed: as an operation stopped to read what is not made yet is.
+    ops.add(OpDef::new("t.spill_fail", "Spill and fail", "1").makes(file_type(), |call| {
+        let mut writer = call.writer("big.bin");
+        std::io::Write::write_all(&mut writer, &vec![7u8; super::exec::SPILL * 2])?;
+        anyhow::bail!("it stopped")
+    }));
+    // Two paths handed a program, one kept.
+    ops.add(OpDef::new("t.temps", "Temps", "1").makes(file_type(), |call| {
+        let (kept, lost) = (call.temp()?, call.temp()?);
+        std::fs::write(&kept, b"made")?;
+        std::fs::write(&lost, b"scratch")?;
+        let file = call.keep(&kept, "made.bin")?;
+        Ok(Value::Typed(Typed { ty: "bytes".into(), files: vec![file], ..Typed::default() }))
+    }));
+    let engine = Engine::new(ops, Some(Store::at(dir.clone()).unwrap()));
+    let stack = |op: &str| format!("[[stack]]\nop = \"{op}\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n");
+    let failing = Bundle::new(&stack("t.spill_fail"), &[]);
+    let (plan, _) = Plan::of(&failing.fields, &engine.ops, &[]);
+    assert!(engine.output(&plan, &failing, "native", false).is_err());
+    assert_eq!(left_in_tmp(&dir), Vec::<String>::new(), "an unfinished writer's spill");
+    let temps = Bundle::new(&stack("t.temps"), &[]);
+    let (plan, _) = Plan::of(&temps.fields, &engine.ops, &[]);
+    let made = engine.output(&plan, &temps, "native", false).unwrap();
+    let Some(Value::Typed(typed)) = made.value.as_deref() else { panic!("not a file") };
+    let Content::Stored { sha1, .. } = &typed.files[0].content else { panic!("not kept") };
+    assert_eq!(std::fs::read(engine.store().unwrap().blob_path(sha1)).unwrap(), b"made");
+    assert_eq!(left_in_tmp(&dir), Vec::<String>::new(), "a path handed out and not kept");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tmp/old.expand")).unwrap();
+    let day = std::time::Duration::from_hours(25);
+    for (name, age) in [("1-0", day), ("2-0", std::time::Duration::ZERO)] {
+        let file = std::fs::File::create(dir.join("tmp").join(name)).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+    std::fs::File::open(dir.join("tmp/old.expand")).unwrap().set_modified(std::time::SystemTime::now() - day).unwrap();
+    let _store = Store::at(dir.clone()).unwrap();
+    // What a stopped process left goes, a folder of it too; what is being written stays.
+    assert_eq!(left_in_tmp(&dir), ["2-0"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-due-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::at(dir.clone()).unwrap();
+    let every = std::time::Duration::from_mins(30);
+    assert!(store.sweep_due(every), "never swept");
+    store.mark_swept();
+    let set = |path: &str, ago: std::time::Duration| {
+        let at = std::time::SystemTime::now() - ago;
+        std::fs::File::open(dir.join(path)).unwrap().set_modified(at).unwrap();
+    };
+    // Swept an hour ago, nothing kept since.
+    set("swept", std::time::Duration::from_hours(1));
+    set("traces", std::time::Duration::from_hours(2));
+    assert!(!store.sweep_due(every), "nothing kept since");
+    // Something kept since: due, unless the sweep was recent.
+    set("traces", std::time::Duration::from_mins(1));
+    assert!(store.sweep_due(every));
+    set("swept", std::time::Duration::from_mins(5));
+    assert!(!store.sweep_due(every), "swept a while ago only");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

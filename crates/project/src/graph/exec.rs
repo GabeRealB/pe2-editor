@@ -335,6 +335,17 @@ pub struct Call<'a> {
     others: &'a Others,
     /// What it may read of other nodes, where it is held to that.
     needs: Option<&'a Needs>,
+    /// The paths it handed a program to write (`temp`): what is not kept of them is removed when it is done.
+    temps: Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        let temps = std::mem::take(self.temps.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for path in temps {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// What an operation said it reads, made before it ran, by `<node>#<address>`; and what it asked for that was not.
@@ -617,7 +628,9 @@ impl<'a> Call<'a> {
     /// # Errors
     /// There is no store, or it cannot be made.
     pub fn temp(&self) -> Result<std::path::PathBuf> {
-        Ok(self.store.context("no store to keep it in")?.spill()?.1)
+        let path = self.store.context("no store to keep it in")?.spill()?.1;
+        self.temps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.clone());
+        Ok(path)
     }
 
     /// A file made kept as a content: moved to its blob, named `name`.
@@ -784,14 +797,34 @@ impl Writer {
     ///
     /// # Errors
     /// What was spilled cannot be written or kept.
-    pub fn finish(self) -> Result<File> {
-        let Writer { name, store, memory, spilled, hasher, size } = self;
-        let Some((mut file, path)) = spilled else { return Ok(File::new(&name, memory)) };
-        std::io::Write::flush(&mut file)?;
-        drop(file);
-        let sha1 = crate::extract::hex(&hasher.finalize());
-        store.context("spilled with no store")?.adopt(&path, &sha1)?;
-        Ok(File { name, content: Content::Stored { sha1, size } })
+    pub fn finish(mut self) -> Result<File> {
+        let name = std::mem::take(&mut self.name);
+        let Some((mut file, path)) = self.spilled.take() else {
+            return Ok(File::new(&name, std::mem::take(&mut self.memory)));
+        };
+        // Its file is the store's from here, whatever comes of keeping it: removed where it cannot be kept.
+        let kept = (|| {
+            std::io::Write::flush(&mut file)?;
+            drop(file);
+            let sha1 = crate::extract::hex(&std::mem::take(&mut self.hasher).finalize());
+            self.store.as_ref().context("spilled with no store")?.adopt(&path, &sha1)?;
+            Ok(File { name, content: Content::Stored { sha1, size: self.size } })
+        })();
+        if kept.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        kept
+    }
+}
+
+/// A writer dropped unfinished - its operation failed, stopped to read what was not made yet, or was cancelled - leaves
+/// nothing of what it spilled.
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some((file, path)) = self.spilled.take() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -938,6 +971,7 @@ impl Evaluation<'_> {
                 reach: self.reach,
                 others,
                 needs: None,
+                temps: Mutex::default(),
             };
             return match start(&mut call) {
                 Ok(producer) => {
@@ -986,6 +1020,7 @@ impl Evaluation<'_> {
             reach: self.reach,
             others,
             needs: held,
+            temps: Mutex::default(),
         };
         let value = match run(&mut call) {
             Ok(value) => value,
@@ -1022,6 +1057,7 @@ impl Evaluation<'_> {
                 reach: self.reach,
                 others,
                 needs: Some(needs),
+                temps: Mutex::default(),
             };
             let prepared = prepare(&mut call);
             let mut asked = std::mem::take(&mut *needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
@@ -1410,8 +1446,13 @@ impl Engine {
             reach,
             others: &others,
             needs: None,
+            temps: Mutex::default(),
         };
-        let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()))?;
+        let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()));
+        // What a stream's producer may go on writing outlives the call that opened it: left to the store's sweep.
+        call.temps.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        drop(call);
+        let producer = producer?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok((producer, reads, self.key(plan, node, output, parameter)))
     }
@@ -1452,6 +1493,7 @@ impl Engine {
             reach,
             others,
             needs: None,
+            temps: Mutex::default(),
         };
         run(&mut call)
     }

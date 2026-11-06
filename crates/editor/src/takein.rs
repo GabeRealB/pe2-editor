@@ -283,6 +283,7 @@ impl Worker {
             // Their outputs made from their settings as now applied.
             self.applied.mark(&mut self.index, Some(&applied));
             let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &applied);
+            self.sweep_if_due();
         }
         if paths.is_empty() {
             return match reload {
@@ -323,6 +324,7 @@ impl Worker {
         }
         self.applied.mark(&mut self.index, Some(&refreshed.assets));
         let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
+        self.sweep_if_due();
         let mut changed = refreshed.assets;
         changed.extend(applied);
         match reload {
@@ -345,11 +347,25 @@ impl Worker {
     fn attach_all(&mut self) {
         let report = self.reporter();
         let _ = self.imports.attach_reporting(&mut self.index, &self.extensions, &report);
-        // Aside: it reads all the store keeps.
-        let (sweeping, nodes) = (self.store.clone(), project::imports::live_nodes(&self.index));
+        self.sweep_aside();
+    }
+
+    /// The store swept of what the project's nodes no longer make, aside - it reads all the store keeps - noted as swept
+    /// first, so that nothing else starts one meanwhile.
+    fn sweep_aside(&self) {
+        self.store.mark_swept();
+        let (store, nodes) = (self.store.clone(), project::imports::live_nodes(&self.index));
         let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
-            let _ = sweeping.sweep(&nodes, &std::collections::HashSet::new());
+            let _ = project::imports::sweep_store(&store, &nodes);
         });
+    }
+
+    /// The store swept aside where a sweep is due (`SWEEP_EVERY` since the last, something kept since): what a long
+    /// session makes kept no longer than that past what the project makes now.
+    fn sweep_if_due(&self) {
+        if self.store.sweep_due(project::imports::SWEEP_EVERY) {
+            self.sweep_aside();
+        }
     }
 
     /// The project read again, as `why` changed, and handed over; where it cannot be, it goes on as it was.

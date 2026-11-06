@@ -265,7 +265,8 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
         eprintln!("warning: {problem}");
     }
     whole(&extensions)?;
-    extensions.keep_in(project::graph::store::Store::open(&cache)?);
+    let store = project::graph::store::Store::open(&cache)?;
+    extensions.keep_in(store.clone());
     let wiring = project::build::wiring(&index, &extensions, &chosen);
     for (at, why) in &wiring.problems {
         eprintln!("{at}: {why}");
@@ -289,6 +290,8 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
             failed = true;
         }
     }
+    // What it kept, swept on its way out where a sweep is due.
+    let _ = project::imports::sweep_if_due(&store, &index);
     anyhow::ensure!(!failed, "it failed");
     Ok(())
 }
@@ -491,6 +494,11 @@ fn main() -> Result<()> {
                 report.layouts,
                 report.layer.display()
             );
+            // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted.
+            let _ = project::cache::Cache::open(&p, &lock).and_then(|cache| {
+                let index = project::index::Index::open(&p, &cache)?;
+                Ok(project::imports::sweep_if_due(&project::graph::store::Store::open(&cache)?, &index))
+            });
         }
         Tool::Mcp { project } => {
             let root = project::Project::load(&project)?.root;
