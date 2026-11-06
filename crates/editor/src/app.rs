@@ -73,6 +73,9 @@ struct Opening {
     began: std::time::Instant,
     progress: Arc<std::sync::Mutex<(String, usize, usize)>>,
     ready: std::sync::mpsc::Receiver<anyhow::Result<crate::workspace::Opened>>,
+    /// Agents' requests, from the link the opening starts as it takes the project's lock: answered as it opens - what
+    /// they ask of the window as ever, what they ask of the project with how far it is - then the workspace's.
+    agents: std::sync::mpsc::Receiver<crate::workspace::AgentRequest>,
     /// Shown once it is open: the selection kept across a reopen, or asked on the command line.
     select: Option<String>,
 }
@@ -147,6 +150,8 @@ pub struct Editor {
     unattended: bool,
     /// Agents using the window, and whether this session lets them act whatever the settings say.
     drive: crate::drive::Driver,
+    /// What it says of itself to whoever lists the editors on this computer (`mcp::presence`).
+    presence: Option<mcp::presence::Keeper>,
     agents_drive: bool,
 }
 
@@ -290,6 +295,7 @@ impl Editor {
             not_now: None,
             unattended: start.unattended,
             drive: crate::drive::Driver::new(),
+            presence: mcp::presence::Keeper::start(),
             agents_drive: start.agents_drive,
         };
         if let Some(dir) = project {
@@ -315,8 +321,12 @@ impl Editor {
         let leaving = self.workspace.take().map(Workspace::leave);
         self.deferred.clear();
         let progress: Arc<std::sync::Mutex<(String, usize, usize)>> = Arc::default();
+        // Said before the lock is taken: an agent's server finding it about to open the project leaves the project to it.
+        self.announce_opening(dir);
         let (done, ready) = std::sync::mpsc::channel();
+        let (to_frames, agents) = std::sync::mpsc::channel();
         let (dir_owned, said, ctx) = (dir.to_path_buf(), progress.clone(), self.ctx.clone());
+        let link_ctx = self.ctx.clone();
         let started = std::thread::Builder::new().name("open".into()).spawn(move || {
             let report = |stage: &str, done: usize, total: usize| {
                 if let Ok(mut p) = said.lock() {
@@ -326,16 +336,38 @@ impl Editor {
             };
             report("Closing the project", 0, 0);
             drop(leaving);
-            let _ = done.send(Workspace::prepare(&dir_owned, &report));
+            let _ = done.send(Workspace::prepare(&dir_owned, &report, (to_frames, link_ctx)));
             ctx.request_repaint();
         });
         match started {
             Ok(_) => {
                 let began = std::time::Instant::now();
-                self.opening = Some(Opening { dir: dir.to_path_buf(), began, progress, ready, select: None });
+                self.opening = Some(Opening { dir: dir.to_path_buf(), began, progress, ready, agents, select: None });
             }
             Err(e) => self.error = Some(format!("{}: {e}", dir.display())),
         }
+    }
+
+    /// Agents' requests while the project opens: what they ask of the window answered as ever, what they ask of the
+    /// project said to wait, with how far it is.
+    fn answer_while_opening(&mut self, ctx: &egui::Context) {
+        let Some(opening) = &self.opening else { return };
+        let arrived: Vec<crate::workspace::AgentRequest> = opening.agents.try_iter().collect();
+        if arrived.is_empty() {
+            return;
+        }
+        let (stage, done, total) = opening.progress.lock().map_or_default(|p| p.clone());
+        let far = if total > 0 { format!("{stage}, {done} of {total}") } else { stage };
+        let mut window = Vec::new();
+        for (request, reply) in arrived {
+            if request.uses_window() {
+                window.push((request, reply));
+            } else {
+                let said = format!("the editor is still opening the project ({far}): ask again once it is open");
+                let _ = reply.send(mcp::Reply::Error(said));
+            }
+        }
+        self.drive.take(ctx, window);
     }
 
     /// The project being opened, once it is: shown, its selection kept; or why it could not be.
@@ -350,7 +382,7 @@ impl Editor {
                 if let Some(label) = &opened.recovered {
                     self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
                 }
-                let mut ws = Workspace::from_opened(opened);
+                let mut ws = Workspace::from_opened(opened, opening.agents);
                 // A layout outlives a project: tabs of what is not here close, and what is in front is what is selected.
                 self.layouts.close_documents(|path| !ws.exists(path));
                 self.opened = None;
@@ -1756,6 +1788,92 @@ impl Editor {
         self.onboarding = None;
     }
 
+    /// What it is busy with, by name: nothing where it is not.
+    #[must_use]
+    pub fn busy_with(&self) -> Vec<&'static str> {
+        let ws = self.workspace.as_ref();
+        [
+            ("opening", self.opening.is_some()),
+            ("deferred", !self.deferred.is_empty()),
+            ("taking in", ws.is_some_and(Workspace::taking_in)),
+            ("starting its watch", ws.is_some_and(Workspace::watch_is_starting)),
+            ("requests", ws.is_some_and(Workspace::requests_busy)),
+            ("an epoch", ws.is_some_and(Workspace::in_epoch)),
+            ("tests", ws.is_some_and(|ws| ws.tests.running())),
+        ]
+        .into_iter()
+        .filter_map(|(what, busy)| busy.then_some(what))
+        .collect()
+    }
+
+    /// Say, now, that it is opening the project in `dir`: before it takes the project, so that no agent's server takes
+    /// it first for a request of its own.
+    fn announce_opening(&mut self, dir: &Path) {
+        let Some(keeper) = &mut self.presence else { return };
+        keeper.keep_now(mcp::presence::Presence {
+            opening: Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).display().to_string()),
+            stage: Some("Starting".to_string()),
+            agents: self.agents_drive || self.settings.agents.drive,
+            ..mcp::presence::Presence::default()
+        });
+    }
+
+    /// Say what it is doing, to whoever lists the editors on this computer: written where it changed.
+    fn keep_presence(&mut self, ctx: &egui::Context) {
+        if self.presence.is_none() {
+            return;
+        }
+        let ws = self.workspace.as_ref();
+        let opening = self.opening.as_ref().map(|opening| {
+            std::fs::canonicalize(&opening.dir).unwrap_or_else(|_| opening.dir.clone()).display().to_string()
+        });
+        let stage = self.opening.as_ref().map(|opening| {
+            let (stage, done, total) = opening.progress.lock().map_or_else(|p| p.into_inner().clone(), |p| p.clone());
+            if total > 0 { format!("{stage} {done}/{total}") } else { stage }
+        });
+        let last_run = ws.and_then(|ws| ws.last_epoch.as_ref()).map(|run| {
+            let report = &run.report;
+            let cancelled = if report.cancelled { ", cancelled" } else { "" };
+            let failed = report.failed.iter().take(3).fold(String::new(), |mut said, (asset, why)| {
+                let _ = std::fmt::Write::write_fmt(&mut said, format_args!("; {asset}: {why}"));
+                said
+            });
+            format!(
+                "{}: {} made, {} failed{cancelled}{failed}",
+                run.roots.join(", "),
+                report.made.len(),
+                report.failed.len()
+            )
+        });
+        let window = ctx.input(|i| {
+            let viewport = i.viewport();
+            if viewport.minimized == Some(true) {
+                "minimized"
+            } else if viewport.focused == Some(true) {
+                "focused"
+            } else {
+                "in the background"
+            }
+        });
+        let presence = mcp::presence::Presence {
+            project: ws.map(|ws| ws.project.root.display().to_string()),
+            opening,
+            stage,
+            busy: self.busy_with().into_iter().map(str::to_string).collect(),
+            asking: self.onboarding.is_some(),
+            error: self.error.clone(),
+            agents: self.agents_drive || self.settings.agents.drive,
+            fetching: ws.and_then(|ws| ws.fetcher.status()).map(|(said, _)| said),
+            last_run,
+            problems: ws.map_or(0, |ws| ws.index.problems.len()),
+            window: window.to_string(),
+            ..mcp::presence::Presence::default()
+        };
+        if let Some(keeper) = &mut self.presence {
+            keeper.keep(presence);
+        }
+    }
+
     /// What the project's extensions fetch onto this machine, fetched beside the editor as they run: trusting them is
     /// consenting to it. A run that only looks, as a screenshot does, fetches nothing.
     fn fetch(&mut self, ctx: &egui::Context) {
@@ -1965,24 +2083,6 @@ impl Editor {
         !self.busy_with().is_empty()
     }
 
-    /// What it is busy with, by name: nothing where it is not.
-    #[must_use]
-    pub fn busy_with(&self) -> Vec<&'static str> {
-        let ws = self.workspace.as_ref();
-        [
-            ("opening", self.opening.is_some()),
-            ("deferred", !self.deferred.is_empty()),
-            ("taking in", ws.is_some_and(Workspace::taking_in)),
-            ("starting its watch", ws.is_some_and(Workspace::watch_is_starting)),
-            ("requests", ws.is_some_and(Workspace::requests_busy)),
-            ("an epoch", ws.is_some_and(Workspace::in_epoch)),
-            ("tests", ws.is_some_and(|ws| ws.tests.running())),
-        ]
-        .into_iter()
-        .filter_map(|(what, busy)| busy.then_some(what))
-        .collect()
-    }
-
     /// Undo the last step.
     pub fn undo(&mut self) -> bool {
         self.step(false, false)
@@ -2026,8 +2126,9 @@ impl eframe::App for Editor {
         self.opened();
         self.follow_disk(&ctx);
         self.do_deferred();
-        // What an agent sees of the window is the project whole.
-        if let Some(ws) = self.workspace.as_mut().filter(|ws| ws.attached()) {
+        // The window is the agents' from the first frame, whatever is still being read.
+        self.answer_while_opening(&ctx);
+        if let Some(ws) = self.workspace.as_mut() {
             self.drive.take(&ctx, std::mem::take(&mut ws.window_requests));
         }
         // What a project asks is for a person to answer: agents wait.
@@ -2089,6 +2190,7 @@ impl eframe::App for Editor {
         self.import_dialog(&ctx);
         self.onboarding_ui(&ctx);
         self.fetch(&ctx);
+        self.keep_presence(&ctx);
         self.in_use_dialog(&ctx);
         self.force_dialog(&ctx);
         self.rename_dialog(&ctx);

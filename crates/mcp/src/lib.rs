@@ -14,6 +14,7 @@
 //! layer.
 
 pub mod link;
+pub mod presence;
 pub mod server;
 mod tools;
 

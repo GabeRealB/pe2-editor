@@ -109,6 +109,17 @@ fn unprotected(root: &Path, lock: &Path, who: &str, e: &std::io::Error) -> Resul
     Ok(Lock { _file: None, unprotected: Some(why) })
 }
 
+/// Who holds the project in `root` now, as its owner file says; none where nobody does. Asked by a shared lock tried and
+/// let go of at once, which writes nothing: a process taking the project at that same instant is refused, and tries
+/// again as it would on any holder.
+#[must_use]
+pub fn holder(root: &Path) -> Option<String> {
+    let (lock, _) = paths(root);
+    let file = OpenOptions::new().read(true).open(&lock).ok()?;
+    // Taken, or not lockable at all: nobody holds it by a lock.
+    matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)).then(|| owner(root))
+}
+
 impl Lock {
     /// Why the project is held without a lock, where its file system cannot lock files.
     #[must_use]

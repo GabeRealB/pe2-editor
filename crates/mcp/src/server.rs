@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use crate::{Reply, Request, View, answer, link};
 
+/// How long a request waits for an editor opening the project to listen.
+const EDITOR_STARTING: Duration = Duration::from_secs(10);
+
 /// How long a request waits for another brief holder of the project (another agent's request) to let go.
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -27,13 +30,37 @@ declaration is its node.toml), follow references both ways with references, see 
 is read-only here. Where the editor has the project open, its window is served too: editor_ui reads its widgets (ids \
 to act on), editor_screenshot shows it, and - where the user lets agents use the editor - editor_act clicks, drags \
 and scrolls, editor_type types and presses keys, editor_commands lists and editor_run runs its commands, the edits these make being the editor's own, undoable in its \
-history.";
+history. editors lists the editors running on this computer and what each is doing, who holds the project now, and \
+whether this server's program was rebuilt since it started (then it runs older code, and should be restarted).";
 
 /// Answer a request for the project in `root`: through the editor when it serves the project, else here.
 #[must_use]
 pub fn execute(root: &Path, request: &Request) -> Reply {
+    // The editors and who holds the project: answered here, never through an editor nor under the project's lock.
+    if matches!(request, Request::Call { name, .. } if name == "editors") {
+        let text = crate::presence::report(root).to_string();
+        return Reply::Call(rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]));
+    }
     if let Some(reply) = link::forward(root, request) {
         return reply;
+    }
+    // An editor opening the project, or holding it with its link not up yet: its, as soon as it listens - never taken
+    // from under it.
+    if let Some(pid) = crate::presence::claimed_by(root) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < EDITOR_STARTING {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if let Some(reply) = link::forward(root, request) {
+                return reply;
+            }
+        }
+        return Reply::Error(format!(
+            "the editor (process {pid}) is opening the project: ask again once it is open - `editors` says how far it is"
+        ));
+    }
+    // The window is the editor's alone: asked of none, it is no reason to take the project.
+    if request.uses_window() {
+        return Reply::Error("no editor has the project open".to_string());
     }
     let lock = match Lock::acquire_within(root, "pe2-cli mcp", PATIENCE) {
         Ok(lock) if lock.unprotected().is_some() => {
@@ -153,6 +180,7 @@ impl ServerHandler for Server {
 /// # Errors
 /// The runtime cannot start or the connection fails.
 pub fn serve_stdio(root: PathBuf) -> anyhow::Result<()> {
+    crate::presence::note_start();
     // Made before the runtime: listing the extensions' tools loads them, and a component's call blocks its thread.
     let server = Server::new(root);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

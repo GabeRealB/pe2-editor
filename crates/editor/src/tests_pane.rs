@@ -87,7 +87,6 @@ impl Tests {
     }
 
     /// Whether the runner is at work.
-    #[cfg(any(test, feature = "tests"))]
     #[must_use]
     pub fn running(&self) -> bool {
         self.job.is_some()

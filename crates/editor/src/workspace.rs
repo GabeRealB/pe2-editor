@@ -205,7 +205,8 @@ pub struct Workspace {
     /// The watcher being started, off the window's thread.
     watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
     /// The agents' link, started with the watcher; their requests, answered between frames.
-    link: Option<mcp::link::Listener>,
+    /// Agents' link, listening while it is kept: it stops with the workspace.
+    _link: Option<mcp::link::Listener>,
     requests: Option<mpsc::Receiver<(mcp::Request, mpsc::Sender<mcp::Reply>)>>,
     /// Requests using the editor's window, which the app's driver answers across frames.
     pub window_requests: Vec<crate::drive::Request>,
@@ -455,6 +456,29 @@ pub struct Opened {
     imports: project::imports::Imports,
     layer_view: LayerView,
     tree: Arc<Node>,
+    /// Agents' link to it, listening since its lock was taken; or why agents cannot reach it.
+    link: std::result::Result<mcp::link::Listener, String>,
+}
+
+/// Agents' requests, each with where its answer goes: what the link hands the window.
+pub type AgentRequest = (mcp::Request, mpsc::Sender<mcp::Reply>);
+
+/// Listen for agents on the project in `root`, which this process holds: each request handed to the window's frames
+/// (`to_frames`), which wake for it, and its answer awaited. Started as the project's lock is taken, before the rest
+/// of opening it, so that an agent reaches the editor - its window, and what it says of the project - all along.
+fn listen(
+    root: &Path,
+    to_frames: mpsc::Sender<AgentRequest>,
+    ctx: egui::Context,
+) -> std::result::Result<mcp::link::Listener, String> {
+    mcp::link::Listener::start(root, move |request| {
+        let (reply, answered) = mpsc::channel();
+        let delivered = to_frames.send((request, reply)).is_ok();
+        ctx.request_repaint();
+        let closed = || mcp::Reply::Error("the editor closed the project".into());
+        if delivered { answered.recv().unwrap_or_else(|_| closed()) } else { closed() }
+    })
+    .map_err(|e| format!("agents cannot reach the editor: {e}"))
 }
 
 /// What a project being left has yet to finish. Dropped in this order: what writes first, the lock on all it writes last.
@@ -510,11 +534,23 @@ impl Workspace {
     ///
     /// # Errors
     /// Its `project.toml` or its assets cannot be read, or another holds it.
-    pub fn prepare(dir: &Path, report: &project::index::Report<'_>) -> Result<Opened> {
+    pub fn prepare(
+        dir: &Path,
+        report: &project::index::Report<'_>,
+        agents: (mpsc::Sender<AgentRequest>, egui::Context),
+    ) -> Result<Opened> {
         report("Reading project.toml", 0, 0);
         let project = Project::load(dir)?;
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
-        let lock = Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2))?;
+        let lock = match Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2)) {
+            // An agent's server answering a request of its own: brief, if longer than that - it lets go.
+            Err(project::lock::LockError::Held(owner)) if owner.starts_with("pe2-cli mcp") => {
+                Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(30))?
+            }
+            locked => locked?,
+        };
+        // Agents reach it from now on: what they ask of the window is answered as it opens.
+        let link = listen(&project.root, agents.0, agents.1);
         let cache = Cache::open(&project, &lock)?;
         // The history first: a transaction a crash left half done is rolled back before the index reads the files.
         let (history, recovered) = History::open(&cache)?;
@@ -547,12 +583,13 @@ impl Workspace {
             imports,
             layer_view,
             tree,
+            link,
         })
     }
 
     /// The workspace of a project opened (`prepare`): its worker started, its index shown.
     #[expect(clippy::too_many_lines, reason = "what it holds, one line each")]
-    pub fn from_opened(opened: Opened) -> Workspace {
+    pub fn from_opened(opened: Opened, requests: mpsc::Receiver<AgentRequest>) -> Workspace {
         let Opened {
             project,
             lock,
@@ -566,8 +603,13 @@ impl Workspace {
             imports,
             layer_view,
             tree,
+            link,
             ..
         } = opened;
+        let (link, link_error) = match link {
+            Ok(link) => (Some(link), None),
+            Err(why) => (None, Some(why)),
+        };
         let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), store.clone());
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it.
@@ -632,11 +674,11 @@ impl Workspace {
             watch: None,
             watch_starting: None,
             watch_error: None,
-            link: None,
-            requests: None,
+            _link: link,
+            requests: Some(requests),
             window_requests: Vec::new(),
             fetcher: crate::fetcher::Fetcher::default(),
-            link_error: None,
+            link_error,
             extensions_found,
             extensions_checked: std::time::Instant::now(),
             takein,
@@ -698,9 +740,6 @@ impl Workspace {
                 Err(why) => self.watch_error = Some(why),
             }
         }
-        if self.link.is_none() && self.link_error.is_none() {
-            self.serve(ctx);
-        }
         if self.watch.is_some() || self.watch_error.is_some() || self.watch_starting.is_some() {
             return;
         }
@@ -732,13 +771,11 @@ impl Workspace {
     }
 
     /// Whether an output is on its way to a view.
-    #[cfg(any(test, feature = "tests"))]
     pub fn requests_busy(&self) -> bool {
         self.outputs.busy()
     }
 
     /// Whether the layers are yet to be watched.
-    #[cfg(any(test, feature = "tests"))]
     pub fn watch_is_starting(&self) -> bool {
         self.watch_starting.is_some()
     }
@@ -928,26 +965,6 @@ impl Workspace {
         self.runner.run(crate::runner::Job { roots, index: self.index.clone(), config, reply });
     }
 
-    /// Listen for agents: each request is passed to the frame loop (`answer_agents`), which wakes for it.
-    fn serve(&mut self, ctx: &egui::Context) {
-        let (to_frames, from_agents) = mpsc::channel::<(mcp::Request, mpsc::Sender<mcp::Reply>)>();
-        let ctx = ctx.clone();
-        let started = mcp::link::Listener::start(&self.project.root, move |request| {
-            let (reply, answered) = mpsc::channel();
-            let delivered = to_frames.send((request, reply)).is_ok();
-            ctx.request_repaint();
-            let closed = || mcp::Reply::Error("the editor closed the project".into());
-            if delivered { answered.recv().unwrap_or_else(|_| closed()) } else { closed() }
-        });
-        match started {
-            Ok(link) => {
-                self.link = Some(link);
-                self.requests = Some(from_agents);
-            }
-            Err(e) => self.link_error = Some(format!("agents cannot reach the editor: {e}")),
-        }
-    }
-
     /// Answer the agents' requests that arrived since the last frame, against the index and the selection as shown. A
     /// request first has what other programs changed taken in - an agent reads what it just wrote - and waits for it.
     pub fn answer_agents(&mut self) {
@@ -962,6 +979,13 @@ impl Workspace {
             }
             if request.uses_window() {
                 self.window_requests.push((request, reply));
+                continue;
+            }
+            // Opened, what its importers made not yet attached: said now, not left to wait for it.
+            if !self.attached() {
+                let stage = self.reading().unwrap_or_else(|| "taking in what its importers make".to_string());
+                let said = format!("the editor is still opening the project ({stage}): ask again once it is open");
+                let _ = reply.send(mcp::Reply::Error(said));
                 continue;
             }
             self.take_in_pending();

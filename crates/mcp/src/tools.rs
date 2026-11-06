@@ -169,9 +169,24 @@ fn extension_tool(tool: &pe2_ext::ToolDef) -> Tool {
 /// Every tool: the server's own, then the extensions'.
 #[must_use]
 pub fn definitions() -> Vec<Tool> {
-    let mut tools = own();
+    let mut tools = vec![editors()];
+    tools.extend(own());
     tools.extend(extensions::shared().tools().iter().map(extension_tool));
     tools
+}
+
+/// The tool listing the editors on this computer, which needs no project (`presence`).
+fn editors() -> Tool {
+    tool::<NoArgs>(
+        "editors",
+        "The editors running on this computer and what each is doing: its process, the project it has open or is \
+             opening, what it is busy with (taking in, an epoch, requests), whether the project asks something \
+             unanswered, its error, what it fetches, its last epoch, its problems, its window (focused, in the \
+             background, minimized), whether agents may use it, and whether its program was rebuilt since it started. \
+             And of this server: who holds its project now, and whether its own program was rebuilt since it started \
+             - a server that was runs older code, and should be restarted. Answered without the project: it never \
+             waits for it or takes it.",
+    )
 }
 
 fn own() -> Vec<Tool> {
@@ -280,6 +295,7 @@ fn own() -> Vec<Tool> {
 /// A tool's answer.
 pub fn call(view: &mut View, name: &str, arguments: &Map<String, Value>) -> CallToolResult {
     let result = match name {
+        "editors" => Ok(crate::presence::report(&view.project.root)),
         "project" => Ok(project(view)),
         "find_assets" => parse(arguments).map(|a| find_assets(view.index, view.extensions, &a)),
         "list_folder" => {
