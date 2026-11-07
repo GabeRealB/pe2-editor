@@ -1510,7 +1510,7 @@ impl crate::Declared for Declarations<'_> {
         self.0
             .of_type(node_type)
             .into_iter()
-            .filter_map(|(path, text)| Some((path, toml::from_str(&text).ok()?)))
+            .filter_map(|(path, bytes)| Some((path, crate::cbor::decode(&bytes).ok()?)))
             .collect()
     }
 }
@@ -1520,17 +1520,17 @@ struct Discs<'a>(&'a host::Discs);
 
 impl crate::Discs for Discs<'_> {
     fn read(&mut self, at: &Table) -> crate::Result<Vec<u8>> {
-        let at = toml::to_string(at)?;
+        let at = crate::cbor::encode(at)?;
         self.0.read(&at).map_err(|e| crate::anyhow!(e))
     }
 
     fn size(&mut self, at: &Table) -> crate::Result<u64> {
-        let at = toml::to_string(at)?;
+        let at = crate::cbor::encode(at)?;
         self.0.size(&at).map_err(|e| crate::anyhow!(e))
     }
 
     fn read_range(&mut self, at: &Table, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
-        let at = toml::to_string(at)?;
+        let at = crate::cbor::encode(at)?;
         let len = u32::try_from(len).unwrap_or(u32::MAX);
         self.0.read_range(&at, offset, len).map_err(|e| crate::anyhow!(e))
     }

@@ -220,7 +220,12 @@ impl Pool {
 }
 
 /// How many threads the pool has: every processor but one, kept for the window and what it does (`PE2_JOBS`, where set).
-fn threads() -> usize {
+#[must_use]
+pub fn threads() -> usize {
+    pool().threads
+}
+
+fn threads_wanted() -> usize {
     let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
     std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores.saturating_sub(1)).max(1)
 }
@@ -229,7 +234,7 @@ fn pool() -> &'static Pool {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let pool: &'static Pool =
-            Box::leak(Box::new(Pool { queues: Mutex::default(), ready: Condvar::new(), threads: threads() }));
+            Box::leak(Box::new(Pool { queues: Mutex::default(), ready: Condvar::new(), threads: threads_wanted() }));
         for at in 0..pool.threads {
             let _ = std::thread::Builder::new().name(format!("pool {at}")).spawn(move || {
                 loop {
@@ -349,6 +354,170 @@ fn helper(scope: Arc<Scope>, group: Group, drain: &'static Drain<'static>) -> Un
     })
 }
 
+/// Close a scope, and wait until no helper is inside it.
+fn close(scope: &Scope, group: &Group) {
+    scope.inside.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
+    wait_helping(group, &scope.inside, &scope.left, |inside| inside.1 == 0);
+}
+
+/// Wait until `done` holds of what `lock` guards, told by `told`: meanwhile running what else its group has queued, as
+/// deep as is safe. Only its own: run on its stack, another group's work would hold it as long as that work goes on.
+fn wait_helping<S>(group: &Group, lock: &Mutex<S>, told: &Condvar, done: impl Fn(&S) -> bool) {
+    let pool = pool();
+    loop {
+        let state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if done(&state) {
+            return;
+        }
+        if HELPING.with(std::cell::Cell::get) < MOST_HELPING {
+            drop(state);
+            if let Some(unit) = pool.try_pop_of(group) {
+                HELPING.with(|depth| depth.set(depth.get() + 1));
+                apart(unit);
+                HELPING.with(|depth| depth.set(depth.get() - 1));
+            } else {
+                let state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                if !done(&state) {
+                    drop(told.wait_timeout(state, Duration::from_millis(1)));
+                }
+            }
+            continue;
+        }
+        drop(told.wait_timeout(state, Duration::from_millis(1)));
+    }
+}
+
+/// What a work list holds: the items waiting, how many are being worked, and how many helpers are queued or working.
+struct List<T> {
+    waiting: VecDeque<T>,
+    busy: usize,
+    helpers: usize,
+}
+
+/// What works an item of a work list, given what adds another.
+type Worker<'a, T> = dyn Fn(T, &dyn Fn(T)) + Sync + 'a;
+
+/// A work list as its caller and helpers share it.
+struct Work<'a, T> {
+    list: Mutex<List<T>>,
+    changed: Condvar,
+    worker: &'a Worker<'a, T>,
+    ahead: &'a (dyn Fn(&T) -> bool + Sync),
+    group: Group,
+    scope: Arc<Scope>,
+    panicked: Mutex<Option<Box<dyn Any + Send>>>,
+    /// What a helper runs, once made.
+    drain: OnceLock<&'static Drain<'static>>,
+}
+
+impl<T: Send> Work<'_, T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, List<T>> {
+        self.list.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Work through what waits until nothing does (false) or another group is owed this thread first (true). A helper
+    /// finding nothing leaves, counted out under the lock that found it so: what is added after starts another.
+    fn drain(&self, owed: &dyn Fn() -> bool, helper: bool) -> bool {
+        loop {
+            let item = {
+                let mut list = self.lock();
+                if list.waiting.is_empty() {
+                    if helper {
+                        list.helpers -= 1;
+                    }
+                    return false;
+                }
+                if owed() {
+                    return true;
+                }
+                list.busy += 1;
+                list.waiting.pop_front()
+            };
+            let Some(item) = item else { continue };
+            let started = Instant::now();
+            let done = std::panic::catch_unwind(AssertUnwindSafe(|| (self.worker)(item, &|more| self.add(more))));
+            self.group.charge(started.elapsed());
+            if let Err(panic) = done {
+                self.panicked.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(panic);
+            }
+            self.lock().busy -= 1;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Another item, in line or ahead of what waits: a helper started for it where fewer are out than what waits and is
+    /// worked could use.
+    fn add(&self, item: T) {
+        let pool = pool();
+        let ahead = (self.ahead)(&item);
+        let mut list = self.lock();
+        if ahead {
+            list.waiting.push_front(item);
+        } else {
+            list.waiting.push_back(item);
+        }
+        let spawn = list.helpers < (list.busy + list.waiting.len()).min(pool.threads);
+        if spawn {
+            list.helpers += 1;
+        }
+        drop(list);
+        self.changed.notify_all();
+        if spawn && let Some(&drain) = self.drain.get() {
+            pool.push(&self.group, helper(self.scope.clone(), self.group.clone(), drain));
+        }
+    }
+}
+
+/// Each of these worked out, and each item it adds as it goes (`work`'s second argument), until none is left: by this
+/// thread and helpers queued in the pool under its group, as `parallel`, started as items are added - a pipeline whose
+/// stages feed the next, as an extraction's reading feeds what writes each asset. Items are taken in the order added,
+/// but for those `ahead` puts before all that waits: what feeds the rest.
+///
+/// # Panics
+/// Where work for an item panicked: after the rest is done, as that panic.
+pub(crate) fn worklist<T: Send>(items: Vec<T>, ahead: impl Fn(&T) -> bool + Sync, work: impl Fn(T, &dyn Fn(T)) + Sync) {
+    let group = current();
+    let work = Work {
+        list: Mutex::new(List { waiting: VecDeque::new(), busy: 0, helpers: 0 }),
+        changed: Condvar::new(),
+        worker: &work,
+        ahead: &ahead,
+        group: group.clone(),
+        scope: Arc::new(Scope::default()),
+        panicked: Mutex::default(),
+        drain: OnceLock::new(),
+    };
+    let drain = |owed: &dyn Fn() -> bool| work.drain(owed, true);
+    let drain: &Drain<'_> = &drain;
+    // SAFETY: as `parallel`'s: a helper calls it only while the scope is open, counted inside, and the scope closes and
+    // waits until none is inside before this returns.
+    let drain: &'static Drain<'static> = unsafe { std::mem::transmute(drain) };
+    let _ = work.drain.set(drain);
+    for item in items {
+        work.add(item);
+    }
+    loop {
+        work.drain(
+            &|| {
+                yield_now();
+                false
+            },
+            false,
+        );
+        // Others are at work, which may add more: helped, or waited on.
+        let finished = |list: &List<T>| !list.waiting.is_empty() || list.busy == 0;
+        wait_helping(&group, &work.list, &work.changed, finished);
+        let list = work.lock();
+        if list.waiting.is_empty() && list.busy == 0 {
+            break;
+        }
+    }
+    close(&work.scope, &group);
+    if let Some(panic) = work.panicked.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Each of these worked out at the same time, each result in its item's place: by this thread and by helpers queued in
 /// the pool under its group, each taking the next item until none is left. It returns once every helper that started is
 /// done, having run other queued work while it waited; a helper starting after that does nothing.
@@ -400,30 +569,7 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
         yield_now();
         false
     });
-    scope.inside.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
-    loop {
-        let inside = scope.inside.lock().unwrap_or_else(PoisonError::into_inner);
-        if inside.1 == 0 {
-            break;
-        }
-        // Waiting, run what else its group has queued, as deep as is safe; else wait to be told. Only its own: run on
-        // its stack, another group's work would hold it as long as that work goes on.
-        if HELPING.with(std::cell::Cell::get) < MOST_HELPING {
-            drop(inside);
-            if let Some(unit) = pool.try_pop_of(&group) {
-                HELPING.with(|depth| depth.set(depth.get() + 1));
-                apart(unit);
-                HELPING.with(|depth| depth.set(depth.get() - 1));
-            } else {
-                let inside = scope.inside.lock().unwrap_or_else(PoisonError::into_inner);
-                if inside.1 > 0 {
-                    drop(scope.left.wait_timeout(inside, Duration::from_millis(1)));
-                }
-            }
-            continue;
-        }
-        drop(scope.left.wait_timeout(inside, Duration::from_millis(1)));
-    }
+    close(&scope, &group);
     if let Some(panic) = panicked.into_inner().unwrap_or_else(PoisonError::into_inner) {
         std::panic::resume_unwind(panic);
     }
@@ -487,6 +633,60 @@ mod tests {
         queues.least = 1_000_000_000;
         queues.push(&idle, Box::new(|| {}));
         assert!(idle.virtual_runtime() >= 1_000_000_000 - u64::try_from(RETURNING.as_nanos()).unwrap());
+    }
+
+    #[test]
+    fn a_work_list_works_what_its_items_add_until_none_is_left() {
+        // Each number adds its halves: a tree of 2^10 leaves, its stages feeding the next.
+        let leaves = AtomicUsize::new(0);
+        let threads = Mutex::new(std::collections::HashSet::new());
+        worklist(
+            vec![1024usize, 1024],
+            |_| false,
+            |n, add| {
+                threads.lock().unwrap().insert(std::thread::current().id());
+                if n == 1 {
+                    leaves.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_micros(50));
+                } else {
+                    add(n / 2);
+                    add(n - n / 2);
+                }
+            },
+        );
+        assert_eq!(leaves.into_inner(), 2048);
+        assert!(pool().threads < 2 || threads.into_inner().unwrap().len() > 1);
+        // Nested in a scope, and empty.
+        let sums = parallel(&[3usize, 5], |&n| {
+            let sum = AtomicUsize::new(0);
+            worklist(
+                (0..n).collect(),
+                |_| false,
+                |i, _| {
+                    sum.fetch_add(i, Ordering::Relaxed);
+                },
+            );
+            sum.into_inner()
+        });
+        assert_eq!(sums, vec![3, 10]);
+        worklist(Vec::<u8>::new(), |_| false, |_, _| unreachable!());
+    }
+
+    #[test]
+    fn a_work_list_panics_as_its_item_did_once_the_rest_is_done() {
+        let done = AtomicUsize::new(0);
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            worklist(
+                (0..64).collect(),
+                |_| false,
+                |n: usize, _| {
+                    assert!(n != 7, "seven");
+                    done.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(done.into_inner(), 63);
     }
 
     #[test]

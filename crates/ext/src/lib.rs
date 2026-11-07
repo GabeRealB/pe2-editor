@@ -13,6 +13,7 @@
 //! handle a view draws through, never the host's own types.
 
 mod asset;
+pub mod cbor;
 pub mod data;
 pub mod events;
 mod extract;

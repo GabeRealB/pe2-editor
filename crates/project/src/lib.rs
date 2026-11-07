@@ -166,39 +166,6 @@ pub enum LayerKind {
     Files,
 }
 
-/// Threads lent now outside the pool (`schedule`), to work that waits on a channel and so cannot be its units: extraction's
-/// writers, until extraction runs on the pool.
-static LENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many threads are lent at most: half the processors, the rest for the pool and the window.
-fn most_lent() -> usize {
-    let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores / 2).clamp(1, 8)
-}
-
-/// Threads lent for a while: as many as were free of those wanted, given back when dropped.
-pub(crate) struct Lend {
-    pub count: usize,
-}
-
-impl Lend {
-    /// Up to `wanted` threads, as many as there are to lend now: none, where others have them all.
-    pub(crate) fn threads(wanted: usize) -> Lend {
-        use std::sync::atomic::Ordering;
-        let wanted = wanted.min(most_lent());
-        let taken = LENT.fetch_add(wanted, Ordering::AcqRel);
-        let count = wanted.min(most_lent().saturating_sub(taken));
-        LENT.fetch_sub(wanted - count, Ordering::AcqRel);
-        Lend { count }
-    }
-}
-
-impl Drop for Lend {
-    fn drop(&mut self) {
-        LENT.fetch_sub(self.count, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
 pub(crate) use schedule::parallel;
 
 #[derive(Clone, PartialEq)]

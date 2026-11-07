@@ -717,14 +717,11 @@ impl host::HostDeclarations for State {
         &mut self,
         declarations: Resource<LentDeclarations>,
         node_type: String,
-    ) -> wasmtime::Result<Vec<(String, String)>> {
+    ) -> wasmtime::Result<Vec<(String, Vec<u8>)>> {
         // SAFETY: lent for the call running now (`ComponentExtraction::begin`), taken back before it returns.
         let declared = unsafe { &*self.table.get(&declarations)?.declared };
-        Ok(declared
-            .declarations(&node_type)
-            .into_iter()
-            .map(|(path, table)| (path, toml::to_string(&table).unwrap_or_default()))
-            .collect())
+        let _span = tracing::info_span!("declarations lent", of = %node_type).entered();
+        Ok(declared.encoded(&node_type).as_ref().clone())
     }
 
     fn drop(&mut self, declarations: Resource<LentDeclarations>) -> wasmtime::Result<()> {
@@ -735,22 +732,22 @@ impl host::HostDeclarations for State {
 }
 
 impl host::HostDiscs for State {
-    fn read(&mut self, discs: Resource<LentDiscs>, at: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
+    fn read(&mut self, discs: Resource<LentDiscs>, at: Vec<u8>) -> wasmtime::Result<Result<Vec<u8>, String>> {
         // SAFETY: lent for the call running now (`ComponentExtraction::extract`), taken back before it returns.
         let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match toml::from_str(&at) {
+        let at: Table = match pe2_ext::cbor::decode(&at) {
             Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e}"))),
+            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
         };
         Ok(discs.read(&at).map_err(|e| format!("{e:#}")))
     }
 
-    fn size(&mut self, discs: Resource<LentDiscs>, at: String) -> wasmtime::Result<Result<u64, String>> {
+    fn size(&mut self, discs: Resource<LentDiscs>, at: Vec<u8>) -> wasmtime::Result<Result<u64, String>> {
         // SAFETY: as `read`.
         let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match toml::from_str(&at) {
+        let at: Table = match pe2_ext::cbor::decode(&at) {
             Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e}"))),
+            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
         };
         Ok(discs.size(&at).map_err(|e| format!("{e:#}")))
     }
@@ -758,15 +755,15 @@ impl host::HostDiscs for State {
     fn read_range(
         &mut self,
         discs: Resource<LentDiscs>,
-        at: String,
+        at: Vec<u8>,
         offset: u64,
         len: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, String>> {
         // SAFETY: as `read`.
         let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match toml::from_str(&at) {
+        let at: Table = match pe2_ext::cbor::decode(&at) {
             Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e}"))),
+            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
         };
         Ok(discs.read_range(&at, offset, len as usize).map_err(|e| format!("{e:#}")))
     }
@@ -1911,7 +1908,6 @@ struct ComponentExtraction {
 
 impl ComponentExtraction {
     fn begin(shared: &Shared, extractor: u32, cap: u64, declared: &dyn Declared) -> Result<ComponentExtraction> {
-        let _span = tracing::info_span!("extraction begun", of = %shared.id).entered();
         let mut runner = shared.instantiate(cap)?;
         // SAFETY: the pointer is used only during this call, and taken back before it returns.
         let declared = unsafe { erase_declared(declared) };

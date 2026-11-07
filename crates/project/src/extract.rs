@@ -11,9 +11,9 @@
 //! are written as bundles too; folders, groups, files and streams carry their declarations alone.
 //!
 //! An asset an extension extracts (`pe2.images@textures`: images with a `mode`) is made by that
-//! extractor instead: its session begins with the declarations lent (what it needs of the other assets it reads once)
-//! and then makes each asset's native files, reading the chunks it needs from the discs and checking them against the
-//! declaration. The host knows no image format.
+//! extractor instead: its session begins with the declarations lent (what it needs of the other assets it reads once,
+//! each type encoded once for every session) and then makes each asset's native files, reading the chunks it needs from
+//! the discs and checking them against the declaration. The host knows no image format.
 //!
 //! A reference is written as the referenced asset's uid alone (`"uid://..."`, `"uid://...#palettes/default"` for a part
 //! of it), where the declarations hold its path beside it: the uid decides, and a path written into every referencing
@@ -120,7 +120,7 @@ impl OpenDisc {
     fn open(roms: &Path, name: &str, layout: &Disc) -> Result<OpenDisc> {
         let i = &layout.image;
         let path = find_disc(roms, &i.name, i.size, &i.sha1)?;
-        let mut image = Image::open(&path)?;
+        let image = Image::open(&path)?;
         let mut entries = image.root()?;
         if let Some(d) = entries.iter().find(|e| e.directory) {
             bail!("{name}: the directory {} - the layout knows a flat root only", d.name);
@@ -136,7 +136,7 @@ impl OpenDisc {
     }
 
     /// A slot's bytes: the license data, or an ISO file's - a `mixed` file's as 2336-byte sectors.
-    fn slot(&mut self, name: &str) -> Result<Vec<u8>> {
+    fn slot(&self, name: &str) -> Result<Vec<u8>> {
         let slot = self.layout.slots.iter().find(|s| s.name == name).with_context(|| format!("no slot {name}"))?;
         match slot.ty.as_str() {
             "license" => Ok(self.image.license()?),
@@ -155,7 +155,7 @@ impl OpenDisc {
     }
 
     /// The size of a slot's bytes, as `slot` gives them.
-    fn slot_size(&mut self, name: &str) -> Result<u64> {
+    fn slot_size(&self, name: &str) -> Result<u64> {
         let slot = self.layout.slots.iter().find(|s| s.name == name).with_context(|| format!("no slot {name}"))?;
         Ok(match slot.ty.as_str() {
             "data" => u64::from(self.files[name].size),
@@ -165,7 +165,7 @@ impl OpenDisc {
     }
 
     /// Up to `len` of a slot's bytes from `offset`, as `slot` gives them, reading the sectors they lie in alone.
-    fn slot_range(&mut self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    fn slot_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         let size = self.slot_size(name)?;
         let end = size.min(offset.saturating_add(len as u64));
         if offset >= end {
@@ -195,7 +195,7 @@ impl OpenDisc {
 
 /// An ISO file of an open disc, read sector by sector.
 struct IsoFile<'a> {
-    image: &'a mut Image,
+    image: &'a Image,
     lba: u32,
     size: u64,
 }
@@ -218,10 +218,10 @@ impl Source for IsoFile<'_> {
 }
 
 impl OpenDisc {
-    fn iso_file(&mut self, name: &str) -> Result<IsoFile<'_>> {
+    fn iso_file(&self, name: &str) -> Result<IsoFile<'_>> {
         let e = self.files.get(name).with_context(|| format!("no file {name}"))?;
         let (lba, size) = (e.lba, u64::from(e.size));
-        Ok(IsoFile { image: &mut self.image, lba, size })
+        Ok(IsoFile { image: &self.image, lba, size })
     }
 }
 
@@ -240,23 +240,24 @@ fn stored_in_stage(record: &cdf::StreamRecord) -> bool {
     record.kind == 2 || (record.kind == 1 && record.data[9] == 0)
 }
 
-/// The stage containers of a release, opened as assets ask for them.
+/// The stage containers of a release, opened as assets ask for them - by whichever thread asks first.
+#[derive(Default)]
 struct Containers {
-    open: HashMap<(String, u32), Container>,
+    open: std::sync::Mutex<HashMap<(String, u32), std::sync::Arc<Container>>>,
 }
 
 impl Containers {
-    fn get(&mut self, decl: &Declarations, discs: &mut Discs, release: &str, stage: u32) -> Result<&Container> {
+    fn get(&self, decl: &Declarations, discs: &Discs, release: &str, stage: u32) -> Result<std::sync::Arc<Container>> {
         let key = (release.to_string(), stage);
-        if !self.open.contains_key(&key) {
+        let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !open.contains_key(&key) {
             let layout = decl.layouts[release]
                 .get(&format!("stage{stage}"))
                 .with_context(|| format!("{release}: no stage {stage}"))?;
             let at = layout.at.first().with_context(|| format!("{release} stage {stage}: no disc"))?;
             let disc_name = at.disc.clone().with_context(|| format!("{release} stage {stage}: no disc"))?;
-            let disc = discs
-                .get_mut(&(release.to_string(), disc_name.clone()))
-                .with_context(|| format!("no disc {disc_name}"))?;
+            let disc =
+                discs.get(&(release.to_string(), disc_name.clone())).with_context(|| format!("no disc {disc_name}"))?;
             let mut streams = HashMap::new();
             let (cdf_name, entries) = if stage == 0 {
                 // A stored stream runs to the next file.
@@ -292,17 +293,17 @@ impl Containers {
                 (name, entries)
             };
             let files = entries.into_iter().map(|e| ((e.folder, e.id), e.offset)).collect();
-            self.open.insert(key.clone(), Container { disc: disc_name, cdf: cdf_name, files, streams });
+            open.insert(key.clone(), std::sync::Arc::new(Container { disc: disc_name, cdf: cdf_name, files, streams }));
         }
-        Ok(&self.open[&key])
+        Ok(open[&key].clone())
     }
 }
 
 /// A chunk slot's payload: the file the `at` names, in its stage's container, and the slot its file asset declares.
 fn chunk_payload(
     decl: &Declarations,
-    discs: &mut Discs,
-    containers: &mut Containers,
+    discs: &Discs,
+    containers: &Containers,
     files: &HashMap<(String, u32, Option<u32>, u32), String>,
     release: &str,
     at: &At,
@@ -322,7 +323,7 @@ fn chunk_payload(
     let offset =
         *container.files.get(&(at.folder, file)).with_context(|| format!("stage {stage} has no file {file}"))?;
     let (disc_name, cdf_name) = (container.disc.clone(), container.cdf.clone());
-    let disc = discs.get_mut(&(release.to_string(), disc_name)).context("the container's disc")?;
+    let disc = discs.get(&(release.to_string(), disc_name)).context("the container's disc")?;
     let mut src = disc.iso_file(&cdf_name)?;
     let chunks = cdf::chunks(&mut src, offset)?;
     let chunk = chunks.get(index).with_context(|| format!("{file_asset}: no chunk {index} on the disc"))?;
@@ -332,8 +333,8 @@ fn chunk_payload(
 /// A stream stored in a stage: the `at`'s place in stage 0's or its folder's table.
 fn stream_payload(
     decl: &Declarations,
-    discs: &mut Discs,
-    containers: &mut Containers,
+    discs: &Discs,
+    containers: &Containers,
     release: &str,
     at: &At,
 ) -> Result<Vec<u8>> {
@@ -344,7 +345,7 @@ fn stream_payload(
         .get(&(at.folder, index))
         .with_context(|| format!("stage {stage} folder {:?} stores no stream {index}", at.folder))?;
     let (disc_name, cdf_name) = (container.disc.clone(), container.cdf.clone());
-    let disc = discs.get_mut(&(release.to_string(), disc_name)).context("the container's disc")?;
+    let disc = discs.get(&(release.to_string(), disc_name)).context("the container's disc")?;
     Ok(disc.iso_file(&cdf_name)?.read_at(start, usize::try_from(end - start)?)?)
 }
 
@@ -445,52 +446,76 @@ type Discs = BTreeMap<(String, String), OpenDisc>;
 
 /// Every disc of the releases' layouts, opened and held to its layout.
 fn open_discs(game: &Game, decl: &Declarations, releases: &[String], roms: &Path) -> Result<Discs> {
-    let mut discs = Discs::new();
+    let mut wanted = Vec::new();
     for release in releases {
         let layouts =
             decl.layouts.get(release).with_context(|| format!("{release}: the declarations have no layout"))?;
-        let wanted: &Vec<DiscImage> = &game.releases[release];
+        let images: &Vec<DiscImage> = &game.releases[release];
         for (name, layout) in layouts {
             let Some(disc) = &layout.disc else { continue };
-            if !wanted.iter().any(|d| d.sha1 == disc.image.sha1) {
+            if !images.iter().any(|d| d.sha1 == disc.image.sha1) {
                 bail!("{release} {name}: the project's discs do not include {} ({})", disc.image.name, disc.image.sha1);
             }
-            discs.insert((release.clone(), name.clone()), OpenDisc::open(roms, name, disc)?);
+            wanted.push((release, name, disc));
         }
+    }
+    // Each found by its hash, all at once.
+    let opened = crate::parallel(&wanted, |&(_, name, disc)| OpenDisc::open(roms, name, disc));
+    let mut discs = Discs::new();
+    for ((release, name, _), open) in wanted.into_iter().zip(opened) {
+        discs.insert((release.clone(), name.clone()), open?);
     }
     Ok(discs)
 }
 
-/// The declarations as an extractor reads them: each asset's table as declared.
-struct Declared<'a>(&'a Declarations, &'a Extensions);
+/// Each type's declarations as they cross to a component, encoded once for every extractor reading them.
+type Encoded = std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<(String, Vec<u8>)>>>>;
 
-impl pe2_ext::Declared for Declared<'_> {
+/// The declarations as an extractor reads them: each asset's table as declared.
+struct DeclaredBy<'a> {
+    decl: &'a Declarations,
+    extensions: &'a Extensions,
+    encoded: &'a Encoded,
+}
+
+impl pe2_ext::Declared for DeclaredBy<'_> {
     fn declarations(&self, node_type: &str) -> Vec<(String, toml::Table)> {
-        let wanted = self.1.qualify(node_type);
+        let wanted = self.extensions.qualify(node_type);
         let of_it = |a: &&crate::declarations::Asset| {
-            self.1.template(&a.template).map(|template| template.node_type.as_str()) == wanted
+            self.extensions.template(&a.template).map(|template| template.node_type.as_str()) == wanted
         };
-        self.0.assets.iter().filter(|(_, a)| of_it(a)).map(|(path, a)| (path.clone(), a.table.clone())).collect()
+        self.decl.assets.iter().filter(|(_, a)| of_it(a)).map(|(path, a)| (path.clone(), a.table.clone())).collect()
+    }
+
+    fn encoded(&self, node_type: &str) -> std::sync::Arc<Vec<(String, Vec<u8>)>> {
+        // Held while one is encoded: whoever else asks for it waits for it rather than encoding it again.
+        let mut encoded = self.encoded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let made = encoded.entry(node_type.to_string()).or_insert_with(|| {
+            let tables = self.declarations(node_type).into_iter();
+            let made = tables.filter_map(|(path, table)| Some((path, pe2_ext::cbor::encode(&table).ok()?)));
+            std::sync::Arc::new(made.collect())
+        });
+        made.clone()
     }
 }
 
 /// A release's discs as an extractor reads them: a chunk's payload by its location.
 struct Reader<'a> {
     decl: &'a Declarations,
-    discs: &'a mut Discs,
-    containers: &'a mut Containers,
+    discs: &'a Discs,
+    containers: &'a Containers,
     files: &'a HashMap<(String, u32, Option<u32>, u32), String>,
     release: &'a str,
 }
 
 impl Reader<'_> {
     /// The disc a location's slot is on, where it names one.
-    fn disc_slot(&mut self, at: &toml::Table) -> pe2_ext::Result<Option<(&mut OpenDisc, String)>> {
+    fn disc_slot(&self, at: &toml::Table) -> pe2_ext::Result<Option<(&OpenDisc, String)>> {
         let at: At = at.clone().try_into().context("not a location")?;
         let (Some(disc), Some(slot)) = (at.disc, at.slot) else { return Ok(None) };
         let open = self
             .discs
-            .get_mut(&(self.release.to_string(), disc.clone()))
+            .get(&(self.release.to_string(), disc.clone()))
             .with_context(|| format!("{} has no disc {disc}", self.release))?;
         Ok(Some((open, slot)))
     }
@@ -763,8 +788,8 @@ fn file_assets(decl: &Declarations) -> HashMap<(String, u32, Option<u32>, u32), 
     files
 }
 
-/// An asset as extraction read it, for a worker to finish: its bundle's `node.toml`, stack stamped, and the files
-/// read for it - to be written as they are, or, `sourced`, as its import's source where it has one.
+/// An asset as extraction read it, to be finished: its bundle's `node.toml`, stack stamped, and the files read for it -
+/// to be written as they are, or, `sourced`, as its import's source where it has one.
 struct Extracted<'a> {
     path: &'a str,
     asset: &'a crate::declarations::Asset,
@@ -773,114 +798,232 @@ struct Extracted<'a> {
     sourced: bool,
 }
 
+type Declared<'a> = (&'a String, &'a crate::declarations::Asset);
+
+/// A run of an extractor's assets, in their order.
+type Range<'a> = std::collections::VecDeque<Declared<'a>>;
+
+/// What extraction's work list holds: a session of an extractor working a range of its assets (`thief`, one split off
+/// another's); a run of assets read from their slots; and an asset an extractor made, to be finished - its source
+/// written and imported back.
+enum Unit<'a> {
+    Session { lane: std::sync::Arc<Lane>, range: Range<'a>, thief: bool },
+    Read(Vec<Declared<'a>>),
+    Finish(Extracted<'a>),
+}
+
+/// An extractor's sessions, and what they measured: what a new session costs before it goes at its pace, and what an
+/// asset costs after a session's first.
+///
+/// A session's first asset may cost far more than the rest: it fills what the session keeps (a movie file's clips,
+/// scanned). The first session's warm-up is its own, as a thief works a range at the other end, whose warm-up the
+/// first would have had to do as well. So a split is first judged on what a session costs to begin; once a thief has
+/// extracted its first asset, its beginning and that asset are what a session costs - and a warm-up thieves repeat
+/// stops the splitting. Until it has, nothing splits again: what it costs is not known.
+struct Lane {
+    name: String,
+    sessions: std::sync::atomic::AtomicUsize,
+    /// Thieves that have not yet extracted their first asset.
+    unmeasured: std::sync::atomic::AtomicUsize,
+    /// What a new session costs before it goes at its pace, and the time and count of the assets after a session's
+    /// first, in nanoseconds.
+    setup: std::sync::atomic::AtomicU64,
+    spent: std::sync::atomic::AtomicU64,
+    extracted: std::sync::atomic::AtomicU64,
+}
+
+/// How many times what a new session costs the work each of the two sessions would then have has to be worth, for a
+/// session to split off half of what it has left.
+const WORTH_A_SESSION: u64 = 2;
+
+impl Lane {
+    /// Whether a session holding `left` assets is to split off half of them: the work each half holds is worth more than
+    /// what a new session costs, by `WORTH_A_SESSION`; and a thread could run it.
+    fn worth_splitting(&self, left: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let extracted = self.extracted.load(Ordering::Relaxed);
+        let measured = self.unmeasured.load(Ordering::Relaxed) == 0;
+        if !measured
+            || extracted == 0
+            || left < 2
+            || self.sessions.load(Ordering::Relaxed) >= crate::schedule::threads()
+        {
+            return false;
+        }
+        let half = left as u64 / 2 * (self.spent.load(Ordering::Relaxed) / extracted);
+        half > WORTH_A_SESSION * self.setup.load(Ordering::Relaxed)
+    }
+}
+
+/// How many assets read from their slots make one unit: each takes a fraction of a millisecond.
+const READ_RUN: usize = 64;
+
+/// What extraction's units share: the declarations and the discs, read by any thread, and how it goes.
+struct Extraction<'a> {
+    layer: &'a Path,
+    decl: &'a Declarations,
+    releases: &'a [String],
+    discs: &'a Discs,
+    containers: Containers,
+    files: HashMap<(String, u32, Option<u32>, u32), String>,
+    sourcing: &'a Sourcing<'a>,
+    encoded: Encoded,
+    written: std::sync::atomic::AtomicUsize,
+    stop: std::sync::atomic::AtomicBool,
+    failed: std::sync::Mutex<Option<anyhow::Error>>,
+}
+
 /// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count,
 /// and how many were written as their sources.
 ///
-/// Reading is this thread's, in the declarations' order, as the discs and the extractors' sessions are read in turn;
-/// what follows for each asset - its source written and imported back, its bundle written - is the workers', as many
-/// as there are threads to lend, each asset on its own. Those waiting are at most as many as the workers, so what is
-/// held at once is a few assets' files, whatever the layer's size.
+/// It is a work list on the pool: each extractor's assets one lane, worked by sessions of it, each a range in turn as a
+/// session holds what it read of the declarations - one at first, split as what they measure says it is worth (`Lane`);
+/// every other asset read from its slots in runs; each asset an extractor made finished apart - its source written and
+/// imported back, the costliest of it all - as its session goes on. The discs are read by all at once.
 fn write_assets(
     layer: &Path,
     decl: &Declarations,
     releases: &[String],
-    discs: &mut Discs,
+    discs: &Discs,
     sourcing: &Sourcing,
 ) -> Result<(usize, usize)> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let written = AtomicUsize::new(0);
-    let failed: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::default();
-    let stop = AtomicBool::new(false);
-    let finish = |item: Extracted<'_>| {
-        let done = (|| -> Result<()> {
-            let (toml, made) = if item.sourced {
-                let _span = tracing::info_span!("source", of = %item.asset.template, path = %item.path).entered();
-                sourcing.bundle(item.path, item.asset, item.toml, item.made)?
-            } else {
-                (item.toml, item.made)
-            };
-            let _span = tracing::info_span!("write bundle").entered();
-            let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
-            files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
-            write_bundle(layer, item.path, &files)
-        })();
-        match done {
-            Ok(()) => {
-                written.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(why) => {
-                stop.store(true, Ordering::Relaxed);
-                if let Ok(mut failed) = failed.lock() {
-                    failed.get_or_insert(why);
-                }
-            }
+    use std::sync::atomic::Ordering;
+    let extensions = sourcing.extensions;
+    let mut lanes: Vec<(String, Vec<Declared<'_>>)> = Vec::new();
+    let mut read: Vec<Declared<'_>> = Vec::new();
+    for (path, asset) in &decl.assets {
+        let node_type = extensions.template(&asset.template).map_or("", |template| template.node_type.as_str());
+        match extensions.extractor_for(node_type, |field| asset.table.contains_key(field)) {
+            Some(extractor) => match lanes.iter_mut().find(|(name, _)| *name == extractor.name.as_str()) {
+                Some((_, assets)) => assets.push((path, asset)),
+                None => lanes.push((extractor.name.to_string(), vec![(path, asset)])),
+            },
+            None => read.push((path, asset)),
         }
-    };
-    let lent = crate::Lend::threads(usize::MAX);
-    let (send, receive) = std::sync::mpsc::sync_channel::<Extracted<'_>>(lent.count);
-    let receive = std::sync::Mutex::new(receive);
-    let read = std::thread::scope(|scope| {
-        for _ in 0..lent.count {
-            scope.spawn(|| {
-                while let Ok(item) = receive.lock().map_err(drop).and_then(|r| r.recv().map_err(drop)) {
-                    finish(item);
-                }
-            });
-        }
-        // With no thread to lend, this one finishes each asset as it reads it.
-        let hand = |item| {
-            if lent.count == 0 {
-                finish(item);
-            } else if let Err(unsent) = send.send(item) {
-                finish(unsent.0);
-            }
+    }
+    // The longest lanes first: they bound how long it takes.
+    lanes.sort_by_key(|(_, assets)| std::cmp::Reverse(assets.len()));
+    let mut units: Vec<Unit<'_>> = Vec::new();
+    for (name, assets) in lanes {
+        let lane = Lane {
+            name,
+            sessions: std::sync::atomic::AtomicUsize::new(1),
+            unmeasured: std::sync::atomic::AtomicUsize::new(0),
+            setup: std::sync::atomic::AtomicU64::new(0),
+            spent: std::sync::atomic::AtomicU64::new(0),
+            extracted: std::sync::atomic::AtomicU64::new(0),
         };
-        let read = read_assets(decl, releases, discs, sourcing, &stop, &hand);
-        drop(send);
-        read
+        units.push(Unit::Session { lane: std::sync::Arc::new(lane), range: assets.into(), thief: false });
+    }
+    units.extend(read.chunks(READ_RUN).map(|run| Unit::Read(run.to_vec())));
+    let extraction = Extraction {
+        layer,
+        decl,
+        releases,
+        discs,
+        containers: Containers::default(),
+        files: file_assets(decl),
+        sourcing,
+        encoded: Encoded::default(),
+        written: std::sync::atomic::AtomicUsize::new(0),
+        stop: std::sync::atomic::AtomicBool::new(false),
+        failed: std::sync::Mutex::default(),
+    };
+    // A session feeds what finishes its assets: it goes first.
+    let ahead = |unit: &Unit<'_>| matches!(unit, Unit::Session { .. });
+    crate::schedule::worklist(units, ahead, |unit, add| {
+        if extraction.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let done = match unit {
+            Unit::Session { lane, range, thief } => {
+                let split = |range| {
+                    lane.sessions.fetch_add(1, Ordering::Relaxed);
+                    lane.unmeasured.fetch_add(1, Ordering::Relaxed);
+                    add(Unit::Session { lane: lane.clone(), range, thief: true });
+                };
+                extraction.session(&lane, range, thief, &|item| add(Unit::Finish(item)), &split)
+            }
+            Unit::Read(assets) => assets.iter().try_for_each(|&(path, asset)| {
+                let _span = tracing::info_span!("extract", of = %asset.template, path = %path).entered();
+                extraction.finish(extraction.read(path, asset)?)
+            }),
+            Unit::Finish(item) => extraction.finish(item),
+        };
+        if let Err(why) = done {
+            extraction.stop.store(true, Ordering::Relaxed);
+            extraction.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
+        }
     });
-    drop(lent);
-    if let Some(why) = failed.into_inner().ok().flatten() {
+    if let Some(why) = extraction.failed.into_inner().ok().flatten() {
         return Err(why);
     }
-    read?;
-    Ok((written.into_inner(), sourcing.sources.load(Ordering::Relaxed)))
+    Ok((extraction.written.into_inner(), sourcing.sources.load(Ordering::Relaxed)))
 }
 
-/// Each asset read from the discs in the declarations' order - its extractor's session, or its slots' bytes - and its
-/// bundle's `node.toml` stamped, handed on to be finished; until `stop`.
-fn read_assets<'a>(
-    decl: &'a Declarations,
-    releases: &[String],
-    discs: &mut Discs,
-    sourcing: &Sourcing,
-    stop: &std::sync::atomic::AtomicBool,
-    hand: &dyn Fn(Extracted<'a>),
-) -> Result<()> {
-    use std::sync::atomic::Ordering;
-    let files = file_assets(decl);
-    let mut containers = Containers { open: HashMap::new() };
-    let extensions = sourcing.extensions;
-    // An extractor's session, begun with the first of its assets.
-    let mut sessions: HashMap<String, Box<dyn pe2_ext::Extraction>> = HashMap::new();
-    for (path, asset) in &decl.assets {
-        if stop.load(Ordering::Relaxed) {
-            break;
+impl<'a> Extraction<'a> {
+    /// An asset's bundle written: as its source where it is `sourced` and has one, else as read.
+    fn finish(&self, item: Extracted<'_>) -> Result<()> {
+        let (toml, made) = if item.sourced {
+            let _span = tracing::info_span!("source", of = %item.asset.template, path = %item.path).entered();
+            self.sourcing.bundle(item.path, item.asset, item.toml, item.made)?
+        } else {
+            (item.toml, item.made)
+        };
+        let _span = tracing::info_span!("write bundle").entered();
+        let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
+        files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        write_bundle(self.layer, item.path, &files)?;
+        self.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A session of a lane's extractor, begun here, extracting a range of its assets in turn, each handed on to be
+    /// finished; splitting off the back half of what it has left where that is worth it (`Lane::worth_splitting`).
+    fn session(
+        &self,
+        lane: &Lane,
+        mut range: Range<'a>,
+        thief: bool,
+        hand: &dyn Fn(Extracted<'a>),
+        split: &dyn Fn(Range<'a>),
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let extensions = self.sourcing.extensions;
+        let Some(mut taken) = range.pop_front() else { return Ok(()) };
+        let first = taken.1;
+        let node_type = extensions.template(&first.template).map_or("", |template| template.node_type.as_str());
+        let extractor = extensions
+            .extractor_for(node_type, |field| first.table.contains_key(field))
+            .with_context(|| format!("{}: no longer registered", lane.name))?;
+        let started = std::time::Instant::now();
+        let mut session = {
+            let _span = tracing::info_span!("extraction begun", of = %lane.name).entered();
+            let declared = DeclaredBy { decl: self.decl, extensions, encoded: &self.encoded };
+            (extractor.begin)(&declared).with_context(|| format!("{} could not begin", lane.name))?
+        };
+        let nanos = |since: std::time::Instant| u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if !thief {
+            lane.setup.fetch_max(nanos(started), Ordering::Relaxed);
         }
-        let _span = tracing::info_span!("extract", of = %asset.template, path = %path).entered();
-        let node_type = extensions.template(&asset.template).map_or("", |template| template.node_type.as_str());
-        if let Some(extractor) = extensions.extractor_for(node_type, |field| asset.table.contains_key(field)) {
-            let name = extractor.name.to_string();
-            if !sessions.contains_key(&name) {
-                let session = (extractor.begin)(&Declared(decl, extensions))
-                    .with_context(|| format!("{name} could not begin"))?;
-                sessions.insert(name.clone(), session);
+        let mut first = true;
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
             }
-            let session = sessions.get_mut(&name).context("begun")?;
+            let (path, asset) = taken;
+            let started = if first { started } else { std::time::Instant::now() };
+            let _span = tracing::info_span!("extract", of = %asset.template, path = %path).entered();
             let mut made = Vec::new();
             let mut originals = vec![];
-            for release in releases.iter().filter(|r| asset.from.contains_key(*r)) {
-                let mut reader = Reader { decl, discs, containers: &mut containers, files: &files, release };
+            for release in self.releases.iter().filter(|r| asset.from.contains_key(*r)) {
+                let mut reader = Reader {
+                    decl: self.decl,
+                    discs: self.discs,
+                    containers: &self.containers,
+                    files: &self.files,
+                    release,
+                };
                 let got = session.extract(path, release, &mut reader).with_context(|| format!("{path}: {release}"))?;
                 if made.is_empty() {
                     made = got;
@@ -890,18 +1033,37 @@ fn read_assets<'a>(
             // What it made in one folder (a font's `medium.ufo/`) is what the template's file names.
             let folder = made_folder(&made);
             let toml =
-                sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
+                self.sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
             hand(Extracted { path, asset, toml, made, sourced: true });
-            continue;
+            if !first {
+                lane.spent.fetch_add(nanos(started), Ordering::Relaxed);
+                lane.extracted.fetch_add(1, Ordering::Relaxed);
+            } else if thief {
+                lane.setup.fetch_max(nanos(started), Ordering::Relaxed);
+                lane.unmeasured.fetch_sub(1, Ordering::Relaxed);
+            }
+            first = false;
+            if lane.worth_splitting(range.len()) {
+                split(range.split_off(range.len() / 2));
+            }
+            match range.pop_front() {
+                Some(asset) => taken = asset,
+                None => break,
+            }
         }
+        Ok(())
+    }
+
+    /// An asset no extractor makes, read from its slots and checked against its declaration.
+    fn read(&self, path: &'a str, asset: &'a crate::declarations::Asset) -> Result<Extracted<'a>> {
+        let (decl, discs, releases) = (self.decl, self.discs, self.releases);
         // A container assembled from its movies (a disc's movie file) has no bytes of its own: its stack joins its
         // stages' movies, which `make_assembled` holds to the disc's.
         if asset.template == "stream" {
             let originals: Vec<(String, String)> =
                 releases.iter().filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?))).collect();
-            let toml = sourcing.stack(path, &asset.template, None, &asset_toml(&asset.body, &originals)?)?;
-            hand(Extracted { path, asset, toml, made: Vec::new(), sourced: false });
-            continue;
+            let toml = self.sourcing.stack(path, &asset.template, None, &asset_toml(&asset.body, &originals)?)?;
+            return Ok(Extracted { path, asset, toml, made: Vec::new(), sourced: false });
         }
         let mut native: Option<Vec<u8>> = None;
         let mut originals = vec![];
@@ -911,9 +1073,9 @@ fn read_assets<'a>(
                 if at.disc.is_none() && (at.slot.is_some() || at.stream.is_some()) {
                     let want = loc.sha1.as_deref().with_context(|| format!("{path}: {release} gives no sha1"))?;
                     let bytes = if at.stream.is_some() {
-                        stream_payload(decl, discs, &mut containers, release, at)
+                        stream_payload(decl, discs, &self.containers, release, at)
                     } else {
-                        chunk_payload(decl, discs, &mut containers, &files, release, at)
+                        chunk_payload(decl, discs, &self.containers, &self.files, release, at)
                     }
                     .with_context(|| format!("{path}: {release}"))?;
                     let got = sha1_hex(&bytes);
@@ -927,7 +1089,7 @@ fn read_assets<'a>(
                 let want = loc.sha1.as_deref().with_context(|| format!("{path}: {release} gives no sha1"))?;
                 for slot in at.slots() {
                     let disc = discs
-                        .get_mut(&(release.clone(), disc_name.clone()))
+                        .get(&(release.clone(), disc_name.clone()))
                         .with_context(|| format!("{path}: {release} has no disc {disc_name}"))?;
                     let bytes = disc.slot(slot).with_context(|| format!("{path}: {disc_name} {slot}"))?;
                     let got = sha1_hex(&bytes);
@@ -942,16 +1104,15 @@ fn read_assets<'a>(
             }
         }
         let name = format!("native.{}", asset.format.as_deref().unwrap_or("bin"));
-        let toml = sourcing.stack(
+        let toml = self.sourcing.stack(
             path,
             &asset.template,
             native.as_ref().map(|_| name.as_str()),
             &asset_toml(&asset.body, &originals)?,
         )?;
         let made = native.map_or_else(Vec::new, |native| vec![(name, native)]);
-        hand(Extracted { path, asset, toml, made, sourced: false });
+        Ok(Extracted { path, asset, toml, made, sourced: false })
     }
-    Ok(())
 }
 
 /// A bundle of the layer as written, as a node of the work graph: its declaration and stored files as on disk, each
@@ -1248,7 +1409,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
     }
     // Every disc is opened first: a missing or foreign image stops extraction before the layer is touched.
     let phase = tracing::info_span!("extraction", of = "discs").entered();
-    let mut discs = open_discs(game, &decl, &releases, &roms)?;
+    let discs = open_discs(game, &decl, &releases, &roms)?;
     drop(phase);
     if layer.exists() {
         fs::remove_dir_all(&layer)?; // the layer is the extraction's alone
@@ -1261,7 +1422,7 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
         sources: std::sync::atomic::AtomicUsize::default(),
     };
     let phase = tracing::info_span!("extraction", of = "assets").entered();
-    let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, &sourcing)?;
+    let (assets, sources) = write_assets(&layer, &decl, &releases, &discs, &sourcing)?;
     drop(phase);
     let phase = tracing::info_span!("extraction", of = "layouts").entered();
     let layouts = write_layouts(&layer, &decl, &releases, &discs, extensions)?;

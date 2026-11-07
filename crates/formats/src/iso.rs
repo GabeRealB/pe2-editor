@@ -6,7 +6,7 @@
 //! a disc dump keeps the streams' interleaving; the license data in the system area is kept the same way.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 
 pub const RAW_SECTOR: usize = 2352;
@@ -37,6 +37,34 @@ impl Entry {
     }
 }
 
+/// Read `buf.len()` bytes at `offset`, without moving a cursor of the file's: an image is read by many at once.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            match std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], offset + done as u64)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => done += n,
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // One thread, where neither is: the file's own cursor.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
+    }
+}
+
+/// A disc image, read by sector from any number of threads at once.
 pub struct Image {
     file: File,
     sectors: u32,
@@ -69,13 +97,12 @@ impl Image {
     ///
     /// # Errors
     /// The sectors run past the image's end, or cannot be read.
-    pub fn raw(&mut self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
+    pub fn raw(&self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
         if lba.checked_add(count).is_none_or(|end| end > self.sectors) {
             return Err(invalid(format!("sectors {lba}+{count} are past the image's end ({})", self.sectors)));
         }
         let mut buf = vec![0; count as usize * RAW_SECTOR];
-        self.file.seek(SeekFrom::Start(u64::from(lba) * RAW_SECTOR as u64))?;
-        self.file.read_exact(&mut buf)?;
+        read_exact_at(&self.file, &mut buf, u64::from(lba) * RAW_SECTOR as u64)?;
         Ok(buf)
     }
 
@@ -83,7 +110,7 @@ impl Image {
     ///
     /// # Errors
     /// As [`Image::raw`].
-    pub fn data(&mut self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
+    pub fn data(&self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
         let raw = self.raw(lba, count)?;
         let (sectors, _) = raw.as_chunks::<RAW_SECTOR>();
         Ok(sectors.iter().flat_map(|s| &s[FORM1_DATA_AT..FORM1_DATA_AT + DATA]).copied().collect())
@@ -93,7 +120,7 @@ impl Image {
     ///
     /// # Errors
     /// As [`Image::raw`].
-    pub fn mode2(&mut self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
+    pub fn mode2(&self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
         let raw = self.raw(lba, count)?;
         let (sectors, _) = raw.as_chunks::<RAW_SECTOR>();
         Ok(sectors.iter().flat_map(|s| &s[MODE2_AT..]).copied().collect())
@@ -103,7 +130,7 @@ impl Image {
     ///
     /// # Errors
     /// As [`Image::raw`].
-    pub fn license(&mut self) -> io::Result<Vec<u8>> {
+    pub fn license(&self) -> io::Result<Vec<u8>> {
         self.mode2(0, LICENSE_SECTORS)
     }
 
@@ -111,7 +138,7 @@ impl Image {
     ///
     /// # Errors
     /// The image has no ISO 9660 volume descriptor or root directory, or cannot be read.
-    pub fn root(&mut self) -> io::Result<Vec<Entry>> {
+    pub fn root(&self) -> io::Result<Vec<Entry>> {
         let pvd = self.data(PVD_SECTOR, 1)?;
         if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
             return Err(invalid("no primary volume descriptor at sector 16".into()));

@@ -15,6 +15,13 @@ pub type Made = Vec<(String, Vec<u8>)>;
 pub trait Declared {
     /// Every declaration of a type, as declared (`file`, `image`, `vram_slot`), by path, in path order.
     fn declarations(&self, node_type: &str) -> Vec<(String, Table)>;
+
+    /// The same, each table as CBOR (`cbor`): as they cross to a component. A host lending them to several extractors
+    /// encodes each type once.
+    fn encoded(&self, node_type: &str) -> Arc<Vec<(String, Vec<u8>)>> {
+        let encoded = self.declarations(node_type).into_iter();
+        Arc::new(encoded.filter_map(|(path, table)| Some((path, crate::cbor::encode(&table).ok()?))).collect())
+    }
 }
 
 /// A release's discs, as an extraction reads them.

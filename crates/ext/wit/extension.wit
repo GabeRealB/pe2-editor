@@ -448,20 +448,20 @@ interface host {
 
     /// The declarations, lent to an extraction session's beginning.
     resource declarations {
-        /// Every declaration of a type (as declared: `file`, `image`, `vram_slot`), by path in path order, as TOML.
-        of-type: func(node-type: string) -> list<tuple<string, string>>;
+        /// Every declaration of a type (as declared: `file`, `image`, `vram_slot`), by path in path order, as CBOR.
+        of-type: func(node-type: string) -> list<tuple<string, list<u8>>>;
     }
 
     /// A release's discs, lent for one asset's extraction.
     resource discs {
-        /// A chunk's payload, by a location as a declaration gives it (TOML: `{ stage, folder, file, slot }`), or a
-        /// disc slot's bytes (`{ disc, slot }`).
-        read: func(at: string) -> result<list<u8>, string>;
+        /// A chunk's payload, by a location as a declaration gives it (a table as CBOR: `{ stage, folder, file, slot }`),
+        /// or a disc slot's bytes (`{ disc, slot }`).
+        read: func(at: list<u8>) -> result<list<u8>, string>;
         /// The size of what `read` gives at a location, without reading it.
-        size: func(at: string) -> result<u64, string>;
+        size: func(at: list<u8>) -> result<u64, string>;
         /// Up to `len` bytes of what `read` gives at a location, from `offset`, read alone: a disc slot of hundreds of
         /// megabytes (a movie file) is never read whole.
-        read-range: func(at: string, offset: u64, len: u32) -> result<list<u8>, string>;
+        read-range: func(at: list<u8>, offset: u64, len: u32) -> result<list<u8>, string>;
     }
 
     log: func(message: string);
