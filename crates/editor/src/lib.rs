@@ -2,12 +2,15 @@
 //! references followed both ways, pictures previewed - in panes that can be moved, split, resized and closed.
 //!
 //! ```text
-//! pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive] [--trust-everything]
+//! pe2-editor [PROJECT] [--select ASSET] [--show PANE] [--screenshot FILE] [--agents-drive] [--wait-for-agent]
+//!     [--trust-everything]
 //! ```
 //!
 //! `--select` opens an asset (`stages/akropolis/rooms/square/folder`), `--show` a pane (`settings`); `--screenshot`
 //! saves the window as a PNG once it has settled and exits - what scripts and checks use to see it. `--agents-drive`
-//! lets agents click, type and press keys in this session, as the Agents setting does for every one. `--trust-everything`
+//! lets agents click, type and press keys in this session, as the Agents setting does for every one. `--wait-for-agent`
+//! holds the opening once agents can reach the editor, until the first asks it something: what a script driving it
+//! times starts with it connected. `--trust-everything`
 //! runs every unsandboxed extension in this session, asking nothing and keeping nothing (`extensions::trust`).
 //!
 //! Under `WSLg` the editor talks X11 unless told otherwise: maximizing or resizing a window on Wayland can crash `WSLg`'s
@@ -195,6 +198,7 @@ pub fn run() -> Result {
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--screenshot") => screenshot = args.next().map(PathBuf::from),
             Some("--agents-drive") => agents_drive = true,
+            Some("--wait-for-agent") => workspace::wait_for_agent(),
             Some("--trust-everything") => extensions::trust::trust_everything(),
             _ => project = Some(PathBuf::from(arg)),
         }
@@ -257,6 +261,10 @@ pub fn run() -> Result {
     let mut app = pointer_gate::PointerGate::new(app, context);
     event_loop.run_app_on_demand(&mut app)?;
     drop(app);
+    // What it spent its time on, where asked (`PE2_PROFILE`): as `pe2-cli --profile` prints it.
+    if std::env::var_os("PE2_PROFILE").is_some() {
+        eprintln!("{}", project::profile::table(&project::profile::totals()));
+    }
     if !made.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(eframe::Error::AppCreation("the editor's window could not be made".into()));
     }

@@ -127,15 +127,20 @@ impl Runner {
                     }
                     stop.store(false, Ordering::Relaxed);
                     let wiring = project::build::wiring(&job.index, &extensions, &job.config);
-                    let report = project::build::epoch(
-                        &project,
-                        &job.index,
-                        &extensions,
-                        &wiring,
-                        &job.config,
-                        &job.roots,
-                        &stop,
-                    );
+                    // What the user signaled: a group of its own, over what the editor does by itself.
+                    let group =
+                        project::schedule::Group::new(project::schedule::Class::Commanded, &job.roots.join(" "));
+                    let report = group.enter(|| {
+                        project::build::epoch(
+                            &project,
+                            &job.index,
+                            &extensions,
+                            &wiring,
+                            &job.config,
+                            &job.roots,
+                            &stop,
+                        )
+                    });
                     if let Some(reply) = &job.reply {
                         let _ = reply.send(text(&report));
                     }

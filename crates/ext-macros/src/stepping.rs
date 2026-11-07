@@ -518,26 +518,34 @@ impl Writer {
         quote!(#state #binding)
     }
 
-    /// How a step ends at a cut: what it carries - none yet, while what is carried is worked out - and what it requests
-    /// or spawns.
+    /// How a step ends at a cut: what it requests or spawns, worked out first, then what it carries - none yet, while
+    /// what is carried is worked out - moved on as it is, the same tuple the next step takes (`restore`).
     fn end(cut: usize, cuts: &[Cut], carried: Option<&[Vec<Bound>]>) -> TokenStream {
         let state = carried.map(|carried| carried[cut].iter().map(|b| b.ident.clone()).collect::<Vec<_>>());
         let state = state.unwrap_or_default();
-        let state = quote!(&(#(&#state,)*));
+        let state = quote!((#(#state,)*));
         let number = u32::try_from(cut).unwrap_or(u32::MAX);
-        let ended = match &cuts[cut].kind {
-            Kind::Request(pairs) => quote_spanned! {pairs.span()=>
-                ::pe2_ext::stepped::Ended::request(#number, #state, ::pe2_ext::stepped::needs(#pairs))
-            },
-            Kind::Each { items, .. } => quote!(::pe2_ext::stepped::Ended::spawn(#number, #state, #items)),
-            Kind::EachSteps { items, .. } => quote! {
-                ::pe2_ext::stepped::Ended::spawn(#number, #state, ::core::iter::IntoIterator::into_iter(#items).map(|__item| (__item,)))
-            },
-            Kind::Call { args, .. } => {
-                quote!(::pe2_ext::stepped::Ended::spawn(#number, #state, [(#(#args,)*)]))
-            }
+        let (asked, ended) = match &cuts[cut].kind {
+            Kind::Request(pairs) => (
+                quote_spanned! {pairs.span()=> let __asked = ::pe2_ext::stepped::needs(#pairs);},
+                quote!(::pe2_ext::stepped::Ended::request(#number, #state, __asked)),
+            ),
+            Kind::Each { items, .. } => (
+                quote!(let __asked = ::pe2_ext::stepped::items(#items)?;),
+                quote!(::pe2_ext::stepped::Ended::spawn(#number, #state, __asked)),
+            ),
+            Kind::EachSteps { items, .. } => (
+                quote! {
+                    let __asked = ::pe2_ext::stepped::items(::core::iter::IntoIterator::into_iter(#items).map(|__item| (__item,)))?;
+                },
+                quote!(::pe2_ext::stepped::Ended::spawn(#number, #state, __asked)),
+            ),
+            Kind::Call { args, .. } => (
+                quote!(let __asked = ::pe2_ext::stepped::items([(#(#args,)*)])?;),
+                quote!(::pe2_ext::stepped::Ended::spawn(#number, #state, __asked)),
+            ),
         };
-        quote!(return #ended.map(::pe2_ext::stepped::Flow::Cut);)
+        quote!({ #asked return #ended.map(::pe2_ext::stepped::Flow::Cut); })
     }
 
     /// A list's code from a place in it, to the next cut or its end: each construct from its start. The body's own last

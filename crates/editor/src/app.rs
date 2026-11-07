@@ -336,7 +336,9 @@ impl Editor {
             };
             report("Closing the project", 0, 0);
             drop(leaving);
-            let _ = done.send(Workspace::prepare(&dir_owned, &report, (to_frames, link_ctx)));
+            // Opening is the editor's own doing: what the user asks of it meanwhile goes first.
+            let group = project::schedule::Group::new(project::schedule::Class::Background, "opening");
+            let _ = done.send(group.enter(|| Workspace::prepare(&dir_owned, &report, (to_frames, link_ctx))));
             ctx.request_repaint();
         });
         match started {

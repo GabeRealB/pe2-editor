@@ -807,6 +807,10 @@ impl g::Guest for Component {
         (def.run)(&mut call).map(to_wit).map_err(|e| format!("{e:#}"))
     }
 
+    fn seal_step() -> Result<Option<Vec<u8>>, String> {
+        crate::stepped::seal().map_err(|e| format!("{e:#}"))
+    }
+
     #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
     async fn prepare_op(
         op: u32,

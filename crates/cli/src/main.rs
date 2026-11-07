@@ -56,6 +56,51 @@ enum Tool {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// The editor, started and waited on, as scripts and checks drive it
+    Editor {
+        #[command(subcommand)]
+        command: EditorCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EditorCommand {
+    /// Start the editor on a project, returning once it is up - waiting for an agent (`--wait-for-agent`), or the project
+    /// open - and failing where it does not get there: the project held by another editor, a question the project asks
+    /// whoever opens it, an error, the editor gone, or the time up. Prints its process
+    Start {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Hold its opening once agents can reach it, until the first asks it something
+        #[arg(long)]
+        wait_for_agent: bool,
+        /// How long it may take, in seconds
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// What else the editor is given (`-- --select characters/aya/aya`)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Wait for the editor that has a project open: until it is idle - the project open, nothing taken in or run -
+    /// or until it exits; failing on an error, a question unanswered, or the time up
+    Wait {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Until it is idle, or until it exits
+        #[arg(long, value_enum, default_value_t = Until::Idle)]
+        until: Until,
+        /// How long it may take, in seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Until {
+    Idle,
+    Exit,
 }
 
 #[derive(Subcommand)]
@@ -321,6 +366,99 @@ fn palette_to_png(input: &std::path::Path, output: &std::path::Path) -> Result<(
 const EPOCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Run an epoch for each of these events, in turn, and say what came of them.
+/// The editor's program: beside this one, else as the system finds it.
+fn editor_program() -> PathBuf {
+    let beside = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("pe2-editor")));
+    beside.filter(|program| program.exists()).unwrap_or_else(|| PathBuf::from("pe2-editor"))
+}
+
+/// What keeps an editor from going on, where something does: an error it shows, a question the project asks.
+fn blocked(presence: &mcp::presence::Presence) -> Option<String> {
+    if let Some(error) = &presence.error {
+        return Some(format!("the editor says: {error}"));
+    }
+    presence.asking.then(|| {
+        "the project asks which of its extensions to trust: answer it in the editor, or trust them first \
+         (`pe2-cli project trust`)"
+            .to_string()
+    })
+}
+
+/// Start the editor on a project, and wait until it is up: waiting for an agent, or the project open.
+fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[String]) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(project).with_context(|| project.display().to_string())?;
+    if let Some(pid) = mcp::presence::claimed_by(&root) {
+        anyhow::bail!("{}: the editor in process {pid} has it open", root.display());
+    }
+    let mut command = std::process::Command::new(editor_program());
+    // What it says goes where this says what goes wrong: this says its process alone.
+    command
+        .arg(&root)
+        .args(wait_for_agent.then_some("--wait-for-agent"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::io::stderr());
+    let mut child = command.spawn().context("the editor could not be started")?;
+    let pid = child.id();
+    let started = std::time::Instant::now();
+    let mut said = String::new();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("the editor ended before it was up ({status}){said}");
+        }
+        if let Some(presence) = mcp::presence::running().remove(&pid) {
+            if let Some(why) = blocked(&presence) {
+                anyhow::bail!("{why}");
+            }
+            said = presence.stage.as_deref().map_or_else(String::new, |stage| format!("; it was at: {stage}"));
+            let waiting = wait_for_agent && presence.stage.as_deref() == Some(WAITING_FOR_AGENT);
+            let open = !wait_for_agent && presence.opening.is_none() && presence.project.is_some();
+            if waiting || open {
+                println!("{pid}");
+                return Ok(());
+            }
+        }
+        if started.elapsed() > std::time::Duration::from_secs(timeout) {
+            anyhow::bail!("the editor in process {pid} was not up within {timeout} s{said}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The stage an editor holds its opening at for an agent (`pe2-editor --wait-for-agent`).
+const WAITING_FOR_AGENT: &str = "Waiting for an agent";
+
+/// Wait for the editor that has a project open: until it is idle, or until it exits.
+fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()> {
+    let root = std::fs::canonicalize(project).with_context(|| project.display().to_string())?;
+    let Some(pid) = mcp::presence::claimed_by(&root) else {
+        // Waited for to exit, an editor that is not there has.
+        if until == Until::Exit {
+            return Ok(());
+        }
+        anyhow::bail!("{}: no editor has it open", root.display());
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match mcp::presence::running().remove(&pid) {
+            None if until == Until::Exit => return Ok(()),
+            None => anyhow::bail!("the editor in process {pid} ended"),
+            Some(presence) => {
+                if let Some(why) = blocked(&presence) {
+                    anyhow::bail!("{why}");
+                }
+                if until == Until::Idle && presence.opening.is_none() && presence.busy.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+        if started.elapsed() > std::time::Duration::from_secs(timeout) {
+            anyhow::bail!("the editor in process {pid} did not get there within {timeout} s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
     let p = project::Project::load(project)?;
     // An editor with the project open holds it: it runs them, and says what came of them.
@@ -740,7 +878,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
     project::profile::install();
     let profile = cli.profile.then(std::time::Instant::now);
-    let done = run(cli);
+    // What the command line asks is a command: its work weighed as one, over the host's own.
+    let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
     if let Some(started) = profile {
         eprintln!("\n{}", project::profile::table(&project::profile::totals()));
         eprintln!("{:.2} s in all", started.elapsed().as_secs_f64());
@@ -759,6 +898,12 @@ fn run(cli: Cli) -> Result<()> {
             texture_to_png(&input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
         }
         Tool::Convert { command: ConvertCommand::Palette { input, output } } => palette_to_png(&input, &output)?,
+        Tool::Editor { command: EditorCommand::Start { project, wait_for_agent, timeout, args } } => {
+            start_editor(&project, wait_for_agent, timeout, &args)?;
+        }
+        Tool::Editor { command: EditorCommand::Wait { project, until, timeout } } => {
+            wait_editor(&project, until, timeout)?;
+        }
         Tool::Project { command: ProjectCommand::Build { project, config, clean } } => {
             let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
             signal(&project, config.as_deref(), events)?;

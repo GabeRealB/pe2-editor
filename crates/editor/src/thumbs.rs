@@ -47,8 +47,10 @@ impl Thumbs {
         let wake = ctx.clone();
         std::thread::spawn(move || {
             let engine = Engine::new(extensions.operations(), Some(store));
+            // Thumbnails are the editor's own doing, behind what the user looks at.
+            let group = project::schedule::Group::new(project::schedule::Class::Background, "thumbnails");
             for job in queue {
-                let image = make(&extensions, &engine, &job.asset);
+                let image = group.enter(|| make(&extensions, &engine, &job.asset));
                 if finished.send(Done { path: job.path, image }).is_err() {
                     break;
                 }

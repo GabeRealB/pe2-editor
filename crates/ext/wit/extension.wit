@@ -819,6 +819,9 @@ interface guest {
     /// contents its values hold, named by their hashes - given its values by port, its settings (TOML) and its output's
     /// parameter.
     run-op: async func(op: u32, node: borrow<asset>, inputs: list<list<value>>, settings: string, parameter: option<string>) -> result<value, string>;
+    /// What the step that just ended at a cut carries, which the instance holds for its next step: written out (CBOR) and
+    /// let go of, as the host lets go of the instance and runs that step elsewhere. None where it holds nothing.
+    seal-step: func() -> result<option<list<u8>>, string>;
     /// What an operation's run will read, given what its run is given. Asked again once that is made, as long as it asks for
     /// more: what it read is there to read, and anything else is noted as asked for, and fails. Its reads are its run's, so
     /// that an operation reads only what this said.

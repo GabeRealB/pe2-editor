@@ -1451,6 +1451,12 @@ impl Runner {
     fn bytes(&self) -> usize {
         self.meter.bytes.load(Ordering::Relaxed)
     }
+
+    /// Whether a job that ran well on it leaves it for the next step of its chain (`Shared::job`): where a chain runs,
+    /// and it holds no more than a resident instance may.
+    fn goes_on(&self) -> bool {
+        crate::schedule::chained() && self.bytes() <= RESIDENT
+    }
 }
 
 impl Runner {
@@ -1630,12 +1636,22 @@ impl Shared {
     }
 
     /// A job that may take `cap` bytes: run on an instance made for it, dropped when it returns.
+    ///
+    /// Within a chain of steps (`schedule::chain`), the instance the last step left goes on - the chain's own, made for as
+    /// much - and this one is left for the next, where it ran well and holds no more than a resident instance may.
     fn job<R>(&self, cap: u64, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
         let _span = tracing::info_span!("job", of = %self.id).entered();
         self.have_required()?;
-        let mut runner = self.instantiate(cap).with_context(|| self.id.clone())?;
+        let key = format!("{}/{cap}", self.id);
+        let mut runner = match crate::schedule::take_held::<Runner>(&key) {
+            Some(runner) => runner,
+            None => self.instantiate(cap).with_context(|| self.id.clone())?,
+        };
         let out = call(&mut runner).with_context(|| self.id.clone());
         self.peak.fetch_max(runner.bytes(), Ordering::Relaxed);
+        if out.is_ok() && runner.goes_on() {
+            let _ = crate::schedule::keep_held(&key, runner);
+        }
         out
     }
 
@@ -2436,7 +2452,17 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
                 let made = r.with_asset(&asset, shared.long(), async |a, g, lent| {
                     g.call_run_op(a, handle, lent, inputs, settings, parameter).await
                 })?;
-                value_from_wit(made.map_err(|e| anyhow!(e))?, &mut r.store.data_mut().table)
+                let mut made = value_from_wit(made.map_err(|e| anyhow!(e))?, &mut r.store.data_mut().table)?;
+                // A step ended at a cut, what it carries held by the instance: written out only where the next step will
+                // not run on it.
+                if pe2_ext::stepped::is_record(&made) && !r.goes_on() {
+                    let _span = tracing::info_span!("seal step", of = %shared.id).entered();
+                    let sealed = r.call(QUICK, async |a, g| g.call_seal_step(a).await)?.map_err(|e| anyhow!(e))?;
+                    if let Some(sealed) = sealed {
+                        pe2_ext::stepped::add_sealed(&mut made, sealed);
+                    }
+                }
+                Ok(made)
             })
         });
     }

@@ -67,14 +67,19 @@ impl Shared {
         let index = self.index.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let maker = self.maker.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let made = match (maker, index.assets.get(&key.0)) {
-            (Some(maker), Some(asset)) => maker(&index, asset, &key.1).map_err(|why| format!("{why:#}")),
+            (Some(maker), Some(asset)) => tracing::info_span!("request made", of = %format!("{}#{}", key.0, key.1))
+                .in_scope(|| maker(&index, asset, &key.1))
+                .map_err(|why| format!("{why:#}")),
             (None, _) => Err("nothing makes it".to_string()),
             (_, None) => Err(format!("no asset {}", key.0)),
         };
         let mut state = self.lock();
-        if !matches!(state.slots.get(key), Some(Slot::Making { asked: now, .. }) if *now == asked) {
-            return;
-        }
+        let since = match state.slots.get(key) {
+            Some(Slot::Making { asked: now, since }) if *now == asked => *since,
+            _ => return,
+        };
+        // How long it was waited for, queued and made: what a view's user sees.
+        crate::profile::record(&format!("answered {}#{}", key.0, key.1), since.elapsed());
         state.slots.insert(key.clone(), made.map_or_else(Slot::Failed, |bytes| Slot::Made(Arc::new(bytes))));
         state.kept.push_back(key.clone());
         while state.kept.len() > KEPT {
@@ -123,7 +128,12 @@ impl Requests {
                 loop {
                     let job = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
                     let Ok((key, asked)) = job else { return };
-                    shared.make(&key, asked);
+                    // What a view asks for is what the user looks at: a group of its own, ahead of what runs long.
+                    let group = crate::schedule::Group::new(
+                        crate::schedule::Class::Interactive,
+                        &format!("{}#{}", key.0, key.1),
+                    );
+                    group.enter(|| shared.make(&key, asked));
                 }
             });
         }

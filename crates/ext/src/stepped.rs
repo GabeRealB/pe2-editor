@@ -45,16 +45,24 @@
 //! with its type (`let stages: Vec<String> = ...`) and that type serializes; so are a helper's arguments. An `#[each]`
 //! closure sees only its item and `call`: it runs elsewhere, so what it needs of the step is put in its items.
 //!
-//! What is carried is CBOR (RFC 8949): a binary encoding of serde's data model that describes itself, as reading back a
-//! TOML table needs (`deserialize_any`), and whose bytes are the same for the same values, as a step's key needs.
+//! What is carried stays what it is, held where the step ran (`HELD`) for the next to take: the next step runs where the
+//! last did, as long as the host keeps it there, and is handed the values themselves. Only where it will not - its
+//! instance let go of - does the host have them sealed (`seal`): written as CBOR (RFC 8949), a binary encoding of serde's
+//! data model that describes itself, as reading back a TOML table needs (`deserialize_any`), and read back by the step
+//! that takes them. An item goes to another micro op, so it is always CBOR, whose bytes are the same for the same values,
+//! as the key an item is kept by needs.
 //!
 //! As the host runs them: the operation's run is its first step. A step ends at a cut, its value a record of it (which
-//! cut, what it carries, requests and spawns, and the operations running the next step and its items), or finishes, its
+//! cut, what it holds, requests and spawns, and the operations running the next step and its items), or finishes, its
 //! value the operation's. The host goes on from a record (`continuation`): it makes what was requested, runs what was
 //! spawned, each item kept by what it was given, and runs the next step, given the record, what the items made and the
-//! operation's ports, until a step finishes. Nothing of a step is held between: what the next needs is in the record.
+//! operation's ports, until a step finishes.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -65,10 +73,83 @@ use crate::{Call, Data, File, Need, Result, Table, Typed, Value, anyhow};
 /// A value as carried, read before it is known as a type.
 pub type Carried = ciborium::Value;
 
+/// What a cut carries, as it is held for the next step: the values themselves, sealed only when asked.
+trait Held: Send {
+    fn seal(&self) -> Result<Vec<u8>>;
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+impl<T: Serialize + Send + 'static> Held for T {
+    fn seal(&self) -> Result<Vec<u8>> {
+        to_bytes(self)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// What the cuts of the steps running here carry, until the next step takes it or the host has it sealed: by the token
+/// their records name, with the thread that held it. The instance's, or the process's where an extension runs in it: not
+/// a thread's own, as each call into a component may run as a task of its own.
+static HELD: Mutex<Option<Holding>> = Mutex::new(None);
+static TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// What is held, by token: by which thread, and what.
+type Holding = HashMap<u64, (ThreadId, Box<dyn Held>)>;
+
+fn held<R>(with: impl FnOnce(&mut Holding) -> R) -> R {
+    with(HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new))
+}
+
+fn hold(state: Box<dyn Held>) -> u64 {
+    let token = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+    held(|held| held.insert(token, (std::thread::current().id(), state)));
+    token
+}
+
+fn take(token: u64) -> Option<Box<dyn Held>> {
+    held(|held| held.remove(&token)).map(|(_, state)| state)
+}
+
+/// What the step that ended at a cut here carries, sealed (CBOR) and let go of: for the host, as it lets go of the
+/// instance the step ran on, so that the next step runs elsewhere. None where nothing is held.
+///
+/// # Errors
+/// What is held does not serialize, or more is held than one step's.
+pub fn seal() -> Result<Option<Vec<u8>>> {
+    let states: Vec<Box<dyn Held>> = held(|held| held.drain().map(|(_, (_, state))| state).collect());
+    match states.as_slice() {
+        [] => Ok(None),
+        [state] => state.seal().map(Some),
+        _ => Err(anyhow!("{} steps' states are held, where only the last step's can be", states.len())),
+    }
+}
+
+/// Where what is held now begins: what `release_since` lets go of.
+#[must_use]
+pub fn held_mark() -> u64 {
+    TOKENS.load(Ordering::Relaxed)
+}
+
+/// Let go of what this thread held since `mark`, which no step will take: a chain of steps that ended - failing, where a
+/// state is left - on a host its extension runs in.
+pub fn release_since(mark: u64) {
+    let here = std::thread::current().id();
+    held(|held| held.retain(|token, (thread, _)| *token <= mark || *thread != here));
+}
+
+/// What a step is handed of what the cut before carried.
+enum State {
+    None,
+    Held(Box<dyn Any>),
+    Sealed(Vec<u8>),
+}
+
 /// What a step is handed: what the steps before carried, what was requested for it, what was spawned for it, and the
 /// item it runs for, where it does.
 pub struct Handed {
-    state: Carried,
+    state: State,
     got: Vec<Result<Data>>,
     needs: Vec<Need>,
     joined: Vec<Vec<u8>>,
@@ -76,12 +157,19 @@ pub struct Handed {
 }
 
 impl Handed {
-    /// What the step before carried, as its type.
+    /// What the step before carried, as its type: the values themselves, where it ran here; else read back.
     ///
     /// # Errors
-    /// It does not read as `T`.
-    pub fn state<T: DeserializeOwned>(&self) -> Result<T> {
-        self.state.deserialized().map_err(|e| anyhow!("what the step before carried does not read back: {e}"))
+    /// Nothing was carried, it was taken already, or it is not a `T`.
+    pub fn state<T: DeserializeOwned + 'static>(&mut self) -> Result<T> {
+        match std::mem::replace(&mut self.state, State::None) {
+            State::None => Err(anyhow!("nothing was carried to this step")),
+            State::Held(held) => held
+                .downcast::<T>()
+                .map(|state| *state)
+                .map_err(|_| anyhow!("what the step before carried is not a {}", std::any::type_name::<T>())),
+            State::Sealed(bytes) => from_bytes(&bytes),
+        }
     }
 
     /// What the step before requested, made.
@@ -120,27 +208,38 @@ impl Handed {
 /// How a step ends at a cut: which, what it carries on, and what it requests or spawns.
 pub struct Ended {
     cut: u32,
-    state: Carried,
+    state: Box<dyn Held>,
     needs: Vec<Need>,
     items: Vec<Carried>,
 }
 
+/// What a cut spawns micro ops for, written as each is given it: worked out before the step's state is handed on, so
+/// that the items may be made of what it carries.
+pub struct Items(Vec<Carried>);
+
+/// The items a cut spawns micro ops for.
+///
+/// # Errors
+/// One does not serialize.
+pub fn items<I: Serialize>(items: impl IntoIterator<Item = I>) -> Result<Items> {
+    items.into_iter().map(|item| carried(&item)).collect::<Result<_>>().map(Items)
+}
+
 impl Ended {
-    /// The step ends at a cut asking for these outputs, carrying `state`.
+    /// The step ends at a cut asking for these outputs, carrying `state` on as it is.
     ///
     /// # Errors
-    /// `state` does not serialize.
-    pub fn request<S: Serialize>(cut: u32, state: &S, needs: Vec<Need>) -> Result<Ended> {
-        Ok(Ended { cut, state: carried(state)?, needs, items: Vec::new() })
+    /// None: as `spawn`, for what the step returns.
+    pub fn request<S: Serialize + Send + 'static>(cut: u32, state: S, needs: Vec<Need>) -> Result<Ended> {
+        Ok(Ended { cut, state: Box::new(state), needs, items: Vec::new() })
     }
 
-    /// The step ends at a cut spawning one micro op for each item, carrying `state`.
+    /// The step ends at a cut spawning one micro op for each item, carrying `state` on as it is.
     ///
     /// # Errors
-    /// `state` or an item does not serialize.
-    pub fn spawn<S: Serialize, I: Serialize>(cut: u32, state: &S, items: impl IntoIterator<Item = I>) -> Result<Ended> {
-        let items = items.into_iter().map(|item| carried(&item)).collect::<Result<_>>()?;
-        Ok(Ended { cut, state: carried(state)?, needs: Vec::new(), items })
+    /// None: as `request`, for what the step returns.
+    pub fn spawn<S: Serialize + Send + 'static>(cut: u32, state: S, items: Items) -> Result<Ended> {
+        Ok(Ended { cut, state: Box::new(state), needs: Vec::new(), items: items.0 })
     }
 }
 
@@ -337,12 +436,16 @@ pub const RECORD: &str = "stepped@record";
 /// cut's items made.
 pub const OWN: usize = 2;
 
-/// What a step ending at a cut hands on, for the host to go on from: which cut, what it carries, what it requests, what it
-/// spawns and runs it; and the operations of its extension running the next step and its items.
+/// The record's file in a step's record, and the file the host adds where it had what the step carries sealed.
+const RECORD_FILE: &str = "record.cbor";
+const SEALED_FILE: &str = "state.cbor";
+
+/// What a step ending at a cut hands on, for the host to go on from: which cut, the token what it carries is held by,
+/// what it requests, what it spawns and runs it; and the operations of its extension running the next step and its items.
 #[derive(Serialize, Deserialize)]
 struct Record {
     cut: u32,
-    state: Carried,
+    held: u64,
     needs: Vec<(String, String)>,
     /// Each item spawned, as its settings hold it (`ITEM`).
     items: Vec<String>,
@@ -369,9 +472,27 @@ pub fn continuation(data: &Data, read: impl FnOnce(&File) -> Result<Vec<u8>>) ->
     if typed.ty != RECORD {
         return Ok(None);
     }
-    let record: Record = from_bytes(&read(typed.file()?)?)?;
+    let record: Record = from_bytes(&read(record_file(typed, RECORD_FILE)?)?)?;
     let needs = record.needs.into_iter().map(|(node, address)| Need { node, address }).collect();
     Ok(Some(Continuation { needs, items: record.items, spawn: record.spawn, next: record.next }))
+}
+
+/// Add what a step's record holds, sealed (`seal`), to the record: what the next step reads, where it runs elsewhere.
+pub fn add_sealed(record: &mut Data, sealed: Vec<u8>) {
+    if let Data::Typed(typed) = record {
+        typed.files.retain(|file| file.name != SEALED_FILE);
+        typed.files.push(File::new(SEALED_FILE, sealed));
+    }
+}
+
+/// Whether a value is a step's record: what is to be gone on from.
+#[must_use]
+pub fn is_record(data: &Data) -> bool {
+    matches!(data, Data::Typed(typed) if typed.ty == RECORD)
+}
+
+fn record_file<'a>(typed: &'a Typed, name: &str) -> Result<&'a File> {
+    typed.files.iter().find(|file| file.name == name).ok_or_else(|| anyhow!("a step's record has no {name}"))
 }
 
 /// What an item made, as a value the host moves and keeps: one file.
@@ -387,14 +508,23 @@ fn bytes_of(call: &Call<'_>, data: &Data) -> Result<Vec<u8>> {
     call.read(typed.file()?)
 }
 
-fn is_record(data: &Data) -> bool {
-    matches!(data, Data::Typed(typed) if typed.ty == RECORD)
-}
-
-/// The record a step was handed: none for the first.
-fn record(call: &Call<'_>) -> Result<Option<Record>> {
+/// The record a step was handed, and what it carries: none for the first.
+fn record(call: &Call<'_>) -> Result<Option<(Record, State)>> {
     match call.inputs.first().and_then(|port| port.first()) {
-        Some(data) if is_record(data) => Ok(Some(from_bytes(&bytes_of(call, data)?)?)),
+        Some(Data::Typed(typed)) if typed.ty == RECORD => {
+            let record: Record = from_bytes(&call.read(record_file(typed, RECORD_FILE)?)?)?;
+            // Sealed where it ran, or held here; once sealed, nothing held here is the next step's.
+            let held = take(record.held);
+            let state = if let Some(sealed) = typed.files.iter().find(|file| file.name == SEALED_FILE) {
+                State::Sealed(call.read(sealed)?)
+            } else {
+                let held = held.ok_or_else(|| {
+                    anyhow!("what the step before carried is not held where this step runs, and was not sealed")
+                })?;
+                State::Held(held.into_any())
+            };
+            Ok(Some((record, state)))
+        }
         Some(data) => Err(anyhow!("a step was handed {}, not a step's record", data.ty())),
         None => Ok(None),
     }
@@ -456,11 +586,11 @@ fn handed(call: &Call<'_>, after_own: bool) -> Result<Handed> {
     };
     let item = item_of(call.settings)?;
     let (state, needs) = match record {
-        Some(record) => {
+        Some((record, state)) => {
             let needs: Vec<Need> = record.needs.iter().map(|(node, address)| Need::new(node, address)).collect();
-            (record.state, needs)
+            (state, needs)
         }
-        None => (Carried::Null, Vec::new()),
+        None => (State::None, Vec::new()),
     };
     // Each read on its own: one that could not be made is said to what reads it, which may take that.
     let got = needs.iter().map(|need| call.output_of(&need.node, &need.address)).collect();
@@ -483,13 +613,13 @@ fn step_run(
                 let at = ended.cut as usize;
                 let record = Record {
                     cut: ended.cut,
-                    state: ended.state,
+                    held: hold(ended.state),
                     needs: ended.needs.into_iter().map(|need| (need.node, need.address)).collect(),
                     items: ended.items.iter().map(item_text).collect::<Result<_>>()?,
                     next: step_name(&name, at + 1),
                     spawn: spawns.get(at).cloned().flatten(),
                 };
-                Ok(Data::Typed(Typed::new(RECORD, vec![File::new("record.cbor", to_bytes(&record)?)])))
+                Ok(Data::Typed(Typed::new(RECORD, vec![File::new(RECORD_FILE, to_bytes(&record)?)])))
             }
             Flow::Done(made) if also.is_empty() => Ok(made),
             Flow::Done(first) => {
@@ -614,7 +744,7 @@ pub fn replayed<R: 'static>(run: impl Fn(&mut Call<'_>) -> Result<R> + Send + Sy
             }
         }
         let needs = wanted.iter().map(|(node, address)| Need::new(node, address)).collect();
-        Ended::request(0, &wanted, needs).map(Flow::Cut)
+        Ended::request(0, wanted, needs).map(Flow::Cut)
     };
     let turn = Arc::new(turn);
     let again = turn.clone();
@@ -698,5 +828,42 @@ impl crate::data::CallHost for Replaying<'_> {
 
     fn path_of(&self, content: &crate::Content) -> Option<String> {
         self.inner.path_of(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handed(state: State) -> Handed {
+        Handed { state, got: Vec::new(), needs: Vec::new(), joined: Vec::new(), item: None }
+    }
+
+    #[test]
+    fn what_a_cut_carries_is_handed_on_as_it_is_or_sealed() {
+        type Carries = (u32, Vec<String>);
+        let carries = || -> Carries { (7, vec!["seven".to_string()]) };
+        // Held where the step ran: the value itself, taken once.
+        let ended = Ended::request(0, carries(), Vec::new()).unwrap();
+        let token = hold(ended.state);
+        let state = State::Held(take(token).unwrap().into_any());
+        assert!(take(token).is_none());
+        let mut next = handed(state);
+        assert_eq!(next.state::<Carries>().unwrap(), carries());
+        assert!(next.state::<Carries>().is_err());
+        // Its instance let go of: sealed, and read back where the next step runs.
+        let ended = Ended::request(0, carries(), Vec::new()).unwrap();
+        let token = hold(ended.state);
+        let sealed = seal().unwrap().unwrap();
+        assert!(take(token).is_none() && seal().unwrap().is_none());
+        assert_eq!(handed(State::Sealed(sealed)).state::<Carries>().unwrap(), carries());
+        // Taken as what it is not: said, not read.
+        let token = hold(Box::new(carries()));
+        assert!(handed(State::Held(take(token).unwrap().into_any())).state::<u32>().is_err());
+        // Left by a chain that ended: let go of with it. (One test, as `seal` takes all that is held.)
+        let mark = held_mark();
+        let token = hold(Box::new(1u32));
+        release_since(mark);
+        assert!(take(token).is_none());
     }
 }

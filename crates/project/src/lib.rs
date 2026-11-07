@@ -16,6 +16,7 @@ pub mod imports;
 pub mod index;
 pub mod lock;
 pub mod profile;
+pub mod schedule;
 pub mod stack;
 pub mod store;
 pub mod switches;
@@ -165,10 +166,11 @@ pub enum LayerKind {
     Files,
 }
 
-/// Threads lent to `parallel` now, whoever asks: how many jobs run at once, as one number however it nests.
+/// Threads lent now outside the pool (`schedule`), to work that waits on a channel and so cannot be its units: extraction's
+/// writers, until extraction runs on the pool.
 static LENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// How many threads `parallel` lends at most: half the processors, the rest for the window and what it asks.
+/// How many threads are lent at most: half the processors, the rest for the pool and the window.
 fn most_lent() -> usize {
     let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
     std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores / 2).clamp(1, 8)
@@ -180,7 +182,7 @@ pub(crate) struct Lend {
 }
 
 impl Lend {
-    /// Up to `wanted` threads, as many as `parallel` has to lend now: none, where others have them all.
+    /// Up to `wanted` threads, as many as there are to lend now: none, where others have them all.
     pub(crate) fn threads(wanted: usize) -> Lend {
         use std::sync::atomic::Ordering;
         let wanted = wanted.min(most_lent());
@@ -197,36 +199,7 @@ impl Drop for Lend {
     }
 }
 
-/// Each of these worked out at the same time, each result in its item's place, by this thread and as many more as there
-/// are to lend: none, where others have them all, and it does them alone. So what is parallel within what is parallel adds
-/// no threads, and waits for nothing.
-pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    // What one edit changed is one asset, and is not worth a thread.
-    if items.len() < 2 {
-        return items.iter().map(work).collect();
-    }
-    let lent = Lend::threads(items.len() - 1);
-    let next = AtomicUsize::new(0);
-    let worker = || {
-        let mut done = Vec::new();
-        loop {
-            let at = next.fetch_add(1, Ordering::Relaxed);
-            let Some(item) = items.get(at) else { return done };
-            done.push((at, work(item)));
-        }
-    };
-    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..lent.count).map(|_| scope.spawn(worker)).collect();
-        let own = worker();
-        let rest =
-            threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
-        own.into_iter().chain(rest.flatten()).collect()
-    });
-    drop(lent);
-    done.sort_unstable_by_key(|(at, _)| *at);
-    done.into_iter().map(|(_, result)| result).collect()
-}
+pub(crate) use schedule::parallel;
 
 #[derive(Clone, PartialEq)]
 pub struct Layer {

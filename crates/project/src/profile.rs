@@ -64,6 +64,15 @@ pub fn frame() {
     }
 }
 
+/// Add a duration measured otherwise than by a span: what crosses threads, as a request's wait from asked to answered.
+pub fn record(name: &str, took: Duration) {
+    let Ok(mut totals) = totals_map().lock() else { return };
+    let total = totals.entry(name.to_string()).or_insert_with(|| Total { name: name.to_string(), ..Total::default() });
+    total.count += 1;
+    total.total += took;
+    total.longest = total.longest.max(took);
+}
+
 /// Every name's total so far, the longest first.
 #[must_use]
 pub fn totals() -> Vec<Total> {

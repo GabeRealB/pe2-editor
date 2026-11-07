@@ -67,7 +67,9 @@ impl Pictures {
                         Err(_) => return,
                     };
                     let Ok(request) = request else { return };
-                    let made = make(&extensions, &engine, &request);
+                    // A picture a view shows: a group of its own, ahead of what runs long.
+                    let group = project::schedule::Group::new(project::schedule::Class::Interactive, "picture");
+                    let made = group.enter(|| make(&extensions, &engine, &request));
                     if drawn.send((request.path, request.look, request.asked, made)).is_err() {
                         return;
                     }

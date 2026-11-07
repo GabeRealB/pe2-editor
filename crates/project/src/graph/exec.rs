@@ -1017,16 +1017,29 @@ impl Evaluation<'_> {
             needs: held,
             temps: Mutex::default(),
         };
-        let value = match tracing::info_span!("op", of = %step.op).in_scope(|| run(&mut call)) {
-            Ok(value) => value,
-            Err(e) => return fail(format!("{e:#}")),
+        // In steps, a chain: what its first step's run leaves - its instance - goes on to the next.
+        let Some(given) = given else {
+            let value = match tracing::info_span!("op", of = %step.op).in_scope(|| run(&mut call)) {
+                Ok(value) => value,
+                Err(e) => return fail(format!("{e:#}")),
+            };
+            return Self::made(step, def, &bound, value);
         };
-        drop(call);
-        let Some(given) = given else { return Self::made(step, def, &bound, value) };
-        match self.continued(step, value, &given, parameter, recorder) {
-            Ok(value) => Self::made(step, def, &bound, value),
-            Err(e) => fail(format!("{e:#}")),
-        }
+        // What the chain's steps hold where they share this thread - an extension running here - goes with it.
+        let mark = pe2_ext::stepped::held_mark();
+        let done = crate::schedule::chain(|| {
+            let value = match tracing::info_span!("op", of = %step.op).in_scope(|| run(&mut call)) {
+                Ok(value) => value,
+                Err(e) => return fail(format!("{e:#}")),
+            };
+            drop(call);
+            match self.continued(step, value, &given, parameter, recorder) {
+                Ok(value) => Self::made(step, def, &bound, value),
+                Err(e) => fail(format!("{e:#}")),
+            }
+        });
+        pe2_ext::stepped::release_since(mark);
+        done
     }
 
     /// Where a run ended at a cut (`pe2_ext::stepped`), what it goes on to: what it requested made, what it spawned run -
@@ -1042,10 +1055,15 @@ impl Evaluation<'_> {
     ) -> Result<Value> {
         let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
         while let Some(next) = pe2_ext::stepped::continuation(&value, |file| self.content(&file.content))? {
+            // A cut: what is owed the pool before this goes first.
+            crate::schedule::yield_now();
+            // What it requested and spawned is made apart: it takes nothing the chain holds.
             let needs = Needs::default();
-            self.make_needs(&next.needs, &needs);
+            crate::schedule::apart(|| self.make_needs(&next.needs, &needs));
             let joined = match &next.spawn {
-                Some(spawn) => self.spawned(extension, step, spawn, &next.items, given, parameter)?,
+                Some(spawn) => {
+                    crate::schedule::apart(|| self.spawned(extension, step, spawn, &next.items, given, parameter))?
+                }
                 None => Vec::new(),
             };
             let op = format!("{extension}@{}", next.next);

@@ -19,7 +19,7 @@ const PATIENCE: Duration = Duration::from_secs(20);
 #[cfg(unix)]
 fn name(root: &Path) -> std::io::Result<Name<'static>> {
     use interprocess::local_socket::GenericFilePath;
-    root.join(project::cache::DIR).join("editor.sock").to_fs_name::<GenericFilePath>()
+    root.join(project::cache::DIR).join(project::cache::SOCKET).to_fs_name::<GenericFilePath>()
 }
 
 #[cfg(windows)]

@@ -460,6 +460,38 @@ pub struct Opened {
     link: std::result::Result<mcp::link::Listener, String>,
 }
 
+/// What agents ask of the editor's own state, answered while the imports attach as the user has it then: what it shows,
+/// showing another asset, what it costs.
+const EDITOR_OWN: [&str; 3] = ["editor_selection", "editor_show", "editor_performance"];
+
+/// Whether the opening waits for an agent once the link listens (`--wait-for-agent`), and whether one came.
+static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ARRIVED: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Hold each opening, once agents can reach the editor, until the first asks it something (`--wait-for-agent`).
+pub fn wait_for_agent() {
+    WAITING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// An agent asked something: what the opening waits for, where it does.
+fn arrived() {
+    *ARRIVED.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    ARRIVED.1.notify_all();
+}
+
+/// Hold here, where the opening waits for an agent, until one asks something.
+fn await_agent(report: &project::index::Report<'_>) {
+    if !WAITING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    report("Waiting for an agent", 0, 0);
+    let mut came = ARRIVED.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*came {
+        came = ARRIVED.1.wait(came).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
 /// Agents' requests, each with where its answer goes: what the link hands the window.
 pub type AgentRequest = (mcp::Request, mpsc::Sender<mcp::Reply>);
 
@@ -472,6 +504,7 @@ fn listen(
     ctx: egui::Context,
 ) -> std::result::Result<mcp::link::Listener, String> {
     mcp::link::Listener::start(root, move |request| {
+        arrived();
         let (reply, answered) = mpsc::channel();
         let delivered = to_frames.send((request, reply)).is_ok();
         ctx.request_repaint();
@@ -551,6 +584,9 @@ impl Workspace {
         };
         // Agents reach it from now on: what they ask of the window is answered as it opens.
         let link = listen(&project.root, agents.0, agents.1);
+        if link.is_ok() {
+            await_agent(report);
+        }
         let cache = Cache::open(&project, &lock)?;
         // The history first: a transaction a crash left half done is rolled back before the index reads the files.
         let (history, recovered) = History::open(&cache)?;
@@ -979,6 +1015,14 @@ impl Workspace {
             }
             if request.uses_window() {
                 self.window_requests.push((request, reply));
+                continue;
+            }
+            // What is the editor's own - what it shows, what it costs - the user has while the imports attach; the
+            // agents too.
+            if !self.attached()
+                && matches!(&request, mcp::Request::Call { name, .. } if EDITOR_OWN.contains(&name.as_str()))
+            {
+                self.answer_agent(&request, &reply);
                 continue;
             }
             // Opened, what its importers made not yet attached: said now, not left to wait for it.

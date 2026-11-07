@@ -115,10 +115,12 @@ impl TakeIn {
             .name("take-in".into())
             .spawn(move || {
                 // Each job as it comes, with those queued behind it merged in.
+                // Taking in changes is the editor's own doing, behind what the user looks at.
+                let group = project::schedule::Group::new(project::schedule::Class::Background, "take-in");
                 while let Ok(first) = queued.recv() {
                     let jobs: Vec<(u64, Job)> = std::iter::once(first).chain(queued.try_iter()).collect();
                     let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
-                    let mut snapshot = worker.take_in(jobs);
+                    let mut snapshot = group.enter(|| worker.take_in(jobs));
                     snapshot.files = files;
                     if made.send(snapshot).is_err() {
                         return;
