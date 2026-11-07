@@ -3,7 +3,7 @@
 //! never carries a copy.
 //!
 //! The same crates are linked in too: `PE2_EXTENSIONS=linked` runs them in the host instead of their components, to
-//! step through one in a debugger or compare the two.
+//! step through one in a debugger, profile it, or compare the two; what a project holds still runs as components.
 
 use project::ext::component::{Described, Unsandboxed};
 use project::ext::{
@@ -91,9 +91,6 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires:
         }
         loadable
     };
-    if std::env::var_os("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
-        return Extensions::load_without(with_settings(linked().into_iter().map(Into::into).collect()), true, disabled);
-    }
     let mut loadable: Vec<Loadable> = vec![];
     let mut failed = vec![];
     // Those not run: refused, not trusted, kept apart.
@@ -170,10 +167,16 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires:
             }
         }
     }
-    for (package, bytes) in COMPONENTS {
-        match component::load_bytes(package, bytes, Origin::Builtin) {
-            Ok(extension) => loadable.push(extension),
-            Err(e) => failed.push(format!("{package}: {e:#}")),
+    // The built-ins: their crates, linked in, where asked (a native profiler sees into them); what the project holds
+    // runs as ever.
+    if std::env::var_os("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
+        loadable.extend(linked().into_iter().map(Into::into));
+    } else {
+        for (package, bytes) in COMPONENTS {
+            match component::load_bytes(package, bytes, Origin::Builtin) {
+                Ok(extension) => loadable.push(extension),
+                Err(e) => failed.push(format!("{package}: {e:#}")),
+            }
         }
     }
     loadable.extend(TEST_HOST.get().map(|host| host().into()));

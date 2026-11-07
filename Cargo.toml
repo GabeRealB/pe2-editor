@@ -144,6 +144,13 @@ opt-level = 1
 [profile.release]
 strip = true
 
+# For a sampling profiler (`perf`): release, with the symbols and line tables it reads (`cargo build --profile profiling`,
+# into target/profiling).
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+
 # What we ship: release, optimized across crates as one (`cargo build --profile dist`). Slower to build than release,
 # which stays the everyday optimized build.
 [profile.dist]

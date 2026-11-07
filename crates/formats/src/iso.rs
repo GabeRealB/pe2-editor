@@ -64,6 +64,15 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// Slices joined, each copied whole: a byte at a time, a disc's hundreds of megabytes take seconds.
+fn joined<'a>(slices: impl Iterator<Item = &'a [u8]>, capacity: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(capacity);
+    for slice in slices {
+        out.extend_from_slice(slice);
+    }
+    out
+}
+
 /// A disc image, read by sector from any number of threads at once.
 pub struct Image {
     file: File,
@@ -113,7 +122,7 @@ impl Image {
     pub fn data(&self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
         let raw = self.raw(lba, count)?;
         let (sectors, _) = raw.as_chunks::<RAW_SECTOR>();
-        Ok(sectors.iter().flat_map(|s| &s[FORM1_DATA_AT..FORM1_DATA_AT + DATA]).copied().collect())
+        Ok(joined(sectors.iter().map(|s| &s[FORM1_DATA_AT..FORM1_DATA_AT + DATA]), sectors.len() * DATA))
     }
 
     /// `count` sectors without sync and header, 2336 bytes each.
@@ -123,7 +132,7 @@ impl Image {
     pub fn mode2(&self, lba: u32, count: u32) -> io::Result<Vec<u8>> {
         let raw = self.raw(lba, count)?;
         let (sectors, _) = raw.as_chunks::<RAW_SECTOR>();
-        Ok(sectors.iter().flat_map(|s| &s[MODE2_AT..]).copied().collect())
+        Ok(joined(sectors.iter().map(|s| &s[MODE2_AT..]), sectors.len() * (RAW_SECTOR - MODE2_AT)))
     }
 
     /// The license data: the system area's first sectors, as `mode2` keeps them.

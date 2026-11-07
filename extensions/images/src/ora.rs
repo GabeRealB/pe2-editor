@@ -796,4 +796,48 @@ mod tests {
         texels[8] = 0x23;
         assert_eq!(imported(&painted), expected);
     }
+
+    /// How long every source an extraction wrote takes to import, and to export again from what it imports: the
+    /// layer's folder in `PE2_ORA_TIMING` (`cargo test --profile profiling -p pe2-images -- --ignored timing`).
+    #[test]
+    #[ignore = "reads an extracted project"]
+    fn timing() {
+        let root = std::path::PathBuf::from(std::env::var("PE2_ORA_TIMING").expect("PE2_ORA_TIMING"));
+        let mut sources = Vec::new();
+        let mut folders = vec![root];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if path.file_name().is_some_and(|name| name == "source.ora") {
+                    sources.push(path);
+                }
+            }
+        }
+        let (mut imports, mut exports, mut bytes) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
+        for path in &sources {
+            let node: Table =
+                toml::from_str(&std::fs::read_to_string(path.with_file_name("node.toml")).unwrap()).unwrap();
+            let step = node["stack"].as_array().unwrap().iter().find(|s| s["op"].as_str() == Some("pe2.images@ora"));
+            let mut fields = step.unwrap().as_table().unwrap().clone();
+            fields.remove("op");
+            fields.remove("id");
+            let source = std::fs::read(path).unwrap();
+            let started = std::time::Instant::now();
+            let lent = Lent { fields: fields.clone(), files: HashMap::new() };
+            let image = import(&Asset::new(&lent, Some("pe2.images@image")), &source).unwrap();
+            imports += started.elapsed();
+            let pe2_ext::Data::Typed(typed) = <crate::Texels as pe2_ext::ty::ValueType>::encode(image.clone()) else {
+                panic!("no files")
+            };
+            fields.extend(typed.settings);
+            let lent = Lent { fields, files: HashMap::new() };
+            let started = std::time::Instant::now();
+            let written = export(&Asset::new(&lent, Some("pe2.images@image")), &image).unwrap();
+            exports += started.elapsed();
+            bytes += written.len();
+        }
+        eprintln!("{} sources: import {imports:?}, export {exports:?}, {bytes} bytes written", sources.len());
+    }
 }

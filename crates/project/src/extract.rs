@@ -523,6 +523,7 @@ impl Reader<'_> {
 
 impl pe2_ext::Discs for Reader<'_> {
     fn read(&mut self, at: &toml::Table) -> pe2_ext::Result<Vec<u8>> {
+        let _span = tracing::info_span!("disc read").entered();
         if let Some((disc, slot)) = self.disc_slot(at)? {
             return disc.slot(&slot);
         }
@@ -833,8 +834,10 @@ struct Lane {
 }
 
 /// How many times what a new session costs the work each of the two sessions would then have has to be worth, for a
-/// session to split off half of what it has left.
-const WORTH_A_SESSION: u64 = 2;
+/// session to split off half of what it has left. Once is enough: what the first session cost to begin, which the
+/// estimate starts from, is more than another's, as the declarations it was lent are encoded once for all (twice held
+/// back the textures, a cold extraction's longest lane: 4.1 s against 2.9).
+const WORTH_A_SESSION: u64 = 1;
 
 impl Lane {
     /// Whether a session holding `left` assets is to split off half of them: the work each half holds is worth more than

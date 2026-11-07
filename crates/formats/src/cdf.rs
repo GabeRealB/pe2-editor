@@ -160,12 +160,11 @@ impl Chunk {
         let bytes = src.read_at(self.offset, len)?;
         let sector = usize::try_from(SECTOR).unwrap_or(0x800);
         let used = usize::from(self.sector_len);
-        Ok(bytes
-            .chunks(sector)
-            .enumerate()
-            .flat_map(|(i, s)| &s[if i == 0 { HEADER } else { 0 }..used])
-            .copied()
-            .collect())
+        let mut payload = Vec::with_capacity(bytes.len());
+        for (i, s) in bytes.chunks(sector).enumerate() {
+            payload.extend_from_slice(&s[if i == 0 { HEADER } else { 0 }..used]);
+        }
+        Ok(payload)
     }
 }
 

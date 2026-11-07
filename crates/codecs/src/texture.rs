@@ -142,6 +142,20 @@ pub fn color([red, green, blue, alpha]: [u8; 4]) -> u16 {
     }
 }
 
+/// How a PNG of this many bytes is compressed: zlib's fastest level, and below `SMALL` PNG's own deflater (`fdeflate`).
+///
+/// An image's source is written for every texture an extraction makes, and its PNGs - a strip for each palette, a layer
+/// for each cell, the texels twice, the merged picture and its thumbnail - are most of what that costs. For 1578
+/// textures: zlib's best level takes 13.7 s and writes 152 MB; its fastest 3.9 s and 170 MB, a fifth of it zeroing
+/// the state each of the many small PNGs makes anew; with `fdeflate` for those, whose state is small, 2.9 s and 176 MB.
+/// `fdeflate` for all of them takes 1.6 s but writes 249 MB: it is made for filtered color, not rows of indices.
+fn deflate(bytes: usize) -> png::DeflateCompression {
+    if bytes < SMALL { png::DeflateCompression::FdeflateUltraFast } else { png::DeflateCompression::Level(1) }
+}
+
+/// What a small PNG is, in the bytes of its rows.
+const SMALL: usize = 2 << 10;
+
 /// Indices as a PNG anyone can read them back from: indexed, its palette a gray ramp (index `i` of 16 is `17 * i`,
 /// of 256 is `i`), so a program saving it in color keeps them as its grays.
 ///
@@ -152,7 +166,7 @@ pub fn index_png(width: usize, height: usize, bpp: u8, indices: &[u16]) -> Resul
     let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
     let mut encoder = png::Encoder::new(&mut out, to_u32(width), to_u32(height));
     encoder.set_color(png::ColorType::Indexed);
-    encoder.set_compression(png::Compression::High);
+    encoder.set_deflate_compression(deflate(width * height * usize::from(bpp) / 8));
     encoder.set_filter(png::Filter::NoFilter);
     let n = entries(bpp);
     let step = 255 / (n - 1);
@@ -191,6 +205,7 @@ pub fn rgba_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, png
     let mut encoder = png::Encoder::new(&mut out, to_u32(width.max(1)), to_u32(height.max(1)));
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_deflate_compression(deflate(rgba.len()));
     if rgba.is_empty() {
         encoder.write_header()?.write_image_data(&[0; 4])?;
     } else {
@@ -264,13 +279,14 @@ pub fn png(
     if bpp == 16 {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_deflate_compression(deflate(width * height * 4));
         let data: Vec<u8> = texels.iter().flat_map(|&c| rgba(c)).collect();
         encoder.write_header()?.write_image_data(&data)?;
         return Ok(out);
     }
     let colors: Vec<[u8; 4]> = palette.iter().map(|&c| rgba(c)).collect();
     encoder.set_color(png::ColorType::Indexed);
-    encoder.set_compression(png::Compression::High);
+    encoder.set_deflate_compression(deflate(width * height * usize::from(bpp) / 8));
     encoder.set_filter(png::Filter::NoFilter);
     encoder.set_depth(if bpp == 4 { png::BitDepth::Four } else { png::BitDepth::Eight });
     encoder.set_palette(colors.iter().flat_map(|c| [c[0], c[1], c[2]]).collect::<Vec<u8>>());
