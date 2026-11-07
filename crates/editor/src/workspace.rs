@@ -222,6 +222,8 @@ pub struct Workspace {
     runner: crate::runner::Runner,
     /// The config in use.
     pub config: Option<project::Config>,
+    /// The config the extensions were told, and which extensions were: told again once they are read again.
+    config_told: Option<(usize, Option<project::Config>)>,
     /// How the last epoch ended.
     pub last_epoch: Option<crate::runner::Finished>,
     /// The name of an event being defined.
@@ -676,6 +678,7 @@ impl Workspace {
         let mut workspace = Workspace {
             runner,
             config: None,
+            config_told: None,
             last_epoch: None,
             new_event_name: String::new(),
             gpu_errors: Vec::new(),
@@ -843,6 +846,19 @@ impl Workspace {
     /// Read the project again, its files too, as someone asked.
     pub fn reload_whole(&mut self) {
         self.takein.reload("Reload", true);
+    }
+
+    /// The config in use: what events set off are for, and, told the extensions as it changes, what is made of the
+    /// assets is made for (a file the releases have apart is read as its release has it).
+    pub fn set_config(&mut self, config: Option<project::Config>) {
+        let told = (Arc::as_ptr(&self.extensions) as usize, config.clone());
+        if self.config_told.as_ref() != Some(&told) {
+            let built = config.as_ref().map(|c| project::build::build_config(&self.project, c));
+            let disabled = config.as_ref().map_or(&[][..], |c| c.disabled.as_slice());
+            self.extensions.set_config(built, disabled);
+            self.config_told = Some(told);
+        }
+        self.config = config;
     }
 
     /// Read the project again, as this changed (not its files).
@@ -1288,6 +1304,7 @@ impl Workspace {
         self.runner.restart(project.clone(), extensions.clone());
         self.project = project;
         self.plans.again();
+
         self.extensions_found = found;
         self.outcome = Update::Reloaded(why);
         // What came of it is what was showing: it goes on.

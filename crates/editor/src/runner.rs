@@ -235,7 +235,14 @@ fn extract(project: &Project, extensions: &Extensions, extraction: &Extraction) 
     extraction.started.store(true, Ordering::Relaxed);
     let group = project::schedule::Group::new(project::schedule::Class::Commanded, "extract");
     let ran = group.enter(|| {
-        project::plan::run(project, &extraction.layer, &extensions.engine(), extensions, &extraction.progress)
+        project::plan::run(
+            project,
+            &extraction.layer,
+            &extensions.engine(),
+            extensions,
+            &extraction.progress,
+            &project::plan::Releases::Available,
+        )
     });
     let _ = extraction.done.send(ran);
 }

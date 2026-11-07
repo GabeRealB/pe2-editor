@@ -410,7 +410,8 @@ impl Default for Ops {
     fn default() -> Ops {
         let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()) };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
-            let name = call.setting_str("file")?.to_string();
+            // A file the releases have apart is read as the release being built has it (`<release>/<file>`).
+            let name = call.of_release(call.setting_str("file")?);
             // A file the node may lack (`optional`): none, without it.
             if call.settings().get("optional").and_then(Toml::as_bool) == Some(true) {
                 return call.stored_if_any(&name).map(Value::Typed);

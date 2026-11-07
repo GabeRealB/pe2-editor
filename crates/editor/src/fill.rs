@@ -142,6 +142,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
             Some(Ok(State::Empty)) => "is empty".to_string(),
             Some(Ok(State::Stale(why))) => format!("is out of date ({})", why.join("; ")),
             Some(Ok(State::Filled)) => "is filled, as its plan says".to_string(),
+            Some(Ok(State::Partial(not))) => format!("is filled but for {}, whose discs were not read", not.join(", ")),
             Some(Ok(State::NoPlan)) => "has no plan".to_string(),
             Some(Err(why)) => format!("has a plan that cannot be read: {why}"),
             None => "is being looked at".to_string(),
@@ -152,7 +153,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
         );
         ui.add(egui::Label::new(what).wrap());
         ui.add_space(4.0);
-        let all_found = discs_ui(ui, &planned);
+        let (whole, short) = discs_ui(ui, &planned);
         // Where they are stays as it is while they are read.
         let running = ws.fill.running.is_some();
         ui.add_enabled_ui(!running, |ui| look_here = look_in_ui(ui, ws, &planned));
@@ -162,13 +163,22 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
         }
         ui.add_space(10.0);
         if !running_ui(ui, ctx, ws) {
+            if !whole.is_empty() && !short.is_empty() {
+                let said = format!(
+                    "{} is read; {} is not, its discs not all found: what only it has is left for another time",
+                    whole.join(" and "),
+                    short.join(" and ")
+                );
+                ui.add(egui::Label::new(RichText::new(said).color(theme::weak())).wrap());
+                ui.add_space(6.0);
+            }
             ui.horizontal(|ui| {
-                let hint = if all_found {
-                    "Run its plan: only what is not there yet is made"
+                let hint = if whole.is_empty() {
+                    "No release's discs are all found".to_string()
                 } else {
-                    "Not every disc is found"
+                    format!("Run its plan of {}: only what is not there yet is made", whole.join(" and "))
                 };
-                extract = ui.add_enabled(all_found, egui::Button::new("Extract")).on_hover_text(hint).clicked();
+                extract = ui.add_enabled(!whole.is_empty(), egui::Button::new("Extract")).on_hover_text(hint).clicked();
                 close = ui.button("Not now").on_hover_text("Asked again next time").clicked();
             });
         }
@@ -235,18 +245,18 @@ fn running_ui(ui: &mut egui::Ui, ctx: &egui::Context, ws: &mut Workspace) -> boo
     true
 }
 
-/// Each release's discs, found or not, a row each. Whether every one was found.
-fn discs_ui(ui: &mut egui::Ui, planned: &crate::plans::Planned) -> bool {
+/// Each release's discs, found or not, a row each. The releases whose discs are all found, and the others.
+fn discs_ui(ui: &mut egui::Ui, planned: &crate::plans::Planned) -> (Vec<String>, Vec<String>) {
     let Some(discs) = &planned.discs else {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(RichText::new("Looking for the discs…").color(theme::weak()));
         });
-        return false;
+        return (Vec::new(), Vec::new());
     };
     let mut releases: Vec<&str> = discs.iter().map(|d| d.release.as_str()).collect();
     releases.dedup();
-    for release in releases {
+    for &release in &releases {
         theme::section(ui, release, |ui| {
             egui::Grid::new(("discs", release)).num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
                 for disc in discs.iter().filter(|d| d.release == release) {
@@ -266,7 +276,9 @@ fn discs_ui(ui: &mut egui::Ui, planned: &crate::plans::Planned) -> bool {
             });
         });
     }
-    discs.iter().all(|d| d.found.is_some())
+    let whole = |release: &&str| discs.iter().filter(|d| d.release == *release).all(|d| d.found.is_some());
+    let (found, short): (Vec<&str>, Vec<&str>) = releases.into_iter().partition(whole);
+    (found.into_iter().map(str::to_string).collect(), short.into_iter().map(str::to_string).collect())
 }
 
 /// Where the discs are looked for, where that is an unmanaged mount: its place on this machine, to change. The mount and

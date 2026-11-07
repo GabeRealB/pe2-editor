@@ -52,7 +52,11 @@ const VERSION: &str = "1";
 struct Op {
     id: String,
     kind: String,
+    /// What it takes, as chosen (`Plan::resolve`): an operation's id at each place of each port.
     takes: BTreeMap<String, Vec<String>>,
+    /// What it may take at each place of each port, in preference order: the same bytes from any of the releases that
+    /// have them (`{"any": [...]}`), or one operation.
+    inputs: BTreeMap<String, Vec<Vec<String>>>,
     /// What it comes after, taking nothing of it: its key is theirs too.
     after: Vec<String>,
     args: Value,
@@ -72,9 +76,14 @@ struct Emit {
 #[derive(Clone, Debug)]
 struct Given {
     name: String,
+    /// What makes it, as chosen (`Plan::resolve`), and the folder of what it made it is, where it is one.
     at: usize,
     prefix: Option<String>,
     optional: bool,
+    /// What may make it, in preference order: the same bytes of any of the releases that have them.
+    candidates: Vec<(usize, Option<String>)>,
+    /// Whether any of them is made of the releases run.
+    possible: bool,
 }
 
 impl Given {
@@ -87,6 +96,8 @@ impl Given {
 pub struct Plan {
     /// What it reads, by release.
     pub inputs: BTreeMap<String, Input>,
+    /// Its releases in the order it prefers them.
+    pub order: Vec<String>,
     /// The extensions its operations are theirs, by id, and the versions it takes of each (`^0.1`).
     pub requires: Vec<(String, String)>,
     ops: Vec<Op>,
@@ -103,6 +114,8 @@ pub struct Plan {
 pub struct Header {
     /// What it reads, by release.
     pub inputs: BTreeMap<String, Input>,
+    /// Its releases in the order it prefers them (`releases`; else by name).
+    pub order: Vec<String>,
     /// The extensions its operations are theirs, by id, and the versions it takes of each (`^0.1`).
     pub requires: Vec<(String, String)>,
 }
@@ -132,7 +145,11 @@ impl Header {
             .flatten()
             .filter_map(|r| Some((r.get("id")?.as_str()?.to_string(), r.get("version")?.as_str()?.to_string())))
             .collect();
-        Ok(Header { inputs, requires })
+        let order: Vec<String> = head.get("releases").and_then(Value::as_array).map_or_else(
+            || inputs.keys().cloned().collect(),
+            |r| r.iter().filter_map(Value::as_str).filter(|r| inputs.contains_key(*r)).map(str::to_string).collect(),
+        );
+        Ok(Header { inputs, order, requires })
     }
 }
 
@@ -158,10 +175,40 @@ impl Plan {
         Self::parse(&text).with_context(|| path.display().to_string())
     }
 
+    /// What an emit line gives its bundle: each file by the operations that may make it, in preference order.
+    fn given(line: &Value, at: usize, by_id: &HashMap<String, usize>) -> Result<Vec<Given>> {
+        let files = line.get("files").and_then(Value::as_object).with_context(|| format!("line {at}: no files"))?;
+        let optional: Vec<&str> =
+            line.get("optional").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut given = Vec::new();
+        for (name, ids) in files {
+            let ids: Vec<&str> = match ids {
+                Value::String(id) => vec![id.as_str()],
+                Value::Array(ids) => ids.iter().filter_map(Value::as_str).collect(),
+                _ => bail!("line {at}: {name} is made by nothing"),
+            };
+            let mut candidates = Vec::new();
+            for id in ids {
+                let (id, prefix) = match id.split_once('#') {
+                    Some((id, prefix)) => (id, Some(prefix.to_string())),
+                    None => (id, None),
+                };
+                let made_by = *by_id
+                    .get(id)
+                    .with_context(|| format!("line {at}: {name} is made by {id}, which nothing before makes"))?;
+                candidates.push((made_by, prefix));
+            }
+            let (made_by, prefix) = candidates.first().cloned().with_context(|| format!("line {at}: {name}"))?;
+            let optional = optional.contains(&name.as_str());
+            given.push(Given { name: name.clone(), at: made_by, prefix, optional, candidates, possible: true });
+        }
+        Ok(given)
+    }
+
     fn parse(text: &str) -> Result<Plan> {
         let mut lines = text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty());
         let (_, head) = lines.next().context("an empty plan")?;
-        let Header { inputs, requires } = Header::parse(head)?;
+        let Header { inputs, order, requires } = Header::parse(head)?;
         let (mut ops, mut emits, mut checks, mut by_id) = (Vec::new(), Vec::new(), Vec::new(), HashMap::new());
         for (at, line) in lines {
             let at = at + 1;
@@ -172,47 +219,42 @@ impl Plan {
                 continue;
             }
             if let Some(node) = line.get("emit").and_then(Value::as_str) {
-                let files =
-                    line.get("files").and_then(Value::as_object).with_context(|| format!("line {at}: no files"))?;
-                let optional: Vec<&str> = line
-                    .get("optional")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect();
-                let mut given = Vec::new();
-                for (name, id) in files {
-                    let id = id.as_str().with_context(|| format!("line {at}: {name}"))?;
-                    let (id, prefix) = match id.split_once('#') {
-                        Some((id, prefix)) => (id, Some(prefix.to_string())),
-                        None => (id, None),
-                    };
-                    let made_by = *by_id
-                        .get(id)
-                        .with_context(|| format!("line {at}: {name} is made by {id}, which nothing before makes"))?;
-                    let optional = optional.contains(&name.as_str());
-                    given.push(Given { name: name.clone(), at: made_by, prefix, optional });
-                }
-                emits.push(Emit { node: node.to_string(), files: given });
+                emits.push(Emit { node: node.to_string(), files: Self::given(&line, at, &by_id)? });
                 continue;
             }
             let id = line.get("id").and_then(Value::as_str).with_context(|| format!("line {at}: no id"))?.to_string();
             let op = line.get("op").and_then(Value::as_str).with_context(|| format!("line {at}: no op"))?.to_string();
-            let mut takes = BTreeMap::new();
-            for (port, from) in line.get("in").and_then(Value::as_object).into_iter().flatten() {
+            let (mut takes, mut inputs) = (BTreeMap::new(), BTreeMap::new());
+            // One operation, or any of several in preference order (`{"any": [...]}`).
+            let alternatives = |from: &Value| -> Result<Vec<String>> {
                 let ids: Vec<String> = match from {
                     Value::String(id) => vec![id.clone()],
-                    Value::Array(ids) => ids.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-                    _ => bail!("line {at}: {port} takes no id"),
+                    Value::Object(any) => any
+                        .get("any")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    _ => vec![],
                 };
-                for taken in &ids {
+                anyhow::ensure!(!ids.is_empty(), "line {at}: it takes nothing at a place");
+                Ok(ids)
+            };
+            for (port, from) in line.get("in").and_then(Value::as_object).into_iter().flatten() {
+                let places: Vec<Vec<String>> = match from {
+                    Value::Array(items) => items.iter().map(alternatives).collect::<Result<_>>()?,
+                    one => vec![alternatives(one)?],
+                };
+                for taken in places.iter().flatten() {
                     anyhow::ensure!(
                         by_id.contains_key(taken),
                         "line {at}: {port} takes {taken}, which nothing before makes"
                     );
                 }
-                takes.insert(port.clone(), ids);
+                takes.insert(port.clone(), places.iter().map(|ids| ids[0].clone()).collect());
+                inputs.insert(port.clone(), places);
             }
             let after: Vec<String> = line
                 .get("after")
@@ -232,9 +274,19 @@ impl Plan {
             let sha1 = line.pointer("/expect/sha1").and_then(Value::as_str).map(str::to_string);
             anyhow::ensure!(!by_id.contains_key(&id), "line {at}: {id} is made twice");
             by_id.insert(id.clone(), ops.len());
-            ops.push(Op { id, kind: op, takes, after, args, sha1 });
+            ops.push(Op { id, kind: op, takes, inputs, after, args, sha1 });
         }
-        Ok(Plan { inputs, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
+        // A release's own file (`<release>/<name>`) is the file `<name>` of what makes it.
+        for given in emits.iter_mut().flat_map(|emit| emit.files.iter_mut()) {
+            let Some((release, name)) = given.name.split_once('/') else { continue };
+            if inputs.contains_key(release) && !given.folder() {
+                for (_, prefix) in given.candidates.iter_mut().filter(|(_, prefix)| prefix.is_none()) {
+                    *prefix = Some(name.to_string());
+                }
+                given.prefix = given.candidates[0].1.clone();
+            }
+        }
+        Ok(Plan { inputs, order, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
     }
 
     /// What it requires that the extensions do not have: each extension missing - not there, left off or not trusted -
@@ -259,11 +311,13 @@ impl Plan {
     fn keys(&self, versions: &dyn Fn(&str) -> String) -> Vec<String> {
         let mut keys: Vec<String> = Vec::with_capacity(self.ops.len());
         for op in &self.ops {
-            let taken: BTreeMap<&String, Vec<&String>> = op
-                .takes
-                .iter()
-                .map(|(port, ids)| (port, ids.iter().map(|id| &keys[self.by_id[id]]).collect()))
-                .collect();
+            // A place taking any of several is keyed by all of them, whichever is taken: they are the same bytes.
+            let key = |ids: &Vec<String>| match ids.as_slice() {
+                [one] => json!(keys[self.by_id[one]]),
+                many => json!(many.iter().map(|id| &keys[self.by_id[id]]).collect::<Vec<_>>()),
+            };
+            let taken: BTreeMap<&String, Vec<Value>> =
+                op.inputs.iter().map(|(port, places)| (port, places.iter().map(key).collect())).collect();
             let version = match op.kind.split_once('@') {
                 Some((extension, _)) => versions(extension),
                 None => VERSION.to_string(),
@@ -274,6 +328,118 @@ impl Plan {
         }
         keys
     }
+
+    /// A file's key: what makes it, whichever of its candidates does - they make the same bytes.
+    fn file_key(keys: &[String], given: &Given) -> String {
+        match given.candidates.as_slice() {
+            [(at, _)] => keys[*at].clone(),
+            many => sha1_hex(json!(many.iter().map(|(at, _)| &keys[*at]).collect::<Vec<_>>()).to_string().as_bytes()),
+        }
+    }
+
+    /// The releases it reads, in its order.
+    #[must_use]
+    pub fn releases(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
+    /// Choose, of what may be taken, what is made of these releases: each place's first alternative so made, each
+    /// file's first candidate. Whether each operation is made of them: a disc of a release among them, anything else
+    /// of what it takes.
+    fn resolve(&mut self, releases: &std::collections::BTreeSet<String>) -> Vec<bool> {
+        let mut possible = vec![false; self.ops.len()];
+        for at in 0..self.ops.len() {
+            let op = &self.ops[at];
+            possible[at] = if op.kind == "disc" {
+                op.args.get("release").and_then(Value::as_str).is_some_and(|r| releases.contains(r))
+            } else {
+                let mut ok = op.after.iter().all(|id| possible[self.by_id[id]]);
+                let mut takes = BTreeMap::new();
+                for (port, places) in &op.inputs {
+                    let chosen = places
+                        .iter()
+                        .map(|ids| {
+                            let made = ids.iter().find(|id| possible[self.by_id[*id]]);
+                            ok &= made.is_some();
+                            made.unwrap_or(&ids[0]).clone()
+                        })
+                        .collect();
+                    takes.insert(port.clone(), chosen);
+                }
+                self.ops[at].takes = takes;
+                ok
+            };
+        }
+        for emit in &mut self.emits {
+            for given in &mut emit.files {
+                let chosen = given.candidates.iter().find(|(at, _)| possible[*at]).cloned();
+                given.possible = chosen.is_some();
+                if let Some((at, prefix)) = chosen {
+                    given.at = at;
+                    given.prefix = prefix;
+                }
+            }
+        }
+        possible
+    }
+}
+
+/// Which of a plan's releases a run reads: all of them - each disc there, or the run fails by name - those whose discs
+/// are all found, or those named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Releases {
+    All,
+    Available,
+    Only(Vec<String>),
+}
+
+/// A disc a run looks for: its release, its name, size and sha1, and where it is looked for.
+type DiscSought<'a> = (&'a String, &'a (String, u64, String), Option<PathBuf>);
+
+/// The releases a run reads, and where each of their discs is, by its sha1.
+fn found_releases(
+    project: &crate::Project,
+    plan: &Plan,
+    releases: &Releases,
+) -> Result<(std::collections::BTreeSet<String>, HashMap<String, PathBuf>)> {
+    let asked: Vec<&String> = match releases {
+        Releases::Only(names) => {
+            for name in names {
+                anyhow::ensure!(plan.inputs.contains_key(name), "the plan reads no release {name}");
+            }
+            plan.inputs.keys().filter(|r| names.contains(r)).collect()
+        }
+        _ => plan.inputs.keys().collect(),
+    };
+    let discs: Vec<DiscSought<'_>> = asked
+        .iter()
+        .flat_map(|&release| {
+            let look_in = project.resolve(&plan.inputs[release].look_in).ok();
+            plan.inputs[release].discs.iter().map(move |disc| (release, disc, look_in.clone()))
+        })
+        .collect();
+    let found = crate::parallel(&discs, |(_, (name, size, sha1), look_in)| {
+        look_in.as_ref().and_then(|dir| discs::find_disc(dir, name, *size, sha1).ok())
+    });
+    let (mut available, mut paths, mut missing) = (std::collections::BTreeSet::new(), HashMap::new(), Vec::new());
+    for &release in &asked {
+        available.insert(release.clone());
+    }
+    for ((release, (name, _, sha1), look_in), path) in discs.iter().zip(found) {
+        if let Some(path) = path {
+            paths.insert(sha1.clone(), path);
+        } else {
+            available.remove(*release);
+            let place =
+                look_in.as_ref().map_or_else(|| plan.inputs[*release].look_in.clone(), |p| p.display().to_string());
+            missing.push(format!("{release}'s {name} is not in {place}"));
+        }
+    }
+    if *releases != Releases::Available || available.is_empty() {
+        anyhow::ensure!(missing.is_empty(), "{}", missing.join("; "));
+    }
+    anyhow::ensure!(!available.is_empty(), "the plan reads no release");
+    Ok((available, paths))
 }
 
 /// A file a run wrote, as its record keeps it; an optional one not made has no sha1.
@@ -295,11 +461,19 @@ impl Written {
 struct Record {
     files: BTreeMap<(String, String), Written>,
     checks: BTreeMap<String, String>,
+    /// The releases its files are of: none said, all the plan's.
+    releases: Option<std::collections::BTreeSet<String>>,
 }
 
 fn read_record(path: &Path) -> Record {
     let Ok(text) = std::fs::read_to_string(path) else { return Record::default() };
     let mut record = Record::default();
+    let head = text.lines().next().and_then(|line| serde_json::from_str::<Value>(line).ok());
+    record.releases = head
+        .as_ref()
+        .and_then(|h| h.get("releases"))
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).map(str::to_string).collect());
     for line in text.lines().skip(1) {
         let Ok(line) = serde_json::from_str::<Value>(line) else { continue };
         let field = |name: &str| line.get(name).and_then(Value::as_str).map(str::to_string);
@@ -318,7 +492,7 @@ fn read_record(path: &Path) -> Record {
 }
 
 fn write_record(path: &Path, plan: &Plan, record: &Record) -> Result<()> {
-    let mut text = json!({"record": 1, "plan": plan.sha1}).to_string();
+    let mut text = json!({"record": 1, "plan": plan.sha1, "releases": record.releases}).to_string();
     text.push('\n');
     for ((node, file), written) in &record.files {
         let line = json!({"node": node, "file": file, "key": written.key, "sha1": written.sha1, "size": written.size});
@@ -423,9 +597,12 @@ impl crate::graph::exec::Node for Planned {
 /// What a run did.
 #[derive(Debug, Default)]
 pub struct Ran {
-    /// Files written, and kept as they were.
+    /// The releases read.
+    pub releases: Vec<String>,
+    /// Files written, and kept as they were; files of releases not read, left as they are.
     pub written: usize,
     pub kept: usize,
+    pub skipped: usize,
     /// Operations run.
     pub ran: usize,
     /// Files removed, no bundle being given them any more.
@@ -467,7 +644,7 @@ pub struct Disc {
 #[must_use]
 pub fn discs(project: &crate::Project, header: &Header) -> Vec<Disc> {
     let mut out = Vec::new();
-    for (release, input) in &header.inputs {
+    for (release, input) in header.order.iter().filter_map(|r| Some((r, header.inputs.get(r)?))) {
         let look_in = project.resolve(&input.look_in).unwrap_or_else(|_| PathBuf::from(&input.look_in));
         for (name, size, sha1) in &input.discs {
             let found = discs::find_disc(&look_in, name, *size, sha1).ok();
@@ -481,6 +658,116 @@ pub fn discs(project: &crate::Project, header: &Header) -> Vec<Disc> {
         }
     }
     out
+}
+
+/// What an operation read, as `observe` saw it: its bytes' sha1 and size, or why it read nothing.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Observed {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// What `observe` notes as it goes, and where it keeps what was read.
+struct Observing {
+    keep: Option<PathBuf>,
+    /// The operations whose bytes are kept, by kind: all where empty.
+    kinds: Vec<String>,
+    seen: Mutex<Vec<Observed>>,
+}
+
+impl Observing {
+    fn saw(&self, op: &Op, bytes: &[u8]) -> Result<()> {
+        let sha1 = sha1_hex(bytes);
+        if let Some(keep) = self.keep.as_ref().filter(|_| self.kinds.is_empty() || self.kinds.contains(&op.kind)) {
+            let path = keep.join(&sha1);
+            if !path.exists() {
+                std::fs::write(&path, bytes).with_context(|| path.display().to_string())?;
+            }
+        }
+        let seen = Observed { id: op.id.clone(), sha1: Some(sha1), size: Some(bytes.len() as u64), error: None };
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(seen);
+        Ok(())
+    }
+
+    /// An extension's operation made what it makes: what it was given held, its declarations among them.
+    fn made(&self, op: &Op) {
+        let seen = Observed { id: op.id.clone(), sha1: None, size: None, error: None };
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(seen);
+    }
+
+    fn failed(&self, op: &Op, why: &anyhow::Error) {
+        let seen = Observed { id: op.id.clone(), sha1: None, size: None, error: Some(format!("{why:#}")) };
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(seen);
+    }
+}
+
+/// Run every operation of a plan and say what each read: its bytes' sha1 and size - kept in `keep` by sha1, where
+/// given, those of the operations of `kinds` (all where empty) - that an extension's made its files, or why it failed,
+/// an operation failing alone (what takes it is not run). Nothing is written but what is kept:
+/// what a plan would read, surveyed - another release's discs held up to one's declarations. Each release's discs are
+/// looked for where `look_in` says.
+///
+/// # Errors
+/// The plan cannot be read, or what is read cannot be kept.
+pub fn observe(
+    plan_file: &Path,
+    look_in: &dyn Fn(&str) -> Result<PathBuf>,
+    engine: &crate::graph::exec::Engine,
+    extensions: &crate::ext::Extensions,
+    keep: Option<&Path>,
+    kinds: &[String],
+) -> Result<Vec<Observed>> {
+    let plan = Plan::read(plan_file)?;
+    let keys = plan.keys(&|id| extensions.version_of(id));
+    let count = plan.ops.len();
+    let mut waiting: Vec<usize> = vec![0; count];
+    let mut takers: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut uses: Vec<usize> = vec![0; count];
+    for (at, op) in plan.ops.iter().enumerate() {
+        for taken in taken_by(&plan, op) {
+            takers[taken].push(at);
+            waiting[at] += 1;
+            uses[taken] += 1;
+        }
+    }
+    if let Some(keep) = keep {
+        std::fs::create_dir_all(keep).with_context(|| keep.display().to_string())?;
+    }
+    let observing =
+        Observing { keep: keep.map(Path::to_path_buf), kinds: kinds.to_vec(), seen: Mutex::new(Vec::new()) };
+    let progress = Progress::default();
+    let state = RunState {
+        plan: &plan,
+        keys: &keys,
+        inputs: plan.inputs.iter().map(|(r, i)| Ok((r.clone(), look_in(&i.look_in)?))).collect::<Result<_>>()?,
+        layer: Path::new(""),
+        found: HashMap::new(),
+        engine,
+        extensions,
+        checked: vec![false; count],
+        made: Mutex::new(HashMap::new()),
+        waiting: waiting.into_iter().map(std::sync::atomic::AtomicUsize::new).collect(),
+        uses: uses.into_iter().map(std::sync::atomic::AtomicUsize::new).collect(),
+        takers,
+        files_of: vec![Vec::new(); count],
+        written: Mutex::new(Vec::new()),
+        failed: Mutex::new(None),
+        ran: std::sync::atomic::AtomicUsize::new(0),
+        progress: &progress,
+        observing: Some(&observing),
+    };
+    let ready: Vec<usize> =
+        (0..count).filter(|&at| state.waiting[at].load(std::sync::atomic::Ordering::Acquire) == 0).collect();
+    let ahead = |at: &usize| matches!(plan.ops[*at].kind.as_str(), "disc" | "container" | "movie_clips");
+    crate::schedule::worklist(ready, ahead, |at, add| state.run(at, add));
+    let mut seen = observing.seen.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(seen)
 }
 
 /// The path of a bundle's file in the layer.
@@ -499,9 +786,11 @@ fn wanted(
     ran: &mut Ran,
 ) -> Vec<(String, Given)> {
     // What is wanted: each file whose key changed, or which is not there as written - a folder's, any of its files.
+    // One of releases not read is left as it is.
     let mut wanted: Vec<(String, Given)> = Vec::new();
     for emit in &plan.emits {
         for given in &emit.files {
+            let key = Plan::file_key(keys, given);
             let held: Vec<(&(String, String), &Written)> = old
                 .files
                 .iter()
@@ -512,9 +801,15 @@ fn wanted(
                 .collect();
             let as_written = |((node, file), written): &(&(String, String), &Written)| {
                 let there = std::fs::metadata(file_path(layer, node, file)).map(|m| m.len()).ok();
-                written.key == keys[given.at] && there == written.present().then_some(written.size)
+                written.key == key && there == written.present().then_some(written.size)
             };
-            if !held.is_empty() && held.iter().all(as_written) {
+            if !given.possible {
+                // Left as it is: what the last run made of it, if anything.
+                ran.skipped += usize::from(!held.is_empty());
+                for (entry, written) in held {
+                    record.files.insert(entry.clone(), written.clone());
+                }
+            } else if !held.is_empty() && held.iter().all(as_written) {
                 for (entry, written) in held {
                     record.files.insert(entry.clone(), written.clone());
                 }
@@ -562,28 +857,33 @@ fn joined(
 /// # Errors
 /// It is no generated layer of the project, its plan cannot be read, it needs what the extensions lack, a disc is not
 /// there, an operation fails, or what it makes is not what the plan says.
+#[expect(clippy::too_many_lines, reason = "a run, as it goes")]
 pub fn run(
     project: &crate::Project,
     generated: &crate::Layer,
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
     progress: &Progress,
+    releases: &Releases,
 ) -> Result<Ran> {
     let fills = generated.fills.as_deref().with_context(|| format!("{} is no generated layer", generated.name))?;
     let nodes = &project.layer(fills)?.path;
     let layer = generated.path.as_path();
-    let plan = Plan::read(&generated.plan())?;
+    let mut plan = Plan::read(&generated.plan())?;
     let unmet = plan.unmet(extensions);
     anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
+    let (available, found) = found_releases(project, &plan, releases)?;
+    let possible = plan.resolve(&available);
     let old = read_record(&layer.join(RECORD));
     let mut record = Record::default();
-    let mut ran = Ran::default();
+    let in_order = plan.releases().into_iter().filter(|r| available.contains(r)).collect();
+    let mut ran = Ran { releases: in_order, ..Ran::default() };
     let wanted = wanted(&plan, &keys, layer, &old, &mut record, &mut ran);
     // Each check whose key changed; a check of what was written, after everything is.
     let mut checked = vec![false; plan.ops.len()];
     let mut last = Vec::new();
-    for &at in &plan.checks {
+    for &at in plan.checks.iter().filter(|&&at| possible[at]) {
         let id = &plan.ops[at].id;
         if old.checks.get(id) == Some(&keys[at]) {
             record.checks.insert(id.clone(), keys[at].clone());
@@ -629,8 +929,10 @@ pub fn run(
         inputs: plan
             .inputs
             .iter()
+            .filter(|(release, _)| available.contains(*release))
             .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
             .collect::<Result<_>>()?,
+        found,
         layer,
         engine,
         extensions,
@@ -644,6 +946,7 @@ pub fn run(
         failed: Mutex::new(None),
         ran: std::sync::atomic::AtomicUsize::new(0),
         progress,
+        observing: None,
     };
     let ready: Vec<usize> = (0..plan.ops.len())
         .filter(|&at| needed[at] && state.waiting[at].load(std::sync::atomic::Ordering::Acquire) == 0)
@@ -658,6 +961,7 @@ pub fn run(
         ran.written += 1;
     }
     if let Some(why) = failed {
+        record.releases = Some(available.iter().cloned().chain(old.releases.clone().unwrap_or_default()).collect());
         // What was written is kept as made: a run stopped or failed goes on from there next time.
         write_record(&layer.join(RECORD), &plan, &record)?;
         return Err(why);
@@ -666,6 +970,13 @@ pub fn run(
         record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
     }
     joined(&plan, &keys, &last, [nodes, layer], engine, extensions, &mut record, &mut ran)?;
+    // The releases the files are of: those read, and those of what was left as it was.
+    record.releases = Some(if ran.skipped > 0 {
+        let before = old.releases.clone().unwrap_or_else(|| plan.inputs.keys().cloned().collect());
+        available.iter().cloned().chain(before).collect()
+    } else {
+        available.clone()
+    });
     ran.removed = remove_left(layer, &old, &record);
     write_record(&layer.join(RECORD), &plan, &record)?;
     Ok(ran)
@@ -693,8 +1004,9 @@ fn taken_by(plan: &Plan, op: &Op) -> Vec<usize> {
 struct RunState<'a> {
     plan: &'a Plan,
     keys: &'a [String],
-    /// Where each release's discs are looked for.
+    /// Where each release's discs are looked for, and where those found are, by sha1.
     inputs: HashMap<String, PathBuf>,
+    found: HashMap<String, PathBuf>,
     layer: &'a Path,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
@@ -710,11 +1022,13 @@ struct RunState<'a> {
     failed: Mutex<Option<anyhow::Error>>,
     ran: std::sync::atomic::AtomicUsize,
     progress: &'a Progress,
+    /// Observing (`observe`): what each operation read is noted, an operation failing failing alone.
+    observing: Option<&'a Observing>,
 }
 
 impl RunState<'_> {
     fn run(&self, at: usize, add: &dyn Fn(usize)) {
-        if self.failed.lock().is_ok_and(|failed| failed.is_some()) {
+        if self.observing.is_none() && self.failed.lock().is_ok_and(|failed| failed.is_some()) {
             return;
         }
         if self.progress.stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -728,11 +1042,16 @@ impl RunState<'_> {
         let done = (|| -> Result<()> {
             let _span = tracing::info_span!("plan op", of = %op.kind).entered();
             let made = self.make(op).with_context(|| op.id.clone())?;
+            match (self.observing, &made) {
+                (Some(observing), Made::Bytes(bytes)) => observing.saw(op, bytes)?,
+                (Some(observing), Made::Files(_)) => observing.made(op),
+                _ => {}
+            }
             self.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.progress.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for (node, given) in &self.files_of[at] {
                 for (file, bytes) in made.given(given).with_context(|| format!("{node}: {}", given.name))? {
-                    let key = self.keys[at].clone();
+                    let key = Plan::file_key(self.keys, given);
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
                         let _ = std::fs::remove_file(file_path(self.layer, node, &file));
@@ -767,6 +1086,10 @@ impl RunState<'_> {
             Ok(())
         })();
         if let Err(why) = done {
+            if let Some(observing) = self.observing {
+                observing.failed(op, &why);
+                return;
+            }
             self.failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(why);
         }
     }
@@ -878,6 +1201,9 @@ impl RunState<'_> {
                     sha1: field("sha1").context("its image has no sha1")?,
                     slots,
                 };
+                if let Some(path) = self.found.get(&layout.sha1) {
+                    return Ok(Made::Disc(Arc::new(OpenDisc::open_at(path.clone(), &op.id, &layout)?)));
+                }
                 let release = text("release")?;
                 let look_in =
                     self.inputs.get(release).with_context(|| format!("the plan reads no release {release}"))?;
@@ -968,14 +1294,25 @@ fn movie_clips(disc: &OpenDisc, name: &str) -> Result<Vec<(u64, u64)>> {
     Ok(clips)
 }
 
-/// How a layer is, by its plan: none to fill it by; not filled; filled as the plan says now; or not as it says now -
-/// what it needs not there, or what was made by another plan or by other extensions, or gone since.
+/// How a layer is, by its plan: none to fill it by; not filled; filled as the plan says now; filled of some of the
+/// plan's releases only, the others' discs not read (these); or not as it says now - what it needs not there, or what
+/// was made by another plan or by other extensions, or gone since.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     NoPlan,
     Empty,
     Filled,
+    Partial(Vec<String>),
     Stale(Vec<String>),
+}
+
+impl Plan {
+    /// As the record's files are: what makes each chosen of the releases they are of. Those releases.
+    fn as_recorded(&mut self, record: &Record) -> std::collections::BTreeSet<String> {
+        let releases = record.releases.clone().unwrap_or_else(|| self.inputs.keys().cloned().collect());
+        self.resolve(&releases);
+        releases
+    }
 }
 
 /// How a layer is, by its plan and the record of its last run - known without the discs and without reading what was
@@ -987,16 +1324,19 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
     if !plan_file.is_file() {
         return Ok(State::NoPlan);
     }
-    let plan = Plan::read(plan_file)?;
+    let mut plan = Plan::read(plan_file)?;
     let record = read_record(&layer.join(RECORD));
     if record.files.is_empty() && record.checks.is_empty() {
         return Ok(State::Empty);
     }
+    let releases = plan.as_recorded(&record);
+    let possible = plan.resolve(&releases);
     let mut stale: Vec<String> = plan.unmet(extensions).into_iter().map(|unmet| format!("it needs {unmet}")).collect();
     let keys = plan.keys(&|id| extensions.version_of(id));
     let (mut other, mut gone) = (0, 0);
     for emit in &plan.emits {
-        for given in &emit.files {
+        for given in emit.files.iter().filter(|given| given.possible) {
+            let key = Plan::file_key(&keys, given);
             let held: Vec<_> = record
                 .files
                 .iter()
@@ -1009,7 +1349,7 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
                 gone += 1;
             }
             for ((node, file), written) in held {
-                if written.key != keys[given.at] {
+                if written.key != key {
                     other += 1;
                 } else if written.present() && !file_path(layer, node, file).exists() {
                     gone += 1;
@@ -1017,7 +1357,11 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
             }
         }
     }
-    let checks = plan.checks.iter().filter(|&&at| record.checks.get(&plan.ops[at].id) != Some(&keys[at])).count();
+    let checks = plan
+        .checks
+        .iter()
+        .filter(|&&at| possible[at] && record.checks.get(&plan.ops[at].id) != Some(&keys[at]))
+        .count();
     for (count, what) in [
         (other, "files made otherwise than the plan says now"),
         (gone, "files not there"),
@@ -1027,7 +1371,12 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
             stale.push(format!("{count} {what}"));
         }
     }
-    Ok(if stale.is_empty() { State::Filled } else { State::Stale(stale) })
+    let missing: Vec<String> = plan.inputs.keys().filter(|r| !releases.contains(*r)).cloned().collect();
+    Ok(match (stale.is_empty(), missing.is_empty()) {
+        (false, _) => State::Stale(stale),
+        (true, true) => State::Filled,
+        (true, false) => State::Partial(missing),
+    })
 }
 
 /// What a check of a layer against its plan found: files not there, made by another key than the plan's now, changed
@@ -1035,6 +1384,8 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
 #[derive(Debug, Default)]
 pub struct Checked {
     pub files: usize,
+    /// The plan's releases its files are not of: their discs were not read.
+    pub not_read: Vec<String>,
     pub missing: Vec<String>,
     pub stale: Vec<String>,
     pub changed: Vec<String>,
@@ -1054,13 +1405,16 @@ impl Checked {
 /// # Errors
 /// The plan cannot be read.
 pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
-    let plan = Plan::read(plan_file)?;
+    let mut plan = Plan::read(plan_file)?;
     let keys = plan.keys(versions);
     let record = read_record(&layer.join(RECORD));
+    let releases = plan.as_recorded(&record);
+    let possible = plan.resolve(&releases);
     // Each file given, as recorded: a folder's, every file recorded in it - none being one missing.
-    let mut entries: Vec<(String, String, usize, Option<Written>)> = Vec::new();
+    let mut entries: Vec<(String, String, String, Option<Written>)> = Vec::new();
     for emit in &plan.emits {
-        for given in &emit.files {
+        for given in emit.files.iter().filter(|given| given.possible) {
+            let key = Plan::file_key(&keys, given);
             let held: Vec<_> = record
                 .files
                 .iter()
@@ -1068,18 +1422,18 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
                     *node == emit.node
                         && if given.folder() { file.starts_with(&given.name) } else { *file == given.name }
                 })
-                .map(|((node, file), written)| (node.clone(), file.clone(), given.at, Some(written.clone())))
+                .map(|((node, file), written)| (node.clone(), file.clone(), key.clone(), Some(written.clone())))
                 .collect();
             if held.is_empty() {
-                entries.push((emit.node.clone(), given.name.clone(), given.at, None));
+                entries.push((emit.node.clone(), given.name.clone(), key.clone(), None));
             }
             entries.extend(held);
         }
     }
-    let found = crate::parallel(&entries, |(node, file, at, written)| {
+    let found = crate::parallel(&entries, |(node, file, key, written)| {
         let name = format!("{node}: {file}");
         let Some(written) = written else { return Some((0, name)) };
-        if written.key != keys[*at] {
+        if written.key != *key {
             return Some((1, name));
         }
         let path = file_path(layer, node, file);
@@ -1093,12 +1447,13 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
         }
     });
     let mut checked = Checked { files: entries.len(), ..Checked::default() };
-    for &at in &plan.checks {
+    for &at in plan.checks.iter().filter(|&&at| possible[at]) {
         let id = &plan.ops[at].id;
         if record.checks.get(id) != Some(&keys[at]) {
             checked.stale.push(format!("{id} (a check)"));
         }
     }
+    checked.not_read = plan.inputs.keys().filter(|r| !releases.contains(*r)).cloned().collect();
     for (kind, name) in found.into_iter().flatten() {
         match kind {
             0 => checked.missing.push(name),
@@ -1129,6 +1484,66 @@ mod tests {
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Empty);
         let unmet = Plan::parse(plan).unwrap().unmet(&extensions);
         assert!(unmet.len() == 1 && unmet[0].contains("pe2.nothing"), "{unmet:?}");
+        let _ = std::fs::remove_dir_all(&layer);
+        let _ = std::fs::remove_file(&plan_file);
+    }
+
+    #[test]
+    fn what_several_releases_make_alike_is_made_of_any_of_them_and_keyed_by_all() {
+        let disc = |release: &str| {
+            format!(
+                r#"{{"id":"disc:{release}","op":"disc","args":{{"release":"{release}","image":{{"name":"{release}","size":1,"sha1":"{release}"}},"slots":[]}}}}"#
+            )
+        };
+        let text = [
+            r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[{"name":"USA","size":1,"sha1":"USA"}]},"EUR":{"look_in":"res://roms","discs":[{"name":"EUR","size":1,"sha1":"EUR"}]}}}"#.to_string(),
+            disc("USA"),
+            disc("EUR"),
+            r#"{"id":"a:USA","op":"slot","in":{"disc":"disc:USA"},"args":{"name":"A"}}"#.to_string(),
+            r#"{"id":"a:EUR","op":"slot","in":{"disc":"disc:EUR"},"args":{"name":"A"}}"#.to_string(),
+            r#"{"id":"made","op":"inflate","in":{"bytes":{"any":["a:USA","a:EUR"]}}}"#.to_string(),
+            r#"{"emit":"n","files":{"native.bin":["a:USA","a:EUR"],"inflated":"made","EUR/own.bin":"a:EUR"}}"#
+                .to_string(),
+        ]
+        .join("\n");
+        let mut plan = Plan::parse(&text).unwrap();
+        let keys = plan.keys(&|_| String::new());
+        let key = |plan: &Plan, name: &str| {
+            Plan::file_key(&keys, plan.emits[0].files.iter().find(|g| g.name == name).unwrap())
+        };
+        let before = key(&plan, "native.bin");
+        let only = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect::<std::collections::BTreeSet<_>>();
+        // Of Europe's discs alone: Europe's read taken, the file and what takes it made of it, keyed as before.
+        let possible = plan.resolve(&only(&["EUR"]));
+        let made = &plan.ops[plan.by_id["made"]];
+        assert_eq!(made.takes["bytes"], ["a:EUR"]);
+        assert!(possible[plan.by_id["made"]] && !possible[plan.by_id["a:USA"]]);
+        let native = plan.emits[0].files.iter().find(|g| g.name == "native.bin").unwrap();
+        assert_eq!((native.possible, native.at), (true, plan.by_id["a:EUR"]));
+        assert_eq!(key(&plan, "native.bin"), before, "which release makes it is not its key");
+        // A release's own file is the file of its name in what makes it.
+        let own = plan.emits[0].files.iter().find(|g| g.name == "EUR/own.bin").unwrap();
+        assert_eq!(own.prefix.as_deref(), Some("own.bin"));
+        // Of USA's alone: Europe's own file is of a release not read.
+        plan.resolve(&only(&["USA"]));
+        assert!(!plan.emits[0].files.iter().find(|g| g.name == "EUR/own.bin").unwrap().possible);
+        assert_eq!(plan.ops[plan.by_id["made"]].takes["bytes"], ["a:USA"]);
+        // What is recorded of USA alone, every file of it there: filled but for Europe.
+        let layer = std::env::temp_dir().join(format!("pe2-plan-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&layer);
+        std::fs::create_dir_all(layer.join("n.node")).unwrap();
+        let plan_file = layer.with_extension("plan.jsonl");
+        std::fs::write(&plan_file, &text).unwrap();
+        let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
+        for name in ["native.bin", "inflated"] {
+            std::fs::write(layer.join("n.node").join(name), "x").unwrap();
+            let written = super::Written { key: key(&plan, name), sha1: "x".into(), size: 1 };
+            record.files.insert(("n".into(), name.into()), written);
+        }
+        let parsed = Plan::parse(&text).unwrap();
+        super::write_record(&layer.join(super::RECORD), &parsed, &record).unwrap();
+        let extensions = crate::ext::Extensions::load(Vec::new(), true);
+        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
         let _ = std::fs::remove_dir_all(&layer);
         let _ = std::fs::remove_file(&plan_file);
     }

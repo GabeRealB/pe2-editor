@@ -433,6 +433,42 @@ fn an_optional_stored_file_is_none_where_the_node_lacks_it_and_read_once_it_is_t
 }
 
 #[test]
+fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"native.bin\"\n\n[[stack]]\nop = \"output\"\nname = \"source\"\n";
+    let mut engine = Engine::new(ops(), None);
+    let world = Nodes(
+        vec![Bundle::new(stack, &[("native.bin", "shared"), ("EUR/native.bin", "europe's")])],
+        engine.ops.clone(),
+    );
+    let read_for = |engine: &Engine| {
+        let reach = super::exec::Reach { engine, world: &world };
+        let (node, plan) = super::exec::World::node(&world, &toml::Value::String("test/bundle".into())).unwrap();
+        let made = engine.output_in(Some(reach), &plan, node, "source", None, false).unwrap();
+        let Value::Typed(typed) = &*made.value.unwrap() else { panic!("not a file") };
+        typed.files[0].name.clone()
+    };
+    assert_eq!(read_for(&engine), "native.bin", "no config: what the releases share");
+    let config = |release: &str| pe2_ext::data::BuildConfig {
+        name: release.to_lowercase(),
+        release: Some(release.to_string()),
+        target: None,
+        folder: String::new(),
+        known: Vec::new(),
+    };
+    engine.config = Some(config("EUR"));
+    assert_eq!(read_for(&engine), "EUR/native.bin");
+    engine.config = Some(config("USA"));
+    assert_eq!(read_for(&engine), "native.bin", "a release without its own: the shared one");
+    // A node with no file apart does not read the config.
+    let shared_only = Bundle::new(stack, &[("native.bin", "shared")]);
+    let (plan, _) = Plan::of(&toml::from_str(stack).unwrap(), &engine.ops, &[]);
+    let (source, _) = plan.output("source").unwrap();
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let (_, reads) = evaluate(&plan, &engine.ops, &shared_only, &[(source, None)], &Vec::new(), (None, Some(reach)));
+    assert!(reads.config.is_none(), "the config was read");
+}
+
+#[test]
 fn a_kept_output_holds_while_what_it_read_does() {
     let dir = std::env::temp_dir().join(format!("pe2-graph-store-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

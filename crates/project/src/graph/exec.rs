@@ -476,6 +476,28 @@ impl<'a> Call<'a> {
         Ok(Typed { ty, also: names, files: vec![file], settings, ..Typed::default() })
     }
 
+    /// The name a stored file is read by: where the node keeps it apart for releases (`<release>/<name>`, beside
+    /// `<name>`, what the releases share), the one of the config's release where it has one - the config then recorded
+    /// as read - else `name`.
+    #[must_use]
+    pub fn of_release(&self, name: &str) -> String {
+        let node = self.recorder.node;
+        let within = name.trim_end_matches('/');
+        let apart = node.file_names().iter().any(|file| {
+            file.split_once('/').is_some_and(|(release, rest)| {
+                !release.contains('.') && (rest == within || rest.starts_with(&format!("{within}/")))
+            })
+        });
+        if !apart {
+            return name.to_string();
+        }
+        let Some(release) = self.config().and_then(|config| config.release) else { return name.to_string() };
+        let ours = format!("{release}/{name}");
+        let held = node.file_sha1(&ours).is_some()
+            || node.file_names().iter().any(|file| file.starts_with(&format!("{release}/{within}/")));
+        if held { ours } else { name.to_string() }
+    }
+
     /// A stored file or folder of the node, as `stored` gives it; where it has neither, no files - its absence recorded,
     /// so that what was made without it is made again once it is there.
     ///

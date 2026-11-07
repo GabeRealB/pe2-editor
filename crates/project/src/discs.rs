@@ -58,7 +58,14 @@ impl OpenDisc {
     /// # Errors
     /// It is not there, or it holds other files.
     pub fn open(roms: &Path, name: &str, layout: &Layout) -> Result<OpenDisc> {
-        let path = find_disc(roms, &layout.image, layout.size, &layout.sha1)?;
+        Self::open_at(find_disc(roms, &layout.image, layout.size, &layout.sha1)?, name, layout)
+    }
+
+    /// A disc image found already (`find_disc`), held to its layout.
+    ///
+    /// # Errors
+    /// It cannot be read, or its files are not the layout's.
+    pub fn open_at(path: PathBuf, name: &str, layout: &Layout) -> Result<OpenDisc> {
         let image = Image::open(&path)?;
         let mut entries = image.root()?;
         if let Some(d) = entries.iter().find(|e| e.directory) {

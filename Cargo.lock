@@ -1010,6 +1010,7 @@ dependencies = [
  "pe2-ext",
  "png",
  "project",
+ "serde_json",
  "tracing",
 ]
 

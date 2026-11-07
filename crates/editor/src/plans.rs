@@ -90,7 +90,7 @@ impl Plans {
                 let header = project::plan::header(&plan).map_err(|e| format!("{e:#}"));
                 let state = project::plan::state(&plan, &layer.path, &extensions).map_err(|e| format!("{e:#}"));
                 let fills = layer.fills.clone().unwrap_or_default();
-                let filled = matches!(state, Ok(State::Filled | State::NoPlan));
+                let filled = matches!(state, Ok(State::Filled | State::Partial(_) | State::NoPlan));
                 let discs = match &header {
                     Ok(header) if wanted || !filled => Some(project::plan::discs(&project, header)),
                     _ => None,
@@ -114,6 +114,7 @@ impl Plans {
             Some(Ok(State::NoPlan)) => "no plan fills it".into(),
             Some(Ok(State::Empty)) => "empty: its plan has not run".into(),
             Some(Ok(State::Filled)) => "filled, as its plan says".into(),
+            Some(Ok(State::Partial(not))) => format!("filled but for {}: their discs were not read", not.join(", ")),
             Some(Ok(State::Stale(why))) => format!("not as its plan says now: {}", why.join("; ")),
         }
     }

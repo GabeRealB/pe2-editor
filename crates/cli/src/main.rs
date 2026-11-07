@@ -56,6 +56,30 @@ enum Tool {
         #[command(subcommand)]
         command: EditorCommand,
     },
+    /// Extraction plans, apart from any project
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Run every operation of a plan and say, a JSON line each, what it read: its bytes' sha1 and size, or why it read
+    /// nothing. Nothing is written but what is kept: a release's discs surveyed
+    Observe {
+        /// The plan
+        plan: PathBuf,
+        /// Where every release's discs are looked for, whatever the plan says
+        #[arg(long)]
+        roms: PathBuf,
+        /// Keep what each operation read here, by its sha1
+        #[arg(long)]
+        keep: Option<PathBuf>,
+        /// Keep what operations of these kinds read only (`inflate`, `slice`)
+        #[arg(long, value_delimiter = ',')]
+        keep_kinds: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -242,6 +266,10 @@ enum ProjectCommand {
         /// This generated layer alone
         #[arg(long)]
         layer: Option<String>,
+        /// The releases to read: `available` - those whose discs are all found - `all`, failing by name on a disc not
+        /// found, or a list (`USA,EUR`)
+        #[arg(long, default_value = "available")]
+        releases: String,
     },
     /// Build a project's packages for a config
     Build {
@@ -1018,6 +1046,9 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
                     project::plan::State::NoPlan => println!("{name} has no plan ({})", l.plan().display()),
                     project::plan::State::Empty => println!("{name} is empty: its plan has not run"),
                     project::plan::State::Filled => println!("{name} is filled, as its plan says"),
+                    project::plan::State::Partial(not) => {
+                        println!("{name} is filled of some releases: {}'s discs were not read", not.join(", "));
+                    }
                     project::plan::State::Stale(why) => println!("{name} is stale: {}", why.join("; ")),
                 }
             }
@@ -1053,16 +1084,27 @@ fn generated_layers<'p>(p: &'p project::Project, only: Option<&str>) -> Result<V
 }
 
 /// Run a generated layer's plan.
-fn run_plan(p: &project::Project, lock: &project::lock::Lock, layer: &project::Layer) -> Result<()> {
+fn run_plan(
+    p: &project::Project,
+    lock: &project::lock::Lock,
+    layer: &project::Layer,
+    releases: &project::plan::Releases,
+) -> Result<()> {
     let plan = layer.plan();
     anyhow::ensure!(plan.is_file(), "{} has no plan ({}): nothing says what to extract", layer.name, plan.display());
     let extensions = project_extensions(p);
     let cache = project::cache::Cache::open(p, lock)?;
     let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
-    let ran = project::plan::run(p, layer, &engine, &extensions, &project::plan::Progress::default())?;
+    let ran = project::plan::run(p, layer, &engine, &extensions, &project::plan::Progress::default(), releases)?;
     println!(
-        "{}: {} files written and {} kept as they were ({} operations run), {} removed",
-        layer.name, ran.written, ran.kept, ran.ran, ran.removed
+        "{} ({}): {} files written and {} kept as they were ({} operations run), {} removed, {} of releases not read left",
+        layer.name,
+        ran.releases.join(", "),
+        ran.written,
+        ran.kept,
+        ran.ran,
+        ran.removed,
+        ran.skipped
     );
     Ok(())
 }
@@ -1096,6 +1138,13 @@ fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
             checked.stale.len(),
             checked.changed.len()
         );
+        if !checked.not_read.is_empty() {
+            println!(
+                "{}: {}'s discs were not read: what only they make is not there",
+                layer.name,
+                checked.not_read.join(", ")
+            );
+        }
         whole &= checked.whole();
     }
     if !whole {
@@ -1117,6 +1166,20 @@ fn run(cli: Cli) -> Result<()> {
         eprintln!("warning: trusting every extension in this run");
     }
     match cli.tool {
+        Tool::Plan { command: PlanCommand::Observe { plan, roms, keep, keep_kinds } } => {
+            let extensions = extensions::shared();
+            let engine = extensions.engine();
+            let seen = project::plan::observe(
+                &plan,
+                &|_| Ok(roms.clone()),
+                &engine,
+                &extensions,
+                keep.as_deref(),
+                &keep_kinds,
+            )?;
+            let lines: Vec<String> = seen.iter().map(serde_json::to_string).collect::<Result<_, _>>()?;
+            println!("{}", lines.join("\n"));
+        }
         Tool::Convert { command: ConvertCommand::Bs { input, output } } => bs_to_png(&input, &output)?,
         Tool::Convert { command: ConvertCommand::Texture { input, output, bpp, palette, row, column } } => {
             texture_to_png(&input, &output, bpp, palette.as_deref().map(|p| (p, row, column)))?;
@@ -1154,7 +1217,12 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
             signal(&project, config.as_deref(), &[event.as_str()])?;
         }
-        Tool::Project { command: ProjectCommand::Extract { project, layer } } => {
+        Tool::Project { command: ProjectCommand::Extract { project, layer, releases } } => {
+            let releases = match releases.as_str() {
+                "available" => project::plan::Releases::Available,
+                "all" => project::plan::Releases::All,
+                list => project::plan::Releases::Only(list.split(',').map(|r| r.trim().to_string()).collect()),
+            };
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
@@ -1163,7 +1231,7 @@ fn run(cli: Cli) -> Result<()> {
                 eprintln!("warning: {why}");
             }
             for layer in generated_layers(&p, layer.as_deref())? {
-                run_plan(&p, &lock, layer)?;
+                run_plan(&p, &lock, layer, &releases)?;
             }
             // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted:
             // indexed only then.

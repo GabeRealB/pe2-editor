@@ -447,8 +447,8 @@ impl Editor {
     /// Bring in what changed on disk; read the project again when its `project.toml` changed, keeping what is showing.
     fn follow_disk(&mut self, ctx: &egui::Context) {
         let Some(ws) = &mut self.workspace else { return };
-        // The config in use, as what events set off reads it.
-        ws.config = active_config(&self.settings, &ws.project);
+        // The config in use, as what events set off reads it, and what is made reads it.
+        ws.set_config(active_config(&self.settings, &ws.project));
         ws.watch(ctx);
         ws.answer_agents();
         let focused = ctx.input(|i| i.focused);
@@ -1196,7 +1196,7 @@ impl Editor {
         if let Some(name) = chosen {
             self.settings.active_configs.insert(root, name);
             if let Some(ws) = &mut self.workspace {
-                ws.config = active_config(&self.settings, &ws.project);
+                ws.set_config(active_config(&self.settings, &ws.project));
             }
             self.signal(ConfigChanged::NAME);
         }
