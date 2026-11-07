@@ -43,17 +43,37 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
     write(&project.root, &document, history, label)
 }
 
-/// Add an extension to the project, or update the one it holds of its id: its folder copied into `extensions/` of the
-/// project's highest layer that is written, whole, in place of what was there, and required at the versions of its
-/// line (`^0.1`). What it is is checked first, as loading checks it.
+/// Add an extension to the project, or update the one it holds of its id: its folder copied into `extensions/` of a
+/// layer, whole, in place of what was there, and required at the versions of its line (`^0.1`). The layer is the one
+/// named (`into`), else the one holding it already, else the project's highest that is written. What it is is checked
+/// first, as loading checks it.
 ///
 /// # Errors
-/// It is no extension's folder, the project has no layer to hold it, or it cannot be copied or `project.toml` written.
-pub fn add_extension(project: &Project, from: &Path, history: &mut History, label: String) -> Result<About> {
+/// It is no extension's folder, the project has no such layer or none to hold it, or it cannot be copied or
+/// `project.toml` written.
+pub fn add_extension(
+    project: &Project,
+    from: &Path,
+    into: Option<&str>,
+    history: &mut History,
+    label: String,
+) -> Result<About> {
     let component = from.join(EXTENSION_COMPONENT);
     let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
     let about = folder::checked(from, &bytes).with_context(|| from.display().to_string())?;
-    let layer = project.extensions_layer().context("the project has no layer it writes to hold it")?;
+    let name = format!("{}{}", about.id, folder::SUFFIX);
+    let holding = || project.layers.iter().rev().find(|l| !l.mounted && l.path.join(folder::HELD).join(&name).is_dir());
+    let layer = match into {
+        Some(into) => project.layer(into)?,
+        None => {
+            holding().or_else(|| project.extensions_layer()).context("the project has no layer it writes to hold it")?
+        }
+    };
+    anyhow::ensure!(
+        !layer.mounted && !layer.read_only && layer.kind == crate::LayerKind::Assets,
+        "{} cannot hold extensions: the project does not write it",
+        layer.name
+    );
     let to = layer.path.join(folder::HELD).join(format!("{}{}", about.id, folder::SUFFIX));
     if same(from, &to) {
         bail!("{}: the project holds it there already", from.display());
@@ -197,8 +217,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pe2-switches-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let text =
-            "# the project\n[game]\nlayer = \"game\"\ndeclarations = \"res://d\"\n\n[[layer]]\nname = \"game\"\n";
+        let text = "# the project\n[[layer]]\nname = \"game\"\n";
         std::fs::write(root.join("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
@@ -247,7 +266,7 @@ mod tests {
         let source = root.join("kept/my.tool.extension");
         kept(&source, "my.tool");
         // Its component carries no manifest: nothing is copied, nothing required.
-        let refused = add_extension(&project, &source, &mut history, "add".into()).unwrap_err();
+        let refused = add_extension(&project, &source, None, &mut history, "add".into()).unwrap_err();
         assert!(format!("{refused:#}").contains("carries no manifest"), "{refused:#}");
         assert!(!root.join(".layers/base/extensions").exists());
         assert_eq!(Project::load(&root).unwrap().requires, []);

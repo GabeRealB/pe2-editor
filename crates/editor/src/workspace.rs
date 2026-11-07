@@ -204,6 +204,8 @@ pub struct Workspace {
     pub watch_error: Option<String>,
     /// The watcher being started, off the window's thread.
     watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
+    /// The generated layers as their plans say they are.
+    pub plans: crate::plans::Plans,
     /// The agents' link, started with the watcher; their requests, answered between frames.
     /// Agents' link, listening while it is kept: it stops with the workspace.
     _link: Option<mcp::link::Listener>,
@@ -709,6 +711,7 @@ impl Workspace {
             cache_dir,
             watch: None,
             watch_starting: None,
+            plans: crate::plans::Plans::default(),
             watch_error: None,
             _link: link,
             requests: Some(requests),
@@ -759,6 +762,7 @@ impl Workspace {
         }
         self.takein.wake(ctx);
         self.runner.wake(ctx);
+        self.plans.update(&self.project, &self.extensions, ctx);
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
         }
@@ -786,7 +790,9 @@ impl Workspace {
             self.project.layers.iter().filter_map(|l| l.changeset.parent().map(Path::to_path_buf)).collect();
         shallow.push(root.clone());
         shallow.dedup();
-        let ignore = vec![self.cache_dir.clone(), root.join("roms"), root.join("build")];
+        // Not the project's: its cache, what its builds write, and what is mounted unmanaged (the discs).
+        let mut ignore = vec![self.cache_dir.clone(), root.join("build")];
+        ignore.extend(self.project.unmanaged.iter().map(|m| m.path.clone()));
         // Reading every folder of a project to watch it takes more than a frame has.
         let (ctx, (started, starting)) = (ctx.clone(), mpsc::channel());
         let start = move || {
@@ -1256,6 +1262,7 @@ impl Workspace {
         }
         self.runner.restart(project.clone(), extensions.clone());
         self.project = project;
+        self.plans.again();
         self.extensions_found = found;
         self.outcome = Update::Reloaded(why);
         // What came of it is what was showing: it goes on.
@@ -1341,7 +1348,7 @@ impl Workspace {
 
     // --- the layers ---------------------------------------------------------------------------------------------------
 
-    /// A layer is locked by nature where only its maker writes it - the game layer, a read-only tree - or by hand.
+    /// A layer is locked by nature where only its maker writes it - a generated layer, a read-only tree - or by hand.
     pub fn locked_by_nature(layer: &LayerInfo) -> bool {
         layer.read_only || (!layer.mounted && !layer.writable)
     }
@@ -1705,7 +1712,7 @@ impl Workspace {
     /// Take a layer out of the stack; its files stay on disk.
     ///
     /// # Errors
-    /// Another layer needs it, it is the game layer or a mount, or `project.toml` cannot be rewritten.
+    /// Another layer needs it, a generated layer fills it, it is a mount, or `project.toml` cannot be rewritten.
     pub fn remove_layer(&mut self, name: &str) -> Result<()> {
         project::stack::remove(&self.project, &self.layers, name, &mut self.history)
     }

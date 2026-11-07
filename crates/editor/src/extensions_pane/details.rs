@@ -575,10 +575,10 @@ fn adding_ui(
             // An archive is unpacked first, and copied in as its folder.
             let added = if extensions::archive::is_archive(folder) {
                 extensions::archive::unpack(folder).and_then(|unpacked| {
-                    project::switches::add_extension(&ws.project, &unpacked.folder, &mut ws.history, to)
+                    project::switches::add_extension(&ws.project, &unpacked.folder, None, &mut ws.history, to)
                 })
             } else {
-                project::switches::add_extension(&ws.project, folder, &mut ws.history, to)
+                project::switches::add_extension(&ws.project, folder, None, &mut ws.history, to)
             };
             change = Some((verb, added.map(|about| about.described.install.is_some())));
         }

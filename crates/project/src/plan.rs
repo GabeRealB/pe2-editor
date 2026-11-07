@@ -1,7 +1,10 @@
-//! An extraction plan, run: what fills a layer's bundles with the files the game's discs hold.
+//! An extraction plan, run: what fills a generated layer with the files the game's discs hold for the nodes of the
+//! layer it fills.
 //!
-//! A plan is `extraction.plan.jsonl` in the layer it fills - one line each, JSON: first what it is
-//! (`{"plan": 1, "layer": ..., "releases": [...]}`), then its operations (`{"id", "op", "in", "args", "expect"}`), each
+//! A plan is `<layer>.plan.jsonl` beside the generated layer's folder - one line each, JSON: first what it is and what
+//! it needs (`{"plan": 1, "requires": [...], "inputs": {<release>: {"look_in": "res://roms", "discs": [...]}}}`: the
+//! extensions its operations are of, and each release's discs by name, size and sha1, looked for in a place of the
+//! project, an unmanaged mount), then its operations (`{"id", "op", "in", "args", "expect"}`), each
 //! taking what operations before it made by their ids, then what each bundle is given (`{"emit": <node>, "files":
 //! {<name>: <id>}}`). It holds where things are on the discs, how large, their sha1s and what reads them - never their
 //! bytes - so it travels with a project, stating what extraction makes of the discs.
@@ -9,7 +12,7 @@
 //! An operation is known by its key: a hash of what it is, its version and its settings, and the keys of what it takes,
 //! the discs' own sha1s at the root - all known without the discs. Running a plan makes only the bundles' files whose
 //! key changed since the last run or which are gone, each operation they need once, at once where threads are free; it
-//! keeps a record beside the plan (`extraction.record.jsonl`: each file written, by its key and sha1), removes the files
+//! keeps a record in the layer (`extraction.record.jsonl`: each file written, by its key and sha1), removes the files
 //! no bundle is given any more, and writes no `node.toml` - the nodes are whoever wrote the plan's. With the record, a
 //! layer is checked without the discs (`verify`): every file there, made by what the plan says now, unchanged.
 //!
@@ -31,8 +34,15 @@ use std::sync::{Arc, Mutex};
 use crate::discs::{self, Container, OpenDisc};
 use crate::extract::sha1_hex;
 
-pub const PLAN: &str = "extraction.plan.jsonl";
 pub const RECORD: &str = "extraction.record.jsonl";
+
+/// A release a plan reads: where its discs are looked for (`res://`), and each disc's image, by name, size and sha1 -
+/// the sha1 deciding, the name where it is looked for first.
+#[derive(Clone, Debug)]
+pub struct Input {
+    pub look_in: String,
+    pub discs: Vec<(String, u64, String)>,
+}
 /// The host's operations' version: another makes everything again.
 const VERSION: &str = "1";
 
@@ -75,8 +85,8 @@ impl Given {
 
 /// A plan, read.
 pub struct Plan {
-    pub layer: String,
-    pub releases: Vec<String>,
+    /// What it reads, by release.
+    pub inputs: BTreeMap<String, Input>,
     /// The extensions its operations are theirs, by id, and the versions it takes of each (`^0.1`).
     pub requires: Vec<(String, String)>,
     ops: Vec<Op>,
@@ -86,6 +96,56 @@ pub struct Plan {
     by_id: HashMap<String, usize>,
     /// The plan's text's sha1: what its record was made by.
     pub sha1: String,
+}
+
+/// What a plan is and needs, its first line: read alone where the rest is not wanted (`header`).
+#[derive(Clone, Debug, Default)]
+pub struct Header {
+    /// What it reads, by release.
+    pub inputs: BTreeMap<String, Input>,
+    /// The extensions its operations are theirs, by id, and the versions it takes of each (`^0.1`).
+    pub requires: Vec<(String, String)>,
+}
+
+impl Header {
+    fn parse(line: &str) -> Result<Header> {
+        let head: Value = serde_json::from_str(line).context("its first line")?;
+        anyhow::ensure!(head.get("plan").and_then(Value::as_u64) == Some(1), "not a plan this reads (`plan`: 1)");
+        let mut inputs = BTreeMap::new();
+        for (release, input) in head.get("inputs").and_then(Value::as_object).into_iter().flatten() {
+            let look_in =
+                input.get("look_in").and_then(Value::as_str).with_context(|| format!("{release}: no look_in"))?;
+            let discs = input.get("discs").and_then(Value::as_array).into_iter().flatten();
+            let discs = discs
+                .map(|d| {
+                    let text = |key: &str| d.get(key).and_then(Value::as_str).map(str::to_string);
+                    let disc = (|| Some((text("name")?, d.get("size").and_then(Value::as_u64)?, text("sha1")?)))();
+                    disc.with_context(|| format!("{release}: a disc said in part"))
+                })
+                .collect::<Result<_>>()?;
+            inputs.insert(release.clone(), Input { look_in: look_in.to_string(), discs });
+        }
+        let requires = head
+            .get("requires")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| Some((r.get("id")?.as_str()?.to_string(), r.get("version")?.as_str()?.to_string())))
+            .collect();
+        Ok(Header { inputs, requires })
+    }
+}
+
+/// A plan's first line alone: what it reads and needs, without its operations.
+///
+/// # Errors
+/// The file cannot be read, or its first line is no plan's.
+pub fn header(plan: &Path) -> Result<Header> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(plan).with_context(|| plan.display().to_string())?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).with_context(|| plan.display().to_string())?;
+    Header::parse(&line).with_context(|| plan.display().to_string())
 }
 
 impl Plan {
@@ -101,20 +161,7 @@ impl Plan {
     fn parse(text: &str) -> Result<Plan> {
         let mut lines = text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty());
         let (_, head) = lines.next().context("an empty plan")?;
-        let head: Value = serde_json::from_str(head).context("its first line")?;
-        anyhow::ensure!(head.get("plan").and_then(Value::as_u64) == Some(1), "not a plan this reads (`plan`: 1)");
-        let layer = head.get("layer").and_then(Value::as_str).context("it names no layer")?.to_string();
-        let releases = head
-            .get("releases")
-            .and_then(Value::as_array)
-            .map_or_else(Vec::new, |r| r.iter().filter_map(Value::as_str).map(str::to_string).collect());
-        let requires = head
-            .get("requires")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|r| Some((r.get("id")?.as_str()?.to_string(), r.get("version")?.as_str()?.to_string())))
-            .collect();
+        let Header { inputs, requires } = Header::parse(head)?;
         let (mut ops, mut emits, mut checks, mut by_id) = (Vec::new(), Vec::new(), Vec::new(), HashMap::new());
         for (at, line) in lines {
             let at = at + 1;
@@ -187,7 +234,7 @@ impl Plan {
             by_id.insert(id.clone(), ops.len());
             ops.push(Op { id, kind: op, takes, after, args, sha1 });
         }
-        Ok(Plan { layer, releases, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
+        Ok(Plan { inputs, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
     }
 
     /// What it requires that the extensions do not have: each extension missing - not there, left off or not trusted -
@@ -435,7 +482,7 @@ fn joined(
     plan: &Plan,
     keys: &[String],
     last: &[usize],
-    layer: &Path,
+    layers: [&Path; 2],
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
     record: &mut Record,
@@ -445,7 +492,7 @@ fn joined(
         let op = &plan.ops[at];
         let node = op.args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
         let want = op.sha1.as_deref().with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
-        let got = crate::extract::assembled_sha1(layer, node, engine, extensions).with_context(|| op.id.clone())?;
+        let got = crate::extract::assembled_sha1(layers, node, engine, extensions).with_context(|| op.id.clone())?;
         anyhow::ensure!(got == want, "{}: what it joins has sha1 {got}, where the plan says {want}", op.id);
         Ok(at)
     });
@@ -457,18 +504,23 @@ fn joined(
     Ok(())
 }
 
-/// Run a layer's plan: make what changed or is gone, reading the discs in `roms`, running extensions' operations with
+/// Run a generated layer's plan (`Layer::plan`), filling the layer: make what changed or is gone, its discs looked for
+/// where each release's input says (`look_in`, a `res://` path of the project), running extensions' operations with
 /// `engine`, each kept by its extension's version.
 ///
 /// # Errors
-/// The plan cannot be read, a disc is not there, an operation fails, or what it makes is not what the plan says.
+/// It is no generated layer of the project, its plan cannot be read, it needs what the extensions lack, a disc is not
+/// there, an operation fails, or what it makes is not what the plan says.
 pub fn run(
-    layer: &Path,
-    roms: &Path,
+    project: &crate::Project,
+    generated: &crate::Layer,
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
 ) -> Result<Ran> {
-    let plan = Plan::read(&layer.join(PLAN))?;
+    let fills = generated.fills.as_deref().with_context(|| format!("{} is no generated layer", generated.name))?;
+    let nodes = &project.layer(fills)?.path;
+    let layer = generated.path.as_path();
+    let plan = Plan::read(&generated.plan())?;
     let unmet = plan.unmet(extensions);
     anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
@@ -521,7 +573,11 @@ pub fn run(
     let state = RunState {
         plan: &plan,
         keys: &keys,
-        roms,
+        inputs: plan
+            .inputs
+            .iter()
+            .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
+            .collect::<Result<_>>()?,
         layer,
         engine,
         extensions,
@@ -552,7 +608,7 @@ pub fn run(
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
         record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
     }
-    joined(&plan, &keys, &last, layer, engine, extensions, &mut record, &mut ran)?;
+    joined(&plan, &keys, &last, [nodes, layer], engine, extensions, &mut record, &mut ran)?;
     // What no bundle is given any more goes.
     for (node, file) in old.files.keys().filter(|entry| !record.files.contains_key(*entry)) {
         let path = file_path(layer, node, file);
@@ -580,7 +636,8 @@ fn taken_by(plan: &Plan, op: &Op) -> Vec<usize> {
 struct RunState<'a> {
     plan: &'a Plan,
     keys: &'a [String],
-    roms: &'a Path,
+    /// Where each release's discs are looked for.
+    inputs: HashMap<String, PathBuf>,
     layer: &'a Path,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
@@ -754,7 +811,10 @@ impl RunState<'_> {
                     sha1: field("sha1").context("its image has no sha1")?,
                     slots,
                 };
-                return Ok(Made::Disc(Arc::new(OpenDisc::open(self.roms, &op.id, &layout)?)));
+                let release = text("release")?;
+                let look_in =
+                    self.inputs.get(release).with_context(|| format!("the plan reads no release {release}"))?;
+                return Ok(Made::Disc(Arc::new(OpenDisc::open(look_in, &op.id, &layout)?)));
             }
             "slot" => self.disc(op)?.slot(text("name")?)?,
             "container" => {
@@ -843,7 +903,7 @@ fn movie_clips(disc: &OpenDisc, name: &str) -> Result<Vec<(u64, u64)>> {
 
 /// How a layer is, by its plan: none to fill it by; not filled; filled as the plan says now; or not as it says now -
 /// what it needs not there, or what was made by another plan or by other extensions, or gone since.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     NoPlan,
     Empty,
@@ -856,11 +916,11 @@ pub enum State {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn state(layer: &Path, extensions: &crate::ext::Extensions) -> Result<State> {
-    if !layer.join(PLAN).is_file() {
+pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions) -> Result<State> {
+    if !plan_file.is_file() {
         return Ok(State::NoPlan);
     }
-    let plan = Plan::read(&layer.join(PLAN))?;
+    let plan = Plan::read(plan_file)?;
     let record = read_record(&layer.join(RECORD));
     if record.files.is_empty() && record.checks.is_empty() {
         return Ok(State::Empty);
@@ -926,8 +986,8 @@ impl Checked {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn verify(layer: &Path, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
-    let plan = Plan::read(&layer.join(PLAN))?;
+pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
+    let plan = Plan::read(plan_file)?;
     let keys = plan.keys(versions);
     let record = read_record(&layer.join(RECORD));
     // Each file given, as recorded: a folder's, every file recorded in it - none being one missing.
@@ -992,21 +1052,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layer);
         std::fs::create_dir_all(&layer).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
-        assert_eq!(super::state(&layer, &extensions).unwrap(), super::State::NoPlan);
-        let plan = r#"{"plan":1,"layer":"game","releases":["USA"],"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
+        let plan_file = layer.with_extension("plan.jsonl");
+        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::NoPlan);
+        let plan = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[]}},"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
 {"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
 {"emit":"n/m","files":{"native.bin":"a"}}
 "#;
-        std::fs::write(layer.join(super::PLAN), plan).unwrap();
-        assert_eq!(super::state(&layer, &extensions).unwrap(), super::State::Empty);
+        std::fs::write(&plan_file, plan).unwrap();
+        assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Empty);
         let unmet = Plan::parse(plan).unwrap().unmet(&extensions);
         assert!(unmet.len() == 1 && unmet[0].contains("pe2.nothing"), "{unmet:?}");
         let _ = std::fs::remove_dir_all(&layer);
+        let _ = std::fs::remove_file(&plan_file);
     }
 
     #[test]
     fn a_plan_reads_its_operations_in_order_and_keys_them_by_what_they_take() {
-        let text = r#"{"plan":1,"layer":"game","releases":["USA"]}
+        let text = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[{"name":"x","size":1,"sha1":"00"}]}}}
 {"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
 {"id":"b","op":"slot","in":{"disc":"a"},"args":{"name":"S"},"expect":{"sha1":"11"}}
 {"emit":"n/m","files":{"native.bin":"b"}}

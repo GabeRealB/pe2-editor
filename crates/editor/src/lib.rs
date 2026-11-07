@@ -45,6 +45,7 @@ mod onboarding;
 mod panes;
 mod perf;
 mod pictures;
+mod plans;
 mod player;
 mod pointer_gate;
 mod runner;

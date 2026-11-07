@@ -382,10 +382,12 @@ fn project(view: &View) -> Value {
             let holds = match info.kind {
                 project::LayerKind::Assets => "assets",
                 project::LayerKind::Files => "files",
+                project::LayerKind::Generated => "generated",
             };
             json!({
                 "name": info.name,
                 "kind": holds,
+                "fills": info.fills,
                 "mounted_at": (!info.at.is_empty()).then_some(&info.at),
                 "path": path.display().to_string(),
                 "read_only": info.read_only,

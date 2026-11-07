@@ -232,27 +232,34 @@ pub(crate) fn with_stack(toml: &str, stack: &str) -> String {
 struct Written {
     path: String,
     uid: String,
-    dir: PathBuf,
+    /// The bundle's folder in the layer of its node, and in the layer of its files.
+    dirs: [PathBuf; 2],
     declaration: String,
     fields: toml::Table,
     sha1s: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Written {
-    fn open(layer: &Path, path: &str, uid: &str) -> Result<Written> {
-        let dir = layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX));
+    fn open(layers: [&Path; 2], path: &str, uid: &str) -> Result<Written> {
+        let dirs = layers.map(|layer| layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX)));
         let declaration =
-            fs::read_to_string(dir.join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
+            fs::read_to_string(dirs[0].join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
         let fields =
             crate::graph::with_settings(declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
         Ok(Written {
             path: path.to_string(),
             uid: uid.to_string(),
-            dir,
+            dirs,
             declaration,
             fields,
             sha1s: std::sync::Mutex::default(),
         })
+    }
+
+    /// A file's place: in the layer of its files, else beside the node.
+    fn at(&self, name: &str) -> PathBuf {
+        let filled = self.dirs[1].join(name);
+        if filled.exists() { filled } else { self.dirs[0].join(name) }
     }
 }
 
@@ -278,28 +285,31 @@ impl crate::graph::exec::Node for Written {
         if let Some(sha1) = sha1s.get(name) {
             return Some(sha1.clone());
         }
-        let sha1 = sha1_file(&self.dir.join(name)).ok()?;
+        let sha1 = sha1_file(&self.at(name)).ok()?;
         sha1s.insert(name.to_string(), sha1.clone());
         Some(sha1)
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {
-        let path = self.dir.join(name);
+        let path = self.at(name);
         fs::read(&path).with_context(|| path.display().to_string())
     }
 
     fn file_names(&self) -> Vec<String> {
-        crate::index::bundle_files(&self.dir).into_keys().collect()
+        let mut names: Vec<String> = self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).into_keys()).collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn file_size(&self, name: &str) -> Option<u64> {
-        fs::metadata(self.dir.join(name)).ok().map(|m| m.len())
+        fs::metadata(self.at(name)).ok().map(|m| m.len())
     }
 
     fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
         use std::io::Read;
         let mut head = Vec::new();
-        if let Ok(file) = fs::File::open(self.dir.join(name)) {
+        if let Ok(file) = fs::File::open(self.at(name)) {
             let _ = file.take(len as u64).read_to_end(&mut head);
         }
         head
@@ -307,13 +317,14 @@ impl crate::graph::exec::Node for Written {
 
     fn content_path(&self, sha1: &str) -> Option<PathBuf> {
         let sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        sha1s.iter().find(|(_, s)| *s == sha1).map(|(name, _)| self.dir.join(name))
+        sha1s.iter().find(|(_, s)| *s == sha1).map(|(name, _)| self.at(name))
     }
 }
 
 /// The layer's bundles as the work graph reaches them, by uid or path: each read from disk when first asked for.
 struct Layer<'a> {
-    root: &'a Path,
+    /// The layer of the nodes, and the layer of their files.
+    roots: [&'a Path; 2],
     extensions: &'a Extensions,
     uids: HashMap<String, String>,
     /// By path: its uid, and the node once read.
@@ -324,14 +335,14 @@ struct Layer<'a> {
 impl<'a> Layer<'a> {
     /// The layer's nodes, each by its path and uid.
     fn of(
-        root: &'a Path,
+        roots: [&'a Path; 2],
         all: Vec<(String, String)>,
         ops: &'a crate::graph::Ops,
         extensions: &'a Extensions,
     ) -> Layer<'a> {
         let uids = all.iter().map(|(path, uid)| (uid.clone(), path.clone())).collect();
         let nodes = all.into_iter().map(|(path, uid)| (path, (uid, std::sync::OnceLock::new()))).collect();
-        Layer { root, extensions, uids, nodes, ops }
+        Layer { roots, extensions, uids, nodes, ops }
     }
 }
 
@@ -342,7 +353,7 @@ impl crate::graph::exec::World for Layer<'_> {
             None => self.uids.get(crate::index::reference(reference)?.0.as_str())?.as_str(),
         };
         let (path, (uid, slot)) = self.nodes.get_key_value(path)?;
-        let node = slot.get_or_init(|| Written::open(self.root, path, uid).ok()).as_ref()?;
+        let node = slot.get_or_init(|| Written::open(self.roots, path, uid).ok()).as_ref()?;
         // Planned as the project plans it: its stack, then what its type offers beyond it (its settings among them).
         let tail = self.extensions.tail_of_shape(&std::sync::Arc::from(crate::graph::shape(&node.fields)));
         let (plan, _) = crate::graph::Plan::of(&node.fields, self.ops, &tail);
@@ -353,24 +364,25 @@ impl crate::graph::exec::World for Layer<'_> {
 /// Make each container assembled from its movies (a disc's movie file: its stages' movies with sound, in order) by its
 /// stack, as the project will - those movies, as written, joined - holding it to the disc's file, and keeping
 /// it in the store. Returns how many were made.
-/// What a container assembled from its movies is, joined by its stack from the layer as written: its file's sha1. The
-/// layer's nodes are its changeset's (`<layer>.toml`).
+/// What a container assembled from its movies is, joined by its stack from the layers as written: its file's sha1. The
+/// nodes are the first layer's, by its changeset (`<layer>.toml`), their files the second's (the generated layer
+/// filling it) or, where it has none of a name, the first's.
 ///
 /// # Errors
 /// The changeset cannot be read, the node is not there, or its stack cannot join what it joins.
 pub(crate) fn assembled_sha1(
-    layer: &Path,
+    layers: [&Path; 2],
     node: &str,
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
 ) -> Result<String> {
-    let changeset = Changeset::load(&layer.with_extension("toml"))?;
+    let changeset = Changeset::load(&layers[0].with_extension("toml"))?;
     let all = changeset
         .entries
         .iter()
         .filter_map(|(uid, at)| Some((at.strip_suffix(crate::index::BUNDLE_SUFFIX)?.to_string(), uid.clone())))
         .collect();
-    let world = Layer::of(layer, all, &engine.ops, extensions);
+    let world = Layer::of(layers, all, &engine.ops, extensions);
     joined_sha1(&world, node, engine)
 }
 

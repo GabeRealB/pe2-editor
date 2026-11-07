@@ -23,8 +23,8 @@ const EDITOR_STARTING: Duration = Duration::from_secs(10);
 /// How long a request waits for another brief holder of the project (another agent's request) to let go.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-const INSTRUCTIONS: &str = "A Parasite Eve II project: its assets are bundles in layers stacked bottom to top (the game \
-layer extracted from the discs at the bottom, read-only), resolved into one tree by path, each asset with a uid \
+const INSTRUCTIONS: &str = "A Parasite Eve II project: its assets are bundles in layers stacked bottom to top (the game's \
+nodes at the bottom, read-only, their files in a generated layer its plan fills from the discs), resolved into one tree by path, each asset with a uid \
 (uid://...) that references name it by. Find assets with find_assets or list_folder, read one with get_asset (its \
 declaration is its node.toml), follow references both ways with references, see images with preview. The project \
 is read-only here. Where the editor has the project open, its window is served too: editor_ui reads its widgets (ids \

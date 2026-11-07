@@ -28,7 +28,7 @@ enum Tool {
         #[command(subcommand)]
         command: ConvertCommand,
     },
-    /// Projects: their game layer, extracted from the discs
+    /// Projects: made, set up, and their generated layers filled by their plans
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -174,20 +174,13 @@ enum LayerCommand {
         /// Below every other layer, as one the rest build on (the game's)
         #[arg(long)]
         bottom: bool,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-enum ReleaseCommand {
-    /// Add a release, its discs known by their images: each named as its file, its size and sha1 read off it
-    Add {
-        name: String,
-        /// The discs' images, in disc order
-        #[arg(required = true)]
-        images: Vec<PathBuf>,
+        /// A generated layer, filled by its plan (`.layers/<name>.plan.jsonl`, written beside it by whoever makes it)
+        /// with the files of the nodes of the layer it fills
+        #[arg(long, requires = "fills", conflicts_with_all = ["files", "bottom"])]
+        generated: bool,
+        /// The layer a generated layer fills
+        #[arg(long, requires = "generated")]
+        fills: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -196,14 +189,27 @@ enum ReleaseCommand {
 
 #[derive(Subcommand)]
 enum MountCommand {
-    /// Mount a tree at a name: a files layer at the bottom of the stack
+    /// Mount a tree at a name: a files layer at the bottom of the stack, or, unmanaged, a place read by path alone
     Add {
         at: String,
-        /// The tree, relative to the project or absolute
-        path: String,
+        /// The tree, relative to the project or absolute; an unmanaged mount's is each machine's (`locate`)
+        #[arg(required_unless_present = "unmanaged")]
+        path: Option<String>,
         /// Nothing is written into it
         #[arg(long)]
         read_only: bool,
+        /// Not indexed: read by path alone (`res://<at>/...`), as a plan reads its discs
+        #[arg(long)]
+        unmanaged: bool,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Say where an unmanaged mount is on this machine (`project.local.toml`)
+    Locate {
+        at: String,
+        /// Where it is, relative to the project or absolute
+        path: String,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -227,15 +233,15 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// Fill a project's game layer from its discs, by the layer's extraction plan (`extraction.plan.jsonl`): only what
-    /// changed or is gone is made, and what the plan no longer gives is removed
+    /// Fill a project's generated layers by their plans (`.layers/<layer>.plan.jsonl`), reading the discs where the
+    /// plans say: only what changed or is gone is made, and what a plan no longer gives is removed
     Extract {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// Where the disc images are, instead of the project's `roms`
+        /// This generated layer alone
         #[arg(long)]
-        roms: Option<PathBuf>,
+        layer: Option<String>,
     },
     /// Build a project's packages for a config
     Build {
@@ -259,23 +265,6 @@ enum ProjectCommand {
         #[command(subcommand)]
         command: LayerCommand,
     },
-    /// Set the game the project is of: the layer its game's files fill, and where its disc images are
-    Game {
-        /// The layer (one of the project's)
-        #[arg(long)]
-        layer: String,
-        /// Where the disc images are, relative to the project
-        #[arg(long)]
-        roms: Option<String>,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-    },
-    /// The releases the project is built for
-    Release {
-        #[command(subcommand)]
-        command: ReleaseCommand,
-    },
     /// The trees mounted into the project
     Mount {
         #[command(subcommand)]
@@ -286,19 +275,25 @@ enum ProjectCommand {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// How a project's game layer is, by its extraction plan: none, empty, filled, or not as the plan says now - known
+    /// How a project's generated layers are, by their plans: none, empty, filled, or not as the plan says now - known
     /// without the discs and without reading what was made
     Status {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// This generated layer alone
+        #[arg(long)]
+        layer: Option<String>,
     },
-    /// Check a project's game layer against its extraction plan, without the discs: every file there, made by what the
+    /// Check a project's generated layers against their plans, without the discs: every file there, made by what the
     /// plan says now, unchanged since it was written
     Verify {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// This generated layer alone
+        #[arg(long)]
+        layer: Option<String>,
     },
     /// What a project's extensions offer whoever writes its nodes, as JSON: each template - its node type, the files it
     /// takes, its stack with `{file}` for the node's stored file - each operation a stack may name - its ports, output,
@@ -367,6 +362,9 @@ enum ExtensionCommand {
     Add {
         /// Its folder or archive, or its id
         what: String,
+        /// The layer to hold it (the one holding it already, else the highest the project writes)
+        #[arg(long)]
+        layer: Option<String>,
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -750,14 +748,15 @@ fn kept_folder(p: &project::Project, what: &str) -> Result<PathBuf> {
 fn add_from(
     p: &project::Project,
     from: &Path,
+    into: Option<&str>,
     history: &mut project::history::History,
     label: String,
 ) -> Result<project::ext::component::About> {
     if extensions::archive::is_archive(from) {
         let unpacked = extensions::archive::unpack(from).with_context(|| from.display().to_string())?;
-        return project::switches::add_extension(p, &unpacked.folder, history, label);
+        return project::switches::add_extension(p, &unpacked.folder, into, history, label);
     }
-    project::switches::add_extension(p, from, history, label)
+    project::switches::add_extension(p, from, into, history, label)
 }
 
 /// `pe2-cli project extension setup`: what the project's extensions running fetch onto this machine, each shown with
@@ -888,9 +887,9 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                 );
             }
         }
-        ExtensionCommand::Add { what, .. } => {
+        ExtensionCommand::Add { what, layer, .. } => {
             let from = kept_folder(&p, &what)?;
-            let about = add_from(&p, &from, &mut history, format!("Add {what}"))?;
+            let about = add_from(&p, &from, layer.as_deref(), &mut history, format!("Add {what}"))?;
             added(&project::Project::load(&project)?, &about);
         }
         ExtensionCommand::Update { id, from, .. } => {
@@ -902,7 +901,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
                 Some(from) => from,
                 None => kept_folder(&p, &id)?,
             };
-            let about = add_from(&p, &from, &mut history, format!("Update {id}"))?;
+            let about = add_from(&p, &from, None, &mut history, format!("Update {id}"))?;
             if was != about.version {
                 println!("{id}: {was} to {}", about.version);
             }
@@ -982,41 +981,45 @@ fn main() -> Result<()> {
     done
 }
 
-/// A project's setup edited - made, its layers, game, releases, mounts and configs - or its game layer's state said.
+/// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
 fn setup_command(command: ProjectCommand) -> Result<()> {
     match command {
         ProjectCommand::New { directory } => {
             project::create(&directory)?;
             println!("an empty project in {}", directory.display());
         }
-        ProjectCommand::Layer { command: LayerCommand::Add { name, files, bottom, project } } => {
-            let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
-            edit_project(&project, |p, history| project::stack::add_at(p, &name, kind, bottom, history))?;
+        ProjectCommand::Layer { command: LayerCommand::Add { name, files, bottom, generated: _, fills, project } } => {
+            if let Some(fills) = fills {
+                edit_project(&project, |p, history| project::setup::add_generated(p, &name, &fills, history))?;
+            } else {
+                let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
+                edit_project(&project, |p, history| project::stack::add_at(p, &name, kind, bottom, history))?;
+            }
         }
-        ProjectCommand::Game { layer, roms, project } => {
-            edit_project(&project, |p, history| project::setup::set_game(p, &layer, roms.as_deref(), history))?;
+        ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, unmanaged, project } } => {
+            edit_project(&project, |p, history| {
+                project::setup::add_mount(p, &at, path.as_deref(), read_only, unmanaged, history)
+            })?;
         }
-        ProjectCommand::Release { command: ReleaseCommand::Add { name, images, project } } => {
-            let images: Vec<&Path> = images.iter().map(PathBuf::as_path).collect();
-            edit_project(&project, |p, history| project::setup::add_release(p, &name, &images, history))?;
-        }
-        ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, project } } => {
-            edit_project(&project, |p, history| project::setup::add_mount(p, &at, &path, read_only, history))?;
+        ProjectCommand::Mount { command: MountCommand::Locate { at, path, project } } => {
+            project::setup::locate(&project::Project::load(&project)?, &at, &path)?;
         }
         ProjectCommand::Config { command: ConfigCommand::Add { name, release, target, project } } => {
             edit_project(&project, |p, history| {
                 project::setup::add_config(p, &name, release.as_deref(), target.as_deref(), history)
             })?;
         }
-        ProjectCommand::Status { project } => {
+        ProjectCommand::Status { project, layer } => {
             let p = project::Project::load(&project)?;
-            let game = p.game.as_ref().context("the project has no [game]")?;
-            let layer = p.layer(&game.layer)?.path.clone();
-            match project::plan::state(&layer, &project_extensions(&p))? {
-                project::plan::State::NoPlan => println!("the game layer has no extraction plan"),
-                project::plan::State::Empty => println!("the game layer is empty: its plan has not run"),
-                project::plan::State::Filled => println!("the game layer is filled, as its plan says"),
-                project::plan::State::Stale(why) => println!("the game layer is stale: {}", why.join("; ")),
+            let extensions = project_extensions(&p);
+            for l in generated_layers(&p, layer.as_deref())? {
+                let name = &l.name;
+                match project::plan::state(&l.plan(), &l.path, &extensions)? {
+                    project::plan::State::NoPlan => println!("{name} has no plan ({})", l.plan().display()),
+                    project::plan::State::Empty => println!("{name} is empty: its plan has not run"),
+                    project::plan::State::Filled => println!("{name} is filled, as its plan says"),
+                    project::plan::State::Stale(why) => println!("{name} is stale: {}", why.join("; ")),
+                }
             }
         }
         _ => unreachable!("not a setup command"),
@@ -1037,26 +1040,31 @@ fn edit_project(
     edit(&p, &mut history)
 }
 
-/// Run the game layer's extraction plan, where it has one: false where it has none.
-fn run_plan(p: &project::Project, lock: &project::lock::Lock, roms: Option<&Path>) -> Result<bool> {
-    let game = p.game.as_ref().context("the project has no [game]")?;
-    let layer = p.layer(&game.layer)?.path.clone();
-    if !layer.join(project::plan::PLAN).is_file() {
-        return Ok(false);
+/// A project's generated layers, or the one named: none is an error.
+fn generated_layers<'p>(p: &'p project::Project, only: Option<&str>) -> Result<Vec<&'p project::Layer>> {
+    let layers: Vec<_> = p.generated().filter(|l| only.is_none_or(|name| l.name == name)).collect();
+    if layers.is_empty() {
+        match only {
+            Some(name) => anyhow::bail!("the project has no generated layer {name}"),
+            None => anyhow::bail!("the project has no generated layer: nothing says what to extract"),
+        }
     }
+    Ok(layers)
+}
+
+/// Run a generated layer's plan.
+fn run_plan(p: &project::Project, lock: &project::lock::Lock, layer: &project::Layer) -> Result<()> {
+    let plan = layer.plan();
+    anyhow::ensure!(plan.is_file(), "{} has no plan ({}): nothing says what to extract", layer.name, plan.display());
     let extensions = project_extensions(p);
     let cache = project::cache::Cache::open(p, lock)?;
     let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
-    let ran = project::plan::run(&layer, roms.unwrap_or(&game.roms), &engine, &extensions)?;
+    let ran = project::plan::run(p, layer, &engine, &extensions)?;
     println!(
-        "{} files written and {} kept as they were ({} operations run), {} removed, in {}",
-        ran.written,
-        ran.kept,
-        ran.ran,
-        ran.removed,
-        layer.display()
+        "{}: {} files written and {} kept as they were ({} operations run), {} removed",
+        layer.name, ran.written, ran.kept, ran.ran, ran.removed
     );
-    Ok(true)
+    Ok(())
 }
 
 /// The extensions a project holds, as many as load: what a plan runs of one that did not fails by name, as it is run.
@@ -1068,26 +1076,29 @@ fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Exte
     extensions
 }
 
-/// Check the game layer against its plan, exiting with failure where it is not what the plan makes.
-fn verify_layer(project: &Path) -> Result<()> {
+/// Check generated layers against their plans, exiting with failure where one is not what its plan makes.
+fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
     let p = project::Project::load(project)?;
-    let game = p.game.as_ref().context("the project has no [game]")?;
-    let layer = p.layer(&game.layer)?.path.clone();
     let extensions = project_extensions(&p);
-    let checked = project::plan::verify(&layer, &|id| extensions.version_of(id))?;
-    for (what, files) in [("missing", &checked.missing), ("stale", &checked.stale), ("changed", &checked.changed)] {
-        for file in files.iter().take(20) {
-            println!("{what}: {file}");
+    let mut whole = true;
+    for layer in generated_layers(&p, only)? {
+        let checked = project::plan::verify(&layer.plan(), &layer.path, &|id| extensions.version_of(id))?;
+        for (what, files) in [("missing", &checked.missing), ("stale", &checked.stale), ("changed", &checked.changed)] {
+            for file in files.iter().take(20) {
+                println!("{}: {what}: {file}", layer.name);
+            }
         }
+        println!(
+            "{}: {} files: {} missing, {} made by another plan, {} changed",
+            layer.name,
+            checked.files,
+            checked.missing.len(),
+            checked.stale.len(),
+            checked.changed.len()
+        );
+        whole &= checked.whole();
     }
-    println!(
-        "{} files: {} missing, {} made by another plan, {} changed",
-        checked.files,
-        checked.missing.len(),
-        checked.stale.len(),
-        checked.changed.len()
-    );
-    if !checked.whole() {
+    if !whole {
         std::process::exit(1);
     }
     Ok(())
@@ -1125,13 +1136,13 @@ fn run(cli: Cli) -> Result<()> {
             command:
                 command @ (ProjectCommand::New { .. }
                 | ProjectCommand::Layer { .. }
-                | ProjectCommand::Game { .. }
-                | ProjectCommand::Release { .. }
                 | ProjectCommand::Mount { .. }
                 | ProjectCommand::Config { .. }
                 | ProjectCommand::Status { .. }),
         } => setup_command(command)?,
-        Tool::Project { command: ProjectCommand::Verify { project } } => verify_layer(&project)?,
+        Tool::Project { command: ProjectCommand::Verify { project, layer } } => {
+            verify_layer(&project, layer.as_deref())?;
+        }
         Tool::Project { command: ProjectCommand::Registry { project } } => print_registry(&project)?,
         Tool::Project { command: ProjectCommand::Clean { project, config } } => {
             signal(&project, config.as_deref(), &[Clean::NAME])?;
@@ -1143,7 +1154,7 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
             signal(&project, config.as_deref(), &[event.as_str()])?;
         }
-        Tool::Project { command: ProjectCommand::Extract { project, roms } } => {
+        Tool::Project { command: ProjectCommand::Extract { project, layer } } => {
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
@@ -1151,11 +1162,8 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(why) = lock.unprotected() {
                 eprintln!("warning: {why}");
             }
-            if !run_plan(&p, &lock, roms.as_deref())? {
-                anyhow::bail!(
-                    "the game layer has no extraction plan ({}): nothing says what to extract",
-                    project::plan::PLAN
-                );
+            for layer in generated_layers(&p, layer.as_deref())? {
+                run_plan(&p, &lock, layer)?;
             }
             // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted:
             // indexed only then.

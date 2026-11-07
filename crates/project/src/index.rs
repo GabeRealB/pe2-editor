@@ -215,6 +215,8 @@ pub struct LayerInfo {
     /// Its changeset can be written.
     pub writable: bool,
     pub mounted: bool,
+    /// The layer a generated layer gives its nodes' files.
+    pub fills: Option<String>,
     pub entries: usize,
     pub overrides: usize,
     pub moves: usize,
@@ -712,6 +714,9 @@ struct LayerState {
     /// Its changeset can be written: unlisted entries are listed in it.
     writable: bool,
     mounted: bool,
+    /// The layer whose nodes a generated layer gives their files: taking no part in the stack, what it holds at a path
+    /// is that layer's bundle's too.
+    fills: Option<String>,
     /// What it holds, shared with the snapshots made of the index until it is scanned again.
     scan: Arc<Scan>,
 }
@@ -722,8 +727,8 @@ impl LayerState {
         let tree_ignore = if layer.mounted { tree_ignores(&layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
         ignore.extend(tree_ignore.iter().cloned());
-        let place =
-            Place { root: layer.path.clone(), at: layer.at.clone(), ignore, assets: layer.kind == LayerKind::Assets };
+        let assets = layer.kind != LayerKind::Files;
+        let place = Place { root: layer.path.clone(), at: layer.at.clone(), ignore, assets };
         let mut scan = Scan::default();
         scan.rescan(&place, "");
         Ok(LayerState {
@@ -736,6 +741,7 @@ impl LayerState {
             tree_ignore,
             read_only: layer.read_only,
             mounted: layer.mounted,
+            fills: layer.fills.clone(),
             scan: Arc::new(scan),
         })
     }
@@ -1021,7 +1027,7 @@ impl Index {
         let mut before_references = HashMap::new();
         for (i, at) in &regions {
             for path in self.layers[*i].scan.under(at).bundles.keys() {
-                if let Some(resolved) = self.winning.get(&(*i, path.clone())) {
+                if let Some(resolved) = self.winning.get(&(self.entries_of(*i), path.clone())) {
                     let asset = asset_of(resolved).to_string();
                     before_references.insert(asset.clone(), self.references_from(&asset));
                 }
@@ -1060,7 +1066,10 @@ impl Index {
             && self.hidden.is_empty()
             && regions.iter().all(|(i, at)| {
                 let scan = self.layers[*i].scan.under(at);
-                scan.bundles.keys().chain(scan.files.keys()).all(|p| self.winning.contains_key(&(*i, p.clone())))
+                let entries = self.entries_of(*i);
+                scan.bundles.keys().all(|p| self.winning.contains_key(&(entries, p.clone())))
+                    && (scan.files.is_empty() || entries == *i)
+                    && scan.files.keys().all(|p| self.winning.contains_key(&(*i, p.clone())))
             });
         if contents_only {
             self.refresh_contents(&regions, &before_references, &mut refreshed);
@@ -1070,10 +1079,14 @@ impl Index {
         refreshed.restacked = true;
         let before = std::mem::take(&mut self.resolved);
         self.apply_stack()?;
-        // An asset changed when its entry did, or when its content lies in what was rescanned.
+        // An asset changed when its entry did, or when its content - or what a generated layer gives it - lies in what
+        // was rescanned.
         for (path, node) in self.resolved.iter() {
             let content = self.layers[node.content.0].place.disk(&node.content.1);
-            let touched = rescanned.iter().any(|r| content.starts_with(r) || r.starts_with(&content));
+            let filled = self.filled_by(node.content.0).map(|g| self.layers[g].place.disk(&node.content.1));
+            let touched = std::iter::once(&content)
+                .chain(filled.as_ref())
+                .any(|c| rescanned.iter().any(|r| c.starts_with(r) || r.starts_with(c)));
             if node.kind == Kind::Asset && (before.get(path) != Some(node) || touched) {
                 refreshed.assets.insert(asset_of(path).to_string());
             }
@@ -1108,8 +1121,9 @@ impl Index {
                     }
                 }
             }
+            let entries = self.entries_of(*i);
             for path in scan.bundles.keys() {
-                if let Some(resolved) = self.winning.get(&(*i, path.clone())) {
+                if let Some(resolved) = self.winning.get(&(entries, path.clone())) {
                     paths.push(resolved.clone());
                 }
             }
@@ -1183,16 +1197,47 @@ impl Index {
         (read, vanished)
     }
 
-    /// The hash of an entry's content in a layer: a plain file's own, a bundle's over its files' names and hashes;
-    /// a folder has none.
+    /// The generated layer filling a layer's nodes, where one does.
+    fn filled_by(&self, layer: usize) -> Option<usize> {
+        let name = &self.layers[layer].name;
+        self.layers.iter().position(|l| l.fills.as_ref() == Some(name))
+    }
+
+    /// The layer a layer's bundles are entries of: a generated layer's, the layer it fills; any other's, its own.
+    fn entries_of(&self, layer: usize) -> usize {
+        let fills = self.layers[layer].fills.as_ref();
+        fills.and_then(|f| self.layers.iter().position(|l| l.name == *f)).unwrap_or(layer)
+    }
+
+    /// A bundle's files in a layer, each with the layer holding it: its own, then what the generated layer filling the
+    /// layer holds at its path - a node's declaration in one, its files in the other. None where the layer holds no
+    /// bundle there.
+    fn bundle_files(&self, layer: usize, path: &str) -> Option<Vec<(String, PathBuf, usize)>> {
+        let own = self.layers[layer].scan.bundles.get(path)?;
+        let mut files: Vec<(String, PathBuf, usize)> = own.iter().map(|(n, f)| (n.clone(), f.clone(), layer)).collect();
+        if let Some(filler) = self.filled_by(layer)
+            && let Some(filled) = self.layers[filler].scan.bundles.get(path)
+        {
+            for (name, file) in filled {
+                if !own.contains_key(name) {
+                    files.push((name.clone(), file.clone(), filler));
+                }
+            }
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Some(files)
+    }
+
+    /// The hash of an entry's content in a layer: a plain file's own, a bundle's over its files' names and hashes - what
+    /// a generated layer gives it with them; a folder has none.
     fn content_hash(&self, layer: usize, path: &str, kind: Kind) -> Option<String> {
         let scan = &self.layers[layer].scan;
         match kind {
             Kind::File => scan.files.get(path).and_then(|f| self.records.get(f)).map(|r| format!("sha1:{}", r.sha1)),
             Kind::Asset => {
-                let files = scan.bundles.get(path)?;
+                let files = self.bundle_files(layer, path)?;
                 let mut listing = String::new();
-                for (name, f) in files {
+                for (name, f, _) in &files {
                     let sha1 = self.records.get(f).map_or("", |r| r.sha1.as_str());
                     listing.push_str(name);
                     listing.push(' ');
@@ -1237,7 +1282,8 @@ impl Index {
         let mut problems = Vec::new();
         let mut statuses = vec![BTreeMap::new(); self.layers.len()];
         for (i, layer) in self.layers.iter().enumerate() {
-            if skip.contains(&i) {
+            // A generated layer makes no entries: what it holds is the files of another's.
+            if skip.contains(&i) || layer.kind == LayerKind::Generated {
                 continue;
             }
             let status = &mut statuses[i];
@@ -1410,16 +1456,15 @@ impl Index {
         let (path, node) = resolution.resolved.iter().find(|(_, n)| n.uid == uid)?;
         let (content, content_path) = &node.content;
         let source = &self.layers[*content];
-        let files =
-            match node.kind {
-                Kind::Asset => source.scan.bundles.get(content_path).map_or_else(Vec::new, |files| {
-                    files.iter().map(|(name, file)| (name.clone(), file.clone())).collect()
-                }),
-                Kind::File => {
-                    source.scan.files.get(content_path).map_or_else(Vec::new, |f| vec![(String::new(), f.clone())])
-                }
-                Kind::Folder => vec![],
-            };
+        let files = match node.kind {
+            Kind::Asset => self
+                .bundle_files(*content, content_path)
+                .map_or_else(Vec::new, |files| files.into_iter().map(|(name, file, _)| (name, file)).collect()),
+            Kind::File => {
+                source.scan.files.get(content_path).map_or_else(Vec::new, |f| vec![(String::new(), f.clone())])
+            }
+            Kind::Folder => vec![],
+        };
         Some(Below {
             kind: node.kind,
             uid: uid.to_string(),
@@ -1464,6 +1509,7 @@ impl Index {
                     read_only: l.read_only,
                     writable: l.writable,
                     mounted: l.mounted,
+                    fills: l.fills.clone(),
                     entries: l.changeset.entries.len(),
                     overrides: count(|o| matches!(o, Op::Override { .. })),
                     moves: count(|o| matches!(o, Op::Move { .. })),
@@ -1721,8 +1767,8 @@ impl Index {
                 imported: None,
                 applied: None,
             };
-            for (name, file) in layer.scan.bundles.get(&node.content.1).into_iter().flatten() {
-                let Some(record) = self.records.get(file) else { continue };
+            for (name, file, held) in self.bundle_files(node.content.0, &node.content.1).into_iter().flatten() {
+                let Some(record) = self.records.get(&file) else { continue };
                 if name == NODE_FILE
                     && let Some(d) = &record.declaration
                 {
@@ -1736,7 +1782,7 @@ impl Index {
                     path: file.clone(),
                     size: record.size,
                     modified: record.modified,
-                    layer: layer.name.clone(),
+                    layer: self.layers[held].name.clone(),
                     sha1: record.sha1.clone(),
                     made_by: None,
                 });
@@ -2127,6 +2173,41 @@ mod tests {
         winning.sort();
         let _ = writeln!(out, "winning {winning:?}");
         out
+    }
+
+    #[test]
+    fn a_generated_layer_gives_the_nodes_it_fills_their_files() {
+        let root = project("generated");
+        // The nodes are base's; what their plan made, base-files' - without a node of its own, and its record beside.
+        let text = "[[layer]]\nname = \"base\"\n\n[[layer]]\nname = \"base-files\"\nkind = \"generated\"\nfills = \"base\"\n\n[[layer]]\nname = \"top\"\n";
+        write(&root, "project.toml", text);
+        std::fs::remove_file(root.join(".layers/base/g/a.node/native.texels")).unwrap();
+        write(&root, ".layers/base-files/g/a.node/native.texels", "texels");
+        write(&root, ".layers/base-files/extraction.record.jsonl", "{}");
+        let (project, mut index) = open(&root);
+        let a = &index.assets["g/a"];
+        let held: Vec<(&str, &str)> = a.files.iter().map(|f| (f.name.as_str(), f.layer.as_str())).collect();
+        assert_eq!(held, [("native.texels", "base-files"), ("node.toml", "base")]);
+        assert!(index.problems.is_empty(), "{:?}", index.problems);
+        assert!(index.layers().iter().any(|l| l.name == "base-files" && l.fills.as_deref() == Some("base")));
+        // What the plan writes again is taken in as the node's.
+        let (_, fresh) = open(&root);
+        let texels = write(&root, ".layers/base-files/g/a.node/native.texels", "repainted");
+        index.refresh(&project, std::slice::from_ref(&texels)).unwrap();
+        assert_ne!(shown(&index), shown(&fresh));
+        let (_, again) = open(&root);
+        assert_eq!(shown(&index), shown(&again));
+        // An override is made of the node and its files, and goes stale when the plan makes them otherwise.
+        let mut top = Changeset::default();
+        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.save(&root.join(".layers/top.toml")).unwrap();
+        write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
+        let below = index.below("top", "uid://a").unwrap();
+        assert!(below.files.iter().any(|(name, _)| name == "native.texels"), "{:?}", below.files);
+        write(&root, ".layers/base-files/g/a.node/native.texels", "extracted otherwise");
+        let (_, after) = open(&root);
+        assert!(after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

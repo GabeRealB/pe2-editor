@@ -147,10 +147,10 @@ pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, hist
 /// Take a layer out of the stack; its directory and changeset stay on disk.
 ///
 /// # Errors
-/// It is a mount or the game layer, another layer needs it, or `project.toml` cannot be rewritten.
+/// It is a mount, a generated layer fills it, another layer needs it, or `project.toml` cannot be rewritten.
 pub fn remove(project: &Project, layers: &[LayerInfo], name: &str, history: &mut History) -> Result<()> {
-    if project.game.as_ref().is_some_and(|g| g.layer == name) {
-        bail!("{name} is the game layer, which extraction fills");
+    if let Some(generated) = project.layers.iter().find(|l| l.fills.as_deref() == Some(name)) {
+        bail!("{} fills {name}'s nodes with their files", generated.name);
     }
     if layers.iter().any(|l| l.name == name && l.mounted) {
         bail!("{name} is a mount, declared apart in project.toml ([[mount]])");
@@ -187,6 +187,7 @@ mod tests {
             read_only: false,
             writable: true,
             mounted: false,
+            fills: None,
             entries: 0,
             overrides: 0,
             moves: 0,
@@ -201,7 +202,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pe2-stack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let text = "# the stack\n[game]\nlayer = \"game\"\ndeclarations = \"res://d\"\n\n[[layer]]\nname = \"game\"\n\
+        let text = "# the stack\n[[layer]]\nname = \"game\"\n\
                     \n# mine\n[[layer]]\nname = \"mod\"\n";
         std::fs::write(root.join("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();

@@ -5,7 +5,7 @@
 //! unlisted, and the index inserts a create for it where the layer can be written.
 //!
 //! ```toml
-//! read_only = true                     # only its maker writes it (the game layer: extraction)
+//! read_only = true                     # only its maker writes it (a project's nodes: its tools)
 //! ignore = ["*.swp"]                   # never listed
 //!
 //! [entries]

@@ -731,7 +731,7 @@ mod tests {
         let project = project::Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let about = add_extension(&project, &source, &mut history, "add".into()).unwrap();
+        let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
         assert_eq!(about.id, "pe2.events");
         let project = project::Project::load(&root).unwrap();
         let held = root.join(".layers/mine/extensions/pe2.events.extension");
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(loaded.origin, project::ext::Origin::Project(held.clone()));
         // Updated: added again, in place of what was there; undone, what was there is back.
         std::fs::write(source.join("linux-x86_64/tool"), "#!/bin/sh\necho new\n").unwrap();
-        add_extension(&project, &source, &mut history, "update".into()).unwrap();
+        add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
         assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\necho new\n");
         history.undo(false).unwrap();
         assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\n");
@@ -760,6 +760,14 @@ mod tests {
         history.undo(false).unwrap();
         history.undo(false).unwrap();
         assert!(!held.exists(), "undone, it was never added");
+        // Added to a layer named, then updated where it is, though a higher layer is written.
+        add_extension(&project, &source, Some("game"), &mut history, "add".into()).unwrap();
+        let in_game = root.join(".layers/game/extensions/pe2.events.extension");
+        assert!(in_game.is_dir());
+        let project = project::Project::load(&root).unwrap();
+        add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
+        assert_eq!(project::Project::load(&root).unwrap().held_extensions(), [in_game]);
+        assert!(add_extension(&project, &source, Some("nowhere"), &mut history, "add".into()).is_err());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }

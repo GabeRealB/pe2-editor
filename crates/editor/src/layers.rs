@@ -229,8 +229,8 @@ fn locked_reason(ws: &Workspace, layer: &LayerInfo) -> String {
         && let Some(solo) = &ws.layer_view.solo
     {
         format!("Locked while {solo} is shown alone")
-    } else if ws.project.game.as_ref().is_some_and(|g| g.layer == layer.name) {
-        "Locked: the game layer is written by extraction alone".into()
+    } else if let Some(fills) = &layer.fills {
+        format!("Locked: written by its plan alone, filling {fills}")
     } else if layer.mounted {
         "Locked: the mounted tree is read-only".into()
     } else {
@@ -248,6 +248,7 @@ fn summary(layer: &LayerInfo) -> String {
         LayerKind::Assets => "assets".to_string(),
         LayerKind::Files if layer.mounted => format!("files, mounted at {}/", layer.at),
         LayerKind::Files => "files".to_string(),
+        LayerKind::Generated => format!("{}'s files", layer.fills.as_deref().unwrap_or("?")),
     };
     let mut parts = vec![kind, format!("{} entr{}", layer.entries, if layer.entries == 1 { "y" } else { "ies" })];
     let ops = layer.overrides + layer.moves + layer.deletes;
@@ -472,7 +473,7 @@ fn resolutions_ui(ui: &mut egui::Ui, op: &project::index::OpView, edit: &mut Opt
     }
 }
 
-/// The entries a layer creates, a row each (the game layer's run to thousands, so only the rows in view are drawn).
+/// The entries a layer creates, a row each (a game's nodes run to thousands, so only the rows in view are drawn).
 fn creates_ui(ui: &mut egui::Ui, ws: &Workspace, layer: &str, nav: &mut Option<String>) {
     let creates = ws.index.creates(layer);
     theme::section(ui, &format!("Creates ({})", creates.len()), |ui| {

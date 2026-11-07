@@ -1,5 +1,5 @@
-//! Projects: what a `project.toml` declares, and the extraction plan that fills its game layer's bundles from the
-//! game's discs.
+//! Projects: what a `project.toml` declares - its layers, among them generated ones, each filled by its plan (`plan`)
+//! from the game's discs - and what is made of it.
 
 pub mod applied;
 pub mod build;
@@ -35,7 +35,6 @@ pub const LAYERS: &str = ".layers";
 
 #[derive(Deserialize)]
 struct ProjectFile {
-    game: Option<GameFile>,
     #[serde(default)]
     layer: Vec<LayerFile>,
     #[serde(default)]
@@ -103,66 +102,51 @@ struct ExtensionsFile {
 }
 
 #[derive(Deserialize)]
-struct GameFile {
-    layer: String,
-    #[serde(default = "default_roms")]
-    roms: String,
-    #[serde(default)]
-    releases: BTreeMap<String, ReleaseFile>,
-}
-
-fn default_roms() -> String {
-    "roms".into()
-}
-
-#[derive(Deserialize)]
-struct ReleaseFile {
-    #[serde(default)]
-    discs: Vec<DiscImage>,
-}
-
-/// A disc image a release needs: its name, size and sha1.
-#[derive(Clone, Debug, Deserialize)]
-pub struct DiscImage {
-    pub name: String,
-    pub size: u64,
-    pub sha1: String,
-}
-
-#[derive(Deserialize)]
 struct LayerFile {
     name: String,
     /// The layer's directory; by default `.layers/<name>`.
     path: Option<String>,
     #[serde(default)]
     read_only: bool,
-    /// `files` for a layer of plain files only (code); an asset layer by default.
+    /// `files` for a layer of plain files only (code), `generated` for one its plan fills; an asset layer by default.
     kind: Option<String>,
+    /// The layer whose nodes a generated layer gives their files.
+    fills: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct MountFile {
     at: String,
-    path: String,
+    /// The tree; an unmanaged mount's is this machine's (`project.local.toml`), else the folder of its name.
+    path: Option<String>,
     #[serde(default)]
     read_only: bool,
+    /// Not indexed: a place files are read from by path (`res://<at>/...`) - the disc images - and nothing else.
+    #[serde(default)]
+    unmanaged: bool,
 }
 
-#[derive(Clone)]
-pub struct Game {
-    /// The name of the layer extraction fills.
-    pub layer: String,
-    pub roms: PathBuf,
-    pub releases: BTreeMap<String, Vec<DiscImage>>,
+/// `project.local.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
+/// "<path>"`). It is kept out of the project's history and of version control.
+#[derive(Default, Deserialize)]
+struct LocalFile {
+    #[serde(default)]
+    mounts: BTreeMap<String, String>,
 }
+
+/// The file what of a project is this machine's is kept in.
+pub const LOCAL: &str = "project.local.toml";
 
 /// What a layer may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind {
-    /// Assets and plain files: the game layer, a mod's assets, the project's own.
+    /// Assets and plain files: a project's nodes, a mod's assets, the project's own.
     Assets,
     /// Plain files only - code. A mount is one whose content is an external tree left where it is.
     Files,
+    /// What a plan writes (`plan`): the files of the nodes of the layer it fills, at their paths. Read-only, its plan
+    /// beside its folder (`Layer::plan`).
+    Generated,
 }
 
 pub(crate) use schedule::parallel;
@@ -177,12 +161,14 @@ pub struct Layer {
     pub at: String,
     /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
     pub changeset: PathBuf,
-    /// Its content is written only by its maker: stated in `project.toml`, or the game layer (extraction's alone).
+    /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
     pub read_only: bool,
     /// Whether its changeset is the project's to write: a mount's is, though its tree may be read-only.
     pub changeset_writable: bool,
     /// A mount, which `project.toml` declares apart (`[[mount]]`) until mounts move into the stack.
     pub mounted: bool,
+    /// The layer a generated layer gives its nodes' files.
+    pub fills: Option<String>,
 }
 
 #[derive(Clone)]
@@ -193,6 +179,15 @@ pub struct Mount {
 }
 
 impl Layer {
+    /// A generated layer's plan: `<path>.plan.jsonl`, beside its folder as its changeset would be, so that what fills
+    /// the layer travels with the project while what it made does not.
+    #[must_use]
+    pub fn plan(&self) -> PathBuf {
+        let mut plan = self.path.clone().into_os_string();
+        plan.push(".plan.jsonl");
+        PathBuf::from(plan)
+    }
+
     /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree.
     #[must_use]
     pub fn disk(&self, path: &str) -> PathBuf {
@@ -210,9 +205,10 @@ impl Layer {
 #[derive(Clone)]
 pub struct Project {
     pub root: PathBuf,
-    pub game: Option<Game>,
     pub layers: Vec<Layer>,
     pub mounts: Vec<Mount>,
+    /// What is mounted and not indexed: read by path alone (`resolve`) - the disc images (`roms`).
+    pub unmanaged: Vec<Mount>,
     /// The extensions it leaves off, by id (`[extensions] disabled`): everyone on it reads its assets the same way.
     pub disabled_extensions: Vec<String>,
     /// The extensions it requires (`[[extension]]`).
@@ -245,6 +241,28 @@ pub fn create(directory: &Path) -> Result<()> {
     std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())
 }
 
+/// A project's mounts, and its unmanaged ones apart, each where this machine says (`project.local.toml`).
+fn mounts_of(root: &Path, declared: Vec<MountFile>) -> Result<(Vec<Mount>, Vec<Mount>)> {
+    let local_path = root.join(LOCAL);
+    let local: LocalFile = match std::fs::read_to_string(&local_path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("{}", local_path.display()))?,
+        Err(_) => LocalFile::default(),
+    };
+    let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
+    for m in declared {
+        let at = m.at.trim_matches('/').to_string();
+        let path = match (m.unmanaged, local.mounts.get(&at), &m.path) {
+            (true, Some(here), _) => resolve_path(root, here),
+            (_, _, Some(path)) => resolve_path(root, path),
+            (true, None, None) => root.join(&at),
+            (false, _, None) => bail!("{}: the mount {at} says no path", root.join(FILE).display()),
+        };
+        let mount = Mount { at, path, read_only: m.read_only || m.unmanaged };
+        if m.unmanaged { unmanaged.push(mount) } else { mounts.push(mount) }
+    }
+    Ok((mounts, unmanaged))
+}
+
 impl Project {
     /// The project in `directory`.
     ///
@@ -255,21 +273,7 @@ impl Project {
         let path = root.join(FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
-        let game = file.game.map(|g| Game {
-            layer: g.layer,
-            roms: resolve_path(&root, &g.roms),
-            releases: g.releases.into_iter().map(|(r, spec)| (r, spec.discs)).collect(),
-        });
-        let game_layer = game.as_ref().map(|g| g.layer.clone());
-        let mounts: Vec<Mount> = file
-            .mount
-            .into_iter()
-            .map(|m| Mount {
-                at: m.at.trim_matches('/').to_string(),
-                path: resolve_path(&root, &m.path),
-                read_only: m.read_only,
-            })
-            .collect();
+        let (mounts, unmanaged) = mounts_of(&root, file.mount)?;
         // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
         let mut layers: Vec<Layer> = mounts
             .iter()
@@ -282,23 +286,37 @@ impl Project {
                 read_only: m.read_only,
                 changeset_writable: true,
                 mounted: true,
+                fills: None,
             })
             .collect();
         for l in file.layer {
             let path = resolve_path(&root, l.path.as_deref().unwrap_or(&format!("{LAYERS}/{}", l.name)));
             let mut changeset = path.clone().into_os_string();
             changeset.push(".toml");
-            let read_only = l.read_only || game_layer.as_deref() == Some(l.name.as_str());
-            if layers.iter().any(|m| m.name == l.name) {
+            if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at == l.name) {
                 bail!("{}: the layer {} is named as a mount point is", root.join(FILE).display(), l.name);
             }
             let kind = match l.kind.as_deref() {
                 None | Some("assets") => LayerKind::Assets,
                 Some("files") => LayerKind::Files,
+                Some("generated") => LayerKind::Generated,
                 Some(other) => {
-                    bail!("{}: the layer {}: no kind {other} (assets, files)", root.join(FILE).display(), l.name)
+                    bail!(
+                        "{}: the layer {}: no kind {other} (assets, files, generated)",
+                        root.join(FILE).display(),
+                        l.name
+                    )
                 }
             };
+            let generated = kind == LayerKind::Generated;
+            if generated != l.fills.is_some() {
+                bail!(
+                    "{}: the layer {}: a generated layer, and it alone, fills another",
+                    root.join(FILE).display(),
+                    l.name
+                );
+            }
+            let read_only = l.read_only || generated;
             layers.push(Layer {
                 name: l.name,
                 kind,
@@ -308,7 +326,20 @@ impl Project {
                 read_only,
                 changeset_writable: !read_only,
                 mounted: false,
+                fills: l.fills,
             });
+        }
+        for layer in &layers {
+            if let Some(filled) = &layer.fills {
+                let found = layers.iter().find(|l| l.name == *filled);
+                if !found.is_some_and(|l| l.kind == LayerKind::Assets) {
+                    bail!(
+                        "{}: the layer {} fills {filled}, no asset layer of the project",
+                        root.join(FILE).display(),
+                        layer.name
+                    );
+                }
+            }
         }
         let disabled_extensions = file.extensions.disabled;
         let requires = file.extension;
@@ -327,7 +358,17 @@ impl Project {
             .into_iter()
             .map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled })
             .collect();
-        Ok(Project { root, game, layers, mounts, disabled_extensions, requires, extension_settings, configs, links })
+        Ok(Project {
+            root,
+            layers,
+            mounts,
+            unmanaged,
+            disabled_extensions,
+            requires,
+            extension_settings,
+            configs,
+            links,
+        })
     }
 
     /// The extensions it holds: the folders in `extensions/` of its layers (`ext::folder`), each id's from the highest
@@ -353,14 +394,14 @@ impl Project {
         self.layers.iter().rev().find(|layer| !layer.mounted && !layer.read_only)
     }
 
-    /// A `res://` path's place on disk, through the mounts (the longest mount point first).
+    /// A `res://` path's place on disk, through the mounts, unmanaged ones too (the longest mount point first).
     ///
     /// # Errors
     /// `uri` is not a `res://` path.
     pub fn resolve(&self, uri: &str) -> Result<PathBuf> {
         let Some(rel) = uri.strip_prefix("res://") else { bail!("{uri}: not a res:// path") };
         let rel = rel.trim_matches('/');
-        let mut mounts: Vec<&Mount> = self.mounts.iter().collect();
+        let mut mounts: Vec<&Mount> = self.mounts.iter().chain(&self.unmanaged).collect();
         mounts.sort_by_key(|m| std::cmp::Reverse(m.at.len()));
         for m in mounts {
             if rel == m.at {
@@ -371,6 +412,11 @@ impl Project {
             }
         }
         Ok(self.root.join(rel))
+    }
+
+    /// The generated layers, each with the plan that fills it.
+    pub fn generated(&self) -> impl Iterator<Item = &Layer> {
+        self.layers.iter().filter(|l| l.kind == LayerKind::Generated)
     }
 
     /// The layer named `name`.
@@ -390,7 +436,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         super::create(&dir).unwrap();
         let project = super::Project::load(&dir).unwrap();
-        assert!(project.game.is_none());
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["project"]);
         assert!(super::create(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
