@@ -450,6 +450,10 @@ impl UiHost for Frame<'_> {
         self.ui().request_repaint();
     }
 
+    fn time(&mut self) -> f64 {
+        self.ui().time()
+    }
+
     fn reference(&mut self, reference: &Value) {
         self.ui().reference(&value_text(reference));
     }

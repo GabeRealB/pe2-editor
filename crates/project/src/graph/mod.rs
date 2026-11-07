@@ -634,7 +634,7 @@ pub fn shape(fields: &Table) -> String {
         let held = layer.as_table().into_iter().flatten();
         let kept = held.filter(|(key, value)| {
             wire_of(value).is_some()
-                || matches!(key.as_str(), "op" | "id" | "name" | "file" | "type" | "result" | "ops" | "each")
+                || matches!(key.as_str(), "op" | "id" | "name" | "file" | "type" | "result" | "ops" | "each" | "branch")
         });
         Toml::Table(kept.map(|(key, value)| (key.clone(), value.clone())).collect())
     };
@@ -941,6 +941,8 @@ impl Lowering<'_> {
     }
 
     /// An output for each key of a table of the node's, under that key's name, its operation told the key as `each`.
+    /// Where the layer names a layer above (`branch`, its `id`), every step from that one down is made again for each
+    /// key and told it, so a chain of steps runs once a key: a package's variants, each gathered, compiled and linked.
     fn each(&mut self, layer: &Table, from: usize, at: &str) {
         let table = layer.get("each").and_then(Toml::as_str).unwrap_or_default().to_string();
         let keys: Vec<String> = self
@@ -956,15 +958,32 @@ impl Lowering<'_> {
             Some("build") => Retain::Build,
             _ => Retain::Transient,
         };
+        let branch = layer.get("branch").and_then(Toml::as_str);
+        let start = branch.map_or(Some(from), |id| self.named.get(id).copied().filter(|start| *start <= from));
+        let Some(start) = start else {
+            self.problem(at, &format!("`branch = \"{}\"`: no layer above it has that id", branch.unwrap_or_default()));
+            return;
+        };
         self.plan.each.push((table, from, retain));
         for key in keys {
-            let mut step = self.plan.steps[from].clone();
-            step.settings.insert("each".into(), key.clone().into());
-            self.plan.steps.push(step);
+            // Each step of the chain again, what it takes from the chain taken from its own again.
+            let mut made: HashMap<usize, usize> = HashMap::new();
+            for at_step in start..=from {
+                let mut step = self.plan.steps[at_step].clone();
+                for port in &mut step.inputs {
+                    for input in port.iter_mut() {
+                        *input = made.get(input).copied().unwrap_or(*input);
+                    }
+                }
+                step.settings.insert("each".into(), key.clone().into());
+                self.plan.steps.push(step);
+                made.insert(at_step, self.plan.steps.len() - 1);
+            }
             let mut output = layer.clone();
             output.remove("each");
+            output.remove("branch");
             output.insert("name".into(), key.into());
-            self.output(&output, self.plan.steps.len() - 1, at, &[]);
+            self.output(&output, made[&from], at, &[]);
         }
     }
 

@@ -283,6 +283,10 @@ impl UiHost for Host<'_> {
         self.target.ui().ctx().request_repaint();
     }
 
+    fn time(&mut self) -> f64 {
+        self.target.ui().ctx().input(|input| input.time)
+    }
+
     fn image(&mut self, texture: &Texture, width: f32, height: f32) {
         let ui = self.target.ui();
         let id = self.textures.get(ui.ctx(), texture, Upscale::Nearest);

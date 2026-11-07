@@ -1,6 +1,9 @@
 //! The 3D view of a model, as Blender's: the middle button orbits, with Shift pans and with Ctrl zooms, as the wheel does, and Alt lends the primary button the same; the number keys look
 //! along the axes (1 the front, 3 the right, 7 the top, with Shift the opposite side), 5 switches the projection, Home shows everything and the period what is selected. A click selects the part it lands on, which is the selection everything else shows, and the handles on it move what
 //! holds its transform: the inspector follows while they do, and letting go writes it as one step. A part with nowhere to keep one has no handles.
+//!
+//! A clip plays on what it moves, at the game's thirty frames a second: Space plays and pauses it, the arrows step a frame,
+//! and the bar along the bottom scrubs it, a tick at each frame a key is reached.
 
 use pe2_ext::{Asset, Image, Style, Texture, Ui, View, ViewportInput};
 
@@ -16,6 +19,7 @@ use crate::prefab;
 use crate::render::{Drawn, Renderer};
 use crate::scene::{self, BlendedFace, Paint, Scene, upright};
 use crate::skeleton;
+use crate::timeline::{self, Bar, Playback};
 
 /// How the faces are shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,19 @@ pub struct ModelView {
     hovering: Option<Handle>,
     last_pointer: Option<(f32, f32)>,
     ball_state: BallState,
+    /// A clip being played, where one is shown.
+    played: Option<Playing>,
+}
+
+/// A clip as the view plays it: where it is, what it moves, its keys' frames, and when it last moved on (the host's
+/// time: a component has no clock).
+struct Playing {
+    playback: Playback,
+    clip: assembly::Played,
+    keys: Vec<u32>,
+    last: Option<f64>,
+    scrubbing: bool,
+    over_bar: bool,
 }
 
 impl Default for ModelView {
@@ -102,6 +119,7 @@ impl Default for ModelView {
             hovering: None,
             last_pointer: None,
             ball_state: BallState::default(),
+            played: None,
         }
     }
 }
@@ -118,8 +136,16 @@ impl ModelView {
         let Some(asset) = ui.asset() else { return };
         let scene = match assembly::requested(ui.project(), &asset) {
             assembly::Scene::Ready(assembled) => {
-                let assembled = *assembled;
+                let mut assembled = *assembled;
                 self.places = assembled.nodes.iter().map(|node| node.place.clone()).collect();
+                self.played = assembled.clip.take().map(|clip| Playing {
+                    playback: Playback::new(&clip.clip),
+                    keys: timeline::key_frames(&clip.clip),
+                    clip,
+                    last: None,
+                    scrubbing: false,
+                    over_bar: false,
+                });
                 Ok(self.pictured(ui, assembled))
             }
             assembly::Scene::Failed(why) => Err(why),
@@ -435,6 +461,18 @@ impl ModelView {
     }
 
     fn keys(&mut self, input: &ViewportInput) {
+        if let Some(played) = &mut self.played {
+            for key in &input.keys {
+                match key.as_str() {
+                    "Space" => played.playback.toggle(),
+                    "ArrowLeft" => played.playback.step(-1),
+                    "ArrowRight" => played.playback.step(1),
+                    _ => continue,
+                }
+                played.last = None;
+                self.dirty.geometry = true;
+            }
+        }
         for key in &input.keys {
             // Blender's is Ctrl, which here is the editor's own: Ctrl+1 shows a document's preview.
             let sign = if input.modifiers.shift { -1.0 } else { 1.0 };
@@ -527,7 +565,7 @@ impl ModelView {
             match held {
                 Handle::Move(axis) => scene.move_part(part, scale(AXES[axis], handles.along(axis, input.drag))),
                 Handle::Turn(axis) => {
-                    scene.turn_part(part, AXES[axis], handles.turned(AXES[axis], self.camera.axes().2, before, now))
+                    scene.turn_part(part, AXES[axis], handles.turned(AXES[axis], self.camera.axes().2, before, now));
                 }
             }
             self.dirty.geometry = true;
@@ -554,6 +592,10 @@ impl ModelView {
             self.dirty.frame = self.dirty.frame || input.pointer != self.last_pointer;
         }
         self.ball_state.over = ball.holds(input.pointer);
+        if self.scrub(input, size) {
+            self.last_pointer = input.pointer;
+            return;
+        }
         let on_ball = self.ball(input, &ball);
         let on_handle = !on_ball && self.handles(input, handles.as_ref());
         if let Some(part) = self.released.take() {
@@ -574,6 +616,92 @@ impl ModelView {
             }
         }
         self.last_pointer = input.pointer;
+    }
+
+    /// The bar a clip is scrubbed on, where one plays: whether it took the pointer.
+    fn scrub(&mut self, input: &ViewportInput, size: (f32, f32)) -> bool {
+        let Some(played) = &mut self.played else { return false };
+        let bar = Bar::new(size);
+        let over = input.pointer.is_some_and(|at| bar.holds(at));
+        if over != played.over_bar {
+            played.over_bar = over;
+            self.dirty.frame = true;
+        }
+        if input.pressed.0 && over && !input.modifiers.alt {
+            played.scrubbing = true;
+        }
+        if !played.scrubbing {
+            return false;
+        }
+        if let Some((x, _)) = input.pointer {
+            played.playback.seek(bar.frame_at(x, played.playback.length));
+            played.last = None;
+            self.dirty.geometry = true;
+        }
+        if !input.held.0 {
+            played.scrubbing = false;
+        }
+        true
+    }
+
+    /// The clip's controls: play and pause, a frame each way, whether it loops, and where it is.
+    fn transport(&mut self, ui: &mut Ui) {
+        let Some(played) = &mut self.played else { return };
+        let playback = &mut played.playback;
+        let was = playback.clone();
+        ui.wrapped(|ui| {
+            if ui.button(if playback.playing { "Pause" } else { "Play" }) {
+                playback.toggle();
+            }
+            if ui.button("Frame back") {
+                playback.step(-1);
+            }
+            if ui.button("Frame on") {
+                playback.step(1);
+            }
+            playback.looped ^= ui.toggle("Loop", playback.looped);
+            #[expect(clippy::cast_precision_loss, reason = "a clip's frames")]
+            let seconds = (playback.frame / timeline::FPS, playback.length as f32 / timeline::FPS);
+            ui.styled(
+                &format!(
+                    "frame {:.0} of {}  ·  {:.2} of {:.2} s",
+                    playback.frame.floor(),
+                    playback.length,
+                    seconds.0,
+                    seconds.1
+                ),
+                Style::Note,
+            );
+        });
+        if *playback != was {
+            played.last = None;
+            self.dirty.geometry = true;
+        }
+    }
+
+    /// On by the time since the last frame, where the clip plays; and its joints where it has them now.
+    fn play(&mut self, ui: &mut Ui) {
+        let (Some(played), Some(Ok(scene))) = (&mut self.played, &mut self.scene) else { return };
+        if played.playback.playing {
+            let now = ui.time();
+            if let Some(last) = played.last {
+                #[expect(clippy::cast_possible_truncation, reason = "a frame's seconds")]
+                played.playback.advance((now - last).max(0.0) as f32);
+            }
+            played.last = Some(now);
+            self.dirty.geometry = true;
+            ui.request_repaint();
+        }
+        if self.dirty.geometry {
+            for (part, local) in
+                timeline::pose(&played.clip.clip, &played.clip.parts, &scene.rest, played.playback.frame)
+            {
+                if let Some(at) = scene.pose.get_mut(part) {
+                    *at = local;
+                }
+            }
+            self.dirty.lines = true;
+        }
     }
 
     fn lines(&self, scene: &Scene) -> Vec<u8> {
@@ -607,6 +735,9 @@ impl ModelView {
             handles.draw(&mut overlay, self.held.or(self.hovering));
         }
         Ball::new(&self.camera, size).draw(&mut overlay, pointer);
+        if let Some(played) = &self.played {
+            Bar::new(size).draw(&mut overlay, &played.playback, &played.keys, played.over_bar || played.scrubbing);
+        }
         overlay.bytes
     }
 
@@ -673,6 +804,7 @@ impl View for ModelView {
         self.editable = ui.editable();
         self.follow(ui);
         self.toolbar(ui);
+        self.transport(ui);
         if self.renderer.is_none() {
             self.renderer = Renderer::new();
         }
@@ -689,6 +821,7 @@ impl View for ModelView {
         }
         let input = ui.gpu_viewport(renderer.id(), size.0, size.1);
         self.interact(ui, &input, size);
+        self.play(ui);
         if self.dirty.geometry || self.dirty.lines || self.dirty.frame {
             self.draw(size, input.pointer);
             self.dirty.frame = false;

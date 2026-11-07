@@ -20,6 +20,9 @@ pub struct Shader {
 
 /// The texture a face's coordinates read.
 pub const MAIN: &str = "main";
+/// The depth faces read the main texture at, where it is not its image's: the M4A1 grenade launcher's round reads its
+/// 4-bit sheet as 8-bit texels.
+pub const BITS: &str = "bits";
 /// The layer the game adds over it, at the object's own page and palette offsets.
 pub const ENVIRONMENT: &str = "environment";
 
@@ -149,7 +152,17 @@ pub fn image_placement(image: &Table, placed: impl Fn(&Value) -> Option<[i64; 2]
 /// # Errors
 /// It names what the image does not hold, or what the console cannot draw.
 pub fn placement(image: &Table, texture: &Value) -> Result<Placement> {
-    let bits = image.get("bits").and_then(Value::as_integer).ok_or_else(|| anyhow!("it has no depth"))?;
+    placement_at(image, texture, None)
+}
+
+/// Where a material's texture is on the console, its texels read at `bits` where the material says (`BITS`): faces may
+/// read a texture deeper than its image is stored.
+///
+/// # Errors
+/// As `placement`.
+pub fn placement_at(image: &Table, texture: &Value, bits: Option<i64>) -> Result<Placement> {
+    let bits =
+        bits.or_else(|| image.get("bits").and_then(Value::as_integer)).ok_or_else(|| anyhow!("it has no depth"))?;
     if !matches!(bits, 4 | 8) {
         bail!("a {bits} bit image is no texture of a face");
     }
@@ -170,12 +183,15 @@ pub fn placement(image: &Table, texture: &Value) -> Result<Placement> {
 ///
 /// # Errors
 /// As what `place` says.
-pub fn binding(fields: &Table, place: impl Fn(&Value) -> Result<Placement>) -> Result<Binding> {
+pub fn binding(fields: &Table, place: impl Fn(&Value, Option<i64>) -> Result<Placement>) -> Result<Binding> {
     let read = Definition::read(|key| fields.get(key));
     let texture = if read.shader.textures.is_empty() {
         None
     } else {
-        Some(place(fields.get(MAIN).ok_or_else(|| anyhow!("it has no texture"))?)?)
+        Some(place(
+            fields.get(MAIN).ok_or_else(|| anyhow!("it has no texture"))?,
+            fields.get(BITS).and_then(Value::as_integer),
+        )?)
     };
     Ok(Binding {
         texture,

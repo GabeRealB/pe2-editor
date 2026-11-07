@@ -2,6 +2,8 @@
 //! model is (`offset`, `size`), where it loads (`address`), what its slots are called (`material_slots`), and its bytes'
 //! sha1. All of that is the recipe: what the bundle holds is the geometry. A package holding many is inflated once.
 //!
+//! A clip is read the same way, from the package that stores it first, and checked to come out the same once written.
+//!
 //! A model's `from` is where the disc stores it, and it extracts to nothing: its bytes are rebuilt from its mesh, its
 //! skeleton and its materials, and have to come out the same, so that nothing a material leaves out goes unnoticed.
 
@@ -13,6 +15,7 @@ use crate::material::{self, Definition};
 use crate::mesh;
 use crate::model::{Binding, Model, Placement, decode, encode};
 use crate::skeleton;
+use crate::{clip, clip_usd};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -57,6 +60,39 @@ pub fn models(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
     }))
 }
 
+#[expect(clippy::unnecessary_wraps, reason = "what begins an extraction may fail; this does not")]
+pub fn clips(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
+    Ok(Box::new(Clips {
+        meshes: Meshes { tables: Tables::new(declared), package: None },
+        declared: declared.declarations("clip").into_iter().collect(),
+    }))
+}
+
+/// Clips, read from where a package stores them, on the skeleton they move.
+struct Clips {
+    meshes: Meshes,
+    declared: HashMap<String, Table>,
+}
+
+impl Extraction for Clips {
+    fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
+        let declared = self.declared.get(path).ok_or_else(|| anyhow!("{path}: not a clip"))?.clone();
+        let (stored, address) = self.meshes.stored(path, &declared, release, discs)?;
+        let named = declared.get("skeleton").and_then(target).ok_or_else(|| anyhow!("{path}: it moves no skeleton"))?;
+        let table = self.meshes.tables.skeletons.get(named).ok_or_else(|| anyhow!("{path}: no skeleton {named}"))?;
+        let joints = skeleton::parse(table.get("joints").and_then(Value::as_array).map_or(&[][..], Vec::as_slice))?;
+        let decoded = clip::decode(&stored, address).map_err(|why| anyhow!("{path}: {why:#}"))?;
+        let text = clip_usd::write(&decoded, &joints).map_err(|why| anyhow!("{path}: {why:#}"))?;
+        // What the bundle holds, read back, has to be what the disc stores.
+        let again = clip::encode(&clip_usd::read(&text)?, address)?;
+        if again != stored {
+            let first = again.iter().zip(&stored).position(|(a, b)| a != b).unwrap_or(again.len().min(stored.len()));
+            bail!("{path}: written and read back it differs from the disc at {first:#x}");
+        }
+        Ok(vec![(clip_usd::FILE.to_string(), text.into_bytes())])
+    }
+}
+
 /// A model holds nothing of its own: extracting one is rebuilding what the disc stores from its mesh, its skeleton, its
 /// materials and their images, and holding that to the disc.
 struct Models {
@@ -83,11 +119,12 @@ fn placed(tables: &Tables, placement: &Value) -> Option<[i64; 2]> {
     Some([x + ax, y + ay])
 }
 
-/// Where a material's texture is on the console: all of it follows from the image's declaration.
-fn placement(tables: &Tables, texture: &Value) -> Result<Placement> {
+/// Where a material's texture is on the console: all of it follows from the image's declaration, and the depth the
+/// material reads it at where it says.
+fn placement(tables: &Tables, texture: &Value, bits: Option<i64>) -> Result<Placement> {
     let path = target(texture).ok_or_else(|| anyhow!("a texture names no image"))?;
     let image = tables.images.get(path).ok_or_else(|| anyhow!("no image {path}"))?;
-    material::placement(&material::image_placement(image, |placement| placed(tables, placement)), texture)
+    material::placement_at(&material::image_placement(image, |placement| placed(tables, placement)), texture, bits)
         .map_err(|why| anyhow!("{path}: {why:#}"))
 }
 
@@ -102,7 +139,8 @@ fn binding(tables: &Tables, model: &Table, slot: &str) -> Result<Binding> {
     let texture = if read.shader.textures.is_empty() {
         None
     } else {
-        Some(placement(tables, table.get(material::MAIN).ok_or_else(|| anyhow!("{path}: no main texture"))?)?)
+        let main = table.get(material::MAIN).ok_or_else(|| anyhow!("{path}: no main texture"))?;
+        Some(placement(tables, main, table.get(material::BITS).and_then(Value::as_integer))?)
     };
     Ok(Binding {
         texture,
@@ -272,7 +310,7 @@ mod tests {
     fn a_cell_past_a_page_is_on_the_next() {
         let texture: Table =
             "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/right' }".parse().unwrap();
-        let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
+        let at = placement(&tables(), texture.get("main").unwrap(), None).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [448, 256], palette: [0, 246] });
     }
 
@@ -280,7 +318,7 @@ mod tests {
     fn a_binding_chooses_its_palette_over_its_cells() {
         let texture: Table =
             "main = { uid = 'uid://x', path = 'res://image.node', output = 'cells/left@two' }".parse().unwrap();
-        let at = placement(&tables(), texture.get("main").unwrap()).unwrap();
+        let at = placement(&tables(), texture.get("main").unwrap(), None).unwrap();
         assert_eq!(at, Placement { bits: 8, page: [384, 256], palette: [0, 246] });
     }
 }

@@ -376,6 +376,9 @@ interface host {
         gpu-viewport: func(id: u64, width: f32, height: f32) -> viewport-input;
         /// Draw again next frame, nothing having happened: a view that is animating.
         request-repaint: func();
+        /// The host's time, in seconds from when it started, as this frame has it: what a view that animates moves by,
+        /// having no clock of its own.
+        time: func() -> f64;
         button: func(text: string) -> bool;
         /// A button showing an icon of the host's set, what it does said on hovering it; whether it was clicked.
         icon-button: func(icon: icon, hint: string) -> bool;

@@ -1185,6 +1185,10 @@ impl host::HostUi for State {
         Ok(())
     }
 
+    fn time(&mut self, ui: Resource<Frame>) -> wasmtime::Result<f64> {
+        Ok(self.frame(&ui)?.time())
+    }
+
     fn image(
         &mut self,
         ui: Resource<Frame>,

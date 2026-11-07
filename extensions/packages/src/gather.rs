@@ -336,8 +336,25 @@ fn place_of(packages: &HashMap<String, Package>, own: &str, owner: &str, entry: 
 pub fn gather(call: &mut Call) -> Result<Typed> {
     let call: &Call = call;
     let path = call.host.path().to_string();
-    let packages = packages(call)?;
-    let name = name_at(&packages, &path)?;
+    let mut packages = packages(call)?;
+    let mut name = name_at(&packages, &path)?;
+    // A variant is built as a package of its own, beside its package and named so: what it sets over the package's.
+    if let Some(variant) = variant_of(call) {
+        let base = &packages[&name];
+        let declared = with_variant(&base.declared, Some(&variant)).map_err(|why| anyhow!("{path}: {why:#}"))?;
+        let fields = pe2_ext::targeted(&declared, target_of(call).as_deref());
+        let made = Package {
+            path: base.path.clone(),
+            fields,
+            declared,
+            files: base.files.clone(),
+            dependencies: base.dependencies.clone(),
+        };
+        name = variant_name(&name, &variant);
+        if packages.insert(name.clone(), made).is_some() {
+            bail!("{path}: its variant {variant} is named {name}, as another package is");
+        }
+    }
     let own = &packages[&name];
     let (own_path, own_files) = (own.path.clone(), own.files.clone());
     let (objects, images) = linked(&packages, &name);
@@ -405,9 +422,33 @@ fn target_of(call: &Call) -> Option<String> {
     call.config().and_then(|config| config.target)
 }
 
-/// What this package's node declares, as its target reads it.
+/// The variant being built (`variants.<name>`), where one is: the package built again with what it sets over the package's.
+fn variant_of(call: &Call) -> Option<String> {
+    call.given().get("each").and_then(Value::as_str).map(str::to_string)
+}
+
+/// A package's declaration with a variant's over it: its tables merged, its lists appended, its other values replacing.
+fn with_variant(declared: &Table, variant: Option<&str>) -> Result<Table> {
+    let mut own = declared.clone();
+    let variants = own.remove("variants");
+    let Some(variant) = variant else { return Ok(own) };
+    let set = variants
+        .as_ref()
+        .and_then(|variants| variants.get(variant))
+        .and_then(Value::as_table)
+        .ok_or_else(|| anyhow!("it has no variant {variant}"))?;
+    Ok(pe2_ext::merged(&own, set))
+}
+
+/// A variant's name: a sibling of its package's (`weapons/mp5a5` and its `mp5a5_p1`: `weapons/mp5a5_p1`).
+fn variant_name(package: &str, variant: &str) -> String {
+    package.rsplit_once('/').map_or_else(|| variant.to_string(), |(parent, _)| format!("{parent}/{variant}"))
+}
+
+/// What this package's node declares, as its target reads it: a variant's, where one is built.
 fn own_fields(call: &Call) -> Table {
-    pe2_ext::targeted(&call.given(), target_of(call).as_deref())
+    let declared = with_variant(&call.given(), variant_of(call).as_deref()).unwrap_or_else(|_| call.given());
+    pe2_ext::targeted(&declared, target_of(call).as_deref())
 }
 
 /// The build graph's one table: every `package` asset by its name, with its files and what it depends on.

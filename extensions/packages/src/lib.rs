@@ -22,11 +22,13 @@ use pe2_ext::{Call, Field, Icon, Registry, Result, Retain, Table, Tint, Value, a
 
 pe2_ext::extension!(register);
 
-/// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name.
+/// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name; and the
+/// same again for each of its variants, an image each.
 const STACK: &str = r#"[[stack]]
 op = "pe2.packages@package"
 
 [[stack]]
+id = "sources"
 op = "pe2.packages@gather"
 
 [[stack]]
@@ -68,6 +70,15 @@ objects = { from = "objects" }
 [[stack]]
 op = "output"
 name = "native"
+retain = "cache"
+pull = ["pe2.events@build", "pe2.events@files-changed"]
+listen = ["pe2.events@clean"]
+deploy = "build/{config}/"
+
+[[stack]]
+op = "output"
+each = "variants"
+branch = "sources"
 retain = "cache"
 pull = ["pe2.events@build", "pe2.events@files-changed"]
 listen = ["pe2.events@clean"]
@@ -256,6 +267,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("target").label("Targets"))
         .field(Field::new("bind").custom())
         .field(Field::new("option").custom())
+        .field(Field::new("variants").custom())
         .stack(STACK)
         .contents_view("Slots", |_| Box::new(views::Slots::default()))
         .inspector_tab("Slots", Icon::Grid, &[], |_| Box::new(views::Slots::sheet()))

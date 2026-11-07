@@ -264,7 +264,7 @@ mod tests {
         let materials = vec![Material { transparent: false, slot: None, blend: None }; slots.len()];
         let model = Model { parts: vec![part(0), part(0)], materials, faces, ..Model::default() };
         let node = |name: &str| Node { name: name.to_string(), attached: None, place: None };
-        Assembled { posed: Vec::new(), model, nodes: vec![node("a"), node("b")], slots }
+        Assembled { posed: Vec::new(), model, clip: None, nodes: vec![node("a"), node("b")], slots }
     }
 
     #[test]

@@ -136,6 +136,10 @@ pub trait UiHost {
     }
     /// Draw again next frame, nothing having happened.
     fn request_repaint(&mut self) {}
+    /// The host's time, in seconds from when it started, as this frame has it: a sandboxed view has no clock.
+    fn time(&mut self) -> f64 {
+        0.0
+    }
     /// The host's chip for a reference: its asset's icon and name, opening it on a click.
     fn reference(&mut self, reference: &Value);
     /// The host's chip for a reference, taking an asset of `type` dropped on it: the reference that makes, its other keys
@@ -265,6 +269,11 @@ impl<'a> Ui<'a> {
     /// Draw again next frame, nothing having happened.
     pub fn request_repaint(&mut self) {
         self.host.request_repaint();
+    }
+
+    /// The host's time, in seconds from when it started, as this frame has it: what an animation moves by.
+    pub fn time(&mut self) -> f64 {
+        self.host.time()
     }
 
     pub fn image(&mut self, texture: &Texture, width: f32, height: f32) {

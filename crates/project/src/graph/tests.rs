@@ -206,6 +206,60 @@ fn a_stack_lowers_to_a_chain_with_taps() {
 }
 
 #[test]
+fn an_output_for_each_key_makes_its_branch_again_for_each() {
+    let declaration = r#"
+variants.p1 = {}
+variants.p2 = {}
+
+[[stack]]
+op = "file"
+file = "a.txt"
+
+[[stack]]
+id = "made"
+op = "t.upper"
+
+[[stack]]
+op = "t.count"
+
+[[stack]]
+op = "output"
+name = "native"
+
+[[stack]]
+op = "output"
+each = "variants"
+branch = "made"
+"#;
+    let (plan, wrong) = Plan::of(&toml::from_str(declaration).unwrap(), &ops(), &[]);
+    assert!(wrong.is_empty(), "{wrong:?}");
+    // The chain from `made` down, twice more: each copy takes from its own, and from the file above it as the first did.
+    let steps: Vec<_> =
+        plan.steps.iter().map(|s| (s.op.as_str(), s.inputs.clone(), s.settings.get("each").cloned())).collect();
+    let told = |key: &str| Some(toml::Value::from(key));
+    assert_eq!(
+        steps,
+        [
+            ("file", vec![], None),
+            ("t.upper", vec![vec![0]], None),
+            ("t.count", vec![vec![1]], None),
+            ("t.upper", vec![vec![0]], told("p1")),
+            ("t.count", vec![vec![3]], told("p1")),
+            ("t.upper", vec![vec![0]], told("p2")),
+            ("t.count", vec![vec![5]], told("p2")),
+        ]
+    );
+    let outputs: Vec<_> = plan.outputs.iter().map(|o| (o.name.as_str(), o.from)).collect();
+    assert_eq!(outputs[..3], [("native", 2), ("p1", 4), ("p2", 6)]);
+    assert_eq!(
+        problems(
+            "[[stack]]\nop = \"file\"\nfile = \"a\"\n[[stack]]\nop = \"output\"\neach = \"v\"\nbranch = \"nowhere\""
+        ),
+        ["stack[1]: `branch = \"nowhere\"`: no layer above it has that id"]
+    );
+}
+
+#[test]
 fn a_graph_layer_holds_a_preview() {
     let declaration = "[[stack]]\nop = \"graph\"\nresult = \"a\"\nops.a = { op = \"file\", file = \"a.txt\" }\n\
                        ops.size = { op = \"t.count\", from = { in = \"a\" } }\n\

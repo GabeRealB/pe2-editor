@@ -401,6 +401,7 @@ mod tests {
         Assembled {
             posed: Vec::new(),
             model,
+            clip: None,
             nodes: vec![node("a"), node("b")],
             slots: vec![slot("x", "m"), slot("y", "n"), slot("x", "m")],
         }

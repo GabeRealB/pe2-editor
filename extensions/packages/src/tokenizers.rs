@@ -4,10 +4,10 @@
 
 use pe2_ext::tokens::{Args, Yields};
 use pe2_ext::{Call, Data, Registry, Result, Table, Value, anyhow, bail};
-use pe2_model::material;
 use pe2_model::mesh;
 use pe2_model::model::{Arrays, Binding, Model, arrays};
 use pe2_model::skeleton;
+use pe2_model::{clip, clip_usd, material};
 
 pub const SETTINGS: &str = "settings";
 
@@ -21,10 +21,14 @@ fn placed(call: &Call, placement: &Value) -> Option<[i64; 2]> {
 }
 
 fn binding_of(call: &Call, fields: &Table) -> Result<Binding> {
-    material::binding(fields, |texture| {
+    material::binding(fields, |texture, bits| {
         let image = pe2_ext::target_of(texture).ok_or_else(|| anyhow!("its texture names nothing"))?;
         let settings = call.table_of(image, SETTINGS)?;
-        material::placement(&material::image_placement(&settings, |placement| placed(call, placement)), texture)
+        material::placement_at(
+            &material::image_placement(&settings, |placement| placed(call, placement)),
+            texture,
+            bits,
+        )
     })
 }
 
@@ -382,6 +386,138 @@ fn file_stream_id(call: &Call, args: &Args) -> Result<String> {
     bail!("it has no stream {name}")
 }
 
+/// A clip's C name, from its path: its steps after the first, in words (`characters/aya/handgun/walk` ->
+/// `_gAyaHandgunWalkClip`).
+#[must_use]
+pub fn clip_name(path: &str) -> String {
+    let steps = path.split('/').skip(1).flat_map(|step| step.split('_'));
+    let words: String = steps
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect::<String>())
+        })
+        .collect();
+    format!("_g{words}Clip")
+}
+
+/// A clip's arrays and its `AnimationSet`, as one line of C, its arrays named after it.
+#[must_use]
+pub fn clip_definition(name: &str, arrays: &clip::Arrays) -> String {
+    let rows = |rows: Vec<String>| rows.join(", ");
+    let mut out = Vec::new();
+    let mut banks = Vec::new();
+    if !arrays.translations.is_empty() {
+        let poses = arrays
+            .translations
+            .iter()
+            .map(|pose| format!("{{ {} }}", items(pose.map(|v| Value::Integer(i64::from(v))))));
+        out.push(format!("static AnimationPackedPose {name}Bank1[] = {{ {} }};", rows(poses.collect())));
+        banks.push(format!("[1] = {name}Bank1"));
+    }
+    if !arrays.rotations.is_empty() {
+        let steps = arrays
+            .rotations
+            .iter()
+            .map(|steps| format!("{{ {} }}", items(steps.map(|v| Value::Integer(i64::from(v))))));
+        out.push(format!("static AnimationPackedRotation {name}Bank4[] = {{ {} }};", rows(steps.collect())));
+        banks.push(format!("[4] = {name}Bank4"));
+    }
+    let records =
+        arrays.records.iter().map(|(offset, frames, flags)| format!("{{ {offset}, {frames}, {flags:#04X} }}"));
+    out.push(format!("static AnimationRecord {name}Records[] = {{ {} }};", rows(records.collect())));
+    let starts = arrays.starts.iter().map(u16::to_string);
+    out.push(format!("static u16 {name}TrackStarts[] = {{ {} }};", rows(starts.collect())));
+    out.push(format!(
+        "static AnimationSet {name} = {{ .records = {name}Records, .trackStartIndices = {name}TrackStarts, .poseBanks = {{ {} }} }};",
+        banks.join(", ")
+    ));
+    out.join(" ")
+}
+
+/// A bank and the banks it is laid over, nearest first.
+fn bank_chain(call: &Call) -> Result<Vec<Table>> {
+    let mut chain = vec![call.given()];
+    while let Some(base) = chain.last().and_then(|bank| bank.get("base")).and_then(pe2_ext::target_of) {
+        if chain.len() > 32 {
+            bail!("its bases go round");
+        }
+        let next = call.table_of(base, SETTINGS)?;
+        chain.push(next);
+    }
+    Ok(chain)
+}
+
+/// What a bank is: its schema, its filled slots each with its clip, and the clips it stores, in order.
+struct Bank {
+    schema: Table,
+    filled: Vec<(String, String)>,
+    stored: Vec<String>,
+}
+
+/// A bank's slots and what fills each, by the schema its chain names, and the clips it stores in the order it stores
+/// them: its `order`, then what its slots reach that the order leaves out.
+fn bank_of(call: &Call) -> Result<Bank> {
+    let chain = bank_chain(call)?;
+    let schema = chain
+        .iter()
+        .find_map(|bank| bank.get("schema").and_then(pe2_ext::target_of))
+        .ok_or_else(|| anyhow!("no bank it is laid over names a schema"))?;
+    let schema = call.table_of(schema, SETTINGS)?;
+    let names = schema.get("names").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut filled = Vec::new();
+    for name in names.iter().filter_map(Value::as_str).filter(|name| !name.is_empty()) {
+        let clip = chain.iter().find_map(|bank| bank.get("clips")?.get(name).and_then(pe2_ext::target_of));
+        if let Some(clip) = clip {
+            filled.push((name.to_string(), clip.to_string()));
+        }
+    }
+    let order = chain.first().and_then(|bank| bank.get("order")).and_then(Value::as_array);
+    let mut stored: Vec<String> =
+        order.into_iter().flatten().filter_map(pe2_ext::target_of).map(str::to_string).collect();
+    for (_, clip) in &filled {
+        if !stored.contains(clip) {
+            stored.push(clip.clone());
+        }
+    }
+    Ok(Bank { schema, filled, stored })
+}
+
+/// A clip's arrays, from what its node makes, and its path.
+fn clip_arrays(call: &Call, reference: &str) -> Result<(String, clip::Arrays)> {
+    let path = call.node_named(reference).ok_or_else(|| anyhow!("no clip {reference}"))?.path;
+    let Data::Typed(stored) = call.output_of(reference, "native")? else { bail!("{path}: its output is no clip") };
+    let read =
+        clip_usd::read(&String::from_utf8(call.read(stored.file()?)?)?).map_err(|why| anyhow!("{path}: {why:#}"))?;
+    Ok((path.clone(), clip::arrays(&read).map_err(|why| anyhow!("{path}: {why:#}"))?))
+}
+
+/// A bank as the game stores it: every clip it stores, then `AnimationSet* <symbol>[capacity]` naming each slot's.
+fn bank_whole(call: &Call, args: &Args) -> Result<String> {
+    let symbol = args.one("symbol")?;
+    let Bank { schema, filled, stored } = bank_of(call)?;
+    let prefix = schema.get("prefix").and_then(Value::as_str).unwrap_or_default();
+    let capacity =
+        schema.get("capacity").and_then(Value::as_integer).ok_or_else(|| anyhow!("its schema has no capacity"))?;
+    let mut defined: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    for reference in &stored {
+        let (path, arrays) = clip_arrays(call, reference)?;
+        let name = clip_name(&path);
+        out.push(clip_definition(&name, &arrays));
+        defined.push((reference.clone(), name));
+    }
+    let defined_as = |clip: &str| defined.iter().find(|(reference, _)| reference == clip).map(|(_, name)| name.clone());
+    let entries: Vec<String> = filled
+        .iter()
+        .map(|(slot, clip)| {
+            let name = defined_as(clip).ok_or_else(|| anyhow!("{slot}: its clip is not stored"))?;
+            Ok(format!("[{prefix}{}] = &{name}", slot.to_uppercase()))
+        })
+        .collect::<Result<_>>()?;
+    out.push(format!("AnimationSet* {symbol}[{capacity}] = {{ {} }};", entries.join(", ")));
+    Ok(out.join(" "))
+}
+
 pub fn register(r: &mut Registry) {
     r.tokenizer(&["pe2.render@model"])
         .follows()
@@ -395,6 +531,11 @@ pub fn register(r: &mut Registry) {
         .whole(Yields::Definition("TmdSource"), &["symbol", "member"], member_whole)
         .derived("buffer", Yields::IntLiteral, &["member"], member_buffer)
         .derived("seam", Yields::IntLiteral, &["member"], member_seam)
+        .register();
+    // A bank, with the clips it stores.
+    r.tokenizer(&["pe2.render@animation_bank"])
+        .follows()
+        .whole(Yields::Definition("AnimationSet*"), &["symbol"], bank_whole)
         .register();
     r.tokenizer(&["pe2.render@material"])
         .follows()
@@ -465,5 +606,31 @@ mod tests {
         assert!(text.contains("static SVECTOR _gBodyVerts[] = { { 1, 2, 3, 0 } };"), "{text}");
         assert!(text.ends_with(".stream = _gBodyStream };"), "{text}");
         assert!(text.find("_gBodyStream[]") < text.find("TmdSource gBody"));
+    }
+
+    #[test]
+    fn a_clip_is_named_by_its_path_after_its_first_step() {
+        assert_eq!(clip_name("characters/aya/handgun/walk"), "_gAyaHandgunWalkClip");
+        assert_eq!(clip_name("weapons/m93r/aim_idle"), "_gM93rAimIdleClip");
+    }
+
+    #[test]
+    fn a_clip_is_its_arrays_then_its_set() {
+        let arrays = clip::Arrays {
+            translations: vec![[0, -928, 0, 0, 0, 0]],
+            rotations: vec![[1, -2, 3]],
+            records: vec![(0, 1, 0x01), (0, 128, 0xC0), (0, 4, 0x14), (0, 128, 0xC0)],
+            starts: vec![0, 2],
+        };
+        let text = clip_definition("_gIdleClip", &arrays);
+        assert_eq!(
+            text,
+            "static AnimationPackedPose _gIdleClipBank1[] = { { 0, -928, 0, 0, 0, 0 } }; \
+             static AnimationPackedRotation _gIdleClipBank4[] = { { 1, -2, 3 } }; \
+             static AnimationRecord _gIdleClipRecords[] = { { 0, 1, 0x01 }, { 0, 128, 0xC0 }, { 0, 4, 0x14 }, { 0, 128, 0xC0 } }; \
+             static u16 _gIdleClipTrackStarts[] = { 0, 2 }; \
+             static AnimationSet _gIdleClip = { .records = _gIdleClipRecords, .trackStartIndices = _gIdleClipTrackStarts, \
+             .poseBanks = { [1] = _gIdleClipBank1, [4] = _gIdleClipBank4 } };"
+        );
     }
 }

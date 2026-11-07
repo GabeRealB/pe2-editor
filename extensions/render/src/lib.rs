@@ -7,7 +7,7 @@ use pe2_ext::{Asset, Cell, Field, Icon, Registry, Result, Signature, Style, Tabl
 
 pe2_ext::extension!(register);
 
-pub(crate) use pe2_model::{material, mesh, model, skeleton};
+pub(crate) use pe2_model::{clip, clip_usd, material, mesh, model, skeleton};
 
 mod assembly;
 #[cfg(any(target_family = "wasm", test))]
@@ -41,6 +41,12 @@ mod render;
     expect(dead_code, reason = "tested here, used by the view, which is the component's")
 )]
 mod scene;
+#[cfg(any(target_family = "wasm", test))]
+#[cfg_attr(
+    not(target_family = "wasm"),
+    expect(dead_code, reason = "tested here, used by the view, which is the component's")
+)]
+mod timeline;
 mod uv;
 #[cfg(target_family = "wasm")]
 mod view;
@@ -62,6 +68,20 @@ impl Registered for Usd {
 }
 
 impl Files for Usd {}
+
+/// A clip, in USD's text form.
+pub struct ClipUsd;
+
+impl Registered for ClipUsd {
+    const NAME: &str = "pe2.render@clip_usd";
+    const LABEL: &str = "Clip as USD text";
+
+    fn signatures() -> Vec<Signature> {
+        vec![Signature::Name(clip_usd::FILE.into())]
+    }
+}
+
+impl Files for ClipUsd {}
 
 /// What a viewer of a model shows: a mesh, a model with its materials filled or a prefab's models in one tree, with
 /// where each transform is kept (`assembly::Assembled`).
@@ -100,6 +120,44 @@ node = { from = "mesh" }
 op = "preview"
 name = "scene"
 retain = "cache"
+"#;
+
+/// A clip's stack: its file, and the skeleton it moves.
+const CLIP: &str = r#"[[stack]]
+id = "clip"
+op = "file"
+file = "clip.usda"
+
+[[stack]]
+op = "output"
+name = "native"
+retain = "cache"
+
+[[stack]]
+op = "pe2.render@skeleton_of"
+
+[[stack]]
+op = "output"
+name = "skeleton"
+
+[[stack]]
+op = "pe2.render@assemble"
+node = { from = "clip" }
+
+[[stack]]
+op = "preview"
+name = "scene"
+retain = "cache"
+"#;
+
+/// A schema: the slots a bank of it has, their names by index.
+const SCHEMA: &str = r#"[[stack]]
+op = "pe2.render@animation_schema"
+"#;
+
+/// A bank: its slots, filled by its own clips and its bases'.
+const BANK: &str = r#"[[stack]]
+op = "pe2.render@animation_bank"
 "#;
 
 /// A material: what is set on it, shown on a ball.
@@ -207,7 +265,7 @@ fn links(r: &mut Registry) {
     let _ = r
         .op("skeleton_of")
         .label("Its skeleton")
-        .takes("mesh", &[Usd::NAME])
+        .takes("mesh", &[Usd::NAME, ClipUsd::NAME])
         .output::<ty::Table>()
         .run(|call| link(call.given().get("skeleton")));
     let _ = r
@@ -240,6 +298,47 @@ fn links(r: &mut Registry) {
         });
 }
 
+/// Clips, their schemas and their banks. A clip is what a package stores, read from it; a schema and a bank are made by
+/// hand, a bank's slots each a clip of its own or what its base has there.
+fn animation_types(r: &mut Registry) {
+    let _ = r.value_type::<ClipUsd>();
+    let clip = r
+        .named_type("clip")
+        .alias("clip")
+        .label("Clip")
+        .of(ClipUsd::NAME)
+        .icon(Icon::Bone, Tint::Motion)
+        .stack(CLIP)
+        .takes(&["clip.usda"])
+        .register();
+    let _ = r.extractor("clips", &clip, &[], extract::clips);
+    let schema = r
+        .named_type("animation_schema")
+        .alias("animation_schema")
+        .label("Animation schema")
+        .data()
+        .stack(SCHEMA)
+        .icon(Icon::Grid, Tint::Structure)
+        .field(Field::new("prefix").label("C names"))
+        .field(Field::new("capacity").label("Slots stored"))
+        .field(Field::new("names").custom())
+        .register();
+    let _ = r.extractor("animation_schemas", &schema, &[], extract::authored);
+    let bank = r
+        .named_type("animation_bank")
+        .alias("animation_bank")
+        .label("Animation bank")
+        .data()
+        .stack(BANK)
+        .icon(Icon::Stack, Tint::Motion)
+        .field(Field::new("schema").label("Schema"))
+        .field(Field::new("base").label("Base"))
+        .field(Field::new("clips").custom())
+        .field(Field::new("order").custom())
+        .register();
+    let _ = r.extractor("animation_banks", &bank, &[], extract::authored);
+}
+
 /// A material: its shader, surface, blend and effect, and its textures, extracted as authored.
 fn material_type(r: &mut Registry) {
     let material = r
@@ -257,6 +356,7 @@ fn material_type(r: &mut Registry) {
         .field(Field::new("surface").label("Surface").choices(material::SURFACES))
         .field(Field::new("blend").label("Blend").choices(material::BLENDS.iter().map(|(id, label, _)| (*id, *label))))
         .field(Field::new(material::EFFECT).label("Effect"))
+        .field(Field::new(material::BITS).label("Texel depth"))
         .field(Field::new(material::MAIN).custom())
         .field(Field::new(material::ENVIRONMENT).custom())
         .contents(parts::contents)
@@ -273,7 +373,7 @@ fn register(r: &mut Registry) -> Result<()> {
     let scene_type = r.value_type::<Scene>();
     r.viewer(&scene_type, "3D", Icon::Cube, |_| make_view());
     r.viewer(&scene_type, "UV", Icon::Grid, |_| Box::new(uv::UvView::default()));
-    let shown = [Usd::NAME, "pe2.render@material", "pe2.render@skeleton", MODEL, PREFAB];
+    let shown = [Usd::NAME, ClipUsd::NAME, "pe2.render@material", "pe2.render@skeleton", MODEL, PREFAB];
     let _ = r
         .op("assemble")
         .label("What it shows")
@@ -305,6 +405,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .register();
     let _ = r.extractor("meshes", &mesh, &[], extract::begin);
     material_type(r);
+    animation_types(r);
     let skeleton = r
         .named_type("skeleton")
         .alias("skeleton")

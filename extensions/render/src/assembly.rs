@@ -96,12 +96,23 @@ impl Slot {
 #[derive(Serialize, Deserialize)]
 pub struct Assembled {
     pub model: Model,
+    /// What a clip shows: the clip, and the part each of its tracks moves.
+    #[serde(default)]
+    pub clip: Option<Played>,
     /// The joints a prefab moves from where the skeleton has them.
     pub posed: Vec<String>,
     /// By the model's part.
     pub nodes: Vec<Node>,
     /// By the model's material.
     pub slots: Vec<Slot>,
+}
+
+/// A clip as a view plays it: its tracks, and by track the part of what is shown it moves (none where nothing there
+/// is that joint).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Played {
+    pub clip: crate::clip::Clip,
+    pub parts: Vec<Option<usize>>,
 }
 
 /// What a scene is made from: the nodes it reaches, read as an operation reads them, and the member shown of each group.
@@ -262,7 +273,7 @@ fn mesh_of(nodes: &Nodes, mesh: &Asset) -> Result<Assembled> {
         mesh::pose(&mut model, &joints)?;
         shown = joints.into_iter().map(|joint| Node { name: joint.name, attached: None, place: None }).collect();
     }
-    Ok(Assembled { posed: Vec::new(), model, nodes: shown, slots })
+    Ok(Assembled { posed: Vec::new(), model, clip: None, nodes: shown, slots })
 }
 
 fn model_of(
@@ -295,7 +306,13 @@ fn skeleton_of(asset: &Asset) -> Result<Assembled> {
     let named = joints.into_iter().enumerate();
     let nodes =
         named.map(|(at, joint)| Node { name: joint.name, attached: None, place: Some(Place::Joint(at)) }).collect();
-    Ok(Assembled { posed: Vec::new(), model: Model { parts, ..Model::default() }, nodes, slots: Vec::new() })
+    Ok(Assembled {
+        posed: Vec::new(),
+        model: Model { parts, ..Model::default() },
+        clip: None,
+        nodes,
+        slots: Vec::new(),
+    })
 }
 
 const BALL_RADIUS: f64 = 350.0;
@@ -362,6 +379,7 @@ fn material_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     Ok(Assembled {
         posed: Vec::new(),
         model,
+        clip: None,
         nodes: vec![Node { name: leaf(asset.path()).to_string(), attached: None, place: None }],
         slots: vec![slot],
     })
@@ -463,6 +481,39 @@ fn prefab_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
     Ok(tree)
 }
 
+/// A clip, on what it moves: the prefab built on its skeleton, a weapon's clip with that weapon in hand where the prefab
+/// has it, else the skeleton's joints alone.
+fn clip_of(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
+    let clip = crate::clip_usd::read(&String::from_utf8_lossy(&asset.read(crate::clip_usd::FILE)?))?;
+    let skeleton = resolved(nodes, asset, "skeleton", asset.field("skeleton"))?;
+    let joints = skeleton::of(&skeleton.asset())?;
+    let mut prefabs = nodes.call.assets_of("prefab")?.into_iter().filter_map(|(path, declaration)| {
+        let table: Table = declaration.parse().ok()?;
+        let named = table.get("skeleton").and_then(pe2_ext::target_of)?;
+        let same = skeleton.uid.as_deref() == Some(named)
+            || named.trim_start_matches("res://").trim_end_matches(".node") == skeleton.path;
+        same.then_some(path)
+    });
+    let mut tree = match prefabs.next() {
+        Some(path) => {
+            let prefab = nodes.named(&path)?;
+            // A weapon's clips (`weapons/<weapon>/...`) show it held.
+            let mut chosen = nodes.chosen.clone();
+            if let Some(weapon) = asset.path().strip_prefix("weapons/").and_then(|rest| rest.split('/').next()) {
+                chosen.entry("weapon".to_string()).or_insert_with(|| weapon.to_string());
+            }
+            prefab_of(&Nodes { call: nodes.call, chosen }, &prefab.asset())?
+        }
+        None => skeleton_of(&skeleton.asset())?,
+    };
+    if clip.tracks.len() != joints.len() {
+        bail!("{}: {} tracks for {} joints", asset.path(), clip.tracks.len(), joints.len());
+    }
+    let parts = joints.iter().map(|joint| tree.nodes.iter().position(|node| node.name == joint.name)).collect();
+    tree.clip = Some(Played { clip, parts });
+    Ok(tree)
+}
+
 /// Hang `child` under `node` of `tree`: its parts follow the tree's, and whatever it names by index moves with them.
 pub fn attach(tree: &mut Model, mut child: Model, node: usize) {
     let (parts, materials, normals) = (tree.parts.len(), tree.materials.len(), tree.normals.len());
@@ -524,6 +575,7 @@ fn built(nodes: &Nodes, asset: &Asset) -> Result<Assembled> {
         Some("material") => material_of(nodes, asset),
         Some("model") => model_of(nodes, asset, None, None),
         Some("prefab") => prefab_of(nodes, asset),
+        Some("clip") => clip_of(nodes, asset),
         other => Err(anyhow!("{}: a {other:?} does not show in 3D", asset.path())),
     }?;
     for (material, slot) in assembled.model.materials.iter_mut().zip(&assembled.slots) {
