@@ -1752,6 +1752,7 @@ impl Extensions {
                 continue;
             }
             op.strict = true;
+            op.stepped = def.stepped;
             if let Some(prepare) = def.prepare.clone() {
                 op.prepare = Some(Arc::new(move |call| {
                     let inputs = call.take_inputs();

@@ -16,6 +16,8 @@ const GPU_EVERY: Duration = Duration::from_secs(3);
 const ASKED_FOR: Duration = Duration::from_secs(30);
 /// The overlay's type: a corner's worth, at any zoom it is read in.
 const TEXT: f32 = 9.0;
+/// The spans an agent is given, the costliest.
+const SPANS: usize = 25;
 
 #[derive(Clone, Default, Serialize)]
 pub struct Sample {
@@ -93,7 +95,29 @@ pub fn read() -> serde_json::Value {
     let shared = shared();
     *shared.asked.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
     let sample = shared.sample.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    serde_json::to_value(sample).unwrap_or_default()
+    let mut value = serde_json::to_value(sample).unwrap_or_default();
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("spans".into(), spans());
+    }
+    value
+}
+
+/// How many spans of each kind the editor has run since it started and what they took (`project::profile`), the
+/// costliest first: work run in parallel totals more than it took.
+fn spans() -> serde_json::Value {
+    let millis = |d: Duration| (d.as_secs_f64() * 1e4).round() / 10.0;
+    let totals = project::profile::totals();
+    let rows = totals.iter().take(SPANS).map(|t| {
+        let mean = t.total.as_secs_f64() / f64::from(u32::try_from(t.count.max(1)).unwrap_or(u32::MAX));
+        serde_json::json!({
+            "span": t.name,
+            "count": t.count,
+            "total_ms": millis(t.total),
+            "mean_ms": (mean * 1e4).round() / 10.0,
+            "longest_ms": millis(t.longest),
+        })
+    });
+    serde_json::Value::Array(rows.collect())
 }
 
 fn sample_forever(shared: &Shared) {

@@ -177,16 +177,29 @@ name = "items"
 "#;
 
 /// A list's item: what its reference names, as the reference names it - an output of a node leads on where that output does.
+#[pe2_ext::steps]
 fn item(call: &mut Call) -> Result<Table> {
+    let reference: Value = item_reference(call)?;
+    // An output of another node is read; anything else is the item as it is.
+    let read: Vec<(String, String)> = match (pe2_ext::target_of(&reference), pe2_ext::output_of(&reference)) {
+        (Some(node), Some(output)) => vec![(node.to_string(), output.to_string())],
+        _ => Vec::new(),
+    };
+    #[request]
+    let mut got: Vec<Table> = call.tables_of(read.iter().map(|(node, output)| (node.as_str(), output.as_str())))?;
+    match got.pop() {
+        Some(table) => Ok(table),
+        None => pe2_ext::tokens::link(Some(&reference)),
+    }
+}
+
+/// The item a list's member is: the reference its parameter's index names.
+fn item_reference(call: &Call) -> Result<Value> {
     let index: String = call.parameter()?;
     let given = call.given();
     let items = given.get("items").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     let at: usize = index.parse().map_err(|_| anyhow!("{index} is no index"))?;
-    let reference = items.get(at).ok_or_else(|| anyhow!("it has {} items, and no item {at}", items.len()))?;
-    match (pe2_ext::target_of(reference), pe2_ext::output_of(reference)) {
-        (Some(node), Some(output)) => call.table_of(node, output),
-        _ => pe2_ext::tokens::link(Some(reference)),
-    }
+    items.get(at).cloned().ok_or_else(|| anyhow!("it has {} items, and no item {at}", items.len()))
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -204,8 +217,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("Slots and values")
         .input::<SourceTree>("sources")
         .output::<SourceTree>()
-        .prepared_by_running()
-        .run(gather::resolve);
+        .steps(gather::resolve());
     tokenizers::register(r);
     let _ = r
         .op("item")
@@ -217,8 +229,7 @@ fn register(r: &mut Registry) -> Result<()> {
             let count = asset.field("items").and_then(Value::as_array).map_or(0, Vec::len);
             (0..count).map(|at| (at.to_string(), at.to_string())).collect()
         })
-        .prepared_by_running()
-        .run(item);
+        .steps(item());
     r.named_type("list")
         .alias("list")
         .label("List")

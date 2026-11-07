@@ -530,7 +530,8 @@ impl pe2_ext::Discs for Reader<'_> {
 struct Sourcing<'a> {
     extensions: &'a Extensions,
     engine: crate::graph::exec::Engine,
-    sources: usize,
+    /// How many assets were written as their sources, by every worker.
+    sources: std::sync::atomic::AtomicUsize,
 }
 
 /// An asset as extraction lends it to its importer: its declaration and the files given.
@@ -645,7 +646,7 @@ impl Sourcing<'_> {
     /// by its stack with the declaration less what the import derives, and compared, files and settings both; its
     /// import kept.
     fn bundle(
-        &mut self,
+        &self,
         path: &str,
         asset: &crate::declarations::Asset,
         toml: String,
@@ -726,7 +727,7 @@ impl Sourcing<'_> {
                 resolved.orphans
             );
         }
-        self.sources += 1;
+        self.sources.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok((written, written_files))
     }
 }
@@ -762,22 +763,111 @@ fn file_assets(decl: &Declarations) -> HashMap<(String, u32, Option<u32>, u32), 
     files
 }
 
+/// An asset as extraction read it, for a worker to finish: its bundle's `node.toml`, stack stamped, and the files
+/// read for it - to be written as they are, or, `sourced`, as its import's source where it has one.
+struct Extracted<'a> {
+    path: &'a str,
+    asset: &'a crate::declarations::Asset,
+    toml: String,
+    made: pe2_ext::Made,
+    sourced: bool,
+}
+
 /// Every asset located in the releases, read from its slots, checked and written as a bundle. Returns their count,
 /// and how many were written as their sources.
+///
+/// Reading is this thread's, in the declarations' order, as the discs and the extractors' sessions are read in turn;
+/// what follows for each asset - its source written and imported back, its bundle written - is the workers', as many
+/// as there are threads to lend, each asset on its own. Those waiting are at most as many as the workers, so what is
+/// held at once is a few assets' files, whatever the layer's size.
 fn write_assets(
     layer: &Path,
     decl: &Declarations,
     releases: &[String],
     discs: &mut Discs,
-    mut sourcing: Sourcing,
+    sourcing: &Sourcing,
 ) -> Result<(usize, usize)> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let written = AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::default();
+    let stop = AtomicBool::new(false);
+    let finish = |item: Extracted<'_>| {
+        let done = (|| -> Result<()> {
+            let (toml, made) = if item.sourced {
+                let _span = tracing::info_span!("source", of = %item.asset.template, path = %item.path).entered();
+                sourcing.bundle(item.path, item.asset, item.toml, item.made)?
+            } else {
+                (item.toml, item.made)
+            };
+            let _span = tracing::info_span!("write bundle").entered();
+            let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
+            files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+            write_bundle(layer, item.path, &files)
+        })();
+        match done {
+            Ok(()) => {
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => {
+                stop.store(true, Ordering::Relaxed);
+                if let Ok(mut failed) = failed.lock() {
+                    failed.get_or_insert(why);
+                }
+            }
+        }
+    };
+    let lent = crate::Lend::threads(usize::MAX);
+    let (send, receive) = std::sync::mpsc::sync_channel::<Extracted<'_>>(lent.count);
+    let receive = std::sync::Mutex::new(receive);
+    let read = std::thread::scope(|scope| {
+        for _ in 0..lent.count {
+            scope.spawn(|| {
+                while let Ok(item) = receive.lock().map_err(drop).and_then(|r| r.recv().map_err(drop)) {
+                    finish(item);
+                }
+            });
+        }
+        // With no thread to lend, this one finishes each asset as it reads it.
+        let hand = |item| {
+            if lent.count == 0 {
+                finish(item);
+            } else if let Err(unsent) = send.send(item) {
+                finish(unsent.0);
+            }
+        };
+        let read = read_assets(decl, releases, discs, sourcing, &stop, &hand);
+        drop(send);
+        read
+    });
+    drop(lent);
+    if let Some(why) = failed.into_inner().ok().flatten() {
+        return Err(why);
+    }
+    read?;
+    Ok((written.into_inner(), sourcing.sources.load(Ordering::Relaxed)))
+}
+
+/// Each asset read from the discs in the declarations' order - its extractor's session, or its slots' bytes - and its
+/// bundle's `node.toml` stamped, handed on to be finished; until `stop`.
+fn read_assets<'a>(
+    decl: &'a Declarations,
+    releases: &[String],
+    discs: &mut Discs,
+    sourcing: &Sourcing,
+    stop: &std::sync::atomic::AtomicBool,
+    hand: &dyn Fn(Extracted<'a>),
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
     let files = file_assets(decl);
     let mut containers = Containers { open: HashMap::new() };
     let extensions = sourcing.extensions;
     // An extractor's session, begun with the first of its assets.
     let mut sessions: HashMap<String, Box<dyn pe2_ext::Extraction>> = HashMap::new();
-    let mut written = 0;
     for (path, asset) in &decl.assets {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let _span = tracing::info_span!("extract", of = %asset.template, path = %path).entered();
         let node_type = extensions.template(&asset.template).map_or("", |template| template.node_type.as_str());
         if let Some(extractor) = extensions.extractor_for(node_type, |field| asset.table.contains_key(field)) {
             let name = extractor.name.to_string();
@@ -801,11 +891,7 @@ fn write_assets(
             let folder = made_folder(&made);
             let toml =
                 sourcing.stack(path, &asset.template, folder.as_deref(), &asset_toml(&asset.body, &originals)?)?;
-            let (toml, made) = sourcing.bundle(path, asset, toml, made)?;
-            let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
-            files.extend(made.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
-            write_bundle(layer, path, &files)?;
-            written += 1;
+            hand(Extracted { path, asset, toml, made, sourced: true });
             continue;
         }
         // A container assembled from its movies (a disc's movie file) has no bytes of its own: its stack joins its
@@ -814,8 +900,7 @@ fn write_assets(
             let originals: Vec<(String, String)> =
                 releases.iter().filter_map(|r| Some((r.clone(), asset.from.get(r)?.sha1.clone()?))).collect();
             let toml = sourcing.stack(path, &asset.template, None, &asset_toml(&asset.body, &originals)?)?;
-            write_bundle(layer, path, &[("node.toml", toml.as_bytes())])?;
-            written += 1;
+            hand(Extracted { path, asset, toml, made: Vec::new(), sourced: false });
             continue;
         }
         let mut native: Option<Vec<u8>> = None;
@@ -863,14 +948,10 @@ fn write_assets(
             native.as_ref().map(|_| name.as_str()),
             &asset_toml(&asset.body, &originals)?,
         )?;
-        let mut files: Vec<(&str, &[u8])> = vec![("node.toml", toml.as_bytes())];
-        if let Some(native) = &native {
-            files.push((&name, native));
-        }
-        write_bundle(layer, path, &files)?;
-        written += 1;
+        let made = native.map_or_else(Vec::new, |native| vec![(name, native)]);
+        hand(Extracted { path, asset, toml, made, sourced: false });
     }
-    Ok((written, sourcing.sources))
+    Ok(())
 }
 
 /// A bundle of the layer as written, as a node of the work graph: its declaration and stored files as on disk, each
@@ -1007,7 +1088,7 @@ fn make_assembled(
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
 ) -> Result<usize> {
-    let world = Layer::new(layer, decl, &engine.ops, extensions);
+    let world = tracing::info_span!("world").in_scope(|| Layer::new(layer, decl, &engine.ops, extensions));
     let reach = crate::graph::exec::Reach { engine, world: &world };
     let mut made = 0;
     for (path, asset) in &decl.assets {
@@ -1020,6 +1101,7 @@ fn make_assembled(
             .result_output()
             .map(|o| plan.outputs[o].name.clone())
             .with_context(|| format!("{path}: its stack keeps no result"))?;
+        let _span = tracing::info_span!("assembled", path = %path).entered();
         let given = engine
             .output_in(Some(reach), &plan, node, &result, None, true)
             .with_context(|| format!("{path}: its movies could not be joined"))?;
@@ -1152,7 +1234,9 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
         Some(p) => p.clone(),
         None => project.resolve(&game.declarations)?,
     };
+    let phase = tracing::info_span!("extraction", of = "declarations").entered();
     let decl = Declarations::load(&decl_root)?;
+    drop(phase);
     let roms = options.roms.clone().unwrap_or_else(|| game.roms.clone());
     let layer = project.layer(&game.layer)?.path.clone();
     let (root, abs_layer) = (fs::canonicalize(&project.root)?, std::path::absolute(&layer)?);
@@ -1163,17 +1247,33 @@ pub fn extract(project: &Project, options: &Options, lock: &Lock, extensions: &E
         bail!("{} is a link: the game layer is the extraction's own folder", layer.display());
     }
     // Every disc is opened first: a missing or foreign image stops extraction before the layer is touched.
+    let phase = tracing::info_span!("extraction", of = "discs").entered();
     let mut discs = open_discs(game, &decl, &releases, &roms)?;
+    drop(phase);
     if layer.exists() {
         fs::remove_dir_all(&layer)?; // the layer is the extraction's alone
     }
     fs::create_dir_all(&layer)?;
     let cache = crate::cache::Cache::open(project, lock)?;
-    let sourcing = Sourcing { extensions, engine: Imports::open(&cache)?.engine(extensions), sources: 0 };
-    let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, sourcing)?;
+    let sourcing = Sourcing {
+        extensions,
+        engine: Imports::open(&cache)?.engine(extensions),
+        sources: std::sync::atomic::AtomicUsize::default(),
+    };
+    let phase = tracing::info_span!("extraction", of = "assets").entered();
+    let (assets, sources) = write_assets(&layer, &decl, &releases, &mut discs, &sourcing)?;
+    drop(phase);
+    let phase = tracing::info_span!("extraction", of = "layouts").entered();
     let layouts = write_layouts(&layer, &decl, &releases, &discs, extensions)?;
+    drop(phase);
+    let phase = tracing::info_span!("extraction", of = "assembled").entered();
     make_assembled(&layer, &decl, &releases, &Imports::open(&cache)?.engine(extensions), extensions)?;
+    drop(phase);
+    let phase = tracing::info_span!("extraction", of = "record").entered();
     write_record(&layer, &decl_root, &releases, &discs)?;
+    drop(phase);
+    let phase = tracing::info_span!("extraction", of = "changeset").entered();
     write_changeset(project, &game.layer, &decl, &releases)?;
+    drop(phase);
     Ok(Report { layer, assets, layouts, sources })
 }

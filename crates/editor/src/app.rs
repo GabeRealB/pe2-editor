@@ -2106,6 +2106,9 @@ impl eframe::App for Editor {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // The frame before ended where this one begins.
+        project::profile::frame();
+        let _span = tracing::info_span!("frame").entered();
         let ctx = ui.ctx().clone();
         let pixels = ctx.content_rect().size() * ctx.pixels_per_point();
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a window's pixels")]

@@ -316,6 +316,7 @@ impl Store {
     /// # Errors
     /// It cannot be written, or a content of it found.
     pub fn put(&self, hash: &str, value: &Value, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<()> {
+        let _span = tracing::info_span!("store put").entered();
         // Kept already, as this store reads values (one written otherwise is written again).
         if self.describe(hash).is_some() {
             return Ok(());
@@ -390,6 +391,7 @@ impl Store {
     /// # Errors
     /// It is not kept, or a blob of it cannot be read.
     pub fn get(&self, hash: &str) -> Result<Value> {
+        let _span = tracing::info_span!("store get").entered();
         let kept = self.describe(hash).with_context(|| format!("{hash}: not kept"))?;
         let file =
             |f: KeptFile| File { name: f.name, content: Content::Stored { sha1: f.blob.sha1, size: f.blob.size } };

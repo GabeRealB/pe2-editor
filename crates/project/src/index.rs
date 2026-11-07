@@ -918,6 +918,7 @@ impl Index {
     /// # Errors
     /// As `open`.
     pub fn open_reporting(project: &Project, cache: &Cache, report: &Report<'_>) -> Result<Index> {
+        let _span = tracing::info_span!("index open").entered();
         report("Reading what the cache knows", 0, 0);
         Index::over(Arc::new(Store::open(&cache.path(STORE))?), project, report)
     }

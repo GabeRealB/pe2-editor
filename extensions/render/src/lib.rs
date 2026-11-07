@@ -379,9 +379,8 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("What it shows")
         .takes("node", &shown)
         .output::<Scene>()
-        .prepared_by_running()
         .parameter::<String>("chosen")
-        .run(assembly::scene);
+        .steps(pe2_ext::stepped::replayed(assembly::scene));
     links(r);
     let _ = r
         .op("member")

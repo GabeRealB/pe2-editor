@@ -184,6 +184,7 @@ pub type Result = eframe::Result;
 /// # Errors
 /// Its window could not be made.
 pub fn run() -> Result {
+    project::profile::install();
     project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);

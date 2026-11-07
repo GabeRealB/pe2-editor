@@ -35,15 +35,29 @@ retain = "cache"
 /// What a node's fields are, read by another's op.
 const SETTINGS: &str = "settings";
 
-/// A stage's files in its order, each once: stage 0's across its groups by id (a group's number, as many ten
-/// thousands, and the file's in it), a stage's folders in its layout's order and their files by id.
-fn stage_files(call: &Call, layout: &Table) -> Result<Vec<String>> {
+/// The groups or folders a stage's layout lists, by their nodes, in its order: stage 0's groups, a stage's folders.
+fn layout_parts(layout: &Table) -> Result<Vec<String>> {
+    let key = if layout.contains_key("groups") { "groups" } else { "folders" };
+    let parts = layout.get(key).and_then(Value::as_array).into_iter().flatten();
+    parts
+        .map(|part| {
+            part.get("asset")
+                .and_then(pe2_ext::target_of)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("a group or folder of the layout names nothing"))
+        })
+        .collect()
+}
+
+/// A stage's files in its order, each once, given what its groups or folders hold (`layout_parts`'s, in order): stage
+/// 0's across its groups by id (a group's number, as many ten thousands, and the file's in it), a stage's folders in its
+/// layout's order and their files by id.
+fn stage_files(layout: &Table, held: &[Table]) -> Vec<String> {
     let list = |table: &Table, key: &str| table.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
     let id = |v: &Value| v.get("id").and_then(Value::as_integer).unwrap_or(0);
     let asset = |v: &Value| v.get("asset").and_then(pe2_ext::target_of).map(str::to_string);
     let mut out: Vec<String> = Vec::new();
-    let mut take = |files: Vec<(i64, String)>| {
-        let mut files = files;
+    let mut take = |mut files: Vec<(i64, String)>| {
         files.sort_by_key(|f| f.0);
         for (_, file) in files {
             if !out.contains(&file) {
@@ -53,66 +67,71 @@ fn stage_files(call: &Call, layout: &Table) -> Result<Vec<String>> {
     };
     if layout.contains_key("groups") {
         let mut files = Vec::new();
-        for group in list(layout, "groups") {
-            let node = asset(&group).ok_or_else(|| anyhow!("a group of the layout names nothing"))?;
-            for file in list(&call.table_of(&node, SETTINGS)?, "files") {
-                files.extend(asset(&file).map(|a| (id(&group) * 10_000 + id(&file), a)));
-            }
+        for (group, table) in list(layout, "groups").iter().zip(held) {
+            files.extend(
+                list(table, "files").iter().filter_map(|file| Some((id(group) * 10_000 + id(file), asset(file)?))),
+            );
         }
         take(files);
     } else {
-        for folder in list(layout, "folders") {
-            let node = asset(&folder).ok_or_else(|| anyhow!("a folder of the layout names nothing"))?;
-            take(
-                list(&call.table_of(&node, SETTINGS)?, "files")
-                    .iter()
-                    .filter_map(|f| Some((id(f), asset(f)?)))
-                    .collect(),
-            );
+        for table in held {
+            take(list(table, "files").iter().filter_map(|f| Some((id(f), asset(f)?))).collect());
         }
     }
-    Ok(out)
+    out
 }
 
-/// A disc's movie file: the movies with sound its stages' files play on this disc, in the stages' order - a movie
-/// entry with a volume (a movie without plays from the stage), and naming this disc where it names one.
-fn inter(call: &mut Call) -> Result<Typed> {
-    let given = call.given();
-    let disc = given.get("disc").and_then(Value::as_integer).ok_or_else(|| anyhow!("it names no disc"))?;
-    let stages = given.get("stages").and_then(Value::as_array).cloned().unwrap_or_default();
+/// The movies with sound the files play on a disc, in the files' order: a movie entry with a volume (a movie without
+/// plays from the stage), naming this disc where it names one.
+fn movies_of(files: &[String], fields: &[Table], disc: i64) -> Result<Vec<String>> {
     let mut movies = Vec::new();
-    for stage in &stages {
-        let stage = pe2_ext::target_of(stage).ok_or_else(|| anyhow!("a stage names nothing"))?;
-        let layout = call.table_of(stage, SETTINGS)?;
-        for file in stage_files(call, &layout)? {
-            let fields = call.table_of(&file, SETTINGS)?;
-            for entry in fields.get("streams").and_then(Value::as_array).into_iter().flatten() {
-                let integer = |key: &str| entry.get(key).and_then(Value::as_integer);
-                let movie = entry.get("type").and_then(Value::as_str) == Some("movie");
-                if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc)
-                {
-                    movies.push(
-                        entry
-                            .get("asset")
-                            .and_then(pe2_ext::target_of)
-                            .ok_or_else(|| anyhow!("{file}: a stream names nothing"))?
-                            .to_string(),
-                    );
-                }
+    for (file, fields) in files.iter().zip(fields) {
+        for entry in fields.get("streams").and_then(Value::as_array).into_iter().flatten() {
+            let integer = |key: &str| entry.get(key).and_then(Value::as_integer);
+            let movie = entry.get("type").and_then(Value::as_str) == Some("movie");
+            if movie && integer("volume_table_index").unwrap_or(0) != 0 && integer("disc").is_none_or(|d| d == disc) {
+                let asset = entry.get("asset").and_then(pe2_ext::target_of);
+                movies.push(asset.ok_or_else(|| anyhow!("{file}: a stream names nothing"))?.to_string());
             }
         }
     }
-    // Every movie had before a byte is written: run until it has them all (`prepared_by_running`), it writes once.
-    let mut natives = Vec::with_capacity(movies.len());
-    for movie in &movies {
-        let Data::Typed(native) = call.output_of(movie, "native")? else {
-            pe2_ext::bail!("{movie}: its native is no file")
-        };
-        natives.push(native.file()?.clone());
+    Ok(movies)
+}
+
+/// A disc's movie file: the movies with sound its stages' files play on this disc, in the stages' order, joined. Each
+/// level of what it reads - the stages, their groups or folders, their files, the movies - is requested whole, a step
+/// each, so that every movie is had before a byte is written.
+#[pe2_ext::steps]
+fn inter(call: &mut Call) -> Result<Typed> {
+    let given = call.given();
+    let disc: i64 = given.get("disc").and_then(Value::as_integer).ok_or_else(|| anyhow!("it names no disc"))?;
+    let stages: Vec<String> = given
+        .get("stages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|stage| pe2_ext::target_of(stage).map(str::to_string).ok_or_else(|| anyhow!("a stage names nothing")))
+        .collect::<Result<_>>()?;
+    #[request]
+    let layouts: Vec<Table> = call.tables_of(stages.iter().map(|stage| (stage.as_str(), SETTINGS)))?;
+    let parts: Vec<Vec<String>> = layouts.iter().map(layout_parts).collect::<Result<_>>()?;
+    #[request]
+    let held: Vec<Table> = call.tables_of(parts.iter().flatten().map(|part| (part.as_str(), SETTINGS)))?;
+    let mut files: Vec<String> = Vec::new();
+    let mut at = 0;
+    for (layout, parts) in layouts.iter().zip(&parts) {
+        files.extend(stage_files(layout, &held[at..at + parts.len()]));
+        at += parts.len();
     }
+    #[request]
+    let fields: Vec<Table> = call.tables_of(files.iter().map(|file| (file.as_str(), SETTINGS)))?;
+    let movies: Vec<String> = movies_of(&files, &fields, disc)?;
+    #[request]
+    let natives: Vec<Data> = call.outputs_of(movies.iter().map(|movie| (movie.as_str(), "native")))?;
     let mut writer = call.writer("native.str")?;
-    for native in &natives {
-        std::io::Write::write_all(&mut writer, &call.read(native)?)?;
+    for (movie, native) in movies.iter().zip(&natives) {
+        let Data::Typed(native) = native else { pe2_ext::bail!("{movie}: its native is no file") };
+        std::io::Write::write_all(&mut writer, &call.read(native.file()?)?)?;
     }
     Ok(Typed::new(pe2_ext::data::BYTES, vec![writer.finish()?]))
 }
@@ -235,8 +254,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .label("Its stages' movies with sound")
         .takes("file", &["pe2.game@stream"])
         .output::<ty::Bytes>()
-        .prepared_by_running()
-        .run(inter);
+        .steps(inter());
     r.named_type("stream")
         .alias("stream")
         .label("Movie file")

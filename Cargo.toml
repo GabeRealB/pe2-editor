@@ -44,6 +44,11 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+# Spans over what the editor and its tools spend time on (project::profile): totaled by name for `--profile` and
+# `editor_performance`, and shown on a timeline by Tracy in builds with the `tracy` feature.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+tracing-tracy = "0.12"
 formats = { path = "crates/formats" }
 pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }

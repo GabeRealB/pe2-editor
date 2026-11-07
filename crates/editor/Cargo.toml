@@ -22,6 +22,7 @@ required-features = ["tests"]
 workspace = true
 
 [dependencies]
+tracing.workspace = true
 codecs.workspace = true
 project.workspace = true
 extensions.workspace = true
@@ -47,6 +48,8 @@ winit.workspace = true
 egui_kittest = { workspace = true, optional = true }
 
 [features]
+# Spans on a timeline, for Tracy's viewer to connect to (project::profile).
+tracy = ["project/tracy"]
 # `pe2-test-runner`, a build for testing: what ships has no harness in it.
 tests = ["dep:egui_kittest"]
 

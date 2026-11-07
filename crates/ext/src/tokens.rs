@@ -172,8 +172,7 @@ impl Tokenizer<'_> {
             .parameter::<String>("address")
             .provides(&names(OUTPUT))
             .keeps(Retain::Cache);
-        let op = if follows { op.prepared_by_running() } else { op };
-        let _ = op.run(move |call| {
+        let made = move |call: &mut Call<'_>| {
             let asked: String = call.parameter()?;
             let (name, args) = parsed(&asked);
             let call: &Call<'_> = call;
@@ -184,7 +183,9 @@ impl Tokenizer<'_> {
             }
             let tokens = (entry.make)(call, &args)?;
             Ok(Typed::new(ty::Tokens::NAME, vec![File::new(ty::Tokens::FILE, tokens.into_bytes())]))
-        });
+        };
+        // Entries following what they read find it by running, replayed until they read nothing new.
+        let _ = if follows { op.steps(crate::stepped::replayed(made)) } else { op.run(made) };
         let _ = registry
             .op(&format!("tokenizer_{local}{suffix}"))
             .label("What it tokenizes to")

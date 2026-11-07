@@ -9,7 +9,9 @@ use std::fmt::Write as _;
 use pe2_ext::tokens::{self, Args};
 use pe2_ext::ty::{Registered, SourceTree};
 use pe2_ext::{Call, File, Result, Table, Typed, Value, anyhow, bail};
+use serde::{Deserialize, Serialize};
 
+use crate::tokenizers::SETTINGS;
 use crate::types::{Shape, Tree, Types};
 use crate::{scan, tokenizers};
 
@@ -1082,7 +1084,7 @@ fn integer(text: &str) -> Option<i64> {
 }
 
 /// A use of a value, read from what a first pass left.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Read {
     binding: String,
     path: Vec<String>,
@@ -1138,15 +1140,59 @@ fn defined(name: &str, tokens: &str) -> String {
     out
 }
 
-/// What a first pass left, with each binding's macros written for the compile: `pe2_values.h`.
+/// What a first pass left, with each binding's macros written for the compile: `pe2_values.h`. What its bindings come to
+/// it reads a level at a time: every use's next read asked for together, until none has any left (`Use`).
+#[pe2_ext::steps]
 pub fn resolve(call: &mut Call) -> Result<Typed> {
-    let tree = call.take::<SourceTree>(0)?;
-    let call: &Call = call;
-    let (first, mut kept): (Vec<File>, Vec<File>) =
-        tree.files.into_iter().partition(|file| file.name.starts_with(FIRST));
+    let scanned = scanned(call)?;
+    let pass: Pass = Pass::of(&scanned);
+    let mut uses: Vec<Use> = uses_of(call, &scanned);
+    loop {
+        let wanted: Vec<(usize, String, String)> = uses
+            .iter()
+            .enumerate()
+            .filter_map(|(at, used)| used.wanted().map(|(node, address)| (at, node, address)))
+            .collect();
+        if wanted.is_empty() {
+            break;
+        }
+        #[request]
+        let got: Vec<Result<pe2_ext::Data>> =
+            call.outputs_tried(wanted.iter().map(|(_, node, address)| (node.as_str(), address.as_str())));
+        for ((at, ..), got) in wanted.iter().zip(got) {
+            uses[*at].given(call, got);
+        }
+    }
+    // What the tree keeps, by its files' names alone: what the first pass said is carried.
+    let tree = given_tree(call)?;
+    let (mut notes, mut kept) = (tree.notes, tree.files);
+    kept.retain(|file| !file.name.starts_with(FIRST));
+    let said = uses.iter().map(|used| used.outcome(call)).collect();
+    let (header, failed) = header(&pass, said);
+    notes.extend(failed);
+    kept.push(File::new(VALUES, header.into_bytes()));
+    Ok(Typed { notes, settings: call.given(), ..Typed::new(SourceTree::NAME, kept) })
+}
+
+/// What a first pass's files say: its slots, the values it reads and the queries it asks.
+struct Scanned {
+    slots: Slots,
+    reads: BTreeSet<Read>,
+    queries: BTreeSet<Query>,
+}
+
+/// The tree `resolve` is given, read where it is and left there: each of its steps is given it.
+fn given_tree(call: &Call) -> Result<Typed> {
+    let given = call.inputs.first().and_then(|port| port.first()).cloned();
+    <SourceTree as pe2_ext::ty::ValueType>::decode(given.ok_or_else(|| anyhow!("it was given no tree"))?, call)
+}
+
+fn scanned(call: &Call) -> Result<Scanned> {
+    let tree = given_tree(call)?;
+    let first = tree.files.iter().filter(|file| file.name.starts_with(FIRST));
     let mut slots = Slots::default();
     let (mut reads, mut queries) = (BTreeSet::new(), BTreeSet::new());
-    for file in &first {
+    for file in first {
         let bytes = call.read(file)?;
         let text = String::from_utf8_lossy(&bytes);
         for found in scan::uses(&text) {
@@ -1158,21 +1204,474 @@ pub fn resolve(call: &mut Call) -> Result<Typed> {
             }
         }
     }
-    let mut notes = tree.notes;
-    let (header, failed) = values(call, &slots, &reads, &queries);
-    notes.extend(failed);
-    kept.push(File::new(VALUES, header.into_bytes()));
-    Ok(Typed { notes, settings: call.given(), ..Typed::new(SourceTree::NAME, kept) })
+    Ok(Scanned { slots, reads, queries })
 }
 
-/// What a binding holds: the reference filling it.
-fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet<Query>) -> (String, Vec<String>) {
+/// What of a first pass the header is written from, carried from the step reading its files to the last: each slot's name
+/// and type, the values read and the queries asked.
+#[derive(Serialize, Deserialize)]
+struct Pass {
+    slots: Vec<(String, String)>,
+    reads: BTreeSet<Read>,
+    queries: BTreeSet<Query>,
+}
+
+impl Pass {
+    fn of(scanned: &Scanned) -> Pass {
+        let slots = scanned.slots.held.iter().map(|(name, slot)| (name.clone(), slot.ty.clone().unwrap_or_default()));
+        Pass { slots: slots.collect(), reads: scanned.reads.clone(), queries: scanned.queries.clone() }
+    }
+}
+
+/// What a use came to: its tokens, or why not; for a slot, nothing where what fills it is what it declares.
+type Said = std::result::Result<String, String>;
+
+/// The uses whose bindings are read, in the order the header writes them: each slot declaring a type but `package`, each
+/// value read under a name no other takes, each query.
+fn uses_of(call: &Call, scanned: &Scanned) -> Vec<Use> {
+    let Scanned { slots, reads, queries, .. } = scanned;
     let fields = &own_fields(call);
-    let mut header = String::new();
-    let mut failed = Vec::new();
+    let active = call.config().and_then(|config| config.target);
+    let mut uses = Vec::new();
     for (name, slot) in &slots.held {
         let ty = slot.ty.as_deref().unwrap_or_default();
-        let wrong = if ty == "package" { None } else { slot_problem(call, fields, slots, name, ty) };
+        if ty != "package" {
+            let walk = bound(call, fields, slots, name).map(|bound| Trail::new(&bound, Vec::new()));
+            uses.push(Use::Slot { name: name.clone(), ty: ty.to_string(), walk });
+        }
+    }
+    let mut names = BTreeSet::new();
+    for read in reads.iter().filter(|read| names.insert(read.name())) {
+        let slot = slots.held.get(&read.binding).filter(|slot| slot.ty.is_some());
+        let stage = match (slot, bound(call, fields, slots, &read.binding)) {
+            (None, _) => Stage::Said(Err("it has no PE2_BIND".into())),
+            (_, None) => Stage::Said(Err("nothing fills it on this package".into())),
+            (Some(_), Some(bound)) => Stage::Walking(Trail::new(&bound, read.path.clone())),
+        };
+        let mut args = BTreeMap::new();
+        for ((path, arg), values) in slot.map(|slot| &slot.args).into_iter().flatten() {
+            if *path == read.path {
+                args.insert(arg.clone(), values.clone());
+            }
+        }
+        let stage = match stage {
+            Stage::Walking(walk) => value_walked(read, &args, active.as_deref(), walk),
+            other => other,
+        };
+        uses.push(Use::Value { read: read.clone(), args, active: active.clone(), stage });
+    }
+    for query in queries {
+        let filled = |name: &str| {
+            bound(call, fields, slots, name).ok_or_else(|| format!("nothing fills {name} on this package"))
+        };
+        let stage = match asked(query, slots) {
+            Err(why) => Stage::Said(Err(why)),
+            Ok(other) => match (filled(other), filled(&query.binding)) {
+                (Err(why), _) => Stage::Said(Err(why)),
+                (Ok(other), own) => {
+                    let mut holder = Holder::new(&other);
+                    holder.settle(call);
+                    query_held(call, None, holder, own)
+                }
+            },
+        };
+        uses.push(Use::Query { query: query.clone(), stage });
+    }
+    uses
+}
+
+/// The slot a query asks about, where it asks a question there is and of a slot of the package.
+fn asked<'a>(query: &'a Query, slots: &Slots) -> std::result::Result<&'a str, String> {
+    if !QUERIES.contains(&query.key.as_str()) {
+        return Err(format!("there is no query {}; there is {}", query.key, QUERIES.join(", ")));
+    }
+    let [other] = query.args.as_slice() else { return Err(format!("{} takes a slot of the package", query.key)) };
+    if !slots.held.contains_key(other) {
+        return Err(format!("{} takes a slot of the package, and {other} is none", query.key));
+    }
+    Ok(other)
+}
+
+/// One use whose binding is read, a read at a time: what it asks for next, given what it asked for last.
+#[derive(Serialize, Deserialize)]
+enum Use {
+    /// A slot declaring a type: whether what fills it is one, from where its binding leads (none where nothing fills it).
+    Slot { name: String, ty: String, walk: Option<Trail> },
+    /// A value read: its tokens, by the args its slot gives it.
+    Value { read: Read, args: BTreeMap<String, Vec<String>>, active: Option<String>, stage: Stage },
+    /// A query: whether what one slot holds names what another holds.
+    Query { query: Query, stage: Stage },
+}
+
+/// How far a value or a query has got.
+#[derive(Serialize, Deserialize)]
+enum Stage {
+    /// Following its binding.
+    Walking(Trail),
+    /// Finding which output makes the node's tokens, then the tokens made by these args.
+    Probing {
+        target: String,
+        args: BTreeMap<String, Vec<String>>,
+        probe: Probe,
+    },
+    Reading {
+        target: String,
+        address: String,
+    },
+    /// Finding what the slot asked about holds (`wanted` none), then what the own slot holds.
+    Holding {
+        wanted: Option<String>,
+        holder: Holder,
+        own: std::result::Result<Bound, String>,
+    },
+    /// Reading what the own slot holds, to look in it for what the other does.
+    Looking {
+        wanted: String,
+        held: String,
+    },
+    Said(Said),
+}
+
+impl Use {
+    /// What it reads next: none once it has its result.
+    fn wanted(&self) -> Option<(String, String)> {
+        match self {
+            Use::Slot { walk, .. } => walk.as_ref()?.wanted(),
+            Use::Value { stage, .. } | Use::Query { stage, .. } => match stage {
+                Stage::Walking(walk) => walk.wanted(),
+                Stage::Probing { probe, .. } => probe.wanted(),
+                Stage::Reading { target, address } => Some((target.clone(), address.clone())),
+                Stage::Holding { holder, .. } => holder.wanted(),
+                Stage::Looking { held, .. } => Some((held.clone(), SETTINGS.to_string())),
+                Stage::Said(_) => None,
+            },
+        }
+    }
+
+    /// What it asked for, read, and where that leaves it.
+    fn given(&mut self, call: &Call, got: Result<pe2_ext::Data>) {
+        match self {
+            Use::Slot { walk, .. } => {
+                if let Some(walk) = walk {
+                    walk.given(got);
+                }
+            }
+            Use::Value { read, args, active, stage } => {
+                let next =
+                    match std::mem::replace(stage, Stage::Said(Ok(String::new()))) {
+                        Stage::Walking(mut walk) => {
+                            walk.given(got);
+                            value_walked(read, args, active.as_deref(), walk)
+                        }
+                        Stage::Probing { target, args, mut probe } => {
+                            probe.given(got);
+                            match probe.found.clone() {
+                                None => Stage::Probing { target, args, probe },
+                                Some(Err(why)) => Stage::Said(Err(why)),
+                                Some(Ok(output)) => {
+                                    let address = pe2_ext::tokens::address(read.derived.as_deref(), &Args(args))
+                                        .replacen(tokens::OUTPUT, &output, 1);
+                                    Stage::Reading { target, address }
+                                }
+                            }
+                        }
+                        Stage::Reading { .. } => Stage::Said(
+                            got.and_then(|made| pe2_ext::tokens::text_of(call, &made))
+                                .map_err(|why| format!("{why:#}")),
+                        ),
+                        other => other,
+                    };
+                *stage = next;
+            }
+            Use::Query { stage, .. } => {
+                let next = match std::mem::replace(stage, Stage::Said(Ok(String::new()))) {
+                    Stage::Holding { wanted, mut holder, own } => {
+                        holder.given(call, got);
+                        query_held(call, wanted, holder, own)
+                    }
+                    Stage::Looking { wanted, .. } => Stage::Said(
+                        table(got)
+                            .map(|held| if names(call, &Value::Table(held), &wanted) { "1" } else { "0" }.to_string())
+                            .map_err(|why| format!("{why:#}")),
+                    ),
+                    other => other,
+                };
+                *stage = next;
+            }
+        }
+    }
+
+    /// What it came to: none while it reads.
+    fn outcome(&self, call: &Call) -> Option<Said> {
+        match self {
+            Use::Slot { name, ty, walk } => {
+                let Some(walk) = walk else { return Some(Err(format!("{name}: nothing fills it on this package"))) };
+                let own = match walk.ended.as_ref()? {
+                    Ok(Reached::Node { reads_as: Some(reads_as), .. }) => reads_as.clone(),
+                    Ok(Reached::Node { node, .. }) => {
+                        let types = call.node_named(node).map_or_else(Vec::new, |named| named.types);
+                        if types.iter().any(|known| known.rsplit('@').next() == Some(ty)) {
+                            return Some(Ok(String::new()));
+                        }
+                        types.first().and_then(|known| known.rsplit('@').next()).unwrap_or("nothing").to_string()
+                    }
+                    Ok(Reached::Value(_)) => "a value".to_string(),
+                    Err(why) => return Some(Err(format!("{name}: {why}"))),
+                };
+                Some(if own == *ty {
+                    Ok(String::new())
+                } else {
+                    Err(format!("{name} is declared {ty}, and what fills it is {own}"))
+                })
+            }
+            Use::Value { stage: Stage::Said(said), .. } | Use::Query { stage: Stage::Said(said), .. } => {
+                Some(said.clone())
+            }
+            Use::Value { .. } | Use::Query { .. } => None,
+        }
+    }
+}
+
+/// Where a value's walk leaves it: at a node, to find its tokens; at a plain value, printed.
+fn value_walked(read: &Read, args: &BTreeMap<String, Vec<String>>, active: Option<&str>, walk: Trail) -> Stage {
+    match walk.ended.clone() {
+        None => Stage::Walking(walk),
+        Some(Err(why)) => Stage::Said(Err(why)),
+        Some(Ok(Reached::Value(_))) if read.derived.is_some() => {
+            Stage::Said(Err(format!("{} is a value, and nothing is derived from it", read.path.join("/"))))
+        }
+        Some(Ok(Reached::Value(value))) => Stage::Said(Ok(tokenizers::printed(&value))),
+        Some(Ok(Reached::Node { node, args: led, .. })) => {
+            let mut args = args.clone();
+            args.extend(led);
+            let probe = Probe::new(node.clone(), active.map(str::to_string));
+            Stage::Probing { target: node, args, probe }
+        }
+    }
+}
+
+/// Where a query's holders leave it: the slot asked about's found, the own slot's next; both found, what it holds read.
+fn query_held(call: &Call, wanted: Option<String>, holder: Holder, own: std::result::Result<Bound, String>) -> Stage {
+    match (holder.found.clone(), wanted) {
+        (None, wanted) => Stage::Holding { wanted, holder, own },
+        (Some(Err(why)), _) => Stage::Said(Err(why)),
+        (Some(Ok(other)), None) => match own {
+            Err(why) => Stage::Said(Err(why)),
+            Ok(bound) => {
+                let mut holder = Holder::new(&bound);
+                holder.settle(call);
+                query_held(call, Some(other), holder, Ok(bound))
+            }
+        },
+        (Some(Ok(held)), Some(wanted)) => Stage::Looking { wanted, held },
+    }
+}
+
+/// A read as a table.
+fn table(got: Result<pe2_ext::Data>) -> Result<Table> {
+    match got? {
+        pe2_ext::Data::Table(table) => Ok(table),
+        other => bail!("it is {}, no table", other.ty()),
+    }
+}
+
+/// A sub-path followed from what a reference names, a read at a time: each step an output, a family's member first, leading
+/// to another node or ending at a plain value.
+#[derive(Clone, Serialize, Deserialize)]
+struct Trail {
+    path: Vec<String>,
+    reached: Reached,
+    at: usize,
+    /// The output the reference names, read first where it names one.
+    first: Option<(String, String)>,
+    /// Whether the family member at this step was tried and is none: its plain output is read.
+    member_tried: bool,
+    ended: Option<std::result::Result<Reached, String>>,
+}
+
+impl Trail {
+    fn new(from: &Bound, path: Vec<String>) -> Trail {
+        let reached = Reached::Node { node: from.node.clone(), reads_as: None, args: BTreeMap::new() };
+        let first = from.output.clone().map(|output| (from.node.clone(), output));
+        let mut walk = Trail { path, reached, at: 0, first, member_tried: false, ended: None };
+        walk.settle();
+        walk
+    }
+
+    /// Ended where nothing is left to read: at the path's end, or where it reached a value before.
+    fn settle(&mut self) {
+        if self.ended.is_some() || self.first.is_some() {
+            return;
+        }
+        if self.at >= self.path.len() {
+            self.ended = Some(Ok(self.reached.clone()));
+        } else if let Reached::Value(_) = self.reached {
+            self.ended = Some(Err(format!("nothing goes on from {}", self.path[..self.at].join("/"))));
+        }
+    }
+
+    fn wanted(&self) -> Option<(String, String)> {
+        if self.ended.is_some() {
+            return None;
+        }
+        if let Some(first) = &self.first {
+            return Some(first.clone());
+        }
+        let Reached::Node { node, .. } = &self.reached else { return None };
+        let step = &self.path[self.at];
+        Some(match self.path.get(self.at + 1).filter(|_| !self.member_tried) {
+            Some(member) => (node.clone(), format!("{step}/{member}")),
+            None => (node.clone(), step.clone()),
+        })
+    }
+
+    fn given(&mut self, got: Result<pe2_ext::Data>) {
+        if let Some((node, output)) = self.first.take() {
+            match table(got) {
+                Err(_) => self.ended = Some(Err(format!("{node} has no output {output}"))),
+                Ok(table) => match table.get(tokens::NODE).and_then(Value::as_str) {
+                    Some(next) => self.reached = Reached::leading_on(&table, next.to_string()),
+                    None => self.ended = Some(Err(format!("nothing goes on from {output}"))),
+                },
+            }
+            self.settle();
+            return;
+        }
+        let member = self.at + 1 < self.path.len() && !self.member_tried;
+        match (table(got), member) {
+            (Ok(table), true) => self.went(&table, 2),
+            (Err(_), true) => self.member_tried = true,
+            (Ok(table), false) => self.went(&table, 1),
+            (Err(_), false) => {
+                let (at, step) = (self.path[..self.at].join("/"), &self.path[self.at]);
+                self.ended = Some(Err(format!("{at} has no output {step}")));
+            }
+        }
+    }
+
+    /// A step's table, `used` of the path read: where it leads on, or the value it ends at.
+    fn went(&mut self, table: &Table, used: usize) {
+        self.member_tried = false;
+        self.at += used;
+        if let Some(next) = table.get(tokens::NODE).and_then(Value::as_str) {
+            self.reached = Reached::leading_on(table, next.to_string());
+            self.settle();
+        } else if let Some(value) = table.get(tokens::VALUE).filter(|_| self.at == self.path.len()) {
+            self.ended = Some(Ok(Reached::Value(value.clone())));
+        } else {
+            self.ended = Some(Err(format!("nothing goes on from {}", self.path[..self.at].join("/"))));
+        }
+    }
+}
+
+/// The output making a node's tokens, a read at a time: the active target's own, where the node declares one, else its own.
+#[derive(Clone, Serialize, Deserialize)]
+struct Probe {
+    target: String,
+    active: Option<String>,
+    /// Whether the target's own was looked for, and is none.
+    own_tried: bool,
+    found: Option<std::result::Result<String, String>>,
+}
+
+impl Probe {
+    fn new(target: String, active: Option<String>) -> Probe {
+        let own_tried = active.is_none();
+        Probe { target, active, own_tried, found: None }
+    }
+
+    fn wanted(&self) -> Option<(String, String)> {
+        if self.found.is_some() {
+            return None;
+        }
+        Some(match (&self.active, self.own_tried) {
+            (Some(active), false) => (self.target.clone(), format!("{}.{active}", tokens::DECLARED)),
+            _ => (self.target.clone(), tokens::DECLARED.to_string()),
+        })
+    }
+
+    fn given(&mut self, got: Result<pe2_ext::Data>) {
+        match (&self.active, self.own_tried, table(got).is_ok()) {
+            (Some(active), false, true) => self.found = Some(Ok(format!("{}.{active}", tokens::OUTPUT))),
+            (Some(_), false, false) => self.own_tried = true,
+            (_, _, true) => self.found = Some(Ok(tokens::OUTPUT.to_string())),
+            (_, _, false) => self.found = Some(Err("it has no tokenizer".into())),
+        }
+    }
+}
+
+/// What a slot comes to as a holder of others, by its path, a read at a time: a file of a group is the file's asset.
+#[derive(Clone, Serialize, Deserialize)]
+struct Holder {
+    walk: Trail,
+    /// The group a file of it is read from, and the file's name, once the walk ends at one.
+    group: Option<(String, String)>,
+    found: Option<std::result::Result<String, String>>,
+}
+
+impl Holder {
+    fn new(bound: &Bound) -> Holder {
+        Holder { walk: Trail::new(bound, Vec::new()), group: None, found: None }
+    }
+
+    fn wanted(&self) -> Option<(String, String)> {
+        if self.found.is_some() {
+            return None;
+        }
+        match &self.group {
+            Some((node, _)) => Some((node.clone(), SETTINGS.to_string())),
+            None => self.walk.wanted(),
+        }
+    }
+
+    fn given(&mut self, call: &Call, got: Result<pe2_ext::Data>) {
+        if let Some((node, file)) = self.group.take() {
+            let found = table(got).map_err(|why| format!("{why:#}")).and_then(|group| {
+                let files = group.get("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+                let entry = files.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(file.as_str()));
+                let asset = entry.and_then(|entry| entry.get("asset")).and_then(pe2_ext::target_of);
+                path_of(call, asset.ok_or_else(|| format!("{node} has no file {file}"))?)
+            });
+            self.found = Some(found);
+            return;
+        }
+        self.walk.given(got);
+        self.settle(call);
+    }
+
+    /// Where its walk ended: at a file of a group, read next; at a node, found; at a value, held by nothing.
+    fn settle(&mut self, call: &Call) {
+        self.found = match self.walk.ended.clone() {
+            None => None,
+            Some(Err(why)) => Some(Err(why)),
+            Some(Ok(Reached::Value(_))) => Some(Err("it holds a value".into())),
+            Some(Ok(Reached::Node { node, reads_as, args })) => {
+                match args.get("file").and_then(|file| file.first()).filter(|_| reads_as.as_deref() == Some("file")) {
+                    Some(file) => {
+                        self.group = Some((node, file.clone()));
+                        None
+                    }
+                    None => Some(path_of(call, &node)),
+                }
+            }
+        };
+    }
+}
+
+/// A reference's node, by its path.
+fn path_of(call: &Call, reference: &str) -> std::result::Result<String, String> {
+    call.node_named(reference).map(|named| named.path).ok_or_else(|| format!("{reference} names nothing"))
+}
+
+/// The header: a macro for each slot, value and query - what it comes to, or failing where it is used - and what failed.
+fn header(pass: &Pass, outcomes: Vec<Option<Said>>) -> (String, Vec<String>) {
+    let Pass { slots, reads, queries } = pass;
+    let mut header = String::new();
+    let mut failed = Vec::new();
+    let mut outcomes = outcomes.into_iter();
+    let mut next = || outcomes.next().flatten().unwrap_or_else(|| Err("it was not read".into()));
+    for (name, ty) in slots {
+        let wrong = if ty == "package" { None } else { next().err() };
         failed.extend(wrong.clone());
         header.push_str(
             &wrong
@@ -1186,10 +1685,10 @@ fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet
             header.push_str(&failing(&name, &format!("{other:?} and {read:?} are one name")));
             continue;
         }
-        header.push_str(&match tokens(call, fields, slots, read) {
+        header.push_str(&match next() {
             Ok(tokens) => defined(&name, &tokens),
             Err(why) => {
-                let why = said(&read.binding, &format!("{why:#}"));
+                let why = said(&read.binding, &why);
                 let written = failing(&name, &why);
                 failed.push(why);
                 written
@@ -1197,10 +1696,10 @@ fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet
         });
     }
     for query in queries {
-        header.push_str(&match answer(call, fields, slots, query) {
-            Ok(answer) => defined(&query.name(), answer),
+        header.push_str(&match next() {
+            Ok(answer) => defined(&query.name(), &answer),
             Err(why) => {
-                let why = said(&query.binding, &format!("{why:#}"));
+                let why = said(&query.binding, &why);
                 let written = failing(&query.name(), &why);
                 failed.push(why);
                 written
@@ -1211,7 +1710,7 @@ fn values(call: &Call, slots: &Slots, reads: &BTreeSet<Read>, queries: &BTreeSet
 }
 
 /// A question the build answers of what a slot holds: `PE2_QUERY(file, contains, self)`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Query {
     binding: String,
     key: String,
@@ -1242,44 +1741,6 @@ impl Query {
     }
 }
 
-/// What the build says to a query, 1 or 0: `contains`, whether what a slot holds names, anywhere in it, what another holds.
-fn answer(call: &Call, fields: &Table, slots: &Slots, query: &Query) -> Result<&'static str> {
-    if !QUERIES.contains(&query.key.as_str()) {
-        bail!("there is no query {}; there is {}", query.key, QUERIES.join(", "));
-    }
-    let [other] = query.args.as_slice() else { bail!("{} takes a slot of the package", query.key) };
-    if !slots.held.contains_key(other) {
-        bail!("{} takes a slot of the package, and {other} is none", query.key);
-    }
-    let filled =
-        |name: &str| bound(call, fields, slots, name).ok_or_else(|| anyhow!("nothing fills {name} on this package"));
-    let wanted = holder(call, &filled(other)?)?;
-    let held = call.table_of(&holder(call, &filled(&query.binding)?)?, "settings")?;
-    Ok(if names(call, &Value::Table(held), &wanted) { "1" } else { "0" })
-}
-
-/// What a slot comes to as a holder of others, by its path: a file of a group is the file's asset.
-fn holder(call: &Call, bound: &Bound) -> Result<String> {
-    let Reached::Node { node, reads_as, args } = walked(call, bound, &[])? else { bail!("it holds a value") };
-    let path = |reference: &str| {
-        call.node_named(reference).map(|named| named.path).ok_or_else(|| anyhow!("{reference} names nothing"))
-    };
-    match args.get("file").and_then(|file| file.first()).filter(|_| reads_as.as_deref() == Some("file")) {
-        Some(file) => {
-            let group = call.table_of(&node, "settings")?;
-            let files = group.get("files").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-            let entry = files.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(file.as_str()));
-            path(
-                entry
-                    .and_then(|entry| entry.get("asset"))
-                    .and_then(pe2_ext::target_of)
-                    .ok_or_else(|| anyhow!("{node} has no file {file}"))?,
-            )
-        }
-        None => path(&node),
-    }
-}
-
 /// Whether a value names, anywhere in it, the node at a path.
 fn names(call: &Call, value: &Value, wanted: &str) -> bool {
     if pe2_ext::target_of(value).and_then(|target| call.node_named(target)).is_some_and(|named| named.path == wanted) {
@@ -1301,56 +1762,13 @@ fn said(binding: &str, why: &str) -> String {
     }
 }
 
-/// Why a slot cannot be filled as it declares.
-fn slot_problem(call: &Call, fields: &Table, slots: &Slots, name: &str, ty: &str) -> Option<String> {
-    let Some(bound) = bound(call, fields, slots, name) else {
-        return Some(format!("{name}: nothing fills it on this package"));
-    };
-    let own = match walked(call, &bound, &[]) {
-        Ok(Reached::Node { reads_as: Some(reads_as), .. }) => reads_as,
-        Ok(Reached::Node { node, .. }) => {
-            let types = call.node_named(&node).map_or_else(Vec::new, |named| named.types);
-            if types.iter().any(|known| known.rsplit('@').next() == Some(ty)) {
-                return None;
-            }
-            types.first().and_then(|known| known.rsplit('@').next()).unwrap_or("nothing").to_string()
-        }
-        Ok(Reached::Value(_)) => "a value".to_string(),
-        Err(why) => return Some(format!("{name}: {why:#}")),
-    };
-    (own != ty).then(|| format!("{name} is declared {ty}, and what fills it is {own}"))
-}
-
-/// What a read comes to.
-fn tokens(call: &Call, fields: &Table, slots: &Slots, read: &Read) -> Result<String> {
-    let slot =
-        slots.held.get(&read.binding).filter(|slot| slot.ty.is_some()).ok_or_else(|| anyhow!("it has no PE2_BIND"))?;
-    let bound = bound(call, fields, slots, &read.binding).ok_or_else(|| anyhow!("nothing fills it on this package"))?;
-    let (target, led) = match walked(call, &bound, &read.path)? {
-        Reached::Node { node, args, .. } => (node, args),
-        Reached::Value(_) if read.derived.is_some() => {
-            bail!("{} is a value, and nothing is derived from it", read.path.join("/"))
-        }
-        Reached::Value(value) => return Ok(tokenizers::printed(&value)),
-    };
-    let mut args = Args::default();
-    for ((path, arg), values) in &slot.args {
-        if *path == read.path {
-            args.0.insert(arg.clone(), values.clone());
-        }
-    }
-    args.0.extend(led);
-    let output = tokenizer_of(call, &target)?;
-    let address = pe2_ext::tokens::address(read.derived.as_deref(), &args).replacen(tokens::OUTPUT, &output, 1);
-    pe2_ext::tokens::text_of(call, &call.output_of(&target, &address)?)
-}
-
 /// The slot `PE2_BIND_SELF` fills with the package built.
 const SELF: &str = "self";
 /// What a slot kept out of the editor says of itself.
 const HIDDEN: &str = "hidden";
 
 /// What fills a slot: a node, and the output of it a reference names.
+#[derive(Clone, Serialize, Deserialize)]
 struct Bound {
     node: String,
     output: Option<String>,
@@ -1370,6 +1788,7 @@ fn bound(call: &Call, fields: &Table, slots: &Slots, name: &str) -> Option<Bound
 
 /// Where a sub-path ends: a node, as what it is read here where that is not what it is, with the args it is then read by; or a
 /// plain value.
+#[derive(Clone, Serialize, Deserialize)]
 enum Reached {
     Node { node: String, reads_as: Option<String>, args: BTreeMap<String, Vec<String>> },
     Value(Value),
@@ -1385,40 +1804,6 @@ impl Reached {
             args: args.collect(),
         }
     }
-}
-
-/// A sub-path followed from what a reference names: each step an output, a family's member first, leading to another node or
-/// ending at a plain value.
-fn walked(call: &Call, from: &Bound, path: &[String]) -> Result<Reached> {
-    let (mut reached, mut at) = (Reached::Node { node: from.node.clone(), reads_as: None, args: BTreeMap::new() }, 0);
-    if let Some(output) = &from.output {
-        let table = call.table_of(&from.node, output).map_err(|_| anyhow!("{} has no output {output}", from.node))?;
-        let next =
-            table.get(tokens::NODE).and_then(Value::as_str).ok_or_else(|| anyhow!("nothing goes on from {output}"))?;
-        reached = Reached::leading_on(&table, next.to_string());
-    }
-    while at < path.len() {
-        let Reached::Node { node, .. } = &reached else { bail!("nothing goes on from {}", path[..at].join("/")) };
-        let member = path.get(at + 1).map(|member| format!("{}/{member}", path[at]));
-        let told = member.and_then(|address| Some((call.table_of(node, &address).ok()?, 2)));
-        let (table, used) = match told {
-            Some(told) => told,
-            None => (
-                call.table_of(node, &path[at])
-                    .map_err(|_| anyhow!("{} has no output {}", path[..at].join("/"), path[at]))?,
-                1,
-            ),
-        };
-        at += used;
-        if let Some(next) = table.get(tokens::NODE).and_then(Value::as_str) {
-            reached = Reached::leading_on(&table, next.to_string());
-        } else if let Some(value) = table.get(tokens::VALUE).filter(|_| at == path.len()) {
-            return Ok(Reached::Value(value.clone()));
-        } else {
-            bail!("nothing goes on from {}", path[..at].join("/"));
-        }
-    }
-    Ok(reached)
 }
 
 /// The output making a node's tokens: the target's own, where it has one.

@@ -15,6 +15,7 @@ pub mod history;
 pub mod imports;
 pub mod index;
 pub mod lock;
+pub mod profile;
 pub mod stack;
 pub mod store;
 pub mod switches;
@@ -173,6 +174,29 @@ fn most_lent() -> usize {
     std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores / 2).clamp(1, 8)
 }
 
+/// Threads lent for a while: as many as were free of those wanted, given back when dropped.
+pub(crate) struct Lend {
+    pub count: usize,
+}
+
+impl Lend {
+    /// Up to `wanted` threads, as many as `parallel` has to lend now: none, where others have them all.
+    pub(crate) fn threads(wanted: usize) -> Lend {
+        use std::sync::atomic::Ordering;
+        let wanted = wanted.min(most_lent());
+        let taken = LENT.fetch_add(wanted, Ordering::AcqRel);
+        let count = wanted.min(most_lent().saturating_sub(taken));
+        LENT.fetch_sub(wanted - count, Ordering::AcqRel);
+        Lend { count }
+    }
+}
+
+impl Drop for Lend {
+    fn drop(&mut self) {
+        LENT.fetch_sub(self.count, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Each of these worked out at the same time, each result in its item's place, by this thread and as many more as there
 /// are to lend: none, where others have them all, and it does them alone. So what is parallel within what is parallel adds
 /// no threads, and waits for nothing.
@@ -182,10 +206,7 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
     if items.len() < 2 {
         return items.iter().map(work).collect();
     }
-    let wanted = (items.len() - 1).min(most_lent());
-    let taken = LENT.fetch_add(wanted, Ordering::AcqRel);
-    let lent = wanted.min(most_lent().saturating_sub(taken));
-    LENT.fetch_sub(wanted - lent, Ordering::AcqRel);
+    let lent = Lend::threads(items.len() - 1);
     let next = AtomicUsize::new(0);
     let worker = || {
         let mut done = Vec::new();
@@ -196,13 +217,13 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
         }
     };
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..lent).map(|_| scope.spawn(worker)).collect();
+        let threads: Vec<_> = (0..lent.count).map(|_| scope.spawn(worker)).collect();
         let own = worker();
         let rest =
             threads.into_iter().map(|thread| thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
         own.into_iter().chain(rest.flatten()).collect()
     });
-    LENT.fetch_sub(lent, Ordering::AcqRel);
+    drop(lent);
     done.sort_unstable_by_key(|(at, _)| *at);
     done.into_iter().map(|(_, result)| result).collect()
 }

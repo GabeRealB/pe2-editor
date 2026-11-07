@@ -188,15 +188,14 @@ fn register(r: &mut Registry) -> Result<()> {
         .input::<Objects>("objects")
         .output::<Symbols>()
         .run(symbols);
-    // What it links of other packages - their objects, what they publish - it reads as it runs: a first run says which.
+    // What it links of other packages - their objects, what they publish - it reads in a step before it links.
     let _ = r
         .op("link")
         .label("Link")
         .input::<SourceTree>("sources")
         .input::<Objects>("objects")
         .output::<ty::File<Package>>()
-        .prepared_by_running()
-        .run(link_image);
+        .steps(link_image());
     let _ = r
         .op("flags")
         .label("What a language server is told")
@@ -476,10 +475,9 @@ fn write_objects(call: &Call, objects: &[File], scratch: &Path) -> Result<Vec<Pa
     Ok(written)
 }
 
-/// What the gathered tree says the image links besides its own objects (`linked`): its dependencies, and the packages it
-/// binds, by their paths.
-fn linked(tree: &Path, kind: &str) -> Vec<String> {
-    let listed = fs::read_to_string(tree.join("linked")).unwrap_or_default();
+/// What the gathered tree says the image links besides its own objects (its file `linked`, as text): its dependencies
+/// (`dependency`), and the packages it binds (`bound`), by their paths.
+fn linked_in(listed: &str, kind: &str) -> Vec<String> {
     listed.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' ')).map(str::to_string).collect()
 }
 
@@ -528,7 +526,24 @@ fn symbols(call: &mut Call) -> Result<Typed> {
 
 /// The image: the package's objects and its dependencies', by its script at its slot, against what the libraries publish
 /// and what the images it binds do.
+#[pe2_ext::steps]
 fn link_image(call: &mut Call) -> Result<Typed> {
+    // What it links of others, from its tree's `linked`, read whole before it is linked once.
+    let listed: String = {
+        let sources = call.take::<SourceTree>(0)?;
+        let file = sources.files.iter().find(|file| file.name == "linked");
+        file.map(|file| call.read(file))
+            .transpose()?
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default()
+    };
+    let dependencies: Vec<String> = linked_in(&listed, "dependency");
+    let bound: Vec<String> = linked_in(&listed, "bound");
+    #[request]
+    let read: Vec<pe2_ext::Data> = call.outputs_of(
+        dependencies.iter().map(|d| (d.as_str(), "objects")).chain(bound.iter().map(|b| (b.as_str(), "symbols"))),
+    )?;
+    let (objects_read, symbols_read) = read.split_at(dependencies.len());
     let path = call.host.path().to_string();
     let fields = call.given();
     let sources = call.take::<SourceTree>(0)?;
@@ -539,8 +554,8 @@ fn link_image(call: &mut Call) -> Result<Typed> {
     let made = write_out(call, &sources, &scratch).and_then(|tree| {
         let name = name_in(&tree)?;
         let mut files = own.files.clone();
-        for dependency in linked(&tree, "dependency") {
-            let pe2_ext::Data::Typed(objects) = call.output_of(&dependency, "objects")? else {
+        for (dependency, objects) in dependencies.iter().zip(objects_read) {
+            let pe2_ext::Data::Typed(objects) = objects.clone() else {
                 bail!("{dependency}: its objects are no files")
             };
             // What it gives what links it: its public objects.
@@ -563,10 +578,8 @@ fn link_image(call: &mut Call) -> Result<Typed> {
                 }
             }
         }
-        for (at, bound) in linked(&tree, "bound").iter().enumerate() {
-            let pe2_ext::Data::Typed(symbols) = call.output_of(bound, "symbols")? else {
-                bail!("{bound}: what it publishes is no file")
-            };
+        for (at, (bound, symbols)) in bound.iter().zip(symbols_read).enumerate() {
+            let pe2_ext::Data::Typed(symbols) = symbols else { bail!("{bound}: what it publishes is no file") };
             let written = scratch.join(format!("bound_{at}.ld"));
             fs::write(&written, call.read(symbols.file()?)?)?;
             published.push(written);

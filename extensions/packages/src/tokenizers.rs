@@ -482,10 +482,10 @@ fn bank_of(call: &Call) -> Result<Bank> {
     Ok(Bank { schema, filled, stored })
 }
 
-/// A clip's arrays, from what its node makes, and its path.
-fn clip_arrays(call: &Call, reference: &str) -> Result<(String, clip::Arrays)> {
+/// A clip's arrays, from what its node made, and its path.
+fn clip_arrays(call: &Call, reference: &str, made: Data) -> Result<(String, clip::Arrays)> {
     let path = call.node_named(reference).ok_or_else(|| anyhow!("no clip {reference}"))?.path;
-    let Data::Typed(stored) = call.output_of(reference, "native")? else { bail!("{path}: its output is no clip") };
+    let Data::Typed(stored) = made else { bail!("{path}: its output is no clip") };
     let read =
         clip_usd::read(&String::from_utf8(call.read(stored.file()?)?)?).map_err(|why| anyhow!("{path}: {why:#}"))?;
     Ok((path.clone(), clip::arrays(&read).map_err(|why| anyhow!("{path}: {why:#}"))?))
@@ -500,8 +500,11 @@ fn bank_whole(call: &Call, args: &Args) -> Result<String> {
         schema.get("capacity").and_then(Value::as_integer).ok_or_else(|| anyhow!("its schema has no capacity"))?;
     let mut defined: Vec<(String, String)> = Vec::new();
     let mut out = Vec::new();
-    for reference in &stored {
-        let (path, arrays) = clip_arrays(call, reference)?;
+    // Every clip asked for at once (`outputs_of`): a tokenizer following what it reads is run until it has them, and
+    // asking one at a time took a run each.
+    let made = call.outputs_of(stored.iter().map(|reference| (reference.as_str(), "native")))?;
+    for (reference, made) in stored.iter().zip(made) {
+        let (path, arrays) = clip_arrays(call, reference, made)?;
         let name = clip_name(&path);
         out.push(clip_definition(&name, &arrays));
         defined.push((reference.clone(), name));

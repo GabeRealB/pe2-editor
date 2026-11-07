@@ -13,6 +13,10 @@ struct Cli {
     /// Run every unsandboxed extension in this run, asking nothing and keeping nothing
     #[arg(long, global = true)]
     trust_everything: bool,
+    /// Print, once done, what the run spent its time on: each span's count, total, mean and longest (summed over
+    /// threads, so work run in parallel totals more than it took)
+    #[arg(long, global = true)]
+    profile: bool,
     #[command(subcommand)]
     tool: Tool,
 }
@@ -734,6 +738,17 @@ fn main() -> Result<()> {
         args.insert(1, tool);
     }
     let cli = Cli::parse_from(args);
+    project::profile::install();
+    let profile = cli.profile.then(std::time::Instant::now);
+    let done = run(cli);
+    if let Some(started) = profile {
+        eprintln!("\n{}", project::profile::table(&project::profile::totals()));
+        eprintln!("{:.2} s in all", started.elapsed().as_secs_f64());
+    }
+    done
+}
+
+fn run(cli: Cli) -> Result<()> {
     if cli.trust_everything {
         extensions::trust::trust_everything();
         eprintln!("warning: trusting every extension in this run");
@@ -782,10 +797,15 @@ fn main() -> Result<()> {
                 report.layouts,
                 report.layer.display()
             );
-            // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted.
+            // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted:
+            // indexed only then.
             let _ = project::cache::Cache::open(&p, &lock).and_then(|cache| {
+                let store = project::graph::store::Store::open(&cache)?;
+                if !store.sweep_due(project::imports::SWEEP_EVERY) {
+                    return Ok(None);
+                }
                 let index = project::index::Index::open(&p, &cache)?;
-                Ok(project::imports::sweep_if_due(&project::graph::store::Store::open(&cache)?, &index))
+                Ok(project::imports::sweep_if_due(&store, &index))
             });
         }
         Tool::Fetched { command } => fetched(command)?,

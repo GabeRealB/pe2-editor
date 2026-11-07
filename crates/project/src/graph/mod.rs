@@ -130,6 +130,8 @@ pub struct OpDef {
     pub run: Option<Arc<Run>>,
     /// What it will read, said before it runs.
     pub prepare: Option<Arc<Prepare>>,
+    /// Whether it runs in steps (`pe2_ext::stepped`): what it was given is kept for its steps after the first.
+    pub stepped: bool,
     /// An extension's, which reads of other nodes only what it said: what reads otherwise holds an instance while what it
     /// reads is made. The host's own run nothing to hold.
     pub strict: bool,
@@ -161,6 +163,7 @@ impl OpDef {
             parameter: None,
             run: None,
             prepare: None,
+            stepped: false,
             strict: false,
             start: None,
             output_of: None,

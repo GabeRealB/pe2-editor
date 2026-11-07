@@ -1,6 +1,6 @@
 [package]
 name = "pe2-ext-macros"
-description = "The extension SDK's macros: `extension!`, which declares an extension from its manifest"
+description = "The extension SDK's macros: `extension!`, which declares an extension from its manifest, and `#[steps]`"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
@@ -12,5 +12,9 @@ proc-macro = true
 workspace = true
 
 [dependencies]
+# `#[steps]` reads the function it cuts (stepping.rs).
+syn = { version = "2", features = ["full", "visit", "visit-mut"] }
+quote = "1"
+proc-macro2 = "1"
 toml.workspace = true
 sha2.workspace = true

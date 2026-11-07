@@ -1592,6 +1592,7 @@ impl Shared {
 
     /// A new instance for a job that may take `cap` bytes; its extension registers when a call first needs it.
     fn instantiate(&self, cap: u64) -> Result<Runner> {
+        let _span = tracing::info_span!("instantiate", of = %self.id).entered();
         let stderr = MemoryOutputPipe::new(64 << 10);
         let mut wasi = WasiCtx::builder();
         wasi.stderr(stderr.clone());
@@ -1630,6 +1631,7 @@ impl Shared {
 
     /// A job that may take `cap` bytes: run on an instance made for it, dropped when it returns.
     fn job<R>(&self, cap: u64, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
+        let _span = tracing::info_span!("job", of = %self.id).entered();
         self.have_required()?;
         let mut runner = self.instantiate(cap).with_context(|| self.id.clone())?;
         let out = call(&mut runner).with_context(|| self.id.clone());
@@ -1640,6 +1642,7 @@ impl Shared {
     /// A reading: run on the readings' instance, made if there is none, its frames reset; a reading while it is busy
     /// on another thread is a job. One that failed, or grew past the budget, goes.
     fn read<R>(&self, call: impl FnOnce(&mut Runner) -> Result<R>) -> Result<R> {
+        let _span = tracing::info_span!("reading", of = %self.id).entered();
         let Ok(mut reading) = self.reading.try_lock() else { return self.job(MEMORY, call) };
         self.have_required()?;
         let mut runner = match reading.take() {
@@ -1892,6 +1895,7 @@ struct ComponentExtraction {
 
 impl ComponentExtraction {
     fn begin(shared: &Shared, extractor: u32, cap: u64, declared: &dyn Declared) -> Result<ComponentExtraction> {
+        let _span = tracing::info_span!("extraction begun", of = %shared.id).entered();
         let mut runner = shared.instantiate(cap)?;
         // SAFETY: the pointer is used only during this call, and taken back before it returns.
         let declared = unsafe { erase_declared(declared) };
@@ -2380,6 +2384,9 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             });
         }
         let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
+        if op.stepped {
+            builder = builder.stepped();
+        }
         if op.prepares {
             let shared = shared.clone();
             builder = builder.prepare(move |call| {
@@ -2754,10 +2761,12 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
     {
         // SAFETY: what `serialize` wrote for this engine's settings (the key) and these bytes, unchanged since (the
         // digest).
+        let _span = tracing::info_span!("component read compiled").entered();
         if let Ok(component) = unsafe { Component::deserialize(engine, code) } {
             return Ok(component);
         }
     }
+    let _span = tracing::info_span!("component compiled", bytes = bytes.len()).entered();
     let component = Component::new(engine, bytes).map_err(anyhow::Error::from)?;
     if let Some(file) = file
         && let Ok(code) = component.serialize()
@@ -2997,6 +3006,7 @@ pub fn load_unsandboxed(name: &str, bytes: &[u8], origin: Origin, unsandboxed: U
 }
 
 fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<Loadable> {
+    let _span = tracing::info_span!("component loaded", name = %name).entered();
     let trust = unsandboxed.as_ref().map(|u| u.trust.clone());
     let build = trust.clone().unwrap_or_else(|| crate::extract::sha1_hex(bytes));
     let (size, build) = (bytes.len(), Some(build));

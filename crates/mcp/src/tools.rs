@@ -244,9 +244,9 @@ fn own() -> Vec<Tool> {
         ),
         tool::<NoArgs>(
             "editor_performance",
-            "What the editor costs, sampled each second: frames shown and what one takes, CPU (100 is one core's whole \
-             time), memory, the GPU's use and memory where they can be read, the window, what draws it. Asking \
-             starts the GPU's sampling. Only when the editor has the project open.",
+            "What the editor costs, each second: frames and their time, CPU (100 is one core), memory, the GPU's use \
+             and memory, the window, what draws it; and its time since it started by span (operations, instances, the \
+             index, the store), costliest first, summed over threads. Only when the editor has the project open.",
         ),
         tool::<AssetArgs>(
             "editor_show",

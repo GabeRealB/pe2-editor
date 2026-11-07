@@ -201,6 +201,7 @@ impl Imports {
         found
     }
 
+    #[tracing::instrument(name = "imports attach", skip_all)]
     fn attach_some(
         &self,
         index: &mut Index,
@@ -544,6 +545,7 @@ pub const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_mins(30);
 #[must_use = "what was swept is the sweep's report"]
 #[expect(clippy::implicit_hasher, reason = "the store sweeps by a set of the standard hasher's")]
 pub fn sweep_store(store: &Store, live: &HashSet<String>) -> (usize, usize, usize) {
+    let _span = tracing::info_span!("store sweep").entered();
     store.mark_swept();
     let swept = store.sweep(live, &HashSet::new());
     store.mark_swept();
@@ -1039,12 +1041,12 @@ mod attaching {
             Ok(call.settings.clone())
         });
         // Reads what the setting names, and what that says comes next: known only once the first is made.
-        let _ = r.op("hops").output::<ty::Table>().prepared_by_running().run(|call| {
+        let _ = r.op("hops").output::<ty::Table>().steps(pe2_ext::stepped::replayed(|call| {
             let first = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
             let found = call.table_of(&first, "native")?;
             let next = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
             call.table_of(&next, "native")
-        });
+        }));
         // Reads each of its `reads`, a list of nodes.
         let list = |call: &pe2_ext::Call<'_>| -> Vec<String> {
             call.settings
@@ -1119,7 +1121,102 @@ mod attaching {
                 Ok(pe2_ext::Prepared { needs: Vec::new(), micros })
             })
             .run(|_| anyhow::bail!("it is done by its micro ops"));
+        let _ = r.op("chained").output::<ty::Table>().steps(chained());
+        let _ = r.op("unasked").output::<ty::Table>().steps(unasked());
+        let _ = r.op("followed").output::<ty::Table>().steps(followed());
+        let _ = r.op("counted_on").output::<ty::Table>().steps(counted_on());
         Ok(())
+    }
+
+    /// Reads what its setting names, then what that names next, each requested where a step ends; doubles three numbers,
+    /// each its own micro op, counted; then reads both nodes again, each an item reading its own in steps.
+    #[pe2_ext::steps]
+    fn chained(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
+        let first: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        #[request]
+        let found: Table = call.table_of(&first, "native")?;
+        let next: String = found.get("next").and_then(Value::as_str).unwrap_or_default().to_string();
+        #[request]
+        let arrived: Vec<Table> = call.tables_of([(next.as_str(), "native")])?;
+        #[each]
+        let doubled: Vec<i64> = vec![1_i64, 2, 3]
+            .into_iter()
+            .map(|n: i64| {
+                RUNS.lock().unwrap().push(format!("doubled {n}"));
+                n * 2
+            })
+            .collect();
+        #[each]
+        let hops: Vec<Table> = [first, next].into_iter().map(hop).collect();
+        let mut out = arrived[0].clone();
+        out.insert("doubled".into(), Value::Array(doubled.into_iter().map(Value::Integer).collect()));
+        out.insert("hops".into(), Value::Array(hops.into_iter().map(Value::Table).collect()));
+        Ok(out)
+    }
+
+    /// An item reading the node it is given.
+    #[pe2_ext::steps]
+    fn hop(call: &mut pe2_ext::Call<'_>, node: String) -> Result<Table> {
+        #[request]
+        let got: Table = call.table_of(&node, "native")?;
+        Ok(got)
+    }
+
+    /// Follows `next` from node to node, a step each, until a node names none: the nodes it went through.
+    #[pe2_ext::steps]
+    fn followed(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
+        let mut at: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            #[request]
+            let found: Table = call.table_of(&at, "native")?;
+            seen.push(at.clone());
+            let Some(next) = found.get("next").and_then(Value::as_str) else { break };
+            at = next.to_string();
+        }
+        Ok(Table::from_iter([("seen".to_string(), Value::Array(seen.into_iter().map(Value::String).collect()))]))
+    }
+
+    /// How many nodes follow from the first, `next` after `next`: a helper calling itself while there is a next.
+    #[pe2_ext::steps]
+    fn counted_on(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
+        let first: String = call.settings.get("first").and_then(Value::as_str).unwrap_or_default().to_string();
+        #[call]
+        let length: i64 = depth(call, first)?;
+        let names: Vec<String> = vec!["one".to_string(), "two".to_string()];
+        let mut keys: Vec<String> = Vec::new();
+        for name in names {
+            #[request]
+            let found: Table = call.table_of(&name, "native")?;
+            keys.extend(found.keys().cloned());
+        }
+        Ok(Table::from_iter([
+            ("length".to_string(), Value::Integer(length)),
+            ("keys".to_string(), Value::Array(keys.into_iter().map(Value::String).collect())),
+        ]))
+    }
+
+    /// How many nodes there are from this one on.
+    #[pe2_ext::steps]
+    fn depth(call: &mut pe2_ext::Call<'_>, node: String) -> Result<i64> {
+        #[request]
+        let found: Table = call.table_of(&node, "native")?;
+        if let Some(next) = found.get("next").and_then(Value::as_str) {
+            let next: String = next.to_string();
+            #[call]
+            let below: i64 = depth(call, next)?;
+            return Ok(below + 1);
+        }
+        Ok(1)
+    }
+
+    /// Reads what nothing requested.
+    #[pe2_ext::steps]
+    fn unasked(call: &mut pe2_ext::Call<'_>) -> Result<Table> {
+        let read: Table = call.table_of("one", "native")?;
+        #[request]
+        let never: Table = call.table_of("two", "native")?;
+        Ok(read)
     }
 
     fn opened(root: &Path) -> (Lock, Cache, Index) {
@@ -1173,6 +1270,52 @@ mod attaching {
         let given = extensions.output(&engine, &index, &index.assets["hop"], "native", true).unwrap();
         let value = format!("{:?}", given.value.unwrap());
         assert!(value.contains("arrived"), "{value}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn steps_read_what_the_steps_before_requested_and_join_what_they_spawned() {
+        let nodes = [
+            ("chain", staged_node("chained", "first = \"one\"", "transient")),
+            ("one", staged_node("counted", "next = \"two\"", "transient")),
+            ("two", staged_node("counted", "arrived = \"yes\"", "transient")),
+            ("unasked", staged_node("unasked", "", "transient")),
+            ("followed", staged_node("followed", "first = \"one\"", "transient")),
+            ("counted_on", staged_node("counted_on", "first = \"one\"", "transient")),
+            ("three", staged_node("counted", "last = \"yes\"", "transient")),
+        ];
+        let (root, extensions) = staged("chained", &nodes);
+        let (_lock, cache, index) = opened(&root);
+        let store = crate::graph::store::Store::open(&cache).unwrap();
+        let make = |at: &str| {
+            let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
+            extensions.output(&engine, &index, &index.assets[at], "native", true)
+        };
+        let value = format!("{:?}", make("chain").unwrap().value.unwrap());
+        assert!(value.contains("arrived"), "the second read, named by the first: {value}");
+        assert!(value.contains("\"doubled\": Array([Integer(2), Integer(4), Integer(6)])"), "in their order: {value}");
+        assert_eq!(runs_of("doubled "), 3);
+        assert!(value.contains("\"hops\": Array([Table({\"next\": String(\"two\")}), Table({\"arrived\""), "{value}");
+        drop(make("chain").unwrap());
+        assert_eq!(runs_of("doubled "), 3, "each item kept, by what it was given");
+        // A loop, a step a turn: one, then two, which names three, which names none.
+        write(
+            &root,
+            ".layers/base/two.node/node.toml",
+            &staged_node("counted", "arrived = \"yes\"\nnext = \"three\"", "transient"),
+        );
+        let index = Index::open(&Project::load(&root).unwrap(), &cache).unwrap();
+        let engine = crate::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
+        let followed = extensions.output(&engine, &index, &index.assets["followed"], "native", true).unwrap();
+        let followed = format!("{:?}", followed.value.unwrap());
+        assert!(followed.contains("[String(\"one\"), String(\"two\"), String(\"three\")]"), "{followed}");
+        // A helper calling itself, a `for` with a cut in it.
+        let counted = extensions.output(&engine, &index, &index.assets["counted_on"], "native", true).unwrap();
+        let counted = format!("{:?}", counted.value.unwrap());
+        assert!(counted.contains("\"length\": Integer(3)"), "{counted}");
+        assert!(counted.contains("[String(\"next\"), String(\"arrived\"), String(\"next\")]"), "{counted}");
+        let why = make("unasked").err().expect("a read nothing requested");
+        assert!(format!("{why:#}").contains("it did not say it reads this"), "{why:#}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

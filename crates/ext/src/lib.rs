@@ -25,6 +25,7 @@ pub mod media;
 pub mod process;
 mod project;
 mod registry;
+pub mod stepped;
 pub mod test;
 pub mod tokens;
 pub mod ty;
@@ -40,7 +41,7 @@ pub use data::{
 pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
-pub use pe2_ext_macros::extension;
+pub use pe2_ext_macros::{extension, steps};
 pub use project::{Project, Requested};
 pub use registry::{
     ActOnContents, CommandDef, ContentAction, ContentDrag, ContentOutcome, ContentPlace, ContentRequest, ContentRow,

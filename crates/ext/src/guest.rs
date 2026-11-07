@@ -1156,6 +1156,7 @@ fn imports(ops: &[OpDef], out: &mut g::Registration, numbered: &mut Registered) 
             members: op.members.is_some(),
             also: op.also.iter().map(|(name, ty)| (name.clone(), ty.to_string())).collect(),
             prepares: op.prepare.is_some(),
+            stepped: op.stepped,
         });
     }
 }

@@ -731,6 +731,40 @@ impl Call<'_> {
         }
     }
 
+    /// Outputs of several assets, each asked for before any is found missing: in a replayed run (`stepped::replayed`),
+    /// what it lacks of them is made in one round, where asking in turn costs a round each - and each round runs it
+    /// again from the start. In steps, what a `#[request]` names.
+    ///
+    /// # Errors
+    /// As `output_of`, for the first that fails.
+    pub fn outputs_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Vec<Value>> {
+        let got: Vec<Result<Value>> = wanted.into_iter().map(|(path, address)| self.output_of(path, address)).collect();
+        got.into_iter().collect()
+    }
+
+    /// Outputs of several assets, each read on its own: what it made, or why it could not be - for reads that may find
+    /// nothing, asked for together as `outputs_of` asks.
+    #[must_use]
+    pub fn outputs_tried<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<Result<Value>> {
+        wanted.into_iter().map(|(path, address)| self.output_of(path, address)).collect()
+    }
+
+    /// Tables of several assets, asked for together as `outputs_of` asks.
+    ///
+    /// # Errors
+    /// As `outputs_of`, or one is no table.
+    pub fn tables_of<'a>(&self, wanted: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Vec<Table>> {
+        let wanted: Vec<(&str, &str)> = wanted.into_iter().collect();
+        let got = self.outputs_of(wanted.iter().copied())?;
+        got.into_iter()
+            .zip(wanted)
+            .map(|(value, (path, address))| match value {
+                Value::Table(table) => Ok(table),
+                other => bail!("{path}: {address} is {}, no table", other.ty()),
+            })
+            .collect()
+    }
+
     /// The config being built; made again for another.
     #[must_use]
     pub fn config(&self) -> Option<BuildConfig> {
@@ -951,6 +985,8 @@ pub struct OpDef {
     pub run: Arc<RunOp>,
     /// What it will read, said before it runs (`OpBuilder::prepare`). What says nothing reads nothing of other nodes.
     pub prepare: Option<Arc<PrepareOp>>,
+    /// Whether it runs in steps (`stepped`): its run may end at a cut, the host going on from its record.
+    pub stepped: bool,
     /// For a stream operation (its output a `stream<T>`): how it is opened.
     pub start: Option<Arc<StartStream>>,
 }

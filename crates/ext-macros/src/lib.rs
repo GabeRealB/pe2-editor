@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use proc_macro::TokenStream;
 
+mod stepping;
+
 /// The file beside an extension's `Cargo.toml` that says what it is.
 const MANIFEST: &str = "extension.toml";
 
@@ -409,6 +411,17 @@ use ::pe2_ext::guest::Component as __Pe2Component;
         platforms = texts("platforms"),
     );
     Ok(code)
+}
+
+/// An operation run in steps (`pe2_ext::stepped`): its body is cut where a `let` is marked - `#[request]`, a read of other
+/// nodes made before the next step; `#[each]`, a map whose items each run as a micro op; `#[call]`, a helper in steps -
+/// wherever a statement stands in its blocks, `if`s, `match`es and loops. What lives across a cut is carried, written with
+/// its type. The function becomes one taking nothing and giving its steps, which `OpBuilder::steps` registers; its
+/// parameters after the call are its arguments, where it is a helper.
+#[proc_macro_attribute]
+pub fn steps(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = syn::parse_macro_input!(item as syn::ItemFn);
+    stepping::expand(&function).into()
 }
 
 #[cfg(test)]

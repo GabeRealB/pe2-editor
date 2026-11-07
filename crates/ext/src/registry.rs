@@ -895,6 +895,20 @@ impl Registry {
 
     /// An operation, `<id>@<name>`: registered by `run` on what this returns. It makes `ty::Any` until it says
     /// otherwise.
+    /// Whether it registered an operation by this name already.
+    #[must_use]
+    pub(crate) fn has_op(&self, name: &str) -> bool {
+        self.parts.ops.iter().any(|op| op.name.local() == name)
+    }
+
+    /// What an operation registered already does, set again: a helper in steps, registered before its steps so that it
+    /// may call itself (`stepped`).
+    pub(crate) fn set_run(&mut self, name: &str, run: Arc<crate::data::RunOp>) {
+        if let Some(op) = self.parts.ops.iter_mut().find(|op| op.name.local() == name) {
+            op.run = run;
+        }
+    }
+
     pub fn op(&mut self, name: &str) -> OpBuilder<'_> {
         let def = OpDef {
             name: Name::of(&self.id, name),
@@ -911,9 +925,10 @@ impl Registry {
             also: vec![],
             run: Arc::new(|_| Err(crate::anyhow!("it does nothing"))),
             prepare: None,
+            stepped: false,
             start: None,
         };
-        OpBuilder { registry: self, def, same: Vec::new(), list_of: None, by_running: false, out: PhantomData }
+        OpBuilder { registry: self, def, same: Vec::new(), list_of: None, out: PhantomData }
     }
 
     /// Declare an event of this extension, for others to wire to and for it to signal.
@@ -1290,8 +1305,6 @@ pub struct OpBuilder<'a, Out = crate::ty::Any> {
     same: Vec<Vec<Option<String>>>,
     /// Its output is a list of what this port takes.
     list_of: Option<String>,
-    /// What it reads is found by running it.
-    by_running: bool,
     out: PhantomData<Out>,
 }
 
@@ -1408,9 +1421,9 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     /// What it makes (`.output::<ty::Image>()`): what `run` returns a value of.
     #[must_use]
     pub fn output<T: ValueType>(self) -> OpBuilder<'a, T> {
-        let OpBuilder { registry, mut def, same, list_of, by_running, .. } = self;
+        let OpBuilder { registry, mut def, same, list_of, .. } = self;
         def.output = T::ty();
-        OpBuilder { registry, def, same, list_of, by_running, out: PhantomData }
+        OpBuilder { registry, def, same, list_of, out: PhantomData }
     }
 
     /// Two ports taking `Any` take one type, whatever it is: given a texture first, the other takes a texture.
@@ -1523,20 +1536,11 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
         self
     }
 
-    /// What it will read of other nodes, said before it runs: all it may read, as what it does not say fails. Called again
-    /// once that is made, for as long as it asks for more, so that a read can name what the last one found.
+    /// What it will read of other nodes, or how it splits into micro ops, said before it runs, once: all it may read, as
+    /// what it does not say fails. What reads in levels, each found by the one before, runs in steps instead (`steps`).
     #[must_use]
     pub fn prepare(mut self, prepare: impl Fn(&mut Call<'_>) -> Result<Prepared> + Send + Sync + 'static) -> Self {
         self.def.prepare = Some(Arc::new(prepare));
-        self
-    }
-
-    /// What it reads found by running it: each read of what is not there yet is noted and fails, it is run again once that
-    /// is made, and what came of it is left. For what reads as it goes, where saying so apart would be writing it twice; its
-    /// work up to its reads is done once a round, so it is for what is cheap until it has them.
-    #[must_use]
-    pub fn prepared_by_running(mut self) -> Self {
-        self.by_running = true;
         self
     }
 
@@ -1545,14 +1549,6 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     pub fn run(mut self, run: impl Fn(&mut Call<'_>) -> Result<Out::Value> + Send + Sync + 'static) -> Name {
         self.constrain();
         let also: Vec<String> = self.def.also.iter().map(|(name, _)| name.clone()).collect();
-        let run = Arc::new(run);
-        if self.by_running {
-            let run = run.clone();
-            self.def.prepare = Some(Arc::new(move |call| {
-                drop(run(call));
-                Ok(Prepared::default())
-            }));
-        }
         self.def.run = Arc::new(move |call| {
             let first = run(call).map(Out::encode)?;
             if also.is_empty() {
@@ -1569,6 +1565,43 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
         let name = self.def.name.clone();
         self.registry.parts.ops.push(self.def);
         name
+    }
+
+    /// What it does, in steps (`#[pe2_ext::steps]`; `stepped`): its run is its first step, and each step after a cut an
+    /// operation of the extension named after it (`inter.step1`), as what a cut spawns is (`inter.cut1.each`). A step ending
+    /// at a cut makes a record the host goes on from (`stepped::continuation`); what it makes is what the step finishing it
+    /// makes.
+    #[must_use = "its name, which a type's outputs and an inverse name it by"]
+    pub fn steps(mut self, steps: crate::stepped::Steps<Out::Value>) -> Name
+    where
+        Out::Value: 'static,
+    {
+        self.constrain();
+        let name = self.def.name.clone();
+        let local = name.local().to_string();
+        let steps = steps.map(|made| Ok(Out::encode(made)));
+        let label = self.def.label.clone();
+        let also: Vec<String> = self.def.also.iter().map(|(name, _)| name.clone()).collect();
+        let mut def = self.def;
+        let registry = self.registry;
+        def.stepped = true;
+        def.run = Arc::new(crate::stepped::register_operation(registry, &local, &label, &also, steps));
+        registry.parts.ops.push(def);
+        name
+    }
+
+    /// It runs in steps, as a component registered it: its run may end at a cut (`stepped`).
+    #[must_use]
+    pub fn stepped(mut self) -> Self {
+        self.def.stepped = true;
+        self
+    }
+
+    /// A port taking any value, by its name: one, or any number (`many`).
+    #[must_use]
+    pub(crate) fn port_any(mut self, name: &str, many: bool) -> Self {
+        self.def.inputs.push(Port { name: name.to_string(), ty: Type::Any, many });
+        self
     }
 
     /// Register what a component runs: it makes what it makes, several outputs already a list of them.

@@ -348,11 +348,10 @@ impl Drop for Call<'_> {
     }
 }
 
-/// What an operation said it reads, made before it ran, by `<node>#<address>`; and what it asked for that was not.
+/// What an operation said it reads, made before it ran, by `<node>#<address>`.
 #[derive(Default)]
 pub struct Needs {
     made: Mutex<HashMap<String, std::result::Result<Got, String>>>,
-    asked: Mutex<Vec<(toml::Value, String)>>,
 }
 
 /// An output of another node, read.
@@ -362,9 +361,6 @@ struct Got {
     value: Arc<Value>,
     hash: String,
 }
-
-/// How many rounds an operation may ask for more before it is taken to be going in circles.
-const MOST_ROUNDS: usize = 4096;
 
 /// Where stored contents of other nodes' outputs are, by hash.
 type Others = Mutex<HashMap<String, std::path::PathBuf>>;
@@ -510,11 +506,7 @@ impl<'a> Call<'a> {
                 match made {
                     Some(Ok(got)) => got,
                     Some(Err(why)) => anyhow::bail!("{why}"),
-                    None => {
-                        let mut asked = needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        asked.push((reference.clone(), address.to_string()));
-                        anyhow::bail!("{key}: it did not say it reads this");
-                    }
+                    None => anyhow::bail!("{key}: it did not say it reads this"),
                 }
             }
         };
@@ -973,7 +965,7 @@ impl Evaluation<'_> {
                 needs: None,
                 temps: Mutex::default(),
             };
-            return match start(&mut call) {
+            return match tracing::info_span!("stream", of = %step.op).in_scope(|| start(&mut call)) {
                 Ok(producer) => {
                     let stream = super::stream::Stream::open(producer);
                     Ok(Arc::new(Value::Stream(pe2_ext::StreamInput::of(Arc::new(super::stream::InTurn::new(&stream))))))
@@ -1011,6 +1003,9 @@ impl Evaluation<'_> {
             return self.split(step, &inputs, &micros, parameter);
         }
         let held = def.strict.then_some(&needs);
+        // What it is given, for its steps after the first, where it runs in steps: kept by nothing else, so that a value
+        // it takes alone it can take whole.
+        let given = def.stepped.then(|| inputs.clone());
         let mut call = Call {
             inputs,
             settings: &step.settings,
@@ -1022,21 +1017,139 @@ impl Evaluation<'_> {
             needs: held,
             temps: Mutex::default(),
         };
-        let value = match run(&mut call) {
+        let value = match tracing::info_span!("op", of = %step.op).in_scope(|| run(&mut call)) {
             Ok(value) => value,
             Err(e) => return fail(format!("{e:#}")),
         };
-        // With several, what it makes is a list of them, each checked where it is picked.
+        drop(call);
+        let Some(given) = given else { return Self::made(step, def, &bound, value) };
+        match self.continued(step, value, &given, parameter, recorder) {
+            Ok(value) => Self::made(step, def, &bound, value),
+            Err(e) => fail(format!("{e:#}")),
+        }
+    }
+
+    /// Where a run ended at a cut (`pe2_ext::stepped`), what it goes on to: what it requested made, what it spawned run -
+    /// each item kept by what it was given, as a micro op is - and its next step run, given the record, what the items
+    /// made and what the operation was given, until a step finishes. What that makes; a value that is no record, itself.
+    fn continued(
+        &self,
+        step: &super::Step,
+        mut value: Value,
+        given: &[Vec<Input>],
+        parameter: Option<&str>,
+        recorder: Recorder<'_>,
+    ) -> Result<Value> {
+        let extension = step.op.split_once('@').map_or(step.op.as_str(), |(extension, _)| extension);
+        while let Some(next) = pe2_ext::stepped::continuation(&value, |file| self.content(&file.content))? {
+            let needs = Needs::default();
+            self.make_needs(&next.needs, &needs);
+            let joined = match &next.spawn {
+                Some(spawn) => self.spawned(extension, step, spawn, &next.items, given, parameter)?,
+                None => Vec::new(),
+            };
+            let op = format!("{extension}@{}", next.next);
+            let def = self.ops.get(&op).with_context(|| format!("`{op}`: no extension provides it"))?;
+            let run = def.run.as_ref().with_context(|| format!("`{op}` makes nothing"))?;
+            let mut inputs = vec![vec![Input(Arc::new(value))], joined];
+            inputs.extend(given.iter().cloned());
+            let mut call = Call {
+                inputs,
+                settings: &step.settings,
+                parameter,
+                recorder,
+                store: self.store,
+                reach: self.reach,
+                others: self.others,
+                needs: Some(&needs),
+                temps: Mutex::default(),
+            };
+            value = tracing::info_span!("op", of = %op).in_scope(|| run(&mut call))?;
+        }
+        Ok(value)
+    }
+
+    /// What an operation said it reads, or a step requested, made - at once, where nothing connects them - for it to read.
+    fn make_needs(&self, wanted: &[pe2_ext::Need], needs: &Needs) {
+        let Some(reach) = self.reach else { return };
+        let mut keyed: Vec<(String, toml::Value, String)> = Vec::new();
+        for need in wanted {
+            let reference = toml::Value::String(need.node.clone());
+            let Ok(key) = reach.key(&reference, &need.address) else { continue };
+            if !keyed.iter().any(|(known, ..)| *known == key) {
+                keyed.push((key, reference, need.address.clone()));
+            }
+        }
+        let chain = MAKING.with(|making| making.borrow().clone());
+        let others = self.others;
+        let made = crate::parallel(&keyed, |(key, reference, address)| {
+            (key.clone(), making_as(&chain, || fetch(reach, others, reference, address)).map_err(|e| format!("{e:#}")))
+        });
+        needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(made);
+    }
+
+    /// What a step's items made, in order: each run by `spawn` as a micro op - given its item in its settings, two empty
+    /// ports and what the operation was given - kept by what it was given, at once where threads are free.
+    fn spawned(
+        &self,
+        extension: &str,
+        step: &super::Step,
+        spawn: &str,
+        items: &[String],
+        given: &[Vec<Input>],
+        parameter: Option<&str>,
+    ) -> Result<Vec<Input>> {
+        let ports: Vec<Vec<pe2_ext::MicroInput>> = [Vec::new(), Vec::new()]
+            .into_iter()
+            .chain(
+                (0..given.len()).map(|port| vec![pe2_ext::MicroInput::port(u32::try_from(port).unwrap_or(u32::MAX))]),
+            )
+            .collect();
+        let micros: Vec<pe2_ext::Micro> = items
+            .iter()
+            .map(|item| {
+                let mut settings = step.settings.clone();
+                settings.insert(pe2_ext::stepped::ITEM.into(), toml::Value::String(item.clone()));
+                pe2_ext::Micro {
+                    op: spawn.to_string(),
+                    label: spawn.to_string(),
+                    settings,
+                    ports: ports.clone(),
+                    keep: true,
+                }
+            })
+            .collect();
+        let chain = MAKING.with(|making| making.borrow().clone());
+        let made = crate::parallel(&micros, |micro| {
+            making_made(&chain, || self.micro(extension, step, micro, given, &[], parameter))
+        });
+        made.into_iter().map(|made| made.map(Input).map_err(|why| anyhow!("{why}"))).collect()
+    }
+
+    /// A content's bytes: inline, or kept in the store.
+    fn content(&self, content: &Content) -> pe2_ext::Result<Vec<u8>> {
+        match content {
+            Content::Inline(bytes) => Ok(bytes.clone()),
+            Content::Stored { sha1, .. } => {
+                let path = self.store.context("no store")?.blob_path(sha1);
+                std::fs::read(&path).with_context(|| path.display().to_string())
+            }
+        }
+    }
+
+    /// What a step made, checked against what its operation says it makes: with several, a list of them, each checked
+    /// where it is picked.
+    fn made(step: &super::Step, def: &super::OpDef, bound: &[(String, super::Type)], value: Value) -> Made {
         let one = def.output.as_ref().filter(|_| def.also.is_empty() && step.op != super::PICK);
-        if let Some(ty) = one.map(|t| t.bind(&bound)).filter(|t| !t.unify(&value.ty(), &mut Vec::new())) {
-            return fail(format!("`{}` made {}, not {ty}", step.op, value.ty()));
+        if let Some(ty) = one.map(|t| t.bind(bound)).filter(|t| !t.unify(&value.ty(), &mut Vec::new())) {
+            return Err(Arc::from(format!("{}: `{}` made {}, not {ty}", step.at, step.op, value.ty())));
         }
         Ok(Arc::new(value))
     }
 
-    /// What an operation says before it runs, asked until it asks for nothing new, what it asks for made in between: no
-    /// instance of it is held meanwhile, so that however far what it reads goes on, it holds one. Its micro ops, where it
-    /// splits. What failed to be made is left for its read to say, as it may be what it wanted to know.
+    /// What an operation says before it runs, asked once: what it reads, made then with no instance of it held, at once
+    /// where nothing connects them; and its micro ops, where it splits. What failed to be made is left for its read to
+    /// say, as it may be what it wanted to know.
     fn prepared(
         &self,
         prepare: &super::Prepare,
@@ -1046,52 +1159,20 @@ impl Evaluation<'_> {
         recorder: Recorder<'_>,
         needs: &Needs,
     ) -> Result<Vec<pe2_ext::Micro>> {
-        for _ in 0..MOST_ROUNDS {
-            let others = self.others;
-            let mut call = Call {
-                inputs: inputs.to_vec(),
-                settings: &step.settings,
-                parameter,
-                recorder,
-                store: self.store,
-                reach: self.reach,
-                others,
-                needs: Some(needs),
-                temps: Mutex::default(),
-            };
-            let prepared = prepare(&mut call);
-            let mut asked = std::mem::take(&mut *needs.asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-            if let Ok(prepared) = &prepared {
-                asked.extend(
-                    prepared.needs.iter().map(|need| (toml::Value::String(need.node.clone()), need.address.clone())),
-                );
-            }
-            let new = self.reach.map_or_else(Vec::new, |reach| {
-                let held = needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut new: Vec<(String, toml::Value, String)> = Vec::new();
-                for (reference, address) in asked {
-                    let Ok(key) = reach.key(&reference, &address) else { continue };
-                    if !held.contains_key(&key) && !new.iter().any(|(known, ..)| *known == key) {
-                        new.push((key, reference, address));
-                    }
-                }
-                new
-            });
-            if new.is_empty() {
-                return prepared.map(|prepared| prepared.micros);
-            }
-            let chain = MAKING.with(|making| making.borrow().clone());
-            let others = self.others;
-            let reach = self.reach.context("no other node is reachable here")?;
-            let made = crate::parallel(&new, |(key, reference, address)| {
-                (
-                    key.clone(),
-                    making_as(&chain, || fetch(reach, others, reference, address)).map_err(|e| format!("{e:#}")),
-                )
-            });
-            needs.made.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(made);
-        }
-        anyhow::bail!("it asks for more each time it is asked: {MOST_ROUNDS} rounds")
+        let mut call = Call {
+            inputs: inputs.to_vec(),
+            settings: &step.settings,
+            parameter,
+            recorder,
+            store: self.store,
+            reach: self.reach,
+            others: self.others,
+            needs: Some(needs),
+            temps: Mutex::default(),
+        };
+        let prepared = tracing::info_span!("prepare", of = %step.op).in_scope(|| prepare(&mut call))?;
+        self.make_needs(&prepared.needs, needs);
+        Ok(prepared.micros)
     }
 
     /// An operation's work in micro ops, each once those it takes from are made, those with nothing between them at the same
@@ -1498,7 +1579,7 @@ impl Engine {
             needs: None,
             temps: Mutex::default(),
         };
-        run(&mut call)
+        tracing::info_span!("op", of = %op).in_scope(|| run(&mut call))
     }
 
     /// The plan's cached outputs found kept - but `except` - as what the steps making them are known to make.

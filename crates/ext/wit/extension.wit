@@ -673,6 +673,9 @@ interface guest {
         also: list<tuple<string, string>>,
         /// Whether it says what it reads before it runs: `prepare-op`, called back by the operation.
         prepares: bool,
+        /// Whether it runs in steps: its run may end at a cut, the host going on from its record, given again what the
+        /// operation was given.
+        stepped: bool,
     }
 
     /// An output of another node an operation will read: by the node's path or a reference to it, and its address.

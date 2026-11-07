@@ -157,6 +157,7 @@ fn label(action: &Action) -> (String, String) {
 /// nothing left can signal first, as `order` left no cycle among them.
 #[must_use]
 pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, cancel: &AtomicBool) -> Report {
+    let _span = tracing::info_span!("epoch", roots = ?roots).entered();
     let mut report = Report { signaled: roots.iter().cloned().collect(), ..Report::default() };
     // Events a failed hook took back: signaled, so not again, but pulling nothing.
     let mut refused: BTreeSet<String> = BTreeSet::new();
@@ -232,6 +233,8 @@ pub fn schedule(triggers: &[Trigger], roots: &[String], effects: &dyn Effects, c
 /// A batch at once, as many at a time as there are threads to lend.
 fn run_all(triggers: &[Trigger], batch: &[usize], effects: &dyn Effects) -> Vec<Outcome> {
     crate::parallel(batch, |t| {
+        let (asset, output) = label(&triggers[*t].action);
+        let _span = tracing::info_span!("trigger", asset = %asset, output = %output).entered();
         let run = std::panic::AssertUnwindSafe(|| effects.run(&triggers[*t].action));
         std::panic::catch_unwind(run)
             .unwrap_or_else(|_| Outcome { failed: Some("it panicked".into()), ..Outcome::default() })

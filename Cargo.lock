@@ -911,6 +911,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +1010,7 @@ dependencies = [
  "pe2-ext",
  "png",
  "project",
+ "tracing",
 ]
 
 [[package]]
@@ -1591,6 +1619,7 @@ dependencies = [
  "sysinfo",
  "toml 0.8.23",
  "toml_edit 0.22.27",
+ "tracing",
  "winit",
 ]
 
@@ -4091,7 +4120,10 @@ name = "pe2-ext"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "ciborium",
  "pe2-ext-macros",
+ "serde",
  "toml 0.8.23",
  "wit-bindgen 0.63.0",
 ]
@@ -4100,7 +4132,10 @@ dependencies = [
 name = "pe2-ext-macros"
 version = "0.1.0"
 dependencies = [
+ "proc-macro2",
+ "quote",
  "sha2 0.10.9",
+ "syn 2.0.119",
  "toml 0.8.23",
 ]
 
@@ -4180,6 +4215,7 @@ version = "0.1.0"
 dependencies = [
  "pe2-ext",
  "pe2-model",
+ "serde",
  "serde_json",
  "toml 0.8.23",
 ]
@@ -4559,6 +4595,9 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.22.27",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-tracy",
  "turso",
  "wasmparser 0.261.0",
  "wasmtime",
@@ -5922,6 +5961,38 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracing-tracy"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b326790213b869d948a5d1ea56472ed5b20c7cefde07684ee35d6b7a980fef1"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracy-client",
+]
+
+[[package]]
+name = "tracy-client"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d93fd676d8946eaeaff4881d26d2240a8d106fcaccbd47cb9f1389e3561ba490"
+dependencies = [
+ "loom",
+ "once_cell",
+ "tracy-client-sys",
+]
+
+[[package]]
+name = "tracy-client-sys"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08f4b6d2481c5e266e9def4c10e1680dbdfdd69523ed555a83d6675953a2785e"
+dependencies = [
+ "cc",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]

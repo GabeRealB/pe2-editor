@@ -9,6 +9,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-tracy = { workspace = true, optional = true }
 formats.workspace = true
 anyhow.workspace = true
 pe2-ext.workspace = true
@@ -28,3 +31,7 @@ turso.workspace = true
 pollster.workspace = true
 branches.workspace = true
 getrandom = "0.3"
+
+[features]
+# Spans on a timeline: Tracy's viewer connects to the running program (project::profile).
+tracy = ["dep:tracing-tracy"]

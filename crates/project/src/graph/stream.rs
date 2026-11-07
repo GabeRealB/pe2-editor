@@ -266,9 +266,15 @@ impl pe2_ext::StreamSource for InTurn {
                 Poll::End => return Ok(None),
                 Poll::Failed(e) => anyhow::bail!(e),
                 Poll::Pending => {
-                    // Woken by what is made; a batch ending just before this waits at most this long.
+                    // Woken by what is made. What was made since `get` let go of the state is seen here, under the
+                    // lock the producer takes to add it, so no batch goes by unseen: one would cost the whole wait,
+                    // and a stream of hundreds of thousands of items as many waits.
                     let state = shared.state();
-                    let _ = shared.changed.wait_timeout(state, std::time::Duration::from_millis(50));
+                    let settled =
+                        state.failed.is_some() || state.item(at).is_some() || state.end.is_some_and(|end| at >= end);
+                    if !settled {
+                        let _ = shared.changed.wait_timeout(state, std::time::Duration::from_millis(50));
+                    }
                 }
             }
         }
