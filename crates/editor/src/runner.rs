@@ -1,5 +1,8 @@
 //! The epoch worker: what events set off, off the UI thread. Each job is an epoch on the project as last taken in, one at a time, in the order asked, so a clean and the build
 //! after it stay two: only batches of files waiting behind each other are one, as they mean the same. It wakes the window when one ends.
+//!
+//! It runs the generated layers' plans too (`extract`): the work graph is theirs alone while they run, so an extraction
+//! waits for the epoch running to end, and what is asked after it waits for it.
 
 use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged};
@@ -20,6 +23,21 @@ pub struct Job {
     pub config: Config,
     /// Who waits for it, over the editor's link.
     pub reply: Option<Sender<mcp::Reply>>,
+}
+
+/// A generated layer's plan to run, as the work graph's only work.
+pub struct Extraction {
+    pub layer: project::Layer,
+    pub progress: Arc<project::plan::Progress>,
+    /// Set once it runs: until then, it waits for the epoch before it.
+    pub started: Arc<AtomicBool>,
+    pub done: Sender<anyhow::Result<project::plan::Ran>>,
+}
+
+/// What the worker is given.
+enum Work {
+    Epoch(Job),
+    Extract(Extraction),
 }
 
 /// An epoch as it ended.
@@ -59,7 +77,7 @@ impl Finished {
 
 /// The worker, as the UI holds it.
 pub struct Runner {
-    jobs: Option<Sender<Job>>,
+    jobs: Option<Sender<Work>>,
     finished: Receiver<Finished>,
     /// Stops the epoch running at its next step.
     cancel: Arc<AtomicBool>,
@@ -101,7 +119,7 @@ impl Runner {
     }
 
     fn after(before: Option<JoinHandle<()>>, project: Project, extensions: Arc<Extensions>) -> Runner {
-        let (jobs, queued) = mpsc::channel::<Job>();
+        let (jobs, queued) = mpsc::channel::<Work>();
         let (done, finished) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicUsize::new(0));
@@ -113,16 +131,29 @@ impl Runner {
                 if let Some(before) = before {
                     let _ = before.join();
                 }
-                let mut held: Option<Job> = None;
+                let mut held: Option<Work> = None;
                 loop {
-                    let Some(mut job) = held.take().or_else(|| queued.recv().ok()) else { return };
+                    let mut job = match held.take().or_else(|| queued.recv().ok()) {
+                        None => return,
+                        Some(Work::Extract(extraction)) => {
+                            extract(&project, &extensions, &extraction);
+                            if let Some(ctx) = wake.get() {
+                                ctx.request_repaint();
+                            }
+                            continue;
+                        }
+                        Some(Work::Epoch(job)) => job,
+                    };
                     for next in queued.try_iter() {
-                        if same(&job, &next) {
-                            left.fetch_sub(1, Ordering::Relaxed);
-                            job = next;
-                        } else {
-                            held = Some(next);
-                            break;
+                        match next {
+                            Work::Epoch(next) if same(&job, &next) => {
+                                left.fetch_sub(1, Ordering::Relaxed);
+                                job = next;
+                            }
+                            next => {
+                                held = Some(next);
+                                break;
+                            }
                         }
                     }
                     stop.store(false, Ordering::Relaxed);
@@ -173,7 +204,14 @@ impl Runner {
     pub fn run(&self, job: Job) {
         if let Some(jobs) = &self.jobs {
             self.waiting.fetch_add(1, Ordering::Relaxed);
-            let _ = jobs.send(job);
+            let _ = jobs.send(Work::Epoch(job));
+        }
+    }
+
+    /// Run a generated layer's plan once the epochs asked before it have ended, nothing else running meanwhile.
+    pub fn extract(&self, extraction: Extraction) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(Work::Extract(extraction));
         }
     }
 
@@ -190,6 +228,16 @@ impl Runner {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// Run a plan, as the commands a user gives: what it made, or why not, to whoever asked.
+fn extract(project: &Project, extensions: &Extensions, extraction: &Extraction) {
+    extraction.started.store(true, Ordering::Relaxed);
+    let group = project::schedule::Group::new(project::schedule::Class::Commanded, "extract");
+    let ran = group.enter(|| {
+        project::plan::run(project, &extraction.layer, &extensions.engine(), extensions, &extraction.progress)
+    });
+    let _ = extraction.done.send(ran);
 }
 
 impl Drop for Runner {

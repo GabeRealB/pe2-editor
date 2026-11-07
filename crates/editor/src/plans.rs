@@ -1,6 +1,7 @@
 //! The project's generated layers as their plans say they are: what each reads (its plan's header) and whether what it
 //! holds is what its plan makes (`project::plan::state`) - known without the discs, but by reading the whole plan, so
-//! worked out off the window's thread, again whenever a plan or what one made changes.
+//! worked out off the window's thread, again whenever a plan or what one made changes. Where a layer is to be filled,
+//! or that is asked (`want_discs`), its discs are looked for too, each image of a disc's size hashed.
 
 use eframe::egui;
 use std::collections::BTreeMap;
@@ -10,7 +11,7 @@ use std::time::SystemTime;
 
 use project::Project;
 use project::ext::Extensions;
-use project::plan::{Header, State};
+use project::plan::{Disc, Header, State};
 
 /// A generated layer as its plan says it is.
 #[derive(Clone)]
@@ -21,6 +22,8 @@ pub struct Planned {
     pub header: Result<Header, String>,
     /// How the layer is; none until worked out.
     pub state: Option<Result<State, String>>,
+    /// Its plan's discs, looked for: none where they were not.
+    pub discs: Option<Vec<Disc>>,
 }
 
 #[derive(Default)]
@@ -34,6 +37,8 @@ pub struct Plans {
     checked: Option<std::time::Instant>,
     /// Worked out again at the next look, whatever the stamps: the project was read again.
     again: bool,
+    /// The discs looked for, whatever the layers' states.
+    discs_wanted: bool,
 }
 
 fn watched(project: &Project) -> Vec<PathBuf> {
@@ -44,6 +49,14 @@ impl Plans {
     /// Worked out again at the next look: the project, or its extensions, were read again.
     pub fn again(&mut self) {
         self.again = true;
+    }
+
+    /// Have the discs looked for, whatever the layers' states: worked out again where they were not.
+    pub fn want_discs(&mut self) {
+        if !self.discs_wanted {
+            self.discs_wanted = true;
+            self.again = self.layers.values().any(|p| p.discs.is_none());
+        }
     }
 
     /// Take what was worked out, and work it out again where a plan or a record changed since. Asked each frame.
@@ -68,7 +81,7 @@ impl Plans {
             self.layers.clear();
             return;
         }
-        let (project, extensions, ctx) = (project.clone(), extensions.clone(), ctx.clone());
+        let (project, extensions, ctx, wanted) = (project.clone(), extensions.clone(), ctx.clone(), self.discs_wanted);
         let (sender, receiver) = mpsc::channel();
         let work = move || {
             let mut layers = BTreeMap::new();
@@ -77,7 +90,12 @@ impl Plans {
                 let header = project::plan::header(&plan).map_err(|e| format!("{e:#}"));
                 let state = project::plan::state(&plan, &layer.path, &extensions).map_err(|e| format!("{e:#}"));
                 let fills = layer.fills.clone().unwrap_or_default();
-                layers.insert(layer.name.clone(), Planned { fills, header, state: Some(state) });
+                let filled = matches!(state, Ok(State::Filled | State::NoPlan));
+                let discs = match &header {
+                    Ok(header) if wanted || !filled => Some(project::plan::discs(&project, header)),
+                    _ => None,
+                };
+                layers.insert(layer.name.clone(), Planned { fills, header, state: Some(state), discs });
             }
             let _ = sender.send(layers);
             ctx.request_repaint();

@@ -13,6 +13,7 @@ pub enum Command {
     Palette,
     OpenProject,
     NewProject,
+    Fill,
     Import,
     ReloadProject,
     Quit,
@@ -56,16 +57,17 @@ impl Command {
     /// Every command but the modes, which are the user's: a list that changes.
     pub fn all() -> Vec<Command> {
         use Command::{
-            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward,
-            Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NewProject, NextTab, OpenProject,
-            Palette, PerformanceOverlay, PreviousTab, Quit, Redo, Refresh, ReloadProject, ResetLayout, ResetMode,
-            Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
+            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Fill,
+            Forward, Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NewProject, NextTab,
+            OpenProject, Palette, PerformanceOverlay, PreviousTab, Quit, Redo, Refresh, ReloadProject, ResetLayout,
+            ResetMode, Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
         };
         let fixed = [
             Palette,
             OpenProject,
             NewProject,
             Import,
+            Fill,
             ReloadProject,
             Quit,
             Settings,
@@ -121,6 +123,7 @@ impl Command {
             Command::OpenProject => "file.open".to_string(),
             Command::NewProject => "file.new".to_string(),
             Command::Import => "file.import".to_string(),
+            Command::Fill => "file.fill".to_string(),
             Command::Build => "file.build".to_string(),
             Command::Clean => "file.clean".to_string(),
             Command::CancelEpoch => "file.cancel_build".to_string(),
@@ -165,6 +168,7 @@ impl Command {
             Command::OpenProject => "Open project…".to_string(),
             Command::NewProject => "New project…".to_string(),
             Command::Import => "Import files…".to_string(),
+            Command::Fill => "Fill generated layers…".to_string(),
             Command::Build => "Build".to_string(),
             Command::Clean => "Clean".to_string(),
             Command::CancelEpoch => "Cancel build".to_string(),

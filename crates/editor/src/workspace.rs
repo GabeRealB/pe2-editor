@@ -206,6 +206,8 @@ pub struct Workspace {
     watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
     /// The generated layers as their plans say they are.
     pub plans: crate::plans::Plans,
+    /// Filling them: the step of the project's onboarding that runs their plans.
+    pub fill: crate::fill::Fill,
     /// The agents' link, started with the watcher; their requests, answered between frames.
     /// Agents' link, listening while it is kept: it stops with the workspace.
     _link: Option<mcp::link::Listener>,
@@ -712,6 +714,7 @@ impl Workspace {
             watch: None,
             watch_starting: None,
             plans: crate::plans::Plans::default(),
+            fill: crate::fill::Fill::default(),
             watch_error: None,
             _link: link,
             requests: Some(requests),
@@ -766,7 +769,7 @@ impl Workspace {
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
         }
-        if self.attached() {
+        if !self.holding_events() {
             for (roots, config, reply) in std::mem::take(&mut self.held_events) {
                 self.signal_all(roots, config, reply);
             }
@@ -840,6 +843,28 @@ impl Workspace {
     /// Read the project again, its files too, as someone asked.
     pub fn reload_whole(&mut self) {
         self.takein.reload("Reload", true);
+    }
+
+    /// Read the project again, as this changed (not its files).
+    pub fn reload_project(&mut self, why: &'static str) {
+        self.takein.reload(why, false);
+    }
+
+    /// Take in what is at these paths now, as another program wrote it (a plan run). The take-in's ticket.
+    pub fn take_in(&mut self, paths: Vec<PathBuf>) -> u64 {
+        self.external.0 = self.takein.paths(paths);
+        self.external.0
+    }
+
+    /// Run a generated layer's plan as the work graph's only work: after the epoch running, before what is asked next.
+    pub fn extract(&mut self, extraction: crate::runner::Extraction) {
+        self.runner.extract(extraction);
+    }
+
+    /// Whether events wait to be signaled: the project is not attached yet, or a plan is filling a layer.
+    fn holding_events(&mut self) -> bool {
+        let takein = &self.takein;
+        !self.attached() || self.fill.holds_events(|ticket| takein.covers(ticket))
     }
 
     /// While the project is being read or attached, the ticket of the last job asked: what would have to wait for it is
@@ -994,7 +1019,7 @@ impl Workspace {
         config: Option<project::Config>,
         reply: Option<mpsc::Sender<mcp::Reply>>,
     ) {
-        if !self.attached() {
+        if self.holding_events() {
             self.held_events.push((roots, config, reply));
             return;
         }

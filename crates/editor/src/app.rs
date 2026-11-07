@@ -785,6 +785,7 @@ impl Editor {
             Command::KeepTab => document.is_some(),
             Command::Import | Command::ReloadProject | Command::Refresh | Command::Extension(_) => ws.is_some(),
             Command::Build | Command::Clean => ws.is_some_and(|ws| !ws.project.configs.is_empty()),
+            Command::Fill => ws.is_some_and(|ws| ws.project.generated().next().is_some() && !ws.fill.running()),
             Command::CancelEpoch => ws.is_some_and(Workspace::in_epoch),
             Command::DeleteSelected => ws.is_some_and(|ws| ws.removing_selected().is_some()),
             // Its graph shown: asked for, and the asset having one.
@@ -811,6 +812,11 @@ impl Editor {
             }
             Command::NewProject => self.new_dialog = Some(String::new()),
             Command::Import => self.import = Some(String::new()),
+            Command::Fill => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.fill.ask();
+                }
+            }
             Command::Build => self.signal(Build::NAME),
             Command::Clean => self.signal(Clean::NAME),
             Command::CancelEpoch => {
@@ -1776,6 +1782,18 @@ impl Editor {
         }
     }
 
+    /// Its generated layers filled, the step after what it asks to trust: not while that is asked, nor where nobody is
+    /// there to answer.
+    fn fill_ui(&mut self, ctx: &egui::Context) {
+        if self.onboarding.is_some() || self.capture.is_some() || self.unattended {
+            return;
+        }
+        let Some(ws) = self.workspace.as_mut().filter(|ws| ws.attached()) else { return };
+        if let Some(said) = crate::fill::ui(ctx, ws) {
+            self.message = Some(said);
+        }
+    }
+
     /// What the project opened asks.
     fn onboarding_ui(&mut self, ctx: &egui::Context) {
         let Some(onboarding) = &mut self.onboarding else { return };
@@ -2233,6 +2251,7 @@ impl eframe::App for Editor {
         self.dropped_files(&ctx);
         self.import_dialog(&ctx);
         self.onboarding_ui(&ctx);
+        self.fill_ui(&ctx);
         self.fetch(&ctx);
         self.keep_presence(&ctx);
         self.in_use_dialog(&ctx);

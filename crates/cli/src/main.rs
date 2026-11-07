@@ -1059,7 +1059,7 @@ fn run_plan(p: &project::Project, lock: &project::lock::Lock, layer: &project::L
     let extensions = project_extensions(p);
     let cache = project::cache::Cache::open(p, lock)?;
     let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
-    let ran = project::plan::run(p, layer, &engine, &extensions)?;
+    let ran = project::plan::run(p, layer, &engine, &extensions, &project::plan::Progress::default())?;
     println!(
         "{}: {} files written and {} kept as they were ({} operations run), {} removed",
         layer.name, ran.written, ran.kept, ran.ran, ran.removed

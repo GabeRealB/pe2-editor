@@ -432,6 +432,57 @@ pub struct Ran {
     pub removed: usize,
 }
 
+/// How a run goes, as it goes: read from another thread, which may also stop it (`stop`).
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// Operations to run, once known; run so far; files written so far.
+    pub operations: std::sync::atomic::AtomicUsize,
+    pub ran: std::sync::atomic::AtomicUsize,
+    pub written: std::sync::atomic::AtomicUsize,
+    /// Set, the run stops where it is: what it wrote is recorded, so the next run goes on from there.
+    pub stop: std::sync::atomic::AtomicBool,
+}
+
+impl Progress {
+    /// Operations run and to run, and files written.
+    #[must_use]
+    pub fn now(&self) -> (usize, usize, usize) {
+        let get = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
+        (get(&self.ran), get(&self.operations), get(&self.written))
+    }
+}
+
+/// A disc a plan reads, looked for: where it was found, if it was.
+#[derive(Clone, Debug)]
+pub struct Disc {
+    pub release: String,
+    pub name: String,
+    pub size: u64,
+    /// Where it was looked for: its release's `look_in`, resolved.
+    pub look_in: PathBuf,
+    pub found: Option<PathBuf>,
+}
+
+/// Look for the discs a plan reads where it says, each by its size and sha1 (each image of its size hashed).
+#[must_use]
+pub fn discs(project: &crate::Project, header: &Header) -> Vec<Disc> {
+    let mut out = Vec::new();
+    for (release, input) in &header.inputs {
+        let look_in = project.resolve(&input.look_in).unwrap_or_else(|_| PathBuf::from(&input.look_in));
+        for (name, size, sha1) in &input.discs {
+            let found = discs::find_disc(&look_in, name, *size, sha1).ok();
+            out.push(Disc {
+                release: release.clone(),
+                name: name.clone(),
+                size: *size,
+                look_in: look_in.clone(),
+                found,
+            });
+        }
+    }
+    out
+}
+
 /// The path of a bundle's file in the layer.
 fn file_path(layer: &Path, node: &str, file: &str) -> PathBuf {
     layer.join(format!("{node}{}", crate::index::BUNDLE_SUFFIX)).join(file)
@@ -516,6 +567,7 @@ pub fn run(
     generated: &crate::Layer,
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
+    progress: &Progress,
 ) -> Result<Ran> {
     let fills = generated.fills.as_deref().with_context(|| format!("{} is no generated layer", generated.name))?;
     let nodes = &project.layer(fills)?.path;
@@ -570,6 +622,7 @@ pub fn run(
     for at in (0..plan.ops.len()).filter(|&at| checked[at]) {
         uses[at] += 1;
     }
+    progress.operations.store(needed.iter().filter(|n| **n).count(), std::sync::atomic::Ordering::Relaxed);
     let state = RunState {
         plan: &plan,
         keys: &keys,
@@ -590,6 +643,7 @@ pub fn run(
         written: Mutex::new(Vec::new()),
         failed: Mutex::new(None),
         ran: std::sync::atomic::AtomicUsize::new(0),
+        progress,
     };
     let ready: Vec<usize> = (0..plan.ops.len())
         .filter(|&at| needed[at] && state.waiting[at].load(std::sync::atomic::Ordering::Acquire) == 0)
@@ -597,27 +651,30 @@ pub fn run(
     // The discs and containers first: everything waits on them.
     let ahead = |at: &usize| matches!(plan.ops[*at].kind.as_str(), "disc" | "container" | "movie_clips");
     crate::schedule::worklist(ready, ahead, |at, add| state.run(at, add));
-    if let Some(why) = state.failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
-        return Err(why);
-    }
+    let failed = state.failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     ran.ran = state.ran.into_inner();
     for (entry, written) in state.written.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         record.files.insert(entry, written);
         ran.written += 1;
     }
+    if let Some(why) = failed {
+        // What was written is kept as made: a run stopped or failed goes on from there next time.
+        write_record(&layer.join(RECORD), &plan, &record)?;
+        return Err(why);
+    }
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
         record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
     }
     joined(&plan, &keys, &last, [nodes, layer], engine, extensions, &mut record, &mut ran)?;
-    // What no bundle is given any more goes.
-    for (node, file) in old.files.keys().filter(|entry| !record.files.contains_key(*entry)) {
-        let path = file_path(layer, node, file);
-        if std::fs::remove_file(&path).is_ok() {
-            ran.removed += 1;
-        }
-    }
+    ran.removed = remove_left(layer, &old, &record);
     write_record(&layer.join(RECORD), &plan, &record)?;
     Ok(ran)
+}
+
+/// Remove what no bundle is given any more: what the last run recorded and this one did not. How many went.
+fn remove_left(layer: &Path, old: &Record, record: &Record) -> usize {
+    let left = old.files.keys().filter(|entry| !record.files.contains_key(*entry));
+    left.filter(|(node, file)| std::fs::remove_file(file_path(layer, node, file)).is_ok()).count()
 }
 
 const ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::AcqRel;
@@ -652,6 +709,7 @@ struct RunState<'a> {
     written: Mutex<Vec<((String, String), Written)>>,
     failed: Mutex<Option<anyhow::Error>>,
     ran: std::sync::atomic::AtomicUsize,
+    progress: &'a Progress,
 }
 
 impl RunState<'_> {
@@ -659,11 +717,19 @@ impl RunState<'_> {
         if self.failed.lock().is_ok_and(|failed| failed.is_some()) {
             return;
         }
+        if self.progress.stop.load(std::sync::atomic::Ordering::Relaxed) {
+            self.failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(anyhow::anyhow!("stopped"));
+            return;
+        }
         let op = &self.plan.ops[at];
         let done = (|| -> Result<()> {
             let _span = tracing::info_span!("plan op", of = %op.kind).entered();
             let made = self.make(op).with_context(|| op.id.clone())?;
             self.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.progress.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for (node, given) in &self.files_of[at] {
                 for (file, bytes) in made.given(given).with_context(|| format!("{node}: {}", given.name))? {
                     let key = self.keys[at].clone();
@@ -680,6 +746,7 @@ impl RunState<'_> {
                     std::fs::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
                     let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64 };
                     self.lock_written().push(((node.clone(), file), written));
+                    self.progress.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             let own = self.files_of[at].len() + usize::from(self.checked[at]);
