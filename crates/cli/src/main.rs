@@ -44,11 +44,6 @@ enum Tool {
         #[command(subcommand)]
         command: AuthorCommand,
     },
-    /// Asset uids
-    Uid {
-        #[command(subcommand)]
-        command: UidCommand,
-    },
     /// Serve a project to agents over the Model Context Protocol, on stdio: through the editor while it has the
     /// project open, else under the project lock, taken for each request alone
     Mcp {
@@ -148,22 +143,6 @@ enum AuthorCommand {
 }
 
 #[derive(Subcommand)]
-enum UidCommand {
-    /// New uids, none of them held by a declaration of the project
-    New {
-        /// How many
-        #[arg(default_value_t = 1)]
-        count: usize,
-        /// The project's directory
-        #[arg(long, default_value = ".")]
-        project: PathBuf,
-        /// The declarations, instead of the project's `[game] declarations`
-        #[arg(long)]
-        declarations: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
 enum ConvertCommand {
     /// A BS picture (a background) to a PNG
     Bs { input: PathBuf, output: PathBuf },
@@ -186,20 +165,15 @@ enum ConvertCommand {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// (Re)write a project's game layer from its discs, by its declarations
+    /// Fill a project's game layer from its discs, by the layer's extraction plan (`extraction.plan.jsonl`): only what
+    /// changed or is gone is made, and what the plan no longer gives is removed
     Extract {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// A release to extract (every release of the project by default)
-        #[arg(long)]
-        release: Vec<String>,
         /// Where the disc images are, instead of the project's `roms`
         #[arg(long)]
         roms: Option<PathBuf>,
-        /// The declarations, instead of the project's `[game] declarations`
-        #[arg(long)]
-        declarations: Option<PathBuf>,
     },
     /// Build a project's packages for a config
     Build {
@@ -212,6 +186,26 @@ enum ProjectCommand {
         /// Clean first
         #[arg(long)]
         clean: bool,
+    },
+    /// Make an empty project: a `project.toml` naming a layer of its own
+    New {
+        /// The directory to make it in (made where missing)
+        directory: PathBuf,
+    },
+    /// Check a project's game layer against its extraction plan, without the discs: every file there, made by what the
+    /// plan says now, unchanged since it was written
+    Verify {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// What a project's extensions offer whoever writes its nodes, as JSON: each template - its node type, the files it
+    /// takes, its stack with `{file}` for the node's stored file - each operation a stack may name - its ports, output,
+    /// version, the settings it derives and what undoes it - and each extension's version
+    Registry {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
     /// Remove what a build deployed, and make it again next time
     Clean {
@@ -887,6 +881,69 @@ fn main() -> Result<()> {
     done
 }
 
+/// Run the game layer's extraction plan, where it has one: false where it has none.
+fn run_plan(p: &project::Project, lock: &project::lock::Lock, roms: Option<&Path>) -> Result<bool> {
+    let game = p.game.as_ref().context("the project has no [game]")?;
+    let layer = p.layer(&game.layer)?.path.clone();
+    if !layer.join(project::plan::PLAN).is_file() {
+        return Ok(false);
+    }
+    let extensions = project_extensions(p);
+    let cache = project::cache::Cache::open(p, lock)?;
+    let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
+    let ran = project::plan::run(&layer, roms.unwrap_or(&game.roms), &engine, &extensions)?;
+    println!(
+        "{} files written and {} kept as they were ({} operations run), {} removed, in {}",
+        ran.written,
+        ran.kept,
+        ran.ran,
+        ran.removed,
+        layer.display()
+    );
+    Ok(true)
+}
+
+/// The extensions a project holds, as many as load: what a plan runs of one that did not fails by name, as it is run.
+fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Extensions> {
+    let extensions = extensions::for_project(p);
+    for problem in &extensions.problems {
+        eprintln!("warning: {problem}");
+    }
+    extensions
+}
+
+/// Check the game layer against its plan, exiting with failure where it is not what the plan makes.
+fn verify_layer(project: &Path) -> Result<()> {
+    let p = project::Project::load(project)?;
+    let game = p.game.as_ref().context("the project has no [game]")?;
+    let layer = p.layer(&game.layer)?.path.clone();
+    let extensions = project_extensions(&p);
+    let checked = project::plan::verify(&layer, &|id| extensions.version_of(id))?;
+    for (what, files) in [("missing", &checked.missing), ("stale", &checked.stale), ("changed", &checked.changed)] {
+        for file in files.iter().take(20) {
+            println!("{what}: {file}");
+        }
+    }
+    println!(
+        "{} files: {} missing, {} made by another plan, {} changed",
+        checked.files,
+        checked.missing.len(),
+        checked.stale.len(),
+        checked.changed.len()
+    );
+    if !checked.whole() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The project's extensions' registry, as JSON: of those that load, the rest said.
+fn print_registry(project: &Path) -> Result<()> {
+    let extensions = project_extensions(&project::Project::load(project)?);
+    println!("{:#}", extensions.registry());
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     if cli.trust_everything {
         extensions::trust::trust_everything();
@@ -908,6 +965,12 @@ fn run(cli: Cli) -> Result<()> {
             let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
             signal(&project, config.as_deref(), events)?;
         }
+        Tool::Project { command: ProjectCommand::New { directory } } => {
+            project::create(&directory)?;
+            println!("an empty project in {}", directory.display());
+        }
+        Tool::Project { command: ProjectCommand::Verify { project } } => verify_layer(&project)?,
+        Tool::Project { command: ProjectCommand::Registry { project } } => print_registry(&project)?,
         Tool::Project { command: ProjectCommand::Clean { project, config } } => {
             signal(&project, config.as_deref(), &[Clean::NAME])?;
         }
@@ -918,7 +981,7 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
             signal(&project, config.as_deref(), &[event.as_str()])?;
         }
-        Tool::Project { command: ProjectCommand::Extract { project, release, roms, declarations } } => {
+        Tool::Project { command: ProjectCommand::Extract { project, roms } } => {
             let p = project::Project::load(&project)?;
             let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
@@ -926,22 +989,12 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(why) = lock.unprotected() {
                 eprintln!("warning: {why}");
             }
-            let options = project::extract::Options { releases: release, roms, declarations };
-            // The extensions it holds, in its layers above the game's.
-            let extensions = extensions::for_project(&p);
-            for problem in &extensions.problems {
-                eprintln!("warning: {problem}");
+            if !run_plan(&p, &lock, roms.as_deref())? {
+                anyhow::bail!(
+                    "the game layer has no extraction plan ({}): nothing says what to extract",
+                    project::plan::PLAN
+                );
             }
-            whole(&extensions)?;
-            let report = project::extract::extract(&p, &options, &lock, &extensions)?;
-            println!(
-                "extracted {} assets ({} as their sources, each checked to import back exactly) and {} layout assets \
-                 into {}",
-                report.assets,
-                report.sources,
-                report.layouts,
-                report.layer.display()
-            );
             // What checking its sources kept, swept on its way out where a sweep is due, by the project as extracted:
             // indexed only then.
             let _ = project::cache::Cache::open(&p, &lock).and_then(|cache| {
@@ -967,22 +1020,6 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Mcp { project } => {
             let root = project::Project::load(&project)?.root;
             mcp::server::serve_stdio(root)?;
-        }
-        Tool::Uid { command: UidCommand::New { count, project, declarations } } => {
-            let root = if let Some(root) = declarations {
-                root
-            } else {
-                let p = project::Project::load(&project)?;
-                let game = p.game.as_ref().context("the project has no [game]")?;
-                p.resolve(&game.declarations)?
-            };
-            let mut taken = project::declarations::Declarations::load(&root)?.uids();
-            for _ in 0..count {
-                let id = project::uid::new(|id| taken.contains(&id))
-                    .map_err(|e| anyhow::anyhow!("the system's random source: {e}"))?;
-                taken.insert(id);
-                println!("{}", project::uid::text(id));
-            }
         }
     }
     Ok(())

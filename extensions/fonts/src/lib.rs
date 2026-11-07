@@ -261,7 +261,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("first").label("First code"))
         .field(Field::new("characters").label("Characters"))
         .register();
-    let face = r
+    let _ = r
         .named_type("font")
         .alias("font")
         .label("Font face")
@@ -301,13 +301,30 @@ fn register(r: &mut Registry) -> Result<()> {
         .input::<UfoFont>("source")
         .output::<ty::Image>()
         .run(|call| Ok(render::sheet(&glyphs_of(call)?)));
-    let atlas = register_atlas(r, &page.to_string());
-    let _ = r.extractor("faces", &face, &[], extract::begin);
-    let _ = r.extractor("atlases", &atlas, &[], extract::begin);
+    let _ = register_atlas(r, &page.to_string());
+    // What a plan runs of them: an atlas and its faces' files from the chunks it was given (`extract::extract_atlas`).
+    let _ = r
+        .op("extract_atlas")
+        .label("An atlas and its faces, read from their chunks")
+        .port("chunks", "bytes", true)
+        .output_described("bytes")
+        .run_described(|call| {
+            let given = call.inputs.first().map_or(&[][..], Vec::as_slice);
+            let chunks = given
+                .iter()
+                .map(|value| match value {
+                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?),
+                    other => Err(pe2_ext::anyhow!("a chunk given as {}", other.ty())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let made = extract::extract_atlas(chunks, call.settings)?;
+            let files = made.into_iter().map(|(name, bytes)| pe2_ext::File::new(&name, bytes)).collect();
+            Ok(pe2_ext::Data::Typed(pe2_ext::Typed::new("bytes", files)))
+        });
     Ok(())
 }
 
-/// The atlas's operations and type, and the texture drawn from one: the atlas type, for its extractor.
+/// The atlas's operations and type, and the texture drawn from one: the atlas type.
 fn register_atlas(r: &mut Registry, page: &str) -> pe2_ext::Name {
     let _ = r
         .op("atlas")

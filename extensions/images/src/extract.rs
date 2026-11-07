@@ -26,7 +26,7 @@
 //! no image owns: an image palette no slot names takes its colors from the run uploaded at its place (the system's
 //! text palettes, which every dialogue atlas is drawn with).
 
-use pe2_ext::{Declared, Discs, Extraction, Made, Result, Table, anyhow, bail};
+use pe2_ext::{Discs, Made, Result, Table, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap};
@@ -34,11 +34,10 @@ use std::fmt::Write as _;
 
 use crate::texels_per_halfword;
 
-/// A reference as declarations write it: a uid and a bundle's `res://` path, and the output of it it names.
+/// A reference as declarations write it: a uid and a bundle's `res://` path.
 #[derive(Clone, Debug, Deserialize)]
 struct Reference {
     path: String,
-    output: Option<String>,
 }
 
 impl Reference {
@@ -90,10 +89,6 @@ struct ChunkSlot {
     name: String,
     #[serde(default)]
     pages: Vec<PageEntry>,
-    #[serde(default)]
-    palettes: Vec<PaletteEntry>,
-    #[serde(default)]
-    resources: Vec<Resource>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -101,22 +96,6 @@ struct PageEntry {
     image: Option<Reference>,
     first: Option<usize>,
     count: Option<usize>,
-}
-
-/// A palette a slot uploads: an image's, by reference to its part (`palettes/<name>`), or a run of colors placed
-/// by `slot` and `at`, which no image owns.
-#[derive(Clone, Debug, Deserialize)]
-struct PaletteEntry {
-    palette: Option<Reference>,
-    slot: Option<Reference>,
-    at: Option<[u32; 2]>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct Resource {
-    index: usize,
-    #[serde(default)]
-    palettes: Vec<PaletteEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -193,7 +172,7 @@ struct PaletteSource {
     in_pages: bool,
 }
 
-/// A session: what extraction needs of the other declarations, read once.
+/// What a texture's extraction reads of the other declarations, as a plan gives them (`extract_texture`).
 struct Textures {
     /// The images, by path.
     images: BTreeMap<String, (Declaration, Table)>,
@@ -208,71 +187,12 @@ struct Textures {
     places: HashMap<(String, u32, Option<u32>, u32), String>,
 }
 
-/// Begin a session: the images, the files and the VRAM slots declared.
-///
-/// # Errors
-/// A declaration has not the shape its type gives it.
-pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
-    let parse = |path: &str, table: Table| -> Result<Declaration> {
-        Table::try_into(table).map_err(|e| anyhow!("{path}: {e}"))
-    };
-    let mut images = BTreeMap::new();
-    for (path, table) in declared.declarations("image") {
-        let declaration = parse(&path, table.clone())?;
-        images.insert(path, (declaration, table));
-    }
-    let mut files = BTreeMap::new();
-    for (path, table) in declared.declarations("file") {
-        let declaration = parse(&path, table)?;
-        files.insert(path, declaration);
-    }
-    let mut vram = HashMap::new();
-    for (path, table) in declared.declarations("vram_slot") {
-        let slot: VramSlot = table.try_into().map_err(|e| anyhow!("{path}: {e}"))?;
-        vram.insert(path, slot);
-    }
-    let (mut palettes, mut runs, mut places) = (HashMap::new(), HashMap::new(), HashMap::new());
-    for (path, file) in &files {
-        let mut note = |slot: &str, resource: Option<usize>, in_pages: bool, entries: &[PaletteEntry]| {
-            for e in entries {
-                let source = || PaletteSource { file: path.clone(), slot: slot.to_string(), resource, in_pages };
-                let named = e
-                    .palette
-                    .as_ref()
-                    .and_then(|p| Some((p.target(), p.output.as_deref()?.strip_prefix("palettes/")?)));
-                match (named, &e.slot, e.at) {
-                    (Some((image, palette)), ..) => {
-                        palettes.entry((image.to_string(), palette.to_string())).or_insert_with(source);
-                    }
-                    (None, Some(vram), Some(at)) => {
-                        runs.entry((vram.target().to_string(), at)).or_insert_with(source);
-                    }
-                    _ => {}
-                }
-            }
-        };
-        for slot in &file.slots {
-            note(&slot.name, None, !slot.pages.is_empty(), &slot.palettes);
-            for r in &slot.resources {
-                note(&slot.name, Some(r.index), false, &r.palettes);
-            }
-        }
-        for (release, loc) in &file.from {
-            for at in &loc.at {
-                if let (Some(stage), Some(number)) = (at.stage, at.file) {
-                    places.insert((release.clone(), stage, at.folder, number), path.clone());
-                }
-            }
-        }
-    }
-    Ok(Box::new(Textures { images, files, vram, palettes, runs, places }))
-}
-
 fn read(discs: &mut dyn Discs, at: &At) -> Result<Vec<u8>> {
     discs.read(&Table::try_from(at)?)
 }
 
-impl Extraction for Textures {
+impl Textures {
+    /// A texture's native files in one release: its texels, and each placed palette's colors.
     fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
         let (asset, table) = self.images.get(path).ok_or_else(|| anyhow!("{path}: no such image"))?;
         let loc = asset.from.get(release).ok_or_else(|| anyhow!("not in this release"))?;
@@ -450,4 +370,105 @@ fn check(bytes: &[u8], want: &str, what: &str) -> Result<()> {
         bail!("{what}: sha1 {got}, declared {want}");
     }
     Ok(())
+}
+
+/// The chunks a plan read for a texture, by the place each was read at: what its extraction reads, and nothing else.
+struct Given {
+    chunks: Vec<(At, Vec<u8>)>,
+}
+
+impl Discs for Given {
+    fn read(&mut self, at: &Table) -> Result<Vec<u8>> {
+        let at: At = at.clone().try_into().map_err(|e| anyhow!("not a place: {e}"))?;
+        let same = |given: &At| {
+            (given.stage, given.folder, given.file, given.slot.as_deref())
+                == (at.stage, at.folder, at.file, at.slot.as_deref())
+        };
+        let found = self.chunks.iter().find(|(given, _)| same(given));
+        found.map(|(_, bytes)| bytes.clone()).ok_or_else(|| {
+            anyhow!(
+                "it reads {:?} folder {:?} file {:?} {:?}, which it was not given",
+                at.stage,
+                at.folder,
+                at.file,
+                at.slot
+            )
+        })
+    }
+}
+
+fn table_of(args: &Table, key: &str) -> impl Iterator<Item = (String, Table)> {
+    let given = args.get(key).and_then(pe2_ext::Value::as_table).cloned().unwrap_or_default();
+    given.into_iter().filter_map(|(path, table)| Some((path, table.as_table()?.clone())))
+}
+
+fn source_of(value: &pe2_ext::Value) -> Result<PaletteSource> {
+    let text = |key: &str| value.get(key).and_then(pe2_ext::Value::as_str).map(str::to_string);
+    let resource = value.get("resource").and_then(pe2_ext::Value::as_integer).map(usize::try_from).transpose()?;
+    Ok(PaletteSource {
+        file: text("file").ok_or_else(|| anyhow!("a palette's source names no file"))?,
+        slot: text("slot").ok_or_else(|| anyhow!("a palette's source names no slot"))?,
+        resource,
+        in_pages: value.get("in_pages").and_then(pe2_ext::Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// A texture's native files as a plan makes them: from the chunks it was given (`chunks`, each read at the place of
+/// `args.reads` in the same order), and what it reads of the other declarations, each resolved by whoever planned it -
+/// the images its file's pages name (`images`), the files it reads (`files`), the slots of VRAM it is placed in
+/// (`vram`), where each of its palettes' colors are (`palettes`, `runs`) and which file holds its first page (`places`).
+///
+/// # Errors
+/// What it was given does not read as declarations, it reads a chunk it was not given, or what it reads is not what
+/// the declarations say.
+pub fn extract_texture(chunks: Vec<Vec<u8>>, args: &Table) -> Result<Made> {
+    let text = |key: &str| args.get(key).and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("no {key}"));
+    let (path, release) = (text("path")?, text("release")?);
+    let parse = |path: &str, table: Table| -> Result<Declaration> {
+        Table::try_into(table).map_err(|e| anyhow!("{path}: {e}"))
+    };
+    let mut images = BTreeMap::new();
+    for (name, table) in table_of(args, "images") {
+        images.insert(name.clone(), (parse(&name, table.clone())?, table));
+    }
+    let mut files = BTreeMap::new();
+    for (name, table) in table_of(args, "files") {
+        files.insert(name.clone(), parse(&name, table)?);
+    }
+    let mut vram = HashMap::new();
+    for (name, table) in table_of(args, "vram") {
+        vram.insert(name.clone(), table.try_into::<VramSlot>().map_err(|e| anyhow!("{name}: {e}"))?);
+    }
+    let list = |key: &str| args.get(key).and_then(pe2_ext::Value::as_array).cloned().unwrap_or_default();
+    let mut palettes = HashMap::new();
+    for entry in list("palettes") {
+        let name = entry.get("palette").and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("a palette unnamed"))?;
+        palettes.insert((path.to_string(), name.to_string()), source_of(&entry)?);
+    }
+    let mut runs = HashMap::new();
+    for entry in list("runs") {
+        let slot = entry.get("vram").and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("a run in no slot"))?;
+        let at = entry.get("at").and_then(pe2_ext::Value::as_array).ok_or_else(|| anyhow!("a run at no place"))?;
+        let place = |i: usize| at.get(i).and_then(pe2_ext::Value::as_integer).map(u32::try_from).transpose();
+        let at = [place(0)?.unwrap_or(0), place(1)?.unwrap_or(0)];
+        runs.insert((slot.to_string(), at), source_of(&entry)?);
+    }
+    let mut places = HashMap::new();
+    for entry in list("places") {
+        let number = |key: &str| entry.get(key).and_then(pe2_ext::Value::as_integer).map(u32::try_from).transpose();
+        let file = entry.get("path").and_then(pe2_ext::Value::as_str).ok_or_else(|| anyhow!("a place of no file"))?;
+        let key = (release.to_string(), number("stage")?.unwrap_or(0), number("folder")?, number("file")?.unwrap_or(0));
+        places.insert(key, file.to_string());
+    }
+    let reads = list("reads");
+    if reads.len() != chunks.len() {
+        bail!("{} chunks given for {} places", chunks.len(), reads.len());
+    }
+    let mut given = Given { chunks: Vec::new() };
+    for (at, bytes) in reads.into_iter().zip(chunks) {
+        let at: At = at.try_into().map_err(|e| anyhow!("a place read: {e}"))?;
+        given.chunks.push((at, bytes));
+    }
+    let mut textures = Textures { images, files, vram, palettes, runs, places };
+    textures.extract(path, release, &mut given)
 }

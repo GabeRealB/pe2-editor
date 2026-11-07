@@ -295,7 +295,6 @@ pub struct Parts {
     pub services: Vec<ToolDef>,
     pub ops: Vec<OpDef>,
     pub types: Vec<TypeDef>,
-    pub extractors: Vec<crate::ExtractorDef>,
     /// Whether its instance may be reclaimed now; without, always.
     pub reclaimable: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Viewers: what shows an output of a type in a document, by the type's name.
@@ -858,26 +857,6 @@ impl Registry {
         TypeBuilder { registry: self, def }
     }
 
-    /// An extractor, `<id>@<name>`, making the native files of assets of `type` (of those declaring all of `requires`; of every one
-    /// where none is named) from the discs, its sessions begun by `begin`.
-    pub fn extractor(
-        &mut self,
-        name: &str,
-        node_type: &Name,
-        requires: &[&str],
-        begin: impl Fn(&dyn crate::Declared) -> Result<Box<dyn crate::Extraction>> + Send + Sync + 'static,
-    ) -> Name {
-        let def = crate::ExtractorDef {
-            name: Name::of(&self.id, name),
-            node_type: node_type.clone(),
-            requires: requires.iter().map(|field| (*field).to_string()).collect(),
-            begin: Arc::new(begin),
-        };
-        let name = def.name.clone();
-        self.parts.extractors.push(def);
-        name
-    }
-
     /// Whether an instance of it may be reclaimed now: the host asks before it drops a long-running instance (its
     /// views' when the last closes), and keeps one that says no - a scene its next view shows, which cannot be rebuilt
     /// cheaply. An extension that keeps nothing between calls needs none.
@@ -886,7 +865,7 @@ impl Registry {
     }
 
     /// How much memory a job of `of` may take - a type's pictures, thumbnails, parts and views, an importer's
-    /// imports and exports, an extractor's sessions, a tool's runs, a panel - where its default is too little (a
+    /// imports and exports, a tool's runs, a panel - where its default is too little (a
     /// renderer's scene, a movie's frames). The host enforces it for each instance by the job it runs (up to 4 GiB, a
     /// 32-bit memory's most).
     pub fn memory(&mut self, of: &Name, bytes: u64) {

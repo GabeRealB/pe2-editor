@@ -106,6 +106,8 @@ pub struct Editor {
     /// monitor's size as measured with the previous frame's scale, so a size is read only once the scale holds.
     steady: (f32, u32),
     open_dialog: Option<String>,
+    /// The directory a new project is to be made in, being typed.
+    new_dialog: Option<String>,
     /// A step that files changed outside the editor block: redo (true) or undo, and why.
     force: Option<(bool, String)>,
     /// An entry being renamed: its uid, its real path, the new name being typed.
@@ -266,6 +268,7 @@ impl Editor {
             zoomed_for: None,
             steady: (0.0, 0),
             open_dialog: None,
+            new_dialog: None,
             force: None,
             renaming: None,
             choosing: None,
@@ -750,6 +753,7 @@ impl Editor {
         match command {
             Command::Palette
             | Command::OpenProject
+            | Command::NewProject
             | Command::Quit
             | Command::Settings
             | Command::DocumentsOnly
@@ -805,6 +809,7 @@ impl Editor {
                 self.open_dialog =
                     Some(self.workspace.as_ref().map_or_else(String::new, |w| w.project.root.display().to_string()));
             }
+            Command::NewProject => self.new_dialog = Some(String::new()),
             Command::Import => self.import = Some(String::new()),
             Command::Build => self.signal(Build::NAME),
             Command::Clean => self.signal(Clean::NAME),
@@ -1486,6 +1491,7 @@ impl Editor {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                self.item(ui, Command::NewProject, "New project…");
                 self.item(ui, Command::OpenProject, "Open project…");
                 self.item(ui, Command::Import, "Import…");
                 self.new_node_menu(ui);
@@ -1978,6 +1984,38 @@ impl Editor {
         }
     }
 
+    /// Make an empty project where the user says, and open it.
+    fn new_dialog(&mut self, ctx: &egui::Context) {
+        let Some(text) = &mut self.new_dialog else { return };
+        let (mut make, mut cancel) = (false, false);
+        egui::Window::new("New project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("The directory to make it in, empty or not there yet:");
+                let edit = ui.add(egui::TextEdit::singleline(text).desired_width(460.0));
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    make = true;
+                }
+                edit.request_focus();
+                ui.horizontal(|ui| {
+                    make |= ui.button("Make").clicked();
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        if make {
+            let dir = PathBuf::from(text.trim());
+            self.new_dialog = None;
+            match project::create(&dir) {
+                Ok(()) => self.open(&dir),
+                Err(why) => self.message = Some(format!("No project was made: {why:#}")),
+            }
+        } else if cancel {
+            self.new_dialog = None;
+        }
+    }
+
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let Some(text) = &mut self.open_dialog else { return };
         let (mut open, mut cancel) = (false, false);
@@ -2189,6 +2227,7 @@ impl eframe::App for Editor {
             ws.settle_players(|pane| layouts.find(pane).is_some());
         }
         self.open_dialog(&ctx);
+        self.new_dialog(&ctx);
         self.naming_dialog(&ctx);
         self.palette_ui(&ctx);
         self.dropped_files(&ctx);

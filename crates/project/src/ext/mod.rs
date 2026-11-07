@@ -160,7 +160,7 @@ pub struct Present {
     pub contract: Option<String>,
     /// How long registering it took (compiling and instantiating a component), where it was registered.
     pub load: Option<std::time::Duration>,
-    /// What it registered, by what it is - types, formats, importers, extractors, panels, tools, services -
+    /// What it registered, by what it is - types, formats, importers, panels, tools, services -
     /// each name qualified.
     pub registers: Registers,
     /// For an unsandboxed extension, its hash: what enabling it records.
@@ -356,7 +356,6 @@ pub struct Extensions {
     store: std::sync::RwLock<Option<graph::store::Store>>,
     /// What is asked without waiting.
     requests: RwLock<Option<Arc<dyn requests::Asking>>>,
-    extractors: Vec<pe2_ext::ExtractorDef>,
     /// The components of the extensions loaded, by id.
     components: Vec<(String, Arc<std::sync::OnceLock<Arc<component::Shared>>>)>,
     /// The formats recognized in files, by their content's hash.
@@ -570,7 +569,6 @@ impl Extensions {
         let registers = vec![
             ("operations", listed(parts.ops.iter().map(|o| &o.name).collect())),
             ("types", listed(parts.types.iter().filter(|t| !t.extends).map(|t| &t.name).collect())),
-            ("extractors", listed(parts.extractors.iter().map(|e| &e.name).collect())),
             ("panels", listed(parts.panels.iter().map(|p| &p.name).collect())),
             ("tools", listed(parts.tools.iter().map(|t| &t.name).collect())),
             ("services", listed(parts.services.iter().map(|s| &s.name).collect())),
@@ -584,23 +582,12 @@ impl Extensions {
         let names = own_types.iter().map(|k| &k.name);
         let names = names.chain(parts.panels.iter().map(|p| &p.name)).chain(parts.tools.iter().map(|t| &t.name));
         let names = names.chain(parts.ops.iter().map(|o| &o.name));
-        let names = names.chain(parts.extractors.iter().map(|e| &e.name)).chain(parts.services.iter().map(|s| &s.name));
+        let names = names.chain(parts.services.iter().map(|s| &s.name));
         for name in names {
             anyhow::ensure!(name.extension() == extension.id, "{name} is not in its namespace");
             anyhow::ensure!(seen.insert(name.clone()), "it registers {name} twice");
         }
-        let reachable = |owner: &str, known: bool| owner == extension.id && known || dependencies.contains(&owner);
         self.check_graph(&extension.id, &dependencies, (&parts.ops, &own_types, &parts.problems))?;
-        for extractor in &parts.extractors {
-            let own = own_types.iter().any(|k| k.name == extractor.node_type);
-            anyhow::ensure!(
-                reachable(extractor.node_type.extension(), own)
-                    && (own || self.types.contains_key(extractor.node_type.as_str())),
-                "{} extracts {}, which neither it nor what it requires registers",
-                extractor.name,
-                extractor.node_type
-            );
-        }
         let aliases = own_types.iter().filter_map(|k| k.alias.as_ref());
         for alias in aliases {
             anyhow::ensure!(builtin, "only a built-in extension names a type bare ({alias})");
@@ -639,7 +626,6 @@ impl Extensions {
         }
         self.add_to_types(extended);
         self.add_declared(parts.events, parts.hooks, parts.templates, parts.commands);
-        self.extractors.extend(parts.extractors);
         Ok(registers)
     }
 
@@ -1002,6 +988,59 @@ impl Extensions {
     #[must_use]
     pub fn template(&self, name: &str) -> Option<&pe2_ext::TemplateDef> {
         self.templates.get(name)
+    }
+
+    /// What these extensions offer whoever writes a project's nodes, as JSON: each template - what it makes, the files it
+    /// takes, its stack with `{file}` where its node's stored file is named - and each operation a stack may name - its
+    /// ports, what it makes, its version, and for an extension's, the settings it derives and what undoes it - and each
+    /// extension's version as what it makes is kept by.
+    #[must_use]
+    pub fn registry(&self) -> serde_json::Value {
+        use serde_json::{Map, Value, json};
+        let templates: Map<String, Value> = self
+            .templates
+            .values()
+            .map(|t| {
+                let made = json!({
+                    "label": t.label, "node_type": t.node_type, "files": t.files, "stack": t.stack, "offered": t.offered,
+                });
+                (t.name.clone(), made)
+            })
+            .collect();
+        let port =
+            |name: &str, ty: &pe2_ext::Type, many: bool| json!({"name": name, "type": ty.to_string(), "many": many});
+        let operations: Map<String, Value> = self
+            .operations()
+            .iter()
+            .map(|(name, def)| {
+                let mut made = json!({
+                    "label": def.label,
+                    "version": def.version,
+                    "inputs": def.inputs.iter().map(|p| port(&p.name, &p.ty, p.many)).collect::<Vec<_>>(),
+                    "output": def.output.as_ref().map(ToString::to_string),
+                    "parameter": def.parameter,
+                    "stepped": def.stepped,
+                });
+                if let Some(own) = self.ops.get(name) {
+                    made["derives"] = json!(own.derives);
+                    made["inverse"] = json!(own.inverse);
+                    made["also"] = Value::Array(own.also.iter().map(|(n, ty)| json!([n, ty.to_string()])).collect());
+                }
+                (name.clone(), made)
+            })
+            .collect();
+        let extensions: Map<String, Value> =
+            self.loaded.iter().map(|l| (l.id.clone(), Value::String(self.version_of(&l.id)))).collect();
+        // The host's own, which a stack names bare: a stored file, a constant, the version below, an output kept or shown,
+        // a graph of operations.
+        let host = [graph::FILE, graph::CONSTANT, graph::BELOW, graph::OUTPUT, graph::PREVIEW, graph::GRAPH];
+        json!({
+            "registry": 1,
+            "extensions": extensions,
+            "templates": templates,
+            "operations": operations,
+            "host_operations": host,
+        })
     }
 
     /// A template's stack as it goes into a node, made with this file.
@@ -1805,13 +1844,6 @@ impl Extensions {
         for component in self.components.iter().filter_map(|(_, c)| c.get()) {
             component.release();
         }
-    }
-
-    /// The extractor of an asset of a declared type (`image`) declaring what `declares` says, where an extension registers one.
-    #[must_use]
-    pub fn extractor_for(&self, node_type: &str, declares: impl Fn(&str) -> bool) -> Option<&pe2_ext::ExtractorDef> {
-        let node_type = self.qualify(node_type)?;
-        self.extractors.iter().find(|e| e.takes(node_type, &declares))
     }
 
     /// The formats a file is, by signatures and sniffs: from its first bytes, read once a content.

@@ -2505,7 +2505,6 @@ fn project_settings_ui(
                     vec![
                         ("game layer".into(), game.layer.clone()),
                         ("disc images".into(), game.roms.display().to_string()),
-                        ("declarations".into(), game.declarations.clone()),
                     ],
                 );
             }),

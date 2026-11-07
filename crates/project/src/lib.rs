@@ -1,11 +1,11 @@
-//! Projects: what a `project.toml` declares, the declarations a project is extracted by, and
-//! the extraction that fills its game layer with asset bundles.
+//! Projects: what a `project.toml` declares, and the extraction plan that fills its game layer's bundles from the
+//! game's discs.
 
 pub mod applied;
 pub mod build;
 pub mod cache;
 pub mod changeset;
-pub mod declarations;
+pub mod discs;
 pub mod edit;
 pub mod events;
 pub mod ext;
@@ -15,6 +15,7 @@ pub mod history;
 pub mod imports;
 pub mod index;
 pub mod lock;
+pub mod plan;
 pub mod profile;
 pub mod schedule;
 pub mod stack;
@@ -105,7 +106,6 @@ struct GameFile {
     layer: String,
     #[serde(default = "default_roms")]
     roms: String,
-    declarations: String,
     #[serde(default)]
     releases: BTreeMap<String, ReleaseFile>,
 }
@@ -152,8 +152,6 @@ pub struct Game {
     /// The name of the layer extraction fills.
     pub layer: String,
     pub roms: PathBuf,
-    /// A `res://` path.
-    pub declarations: String,
     pub releases: BTreeMap<String, Vec<DiscImage>>,
 }
 
@@ -231,6 +229,21 @@ fn resolve_path(directory: &Path, value: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { directory.join(p) }
 }
 
+/// What a new project is: a layer of its own, and nothing else.
+const EMPTY: &str = "# A project. `res://` paths are absolute from this directory.\n\n[[layer]]\nname = \"project\"\npath = \".layers/project\"\n";
+
+/// Make an empty project in `directory`: its `project.toml`, naming a layer of its own, and that layer's folder. What
+/// else a project holds - a game, its layers, extensions - is added to it, or written by whatever makes projects whole.
+///
+/// # Errors
+/// A project is there already, or the folder cannot be written.
+pub fn create(directory: &Path) -> Result<()> {
+    let file = directory.join(FILE);
+    anyhow::ensure!(!file.exists(), "{} holds a project already", directory.display());
+    std::fs::create_dir_all(directory.join(".layers/project")).with_context(|| directory.display().to_string())?;
+    std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())
+}
+
 impl Project {
     /// The project in `directory`.
     ///
@@ -244,7 +257,6 @@ impl Project {
         let game = file.game.map(|g| Game {
             layer: g.layer,
             roms: resolve_path(&root, &g.roms),
-            declarations: g.declarations,
             releases: g.releases.into_iter().map(|(r, spec)| (r, spec.discs)).collect(),
         });
         let game_layer = game.as_ref().map(|g| g.layer.clone());
@@ -366,5 +378,20 @@ impl Project {
     /// The project has no such layer.
     pub fn layer(&self, name: &str) -> Result<&Layer> {
         self.layers.iter().find(|l| l.name == name).with_context(|| format!("the project has no layer {name}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_empty_project_loads_and_is_made_once() {
+        let dir = std::env::temp_dir().join(format!("pe2-new-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::create(&dir).unwrap();
+        let project = super::Project::load(&dir).unwrap();
+        assert!(project.game.is_none());
+        assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["project"]);
+        assert!(super::create(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

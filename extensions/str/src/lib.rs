@@ -2,7 +2,7 @@
 //! a container, interleaving MDEC video in BS frames with XA ADPCM audio - kept as `native.str`. The disc's movie files
 //! (INTER0.STR, INTER1.STR) are containers holding movies with sound back to back (`pe2.game`'s `stream`), assembled
 //! from them; a movie without sound is stored in its stage, and a file lists the movies its package plays (`streams`).
-//! This extension extracts the movies from where they are (`extract`), says what one's stream is from a few of its sectors (`stream`): a movie is tens of
+//! This extension says what a movie's stream is from a few of its sectors (`stream`): a movie is tens of
 //! megabytes - and decodes its video and sound to play it (`frames`), what `pe2.movies` takes a movie to be. Extraction
 //! makes no source of a movie: STR is its only truth, and what a source would hold is lossy by then. An import brings a
 //! stream to `encode`, which is held to the STR it replaces.
@@ -13,10 +13,9 @@
 use formats::str::{Coding, Form, HEADER, SECTORS_A_SECOND, Sector};
 use pe2_ext::media::VideoFrame;
 use pe2_ext::ty::{self, Files, Registered};
-use pe2_ext::{Asset, Data, Image, Name, Registry, Result, Signature, Table, Value, anyhow};
+use pe2_ext::{Asset, Data, Image, Registry, Result, Signature, Table, Value, anyhow};
 
 mod encode;
-mod extract;
 mod frames;
 
 pe2_ext::extension!(register);
@@ -115,6 +114,7 @@ when = "eager"
 /// The files that take: what a video container commonly is.
 const VIDEO: [&str; 5] = ["*.mp4", "*.mkv", "*.mov", "*.webm", "*.avi"];
 
+#[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Str>();
     let _ = r.op("stream").label("Stream").input::<Str>("clip").output::<ty::Table>().run(|call| {
@@ -161,8 +161,6 @@ fn register(r: &mut Registry) -> Result<()> {
             .files(&VIDEO),
     );
     let _ = r.extend(MOVIE).of(Str::NAME).stack(&format!("{STACK}{OFFERS}")).register();
-    let movie = Name::parse(MOVIE).ok_or_else(|| anyhow!("{MOVIE}: not a qualified type"))?;
-    let _ = r.extractor("clips", &movie, &[], extract::begin);
     Ok(())
 }
 

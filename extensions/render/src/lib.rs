@@ -1,4 +1,4 @@
-//! pe2.render: meshes, materials, models and prefabs, and the game's renderer. A mesh is read from a run of a package (`extract`) and decoded from there (`model`). What is drawn is the extension's: its 3D view
+//! pe2.render: meshes, materials, models and prefabs, and the game's renderer. A mesh is read from a run of a package (`planned`, as an extraction plan runs it) and decoded from there (`model`). What is drawn is the extension's: its 3D view
 //! renders on the editor's device through `wasi:webgpu`, in the document a model opens in, at the size that document is; what is in a model shows in the panes as any asset's parts.
 
 use pe2_ext::tokens::{VALUE, link};
@@ -16,7 +16,6 @@ mod assembly;
     expect(dead_code, reason = "tested here, used by the view, which is the component's")
 )]
 mod camera;
-mod extract;
 #[cfg(any(target_family = "wasm", test))]
 #[cfg_attr(
     not(target_family = "wasm"),
@@ -32,6 +31,7 @@ mod materials;
 )]
 mod math;
 mod parts;
+mod planned;
 mod prefab;
 #[cfg(target_family = "wasm")]
 mod render;
@@ -302,7 +302,7 @@ fn links(r: &mut Registry) {
 /// hand, a bank's slots each a clip of its own or what its base has there.
 fn animation_types(r: &mut Registry) {
     let _ = r.value_type::<ClipUsd>();
-    let clip = r
+    let _ = r
         .named_type("clip")
         .alias("clip")
         .label("Clip")
@@ -311,8 +311,7 @@ fn animation_types(r: &mut Registry) {
         .stack(CLIP)
         .takes(&["clip.usda"])
         .register();
-    let _ = r.extractor("clips", &clip, &[], extract::clips);
-    let schema = r
+    let _ = r
         .named_type("animation_schema")
         .alias("animation_schema")
         .label("Animation schema")
@@ -323,8 +322,7 @@ fn animation_types(r: &mut Registry) {
         .field(Field::new("capacity").label("Slots stored"))
         .field(Field::new("names").custom())
         .register();
-    let _ = r.extractor("animation_schemas", &schema, &[], extract::authored);
-    let bank = r
+    let _ = r
         .named_type("animation_bank")
         .alias("animation_bank")
         .label("Animation bank")
@@ -336,12 +334,11 @@ fn animation_types(r: &mut Registry) {
         .field(Field::new("clips").custom())
         .field(Field::new("order").custom())
         .register();
-    let _ = r.extractor("animation_banks", &bank, &[], extract::authored);
 }
 
 /// A material: its shader, surface, blend and effect, and its textures, extracted as authored.
 fn material_type(r: &mut Registry) {
-    let material = r
+    let _ = r
         .named_type("material")
         .alias("material")
         .label("Material")
@@ -362,7 +359,6 @@ fn material_type(r: &mut Registry) {
         .contents(parts::contents)
         .inspector("Textures", |_| Box::new(material_panel::Panel::default()))
         .register();
-    let _ = r.extractor("materials", &material, &[], extract::authored);
 }
 
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
@@ -382,6 +378,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .parameter::<String>("chosen")
         .steps(pe2_ext::stepped::replayed(assembly::scene));
     links(r);
+    planned::register(r);
     let _ = r
         .op("member")
         .label("What a member of a group fills a part with")
@@ -390,7 +387,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .parameter::<String>("member")
         .members(|asset| prefab::members(asset).into_iter().map(|address| (address.clone(), address)).collect())
         .run(prefab::member);
-    let mesh = r
+    let _ = r
         .named_type("mesh")
         .alias("mesh")
         .label("Mesh")
@@ -402,10 +399,9 @@ fn register(r: &mut Registry) -> Result<()> {
         .part_sheet(parts::part_sheet)
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))
         .register();
-    let _ = r.extractor("meshes", &mesh, &[], extract::begin);
     material_type(r);
     animation_types(r);
-    let skeleton = r
+    let _ = r
         .named_type("skeleton")
         .alias("skeleton")
         .label("Skeleton")
@@ -416,8 +412,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .contents(parts::contents)
         .part_sheet(parts::part_sheet)
         .register();
-    let _ = r.extractor("skeletons", &skeleton, &[], extract::authored);
-    let model = r
+    let _ = r
         .named_type("model")
         .alias("model")
         .label("Model")
@@ -431,8 +426,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .inspector("Materials", |_| Box::new(materials::Bindings::default()))
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))
         .register();
-    let _ = r.extractor("models", &model, &[], extract::models);
-    let prefab = r
+    let _ = r
         .named_type("prefab")
         .alias("prefab")
         .label("Prefab")
@@ -450,7 +444,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .inspector("Materials", |_| Box::new(materials::Bindings::default()))
         .inspector_tab("Mesh", Icon::Polygon, &[], |_| Box::new(Summary::default()))
         .register();
-    let _ = r.extractor("prefabs", &prefab, &[], extract::authored);
     Ok(())
 }
 

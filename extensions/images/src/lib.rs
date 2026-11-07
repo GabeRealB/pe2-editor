@@ -63,6 +63,28 @@ fn ora_ops(r: &mut Registry) {
         });
 }
 
+/// What a plan runs of them: a texture's native files from the chunks it was given (`extract::extract_texture`).
+fn planned(r: &mut Registry) {
+    let _ = r
+        .op("extract_texture")
+        .label("A texture, read from its chunks")
+        .port("chunks", "bytes", true)
+        .output_described("bytes")
+        .run_described(|call| {
+            let given = call.inputs.first().map_or(&[][..], Vec::as_slice);
+            let chunks = given
+                .iter()
+                .map(|value| match value {
+                    pe2_ext::Data::Typed(typed) => call.read(typed.file()?),
+                    other => Err(pe2_ext::anyhow!("a chunk given as {}", other.ty())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let made = extract::extract_texture(chunks, call.settings)?;
+            let files = made.into_iter().map(|(name, bytes)| pe2_ext::File::new(&name, bytes)).collect();
+            Ok(pe2_ext::Data::Typed(pe2_ext::Typed::new("bytes", files)))
+        });
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     // An image's native form, as stored: a background's BS picture, or a texture's or atlas's texels and palettes.
@@ -110,7 +132,7 @@ fn register(r: &mut Registry) -> Result<()> {
             ty::Either::Second(image) => marks::of(&call.lend_settings(&image.derived).asset()),
         })
     });
-    let image = r
+    let _ = r
         .named_type("image")
         .alias("image")
         .label("Image")
@@ -133,8 +155,7 @@ fn register(r: &mut Registry) -> Result<()> {
     drop(
         r.template("background", IMAGE, &format!("{BACKGROUND}{OFFERS}")).label("Background picture").files(&["*.bs"]),
     );
-    // Textures and atlases are read off the discs here; a background is its slot's bytes, which the host writes.
-    let _ = r.extractor("textures", &image, &["mode"], extract::begin);
+    planned(r);
     r.named_type("vram_slot")
         .alias("vram_slot")
         .label("VRAM slot")

@@ -1,30 +1,20 @@
-//! Extractors: how an extension makes its assets' native files from a release's discs. Extraction asks the extractor
-//! registered for an asset's type and fields, if any (the rest it writes as their slots' bytes): it begins a session
-//! with the declarations - what the extractor needs of the other assets (which file uploads a palette, where a VRAM
-//! slot is) it reads once, there - and then extracts asset after asset, reading what chunks it needs from the discs.
+//! What an extension's extraction operations read: a plan (the host's `plan`) reads off the discs what each takes and
+//! gives it as its chunks, each with the place it was read at (`Given`), and the declarations it needs as its settings.
+//! An extension's code reads them as it would read the discs (`Discs`) and the declarations (`Declared`), so that what
+//! reads a texture's pages or an atlas's faces needs no knowledge of where they came from.
 
-use std::sync::Arc;
-
-use crate::{Name, Result, Table};
+use crate::{Result, Table};
 
 /// Files made, each by its name in the bundle.
 pub type Made = Vec<(String, Vec<u8>)>;
 
-/// The declarations, as extraction holds them: each the table its group file declares it by (with `from`, where
-/// extraction finds it per release).
+/// Declarations as an operation was given them: each the table its group file declares it by.
 pub trait Declared {
-    /// Every declaration of a type, as declared (`file`, `image`, `vram_slot`), by path, in path order.
+    /// Every declaration of a type given (`file`, `image`, `vram_slot`), by path, in path order.
     fn declarations(&self, node_type: &str) -> Vec<(String, Table)>;
-
-    /// The same, each table as CBOR (`cbor`): as they cross to a component. A host lending them to several extractors
-    /// encodes each type once.
-    fn encoded(&self, node_type: &str) -> Arc<Vec<(String, Vec<u8>)>> {
-        let encoded = self.declarations(node_type).into_iter();
-        Arc::new(encoded.filter_map(|(path, table)| Some((path, crate::cbor::encode(&table).ok()?))).collect())
-    }
 }
 
-/// A release's discs, as an extraction reads them.
+/// The discs, as an extension's code reads them: here, what a plan gave it (`Given`).
 pub trait Discs {
     /// A chunk's payload, by a location as a declaration's `from` gives it (`{ stage, folder, file, slot }`).
     ///
@@ -52,32 +42,35 @@ pub trait Discs {
     }
 }
 
-/// An extraction session: the assets of the type, one after another.
-pub trait Extraction: Send {
-    /// An asset's native files for one release, each checked against what its declaration says of it.
+/// The chunks a plan read for an extraction, each by the place it was read at (`{ disc, slot }`, or `{ stage, folder,
+/// file, slot }`): what it reads, and nothing else - a read of another place fails, naming it.
+pub struct Given {
+    chunks: Vec<(Table, Vec<u8>)>,
+}
+
+/// What of a place says which chunk it is: an image chunk's `page` is read of it, not where it is.
+fn place_of(at: &Table) -> Vec<(&str, &toml::Value)> {
+    ["disc", "stage", "folder", "file", "slot"].iter().filter_map(|key| Some((*key, at.get(*key)?))).collect()
+}
+
+impl Given {
+    /// The chunks, each with the place it was read at, in the same order.
     ///
     /// # Errors
-    /// Its chunks cannot be read or decoded, or what they hold is not what the declaration says.
-    fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made>;
+    /// They are not as many as the places, or a place is no table.
+    pub fn new(places: &[toml::Value], chunks: Vec<Vec<u8>>) -> Result<Given> {
+        if places.len() != chunks.len() {
+            crate::bail!("{} chunks given for {} places", chunks.len(), places.len());
+        }
+        let places = places.iter().map(|at| at.as_table().cloned().ok_or_else(|| crate::anyhow!("a place no table")));
+        Ok(Given { chunks: places.zip(chunks).map(|(at, bytes)| Ok((at?, bytes))).collect::<Result<_>>()? })
+    }
 }
 
-/// Begin a session.
-pub type Begin = dyn Fn(&dyn Declared) -> Result<Box<dyn Extraction>> + Send + Sync;
-
-/// An extractor as registered: for a type, and of those the assets with some fields (all of them where none is named).
-#[derive(Clone)]
-pub struct ExtractorDef {
-    pub name: Name,
-    pub node_type: Name,
-    /// The fields an asset has to declare for this to extract it.
-    pub requires: Vec<String>,
-    pub begin: Arc<Begin>,
-}
-
-impl ExtractorDef {
-    /// Whether it extracts an asset of this type (qualified) declaring these fields.
-    #[must_use]
-    pub fn takes(&self, node_type: &str, declares: impl Fn(&str) -> bool) -> bool {
-        self.node_type.as_str() == node_type && self.requires.iter().all(|field| declares(field))
+impl Discs for Given {
+    fn read(&mut self, at: &Table) -> Result<Vec<u8>> {
+        let wanted = place_of(at);
+        let found = self.chunks.iter().find(|(given, _)| place_of(given) == wanted);
+        found.map(|(_, bytes)| bytes.clone()).ok_or_else(|| crate::anyhow!("it reads {at}, which it was not given"))
     }
 }

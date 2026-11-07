@@ -4231,12 +4231,10 @@ dependencies = [
 name = "pe2-render"
 version = "0.1.0"
 dependencies = [
- "formats",
  "pe2-ext",
  "pe2-model",
  "serde",
  "serde_json",
- "sha1",
 ]
 
 [[package]]
@@ -4270,7 +4268,6 @@ dependencies = [
  "codecs",
  "formats",
  "pe2-ext",
- "sha1",
 ]
 
 [[package]]

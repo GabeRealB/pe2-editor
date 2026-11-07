@@ -44,7 +44,6 @@ struct Registered {
     services: Vec<ToolDef>,
     types: Vec<TypeDef>,
     ops: Vec<OpDef>,
-    extractors: Vec<crate::ExtractorDef>,
     /// Outputs added to others' types.
     reclaimable: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -728,7 +727,6 @@ pub struct Component;
 
 impl g::Guest for Component {
     type ViewState = ViewState;
-    type Extraction = Extraction;
     type Generator = Generating;
 
     fn start_stream(
@@ -966,7 +964,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         services: vec![],
         types: vec![],
         ops: vec![],
-        extractors: vec![],
         reclaimable: None,
     };
     if !describe {
@@ -984,7 +981,6 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
         services: vec![],
         ops: vec![],
         types: vec![],
-        extractors: vec![],
         viewers: vec![],
         commands: parts.commands.iter().map(|c| (c.label.clone(), c.tool.local().to_string())).collect(),
         templates: parts
@@ -1025,19 +1021,8 @@ fn register(describe: bool) -> Result<(Registered, Option<g::Registration>), Str
     numbered.tools = calls(parts.tools, &mut out.tools);
     numbered.services = calls(parts.services, &mut out.services);
     imports(&parts.ops, &mut out, &mut numbered);
-    for (handle, extractor) in parts.extractors.iter().enumerate() {
-        #[expect(clippy::cast_possible_truncation, reason = "a handful of extractors")]
-        let handle = handle as u32;
-        out.extractors.push(g::Extractor {
-            handle,
-            name: extractor.name.local().to_string(),
-            node_type: extractor.node_type.to_string(),
-            requires: extractor.requires.clone(),
-        });
-    }
     numbered.types = parts.types;
     numbered.ops = parts.ops;
-    numbered.extractors = parts.extractors;
     numbered.reclaimable = parts.reclaimable;
     Ok((numbered, Some(out)))
 }
@@ -1100,7 +1085,6 @@ fn number(parts: crate::registry::Parts) -> Registered {
         services: vec![],
         types: vec![],
         ops: vec![],
-        extractors: vec![],
         reclaimable: None,
     };
     for ty in &parts.types {
@@ -1116,7 +1100,6 @@ fn number(parts: crate::registry::Parts) -> Registered {
     numbered.services = parts.services;
     numbered.types = parts.types;
     numbered.ops = parts.ops;
-    numbered.extractors = parts.extractors;
     numbered.reclaimable = parts.reclaimable;
     numbered
 }
@@ -1496,62 +1479,6 @@ impl g::GuestGenerator for Generating {
 
     fn seek(&self, node: &host::Asset, position: u64) -> Result<bool, String> {
         self.with(node, |generator, call| generator.seek(call, position))
-    }
-}
-
-/// An extraction session, kept between assets.
-pub struct Extraction(RefCell<Box<dyn crate::Extraction>>);
-
-/// The host's declarations, as an extractor reads them.
-struct Declarations<'a>(&'a host::Declarations);
-
-impl crate::Declared for Declarations<'_> {
-    fn declarations(&self, node_type: &str) -> Vec<(String, Table)> {
-        self.0
-            .of_type(node_type)
-            .into_iter()
-            .filter_map(|(path, bytes)| Some((path, crate::cbor::decode(&bytes).ok()?)))
-            .collect()
-    }
-}
-
-/// The host's discs, as an extractor reads them.
-struct Discs<'a>(&'a host::Discs);
-
-impl crate::Discs for Discs<'_> {
-    fn read(&mut self, at: &Table) -> crate::Result<Vec<u8>> {
-        let at = crate::cbor::encode(at)?;
-        self.0.read(&at).map_err(|e| crate::anyhow!(e))
-    }
-
-    fn size(&mut self, at: &Table) -> crate::Result<u64> {
-        let at = crate::cbor::encode(at)?;
-        self.0.size(&at).map_err(|e| crate::anyhow!(e))
-    }
-
-    fn read_range(&mut self, at: &Table, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
-        let at = crate::cbor::encode(at)?;
-        let len = u32::try_from(len).unwrap_or(u32::MAX);
-        self.0.read_range(&at, offset, len).map_err(|e| crate::anyhow!(e))
-    }
-}
-
-impl g::GuestExtraction for Extraction {
-    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
-    async fn begin(extractor: u32, declarations: &host::Declarations) -> Result<g::Extraction, String> {
-        let extractor = registered().extractors.get(extractor as usize).ok_or("no such extractor")?;
-        let session = (extractor.begin)(&Declarations(declarations)).map_err(|e| format!("{e:#}"))?;
-        Ok(g::Extraction::new(Extraction(RefCell::new(session))))
-    }
-
-    #[expect(clippy::unused_async_trait_impl, reason = "async in the contract, so the host can cancel a long call")]
-    async fn extract(
-        &self,
-        path: String,
-        release: String,
-        discs: &host::Discs,
-    ) -> Result<Vec<(String, Vec<u8>)>, String> {
-        self.0.borrow_mut().extract(&path, &release, &mut Discs(discs)).map_err(|e| format!("{e:#}"))
     }
 }
 

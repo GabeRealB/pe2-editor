@@ -12,6 +12,7 @@ use crate::theme;
 pub enum Command {
     Palette,
     OpenProject,
+    NewProject,
     Import,
     ReloadProject,
     Quit,
@@ -56,13 +57,14 @@ impl Command {
     pub fn all() -> Vec<Command> {
         use Command::{
             ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Forward,
-            Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NextTab, OpenProject, Palette,
-            PerformanceOverlay, PreviousTab, Quit, Redo, Refresh, ReloadProject, ResetLayout, ResetMode, Settings,
-            ShowIn, Undo, Up, ZoomIn, ZoomOut,
+            Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NewProject, NextTab, OpenProject,
+            Palette, PerformanceOverlay, PreviousTab, Quit, Redo, Refresh, ReloadProject, ResetLayout, ResetMode,
+            Settings, ShowIn, Undo, Up, ZoomIn, ZoomOut,
         };
         let fixed = [
             Palette,
             OpenProject,
+            NewProject,
             Import,
             ReloadProject,
             Quit,
@@ -117,6 +119,7 @@ impl Command {
         match self {
             Command::Palette => "palette".to_string(),
             Command::OpenProject => "file.open".to_string(),
+            Command::NewProject => "file.new".to_string(),
             Command::Import => "file.import".to_string(),
             Command::Build => "file.build".to_string(),
             Command::Clean => "file.clean".to_string(),
@@ -160,6 +163,7 @@ impl Command {
         match self {
             Command::Palette => "Commands".to_string(),
             Command::OpenProject => "Open project…".to_string(),
+            Command::NewProject => "New project…".to_string(),
             Command::Import => "Import files…".to_string(),
             Command::Build => "Build".to_string(),
             Command::Clean => "Clean".to_string(),

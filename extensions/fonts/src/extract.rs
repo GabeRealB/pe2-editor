@@ -7,7 +7,7 @@
 //! a face where its table is (`from.<release>.at`, the executable's disc slot, with the table's `address` and its
 //! `sha1`), the table's `count` records from `first`.
 
-use pe2_ext::{Declared, Discs, Extraction, Made, Result, Table, Value, anyhow, bail};
+use pe2_ext::{Declared, Discs, Made, Result, Table, Value, anyhow, bail};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 
@@ -42,7 +42,7 @@ fn declared_path(reference: &Value) -> Option<&str> {
     Some(path.trim_start_matches("res://").trim_end_matches(".node"))
 }
 
-pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
+fn begin(declared: &dyn Declared) -> Result<Fonts> {
     let mut atlases = BTreeMap::new();
     for (path, table) in declared.declarations("font_atlas") {
         let mut held = Vec::new();
@@ -56,7 +56,7 @@ pub fn begin(declared: &dyn Declared) -> Result<Box<dyn Extraction>> {
     }
     let faces = declared.declarations("font").into_iter().collect();
     let encodings = declared.declarations("encoding").into_iter().collect();
-    Ok(Box::new(Fonts { atlases, faces, encodings, read: BTreeMap::new() }))
+    Ok(Fonts { atlases, faces, encodings, read: BTreeMap::new() })
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -285,7 +285,8 @@ impl Fonts {
     }
 }
 
-impl Extraction for Fonts {
+impl Fonts {
+    /// An atlas's files, or a face's, in one release: the atlas read once for all of them.
     fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> Result<Made> {
         if self.atlases.contains_key(path) {
             self.read_atlas(path, release, discs)?;
@@ -299,5 +300,45 @@ impl Extraction for Fonts {
         let (ufos, _, _) = &self.read[&(atlas, release.to_string())];
         let name = path.rsplit('/').next().unwrap_or(path);
         Ok(ufos[at].iter().map(|(file, bytes)| (format!("{name}.ufo/{file}"), bytes.clone())).collect())
+    }
+}
+
+/// An atlas and its faces' files as a plan makes them: from the chunks it was given (`chunks`, each read at the place
+/// of `args.reads` in the same order) - its pages and its faces' tables - and the declarations it reads: the atlas
+/// (`atlas`, by its path in `atlases`), its faces (`faces`) and their encodings (`encodings`). Its `layout.toml`, its
+/// `under.png` where it has one, and each face's `<name>.ufo/` files under the face's path (`<path>/<name>.ufo/...`).
+///
+/// # Errors
+/// What it was given does not read as declarations, it reads a chunk it was not given, or what it reads does not make
+/// the page and the tables again.
+pub fn extract_atlas(chunks: Vec<Vec<u8>>, args: &Table) -> Result<Made> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str).ok_or_else(|| anyhow!("no {key}"));
+    let (path, release) = (text("atlas")?, text("release")?);
+    let tables = |key: &str| -> Vec<(String, Table)> {
+        let given = args.get(key).and_then(Value::as_table).cloned().unwrap_or_default();
+        given.into_iter().filter_map(|(path, table)| Some((path, table.as_table()?.clone()))).collect()
+    };
+    let lent = Lent {
+        types: [("font_atlas", tables("atlases")), ("font", tables("faces")), ("encoding", tables("encodings"))],
+    };
+    let mut fonts = begin(&lent)?;
+    let reads = args.get("reads").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut given = pe2_ext::Given::new(&reads, chunks)?;
+    let mut made = fonts.extract(path, release, &mut given)?;
+    for (face, _) in tables("faces") {
+        let files = fonts.extract(&face, release, &mut given)?;
+        made.extend(files.into_iter().map(|(name, bytes)| (format!("{face}/{name}"), bytes)));
+    }
+    Ok(made)
+}
+
+/// The declarations an atlas was given, as a session begins with them.
+struct Lent {
+    types: [(&'static str, Vec<(String, Table)>); 3],
+}
+
+impl Declared for Lent {
+    fn declarations(&self, node_type: &str) -> Vec<(String, Table)> {
+        self.types.iter().find(|(ty, _)| *ty == node_type).map_or_else(Vec::new, |(_, tables)| tables.clone())
     }
 }

@@ -446,24 +446,6 @@ interface host {
         tab: func(at: f32);
     }
 
-    /// The declarations, lent to an extraction session's beginning.
-    resource declarations {
-        /// Every declaration of a type (as declared: `file`, `image`, `vram_slot`), by path in path order, as CBOR.
-        of-type: func(node-type: string) -> list<tuple<string, list<u8>>>;
-    }
-
-    /// A release's discs, lent for one asset's extraction.
-    resource discs {
-        /// A chunk's payload, by a location as a declaration gives it (a table as CBOR: `{ stage, folder, file, slot }`),
-        /// or a disc slot's bytes (`{ disc, slot }`).
-        read: func(at: list<u8>) -> result<list<u8>, string>;
-        /// The size of what `read` gives at a location, without reading it.
-        size: func(at: list<u8>) -> result<u64, string>;
-        /// Up to `len` bytes of what `read` gives at a location, from `offset`, read alone: a disc slot of hundreds of
-        /// megabytes (a movie file) is never read whole.
-        read-range: func(at: list<u8>, offset: u64, len: u32) -> result<list<u8>, string>;
-    }
-
     log: func(message: string);
     /// The settings kept for this extension, by scope, as TOML: `{ project = { ... }, user = { ... } }`. Read as it
     /// registers; a change loads it again.
@@ -472,7 +454,7 @@ interface host {
 
 interface guest {
     use types.{image, rect, icon, tint, value};
-    use host.{asset, project, ui, declarations, discs};
+    use host.{asset, project, ui};
 
     /// An extension: its id, its version, what it requires (`pe2.images@^0.1`).
     record about {
@@ -747,15 +729,6 @@ interface guest {
         values: list<string>,
     }
 
-    /// An extractor: the native files of a type's assets (of those with all of `requires`' fields) from the
-    /// discs, in sessions (`extraction`).
-    record extractor {
-        handle: u32,
-        name: string,
-        node-type: string,
-        requires: list<string>,
-    }
-
     /// Where a setting is kept: the project's (the same for everyone on it) or the user's (a preference).
     enum scope { project, user }
 
@@ -798,7 +771,6 @@ interface guest {
         services: list<tool>,
         ops: list<op>,
         types: list<value-type>,
-        extractors: list<extractor>,
         /// Viewers: each view of a document showing an output of a type, by the type's name.
         viewers: list<tuple<string, view>>,
         /// Ways to make a node.
@@ -846,13 +818,6 @@ interface guest {
     serve: async func(service: u32, project: borrow<project>, arguments: string) -> result<string, string>;
     /// A tool's work: its arguments (TOML) to its answer (TOML).
     run: async func(tool: u32, project: borrow<project>, arguments: string) -> result<string, string>;
-
-    /// An extraction session: begun with the declarations, then an asset at a time.
-    resource extraction {
-        begin: static async func(extractor: u32, declarations: borrow<declarations>) -> result<extraction, string>;
-        /// An asset's native files for a release, checked against its declaration.
-        extract: async func(path: string, release: string, discs: borrow<discs>) -> result<list<tuple<string, list<u8>>>, string>;
-    }
 
     /// A view, kept between frames: of an asset, or a panel's (no asset).
     resource view-state {

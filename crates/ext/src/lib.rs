@@ -39,7 +39,7 @@ pub use data::{
     NodeNamed, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp, StartStream, StreamInput,
     StreamSource, Type, Typed, Value as Data, Writer, merged, targeted,
 };
-pub use extract::{Begin, Declared, Discs, Extraction, ExtractorDef, Made};
+pub use extract::{Declared, Discs, Given, Made};
 pub use image::{Image, Mark, Marks, Rect, Texture};
 pub use import::{Recognized, Signature, Sniff, TypeDef};
 pub use pe2_ext_macros::{extension, steps};

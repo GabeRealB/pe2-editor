@@ -27,7 +27,7 @@
 //! settings, so only the first process to load a component compiles it.
 
 use anyhow::{Context, Result, anyhow};
-use pe2_ext::{Asset, Declared, Discs, Extraction, Field, Image, Name, Project, Registry, Source, Table, UiHost};
+use pe2_ext::{Asset, Field, Image, Name, Project, Registry, Source, Table, UiHost};
 use pe2_ext::{Value, View};
 use std::path::Path;
 use std::sync::Weak;
@@ -52,8 +52,6 @@ mod bindings {
             "pe2:extension/host.project": super::LentProject,
             "pe2:extension/host.ui": super::Frame,
             "pe2:extension/host.texture": super::HostTexture,
-            "pe2:extension/host.declarations": super::LentDeclarations,
-            "pe2:extension/host.discs": super::LentDiscs,
             "pe2:extension/host.writer": super::HostWriter,
             "pe2:extension/media.media-buffer": super::HostMediaBuffer,
             "pe2:extension/types.stream-reader": super::HostStreamReader,
@@ -75,8 +73,6 @@ const FRAME: u64 = 200;
 const LONG: u64 = 1000;
 /// An unsandboxed extension's operation, which may wait on a long-running program: an hour.
 const UNSANDBOXED_LONG: u64 = 360_000;
-/// An extraction session's beginning (reading every declaration it needs) or one asset's extraction.
-const EXTRACTION: u64 = 6000;
 /// An instance's memory, at most, unless its extension declares more for its job (`Registry::memory`).
 const MEMORY: u64 = 256 << 20;
 /// The most any job may be given: a 32-bit memory's whole range.
@@ -181,42 +177,6 @@ unsafe fn erase_row<'a>(row: Box<dyn UiHost + 'a>) -> Box<dyn UiHost + 'static> 
     // SAFETY: the same box, its lifetime the caller's to keep.
     unsafe { std::mem::transmute(row) }
 }
-
-/// Lent declarations' pointer, its lifetime erased to keep it in a resource table.
-///
-/// # Safety
-/// It must be taken back before what it points to goes.
-#[expect(clippy::transmute_ptr_to_ptr, reason = "a cast cannot extend a trait object's lifetime")]
-unsafe fn erase_declared<'a>(declared: *const (dyn Declared + 'a)) -> *const (dyn Declared + 'static) {
-    // SAFETY: the same pointer, its lifetime the caller's to keep.
-    unsafe { std::mem::transmute(declared) }
-}
-
-/// Lent discs' pointer, its lifetime erased to keep it in a resource table.
-///
-/// # Safety
-/// It must be taken back before what it points to goes.
-#[expect(clippy::transmute_ptr_to_ptr, reason = "a cast cannot extend a trait object's lifetime")]
-unsafe fn erase_discs<'a>(discs: *mut (dyn Discs + 'a)) -> *mut (dyn Discs + 'static) {
-    // SAFETY: the same pointer, its lifetime the caller's to keep.
-    unsafe { std::mem::transmute(discs) }
-}
-
-/// The declarations lent to an extraction session's beginning, by pointer.
-pub struct LentDeclarations {
-    declared: *const (dyn Declared + 'static),
-}
-
-// SAFETY: lent declarations are read only during the call that lent them, on the thread making the call.
-unsafe impl Send for LentDeclarations {}
-
-/// A release's discs lent for one asset's extraction, by pointer.
-pub struct LentDiscs {
-    discs: *mut (dyn Discs + 'static),
-}
-
-// SAFETY: lent discs are read only during the call that lent them, on the thread making the call.
-unsafe impl Send for LentDiscs {}
 
 /// The project lent for a call, by pointer.
 pub struct LentProject {
@@ -707,69 +667,6 @@ impl host::HostProject for State {
 
     fn drop(&mut self, project: Resource<LentProject>) -> wasmtime::Result<()> {
         self.table.delete(project)?;
-        Ok(())
-    }
-}
-
-/// A value as it crosses: TOML.
-impl host::HostDeclarations for State {
-    fn of_type(
-        &mut self,
-        declarations: Resource<LentDeclarations>,
-        node_type: String,
-    ) -> wasmtime::Result<Vec<(String, Vec<u8>)>> {
-        // SAFETY: lent for the call running now (`ComponentExtraction::begin`), taken back before it returns.
-        let declared = unsafe { &*self.table.get(&declarations)?.declared };
-        let _span = tracing::info_span!("declarations lent", of = %node_type).entered();
-        Ok(declared.encoded(&node_type).as_ref().clone())
-    }
-
-    fn drop(&mut self, declarations: Resource<LentDeclarations>) -> wasmtime::Result<()> {
-        // A borrow the guest drops: the host takes the declarations back itself.
-        let _ = declarations;
-        Ok(())
-    }
-}
-
-impl host::HostDiscs for State {
-    fn read(&mut self, discs: Resource<LentDiscs>, at: Vec<u8>) -> wasmtime::Result<Result<Vec<u8>, String>> {
-        // SAFETY: lent for the call running now (`ComponentExtraction::extract`), taken back before it returns.
-        let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match pe2_ext::cbor::decode(&at) {
-            Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
-        };
-        Ok(discs.read(&at).map_err(|e| format!("{e:#}")))
-    }
-
-    fn size(&mut self, discs: Resource<LentDiscs>, at: Vec<u8>) -> wasmtime::Result<Result<u64, String>> {
-        // SAFETY: as `read`.
-        let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match pe2_ext::cbor::decode(&at) {
-            Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
-        };
-        Ok(discs.size(&at).map_err(|e| format!("{e:#}")))
-    }
-
-    fn read_range(
-        &mut self,
-        discs: Resource<LentDiscs>,
-        at: Vec<u8>,
-        offset: u64,
-        len: u32,
-    ) -> wasmtime::Result<Result<Vec<u8>, String>> {
-        // SAFETY: as `read`.
-        let discs = unsafe { &mut *self.table.get(&discs)?.discs };
-        let at: Table = match pe2_ext::cbor::decode(&at) {
-            Ok(at) => at,
-            Err(e) => return Ok(Err(format!("not a location: {e:#}"))),
-        };
-        Ok(discs.read_range(&at, offset, len as usize).map_err(|e| format!("{e:#}")))
-    }
-
-    fn drop(&mut self, discs: Resource<LentDiscs>) -> wasmtime::Result<()> {
-        let _ = discs;
         Ok(())
     }
 }
@@ -1899,64 +1796,6 @@ impl Drop for ComponentGenerator {
     }
 }
 
-/// An extraction session in an instance of its own, which keeps what the session read between its assets.
-struct ComponentExtraction {
-    id: String,
-    runner: Runner,
-    state: ResourceAny,
-}
-
-impl ComponentExtraction {
-    fn begin(shared: &Shared, extractor: u32, cap: u64, declared: &dyn Declared) -> Result<ComponentExtraction> {
-        let mut runner = shared.instantiate(cap)?;
-        // SAFETY: the pointer is used only during this call, and taken back before it returns.
-        let declared = unsafe { erase_declared(declared) };
-        let lent = runner.store.data_mut().table.push(LentDeclarations { declared })?;
-        let borrowed = Resource::new_borrow(lent.rep());
-        let begun = runner.call(EXTRACTION, async |a, g| g.extraction().call_begin(a, extractor, borrowed).await);
-        let _ = runner.store.data_mut().table.delete(lent);
-        let state = begun?.map_err(|e| anyhow!(e))?;
-        Ok(ComponentExtraction { id: shared.id.clone(), runner, state })
-    }
-}
-
-impl Extraction for ComponentExtraction {
-    fn extract(&mut self, path: &str, release: &str, discs: &mut dyn Discs) -> pe2_ext::Result<pe2_ext::Made> {
-        // SAFETY: the pointer is used only during this call, and taken back before it returns.
-        let discs = unsafe { erase_discs(discs) };
-        let lent = self.runner.store.data_mut().table.push(LentDiscs { discs })?;
-        let borrowed = Resource::new_borrow(lent.rep());
-        let (state, path, release) = (self.state, path.to_string(), release.to_string());
-        let made = self
-            .runner
-            .call(EXTRACTION, async |a, g| g.extraction().call_extract(a, state, path, release, borrowed).await);
-        let _ = self.runner.store.data_mut().table.delete(lent);
-        made.with_context(|| self.id.clone())?.map_err(|e| anyhow!(e))
-    }
-}
-
-impl Drop for ComponentExtraction {
-    fn drop(&mut self) {
-        let Runner { store, runtime, .. } = &mut self.runner;
-        let _ = drive(runtime, self.state.resource_drop_async(&mut *store));
-    }
-}
-
-/// Register a component's extractors, their sessions begun in instances of their own.
-fn apply_extractors(registry: &mut Registry, extractors: Vec<g::Extractor>, shared: &Arc<Shared>) -> Result<()> {
-    for extractor in extractors {
-        let node_type = Name::parse(&extractor.node_type)
-            .with_context(|| format!("{}: not a qualified type", extractor.node_type))?;
-        let requires: Vec<&str> = extractor.requires.iter().map(String::as_str).collect();
-        let (shared, handle) = (shared.clone(), extractor.handle);
-        let cap = shared.cap(&extractor.name);
-        let _ = registry.extractor(&extractor.name, &node_type, &requires, move |declared| {
-            Ok(Box::new(ComponentExtraction::begin(&shared, handle, cap, declared)?) as Box<dyn Extraction>)
-        });
-    }
-    Ok(())
-}
-
 /// A tool's or a service's work, as a job of its component with the project lent: its arguments to its answer.
 /// Tests run: a service may be one, as long as what it drives takes.
 static PATIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2222,7 +2061,6 @@ fn apply(registry: &mut Registry, registration: g::Registration, shared: &Arc<Sh
             .panel(&panel.name, &panel.label, icon, move || Box::new(ComponentView::new(shared.clone(), handle, None)));
     }
     apply_ops(registry, registration.ops, shared);
-    apply_extractors(registry, registration.extractors, shared)?;
     for service in registration.services {
         let run = called(shared, service.handle, &service.name, true);
         let _ = registry.service(&service.name, &service.description, &service.schema, run);
