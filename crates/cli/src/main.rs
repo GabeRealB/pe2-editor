@@ -241,6 +241,21 @@ enum MountCommand {
 }
 
 #[derive(Subcommand)]
+enum LinkCommand {
+    /// Link a file to one the project's builds deploy, on this machine alone, made once that is deployed: where a
+    /// language server looks for it, the project not being the root of what it is edited in
+    Add {
+        /// The link, relative to the project (`../compile_commands.json`)
+        at: String,
+        /// The deployed file, relative to the project (`build/compile_commands.json`)
+        deployed: String,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
     /// Add a build the project can be: a release, and the target building it
     Add {
@@ -302,6 +317,11 @@ enum ProjectCommand {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Links this machine wants to what the project's builds deploy (`project.local.toml`)
+    Link {
+        #[command(subcommand)]
+        command: LinkCommand,
     },
     /// How a project's generated layers are, by their plans: none, empty, filled, or not as the plan says now - known
     /// without the discs and without reading what was made
@@ -1032,6 +1052,9 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
         ProjectCommand::Mount { command: MountCommand::Locate { at, path, project } } => {
             project::setup::locate(&project::Project::load(&project)?, &at, &path)?;
         }
+        ProjectCommand::Link { command: LinkCommand::Add { at, deployed, project } } => {
+            project::setup::add_link(&project::Project::load(&project)?, &at, &deployed)?;
+        }
         ProjectCommand::Config { command: ConfigCommand::Add { name, release, target, project } } => {
             edit_project(&project, |p, history| {
                 project::setup::add_config(p, &name, release.as_deref(), target.as_deref(), history)
@@ -1203,6 +1226,7 @@ fn run(cli: Cli) -> Result<()> {
                 | ProjectCommand::Layer { .. }
                 | ProjectCommand::Mount { .. }
                 | ProjectCommand::Config { .. }
+                | ProjectCommand::Link { .. }
                 | ProjectCommand::Status { .. }),
         } => setup_command(command)?,
         Tool::Project { command: ProjectCommand::Verify { project, layer } } => {

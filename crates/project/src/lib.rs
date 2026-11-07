@@ -47,8 +47,6 @@ struct ProjectFile {
     /// The builds it can be: `[config.<name>]`.
     #[serde(default)]
     config: std::collections::BTreeMap<String, ConfigFile>,
-    #[serde(default)]
-    build: BuildFile,
 }
 
 /// A build the project can be: `[config.<name>]`.
@@ -73,10 +71,11 @@ struct ConfigFile {
     disabled: Vec<String>,
 }
 
-/// `[build]`: where a build's results are also wanted.
+/// `[build]` of `project.local.toml`: where this machine also wants a build's results.
 #[derive(Default, Deserialize)]
 struct BuildFile {
-    /// `[build.links]`: a link, relative to the project, for a deployed file: where a language server finds it.
+    /// `[build.links]`: a link, relative to the project, for a deployed file - where a language server looks for it,
+    /// where the project is not the root of what it is edited in.
     #[serde(default)]
     links: build::Links,
 }
@@ -127,11 +126,22 @@ struct MountFile {
 }
 
 /// `project.local.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
-/// "<path>"`). It is kept out of the project's history and of version control.
+/// "<path>"`), and the links it wants to what builds deploy (`[build.links]`). It is kept out of the project's history
+/// and of version control.
 #[derive(Default, Deserialize)]
 struct LocalFile {
     #[serde(default)]
     mounts: BTreeMap<String, String>,
+    #[serde(default)]
+    build: BuildFile,
+}
+
+fn read_local(root: &Path) -> Result<LocalFile> {
+    let path = root.join(LOCAL);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
+        Err(_) => Ok(LocalFile::default()),
+    }
 }
 
 /// The file what of a project is this machine's is kept in.
@@ -217,7 +227,8 @@ pub struct Project {
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
     /// The builds it can be, by name, in order.
     pub configs: Vec<Config>,
-    /// Links wanted to what is deployed: where each goes, relative to the project, by the deployed file it stands for.
+    /// Links this machine wants to what is deployed (`project.local.toml`): where each goes, relative to the project,
+    /// by the deployed file it stands for.
     pub links: build::Links,
 }
 
@@ -242,12 +253,7 @@ pub fn create(directory: &Path) -> Result<()> {
 }
 
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`project.local.toml`).
-fn mounts_of(root: &Path, declared: Vec<MountFile>) -> Result<(Vec<Mount>, Vec<Mount>)> {
-    let local_path = root.join(LOCAL);
-    let local: LocalFile = match std::fs::read_to_string(&local_path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("{}", local_path.display()))?,
-        Err(_) => LocalFile::default(),
-    };
+fn mounts_of(root: &Path, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
     let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
     for m in declared {
         let at = m.at.trim_matches('/').to_string();
@@ -273,7 +279,8 @@ impl Project {
         let path = root.join(FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
-        let (mounts, unmanaged) = mounts_of(&root, file.mount)?;
+        let local = read_local(&root)?;
+        let (mounts, unmanaged) = mounts_of(&root, file.mount, &local)?;
         // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
         let mut layers: Vec<Layer> = mounts
             .iter()
@@ -352,7 +359,7 @@ impl Project {
                 _ => None,
             })
             .collect();
-        let links = file.build.links;
+        let links = local.build.links;
         let configs = file
             .config
             .into_iter()

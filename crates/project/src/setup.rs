@@ -119,6 +119,25 @@ pub fn add_mount(
     tx.commit().map(drop)
 }
 
+/// Link a file of the project (`at`, relative to it) to a file its builds deploy (`deployed`, relative to the
+/// project), on this machine: `[build.links]` of `project.local.toml`, made once the file is deployed - where a
+/// language server looks for it, the project not being the root of what it is edited in (a build's
+/// `compile_commands.json` one folder up).
+///
+/// # Errors
+/// It links that file already, or the file cannot be written.
+pub fn add_link(project: &Project, at: &str, deployed: &str) -> Result<()> {
+    anyhow::ensure!(!project.links.contains_key(at), "the project links {at} already");
+    let file = project.root.join(crate::LOCAL);
+    let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
+    let build = table(&mut document, "build")?;
+    build.set_implicit(true);
+    let links = build.entry("links").or_insert(Item::Table(Table::new()));
+    let links = links.as_table_mut().with_context(|| format!("`build.links` in {} is not a table", crate::LOCAL))?;
+    links.insert(at, value(deployed));
+    std::fs::write(&file, document.to_string()).with_context(|| file.display().to_string())
+}
+
 /// Add a build the project can be: `[config.<name>]`, a release and the target building it.
 ///
 /// # Errors
@@ -184,6 +203,10 @@ mod tests {
         // Where the discs are is this machine's.
         super::locate(&made, "roms", "/elsewhere").unwrap();
         assert_eq!(project().unmanaged[0].path, std::path::Path::new("/elsewhere"));
+        // So are the links it wants.
+        super::add_link(&project(), "../compile_commands.json", "build/compile_commands.json").unwrap();
+        assert_eq!(project().links["../compile_commands.json"], "build/compile_commands.json");
+        assert!(!std::fs::read_to_string(dir.join(crate::FILE)).unwrap().contains("links"));
         assert!(super::add_generated(&project(), "more", "nothing", &mut history).is_err());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
