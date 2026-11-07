@@ -1097,14 +1097,16 @@ fn run_plan(
     let engine = project::imports::Imports::open(&cache)?.engine(&extensions);
     let ran = project::plan::run(p, layer, &engine, &extensions, &project::plan::Progress::default(), releases)?;
     println!(
-        "{} ({}): {} files written and {} kept as they were ({} operations run), {} removed, {} of releases not read left",
+        "{} ({}): {} files written and {} kept as they were ({} operations run), {} removed, {} of releases not read left, \
+         {} releases' own the same as what they share",
         layer.name,
         ran.releases.join(", "),
         ran.written,
         ran.kept,
         ran.ran,
         ran.removed,
-        ran.skipped
+        ran.skipped,
+        ran.shared
     );
     Ok(())
 }

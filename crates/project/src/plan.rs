@@ -442,12 +442,14 @@ fn found_releases(
     Ok((available, paths))
 }
 
-/// A file a run wrote, as its record keeps it; an optional one not made has no sha1.
+/// A file a run wrote, as its record keeps it; an optional one not made has no sha1. A release's own file that is
+/// the same as what the releases share is not kept: the shared one is it (`shared`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Written {
     key: String,
     sha1: String,
     size: u64,
+    shared: bool,
 }
 
 impl Written {
@@ -485,7 +487,8 @@ fn read_record(path: &Path) -> Record {
             (field("node"), field("file"), field("key"), field("sha1"))
         {
             let size = line.get("size").and_then(Value::as_u64).unwrap_or(0);
-            record.files.insert((node, file), Written { key, sha1, size });
+            let shared = line.get("shared").and_then(Value::as_bool) == Some(true);
+            record.files.insert((node, file), Written { key, sha1, size, shared });
         }
     }
     record
@@ -495,7 +498,11 @@ fn write_record(path: &Path, plan: &Plan, record: &Record) -> Result<()> {
     let mut text = json!({"record": 1, "plan": plan.sha1, "releases": record.releases}).to_string();
     text.push('\n');
     for ((node, file), written) in &record.files {
-        let line = json!({"node": node, "file": file, "key": written.key, "sha1": written.sha1, "size": written.size});
+        let mut line =
+            json!({"node": node, "file": file, "key": written.key, "sha1": written.sha1, "size": written.size});
+        if written.shared {
+            line["shared"] = json!(true);
+        }
         text.push_str(&line.to_string());
         text.push('\n');
     }
@@ -603,6 +610,8 @@ pub struct Ran {
     pub written: usize,
     pub kept: usize,
     pub skipped: usize,
+    /// Releases' own files not kept, being the same as what the releases share.
+    pub shared: usize,
     /// Operations run.
     pub ran: usize,
     /// Files removed, no bundle being given them any more.
@@ -770,6 +779,52 @@ pub fn observe(
     Ok(seen)
 }
 
+impl Plan {
+    /// What a release's own file (`<release>/<name>`) is apart from: the file the releases share (`<name>`).
+    fn plain_of<'a>(&self, file: &'a str) -> Option<&'a str> {
+        let (release, name) = file.split_once('/')?;
+        (self.inputs.contains_key(release) && !name.ends_with('/')).then_some(name)
+    }
+}
+
+/// Where a recorded file's bytes are in the layer: its own place, or, one the same as what the releases share, the
+/// shared file's.
+fn on_disk(plan: &Plan, layer: &Path, node: &str, file: &str, written: &Written) -> PathBuf {
+    match plan.plain_of(file).filter(|_| written.shared) {
+        Some(shared) => file_path(layer, node, shared),
+        None => file_path(layer, node, file),
+    }
+}
+
+/// Keep no release's own file that is the same as what the releases share: each removed, recorded as the shared one.
+/// How many.
+fn share_alike(plan: &Plan, layer: &Path, record: &mut Record) -> usize {
+    let alike: Vec<(String, String)> = record
+        .files
+        .iter()
+        .filter(|((node, file), written)| {
+            written.present()
+                && !written.shared
+                && plan.plain_of(file).is_some_and(|plain| {
+                    let shared = record.files.get(&(node.clone(), plain.to_string()));
+                    shared.is_some_and(|s| s.present() && !s.shared && s.sha1 == written.sha1)
+                })
+        })
+        .map(|(entry, _)| entry.clone())
+        .collect();
+    for (node, file) in &alike {
+        let path = file_path(layer, node, file);
+        let _ = std::fs::remove_file(&path);
+        if let Some(folder) = path.parent() {
+            let _ = std::fs::remove_dir(folder);
+        }
+        if let Some(written) = record.files.get_mut(&(node.clone(), file.clone())) {
+            written.shared = true;
+        }
+    }
+    alike.len()
+}
+
 /// The path of a bundle's file in the layer.
 fn file_path(layer: &Path, node: &str, file: &str) -> PathBuf {
     layer.join(format!("{node}{}", crate::index::BUNDLE_SUFFIX)).join(file)
@@ -800,8 +855,13 @@ fn wanted(
                 })
                 .collect();
             let as_written = |((node, file), written): &(&(String, String), &Written)| {
-                let there = std::fs::metadata(file_path(layer, node, file)).map(|m| m.len()).ok();
-                written.key == key && there == written.present().then_some(written.size)
+                let there = std::fs::metadata(on_disk(plan, layer, node, file, written)).map(|m| m.len()).ok();
+                // What a release's own file was the same as is so still.
+                let alike = !written.shared
+                    || plan.plain_of(file).is_some_and(|plain| {
+                        old.files.get(&(node.clone(), plain.to_string())).is_some_and(|s| s.sha1 == written.sha1)
+                    });
+                written.key == key && alike && there == written.present().then_some(written.size)
             };
             if !given.possible {
                 // Left as it is: what the last run made of it, if anything.
@@ -977,6 +1037,7 @@ pub fn run(
     } else {
         available.clone()
     });
+    ran.shared = share_alike(&plan, layer, &mut record);
     ran.removed = remove_left(layer, &old, &record);
     write_record(&layer.join(RECORD), &plan, &record)?;
     Ok(ran)
@@ -1055,7 +1116,8 @@ impl RunState<'_> {
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
                         let _ = std::fs::remove_file(file_path(self.layer, node, &file));
-                        self.lock_written().push(((node.clone(), file), Written { key, sha1: String::new(), size: 0 }));
+                        self.lock_written()
+                            .push(((node.clone(), file), Written { key, sha1: String::new(), size: 0, shared: false }));
                         continue;
                     };
                     let path = file_path(self.layer, node, &file);
@@ -1063,7 +1125,7 @@ impl RunState<'_> {
                         std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
                     }
                     std::fs::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
-                    let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64 };
+                    let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64, shared: false };
                     self.lock_written().push(((node.clone(), file), written));
                     self.progress.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1351,7 +1413,7 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
             for ((node, file), written) in held {
                 if written.key != key {
                     other += 1;
-                } else if written.present() && !file_path(layer, node, file).exists() {
+                } else if written.present() && !on_disk(&plan, layer, node, file, written).exists() {
                     gone += 1;
                 }
             }
@@ -1436,7 +1498,7 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
         if written.key != *key {
             return Some((1, name));
         }
-        let path = file_path(layer, node, file);
+        let path = on_disk(&plan, layer, node, file, written);
         if !written.present() {
             return path.exists().then_some((2, name));
         }
@@ -1467,6 +1529,7 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
 #[cfg(test)]
 mod tests {
     use super::Plan;
+    use crate::extract::sha1_hex;
 
     #[test]
     fn a_layer_says_whether_its_plan_ran_and_what_it_needs() {
@@ -1537,13 +1600,26 @@ mod tests {
         let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
         for name in ["native.bin", "inflated"] {
             std::fs::write(layer.join("n.node").join(name), "x").unwrap();
-            let written = super::Written { key: key(&plan, name), sha1: "x".into(), size: 1 };
+            let written = super::Written { key: key(&plan, name), sha1: "x".into(), size: 1, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         let parsed = Plan::parse(&text).unwrap();
         super::write_record(&layer.join(super::RECORD), &parsed, &record).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
+        // A release's own file the same as what the releases share is not kept: the shared one is it.
+        let mut record = super::Record::default();
+        std::fs::create_dir_all(layer.join("n.node/EUR")).unwrap();
+        for (name, bytes) in [("own.bin", "same"), ("EUR/own.bin", "same"), ("inflated", "x"), ("EUR/inflated", "y")] {
+            std::fs::write(layer.join("n.node").join(name), bytes).unwrap();
+            let written = super::Written { key: "k".into(), sha1: sha1_hex(bytes.as_bytes()), size: 4, shared: false };
+            record.files.insert(("n".into(), name.into()), written);
+        }
+        assert_eq!(super::share_alike(&parsed, &layer, &mut record), 1);
+        assert!(!layer.join("n.node/EUR/own.bin").exists() && layer.join("n.node/EUR/inflated").exists());
+        let own = &record.files[&("n".to_string(), "EUR/own.bin".to_string())];
+        assert!(own.shared);
+        assert_eq!(super::on_disk(&parsed, &layer, "n", "EUR/own.bin", own), layer.join("n.node/own.bin"));
         let _ = std::fs::remove_dir_all(&layer);
         let _ = std::fs::remove_file(&plan_file);
     }
