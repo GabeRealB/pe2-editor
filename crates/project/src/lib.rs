@@ -18,6 +18,7 @@ pub mod lock;
 pub mod plan;
 pub mod profile;
 pub mod schedule;
+pub mod setup;
 pub mod stack;
 pub mod store;
 pub mod switches;

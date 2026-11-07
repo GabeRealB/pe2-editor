@@ -103,6 +103,15 @@ pub fn check_name(project: &Project, name: &str) -> Result<()> {
 /// # Errors
 /// The name is not one a layer may take, or the files cannot be written.
 pub fn add(project: &Project, name: &str, kind: LayerKind, history: &mut History) -> Result<()> {
+    add_at(project, name, kind, false, history)
+}
+
+/// Add a new, empty layer at the top of the stack, or at its bottom (`bottom`): below every other, as a layer the rest
+/// build on - the game's.
+///
+/// # Errors
+/// The name is not one a layer may take, or the files cannot be written.
+pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, history: &mut History) -> Result<()> {
     check_name(project, name)?;
     let mut document = read(&project.root)?;
     let mut table = Table::new();
@@ -111,7 +120,24 @@ pub fn add(project: &Project, name: &str, kind: LayerKind, history: &mut History
     if kind == LayerKind::Files {
         table.insert("kind", value("files"));
     }
-    layer_tables(&mut document)?.push(table);
+    let tables = layer_tables(&mut document)?;
+    if bottom && !tables.is_empty() {
+        // An array of tables takes no insert: rebuilt with it first, holding what was written over the first (the
+        // file's opening comment).
+        let mut rest: Vec<Table> = tables.iter().cloned().collect();
+        let mut table = table;
+        if let Some(first) = rest.first_mut() {
+            *table.decor_mut() = first.decor().clone();
+            first.decor_mut().clear();
+        }
+        tables.clear();
+        tables.push(table);
+        for t in rest {
+            tables.push(t);
+        }
+    } else {
+        tables.push(table);
+    }
     let mut tx = history.begin(format!("Add the layer {name}"));
     tx.make_dir(&project.root.join(LAYERS).join(name))?;
     tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;

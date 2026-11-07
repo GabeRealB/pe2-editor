@@ -164,6 +164,68 @@ enum ConvertCommand {
 }
 
 #[derive(Subcommand)]
+enum LayerCommand {
+    /// Add an empty layer at the top of the stack (`.layers/<name>`)
+    Add {
+        name: String,
+        /// A layer of plain files only (code), not assets
+        #[arg(long)]
+        files: bool,
+        /// Below every other layer, as one the rest build on (the game's)
+        #[arg(long)]
+        bottom: bool,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCommand {
+    /// Add a release, its discs known by their images: each named as its file, its size and sha1 read off it
+    Add {
+        name: String,
+        /// The discs' images, in disc order
+        #[arg(required = true)]
+        images: Vec<PathBuf>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum MountCommand {
+    /// Mount a tree at a name: a files layer at the bottom of the stack
+    Add {
+        at: String,
+        /// The tree, relative to the project or absolute
+        path: String,
+        /// Nothing is written into it
+        #[arg(long)]
+        read_only: bool,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Add a build the project can be: a release, and the target building it
+    Add {
+        name: String,
+        #[arg(long)]
+        release: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectCommand {
     /// Fill a project's game layer from its discs, by the layer's extraction plan (`extraction.plan.jsonl`): only what
     /// changed or is gone is made, and what the plan no longer gives is removed
@@ -191,6 +253,45 @@ enum ProjectCommand {
     New {
         /// The directory to make it in (made where missing)
         directory: PathBuf,
+    },
+    /// The project's layers
+    Layer {
+        #[command(subcommand)]
+        command: LayerCommand,
+    },
+    /// Set the game the project is of: the layer its game's files fill, and where its disc images are
+    Game {
+        /// The layer (one of the project's)
+        #[arg(long)]
+        layer: String,
+        /// Where the disc images are, relative to the project
+        #[arg(long)]
+        roms: Option<String>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// The releases the project is built for
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
+    /// The trees mounted into the project
+    Mount {
+        #[command(subcommand)]
+        command: MountCommand,
+    },
+    /// The builds the project can be
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// How a project's game layer is, by its extraction plan: none, empty, filled, or not as the plan says now - known
+    /// without the discs and without reading what was made
+    Status {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
     /// Check a project's game layer against its extraction plan, without the discs: every file there, made by what the
     /// plan says now, unchanged since it was written
@@ -881,6 +982,61 @@ fn main() -> Result<()> {
     done
 }
 
+/// A project's setup edited - made, its layers, game, releases, mounts and configs - or its game layer's state said.
+fn setup_command(command: ProjectCommand) -> Result<()> {
+    match command {
+        ProjectCommand::New { directory } => {
+            project::create(&directory)?;
+            println!("an empty project in {}", directory.display());
+        }
+        ProjectCommand::Layer { command: LayerCommand::Add { name, files, bottom, project } } => {
+            let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
+            edit_project(&project, |p, history| project::stack::add_at(p, &name, kind, bottom, history))?;
+        }
+        ProjectCommand::Game { layer, roms, project } => {
+            edit_project(&project, |p, history| project::setup::set_game(p, &layer, roms.as_deref(), history))?;
+        }
+        ProjectCommand::Release { command: ReleaseCommand::Add { name, images, project } } => {
+            let images: Vec<&Path> = images.iter().map(PathBuf::as_path).collect();
+            edit_project(&project, |p, history| project::setup::add_release(p, &name, &images, history))?;
+        }
+        ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, project } } => {
+            edit_project(&project, |p, history| project::setup::add_mount(p, &at, &path, read_only, history))?;
+        }
+        ProjectCommand::Config { command: ConfigCommand::Add { name, release, target, project } } => {
+            edit_project(&project, |p, history| {
+                project::setup::add_config(p, &name, release.as_deref(), target.as_deref(), history)
+            })?;
+        }
+        ProjectCommand::Status { project } => {
+            let p = project::Project::load(&project)?;
+            let game = p.game.as_ref().context("the project has no [game]")?;
+            let layer = p.layer(&game.layer)?.path.clone();
+            match project::plan::state(&layer, &project_extensions(&p))? {
+                project::plan::State::NoPlan => println!("the game layer has no extraction plan"),
+                project::plan::State::Empty => println!("the game layer is empty: its plan has not run"),
+                project::plan::State::Filled => println!("the game layer is filled, as its plan says"),
+                project::plan::State::Stale(why) => println!("the game layer is stale: {}", why.join("; ")),
+            }
+        }
+        _ => unreachable!("not a setup command"),
+    }
+    Ok(())
+}
+
+/// Edit a project's setup, holding its lock, as a step of its history.
+fn edit_project(
+    project: &Path,
+    edit: impl FnOnce(&project::Project, &mut project::history::History) -> Result<()>,
+) -> Result<()> {
+    let p = project::Project::load(project)?;
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
+    let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
+    edit(&p, &mut history)
+}
+
 /// Run the game layer's extraction plan, where it has one: false where it has none.
 fn run_plan(p: &project::Project, lock: &project::lock::Lock, roms: Option<&Path>) -> Result<bool> {
     let game = p.game.as_ref().context("the project has no [game]")?;
@@ -965,10 +1121,16 @@ fn run(cli: Cli) -> Result<()> {
             let events: &[&str] = if clean { &[Clean::NAME, Build::NAME] } else { &[Build::NAME] };
             signal(&project, config.as_deref(), events)?;
         }
-        Tool::Project { command: ProjectCommand::New { directory } } => {
-            project::create(&directory)?;
-            println!("an empty project in {}", directory.display());
-        }
+        Tool::Project {
+            command:
+                command @ (ProjectCommand::New { .. }
+                | ProjectCommand::Layer { .. }
+                | ProjectCommand::Game { .. }
+                | ProjectCommand::Release { .. }
+                | ProjectCommand::Mount { .. }
+                | ProjectCommand::Config { .. }
+                | ProjectCommand::Status { .. }),
+        } => setup_command(command)?,
         Tool::Project { command: ProjectCommand::Verify { project } } => verify_layer(&project)?,
         Tool::Project { command: ProjectCommand::Registry { project } } => print_registry(&project)?,
         Tool::Project { command: ProjectCommand::Clean { project, config } } => {

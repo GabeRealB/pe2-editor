@@ -77,6 +77,8 @@ impl Given {
 pub struct Plan {
     pub layer: String,
     pub releases: Vec<String>,
+    /// The extensions its operations are theirs, by id, and the versions it takes of each (`^0.1`).
+    pub requires: Vec<(String, String)>,
     ops: Vec<Op>,
     emits: Vec<Emit>,
     /// What is run for its success alone, by its place.
@@ -106,6 +108,13 @@ impl Plan {
             .get("releases")
             .and_then(Value::as_array)
             .map_or_else(Vec::new, |r| r.iter().filter_map(Value::as_str).map(str::to_string).collect());
+        let requires = head
+            .get("requires")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| Some((r.get("id")?.as_str()?.to_string(), r.get("version")?.as_str()?.to_string())))
+            .collect();
         let (mut ops, mut emits, mut checks, mut by_id) = (Vec::new(), Vec::new(), Vec::new(), HashMap::new());
         for (at, line) in lines {
             let at = at + 1;
@@ -178,7 +187,24 @@ impl Plan {
             by_id.insert(id.clone(), ops.len());
             ops.push(Op { id, kind: op, takes, after, args, sha1 });
         }
-        Ok(Plan { layer, releases, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
+        Ok(Plan { layer, releases, requires, ops, emits, checks, by_id, sha1: sha1_hex(text.as_bytes()) })
+    }
+
+    /// What it requires that the extensions do not have: each extension missing - not there, left off or not trusted -
+    /// or of a version it does not take.
+    #[must_use]
+    pub fn unmet(&self, extensions: &crate::ext::Extensions) -> Vec<String> {
+        let mut unmet = Vec::new();
+        for (id, version) in &self.requires {
+            match extensions.loaded.iter().find(|l| l.id == *id) {
+                None => unmet.push(format!("{id}, which is not loaded")),
+                Some(loaded) if !crate::ext::satisfies(&loaded.version, version) => {
+                    unmet.push(format!("{id} {version}, where it is {}", loaded.version));
+                }
+                Some(_) => {}
+            }
+        }
+        unmet
     }
 
     /// Each operation's key, in the plan's order: what it is, its version, its settings, what it is held to, and the
@@ -403,6 +429,34 @@ fn wanted(
     wanted
 }
 
+/// The checks of what was written (`assembled`), each at once: they join what was written, each its own.
+#[expect(clippy::too_many_arguments, reason = "what a run holds, as it ends")]
+fn joined(
+    plan: &Plan,
+    keys: &[String],
+    last: &[usize],
+    layer: &Path,
+    engine: &crate::graph::exec::Engine,
+    extensions: &crate::ext::Extensions,
+    record: &mut Record,
+    ran: &mut Ran,
+) -> Result<()> {
+    let joined = crate::parallel(last, |&at| -> Result<usize> {
+        let op = &plan.ops[at];
+        let node = op.args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
+        let want = op.sha1.as_deref().with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
+        let got = crate::extract::assembled_sha1(layer, node, engine, extensions).with_context(|| op.id.clone())?;
+        anyhow::ensure!(got == want, "{}: what it joins has sha1 {got}, where the plan says {want}", op.id);
+        Ok(at)
+    });
+    for at in joined {
+        let at = at?;
+        record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
+        ran.ran += 1;
+    }
+    Ok(())
+}
+
 /// Run a layer's plan: make what changed or is gone, reading the discs in `roms`, running extensions' operations with
 /// `engine`, each kept by its extension's version.
 ///
@@ -415,6 +469,8 @@ pub fn run(
     extensions: &crate::ext::Extensions,
 ) -> Result<Ran> {
     let plan = Plan::read(&layer.join(PLAN))?;
+    let unmet = plan.unmet(extensions);
+    anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
     let old = read_record(&layer.join(RECORD));
     let mut record = Record::default();
@@ -496,20 +552,7 @@ pub fn run(
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
         record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
     }
-    // Each at once: they join what was written, each its own.
-    let joined = crate::parallel(&last, |&at| -> Result<usize> {
-        let op = &plan.ops[at];
-        let node = op.args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
-        let want = op.sha1.as_deref().with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
-        let got = crate::extract::assembled_sha1(layer, node, engine, extensions).with_context(|| op.id.clone())?;
-        anyhow::ensure!(got == want, "{}: what it joins has sha1 {got}, where the plan says {want}", op.id);
-        Ok(at)
-    });
-    for at in joined {
-        let at = at?;
-        record.checks.insert(plan.ops[at].id.clone(), keys[at].clone());
-        ran.ran += 1;
-    }
+    joined(&plan, &keys, &last, layer, engine, extensions, &mut record, &mut ran)?;
     // What no bundle is given any more goes.
     for (node, file) in old.files.keys().filter(|entry| !record.files.contains_key(*entry)) {
         let path = file_path(layer, node, file);
@@ -798,6 +841,68 @@ fn movie_clips(disc: &OpenDisc, name: &str) -> Result<Vec<(u64, u64)>> {
     Ok(clips)
 }
 
+/// How a layer is, by its plan: none to fill it by; not filled; filled as the plan says now; or not as it says now -
+/// what it needs not there, or what was made by another plan or by other extensions, or gone since.
+#[derive(Debug, PartialEq, Eq)]
+pub enum State {
+    NoPlan,
+    Empty,
+    Filled,
+    Stale(Vec<String>),
+}
+
+/// How a layer is, by its plan and the record of its last run - known without the discs and without reading what was
+/// made: each file's key against what the plan says now, and whether it is there.
+///
+/// # Errors
+/// The plan cannot be read.
+pub fn state(layer: &Path, extensions: &crate::ext::Extensions) -> Result<State> {
+    if !layer.join(PLAN).is_file() {
+        return Ok(State::NoPlan);
+    }
+    let plan = Plan::read(&layer.join(PLAN))?;
+    let record = read_record(&layer.join(RECORD));
+    if record.files.is_empty() && record.checks.is_empty() {
+        return Ok(State::Empty);
+    }
+    let mut stale: Vec<String> = plan.unmet(extensions).into_iter().map(|unmet| format!("it needs {unmet}")).collect();
+    let keys = plan.keys(&|id| extensions.version_of(id));
+    let (mut other, mut gone) = (0, 0);
+    for emit in &plan.emits {
+        for given in &emit.files {
+            let held: Vec<_> = record
+                .files
+                .iter()
+                .filter(|((node, file), _)| {
+                    *node == emit.node
+                        && if given.folder() { file.starts_with(&given.name) } else { *file == given.name }
+                })
+                .collect();
+            if held.is_empty() {
+                gone += 1;
+            }
+            for ((node, file), written) in held {
+                if written.key != keys[given.at] {
+                    other += 1;
+                } else if written.present() && !file_path(layer, node, file).exists() {
+                    gone += 1;
+                }
+            }
+        }
+    }
+    let checks = plan.checks.iter().filter(|&&at| record.checks.get(&plan.ops[at].id) != Some(&keys[at])).count();
+    for (count, what) in [
+        (other, "files made otherwise than the plan says now"),
+        (gone, "files not there"),
+        (checks, "checks not run as the plan says now"),
+    ] {
+        if count > 0 {
+            stale.push(format!("{count} {what}"));
+        }
+    }
+    Ok(if stale.is_empty() { State::Filled } else { State::Stale(stale) })
+}
+
 /// What a check of a layer against its plan found: files not there, made by another key than the plan's now, changed
 /// since written, or there and given to no bundle.
 #[derive(Debug, Default)]
@@ -880,6 +985,24 @@ pub fn verify(layer: &Path, versions: &dyn Fn(&str) -> String) -> Result<Checked
 #[cfg(test)]
 mod tests {
     use super::Plan;
+
+    #[test]
+    fn a_layer_says_whether_its_plan_ran_and_what_it_needs() {
+        let layer = std::env::temp_dir().join(format!("pe2-plan-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&layer);
+        std::fs::create_dir_all(&layer).unwrap();
+        let extensions = crate::ext::Extensions::load(Vec::new(), true);
+        assert_eq!(super::state(&layer, &extensions).unwrap(), super::State::NoPlan);
+        let plan = r#"{"plan":1,"layer":"game","releases":["USA"],"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
+{"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
+{"emit":"n/m","files":{"native.bin":"a"}}
+"#;
+        std::fs::write(layer.join(super::PLAN), plan).unwrap();
+        assert_eq!(super::state(&layer, &extensions).unwrap(), super::State::Empty);
+        let unmet = Plan::parse(plan).unwrap().unmet(&extensions);
+        assert!(unmet.len() == 1 && unmet[0].contains("pe2.nothing"), "{unmet:?}");
+        let _ = std::fs::remove_dir_all(&layer);
+    }
 
     #[test]
     fn a_plan_reads_its_operations_in_order_and_keys_them_by_what_they_take() {
