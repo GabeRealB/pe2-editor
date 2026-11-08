@@ -157,7 +157,9 @@ fn which(program: &str) -> bool {
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.
 pub fn open(file: &Path, name: &str, tools: &Tools) -> Result<String, String> {
-    open_as(file, name, Category::of(file), tools)
+    // A large file a layer holds as chunks is opened as assembled for it.
+    let file = project::content::for_program(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    open_as(&file, name, Category::of(&file), tools)
 }
 
 /// Open a file with the tool for `category`, or the system's default.

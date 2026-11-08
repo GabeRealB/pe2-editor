@@ -1,0 +1,2 @@
+# Words the docs use that are names, not code: kept as Clippy's defaults are, with these added.
+doc-valid-idents = ["WebDAV", ".."]

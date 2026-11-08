@@ -54,37 +54,29 @@ fn language(path: &Path) -> Option<&'static str> {
 }
 
 fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
+    project::content::stat(path).ok()
 }
 
 impl Viewed {
     fn read(path: &Path) -> Viewed {
         let stamp = stamp(path);
         let mut truncated = None;
-        let content = match std::fs::File::open(path) {
-            Ok(file) => {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                match file.take(LIMIT as u64).read_to_end(&mut bytes) {
-                    Ok(_) => {
-                        if let Some((size, _)) = stamp.filter(|(size, _)| *size > LIMIT as u64) {
-                            truncated = Some(size);
-                        }
-                        // A cut may fall inside a character: what is before it decides.
-                        let text = match std::str::from_utf8(&bytes) {
-                            Ok(text) => Some(text),
-                            Err(e) if truncated.is_some() && e.error_len().is_none() => {
-                                std::str::from_utf8(&bytes[..e.valid_up_to()]).ok()
-                            }
-                            Err(_) => None,
-                        };
-                        match text.filter(|t| !t.contains('\0')) {
-                            Some(text) => Content::Text(text.to_string()),
-                            None => Content::Binary(bytes),
-                        }
+        let content = match project::content::read_range(path, 0, LIMIT) {
+            Ok(bytes) => {
+                if let Some((size, _)) = stamp.filter(|(size, _)| *size > LIMIT as u64) {
+                    truncated = Some(size);
+                }
+                // A cut may fall inside a character: what is before it decides.
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => Some(text),
+                    Err(e) if truncated.is_some() && e.error_len().is_none() => {
+                        std::str::from_utf8(&bytes[..e.valid_up_to()]).ok()
                     }
-                    Err(e) => Content::Error(e.to_string()),
+                    Err(_) => None,
+                };
+                match text.filter(|t| !t.contains('\0')) {
+                    Some(text) => Content::Text(text.to_string()),
+                    None => Content::Binary(bytes),
                 }
             }
             Err(e) => Content::Error(e.to_string()),

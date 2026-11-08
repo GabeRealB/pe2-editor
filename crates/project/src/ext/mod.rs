@@ -1414,17 +1414,40 @@ impl Extensions {
     pub fn exporters(&self, asset: &index::Asset) -> Vec<Exporter> {
         let lent = self.lend(asset);
         let (plan, _) = self.plan(asset);
-        let outputs = self.outputs_of(asset).into_iter().filter(|o| !o.in_stack);
-        outputs
-            .filter_map(|output| {
+        let all = self.outputs_of(asset);
+        // An output's members: its own family's, else those of what it converts - another conversion (a picture's
+        // looks, through `picture`) or a step of the stack (a bank's slots). A conversion's own members, where it has
+        // none for this node, are none.
+        let members_of = |start: usize| -> Option<Vec<(String, String)>> {
+            let mut at = start;
+            for _ in 0..=all.len() {
+                let output = &all[at];
+                if let Some(own) = output.members.as_ref().map(|members| members(&lent)).filter(|m| !m.is_empty()) {
+                    return Some(own);
+                }
+                if let Some(from) = &output.from {
+                    at = all.iter().position(|o| o.name == *from)?;
+                    continue;
+                }
+                // A step of the stack: the family its output there is (`picture`, of that step), else its op's.
+                let step = output.step?;
+                let family = all.iter().find(|o| o.in_stack && o.step == Some(step) && o.members.is_some());
+                if let Some(members) = family.and_then(|o| o.members.as_ref()) {
+                    return Some(members(&lent));
+                }
+                let op = self.ops.get(&plan.steps.get(step)?.op)?;
+                return Some(op.members.as_ref()?(&lent));
+            }
+            None
+        };
+        (0..all.len())
+            .filter(|at| !all[*at].in_stack)
+            .filter_map(|at| {
+                let output = &all[at];
                 let export = self.ops.get(&output.op)?.provides.as_ref()?.export.clone()?;
-                // Its own family's, else those of the family it takes from (a bank's slots).
-                let members = output.members.as_ref().map(|members| members(&lent)).or_else(|| {
-                    let op = self.ops.get(&plan.steps.get(output.step?)?.op)?;
-                    Some(op.members.as_ref()?(&lent))
-                });
+                let members = members_of(at).unwrap_or_default();
                 let (label, extension) = (export.label, export.extension);
-                Some(Exporter { output: output.name, label, extension, members: members.unwrap_or_default() })
+                Some(Exporter { output: output.name.clone(), label, extension, members })
             })
             .collect()
     }
@@ -1905,11 +1928,7 @@ impl Extensions {
     }
 
     fn recognize_now(&self, file: &index::BundleFile) -> Vec<(usize, Recognized)> {
-        use std::io::Read;
-        let mut head = Vec::new();
-        if let Ok(f) = std::fs::File::open(&file.path) {
-            let _ = f.take(HEAD as u64).read_to_end(&mut head);
-        }
+        let head = crate::content::head(&file.path, HEAD);
         recognize_head(&self.recognizers, &file.name, file.size, &head)
     }
 }
@@ -2257,9 +2276,11 @@ impl pe2_ext::CallHost for StreamHost {
     fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
         match content {
             pe2_ext::Content::Inline(_) => None,
-            pe2_ext::Content::Stored { sha1, .. } => {
-                StreamHost::path_of(self, sha1).ok().map(|p| p.display().to_string())
-            }
+            // A program is given a file: a chunked content assembled for it.
+            pe2_ext::Content::Stored { sha1, .. } => StreamHost::path_of(self, sha1)
+                .ok()
+                .and_then(|p| crate::content::for_program(p).ok())
+                .map(|p| p.display().to_string()),
         }
     }
 
@@ -2272,13 +2293,12 @@ impl pe2_ext::CallHost for StreamHost {
             pe2_ext::Content::Inline(bytes) => Ok(bytes.clone()),
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                std::fs::read(path).with_context(|| path.display().to_string())
+                crate::content::read(path).with_context(|| path.display().to_string())
             }
         }
     }
 
     fn read_range(&self, content: &pe2_ext::Content, offset: u64, len: usize) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
         match content {
             pe2_ext::Content::Inline(bytes) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
@@ -2286,11 +2306,7 @@ impl pe2_ext::CallHost for StreamHost {
             }
             pe2_ext::Content::Stored { sha1, .. } => {
                 let path = self.path_of(sha1)?;
-                let mut file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
-                file.seek(SeekFrom::Start(offset))?;
-                let mut out = Vec::new();
-                file.take(len as u64).read_to_end(&mut out)?;
-                Ok(out)
+                crate::content::read_range(path, offset, len).with_context(|| path.display().to_string())
             }
         }
     }
@@ -2395,7 +2411,12 @@ impl pe2_ext::CallHost for Hosted<'_> {
     fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
         match content {
             pe2_ext::Content::Inline(_) => None,
-            pe2_ext::Content::Stored { sha1, .. } => self.call.content_path(sha1).map(|p| p.display().to_string()),
+            // A program is given a file: a chunked content assembled for it.
+            pe2_ext::Content::Stored { sha1, .. } => self
+                .call
+                .content_path(sha1)
+                .and_then(|p| crate::content::for_program(&p).ok())
+                .map(|p| p.display().to_string()),
         }
     }
 }
@@ -2424,7 +2445,7 @@ impl Source for index::Asset {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let file =
             self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
-        std::fs::read(&file.path).with_context(|| file.path.display().to_string())
+        crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
     fn size(&self, name: &str) -> Option<u64> {
@@ -2432,14 +2453,9 @@ impl Source for index::Asset {
     }
 
     fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
         let file =
             self.files.iter().find(|f| f.name == name).with_context(|| format!("{}: no file {name}", self.path))?;
-        let mut opened = std::fs::File::open(&file.path).with_context(|| file.path.display().to_string())?;
-        opened.seek(SeekFrom::Start(offset))?;
-        let mut out = Vec::with_capacity(len.min(usize::try_from(file.size.saturating_sub(offset)).unwrap_or(len)));
-        opened.take(len as u64).read_to_end(&mut out)?;
-        Ok(out)
+        crate::content::read_range(&file.path, offset, len).with_context(|| file.path.display().to_string())
     }
 }
 

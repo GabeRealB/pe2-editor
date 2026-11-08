@@ -443,10 +443,44 @@ fn operations_ui(
                     path_link(ui, ws, to, nav);
                 });
             }
+            if op.status == OpStatus::Stale {
+                stale_parts_ui(ui, &ws.index.stale_parts(layer, &op.uid), 88.0);
+            }
         }
         if operations.len() > 500 {
             ui.label(RichText::new(format!("… {} more", operations.len() - 500)).color(theme::weak()));
         }
+    });
+}
+
+/// What changed below a stale patching override since it was made: each field it changes, as the layer has it, as it
+/// was made from, and as it is below now; each file it holds or removes. A grid, its columns aligned, indented this far.
+pub fn stale_parts_ui(ui: &mut egui::Ui, parts: &[project::index::StalePart], indent: f32) {
+    if parts.is_empty() {
+        return;
+    }
+    let weak = |text: &str| RichText::new(text).small().color(theme::weak());
+    let value = |v: &Option<String>| RichText::new(v.as_deref().unwrap_or("(absent)")).small().monospace();
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        egui::Grid::new(ui.next_auto_id()).num_columns(4).spacing([12.0, 2.0]).show(ui, |ui| {
+            for heading in ["changed below", "mine", "made from", "below now"] {
+                ui.label(weak(heading));
+            }
+            ui.end_row();
+            for part in parts {
+                let what = match &part.field {
+                    Some(field) if part.file == project::index::NODE_FILE => field.clone(),
+                    Some(field) => format!("{}: {field}", part.file),
+                    None => part.file.clone(),
+                };
+                ui.label(RichText::new(what).small().color(ui.visuals().warn_fg_color));
+                ui.label(value(&part.mine));
+                ui.label(value(&part.was));
+                ui.label(value(&part.now));
+                ui.end_row();
+            }
+        });
     });
 }
 

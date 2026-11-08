@@ -16,25 +16,8 @@ use crate::{Reply, Request};
 /// How long a request waits for the editor's answer: the editor answers between frames.
 const PATIENCE: Duration = Duration::from_secs(20);
 
-#[cfg(unix)]
 fn name(root: &Path) -> std::io::Result<Name<'static>> {
-    use interprocess::local_socket::GenericFilePath;
-    root.join(project::cache::DIR).join(project::cache::SOCKET).to_fs_name::<GenericFilePath>()
-}
-
-#[cfg(windows)]
-fn name(root: &Path) -> std::io::Result<Name<'static>> {
-    use interprocess::local_socket::GenericNamespaced;
-    use sha1::Digest;
-    use std::fmt::Write;
-    // A pipe's name is global: the project's own path, hashed, keeps it to that project.
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let digest = sha1::Sha1::digest(root.to_string_lossy().to_lowercase().as_bytes());
-    let hex = digest.iter().take(8).fold(String::new(), |mut hex, b| {
-        let _ = write!(hex, "{b:02x}");
-        hex
-    });
-    format!("pe2-editor-{hex}").to_ns_name::<GenericNamespaced>()
+    project::host::local_name(root, project::cache::SOCKET, "pe2-editor")
 }
 
 /// Hand a request to the editor serving the project in `root`; none when no editor is.
@@ -43,9 +26,17 @@ pub fn forward(root: &Path, request: &Request) -> Option<Reply> {
     forward_within(root, request, PATIENCE)
 }
 
-/// Hand a request to the editor serving the project in `root`, waiting this long for its answer; none when no editor is.
+/// Hand a request to the editor serving the project in `root`, waiting this long for its answer; none when no editor is,
+/// or the holder declines it (the host answers edits alone).
 #[must_use]
 pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
+    match forward_to_holder(root, request, patience)? {
+        Reply::Declined => None,
+        reply => Some(reply),
+    }
+}
+
+fn forward_to_holder(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
     let stream = Stream::connect(name(root).ok()?).ok()?;
     let line = serde_json::to_string(request).ok()?;
     // Read on a thread of its own, so an editor that does not answer is given up on.
@@ -72,6 +63,8 @@ pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Opt
 pub struct Listener {
     stop: Arc<AtomicBool>,
     root: std::path::PathBuf,
+    /// Told when the accepting thread ends.
+    ended: std::sync::mpsc::Receiver<()>,
 }
 
 impl Listener {
@@ -80,7 +73,10 @@ impl Listener {
     /// # Errors
     /// The socket cannot be made.
     pub fn start(root: &Path, answer: impl Fn(Request) -> Reply + Send + Sync + 'static) -> std::io::Result<Listener> {
-        let listener = ListenerOptions::new().name(name(root)?).try_overwrite(true).create_sync()?;
+        // The name is not removed when this ends: by then it may be a newer holder's, which took it over.
+        let listener =
+            ListenerOptions::new().name(name(root)?).try_overwrite(true).reclaim_name(false).create_sync()?;
+        let (end, ended) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let answer = Arc::new(answer);
         let stopped = stop.clone();
@@ -93,18 +89,23 @@ impl Listener {
                 let answer = answer.clone();
                 std::thread::spawn(move || serve(stream, &*answer));
             }
+            drop(listener);
+            let _ = end.send(());
         });
-        Ok(Listener { stop, root: root.to_path_buf() })
+        Ok(Listener { stop, root: root.to_path_buf(), ended })
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake the accepting thread, which then ends and lets go of the name.
+        // Wake the accepting thread, which then ends.
         if let Ok(name) = name(&self.root) {
             let _ = Stream::connect(name);
         }
+        // Gone once it has stopped answering, for whoever holds the project next to answer - unless the name was taken
+        // over meanwhile, and the wake reached the newer listener: then it is left, no longer reached.
+        let _ = self.ended.recv_timeout(Duration::from_secs(1));
     }
 }
 

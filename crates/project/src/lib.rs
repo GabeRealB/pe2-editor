@@ -4,6 +4,8 @@
 pub mod build;
 pub mod cache;
 pub mod changeset;
+pub mod chunks;
+pub mod content;
 pub mod discs;
 pub mod edit;
 pub mod events;
@@ -11,9 +13,12 @@ pub mod ext;
 pub mod extract;
 pub mod graph;
 pub mod history;
+pub mod host;
 pub mod imports;
 pub mod index;
 pub mod lock;
+pub mod merge;
+pub mod pack;
 pub mod plan;
 pub mod profile;
 pub mod schedule;
@@ -110,6 +115,9 @@ struct LayerFile {
     kind: Option<String>,
     /// The layer whose nodes a generated layer gives their files.
     fills: Option<String>,
+    /// How its content is stored: `text`, its files as files (by default), or `packed`, one listing of them with their
+    /// chunks in the store (`pack`) - a generated layer's, for now.
+    storage: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,14 +133,91 @@ struct MountFile {
 }
 
 /// `project.local.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
-/// "<path>"`), and the links it wants to what builds deploy (`[build.links]`). It is kept out of the project's history
-/// and of version control.
+/// "<path>"`), the links it wants to what builds deploy (`[build.links]`), and how it serves the project as a
+/// filesystem (`[filesystem] serve = "fuse" | "webdav" | "none"`, `address` for WebDAV). It is kept out of the
+/// project's history and of version control.
 #[derive(Default, Deserialize)]
 struct LocalFile {
     #[serde(default)]
     mounts: BTreeMap<String, String>,
     #[serde(default)]
     build: BuildFile,
+    #[serde(default)]
+    filesystem: FilesystemFile,
+}
+
+/// `[filesystem]` of `project.local.toml`: how this machine serves the project's merged layers as a filesystem while
+/// it is open - in the editor, or with `pe2-cli project serve`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesystemFile {
+    serve: Option<String>,
+    address: Option<String>,
+    keep: Option<bool>,
+}
+
+/// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
+pub const SERVED: &str = "assets";
+/// Where what that folder held that was not the project's is set aside before it is served (`vfs::strays`), a folder a
+/// time: the only copy of it, so not in the cache.
+pub const SET_ASIDE: &str = "assets.set-aside";
+
+/// The address WebDAV serves a project at where `project.local.toml` names none.
+pub const WEBDAV_ADDRESS: &str = "127.0.0.1:4918";
+const WEBDAV_PORT: u16 = 4918;
+
+/// How a project is served as a filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Serving {
+    /// Mounted at its folder (`SERVED`), on Linux and macOS.
+    Fuse,
+    /// Over WebDAV at an address, which the system's own client mounts (Windows, Finder, davfs2).
+    WebDav(std::net::SocketAddr),
+    /// Placeholders Windows fills as they are read, at its folder (the Cloud Files API, `vfs::cloud`): on Windows,
+    /// with nothing to install.
+    Cloud,
+    /// Not served.
+    None,
+}
+
+impl Serving {
+    /// What serves where nothing says: FUSE where it is, the Cloud Files API on Windows, WebDAV elsewhere.
+    #[must_use]
+    pub fn default_here() -> Serving {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            Serving::Fuse
+        } else if cfg!(windows) {
+            Serving::Cloud
+        } else {
+            Serving::WebDav(std::net::SocketAddr::from(([127, 0, 0, 1], WEBDAV_PORT)))
+        }
+    }
+
+    /// A backend by name (`fuse`, `webdav`, `none`), WebDAV's at an address.
+    ///
+    /// # Errors
+    /// The name is none of those, or the address is no address.
+    pub fn named(name: &str, address: Option<&str>) -> Result<Serving> {
+        Ok(match name {
+            "fuse" => Serving::Fuse,
+            "cloud" => Serving::Cloud,
+            "webdav" => Serving::WebDav(
+                address.unwrap_or(WEBDAV_ADDRESS).parse().with_context(|| format!("{address:?}: no address"))?,
+            ),
+            "none" => Serving::None,
+            other => bail!("`serve = \"{other}\"`: a filesystem is served by fuse, cloud, webdav or none"),
+        })
+    }
+}
+
+/// How this machine serves a project as a filesystem, and the folder it is at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filesystem {
+    pub at: PathBuf,
+    pub serving: Serving,
+    /// Whether its host serves on with nobody keeping it, until stopped (`[filesystem] keep`): for a folder that is
+    /// always there, while the machine runs, once anything has started serving it.
+    pub keep: bool,
 }
 
 fn read_local(root: &Path) -> Result<LocalFile> {
@@ -178,6 +263,8 @@ pub struct Layer {
     pub mounted: bool,
     /// The layer a generated layer gives its nodes' files.
     pub fills: Option<String>,
+    /// How its content is stored.
+    pub storage: Storage,
 }
 
 #[derive(Clone)]
@@ -229,11 +316,31 @@ pub struct Project {
     /// Links this machine wants to what is deployed (`project.local.toml`): where each goes, relative to the project,
     /// by the deployed file it stands for.
     pub links: build::Links,
+    /// How this machine serves the project as a filesystem while it is open, at its `assets` folder
+    /// (`project.local.toml`).
+    pub filesystem: Filesystem,
 }
 
 fn resolve_path(directory: &Path, value: &str) -> PathBuf {
     let p = Path::new(value);
     if p.is_absolute() { p.to_path_buf() } else { directory.join(p) }
+}
+
+/// That each generated layer fills an asset layer of the project.
+fn check_fills(root: &Path, layers: &[Layer]) -> Result<()> {
+    for layer in layers {
+        if let Some(filled) = &layer.fills {
+            let found = layers.iter().find(|l| l.name == *filled);
+            if !found.is_some_and(|l| l.kind == LayerKind::Assets) {
+                bail!(
+                    "{}: the layer {} fills {filled}, no asset layer of the project",
+                    root.join(FILE).display(),
+                    layer.name
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a new project is: a layer of its own, and nothing else.
@@ -248,7 +355,42 @@ pub fn create(directory: &Path) -> Result<()> {
     let file = directory.join(FILE);
     anyhow::ensure!(!file.exists(), "{} holds a project already", directory.display());
     std::fs::create_dir_all(directory.join(".layers/project")).with_context(|| directory.display().to_string())?;
-    std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())
+    std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())?;
+    // Where it is served is no part of it, nor what was set aside from there.
+    let ignore = directory.join(".gitignore");
+    let mut text = std::fs::read_to_string(&ignore).unwrap_or_default();
+    for folder in [SERVED, SET_ASIDE] {
+        if !text.lines().any(|l| l.trim() == format!("/{folder}/")) {
+            let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+            text = format!("{text}{separator}/{folder}/\n");
+        }
+    }
+    std::fs::write(&ignore, text).with_context(|| ignore.display().to_string())
+}
+
+/// How a layer's content is stored (`storage` in `project.toml`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Storage {
+    /// Its files as files: what a person and version control read.
+    #[default]
+    Text,
+    /// One listing of its files, their chunks in the store (`pack`).
+    Packed,
+}
+
+/// How a layer says it is stored, its pack opened where it is packed.
+fn storage_of(root: &Path, layer: &str, said: Option<&str>, generated: bool, path: &Path) -> Result<Storage> {
+    let file = root.join(FILE);
+    let storage = match said {
+        None | Some("text") => Storage::Text,
+        Some("packed") if generated => Storage::Packed,
+        Some("packed") => bail!("{}: the layer {layer}: only a generated layer is packed, so far", file.display()),
+        Some(other) => bail!("{}: the layer {layer}: no storage {other} (text, packed)", file.display()),
+    };
+    if storage == Storage::Packed {
+        pack::Pack::open(path).with_context(|| format!("{}: its pack", path.display()))?;
+    }
+    Ok(storage)
 }
 
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`project.local.toml`).
@@ -293,6 +435,7 @@ impl Project {
                 changeset_writable: true,
                 mounted: true,
                 fills: None,
+                storage: Storage::Text,
             })
             .collect();
         for l in file.layer {
@@ -323,6 +466,7 @@ impl Project {
                 );
             }
             let read_only = l.read_only || generated;
+            let storage = storage_of(&root, &l.name, l.storage.as_deref(), generated, &path)?;
             layers.push(Layer {
                 name: l.name,
                 kind,
@@ -333,20 +477,10 @@ impl Project {
                 changeset_writable: !read_only,
                 mounted: false,
                 fills: l.fills,
+                storage,
             });
         }
-        for layer in &layers {
-            if let Some(filled) = &layer.fills {
-                let found = layers.iter().find(|l| l.name == *filled);
-                if !found.is_some_and(|l| l.kind == LayerKind::Assets) {
-                    bail!(
-                        "{}: the layer {} fills {filled}, no asset layer of the project",
-                        root.join(FILE).display(),
-                        layer.name
-                    );
-                }
-            }
-        }
+        check_fills(&root, &layers)?;
         let disabled_extensions = file.extensions.disabled;
         let requires = file.extension;
         let extension_settings = file
@@ -359,6 +493,12 @@ impl Project {
             })
             .collect();
         let links = local.build.links;
+        let serving = match &local.filesystem.serve {
+            Some(name) => Serving::named(name, local.filesystem.address.as_deref())
+                .with_context(|| root.join(LOCAL).display().to_string())?,
+            None => Serving::default_here(),
+        };
+        let filesystem = Filesystem { at: root.join(SERVED), serving, keep: local.filesystem.keep.unwrap_or(false) };
         let configs = file
             .config
             .into_iter()
@@ -374,6 +514,7 @@ impl Project {
             extension_settings,
             configs,
             links,
+            filesystem,
         })
     }
 

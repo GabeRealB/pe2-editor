@@ -7,6 +7,9 @@
 //! process finding its project named there works under its parent's lock instead of waiting for it
 //! (`tools/project_lock.py` takes the same lock for the Python tools).
 //!
+//! A project the host serving it holds (`host.rs`) is borrowed from it: the host lets go of the lock when asked, and
+//! takes it back when the borrower lets go - the lease is held with the lock, and ends after it.
+//!
 //! Some file systems cannot lock a file at all - a WSL folder opened from Windows (`\\wsl.localhost\...`, whose 9P
 //! share has no byte-range locks). There the project opens unprotected rather than not at all: the lock says why
 //! (`unprotected`), for the editor and the tools to warn that nothing keeps a second process out. A Windows process
@@ -26,8 +29,10 @@ const HELD: &str = "PE2_PROJECT_LOCKED";
 /// A project held: the lock lasts until this is dropped. None when a parent process holds it for this one.
 #[derive(Debug)]
 pub struct Lock {
-    _file: Option<File>,
+    file: Option<File>,
     unprotected: Option<String>,
+    /// The project borrowed from its host: let go of after the lock, for the host to take it back.
+    _borrowed: Option<crate::host::Lease>,
 }
 
 /// Whether a parent process holds the project in `root` for this one.
@@ -80,7 +85,7 @@ fn owner(root: &Path) -> String {
 fn claim(root: &Path, file: File, who: &str) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {})", std::process::id());
     std::fs::write(paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
-    Ok(Lock { _file: Some(file), unprotected: None })
+    Ok(Lock { file: Some(file), unprotected: None, _borrowed: None })
 }
 
 /// Whether a lock failed because the file system cannot lock files: `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`
@@ -106,7 +111,7 @@ fn unprotected(root: &Path, lock: &Path, who: &str, e: &std::io::Error) -> Resul
          project at the same time",
         lock.display()
     );
-    Ok(Lock { _file: None, unprotected: Some(why) })
+    Ok(Lock { file: None, unprotected: Some(why), _borrowed: None })
 }
 
 /// Who holds the project in `root` now, as its owner file says; none where nobody does. Asked by a shared lock tried and
@@ -121,23 +126,51 @@ pub fn holder(root: &Path) -> Option<String> {
 }
 
 impl Lock {
+    /// Whether a parent process holds the project for this one: held only while that one works on it.
+    #[must_use]
+    pub fn inherited(&self) -> bool {
+        self.file.is_none() && self.unprotected.is_none()
+    }
+
     /// Why the project is held without a lock, where its file system cannot lock files.
     #[must_use]
     pub fn unprotected(&self) -> Option<&str> {
         self.unprotected.as_deref()
     }
 
-    /// Lock the project in `root` for `who`, or say who holds it.
+    /// Lock the project in `root` for `who` - borrowed from the host serving it, where it holds it - or say who holds
+    /// it.
     ///
     /// # Errors
     /// Another process holds the project, or the lock file cannot be made.
     pub fn try_acquire(root: &Path, who: &str) -> Result<Lock, LockError> {
+        Lock::try_lock(root, who, true)
+    }
+
+    /// Lock the project in `root` for `who`, borrowing it from nobody: the host's own taking.
+    ///
+    /// # Errors
+    /// As `try_acquire`.
+    pub fn try_take(root: &Path, who: &str) -> Result<Lock, LockError> {
+        Lock::try_lock(root, who, false)
+    }
+
+    fn try_lock(root: &Path, who: &str, borrowing: bool) -> Result<Lock, LockError> {
         if inherited(root) {
-            return Ok(Lock { _file: None, unprotected: None });
+            return Ok(Lock { file: None, unprotected: None, _borrowed: None });
         }
         let file = open(root).map_err(LockError::Io)?;
         match file.try_lock() {
             Ok(()) => claim(root, file, who),
+            // Held by the host: lent, it is taken at once - or by whoever was quicker.
+            Err(TryLockError::WouldBlock)
+                if let Some(lease) = borrowing.then(|| crate::host::borrow(root, who)).flatten() =>
+            {
+                match file.try_lock() {
+                    Ok(()) => claim(root, file, who).map(|lock| Lock { _borrowed: Some(lease), ..lock }),
+                    Err(_) => Err(LockError::Held(owner(root))),
+                }
+            }
             Err(TryLockError::WouldBlock) => Err(LockError::Held(owner(root))),
             Err(TryLockError::Error(e)) if unsupported(&e) => unprotected(root, &paths(root).0, who, &e),
             Err(TryLockError::Error(e)) => {
@@ -161,20 +194,23 @@ impl Lock {
         }
     }
 
-    /// Lock the project in `root` for `who`, waiting while another process holds it; `waiting` is told who, once.
+    /// Lock the project in `root` for `who`, waiting while another process holds it; `waiting` is told who, once. It
+    /// asks again and again rather than waiting on the lock, so a holder that lends it - the host - lends it here too.
     ///
     /// # Errors
     /// The lock file cannot be made or locked.
     pub fn acquire(root: &Path, who: &str, waiting: impl FnOnce(&str)) -> Result<Lock, LockError> {
-        match Lock::try_acquire(root, who) {
-            Err(LockError::Held(owner)) => {
-                waiting(&owner);
-                let file = open(root).map_err(LockError::Io)?;
-                file.lock()
-                    .map_err(|e| LockError::Io(anyhow::Error::new(e).context(paths(root).0.display().to_string())))?;
-                claim(root, file, who)
+        let mut waiting = Some(waiting);
+        loop {
+            match Lock::try_acquire(root, who) {
+                Err(LockError::Held(owner)) => {
+                    if let Some(waiting) = waiting.take() {
+                        waiting(&owner);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                other => return other,
             }
-            other => other,
         }
     }
 }

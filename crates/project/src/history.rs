@@ -328,6 +328,15 @@ impl History {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 
+    /// Let go of the log where it was opened for a moment's work (a host, a command's edit), not taken up: closed, unless
+    /// it found a session another left - an editor's, crashed or closed with documents unsaved - which stays, for the
+    /// editor to offer back.
+    pub fn let_go(self) {
+        if self.left.is_none() {
+            self.close();
+        }
+    }
+
     /// Who makes the steps begun from now on (`user`, `agent`).
     pub fn set_author(&mut self, author: &str) {
         if self.author != author {
@@ -349,7 +358,13 @@ impl History {
         self.journal();
     }
 
-    /// The paths its steps wrote since this was last asked, made, undone or redone.
+    /// The paths its steps wrote since they were last taken, made, undone or redone.
+    #[must_use]
+    pub fn written(&self) -> &[PathBuf] {
+        &self.written
+    }
+
+    /// The files steps wrote since this was last asked, for the index to take in.
     pub fn take_written(&mut self) -> Vec<PathBuf> {
         std::mem::take(&mut self.written)
     }
@@ -467,7 +482,7 @@ impl History {
             document.base.insert(edit.file.clone(), on_disk(index, &edit.uid, &edit.file));
             // What it was on disk is kept: undone back to it, it is shown though the disk has changed since.
             if let Some(file) = disk_file(index, &edit.uid, &edit.file)
-                && let Ok(bytes) = std::fs::read(&file.path)
+                && let Ok(bytes) = crate::content::read(&file.path)
             {
                 let _ = keep_in(&self.dir, &bytes);
             }
@@ -551,7 +566,7 @@ impl History {
             if stale.is_some() && stale != document.stale {
                 for file in now.keys() {
                     if let Some(file) = disk_file(index, uid, file)
-                        && let Ok(bytes) = std::fs::read(&file.path)
+                        && let Ok(bytes) = crate::content::read(&file.path)
                     {
                         let _ = keep_in(&self.dir, &bytes);
                     }
@@ -1052,6 +1067,22 @@ impl Transaction<'_> {
     /// # Errors
     /// It cannot be written, or the history cannot keep what it was.
     pub fn write(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+        // A large content in a layer is stored as chunks: what the step keeps is its manifest, the other form gone.
+        let manifest = crate::chunks::manifest_path(path);
+        if let Some(text) = crate::content::chunked(path, bytes)? {
+            self.write_stored(&manifest, text.as_bytes())?;
+            self.drop_stored(path)
+        } else {
+            self.write_stored(path, bytes)?;
+            self.drop_stored(&manifest)
+        }
+    }
+
+    /// Write a file as it is to be stored - a manifest as a manifest - not as the content it may stand for.
+    ///
+    /// # Errors
+    /// Its folder cannot be made, or it cannot be written.
+    pub fn write_stored(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
         self.make_parents(path)?;
         let before = self.history.keep_current(path)?;
         let after = Some(self.history.keep(bytes)?);
@@ -1059,6 +1090,15 @@ impl Transaction<'_> {
             return Ok(());
         }
         self.change(Change::Write { path: path.to_path_buf(), before, after })
+    }
+
+    /// Remove a stored file where there is one.
+    fn drop_stored(&mut self, path: &Path) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let before = self.history.keep_current(path)?;
+        self.change(Change::Write { path: path.to_path_buf(), before, after: None })
     }
 
     /// Make a folder (and those it needs).
@@ -1085,11 +1125,13 @@ impl Transaction<'_> {
             let to = trash.join(self.history.trashed.to_string());
             return self.change(Change::Rename { from: path.to_path_buf(), to });
         }
-        let before = self.history.keep_current(path)?;
-        if before.is_none() {
+        // A file, in whichever form it is stored.
+        let manifest = crate::chunks::manifest_path(path);
+        if !path.is_file() && !manifest.is_file() {
             bail!("{}: nothing to remove", path.display());
         }
-        self.change(Change::Write { path: path.to_path_buf(), before, after: None })
+        self.drop_stored(path)?;
+        self.drop_stored(&manifest)
     }
 
     /// Put a copy of a file or a folder at `to`, where there is nothing: copied whole into the history's trash, each
@@ -1115,6 +1157,12 @@ impl Transaction<'_> {
     /// # Errors
     /// The source does not exist, the target does, or the move fails.
     pub fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+        // A file held as its manifest moves as it.
+        let (manifest, to_manifest) = (crate::chunks::manifest_path(from), crate::chunks::manifest_path(to));
+        if !from.exists() && manifest.is_file() && !to.exists() && !to_manifest.exists() {
+            self.make_parents(&to_manifest)?;
+            return self.change(Change::Rename { from: manifest, to: to_manifest });
+        }
         if !from.exists() || to.exists() {
             bail!("{} cannot move to {}", from.display(), to.display());
         }
@@ -1242,6 +1290,35 @@ mod tests {
         history.redo(&index, None, false).unwrap();
         assert!(!one.exists() && root.join("layer/d/c/two").exists());
         assert!(history.redo(&index, None, false).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_large_write_is_kept_as_its_manifest_and_undone_by_it() {
+        let root = project("chunked");
+        let (mut history, _) = history(&root);
+        let index = index(&root);
+        let file = root.join(".layers/top/a.node/native.bin");
+        let manifest = crate::chunks::manifest_path(&file);
+        let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let mut tx = history.begin("write");
+        tx.write(&file, b"small first").unwrap();
+        tx.commit().unwrap();
+        let mut tx = history.begin("write big");
+        tx.write(&file, &big).unwrap();
+        tx.commit().unwrap();
+        assert!(!file.exists() && manifest.is_file(), "a large content is stored as its manifest");
+        assert_eq!(crate::content::read(&file).unwrap(), big);
+        history.undo(&index, None, false).unwrap();
+        assert!(!manifest.exists() && read(&file).as_deref() == Some("small first"));
+        history.redo(&index, None, false).unwrap();
+        assert_eq!(crate::content::read(&file).unwrap(), big);
+        let mut tx = history.begin("remove");
+        tx.remove(&file).unwrap();
+        tx.commit().unwrap();
+        assert!(!crate::content::exists(&file));
+        history.undo(&index, None, false).unwrap();
+        assert_eq!(crate::content::read(&file).unwrap(), big);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1438,7 +1515,10 @@ mod tests {
             // A crash: never closed.
             drop(history);
         }
-        let (history, _) = history(&root);
+        // Opened for a moment's work by another process - the host, a command's edit - and let go: it stays.
+        let (history, _) = self::history(&root);
+        history.let_go();
+        let (history, _) = self::history(&root);
         let mut history = history.journaled();
         let left = history.left().unwrap();
         assert_eq!((left.done.len(), left.documents.len()), (1, 1));

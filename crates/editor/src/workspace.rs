@@ -32,6 +32,13 @@ pub struct Node {
     pub file: bool,
 }
 
+/// How the asset browser shows the project.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Browsing {
+    /// Each node's files inside it, beside what is inside it, as the project's filesystem shows them.
+    pub show_files: bool,
+}
+
 /// A virtual entry: an image and one of its variants.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -205,6 +212,8 @@ pub struct Workspace {
     watch: Option<Watch>,
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
+    /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
+    pub files: Option<crate::files::Files>,
     /// The watcher being started, off the window's thread.
     watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
     /// The generated layers as their plans say they are.
@@ -268,6 +277,8 @@ pub struct Workspace {
     /// address every pane showing the asset shares.
     pub inner: Option<(String, String)>,
     pub filter: String,
+    /// How the asset browser shows the project.
+    pub browsing: Browsing,
     /// An asset just navigated to: the tree opens its ancestors and scrolls to it once.
     pub reveal: Option<String>,
     /// Decoded pictures by (image, variant, upscaling).
@@ -307,6 +318,10 @@ pub enum EditRequest {
     /// Take an entry gone from this layer out of its list: the layer and the uid. Any layer whose list can be written,
     /// its content read-only or not.
     Forget(String, String),
+    /// List what a layer holds unlisted at a path, and under it: the layer and the path.
+    Adopt(String, String),
+    /// Remove what a layer holds unlisted at a path from its folder: the layer and the path.
+    RemoveUnlisted(String, String),
     Resolve(String, project::edit::Resolution),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
@@ -477,6 +492,8 @@ pub struct Opened {
     tree: Arc<Node>,
     /// Agents' link to it, listening since its lock was taken; or why agents cannot reach it.
     link: std::result::Result<mcp::link::Listener, String>,
+    /// The host serving its files, kept from before its lock was taken.
+    files: Option<crate::files::Files>,
 }
 
 /// What agents ask of the editor's own state, answered while the imports attach as the user has it then: what it shows,
@@ -539,6 +556,8 @@ pub struct Leaving {
     _runner: crate::runner::Runner,
     _index: Arc<Index>,
     _lock: Lock,
+    /// The host kept: let go of once the project is, for it to take the project back.
+    _files: Option<crate::files::Files>,
 }
 
 /// An event asked for: the events, the config, and who waits for what became of it.
@@ -591,6 +610,11 @@ impl Workspace {
     ) -> Result<Opened> {
         report("Reading project.toml", 0, 0);
         let project = Project::load(dir)?;
+        // The host serving its files, started where none runs: it takes the project, and lends it at once.
+        if project.filesystem.serving != project::Serving::None {
+            report("Serving its files", 0, 0);
+        }
+        let files = crate::files::Files::keep(&project);
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
         let lock = match Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2)) {
             // An agent's server answering a request of its own: brief, if longer than that - it lets go.
@@ -636,6 +660,7 @@ impl Workspace {
             layer_view,
             tree,
             link,
+            files,
         })
     }
 
@@ -655,6 +680,7 @@ impl Workspace {
             layer_view,
             tree,
             link,
+            files,
             ..
         } = opened;
         let (link, link_error) = match link {
@@ -724,6 +750,7 @@ impl Workspace {
             lock,
             cache_dir,
             watch: None,
+            files,
             watch_starting: None,
             plans: crate::plans::Plans::default(),
             fill: crate::fill::Fill::default(),
@@ -750,6 +777,7 @@ impl Workspace {
             viewing: None,
             inner: None,
             filter: String::new(),
+            browsing: Browsing::default(),
             reveal: None,
             pictures: HashMap::new(),
             parts: Parts::default(),
@@ -906,7 +934,7 @@ impl Workspace {
         if self.history.documents().is_empty() {
             self.history.close();
         }
-        Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock }
+        Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock, _files: self.files }
     }
 
     /// Have the worker read until what is returned goes.
@@ -1132,6 +1160,14 @@ impl Workspace {
     }
 
     fn answer_agent(&mut self, request: &mcp::Request, reply: &mpsc::Sender<mcp::Reply>) {
+        if let mcp::Request::Edit { op, layer } = request {
+            let answer = match self.apply_edit(op, layer.as_deref()) {
+                Ok((label, touched)) => mcp::Reply::Edited { label, touched },
+                Err(why) => mcp::Reply::failed(why),
+            };
+            let _ = reply.send(answer);
+            return;
+        }
         let selection = self.selected.clone();
         let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
         let editor = mcp::EditorState { selection, variant, show: None, performance: crate::perf::read() };
@@ -1692,11 +1728,50 @@ impl Workspace {
         self.history.checkpoint(name);
     }
 
-    /// Save a document: its working copy written into the active layer (overriding it there first where it comes
-    /// from below), a step undo passes over. Returns what was done.
+    /// Make an edit asked from outside the window - the command line's, a program's through the served folder - in a
+    /// layer, by default the active one, as a step of the session's log: its label, and the paths it touched. Undo and
+    /// redo are the project's, as the History pane's.
     ///
     /// # Errors
-    /// The active layer cannot take it, or its files cannot be written.
+    /// The layer cannot be edited, or the edit cannot be made.
+    pub fn apply_edit(
+        &mut self,
+        op: &vfs::ops::Op,
+        layer: Option<&str>,
+    ) -> Result<(String, Vec<std::path::PathBuf>), String> {
+        if let vfs::ops::Op::Undo | vfs::ops::Op::Redo = op {
+            let redo = matches!(op, vfs::ops::Op::Redo);
+            let touched = {
+                let steps = if redo { self.history.undone() } else { self.history.done() };
+                steps.iter().rev().find(|s| s.undoable() || redo).map_or_else(Vec::new, project::history::Step::paths)
+            };
+            let verb = if redo { "Redid" } else { "Undid" };
+            return self
+                .step(redo, false, None)
+                .map(|label| (format!("{verb} {label}"), touched))
+                .map_err(|e| e.to_string());
+        }
+        let layer = match layer {
+            Some(name) => {
+                let info = self.layers.iter().find(|l| l.name == name).ok_or(format!("no layer {name}"))?;
+                if let Some(why) = self.read_only() {
+                    return Err(why.to_string());
+                }
+                if self.is_locked(info) {
+                    return Err(format!("{name} cannot be edited: it is locked"));
+                }
+                name.to_string()
+            }
+            None => self.editable_layer()?.name.clone(),
+        };
+        self.settle();
+        let (label, mut touched) =
+            vfs::ops::apply(op, &self.project, &self.index, &layer, &mut self.history).map_err(|e| format!("{e:#}"))?;
+        touched.extend(self.history.written().iter().cloned());
+        self.take_written();
+        Ok((label, touched))
+    }
+
     pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
@@ -1796,6 +1871,25 @@ impl Workspace {
                 }
                 layer.clone()
             }
+            // What a layer holds unlisted: the list written, or its folder; that layer's, whichever is active.
+            EditRequest::Adopt(layer, path) | EditRequest::RemoveUnlisted(layer, path) => {
+                let chosen = self.layers.iter().find(|l| l.name == *layer);
+                let chosen = chosen.with_context(|| format!("the project has no layer {layer}"))?;
+                let removing = matches!(request, EditRequest::RemoveUnlisted(..));
+                if !chosen.writable || (removing && chosen.read_only) {
+                    anyhow::bail!("{layer} cannot be written");
+                }
+                let (project, index, history) = (&self.project, &self.index, &mut self.history);
+                if removing {
+                    edit::remove_unlisted(project, index, layer, path, history)?;
+                } else {
+                    edit::adopt(project, index, layer, path, history)?;
+                }
+                let label = self.history.done().last().map_or_default(|s| s.label.clone());
+                // What it wrote, taken in ahead of what other programs changed.
+                self.take_written();
+                return Ok(label);
+            }
             _ => self.editable_layer().map_err(anyhow::Error::msg)?.name.clone(),
         };
         let uid = match request {
@@ -1807,7 +1901,9 @@ impl Workspace {
             | EditRequest::Forget(_, uid)
             | EditRequest::Resolve(uid, _)
             | EditRequest::Write { uid, .. } => uid.clone(),
-            EditRequest::ShowGraph => return Ok(String::new()),
+            EditRequest::ShowGraph | EditRequest::Adopt(..) | EditRequest::RemoveUnlisted(..) => {
+                return Ok(String::new());
+            }
         };
         // Code goes to a files layer: an override of it in an asset layer is asked of the user first
         // (`override_choice`), and a write into it is made there.
@@ -1838,7 +1934,10 @@ impl Workspace {
                 self.send_working();
                 return Ok(label.clone());
             }
-            EditRequest::Rename(..) | EditRequest::ShowGraph => return Ok(String::new()),
+            EditRequest::Rename(..)
+            | EditRequest::ShowGraph
+            | EditRequest::Adopt(..)
+            | EditRequest::RemoveUnlisted(..) => return Ok(String::new()),
         };
         self.history.note_selection(self.selected.clone());
         let label = self.history.done().last().map_or_default(|s| s.label.clone());

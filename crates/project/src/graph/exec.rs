@@ -63,7 +63,7 @@ pub trait Node: Sync {
     /// It has no such content, or it cannot be read.
     fn read_content(&self, sha1: &str) -> Result<Vec<u8>> {
         let path = self.content_path(sha1).with_context(|| format!("{}: no content {sha1}", self.path()))?;
-        std::fs::read(&path).with_context(|| path.display().to_string())
+        crate::content::read(&path).with_context(|| path.display().to_string())
     }
 }
 
@@ -97,7 +97,7 @@ impl Node for crate::index::Asset {
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let file = self.files.iter().find(|f| f.name == name && f.made_by.is_none());
         let file = file.with_context(|| format!("{}: no file {name}", self.path))?;
-        std::fs::read(&file.path).with_context(|| file.path.display().to_string())
+        crate::content::read(&file.path).with_context(|| file.path.display().to_string())
     }
 
     fn file_size(&self, name: &str) -> Option<u64> {
@@ -109,13 +109,8 @@ impl Node for crate::index::Asset {
     }
 
     fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
-        use std::io::Read;
         let Some(file) = self.files.iter().find(|f| f.name == name && f.made_by.is_none()) else { return Vec::new() };
-        let mut head = Vec::new();
-        if let Ok(f) = std::fs::File::open(&file.path) {
-            let _ = f.take(len as u64).read_to_end(&mut head);
-        }
-        head
+        crate::content::head(&file.path, len)
     }
 }
 
@@ -264,7 +259,7 @@ impl<'a> Reach<'a> {
         }
         match read.strip_suffix('/') {
             Some(folder) => Some(list_hash(&self.world.entries(folder))),
-            None => std::fs::read(self.world.entry(read)?).ok().map(|bytes| crate::extract::sha1_hex(&bytes)),
+            None => crate::content::sha1(&self.world.entry(read)?).ok(),
         }
     }
 
@@ -568,7 +563,7 @@ impl<'a> Call<'a> {
             .world
             .entry(path)
             .with_context(|| format!("{path}: no such file"))?;
-        let bytes = std::fs::read(&disk).with_context(|| disk.display().to_string())?;
+        let bytes = crate::content::read(&disk).with_context(|| disk.display().to_string())?;
         let hash = crate::extract::sha1_hex(&bytes);
         self.recorder
             .reads
@@ -699,7 +694,7 @@ impl<'a> Call<'a> {
         match content {
             Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => match self.content_path(sha1) {
-                Some(path) => std::fs::read(&path).with_context(|| path.display().to_string()),
+                Some(path) => crate::content::read(&path).with_context(|| path.display().to_string()),
                 None => self.recorder.node.read_content(sha1),
             },
         }
@@ -710,7 +705,6 @@ impl<'a> Call<'a> {
     /// # Errors
     /// As `read`.
     pub fn read_range(&self, content: &Content, offset: u64, len: usize) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
         match content {
             Content::Inline(bytes) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
@@ -722,11 +716,7 @@ impl<'a> Call<'a> {
                     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
                     return Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec());
                 };
-                let mut file = std::fs::File::open(&path).with_context(|| path.display().to_string())?;
-                file.seek(SeekFrom::Start(offset))?;
-                let mut out = Vec::new();
-                file.take(len as u64).read_to_end(&mut out)?;
-                Ok(out)
+                crate::content::read_range(&path, offset, len).with_context(|| path.display().to_string())
             }
         }
     }

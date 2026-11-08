@@ -1,6 +1,7 @@
 //! `pe2-cli mcp`: the protocol over stdio. Each request goes to the editor when one serves the project, and is
 //! otherwise answered here under the project lock, taken for that request alone.
 
+use anyhow::Context as _;
 use project::Project;
 use project::cache::Cache;
 use project::index::Index;
@@ -74,6 +75,9 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
         }
         Err(e) => return Reply::Error(e.to_string()),
     };
+    if let Request::Edit { op, layer } = request {
+        return edit_here(root, &lock, op, layer.as_deref());
+    }
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
         let mut index = Index::open(&project, &cache)?;
@@ -95,6 +99,32 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
             reply
         }
         Err(e) => Reply::Error(format!("the project cannot be opened: {e:#}")),
+    }
+}
+
+/// Make an edit while holding the project for it alone: a step of a history of its own, which ends with it.
+fn edit_here(root: &Path, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -> Reply {
+    if matches!(op, vfs::ops::Op::Undo | vfs::ops::Op::Redo) {
+        return Reply::failed(
+            "nothing holds the project: what is taken back is an editor's or a host's history".into(),
+        );
+    }
+    let done = (|| {
+        let project = Project::load(root)?;
+        let cache = Cache::open(&project, lock)?;
+        let index = Index::open(&project, &cache)?;
+        let layer = match layer {
+            Some(layer) => layer.to_string(),
+            None => vfs::write::writable_layer(&index).context("no layer of the project can be written")?,
+        };
+        let (mut history, _) = project::history::History::open(&cache)?;
+        let done = vfs::ops::apply(op, &project, &index, &layer, &mut history);
+        history.let_go();
+        done
+    })();
+    match done {
+        Ok((label, touched)) => Reply::Edited { label, touched },
+        Err(e) => Reply::failed(format!("{e:#}")),
     }
 }
 
@@ -146,7 +176,9 @@ impl ServerHandler for Server {
         let call = Request::Call { name: request.name.to_string(), arguments: request.arguments.unwrap_or_default() };
         match self.execute(call).await? {
             Reply::Call(result) => Ok(result.into()),
-            Reply::Read(_) => Err(ErrorData::internal_error("a read answered a call", None)),
+            Reply::Read(_) | Reply::Edited { .. } | Reply::Declined => {
+                Err(ErrorData::internal_error("something else answered a call", None))
+            }
             Reply::Error(e) => Err(ErrorData::internal_error(e, None)),
         }
     }
@@ -169,7 +201,9 @@ impl ServerHandler for Server {
     ) -> Result<ReadResourceResponse, ErrorData> {
         match self.execute(Request::Read { uri: request.uri }).await? {
             Reply::Read(result) => Ok(result.into()),
-            Reply::Call(_) => Err(ErrorData::internal_error("a call answered a read", None)),
+            Reply::Call(_) | Reply::Edited { .. } | Reply::Declined => {
+                Err(ErrorData::internal_error("something else answered a read", None))
+            }
             Reply::Error(e) => Err(ErrorData::resource_not_found(e, None)),
         }
     }

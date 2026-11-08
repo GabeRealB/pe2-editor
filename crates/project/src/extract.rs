@@ -259,7 +259,7 @@ impl Written {
     /// A file's place: in the layer of its files, else beside the node.
     fn at(&self, name: &str) -> PathBuf {
         let filled = self.dirs[1].join(name);
-        if filled.exists() { filled } else { self.dirs[0].join(name) }
+        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(name) }
     }
 }
 
@@ -285,14 +285,14 @@ impl crate::graph::exec::Node for Written {
         if let Some(sha1) = sha1s.get(name) {
             return Some(sha1.clone());
         }
-        let sha1 = sha1_file(&self.at(name)).ok()?;
+        let sha1 = crate::content::sha1(&self.at(name)).ok()?;
         sha1s.insert(name.to_string(), sha1.clone());
         Some(sha1)
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>> {
         let path = self.at(name);
-        fs::read(&path).with_context(|| path.display().to_string())
+        crate::content::read(&path).with_context(|| path.display().to_string())
     }
 
     fn file_names(&self) -> Vec<String> {
@@ -303,16 +303,11 @@ impl crate::graph::exec::Node for Written {
     }
 
     fn file_size(&self, name: &str) -> Option<u64> {
-        fs::metadata(self.at(name)).ok().map(|m| m.len())
+        crate::content::len(&self.at(name)).ok()
     }
 
     fn read_head(&self, name: &str, len: usize) -> Vec<u8> {
-        use std::io::Read;
-        let mut head = Vec::new();
-        if let Ok(file) = fs::File::open(self.at(name)) {
-            let _ = file.take(len as u64).read_to_end(&mut head);
-        }
-        head
+        crate::content::head(&self.at(name), len)
     }
 
     fn content_path(&self, sha1: &str) -> Option<PathBuf> {

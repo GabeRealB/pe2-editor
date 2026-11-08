@@ -2330,6 +2330,52 @@ impl Editor {
             ui.label(RichText::new("agents cannot connect").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
             ui.separator();
         }
+        if let Some(files) = &ws.files {
+            match files.state() {
+                crate::files::State::Starting => {
+                    ui.label(RichText::new("serving its files…").small().color(theme::weak()));
+                }
+                crate::files::State::Served(at, note) => {
+                    if let Some(note) = note {
+                        ui.label(RichText::new("not for Windows").small().color(ui.visuals().warn_fg_color))
+                            .on_hover_text(note);
+                    }
+                    ui.label(RichText::new(format!("files at {at}")).small().color(theme::weak())).on_hover_text(
+                        "The project's merged layers as a folder any program can read and write, each change a step \
+                         of the history (project.local.toml, [filesystem] serve). Its host stops 30 s after nothing \
+                         keeps it - the editor, `pe2-cli project serve` - once no file is open in it, unless \
+                         [filesystem] keep says to serve on.",
+                    );
+                }
+                // Right to left: the choices, then what they are for.
+                crate::files::State::Failed { why, strays } if strays > 0 => {
+                    let aside = project::SET_ASIDE;
+                    if ui
+                        .small_button("Take in")
+                        .on_hover_text("Write them into the project, as edits through the folder are, and serve it")
+                        .clicked()
+                    {
+                        files.resolve(crate::files::Strays::TakeIn, ui.ctx());
+                    }
+                    if ui
+                        .small_button("Set aside")
+                        .on_hover_text(format!("Move them beside it, to {aside}, and serve it"))
+                        .clicked()
+                    {
+                        files.resolve(crate::files::Strays::SetAside, ui.ctx());
+                    }
+                    let (count, are) =
+                        if strays == 1 { ("1 file".to_string(), "is") } else { (format!("{strays} files"), "are") };
+                    let said = format!("its files are not served: {count} in its folder {are} not the project's");
+                    ui.label(RichText::new(said).small().color(ui.visuals().warn_fg_color)).on_hover_text(why);
+                }
+                crate::files::State::Failed { why, .. } => {
+                    ui.label(RichText::new("its files are not served").small().color(ui.visuals().warn_fg_color))
+                        .on_hover_text(why);
+                }
+            }
+            ui.separator();
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) -> (bool, Option<Unsaved>, Option<PaneKind>) {

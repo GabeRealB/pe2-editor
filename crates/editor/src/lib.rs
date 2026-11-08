@@ -35,6 +35,7 @@ mod ext_ui;
 mod extensions_pane;
 mod external;
 mod fetcher;
+mod files;
 mod fill;
 mod gpu_stats;
 mod gpu_view;
@@ -191,6 +192,14 @@ pub type Result = eframe::Result;
 /// Its window could not be made.
 pub fn run() -> Result {
     project::profile::install();
+    // A large file a layer holds as chunks is given to a program in a scoped filesystem, mounted when first needed.
+    let _scopes = vfs::scoped::Scopes::install();
+    // Ended by a signal, the editor drops nothing: what it mounted would be left with no one serving it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = ctrlc::set_handler(|| {
+        vfs::fuse::unmount_all();
+        std::process::exit(130);
+    });
     project::ext::component::link_gpu(pe2_webgpu::add_to_linker);
     let mut args = std::env::args_os().skip(1);
     let (mut project, mut select, mut show, mut screenshot) = (None, None, None, None);

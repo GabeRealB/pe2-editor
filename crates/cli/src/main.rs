@@ -2,6 +2,8 @@
 //! It dispatches on its subcommand (`pe2-cli project extract`) or, run under a tool's name (a link in the editor's
 //! own `bin/`), on that name (`project extract`).
 
+mod host;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pe2_ext::events::{Build, Clean, Event};
@@ -270,6 +272,53 @@ enum ConfigCommand {
     },
 }
 
+/// Which project an edit is of, and which of its layers it goes to.
+#[derive(clap::Args)]
+struct EditAt {
+    /// The project's directory
+    #[arg(long, default_value = ".")]
+    project: PathBuf,
+    /// The layer it goes to: by default, the highest the project lets be written
+    #[arg(long)]
+    layer: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Store the project's large files as chunks: each file of its layers' assets, and each plain file, of 1 MiB or
+    /// more and held whole until now, put in the store and replaced by its manifest, its content the same
+    Migrate {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Remove the chunks nothing names any more: no layer's manifest or listing, nor the history
+    Gc {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Pack a generated layer: its files kept in one listing (`.pack`), their chunks in the store, `project.toml`
+    /// saying so (`storage = "packed"`)
+    Pack {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The layer
+        #[arg(long)]
+        layer: String,
+    },
+    /// Unpack a packed layer: its files written back as files
+    Unpack {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The layer
+        #[arg(long)]
+        layer: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum ProjectCommand {
     /// Fill a project's generated layers by their plans (`.layers/<layer>.plan.jsonl`), reading the discs where the
@@ -322,6 +371,141 @@ enum ProjectCommand {
     Link {
         #[command(subcommand)]
         command: LinkCommand,
+    },
+    /// Write a file at a path of the project (`packages/aya/node.toml`), from a file or standard input: a node's file, a
+    /// plain one, or a `node.toml` that makes its folder a node
+    Write {
+        /// The path in the project, as the served folder shows it
+        path: String,
+        /// The file whose content to write; standard input where none
+        #[arg(long)]
+        from: Option<PathBuf>,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Make a folder
+    Mkdir {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Delete an entry (a node with what is inside it), or a file of a node
+    Rm {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Rename or move an entry, or a file within its node
+    Mv {
+        from: String,
+        to: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Make the layer's own version of an entry from below
+    Override {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Drop the layer's operation on an entry - an override, a move, a delete - and what it holds of it
+    Drop {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Keep the layer's version of a stale override: its base becomes what is below now
+    KeepMine {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Give up the layer's version of an entry for the one below
+    TakeBase {
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Take an entry a layer lists and no longer holds out of its list (a problem's layer and path)
+    Forget {
+        layer: String,
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// List what a layer holds unlisted at and under a path of it (a problem's layer and path)
+    Adopt {
+        layer: String,
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Remove what a layer holds unlisted at a path of it from its folder (a problem's layer and path)
+    RemoveUnlisted {
+        layer: String,
+        path: String,
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Take back the last step of whoever holds the project (an editor, or the host serving it)
+    Undo {
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// Do again the last step taken back
+    Redo {
+        #[command(flatten)]
+        at: EditAt,
+    },
+    /// The project's problems: what does not add up, each with the paths it is about
+    Problems {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// The project's chunk store, where its large files' content is kept
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+    /// Serve a project's merged layers as a filesystem: the tree the editor shows - every asset a `<path>.node/` folder
+    /// holding its files - at the project's `assets` folder, until stopped (Ctrl-C), what programs write there a step
+    /// of the highest writable layer. It holds the project while it serves
+    Serve {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// How to serve it - `fuse` (mounted at `assets`), or `webdav` (for the system's own client to mount) - in
+        /// place of what `project.local.toml` says (`[filesystem] serve`)
+        #[arg(long)]
+        backend: Option<String>,
+        /// WebDAV's address (`127.0.0.1:4918`; port 0 for any), in place of `[filesystem] address`
+        #[arg(long)]
+        address: Option<String>,
+        /// On Windows, unregister the project's folder as a sync root, and serve nothing
+        #[arg(long)]
+        forget: bool,
+        /// Stop the host serving it, whoever keeps it
+        #[arg(long)]
+        stop: bool,
+        /// Where its folder holds files that are not the project's, move them beside it (`assets.set-aside`)
+        #[arg(long, conflicts_with = "take_in")]
+        set_aside: bool,
+        /// Where its folder holds files that are not the project's, write them into the project
+        #[arg(long)]
+        take_in: bool,
+    },
+    /// Serve a project as a filesystem, holding it while nothing else does: what `serve` and the editor start, and keep
+    #[command(hide = true)]
+    Host {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        #[arg(long, value_enum, default_value = "refuse")]
+        strays: host::Strays,
     },
     /// How a project's generated layers are, by their plans: none, empty, filled, or not as the plan says now - known
     /// without the discs and without reading what was made
@@ -1019,6 +1203,8 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(args);
     project::profile::install();
+    // A large file a layer holds as chunks is given to a program in a scoped filesystem, mounted when first needed.
+    let _scopes = vfs::scoped::Scopes::install();
     let profile = cli.profile.then(std::time::Instant::now);
     // What the command line asks is a command: its work weighed as one, over the host's own.
     let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
@@ -1144,6 +1330,231 @@ fn project_extensions(p: &project::Project) -> std::sync::Arc<project::ext::Exte
 }
 
 /// Check generated layers against their plans, exiting with failure where one is not what its plan makes.
+/// A project command serving it, editing it, or saying its problems.
+fn project_command(command: &ProjectCommand) -> Result<()> {
+    match command {
+        ProjectCommand::Problems { project } => return problems(project),
+        ProjectCommand::Serve { project, backend, address, forget, stop, set_aside, take_in } => {
+            let strays = match (set_aside, take_in) {
+                (true, _) => host::Strays::SetAside,
+                (_, true) => host::Strays::TakeIn,
+                _ => host::Strays::Refuse,
+            };
+            return if *forget {
+                forget_served(project)
+            } else {
+                serve_project(project, backend.as_deref(), address.as_deref(), *stop, strays)
+            };
+        }
+        ProjectCommand::Host { project, backend, address, strays } => {
+            return host::run(project, backend.as_deref(), address.as_deref(), *strays);
+        }
+        _ => {}
+    }
+    let (op, at) = edit_of(command).context("no such command")??;
+    let done = edit(&op, at);
+    // What standard input was kept in is the edit's alone.
+    if let (ProjectCommand::Write { from: None, .. }, vfs::ops::Op::Write { from, .. }) = (command, &op) {
+        let _ = std::fs::remove_file(from);
+    }
+    done
+}
+
+/// The edit a project command is, and where it goes; none for another command.
+fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> {
+    use vfs::ops::Op;
+    let path = |p: &String| p.trim_matches('/').to_string();
+    Some(Ok(match command {
+        ProjectCommand::Write { path: at_path, from, at } => {
+            let from = match from {
+                Some(from) => std::path::absolute(from).map_err(anyhow::Error::from),
+                None => read_stdin_to_file(),
+            };
+            match from {
+                Ok(from) => (Op::Write { path: path(at_path), from }, at),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        ProjectCommand::Mkdir { path: p, at } => (Op::Folder { path: path(p) }, at),
+        ProjectCommand::Rm { path: p, at } => (Op::Remove { path: path(p) }, at),
+        ProjectCommand::Mv { from, to, at } => (Op::Rename { from: path(from), to: path(to) }, at),
+        ProjectCommand::Override { path: p, at } => (Op::Override { path: path(p) }, at),
+        ProjectCommand::Drop { path: p, at } => (Op::Drop { path: path(p) }, at),
+        ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: path(p) }, at),
+        ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: path(p) }, at),
+        ProjectCommand::Forget { layer, path: p, at } => (Op::Forget { layer: layer.clone(), path: path(p) }, at),
+        ProjectCommand::Adopt { layer, path: p, at } => (Op::Adopt { layer: layer.clone(), path: path(p) }, at),
+        ProjectCommand::RemoveUnlisted { layer, path: p, at } => {
+            (Op::RemoveUnlisted { layer: layer.clone(), path: path(p) }, at)
+        }
+        ProjectCommand::Undo { at } => (Op::Undo, at),
+        ProjectCommand::Redo { at } => (Op::Redo, at),
+        _ => return None,
+    }))
+}
+
+/// Standard input kept in a file, for what applies a write to read: the file's path.
+fn read_stdin_to_file() -> Result<PathBuf> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes)?;
+    let file = std::env::temp_dir().join(format!("pe2-write-{}", std::process::id()));
+    std::fs::write(&file, bytes)?;
+    Ok(file)
+}
+
+/// Make an edit of a project: by whoever holds it, or - where nothing does - here, holding it for the while.
+fn edit(op: &vfs::ops::Op, at: &EditAt) -> Result<()> {
+    let root = project::Project::load(&at.project)?.root;
+    let request = mcp::Request::Edit { op: op.clone(), layer: at.layer.clone() };
+    let reply = mcp::server::execute(&root, &request);
+    // Made by whoever holds the project: what is served follows at once, not when the host's watch sees it.
+    if let mcp::Reply::Edited { touched, .. } = &reply {
+        project::host::changed(&root, touched.clone());
+    }
+    println!("{}", reply.told().map_err(anyhow::Error::msg)?);
+    Ok(())
+}
+
+/// `pe2-cli project problems`: asked of whoever holds the project, or read here.
+fn problems(project: &Path) -> Result<()> {
+    let root = project::Project::load(project)?.root;
+    let request = mcp::Request::Call { name: "problems".into(), arguments: serde_json::Map::new() };
+    let told = mcp::server::execute(&root, &request).told().map_err(anyhow::Error::msg)?;
+    let told: serde_json::Value = serde_json::from_str(&told)?;
+    let listed = |key: &str| told[key].as_array().cloned().unwrap_or_default();
+    for problem in listed("problems") {
+        let paths: Vec<&str> = problem["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();
+        println!("{}: {}", paths.join(", "), problem["problem"].as_str().unwrap_or_default());
+    }
+    for reference in listed("dangling_references") {
+        println!("dangling: {reference}");
+    }
+    if listed("problems").is_empty() && listed("dangling_references").is_empty() {
+        println!("no problems");
+    }
+    Ok(())
+}
+
+/// `pe2-cli project store`.
+fn store(command: &StoreCommand) -> Result<()> {
+    let (StoreCommand::Migrate { project }
+    | StoreCommand::Gc { project }
+    | StoreCommand::Pack { project, .. }
+    | StoreCommand::Unpack { project, .. }) = command;
+    let p = project::Project::load(project)?;
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
+    // Whole MiB with a tenth: what a person reads of a size.
+    let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
+    match command {
+        StoreCommand::Migrate { .. } => {
+            let cache = project::cache::Cache::open(&p, &lock)?;
+            let index = project::index::Index::open(&p, &cache)?;
+            let pass = project::chunks::migrate(&p, &index)?;
+            println!(
+                "{} files stored as chunks: {} MiB whole, {} MiB in the store and their manifests",
+                pass.files,
+                mib(pass.before),
+                mib(pass.after)
+            );
+        }
+        StoreCommand::Pack { layer, .. } => {
+            let count = project::pack::pack_layer(&p, layer)?;
+            println!("{layer}: {count} files packed");
+        }
+        StoreCommand::Unpack { layer, .. } => {
+            let count = project::pack::unpack_layer(&p, layer)?;
+            println!("{layer}: {count} files unpacked");
+        }
+        StoreCommand::Gc { .. } => {
+            let (gone, freed) = project::chunks::sweep(&p)?;
+            println!("{gone} chunks no longer named removed: {} MiB freed", mib(freed));
+        }
+    }
+    Ok(())
+}
+
+/// `pe2-cli project serve`: the host keeps serving the project while this runs - started where none runs - or, with
+/// `--stop`, stops.
+fn serve_project(
+    project: &Path,
+    backend: Option<&str>,
+    address: Option<&str>,
+    stop: bool,
+    strays: host::Strays,
+) -> Result<()> {
+    use project::host::{Connection, FromHost, ToHost};
+    let p = project::Project::load(project)?;
+    if stop {
+        match Connection::connect(&p.root) {
+            Some(mut host) => {
+                host.ask(&ToHost::Stop)?;
+                println!("the host serving {} stops", project::host::shown(&p.root));
+            }
+            None => println!("nothing serves {}", project::host::shown(&p.root)),
+        }
+        return Ok(());
+    }
+    let found = Connection::connect(&p.root);
+    let started = found.is_none();
+    let mut host = if let Some(host) = found {
+        if backend.is_some() || address.is_some() {
+            eprintln!("a host serves it already, as it does: --backend and --address are for one started");
+        }
+        host
+    } else {
+        let mut args = Vec::new();
+        for (flag, value) in [("--backend", backend), ("--address", address)] {
+            if let Some(value) = value {
+                args.extend([flag.to_string(), value.to_string()]);
+            }
+        }
+        args.extend(host::Strays::args(strays));
+        project::host::start(&p.root, &std::env::current_exe()?, &args)?
+    };
+    let FromHost::Kept { at, note } = host.ask(&ToHost::Keep { who: "pe2-cli project serve".into() })? else {
+        anyhow::bail!("the host would not keep serving");
+    };
+    let how = if started { "a host started for it" } else { "by the host serving it already" };
+    println!("{} served at {at}, {how}: Ctrl-C lets go of it", project::host::shown(&p.root));
+    if let Some(note) = note {
+        println!("note: {note}");
+    }
+    // Until Ctrl-C, or the host stops.
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let interrupted = stop.clone();
+    ctrlc::set_handler(move || {
+        let _ = interrupted.send(false);
+    })?;
+    std::thread::spawn(move || {
+        host.closed();
+        let _ = stop.send(true);
+    });
+    if stopped.recv().unwrap_or(true) {
+        println!("the host stopped");
+    } else if p.filesystem.keep {
+        println!("let go: the host serves on, as this machine says (`[filesystem] keep`)");
+    } else {
+        println!("let go: unless something else keeps it, the host stops in 30s, once no file is open in it");
+    }
+    Ok(())
+}
+
+/// Unregister a project's folder as a sync root (Windows).
+fn forget_served(project: &Path) -> Result<()> {
+    let p = project::Project::load(project)?;
+    #[cfg(windows)]
+    {
+        vfs::cloud::forget(&host::served_name(&p))?;
+        println!("{} is no longer a sync root", project::host::shown(&p.filesystem.at));
+    }
+    #[cfg(not(windows))]
+    println!("{}: only Windows registers a project's folder", project::host::shown(&p.root));
+    Ok(())
+}
+
 fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
     let p = project::Project::load(project)?;
     let extensions = project_extensions(&p);
@@ -1185,6 +1596,17 @@ fn print_registry(project: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `pe2-cli plan observe`: what each operation of a plan read, as JSON lines.
+fn observe_plan(plan: &Path, roms: &Path, keep: Option<&Path>, keep_kinds: &[String]) -> Result<()> {
+    let extensions = extensions::shared();
+    let engine = extensions.engine();
+    let roms = roms.to_path_buf();
+    let seen = project::plan::observe(plan, &|_| Ok(roms.clone()), &engine, &extensions, keep, keep_kinds)?;
+    let lines: Vec<String> = seen.iter().map(serde_json::to_string).collect::<Result<_, _>>()?;
+    println!("{}", lines.join("\n"));
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     if cli.trust_everything {
         extensions::trust::trust_everything();
@@ -1192,18 +1614,7 @@ fn run(cli: Cli) -> Result<()> {
     }
     match cli.tool {
         Tool::Plan { command: PlanCommand::Observe { plan, roms, keep, keep_kinds } } => {
-            let extensions = extensions::shared();
-            let engine = extensions.engine();
-            let seen = project::plan::observe(
-                &plan,
-                &|_| Ok(roms.clone()),
-                &engine,
-                &extensions,
-                keep.as_deref(),
-                &keep_kinds,
-            )?;
-            let lines: Vec<String> = seen.iter().map(serde_json::to_string).collect::<Result<_, _>>()?;
-            println!("{}", lines.join("\n"));
+            observe_plan(&plan, &roms, keep.as_deref(), &keep_kinds)?;
         }
         Tool::Convert { command: ConvertCommand::Bs { input, output } } => bs_to_png(&input, &output)?,
         Tool::Convert { command: ConvertCommand::Texture { input, output, bpp, palette, row, column } } => {
@@ -1243,6 +1654,7 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project { command: ProjectCommand::Signal { event, project, config } } => {
             signal(&project, config.as_deref(), &[event.as_str()])?;
         }
+        Tool::Project { command: ProjectCommand::Store { command } } => store(&command)?,
         Tool::Project { command: ProjectCommand::Extract { project, layer, releases } } => {
             let releases = match releases.as_str() {
                 "available" => project::plan::Releases::Available,
@@ -1285,6 +1697,8 @@ fn run(cli: Cli) -> Result<()> {
             let root = project::Project::load(&project)?.root;
             mcp::server::serve_stdio(root)?;
         }
+        // What is left of the project's commands serve it, edit it, and say its problems.
+        Tool::Project { command } => project_command(&command)?,
     }
     Ok(())
 }

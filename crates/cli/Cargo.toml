@@ -23,6 +23,10 @@ png.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+vfs.workspace = true
+ctrlc.workspace = true
+notify.workspace = true
+interprocess.workspace = true
 
 [features]
 # Spans on a timeline, for Tracy's viewer to connect to (project::profile).

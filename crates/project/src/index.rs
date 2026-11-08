@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::Cache;
-use crate::changeset::{self, Changeset, Op};
+use crate::changeset::{self, Base, Changeset, Op};
 use crate::extract::sha1_hex;
 pub use crate::store::Stamp;
 use crate::store::{Declaration, Record, Store};
@@ -36,6 +36,29 @@ pub const SETTINGS_FILE: &str = "settings.toml";
 
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
+
+/// A file an override merged over the one below, in the cache (`.cache/merged/<sha1>/<name>`), written where it is not
+/// yet: its folder is named by its content's SHA-1.
+fn merged_file(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let at = dir.join(sha1_hex(bytes)).join(name);
+    if !at.is_file() {
+        std::fs::create_dir_all(at.parent().expect("in a folder"))?;
+        crate::cache::write_atomic(&at, bytes).map_err(std::io::Error::other)?;
+    }
+    Ok(at)
+}
+
+/// The name a file of an entry at `at` goes by: a bundle's by its own, a plain file by the entry's.
+fn file_name(name: &str, at: &str) -> String {
+    if name.is_empty() { at.rsplit('/').next().unwrap_or(at).to_string() } else { name.to_string() }
+}
+
+/// A merge remembered, by its inputs: what it made (its SHA-1) and its conflicts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Memo {
+    sha1: String,
+    conflicts: Vec<crate::merge::Conflict>,
+}
 const STORE: &str = "index.db";
 
 /// A file of a bundle, from the layer whose version of the asset wins.
@@ -216,6 +239,19 @@ pub struct CreateView {
     pub kind: Option<Kind>,
 }
 
+/// A part of a patching override made from another version of it below (`Index::stale_parts`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StalePart {
+    /// The file of the bundle.
+    pub file: String,
+    /// The field, as a dotted path; none for a file held or removed whole.
+    pub field: Option<String>,
+    /// What the layer has, what it was below when made, and what it is below now: none where absent.
+    pub mine: Option<String>,
+    pub was: Option<String>,
+    pub now: Option<String>,
+}
+
 /// An entry as the layers below one see it: what an operation of that layer on it stands on.
 #[derive(Clone, Debug)]
 pub struct Below {
@@ -223,8 +259,11 @@ pub struct Below {
     pub uid: String,
     /// Its resolved path below the layer.
     pub path: String,
-    /// Its content's hash: what an override records as its base. None for a folder.
+    /// Its content's hash: what an override copying it whole records as its base. None for a folder.
     pub hash: Option<String>,
+    /// Its files' hashes, by name: what an override records of a file it changes, as what it was made from
+    /// (`changeset::Base::was`).
+    pub sha1s: BTreeMap<String, String>,
     /// Its content's files: a plain file itself (an empty name), a bundle's files by name.
     pub files: Vec<(String, PathBuf)>,
     /// The layer holding its content.
@@ -302,7 +341,8 @@ pub enum Problem {
     DuplicateUid { uid: String, paths: Vec<String> },
     /// One path in several layers, which no changeset declares an override of.
     Conflict { path: String, layers: Vec<String> },
-    /// An entry a layer holds that its changeset does not list, in a layer that cannot be written.
+    /// What a layer holds that its changeset does not list: put in a layer folder by other means than the editor, or in
+    /// one that cannot be written. Adopted (listed) or removed by the user.
     Unlisted { layer: String, path: String },
     /// An entry a changeset lists that its layer does not hold; or holds where the index leaves it out (`left_out`:
     /// an extension's folder, an ignored name), which no asset is.
@@ -360,7 +400,9 @@ impl Problem {
             Problem::Unreadable { error, .. } => format!("node.toml cannot be read: {error}"),
             Problem::DuplicateUid { uid, paths } => format!("{uid} is created {} times", paths.len()),
             Problem::Conflict { layers, .. } => format!("in layers {} without a declared override", layers.join(", ")),
-            Problem::Unlisted { layer, .. } => format!("not in the changeset of {layer}, which cannot be written"),
+            Problem::Unlisted { layer, .. } => {
+                format!("held by {layer}, which does not list it: put there by other means than the editor")
+            }
             Problem::Missing { layer, left_out: false, .. } => format!("listed by {layer}, which does not hold it"),
             Problem::Missing { layer, left_out: true, .. } => {
                 format!("listed by {layer}, which leaves it out: no asset")
@@ -439,10 +481,15 @@ struct Pending {
 /// A file's record, read now; none when it vanished meanwhile. A file that cannot be parsed is a record with its
 /// error, not a failure: a user may save a half-written `node.toml`.
 fn read(file: &Pending) -> Option<Record> {
-    let bytes = std::fs::read(&file.path).ok()?;
     let recorded = stamp(SystemTime::now());
-    let declaration = file.declaration.then(|| declaration(&bytes));
-    Some(Record { size: file.size, modified: file.modified, recorded, sha1: sha1_hex(&bytes), declaration })
+    // A declaration is read whole, to be parsed; any other file is only hashed, a piece at a time.
+    let (sha1, declaration) = if file.declaration {
+        let bytes = crate::content::read(&file.path).ok()?;
+        (sha1_hex(&bytes), Some(declaration(&bytes)))
+    } else {
+        (crate::content::sha1(&file.path).ok()?, None)
+    };
+    Some(Record { size: file.size, modified: file.modified, recorded, sha1, declaration })
 }
 
 /// What the index keeps of an `node.toml`: parsed once, here, for its type, uid, variant names and references.
@@ -477,8 +524,8 @@ fn declaration(bytes: &[u8]) -> Declaration {
 
 /// Stat the files on every core: each one's size (none when it is gone) and modification time.
 fn stat_all(files: &[PathBuf]) -> Vec<(Option<u64>, Stamp)> {
-    let stat = |file: &PathBuf| match std::fs::metadata(file) {
-        Ok(meta) => (Some(meta.len()), meta.modified().map_or((0, 0), stamp)),
+    let stat = |file: &PathBuf| match crate::content::stat(file) {
+        Ok((len, modified)) => (Some(len), stamp(modified)),
         Err(_) => (None, (0, 0)),
     };
     if files.len() < 256 {
@@ -586,14 +633,14 @@ impl Scan {
             if name.starts_with('.') || place.ignores(rel) {
                 return;
             }
-            if start.is_dir() {
+            if crate::pack::is_dir(&start) {
                 if place.assets && rel.ends_with(BUNDLE_SUFFIX) {
                     self.bundles.insert(rel.to_string(), bundle_files(&start));
                     return;
                 }
                 self.folders.insert(rel.to_string());
             } else {
-                if start.is_file() {
+                if crate::pack::is_file(&start) {
                     self.files.insert(rel.to_string(), start);
                 }
                 return;
@@ -627,23 +674,23 @@ impl Scan {
 
     /// One folder's entries: its bundles and plain files kept, its folders kept and handed back to walk.
     fn walk_one(&mut self, place: &Place, dir: &Path, dir_rel: &str, folders: &mut Vec<(PathBuf, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        // On disk, or in a packed layer's listing.
+        for (name, path, is_dir) in crate::pack::read_dir(dir) {
             let child = if dir_rel.is_empty() { name.clone() } else { format!("{dir_rel}/{name}") };
             if name.starts_with('.') || place.ignores(&child) {
                 continue;
             }
-            let Ok(file_type) = entry.file_type() else { continue };
-            if file_type.is_dir() {
+            if is_dir {
                 if place.assets && child.ends_with(BUNDLE_SUFFIX) {
-                    self.bundles.insert(child, bundle_files(&entry.path()));
+                    self.bundles.insert(child, bundle_files(&path));
                 } else {
                     self.folders.insert(child.clone());
-                    folders.push((entry.path(), child));
+                    folders.push((path, child));
                 }
-            } else if file_type.is_file() {
-                self.files.insert(child, entry.path());
+            } else {
+                let (name, path) = listed(&name, path);
+                let child = if dir_rel.is_empty() { name } else { format!("{dir_rel}/{name}") };
+                self.files.insert(child, path);
             }
         }
     }
@@ -706,25 +753,45 @@ pub(crate) fn bundle_files(dir: &Path) -> BTreeMap<String, PathBuf> {
     let mut files = BTreeMap::new();
     let mut pending = vec![(dir.to_path_buf(), String::new())];
     while let Some((folder, prefix)) = pending.pop() {
-        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        // On disk, or in a packed layer's listing.
+        for (name, path, is_dir) in crate::pack::read_dir(&folder) {
             if name.starts_with('.') {
                 continue;
             }
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_file() {
-                files.insert(format!("{prefix}{name}"), entry.path());
-            } else if kind.is_dir() {
-                pending.push((entry.path(), format!("{prefix}{name}/")));
+            if is_dir {
+                pending.push((path, format!("{prefix}{name}/")));
+            } else {
+                // A large file is held as its manifest: listed as the file it stands for.
+                let (name, path) = listed(&name, path);
+                files.insert(format!("{prefix}{name}"), path);
             }
         }
     }
     files
 }
 
+/// A file as the index lists it: a manifest (`<name>.chunks`) as the file it stands for, by that file's name and path.
+fn listed(name: &str, path: PathBuf) -> (String, PathBuf) {
+    match (name.strip_suffix(crate::chunks::SUFFIX), crate::chunks::logical(&path)) {
+        (Some(name), Some(logical)) => (name.to_string(), logical),
+        _ => (name.to_string(), path),
+    }
+}
+
 /// The asset an asset entry's real path names: without `.node`.
 fn asset_of(path: &str) -> &str {
     path.strip_suffix(BUNDLE_SUFFIX).unwrap_or(path)
+}
+
+/// How what a layer holds unlisted gets listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listing {
+    /// As it is found: a mounted tree, worked on with its own tools.
+    Always,
+    /// The first time it is indexed: a layer folder with no changeset yet.
+    Once,
+    /// Only as the user adopts it (`edit::adopt`): a layer folder, the editor's storage.
+    Adopted,
 }
 
 /// A layer as the index holds it.
@@ -742,6 +809,8 @@ struct LayerState {
     /// Its changeset can be written: unlisted entries are listed in it.
     writable: bool,
     mounted: bool,
+    /// How what it holds unlisted gets listed (`list_unlisted`).
+    listing: Listing,
     /// The layer whose nodes a generated layer gives their files: taking no part in the stack, what it holds at a path
     /// is that layer's bundle's too.
     fills: Option<String>,
@@ -769,6 +838,13 @@ impl LayerState {
             tree_ignore,
             read_only: layer.read_only,
             mounted: layer.mounted,
+            listing: if layer.mounted {
+                Listing::Always
+            } else if layer.changeset.exists() {
+                Listing::Adopted
+            } else {
+                Listing::Once
+            },
             fills: layer.fills.clone(),
             scan: Arc::new(scan),
         })
@@ -808,12 +884,26 @@ struct Node {
     content: (usize, String),
     overrides: Vec<usize>,
     moved: Option<usize>,
+    /// Its files, where an override wins: those it changes - as held, or merged over the version below now - and those
+    /// below it does not change; a plain file's own by an empty name.
+    files: Option<Arc<Vec<(String, PathBuf, usize)>>>,
+    /// The files its overrides' merges read (theirs below, and their own), for a change to any to merge again.
+    inputs: Arc<Vec<PathBuf>>,
 }
 
 impl Node {
     /// An entry as the layer creating it left it.
     fn created(kind: Kind, uid: &str, home: usize, path: &str) -> Node {
-        Node { kind, uid: uid.to_string(), home, content: (home, path.to_string()), overrides: vec![], moved: None }
+        Node {
+            kind,
+            uid: uid.to_string(),
+            home,
+            content: (home, path.to_string()),
+            overrides: vec![],
+            moved: None,
+            files: None,
+            inputs: Arc::default(),
+        }
     }
 }
 
@@ -917,7 +1007,8 @@ pub struct Index {
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
     records: HashMap<PathBuf, Arc<Record>>,
-    store: Arc<Store>,
+    /// Where the records are kept between runs: none while another process has it (`let_go_of_store`).
+    store: Option<Arc<Store>>,
     resolved: Arc<BTreeMap<String, Node>>,
     /// The layers left out of the view (the editor's eyes); problems and statuses are the full stack's.
     hidden: HashSet<usize>,
@@ -931,6 +1022,10 @@ pub struct Index {
     winning: Arc<HashMap<(usize, String), String>>,
     /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
     working: Arc<HashMap<String, Working>>,
+    /// Where what overrides merged is kept (`merged_file`), and what each merge made (`Memo`).
+    merged: PathBuf,
+    /// The store keeping the versions overrides were made from (`changeset::Base`).
+    objects: crate::chunks::Store,
 }
 
 impl Index {
@@ -956,7 +1051,32 @@ impl Index {
     pub fn open_reporting(project: &Project, cache: &Cache, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
         report("Reading what the cache knows", 0, 0);
-        Index::over(Arc::new(Store::open(&cache.path(STORE))?), project, report)
+        Index::over(Some(Arc::new(Store::open(&cache.path(STORE))?)), project, report)
+    }
+
+    /// Open the index without the cache's store, which another process has: every file read, and its records kept in
+    /// memory alone (until `keep_records`).
+    ///
+    /// # Errors
+    /// A layer cannot be read.
+    pub fn without_store(project: &Project) -> Result<Index> {
+        Index::over(None, project, &|_, _, _| {})
+    }
+
+    /// Stop keeping the records in the cache's store, and close it, for another process to open: what is read from now
+    /// on is kept in memory alone, until `keep_records`.
+    pub fn let_go_of_store(&mut self) {
+        self.store = None;
+    }
+
+    /// Keep the records in the cache's store again, opened anew: what it has is the last holder's, and what changes
+    /// from now on is written to it.
+    ///
+    /// # Errors
+    /// The store cannot be opened.
+    pub fn keep_records(&mut self, cache: &Cache) -> Result<()> {
+        self.store = Some(Arc::new(Store::open(&cache.path(STORE))?));
+        Ok(())
     }
 
     /// The index of the project as `project.toml` has it now, opened over this one's store, which stays open; this
@@ -970,8 +1090,8 @@ impl Index {
         Ok(index)
     }
 
-    fn over(store: Arc<Store>, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let mut known = store.load()?;
+    fn over(store: Option<Arc<Store>>, project: &Project, report: &Report<'_>) -> Result<Index> {
+        let mut known = store.as_ref().map(|s| s.load()).transpose()?.unwrap_or_default();
         let mut layers = Vec::new();
         for (i, layer) in project.layers.iter().enumerate() {
             report(&format!("Scanning {}", layer.name), i, project.layers.len());
@@ -988,6 +1108,8 @@ impl Index {
             problems: vec![],
             layers,
             records: HashMap::new(),
+            merged: project.root.join(crate::cache::DIR).join("merged"),
+            objects: crate::chunks::Store::at(&project.root),
             store,
             resolved: Arc::default(),
             hidden: HashSet::new(),
@@ -1005,7 +1127,9 @@ impl Index {
         index.read = read.len();
         // What is left of what the store knew no layer holds any more.
         let gone: Vec<&Path> = known.keys().map(PathBuf::as_path).collect();
-        index.store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
+        if let Some(store) = &index.store {
+            store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
+        }
         report("Resolving the layers", 0, 0);
         index.apply_stack()?;
         report("Assembling the assets", 0, 0);
@@ -1025,6 +1149,18 @@ impl Index {
     /// # Errors
     /// A changeset cannot be read or written.
     pub fn refresh(&mut self, project: &Project, changed: &[PathBuf]) -> Result<Refreshed> {
+        // A manifest changing is the file it stands for changing; a packed layer's listing, its whole layer.
+        let changed: Vec<PathBuf> = changed
+            .iter()
+            .map(|p| match p.file_name() {
+                Some(name) if name == crate::pack::FILE => p.parent().map_or_else(|| p.clone(), Path::to_path_buf),
+                _ => crate::chunks::logical(p).unwrap_or_else(|| p.clone()),
+            })
+            .collect();
+        self.refresh_files(project, &changed)
+    }
+
+    fn refresh_files(&mut self, project: &Project, changed: &[PathBuf]) -> Result<Refreshed> {
         let mut refreshed = Refreshed::default();
         let mut changesets = false;
         let mut wanted: Vec<(usize, String)> = Vec::new();
@@ -1092,19 +1228,14 @@ impl Index {
         gone.extend(vanished);
         self.read = read.len();
         let records = read.iter().filter_map(|p| Some((p.as_path(), &**self.records.get(p)?)));
-        self.store.write(records, gone.iter().map(PathBuf::as_path))?;
-        // Contents alone: every bundle and plain file of the regions is its entry's winning content.
-        let contents_only = paths_same
-            && !changesets
-            && self.hidden.is_empty()
-            && regions.iter().all(|(i, at)| {
-                let scan = self.layers[*i].scan.under(at);
-                let entries = self.entries_of(*i);
-                scan.bundles.keys().all(|p| self.winning.contains_key(&(entries, p.clone())))
-                    && (scan.files.is_empty() || entries == *i)
-                    && scan.files.keys().all(|p| self.winning.contains_key(&(*i, p.clone())))
-            });
-        if contents_only {
+        if let Some(store) = &self.store {
+            store.write(records, gone.iter().map(PathBuf::as_path))?;
+        }
+        // An override's files are merged as the stack is applied: one of them, or what is below it, changed applies it
+        // again.
+        let inputs: HashSet<&PathBuf> = self.resolved.values().flat_map(|n| n.inputs.iter()).collect();
+        let patched = changed.iter().any(|p| inputs.contains(p));
+        if paths_same && !changesets && !patched && self.contents_only(&regions) {
             self.refresh_contents(&regions, &before_references, &mut refreshed);
             return Ok(refreshed);
         }
@@ -1117,8 +1248,10 @@ impl Index {
         for (path, node) in self.resolved.iter() {
             let content = self.layers[node.content.0].place.disk(&node.content.1);
             let filled = self.filled_by(node.content.0).map(|g| self.layers[g].place.disk(&node.content.1));
+            let through = node.files.iter().flat_map(|f| f.iter().map(|(_, file, _)| file));
             let touched = std::iter::once(&content)
                 .chain(filled.as_ref())
+                .chain(through)
                 .any(|c| rescanned.iter().any(|r| c.starts_with(r) || r.starts_with(c)));
             if node.kind == Kind::Asset && (before.get(path) != Some(node) || touched) {
                 refreshed.assets.insert(asset_of(path).to_string());
@@ -1283,12 +1416,163 @@ impl Index {
         }
     }
 
+    /// A resolved entry's files: as its overrides make them, else its content's - a plain file's own by an empty name.
+    fn node_files(&self, node: &Node) -> Vec<(String, PathBuf, usize)> {
+        match (&node.files, node.kind) {
+            (Some(files), _) => files.as_ref().clone(),
+            (None, Kind::Asset) => self.bundle_files(node.content.0, &node.content.1).unwrap_or_default(),
+            (None, Kind::File) => {
+                let file = self.layers[node.content.0].scan.files.get(&node.content.1);
+                file.map_or_else(Vec::new, |f| vec![(String::new(), f.clone(), node.content.0)])
+            }
+            (None, Kind::Folder) => vec![],
+        }
+    }
+
+    /// A file's SHA-1: as recorded, or, for one merged in the cache, the name of its folder.
+    fn sha1_of(&self, path: &Path) -> Option<String> {
+        if let Some(record) = self.records.get(path) {
+            return Some(record.sha1.clone());
+        }
+        let folder = path.parent().filter(|f| f.parent() == Some(self.merged.as_path()))?;
+        folder.file_name()?.to_str().map(str::to_string)
+    }
+
+    /// The hash of a resolved entry's content: a plain file's own, a bundle's over its files' names and hashes.
+    fn node_hash(&self, node: &Node) -> Option<String> {
+        match node.kind {
+            Kind::Asset => {
+                let mut listing = String::new();
+                for (name, f, _) in &self.node_files(node) {
+                    let sha1 = self.sha1_of(f).unwrap_or_default();
+                    listing.push_str(name);
+                    listing.push(' ');
+                    listing.push_str(&sha1);
+                    listing.push('\n');
+                }
+                Some(format!("sha1:{}", sha1_hex(listing.as_bytes())))
+            }
+            Kind::File => {
+                let files = self.node_files(node);
+                files.first().and_then(|(_, f, _)| self.sha1_of(f)).map(|sha1| format!("sha1:{sha1}"))
+            }
+            Kind::Folder => None,
+        }
+    }
+
+    /// An entry's content as a layer's override of it at `at` makes it: the files it changes (`changed`) as it holds them,
+    /// merged over the version below now where that is no longer the one it was made from, or removed; the rest as below.
+    /// Whether it is stale (something it changes changed below, otherwise or since), or none where a file it holds is
+    /// missing.
+    fn override_with(&self, node: &mut Node, layer: usize, at: &str, changed: &BTreeMap<String, Base>) -> Option<bool> {
+        let below = self.node_files(node);
+        let own: Vec<(String, PathBuf, usize)> = match node.kind {
+            Kind::Asset => self.bundle_files(layer, at).unwrap_or_default(),
+            Kind::File => self.layers[layer].scan.files.get(at).map(|f| vec![(String::new(), f.clone(), layer)])?,
+            Kind::Folder => return None,
+        };
+        let mut files: BTreeMap<String, (PathBuf, usize)> =
+            below.iter().map(|(name, file, held)| (name.clone(), (file.clone(), *held))).collect();
+        let (mut inputs, mut stale) = (Vec::new(), false);
+        for (name, base) in changed {
+            let now = below.iter().find(|(n, ..)| n == name).map(|(_, file, _)| file);
+            let now_sha1 = now.and_then(|f| self.sha1_of(f));
+            if base.removed {
+                files.remove(name);
+                stale |= now_sha1 != base.was;
+                continue;
+            }
+            let (_, mine, held) = own.iter().find(|(n, ..)| n == name)?;
+            inputs.push(mine.clone());
+            inputs.extend(now.cloned());
+            let made = match (&base.was, now) {
+                (was, _) if *was == now_sha1 => mine.clone(),
+                (Some(was), Some(now)) => {
+                    if let Some((merged, conflicts)) = self.merged(&file_name(name, at), was, now, mine) {
+                        stale |= !conflicts.is_empty();
+                        merged
+                    } else {
+                        // What it was made from is not kept: it is stale, as it holds it.
+                        stale = true;
+                        mine.clone()
+                    }
+                }
+                // Added below since, or removed there: as it holds it, stale.
+                _ => {
+                    stale = true;
+                    mine.clone()
+                }
+            };
+            files.insert(name.clone(), (made, *held));
+        }
+        // What it holds and does not list it holds whole, as it is.
+        for (name, file, held) in &own {
+            if !changed.contains_key(name) {
+                files.insert(name.clone(), (file.clone(), *held));
+            }
+        }
+        node.files = Some(Arc::new(files.into_iter().map(|(name, (file, held))| (name, file, held)).collect()));
+        node.inputs = Arc::new(inputs);
+        Some(stale)
+    }
+
+    /// Apply a layer's override of an entry at `at` (`override_with`), the layer holding its content where it holds any
+    /// of it: whether it is stale, or none where what it holds is missing, or is no such entry.
+    fn apply_override(
+        &self,
+        node: &mut Node,
+        layer: usize,
+        at: &str,
+        changed: &BTreeMap<String, Base>,
+    ) -> Option<bool> {
+        let held = self.layers[layer].scan.kind(at);
+        if held.is_some_and(|k| k != node.kind) {
+            return None;
+        }
+        let stale = self.override_with(node, layer, at, changed)?;
+        if held.is_some() {
+            node.content = (layer, at.to_string());
+        }
+        node.overrides.push(layer);
+        Some(stale)
+    }
+
+    /// `mine`, made of the version `was` (kept in the store), merged over `now`: where the result is - `mine` itself
+    /// where it is unchanged, else in the cache - and its conflicts; none where `was` is not kept, or a file cannot be
+    /// read. A merge is remembered by its inputs, so the stack is applied again without merging again.
+    fn merged(&self, name: &str, was: &str, now: &Path, mine: &Path) -> Option<(PathBuf, Vec<crate::merge::Conflict>)> {
+        let (now_sha1, mine_sha1) = (self.sha1_of(now)?, self.sha1_of(mine)?);
+        let key = sha1_hex(format!("{name}\n{was}\n{now_sha1}\n{mine_sha1}").as_bytes());
+        let memo = self.merged.join("memo").join(&key);
+        let at = |sha1: &str| {
+            if sha1 == mine_sha1 { mine.to_path_buf() } else { self.merged.join(sha1).join(name) }
+        };
+        if let Ok(text) = std::fs::read_to_string(&memo)
+            && let Ok(remembered) = serde_json::from_str::<Memo>(&text)
+            && (remembered.sha1 == mine_sha1 || at(&remembered.sha1).is_file())
+        {
+            return Some((at(&remembered.sha1), remembered.conflicts));
+        }
+        let base = self.objects.get_file(was).ok()?;
+        let theirs = crate::content::read(now).ok()?;
+        let ours = crate::content::read(mine).ok()?;
+        let merged = crate::merge::merge(name, &base, &theirs, &ours);
+        let sha1 = sha1_hex(&merged.bytes);
+        let path =
+            if sha1 == mine_sha1 { mine.to_path_buf() } else { merged_file(&self.merged, name, &merged.bytes).ok()? };
+        let remembered = Memo { sha1, conflicts: merged.conflicts };
+        if let Ok(text) = serde_json::to_string(&remembered) {
+            let _ = std::fs::create_dir_all(memo.parent().expect("in a folder"));
+            let _ = crate::cache::write_atomic(&memo, text.as_bytes());
+        }
+        Some((path, remembered.conflicts))
+    }
+
     /// The hash an override of an entry (by its real path) records as its base: the content it is made from, the
     /// version that wins directly below the layer making it.
     #[must_use]
     pub fn base_hash(&self, path: &str) -> Option<String> {
-        let node = self.resolved.get(path)?;
-        self.content_hash(node.content.0, &node.content.1, node.kind)
+        self.node_hash(self.resolved.get(path)?)
     }
 
     /// Apply the stack: each layer's creates, then its operations, bottom to top. What a writable layer holds unlisted
@@ -1306,6 +1590,19 @@ impl Index {
         self.winning =
             Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
         Ok(())
+    }
+
+    /// Whether what changed in these regions is contents alone: every bundle and plain file of them is its entry's
+    /// winning content, and no layer is hidden.
+    fn contents_only(&self, regions: &[(usize, String)]) -> bool {
+        self.hidden.is_empty()
+            && regions.iter().all(|(i, at)| {
+                let scan = self.layers[*i].scan.under(at);
+                let entries = self.entries_of(*i);
+                scan.bundles.keys().all(|p| self.winning.contains_key(&(entries, p.clone())))
+                    && (scan.files.is_empty() || entries == *i)
+                    && scan.files.keys().all(|p| self.winning.contains_key(&(*i, p.clone())))
+            })
     }
 
     /// The stack applied without the layers in `skip`.
@@ -1386,10 +1683,10 @@ impl Index {
                     }
                     None => path.clone(),
                 };
-                if let Op::Override { base, .. } = op
+                if let Op::Override { files: changed, .. } = op
                     && let Some(node) = resolved.get_mut(&at)
                 {
-                    if node.kind == Kind::Folder || layer.scan.kind(&at) != Some(node.kind) {
+                    let Some(stale) = self.apply_override(node, i, &at, changed) else {
                         problems.push(Problem::Missing {
                             layer: layer.name.clone(),
                             path: at.clone(),
@@ -1397,15 +1694,12 @@ impl Index {
                         });
                         status.insert(uid.clone(), (OpStatus::Missing, Some(path)));
                         continue;
-                    }
+                    };
                     accounted.insert(at.clone());
-                    let (below, below_path) = node.content.clone();
-                    if self.content_hash(below, &below_path, node.kind).is_some_and(|h| h != *base) {
+                    if stale {
                         problems.push(Problem::Stale { layer: layer.name.clone(), path: at.clone() });
                         outcome = OpStatus::Stale;
                     }
-                    node.content = (i, at.clone());
-                    node.overrides.push(i);
                 }
                 status.insert(uid.clone(), (outcome, Some(path)));
             }
@@ -1434,9 +1728,13 @@ impl Index {
                 problems.push(Problem::Conflict { path: path.clone(), layers });
             }
         }
-        for path in layer.scan.paths() {
-            if !accounted.contains(path) && !resolved.contains_key(path) {
-                problems.push(Problem::Unlisted { layer: layer.name.clone(), path: path.clone() });
+        // What it holds unlisted, by the topmost path of each tree of it: a folder of a hundred files is one problem.
+        let unlisted: BTreeSet<&String> =
+            layer.scan.paths().filter(|p| !accounted.contains(*p) && !resolved.contains_key(*p)).collect();
+        for path in &unlisted {
+            let parent = path.rsplit_once('/').map(|(p, _)| p.to_string());
+            if !parent.is_some_and(|p| unlisted.contains(&p)) {
+                problems.push(Problem::Unlisted { layer: layer.name.clone(), path: (*path).clone() });
             }
         }
     }
@@ -1487,22 +1785,15 @@ impl Index {
     pub fn below(&self, layer: &str, uid: &str) -> Option<Below> {
         let resolution = self.below_layer(layer)?;
         let (path, node) = resolution.resolved.iter().find(|(_, n)| n.uid == uid)?;
-        let (content, content_path) = &node.content;
-        let source = &self.layers[*content];
-        let files = match node.kind {
-            Kind::Asset => self
-                .bundle_files(*content, content_path)
-                .map_or_else(Vec::new, |files| files.into_iter().map(|(name, file, _)| (name, file)).collect()),
-            Kind::File => {
-                source.scan.files.get(content_path).map_or_else(Vec::new, |f| vec![(String::new(), f.clone())])
-            }
-            Kind::Folder => vec![],
-        };
+        let source = &self.layers[node.content.0];
+        let files: Vec<(String, PathBuf)> =
+            self.node_files(node).into_iter().map(|(name, file, _)| (name, file)).collect();
         Some(Below {
             kind: node.kind,
             uid: uid.to_string(),
             path: path.clone(),
-            hash: self.content_hash(*content, content_path, node.kind),
+            hash: self.node_hash(node),
+            sha1s: files.iter().filter_map(|(name, f)| Some((name.clone(), self.sha1_of(f)?))).collect(),
             files,
             layer: source.name.clone(),
         })
@@ -1568,6 +1859,57 @@ impl Index {
         out
     }
 
+    /// What makes a layer's override of an entry (by uid) stale: what each file it changes conflicts with below - a
+    /// field, lines, a whole file - and each it removes, or holds, that changed below since otherwise.
+    #[must_use]
+    pub fn stale_parts(&self, layer: &str, uid: &str) -> Vec<StalePart> {
+        let Some(i) = self.layers.iter().position(|l| l.name == layer) else { return vec![] };
+        let Some(Op::Override { files, to }) = self.layers[i].changeset.ops.get(uid) else { return vec![] };
+        let Some(below) = self.below(layer, uid) else { return vec![] };
+        let at = to.clone().unwrap_or_else(|| below.path.clone());
+        let mine_of = |name: &str| match below.kind {
+            Kind::File => self.layers[i].scan.files.get(&at).cloned(),
+            _ => self.layers[i].scan.bundles.get(&at).and_then(|b| b.get(name)).cloned(),
+        };
+        let whole = |file: &str, mine: &str, was: &Option<String>, now: Option<&String>| StalePart {
+            file: file.to_string(),
+            field: None,
+            mine: Some(mine.to_string()),
+            was: Some(if was.is_some() { "a version" } else { "absent" }.to_string()),
+            now: Some(if now.is_some() { "another version" } else { "absent" }.to_string()),
+        };
+        let mut parts = Vec::new();
+        for (name, base) in files {
+            let shown = file_name(name, &at);
+            let now = below.files.iter().find(|(n, _)| n == name).map(|(_, f)| f);
+            let now_sha1 = below.sha1s.get(name);
+            if now_sha1 == base.was.as_ref() {
+                continue;
+            }
+            if base.removed {
+                parts.push(whole(&shown, "removed", &base.was, now_sha1));
+                continue;
+            }
+            let merged = base
+                .was
+                .as_ref()
+                .zip(now)
+                .zip(mine_of(name))
+                .and_then(|((was, now), mine)| self.merged(&shown, was, now, &mine));
+            match merged {
+                Some((_, conflicts)) => parts.extend(conflicts.into_iter().map(|c| StalePart {
+                    file: shown.clone(),
+                    field: c.at,
+                    mine: c.mine,
+                    was: c.base,
+                    now: c.theirs,
+                })),
+                None => parts.push(whole(&shown, "its own", &base.was, now_sha1)),
+            }
+        }
+        parts
+    }
+
     /// A layer's operations with their status, in the order of the paths they act on.
     #[must_use]
     pub fn operations(&self, layer: &str) -> Vec<OpView> {
@@ -1620,10 +1962,9 @@ impl Index {
             .filter_map(|(name, file)| Some((name, file.as_ref()?)))
             .filter(|(_, file)| !self.records.contains_key(&file.path))
             .filter_map(|(name, file)| {
-                let meta = std::fs::metadata(&file.path).ok()?;
-                let modified = meta.modified().map_or((0, 0), stamp);
+                let (size, modified) = crate::content::stat(&file.path).ok()?;
                 let declaration = name == NODE_FILE || name == SETTINGS_FILE;
-                Some(Pending { path: file.path.clone(), size: meta.len(), modified, declaration })
+                Some(Pending { path: file.path.clone(), size, modified: stamp(modified), declaration })
             })
             .collect();
         for (file, record) in unread.iter().zip(read_all(&unread)) {
@@ -1691,8 +2032,10 @@ impl Index {
         shown
     }
 
-    /// Keep the content hash of each entry a writable layer holds, for the next pass to tell moves.
+    /// Keep the content hash of each entry a writable layer holds, for a later pass to tell moves - and of each it lists
+    /// and no longer holds, as last known, until it is adopted somewhere else (`adoption`) or forgotten.
     fn remember_hashes(&mut self) {
+        let before = self.hashes.clone();
         self.hashes = Arc::new(
             (0..self.layers.len())
                 .map(|i| {
@@ -1702,7 +2045,15 @@ impl Index {
                     }
                     let held = layer.scan.bundles.keys().map(|p| (p, Kind::Asset));
                     let held = held.chain(layer.scan.files.keys().map(|p| (p, Kind::File)));
-                    held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect()
+                    let mut hashes: HashMap<String, String> =
+                        held.filter_map(|(p, k)| Some((p.clone(), self.content_hash(i, p, k)?))).collect();
+                    let last = before.get(i);
+                    for path in layer.changeset.entries.values().filter(|p| layer.scan.kind(p).is_none()) {
+                        if let Some(hash) = last.and_then(|last| last.get(path)) {
+                            hashes.insert(path.clone(), hash.clone());
+                        }
+                    }
+                    hashes
                 })
                 .collect(),
         );
@@ -1715,105 +2066,135 @@ impl Index {
         layer.changeset.entries.iter().find(|(_, listed)| *listed == path).map(|(uid, _)| uid.as_str())
     }
 
-    /// List what writable layers hold unlisted, and follow what moved outside the editor. A listed entry gone from
-    /// its path while an unlisted one holds the same content (by the hashes of the last pass) moved there, and keeps
-    /// its uid; a folder follows when what it held moved under a new name. What is left gets a create, under the uid
-    /// its `node.toml` names where it names one not taken, a new one otherwise; the changesets are written. What a
-    /// layer holds at a path a lower layer creates is not a create (an override, or a conflict).
+    /// List what writable layers hold unlisted, where that is how they are edited: a mounted tree (source code, worked on
+    /// with its own tools), and a layer folder the first time it is indexed, with no changeset yet. A layer folder is
+    /// otherwise storage, written by the editor: what it holds unlisted is a problem (`Problem::Unlisted`), which the
+    /// user adopts or removes (`edit::adopt`, `edit::remove_unlisted`) - never taken as an edit. The changesets of what
+    /// is listed are written.
     fn list_unlisted(&mut self) -> Result<()> {
+        for i in 0..self.layers.len() {
+            let layer = &self.layers[i];
+            if !layer.writable || layer.listing == Listing::Adopted {
+                continue;
+            }
+            let listing = self.listing(i, None)?;
+            let layer = &mut self.layers[i];
+            if layer.listing == Listing::Once {
+                layer.listing = Listing::Adopted;
+            }
+            if listing.is_empty() {
+                continue;
+            }
+            layer.changeset.entries.extend(listing);
+            layer.changeset.save(&layer.changeset_path)?;
+        }
+        Ok(())
+    }
+
+    /// How a layer would list what it holds unlisted - all of it, or what is at and under the paths given - each by its
+    /// uid and path. A listed entry gone from its path while an unlisted one holds the same content (by the hashes of the
+    /// last pass) moved there, and keeps its uid; a folder follows when what it held moved under a new name. What is
+    /// left gets a new entry, under the uid its `node.toml` names where it names one not taken, a new one otherwise. What
+    /// a layer holds at a path a lower layer creates is no entry of its own (an override, or a conflict).
+    ///
+    /// # Errors
+    /// A new uid cannot be made.
+    fn listing(&self, i: usize, only: Option<&[String]>) -> Result<Vec<(String, String)>> {
         let mut taken: HashSet<String> = HashSet::new();
         for layer in &self.layers {
             taken.extend(layer.changeset.entries.keys().cloned());
         }
-        let mut below: HashSet<String> = HashSet::new();
-        for i in 0..self.layers.len() {
-            let layer = &self.layers[i];
-            let listed: HashSet<&String> = layer.changeset.entries.values().collect();
-            let copies = self.override_targets(i);
-            let mut unlisted: BTreeSet<String> = layer
-                .scan
-                .paths()
-                .filter(|p| !listed.contains(p) && !below.contains(*p) && !copies.contains(*p))
-                .cloned()
-                .collect();
-            if !layer.writable || unlisted.is_empty() {
-                below.extend(layer.changeset.entries.values().cloned());
+        let below: HashSet<&String> = self.layers[..i].iter().flat_map(|l| l.changeset.entries.values()).collect();
+        let layer = &self.layers[i];
+        let listed: HashSet<&String> = layer.changeset.entries.values().collect();
+        let copies = self.override_targets(i);
+        let wanted = |p: &str| only.is_none_or(|only| only.iter().any(|o| p == o || p.starts_with(&format!("{o}/"))));
+        let mut unlisted: BTreeSet<String> = layer
+            .scan
+            .paths()
+            .filter(|p| !listed.contains(p) && !below.contains(p) && !copies.contains(*p) && wanted(p))
+            .cloned()
+            .collect();
+        if unlisted.is_empty() {
+            return Ok(vec![]);
+        }
+        // Moves: a gone entry's last hash found again at an unlisted path, once.
+        let gone: Vec<(String, String)> = layer
+            .changeset
+            .entries
+            .iter()
+            .filter(|(_, p)| layer.scan.kind(p).is_none())
+            .map(|(u, p)| (u.clone(), p.clone()))
+            .collect();
+        let mut by_hash: HashMap<String, Vec<String>> = HashMap::new();
+        for path in &unlisted {
+            if let Some(kind) = layer.scan.kind(path).filter(|k| *k != Kind::Folder)
+                && let Some(hash) = self.content_hash(i, path, kind)
+            {
+                by_hash.entry(hash).or_default().push(path.clone());
+            }
+        }
+        let last = self.hashes.get(i).cloned().unwrap_or_default();
+        let mut moves: Vec<(String, String, String)> = Vec::new();
+        for (id, old) in &gone {
+            if let Some(new) = last.get(old).and_then(|h| by_hash.get(h)).filter(|c| c.len() == 1).map(|c| c[0].clone())
+                && unlisted.remove(&new)
+            {
+                moves.push((id.clone(), old.clone(), new));
+            }
+        }
+        // A gone folder whose content moved from under it to under one new name moved there.
+        for (id, old) in &gone {
+            if layer.scan.kind(old).is_some() || moves.iter().any(|(u, _, _)| u == id) {
                 continue;
             }
-            // Moves: a gone entry's last hash found again at an unlisted path, once.
-            let gone: Vec<(String, String)> = layer
-                .changeset
-                .entries
+            let prefix = format!("{old}/");
+            let targets: BTreeSet<String> = moves
                 .iter()
-                .filter(|(_, p)| layer.scan.kind(p).is_none())
-                .map(|(u, p)| (u.clone(), p.clone()))
+                .filter_map(|(_, from, to)| {
+                    let rest = from.strip_prefix(&prefix)?;
+                    to.strip_suffix(&format!("/{rest}")).map(str::to_string)
+                })
                 .collect();
-            let mut by_hash: HashMap<String, Vec<String>> = HashMap::new();
-            for path in &unlisted {
-                if let Some(kind) = layer.scan.kind(path).filter(|k| *k != Kind::Folder)
-                    && let Some(hash) = self.content_hash(i, path, kind)
-                {
-                    by_hash.entry(hash).or_default().push(path.clone());
-                }
+            if targets.len() == 1
+                && let Some(new) = targets.into_iter().next()
+                && unlisted.remove(&new)
+            {
+                moves.push((id.clone(), old.clone(), new));
             }
-            let last = self.hashes.get(i).cloned().unwrap_or_default();
-            let mut moves: Vec<(String, String, String)> = Vec::new();
-            for (id, old) in &gone {
-                if let Some(new) =
-                    last.get(old).and_then(|h| by_hash.get(h)).filter(|c| c.len() == 1).map(|c| c[0].clone())
-                    && unlisted.remove(&new)
-                {
-                    moves.push((id.clone(), old.clone(), new));
-                }
-            }
-            // A gone folder whose content moved from under it to under one new name moved there.
-            for (id, old) in &gone {
-                if layer.scan.kind(old).is_some() || moves.iter().any(|(u, _, _)| u == id) {
-                    continue;
-                }
-                let prefix = format!("{old}/");
-                let targets: BTreeSet<String> = moves
-                    .iter()
-                    .filter_map(|(_, from, to)| {
-                        let rest = from.strip_prefix(&prefix)?;
-                        to.strip_suffix(&format!("/{rest}")).map(str::to_string)
-                    })
-                    .collect();
-                if targets.len() == 1
-                    && let Some(new) = targets.into_iter().next()
-                    && unlisted.remove(&new)
-                {
-                    moves.push((id.clone(), old.clone(), new));
-                }
-            }
-            let mut creates = Vec::new();
-            for path in unlisted {
-                let declared = layer
-                    .scan
-                    .bundles
-                    .get(&path)
-                    .and_then(|files| files.get(NODE_FILE))
-                    .and_then(|f| self.records.get(f))
-                    .and_then(|r| r.declaration.as_ref()?.uid.clone())
-                    .filter(|u| uid::parse(u).is_some() && !taken.contains(u));
-                let id = match declared {
-                    Some(id) => id,
-                    None => uid::text(
-                        uid::new(|id| taken.contains(&uid::text(id))).map_err(|e| anyhow::anyhow!("a new uid: {e}"))?,
-                    ),
-                };
-                taken.insert(id.clone());
-                creates.push((id, path));
-            }
-            let layer = &mut self.layers[i];
-            for (id, _, new) in moves {
-                layer.changeset.entries.insert(id, new);
-            }
-            layer.changeset.entries.extend(creates);
-            layer.changeset.save(&layer.changeset_path)?;
-            below.extend(layer.changeset.entries.values().cloned());
         }
-        Ok(())
+        let mut out: Vec<(String, String)> = moves.into_iter().map(|(id, _, new)| (id, new)).collect();
+        for path in unlisted {
+            let declared = layer
+                .scan
+                .bundles
+                .get(&path)
+                .and_then(|files| files.get(NODE_FILE))
+                .and_then(|f| self.records.get(f))
+                .and_then(|r| r.declaration.as_ref()?.uid.clone())
+                .filter(|u| uid::parse(u).is_some() && !taken.contains(u));
+            let id = match declared {
+                Some(id) => id,
+                None => uid::text(
+                    uid::new(|id| taken.contains(&uid::text(id))).map_err(|e| anyhow::anyhow!("a new uid: {e}"))?,
+                ),
+            };
+            taken.insert(id.clone());
+            out.push((id, path));
+        }
+        Ok(out)
+    }
+
+    /// How a layer would list what it holds unlisted at and under a path, each by its uid and path: its moves (a gone
+    /// entry's uid, at its new path) and its new entries (`listing`).
+    ///
+    /// # Errors
+    /// There is no such layer, or a new uid cannot be made.
+    pub fn adoption(&self, layer: &str, path: &str) -> Result<Vec<(String, String)>> {
+        let i = anyhow::Context::with_context(self.layers.iter().position(|l| l.name == layer), || {
+            format!("no layer {layer}")
+        })?;
+        self.listing(i, Some(&[path.to_string()]))
     }
 
     /// Where a layer's overrides put their copies: each override's move target, else its entry's path below the
@@ -1889,7 +2270,23 @@ impl Index {
                 imported: None,
                 disk: None,
             };
-            for (name, file, held) in self.bundle_files(node.content.0, &node.content.1).into_iter().flatten() {
+            let files = self.node_files(node);
+            // What overrides merged, in the cache: recorded as any file is, read once.
+            let unread: Vec<Pending> = files
+                .iter()
+                .filter(|(_, file, _)| !self.records.contains_key(file))
+                .filter_map(|(name, file, _)| {
+                    let (size, modified) = crate::content::stat(file).ok()?;
+                    let declaration = name == NODE_FILE || name == SETTINGS_FILE;
+                    Some(Pending { path: file.clone(), size, modified: stamp(modified), declaration })
+                })
+                .collect();
+            for (file, record) in unread.iter().zip(read_all(&unread)) {
+                if let Some(record) = record {
+                    self.records.insert(file.path.clone(), Arc::new(record));
+                }
+            }
+            for (name, file, held) in files {
                 let Some(record) = self.records.get(&file) else { continue };
                 if name == NODE_FILE
                     && let Some(d) = &record.declaration
@@ -2095,7 +2492,20 @@ mod tests {
     use super::{Index, Problem, STORE};
     use crate::Project;
     use crate::cache::Cache;
-    use crate::changeset::{Changeset, Op};
+    use crate::changeset::{Base, Changeset, Op};
+
+    /// The top layer's override of an entry, changing these files of it: each made from the version below now, kept.
+    fn overriding(index: &Index, uid: &str, files: &[&str]) -> Op {
+        let below = index.below("top", uid).expect("below top");
+        let store = crate::chunks::Store::at(index.merged.parent().and_then(Path::parent).expect("a project"));
+        let files = files.iter().map(|name| {
+            let (_, file) = below.files.iter().find(|(n, _)| n == name).expect("a file below");
+            store.put_file(&crate::content::read(file).expect("read")).expect("kept");
+            ((*name).to_string(), Base { was: below.sha1s.get(*name).cloned(), removed: false })
+        });
+        Op::Override { files: files.collect(), to: None }
+    }
+
     use crate::lock::Lock;
     use std::path::{Path, PathBuf};
 
@@ -2191,7 +2601,7 @@ mod tests {
         let base = changeset(&root, "base");
         let uid_of = |path: &str| base.entries.iter().find(|(_, p)| *p == path).unwrap().0.clone();
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), overriding(&index, "uid://a", &["node.toml", "native.texels"]));
         top.ops.insert(uid_of("b.node"), Op::Move { to: "c.node".into() });
         top.ops.insert(uid_of("f.node"), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
@@ -2261,11 +2671,20 @@ mod tests {
         let refreshed = index.refresh(&project, &[texels]).unwrap();
         assert_eq!(refreshed.assets.into_iter().collect::<Vec<_>>(), ["g/a"]);
         assert_eq!(index.read, 1);
-        // A folder renamed outside the editor: what it holds keeps its uids, and so does the folder.
+        // A folder renamed in the layer's folder, by other means than the editor: no edit, a problem - what it holds now
+        // is unlisted, what it listed missing - until it is adopted, which follows the move: the uids are kept.
         std::fs::rename(root.join(".layers/base/g"), root.join(".layers/base/h")).unwrap();
         index.refresh(&project, &[root.join(".layers/base/g"), root.join(".layers/base/h")]).unwrap();
+        assert!(!index.assets.contains_key("h/a"));
+        assert!(index.problems.contains(&Problem::Unlisted { layer: "base".into(), path: "h".into() }));
+        let adopted = index.adoption("base", "h").unwrap();
+        assert!(adopted.contains(&("uid://a".to_string(), "h/a.node".to_string())), "{adopted:?}");
+        assert!(adopted.contains(&(folder.clone(), "h".to_string())), "{adopted:?}");
+        let mut base = changeset(&root, "base");
+        base.entries.extend(adopted);
+        base.save(&root.join(".layers/base.toml")).unwrap();
+        index.refresh(&project, &[root.join(".layers/base.toml")]).unwrap();
         assert_eq!(index.assets["h/a"].uid.as_deref(), Some("uid://a"));
-        assert_eq!(changeset(&root, "base").entries.get(&folder).map(String::as_str), Some("h"));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // A bundle removed: its entry is missing until it is dropped from the changeset.
         std::fs::remove_dir_all(root.join(".layers/base/f.node")).unwrap();
@@ -2331,16 +2750,18 @@ mod tests {
         assert_ne!(shown(&index), shown(&fresh));
         let (_, again) = open(&root);
         assert_eq!(shown(&index), shown(&again));
-        // An override is made of the node and its files, and goes stale when the plan makes them otherwise.
+        // An override of the node's declaration sees the files the plan makes, and what it makes otherwise reaches it.
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), overriding(&index, "uid://a", &["node.toml"]));
         top.save(&root.join(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         let below = index.below("top", "uid://a").unwrap();
         assert!(below.files.iter().any(|(name, _)| name == "native.texels"), "{:?}", below.files);
         write(&root, ".layers/base-files/g/a.node/native.texels", "extracted otherwise");
         let (_, after) = open(&root);
-        assert!(after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
+        assert!(!after.problems.iter().any(|p| matches!(p, Problem::Stale { .. })), "{:?}", after.problems);
+        let texels = after.assets["g/a"].files.iter().find(|f| f.name == "native.texels").unwrap();
+        assert_eq!(std::fs::read_to_string(&texels.path).unwrap(), "extracted otherwise");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2376,9 +2797,9 @@ mod tests {
         check(&mut index, &project, &[base("n.node/node.toml")], "a new bundle", true);
         std::fs::remove_dir_all(base("n.node")).unwrap();
         check(&mut index, &project, &[base("n.node")], "a bundle removed", true);
-        // An override in top, then its base changed below it: stale, though only contents changed.
+        // An override in top, then what is below it changed: merged again, though only contents changed.
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), overriding(&index, "uid://a", &["node.toml"]));
         top.save(&root.join(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");
         check(
@@ -2395,8 +2816,8 @@ mod tests {
             &mut index,
             &project,
             &[root.join(".layers/top/g/a.node/node.toml")],
-            "the override's own content",
-            false,
+            "the override's own content, merged again",
+            true,
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2432,7 +2853,7 @@ mod tests {
         let root = project("hidden");
         let (_, index) = open(&root);
         let mut top = Changeset::default();
-        top.ops.insert("uid://a".into(), Op::Override { base: index.base_hash("g/a.node").unwrap(), to: None });
+        top.ops.insert("uid://a".into(), overriding(&index, "uid://a", &["node.toml"]));
         top.ops.insert("uid://nothing".into(), Op::Delete);
         top.save(&root.join(".layers/top.toml")).unwrap();
         write(&root, ".layers/top/g/a.node/node.toml", "stack = [{ op = \"t.image\" }]\n");

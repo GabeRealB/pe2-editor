@@ -1,7 +1,9 @@
 //! A layer's changeset: `<layer>.toml` beside the layer's directory in `.layers/`, the layer's net effect on the layers
 //! below it. `[entries]` lists what the layer creates - every asset, folder and plain file it owns, by uid; `[ops]`
-//! what it does to entries from below, one record per uid: an override (its own version, with the hash of the version
-//! below it was made from), a move, a delete. Nothing is implicit: an entry on disk the changeset does not list is
+//! what it does to entries from below, one record per uid: an override (the files it changes - a plain file itself,
+//! by an empty name - each with the SHA-1 of the version below it was made from, kept in the store, or removed), a
+//! move, a delete. What an override does not list comes from below as it is there; what it lists, it holds whole, and
+//! the index merges it over what is below now (`merge`). Nothing is implicit: an entry on disk the changeset does not list is
 //! unlisted, and the index inserts a create for it where the layer can be written.
 //!
 //! ```toml
@@ -12,7 +14,7 @@
 //! "uid://k2..." = "stages/akropolis/rooms/plaza/props/neon_sign"
 //!
 //! [ops]
-//! "uid://e8rx12suodf6" = { override = "sha1:..." }
+//! "uid://e8rx12suodf6" = { override = { "node.toml" = "3f2a...", "old.bin" = { was = "77ab...", removed = true } } }
 //! "uid://1x9..." = { to = "stages/akropolis/rooms/plaza/views/old" }
 //! "uid://7q2..." = { delete = true }
 //! ```
@@ -23,13 +25,22 @@ use std::path::Path;
 
 use crate::cache::write_atomic;
 
+/// What an override does to one file of the entry below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Base {
+    /// The SHA-1 of the version below it was made from, kept in the store; none where there was none (a file it adds).
+    pub was: Option<String>,
+    /// Removed, rather than held.
+    pub removed: bool,
+}
+
 /// What a layer does to an entry from below.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// Its own version, at the entry's resolved path in the layer; `base` is the hash of the version below it was
-    /// made from, and `to` a move with it.
+    /// Its own version, at the entry's resolved path in the layer: the files it changes, by name (a plain file's own,
+    /// ""), and `to` a move with it.
     Override {
-        base: String,
+        files: BTreeMap<String, Base>,
         to: Option<String>,
     },
     Move {
@@ -87,8 +98,25 @@ impl Changeset {
             let to = op.get("to").map(|v| string(v, uid)).transpose()?;
             let op = if op.get("delete").and_then(toml::Value::as_bool) == Some(true) {
                 Op::Delete
-            } else if let Some(base) = op.get("override") {
-                Op::Override { base: string(base, uid)?, to }
+            } else if let Some(files) = op.get("override") {
+                let Some(files) = files.as_table() else {
+                    bail!("{uid}: an override written by an older pe2 (`override = {files}`): it cannot be read");
+                };
+                let mut bases = BTreeMap::new();
+                for (name, base) in files {
+                    let base = match base {
+                        toml::Value::String(was) => {
+                            Base { was: (!was.is_empty()).then(|| was.clone()), removed: false }
+                        }
+                        toml::Value::Table(t) => Base {
+                            was: t.get("was").and_then(toml::Value::as_str).map(str::to_string),
+                            removed: t.get("removed").and_then(toml::Value::as_bool).unwrap_or(false),
+                        },
+                        _ => bail!("{uid}: {name}: neither a hash nor a table"),
+                    };
+                    bases.insert(name.clone(), base);
+                }
+                Op::Override { files: bases, to }
             } else if let Some(to) = to {
                 Op::Move { to }
             } else {
@@ -119,8 +147,26 @@ impl Changeset {
             lines.extend([String::new(), "[ops]".into()]);
             for (uid, op) in &self.ops {
                 let fields = match op {
-                    Op::Override { base, to: None } => format!("override = {}", quote(base)),
-                    Op::Override { base, to: Some(to) } => format!("override = {}, to = {}", quote(base), quote(to)),
+                    Op::Override { files, to } => {
+                        let files: Vec<String> = files
+                            .iter()
+                            .map(|(name, base)| {
+                                let was = base.was.as_deref().unwrap_or_default();
+                                let base = if base.removed {
+                                    format!("{{ was = {}, removed = true }}", quote(was))
+                                } else {
+                                    quote(was)
+                                };
+                                format!("{} = {base}", quote(name))
+                            })
+                            .collect();
+                        let files =
+                            if files.is_empty() { "{}".to_string() } else { format!("{{ {} }}", files.join(", ")) };
+                        match to {
+                            Some(to) => format!("override = {files}, to = {}", quote(to)),
+                            None => format!("override = {files}"),
+                        }
+                    }
                     Op::Move { to } => format!("to = {}", quote(to)),
                     Op::Delete => "delete = true".into(),
                 };
@@ -178,19 +224,30 @@ fn glob(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Changeset, Op};
+    use super::{Base, Changeset, Op};
 
     #[test]
     fn round_trip() {
         let mut changeset = Changeset { read_only: true, ignore: vec!["*.swp".into()], ..Changeset::default() };
         changeset.entries.insert("uid://b".into(), "z/b".into());
         changeset.entries.insert("uid://a".into(), "y/a".into());
-        changeset.ops.insert("uid://o".into(), Op::Override { base: "sha1:1".into(), to: Some("w".into()) });
+        let files = [
+            ("node.toml".to_string(), Base { was: Some("3f2a".into()), removed: false }),
+            ("new.txt".to_string(), Base { was: None, removed: false }),
+            ("old.bin".to_string(), Base { was: Some("77ab".into()), removed: true }),
+        ];
+        changeset
+            .ops
+            .insert("uid://o".into(), Op::Override { files: files.into_iter().collect(), to: Some("w".into()) });
+        changeset.ops.insert("uid://p".into(), Op::Override { files: std::collections::BTreeMap::default(), to: None });
         changeset.ops.insert("uid://m".into(), Op::Move { to: "v".into() });
         changeset.ops.insert("uid://d".into(), Op::Delete);
         let text = changeset.render();
         assert!(text.find("y/a").unwrap() < text.find("z/b").unwrap());
         assert_eq!(Changeset::parse(&text).unwrap(), changeset);
         assert!(changeset.ignores("a/.x.swp") && !changeset.ignores("a/x.swap"));
+        // One written before overrides listed their files is refused, by what it is.
+        let old = "[ops]\n\"uid://o\" = { override = \"sha1:1\" }\n";
+        assert!(format!("{:#}", Changeset::parse(old).unwrap_err()).contains("older pe2"));
     }
 }

@@ -16,10 +16,10 @@
 //! Who may edit which layer (locks, the active layer) is the caller's to decide.
 
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
-use crate::changeset::{Changeset, Op};
+use crate::changeset::{Base, Changeset, Op};
 use crate::history::History;
 use crate::index::{BUNDLE_SUFFIX, Index, Kind};
 use crate::{Layer, Project};
@@ -56,26 +56,12 @@ fn target(op: Option<&Op>, below: &str) -> String {
     }
 }
 
-/// Copy an entry's content from below into the layer at `path`.
-fn copy_in(
-    tx: &mut crate::history::Transaction<'_>,
-    layer: &Layer,
-    path: &str,
-    files: &[(String, PathBuf)],
-) -> Result<()> {
-    for (file, source) in files {
-        let bytes = std::fs::read(source).with_context(|| source.display().to_string())?;
-        let disk = if file.is_empty() { layer.disk(path) } else { layer.disk(path).join(file) };
-        tx.write(&disk, &bytes)?;
-    }
-    Ok(())
-}
-
 fn write_changeset(tx: &mut crate::history::Transaction<'_>, layer: &Layer, changeset: &Changeset) -> Result<()> {
     tx.write(&layer.changeset, changeset.render().as_bytes())
 }
 
-/// Make the layer's own copy of an entry from below, recording the override: where the copy is.
+/// Override an entry from below in a layer, recording it: the layer holds nothing of it yet - what it writes it holds,
+/// the rest coming from below as it is there. Where the override is.
 fn own_copy(
     tx: &mut crate::history::Transaction<'_>,
     index: &Index,
@@ -83,19 +69,6 @@ fn own_copy(
     layer_name: &str,
     changeset: &mut Changeset,
     uid: &str,
-) -> Result<String> {
-    own(tx, index, layer, layer_name, changeset, uid, |_| true)
-}
-
-/// A layer's own version of an entry, made of those of its files `keep` takes.
-fn own(
-    tx: &mut crate::history::Transaction<'_>,
-    index: &Index,
-    layer: &Layer,
-    layer_name: &str,
-    changeset: &mut Changeset,
-    uid: &str,
-    keep: impl Fn(&str) -> bool,
 ) -> Result<String> {
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
     if below.kind == Kind::Folder {
@@ -107,12 +80,27 @@ fn own(
     }
     let at = target(op, &below.path);
     let to = matches!(op, Some(Op::Move { .. })).then(|| at.clone());
-    let base = below.hash.clone().with_context(|| format!("{}: no content to override", below.path))?;
-    let files: Vec<(String, PathBuf)> = below.files.iter().filter(|(file, _)| keep(file)).cloned().collect();
-    copy_in(tx, layer, &at, &files)?;
-    changeset.ops.insert(uid.to_string(), Op::Override { base, to });
+    let mut files = BTreeMap::new();
+    // Code is edited where it is, with its own tools: a files layer holds a copy of what it overrides at once.
+    if layer.kind == crate::LayerKind::Files {
+        let store = crate::chunks::Store::at(project_root(layer));
+        for (file, source) in &below.files {
+            let bytes = crate::content::read(source).with_context(|| source.display().to_string())?;
+            let disk = if file.is_empty() { layer.disk(&at) } else { layer.disk(&at).join(file) };
+            tx.write(&disk, &bytes)?;
+            let was = store.put_file(&bytes)?;
+            files.insert(file.clone(), Base { was: Some(was), removed: false });
+        }
+    }
+    changeset.ops.insert(uid.to_string(), Op::Override { files, to });
     write_changeset(tx, layer, changeset)?;
     Ok(at)
+}
+
+/// The project a layer is of: the folder holding `.layers`, where its changeset is.
+fn project_root(layer: &Layer) -> &std::path::Path {
+    let layers = layer.changeset.parent().unwrap_or(&layer.changeset);
+    layers.parent().unwrap_or(layers)
 }
 
 /// Write a file of an entry in a layer - a bundle's file by its name, a plain file itself (an empty name) - in the
@@ -139,9 +127,88 @@ pub fn write_file(
         tx = tx.merging(key);
     }
     let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
-    let disk = if file.is_empty() { layer.disk(&path) } else { layer.disk(&path).join(file) };
-    tx.write(&disk, bytes)?;
+    let at = Place { project, index, layer, layer_name, uid, path: &path };
+    put_files(&mut tx, &at, &mut changeset, &[(file, Some(bytes))])?;
     tx.commit()
+}
+
+/// Where files of an entry are written: in a layer's own version of it.
+struct Place<'a> {
+    project: &'a Project,
+    index: &'a Index,
+    layer: &'a Layer,
+    layer_name: &'a str,
+    uid: &'a str,
+    /// The entry's path in the layer.
+    path: &'a str,
+}
+
+impl Place<'_> {
+    /// A file of the entry on disk: a bundle's by its name, a plain file itself (an empty name).
+    fn disk(&self, file: &str) -> PathBuf {
+        if file.is_empty() { self.layer.disk(self.path) } else { self.layer.disk(self.path).join(file) }
+    }
+}
+
+/// Write (with content) or remove (without) files of an entry in the layer's own version of it. The layer's own entry
+/// takes them as they are. An override holds a file it writes whole, recording the version below now as what it was
+/// made from (kept in the store, for merging when it changes below) - or, written as it is below, holds nothing of it -
+/// and records a file it removes as removed.
+///
+/// # Errors
+/// A file cannot be written or kept.
+fn put_files(
+    tx: &mut crate::history::Transaction<'_>,
+    at: &Place<'_>,
+    changeset: &mut Changeset,
+    files: &[(&str, Option<&[u8]>)],
+) -> Result<()> {
+    let Some(Op::Override { files: mut bases, to }) = changeset.ops.get(at.uid).cloned() else {
+        for (file, bytes) in files {
+            match bytes {
+                Some(bytes) => tx.write(&at.disk(file), bytes)?,
+                None if crate::content::exists(&at.disk(file)) => tx.remove(&at.disk(file))?,
+                None => {}
+            }
+        }
+        return Ok(());
+    };
+    let below =
+        at.index.below(at.layer_name, at.uid).with_context(|| format!("{} is gone below {}", at.uid, at.layer_name))?;
+    let store = crate::chunks::Store::at(&at.project.root);
+    for (file, bytes) in files {
+        let disk = at.disk(file);
+        let now = below.files.iter().find(|(name, _)| name == file).map(|(_, path)| path);
+        let now_sha1 = below.sha1s.get(*file).cloned();
+        let held = crate::content::exists(&disk);
+        match bytes {
+            Some(bytes) if now_sha1.as_deref() == Some(crate::extract::sha1_hex(bytes).as_str()) => {
+                // As it is below: nothing to hold.
+                if held {
+                    tx.remove(&disk)?;
+                }
+                bases.remove(*file);
+            }
+            Some(bytes) => {
+                tx.write(&disk, bytes)?;
+                if let Some(now) = now {
+                    store.put_file(&crate::content::read(now)?)?;
+                }
+                bases.insert((*file).to_string(), Base { was: now_sha1, removed: false });
+            }
+            None => {
+                if held {
+                    tx.remove(&disk)?;
+                }
+                match now_sha1 {
+                    Some(was) => bases.insert((*file).to_string(), Base { was: Some(was), removed: true }),
+                    None => bases.remove(*file),
+                };
+            }
+        }
+    }
+    changeset.ops.insert(at.uid.to_string(), Op::Override { files: bases, to });
+    write_changeset(tx, at.layer, changeset)
 }
 
 /// Where a layer's own version of an entry is: the layer's entry, its override's copy, or a copy made now.
@@ -182,14 +249,9 @@ pub fn save(
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let mut tx = history.begin(label).kind(crate::history::Kind::Save);
     let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
-    for (file, bytes) in files {
-        let disk = layer.disk(&path).join(file);
-        match bytes {
-            Some(bytes) => tx.write(&disk, bytes)?,
-            None if disk.exists() => tx.remove(&disk)?,
-            None => {}
-        }
-    }
+    let at = Place { project, index, layer, layer_name, uid, path: &path };
+    let files: Vec<(&str, Option<&[u8]>)> = files.iter().map(|(f, b)| (f.as_str(), b.as_deref())).collect();
+    put_files(&mut tx, &at, &mut changeset, &files)?;
     tx.commit()
 }
 
@@ -210,23 +272,94 @@ pub fn create(
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
     let mut tx = history.begin(format!("New {}", name(&bundle)));
-    // A folder it is the first thing in: of this step, or the index lists it and the layer's list changes under the history.
-    let mut taken = HashSet::new();
-    for (at, _) in path.match_indices('/') {
-        let folder = &path[..at];
-        if index.entries.contains_key(folder) || changeset.entries.values().any(|known| known == folder) {
-            continue;
-        }
-        let id = crate::uid::new(|id| taken.contains(&id) || index.by_uid.contains_key(&crate::uid::text(id)))?;
-        taken.insert(id);
-        tx.make_dir(&layer.disk(folder))?;
-        changeset.entries.insert(crate::uid::text(id), folder.to_string());
-    }
+    let mut taken = HashSet::from([uid.to_string()]);
+    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
     tx.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
     for (name, bytes) in files {
         tx.write(&layer.disk(&bundle).join(name), bytes)?;
     }
     changeset.entries.insert(uid.to_string(), bundle);
+    write_changeset(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
+/// The folders a new entry at `path` is the first thing in, made in the step and listed: of this step, or the index
+/// lists them and the layer's list changes under the history. `taken` holds the uids given in the step.
+fn make_parents(
+    tx: &mut crate::history::Transaction<'_>,
+    index: &Index,
+    layer: &Layer,
+    changeset: &mut Changeset,
+    path: &str,
+    taken: &mut HashSet<String>,
+) -> Result<()> {
+    for (at, _) in path.match_indices('/') {
+        let folder = &path[..at];
+        if index.entries.contains_key(folder) || changeset.entries.values().any(|known| known == folder) {
+            continue;
+        }
+        let uid = new_uid(index, taken)?;
+        tx.make_dir(&layer.disk(folder))?;
+        changeset.entries.insert(uid, folder.to_string());
+    }
+    Ok(())
+}
+
+/// A uid neither the project nor this step has given.
+fn new_uid(index: &Index, taken: &mut HashSet<String>) -> Result<String> {
+    let id = crate::uid::new(|id| {
+        let text = crate::uid::text(id);
+        taken.contains(&text) || index.by_uid.contains_key(&text)
+    })?;
+    let text = crate::uid::text(id);
+    taken.insert(text.clone());
+    Ok(text)
+}
+
+/// Make a plain file in a layer at a resolved path, with its content and a new uid; the folders it is the first thing
+/// in, too. Returns the paths touched.
+///
+/// # Errors
+/// Something is at that path already, or the layer cannot be written.
+pub fn create_file(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    path: &str,
+    bytes: &[u8],
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    anyhow::ensure!(!index.entries.contains_key(path), "{path} is there already");
+    let mut tx = history.begin(format!("New {}", name(path)));
+    let mut taken = HashSet::new();
+    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
+    tx.write(&layer.disk(path), bytes)?;
+    let uid = new_uid(index, &mut taken)?;
+    changeset.entries.insert(uid, path.to_string());
+    write_changeset(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
+/// Make a folder in a layer at a resolved path, with a new uid; the folders it is in, too. Returns the paths touched.
+///
+/// # Errors
+/// Something is at that path already, or the layer cannot be written.
+pub fn create_folder(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    path: &str,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    anyhow::ensure!(!index.entries.contains_key(path), "{path} is there already");
+    let mut tx = history.begin(format!("New {}", name(path)));
+    let mut taken = HashSet::new();
+    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
+    tx.make_dir(&layer.disk(path))?;
+    let uid = new_uid(index, &mut taken)?;
+    changeset.entries.insert(uid, path.to_string());
     write_changeset(&mut tx, layer, &changeset)?;
     tx.commit()
 }
@@ -253,29 +386,31 @@ pub fn override_entry(
     tx.commit()
 }
 
-/// Override an asset from below with its declaration alone, not its files: for a stack that reads what it needs of the
-/// version it replaces (the graph's `below`), so a large file stays the layer's below. Returns the paths touched.
-///
-/// # Errors
-/// As `override_entry`.
-pub fn override_declaration(
-    project: &Project,
-    index: &Index,
-    layer_name: &str,
-    uid: &str,
-    history: &mut History,
-) -> Result<Vec<PathBuf>> {
-    let (layer, mut changeset) = layer(project, index, layer_name)?;
-    if changeset.entries.contains_key(uid) {
-        bail!("{layer_name} makes it: it is the layer's own already");
-    }
-    let shown = index.below(layer_name, uid).map_or_default(|b| target(changeset.ops.get(uid), &b.path));
-    let mut tx = history.begin(format!("Override {} in {layer_name}", name(&shown)));
-    own(&mut tx, index, layer, layer_name, &mut changeset, uid, |file| file == crate::index::NODE_FILE)?;
-    tx.commit()
+/// The entry paired with one, by its real path: a node's folder of children (`x.node` and `x`), or a folder's node.
+/// They are one thing - a node with what is inside it - and are renamed, moved and deleted together.
+#[must_use]
+pub fn paired(index: &Index, real: &str) -> Option<String> {
+    let other = match real.strip_suffix(BUNDLE_SUFFIX) {
+        Some(folder) => (folder.to_string(), Kind::Folder),
+        None => (format!("{real}{BUNDLE_SUFFIX}"), Kind::Asset),
+    };
+    let entry = index.entries.get(&other.0)?;
+    let mine = index.entries.get(real)?;
+    (entry.kind == other.1 && mine.kind != Kind::File).then_some(other.0)
 }
 
-/// Delete an entry from a layer's view: one the layer makes leaves it; one from below gets a delete.
+/// The uid of the entry at a real path.
+fn uid_at(index: &Index, real: &str) -> Option<String> {
+    index.entries.get(real).map(|e| e.uid.clone())
+}
+
+/// The real path an entry resolves at now, by its uid.
+fn real_of(index: &Index, uid: &str) -> Option<String> {
+    index.entries.iter().find(|(_, e)| e.uid == uid).map(|(path, _)| path.clone())
+}
+
+/// Delete an entry from a layer's view, with the entry paired with it (`paired`): one the layer makes leaves it; one
+/// from below gets a delete.
 ///
 /// # Errors
 /// The entry is neither the layer's nor below it, or files cannot be written.
@@ -287,19 +422,35 @@ pub fn delete(
     history: &mut History,
 ) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
+    let shown = real_of(index, uid).unwrap_or_else(|| uid.to_string());
+    let mut tx = history.begin(format!("Delete {}", name(&shown)));
+    delete_in(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    if let Some(other) = paired(index, &shown).and_then(|p| uid_at(index, &p)) {
+        delete_in(&mut tx, index, layer, layer_name, &mut changeset, &other)?;
+    }
+    write_changeset(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
+/// Delete an entry within a step: its files, and what the changeset says of it.
+fn delete_in(
+    tx: &mut crate::history::Transaction<'_>,
+    index: &Index,
+    layer: &Layer,
+    layer_name: &str,
+    changeset: &mut Changeset,
+    uid: &str,
+) -> Result<()> {
     if let Some(path) = changeset.entries.get(uid).cloned() {
-        let mut tx = history.begin(format!("Delete {}", name(&path)));
         if layer.disk(&path).exists() {
             tx.remove(&layer.disk(&path))?;
         }
         let inside = format!("{path}/");
         changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
-        write_changeset(&mut tx, layer, &changeset)?;
-        return tx.commit();
+        return Ok(());
     }
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
     let at = target(changeset.ops.get(uid), &below.path);
-    let mut tx = history.begin(format!("Delete {}", name(&at)));
     if matches!(changeset.ops.get(uid), Some(Op::Override { .. })) && layer.disk(&at).exists() {
         tx.remove(&layer.disk(&at))?;
     }
@@ -317,8 +468,7 @@ pub fn delete(
         }
     }
     changeset.ops.insert(uid.to_string(), Op::Delete);
-    write_changeset(&mut tx, layer, &changeset)?;
-    tx.commit()
+    Ok(())
 }
 
 /// Take an entry the layer lists but no longer holds out of its list: deleted outside the editor, it is kept listed (its
@@ -348,6 +498,47 @@ pub fn forget(
     tx.commit()
 }
 
+/// Adopt what a layer holds unlisted at and under a path (`Problem::Unlisted`): listed in its changeset, an entry gone
+/// from the layer whose content is found there keeping its uid (moved), the rest new entries (`Index::adoption`). Only
+/// the list is written.
+///
+/// # Errors
+/// The layer's list cannot be written, nothing is unlisted there, or a new uid cannot be made.
+pub fn adopt(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    path: &str,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    let adopted = index.adoption(layer_name, path)?;
+    anyhow::ensure!(!adopted.is_empty(), "{layer_name} lists all it holds at {path}");
+    let mut tx = history.begin(format!("Adopt {}", name(path)));
+    changeset.entries.extend(adopted);
+    write_changeset(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
+/// Remove what a layer holds unlisted at a path (`Problem::Unlisted`) from its folder: the file, or the folder and all
+/// in it.
+///
+/// # Errors
+/// The path is listed, or cannot be removed.
+pub fn remove_unlisted(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    path: &str,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, changeset) = layer(project, index, layer_name)?;
+    anyhow::ensure!(!changeset.entries.values().any(|p| p == path), "{layer_name} lists {path}: delete it instead");
+    let mut tx = history.begin(format!("Remove {} from {layer_name}", name(path)));
+    tx.remove(&layer.disk(path))?;
+    tx.commit()
+}
+
 /// What a rename is called: of the name, or of the folder where the name stays.
 fn rename_label(from: &str, to: &str) -> String {
     if name(from) != name(to) {
@@ -357,7 +548,8 @@ fn rename_label(from: &str, to: &str) -> String {
     format!("Move {} to {folder}", name(to))
 }
 
-/// Rename or move an entry to another resolved path: one the layer makes moves on disk; one from below gets a move.
+/// Rename or move an entry to another resolved path, with the entry paired with it (`paired`): one the layer makes
+/// moves on disk; one from below gets a move.
 ///
 /// # Errors
 /// Something resolves to the target already, the entry is neither the layer's nor below it, or files cannot be
@@ -371,11 +563,35 @@ pub fn rename(
     history: &mut History,
 ) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
+    let from = real_of(index, uid).with_context(|| format!("{uid}: no entry"))?;
+    let mut tx = history.begin(rename_label(&from, to));
+    rename_in(&mut tx, index, layer, layer_name, &mut changeset, uid, to)?;
+    if let Some(other) = paired(index, &from) {
+        let other_to = match to.strip_suffix(BUNDLE_SUFFIX) {
+            Some(folder) => folder.to_string(),
+            None => format!("{to}{BUNDLE_SUFFIX}"),
+        };
+        let other_uid = uid_at(index, &other).with_context(|| format!("{other}: no entry"))?;
+        rename_in(&mut tx, index, layer, layer_name, &mut changeset, &other_uid, &other_to)?;
+    }
+    write_changeset(&mut tx, layer, &changeset)?;
+    tx.commit()
+}
+
+/// Rename an entry within a step: its files where the layer holds them, and what the changeset says of it.
+fn rename_in(
+    tx: &mut crate::history::Transaction<'_>,
+    index: &Index,
+    layer: &Layer,
+    layer_name: &str,
+    changeset: &mut Changeset,
+    uid: &str,
+    to: &str,
+) -> Result<()> {
     if index.entries.contains_key(to) {
         bail!("{to}: an entry is there already");
     }
     if let Some(from) = changeset.entries.get(uid).cloned() {
-        let mut tx = history.begin(rename_label(&from, to));
         tx.rename(&layer.disk(&from), &layer.disk(to))?;
         let inside = format!("{from}/");
         for path in changeset.entries.values_mut() {
@@ -385,8 +601,7 @@ pub fn rename(
                 *path = format!("{to}/{rest}");
             }
         }
-        write_changeset(&mut tx, layer, &changeset)?;
-        return tx.commit();
+        return Ok(());
     }
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
     let op = changeset.ops.get(uid).cloned();
@@ -394,12 +609,15 @@ pub fn rename(
         bail!("{layer_name} deletes {}", below.path);
     }
     let from = target(op.as_ref(), &below.path);
-    let mut tx = history.begin(rename_label(&from, to));
     let back = (to != below.path).then(|| to.to_string());
     let new = match op {
-        Some(Op::Override { base, .. }) => {
-            tx.rename(&layer.disk(&from), &layer.disk(to))?;
-            Some(Op::Override { base, to: back })
+        Some(Op::Override { files, .. }) => {
+            // What it holds of it goes with it; it may hold nothing yet.
+            let held = layer.disk(&from);
+            if held.is_dir() || crate::content::exists(&held) {
+                tx.rename(&held, &layer.disk(to))?;
+            }
+            Some(Op::Override { files, to: back })
         }
         _ => back.map(|to| Op::Move { to }),
     };
@@ -408,8 +626,7 @@ pub fn rename(
         // Moved back where it is below: no move left.
         None => changeset.ops.remove(uid),
     };
-    write_changeset(&mut tx, layer, &changeset)?;
-    tx.commit()
+    Ok(())
 }
 
 /// Resolve a layer's operation on an entry.
@@ -430,11 +647,32 @@ pub fn resolve(
     let at = target(Some(&op), below.as_ref().map_or("", |b| b.path.as_str()));
     let shown = if at.is_empty() { uid } else { name(&at) };
     match (resolution, &op) {
-        (Resolution::KeepMine, Op::Override { to, .. }) => {
+        (Resolution::KeepMine, Op::Override { files, to }) => {
             let below = below.with_context(|| format!("{uid} is gone below {layer_name}"))?;
-            let base = below.hash.with_context(|| format!("{}: no content below", below.path))?;
+            let store = crate::chunks::Store::at(&project.root);
             let mut tx = history.begin(format!("Keep my version of {shown}"));
-            changeset.ops.insert(uid.to_string(), Op::Override { base, to: to.clone() });
+            let place = Place { project, index, layer, layer_name, uid, path: &at };
+            let mut kept = BTreeMap::new();
+            for (file, base) in files {
+                let now = below.files.iter().find(|(name, _)| name == file).map(|(_, path)| path);
+                let now_sha1 = below.sha1s.get(file).cloned();
+                // Mine over what is below now - mine where both changed the same thing - is what it holds from now.
+                if !base.removed
+                    && base.was != now_sha1
+                    && let (Some(was), Some(now)) = (&base.was, now)
+                    && let Ok(old) = store.get_file(was)
+                {
+                    let mine = crate::content::read(&place.disk(file))?;
+                    let name = if file.is_empty() { name(&at) } else { file.as_str() };
+                    let merged = crate::merge::merge(name, &old, &crate::content::read(now)?, &mine);
+                    tx.write(&place.disk(file), &merged.bytes)?;
+                }
+                if let Some(now) = now {
+                    store.put_file(&crate::content::read(now)?)?;
+                }
+                kept.insert(file.clone(), Base { was: now_sha1, removed: base.removed });
+            }
+            changeset.ops.insert(uid.to_string(), Op::Override { files: kept, to: to.clone() });
             write_changeset(&mut tx, layer, &changeset)?;
             tx.commit()
         }
@@ -525,15 +763,169 @@ mod tests {
     }
 
     #[test]
+    fn what_a_layer_holds_unlisted_is_adopted_or_removed() {
+        let root = project("unlisted");
+        let mut o = open(&root);
+        // Put in the layer's folder by other means than the editor: no entry, a problem.
+        let new = root.join(".layers/top/x.node/node.toml");
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, "uid = \"uid://xxxxxxxxxxxx\"\nstack = []\n").unwrap();
+        let junk = root.join(".layers/top/junk/a.bin");
+        std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+        std::fs::write(&junk, "junk").unwrap();
+        // As a watcher reports them: the folders made, with what is in them.
+        o.refresh(&[root.join(".layers/top/x.node"), root.join(".layers/top/junk")]);
+        assert!(!o.index.assets.contains_key("x"));
+        let unlisted = |o: &Open| -> Vec<String> {
+            o.index
+                .problems
+                .iter()
+                .filter_map(|p| match p {
+                    Problem::Unlisted { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(unlisted(&o), ["junk", "x.node"], "a tree is one problem");
+        // Adopted: listed under the uid its declaration names.
+        let paths = super::adopt(&o.project, &o.index, "top", "x.node", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert_eq!(o.index.assets["x"].uid.as_deref(), Some("uid://xxxxxxxxxxxx"));
+        // Removed: gone from the folder, and undone, back.
+        let paths = super::remove_unlisted(&o.project, &o.index, "top", "junk", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!junk.exists() && unlisted(&o).is_empty(), "{:?}", o.index.problems);
+        let paths = o.history.undo(&o.index, None, false).unwrap().paths();
+        o.refresh(&paths);
+        assert!(junk.exists());
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_override_whose_copy_is_deleted_outside_shows_what_is_below() {
+        let root = project("copy-gone");
+        let mut o = open(&root);
+        let n = o.uid("n");
+        let paths =
+            super::write_file(&o.project, &o.index, "top", &n, "", b"mine", "Edit".into(), None, &mut o.history)
+                .unwrap();
+        o.refresh(&paths);
+        assert_eq!(std::fs::read_to_string(&o.index.entries["n"].disk).unwrap(), "mine");
+        // Its copy deleted by another program: the file is what is below again, and the override says it is missing.
+        std::fs::remove_file(root.join(".layers/top/n")).unwrap();
+        o.refresh(&[root.join(".layers/top/n")]);
+        let entry = o.index.entries.get("n").expect("still there");
+        assert_eq!(std::fs::read_to_string(&entry.disk).unwrap(), "notes");
+        assert!(o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_node_and_its_folder_of_children_go_together() {
+        let root = project("pair");
+        let child = root.join(".layers/base/g/a/b.node/node.toml");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, "stack = []\n").unwrap();
+        let mut o = open(&root);
+        let a = o.uid("g/a.node");
+        assert_eq!(super::paired(&o.index, "g/a.node").as_deref(), Some("g/a"));
+        assert_eq!(super::paired(&o.index, "g/a").as_deref(), Some("g/a.node"));
+        // Renamed, from below: both move, one step.
+        let paths = rename(&o.project, &o.index, "top", &a, "g/c.node", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(
+            o.index.assets.contains_key("g/c") && o.index.assets.contains_key("g/c/b"),
+            "{:?}",
+            o.index.assets.keys()
+        );
+        assert!(!o.index.entries.contains_key("g/a"));
+        // Deleted: both go; undone, both are back.
+        let c = o.uid("g/c.node");
+        let paths = delete(&o.project, &o.index, "top", &c, &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!o.index.assets.contains_key("g/c") && !o.index.assets.contains_key("g/c/b"));
+        let paths = o.history.undo(&o.index, None, false).unwrap().paths();
+        o.refresh(&paths);
+        assert!(o.index.assets.contains_key("g/c/b"));
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_override_holds_what_it_changes_and_merges_it_over_changes_below() {
+        let root = project("merge");
+        let mut o = open(&root);
+        let uid = o.uid("g/a.node");
+        let declared = |o: &Open| o.index.assets["g/a"].text().to_string();
+        let stale = |o: &Open| o.index.problems.iter().any(|p| matches!(p, Problem::Stale { .. }));
+        let below = root.join(".layers/base/g/a.node/node.toml");
+        std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\nname = \"a\"\n").unwrap();
+        o.refresh(std::slice::from_ref(&below));
+        let mine = "stack = [{ op = \"t.image\" }]\nsize = 3\nname = \"a\"\n";
+        let write = |o: &mut Open, file: &str, bytes: &[u8]| {
+            let paths =
+                super::write_file(&o.project, &o.index, "top", &uid, file, bytes, "Edit".into(), None, &mut o.history)
+                    .unwrap();
+            o.refresh(&paths);
+        };
+        write(&mut o, "node.toml", mine.as_bytes());
+        // It holds the file whole, with what it was made from; the texels are below's still.
+        let held = root.join(".layers/top/g/a.node/node.toml");
+        assert_eq!(std::fs::read_to_string(&held).unwrap(), mine);
+        let Some(Op::Override { files, .. }) = o.op("g/a.node") else { panic!("no override") };
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["node.toml"]);
+        assert!(files["node.toml"].was.is_some());
+        assert!(!root.join(".layers/top/g/a.node/native.texels").exists());
+        assert!(o.index.assets["g/a"].files.iter().any(|f| f.name == "native.texels" && f.layer == "base"));
+        // Another field changed below reaches it, and it is not stale.
+        std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\nname = \"b\"\n").unwrap();
+        o.refresh(std::slice::from_ref(&below));
+        assert!(declared(&o).contains("name = \"b\"") && declared(&o).contains("size = 3"), "{}", declared(&o));
+        assert!(!stale(&o), "{:?}", o.index.problems);
+        // The same field changed below: mine is kept, and it is stale, saying where.
+        std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 5\nname = \"b\"\n").unwrap();
+        o.refresh(std::slice::from_ref(&below));
+        assert!(declared(&o).contains("size = 3") && stale(&o));
+        let parts = o.index.stale_parts("top", &uid);
+        let part = parts.iter().map(|p| (p.field.as_deref(), p.mine.as_deref(), p.was.as_deref(), p.now.as_deref()));
+        assert_eq!(part.collect::<Vec<_>>(), [(Some("size"), Some("3"), Some("2"), Some("5"))]);
+        // Kept: what it holds is the merge, made from what is below now.
+        let paths = resolve(&o.project, &o.index, "top", &uid, Resolution::KeepMine, &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!stale(&o), "{:?}", o.index.problems);
+        let kept = std::fs::read_to_string(&held).unwrap();
+        assert!(kept.contains("size = 3") && kept.contains("name = \"b\""), "{kept}");
+        // Text that is no TOML merges by line.
+        let notes = root.join(".layers/base/g/a.node/notes.txt");
+        std::fs::write(&notes, "one\ntwo\nthree\n").unwrap();
+        o.refresh(std::slice::from_ref(&notes));
+        write(&mut o, "notes.txt", b"ONE\ntwo\nthree\n");
+        std::fs::write(&notes, "one\ntwo\nTHREE\n").unwrap();
+        o.refresh(std::slice::from_ref(&notes));
+        let shown = o.index.assets["g/a"].files.iter().find(|f| f.name == "notes.txt").unwrap().path.clone();
+        assert_eq!(std::fs::read_to_string(shown).unwrap(), "ONE\ntwo\nTHREE\n");
+        assert!(!stale(&o), "{:?}", o.index.problems);
+        // Written as it is below, it holds nothing of it.
+        write(&mut o, "notes.txt", b"one\ntwo\nTHREE\n");
+        assert!(!root.join(".layers/top/g/a.node/notes.txt").exists());
+        assert!(matches!(o.op("g/a.node"), Some(Op::Override { files, .. }) if !files.contains_key("notes.txt")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn overrides_renames_and_deletes() {
         let root = project("ops");
         let mut o = open(&root);
         let a = o.uid("g/a.node");
-        // Override: the top's own copy wins.
+        // Override: the top's version wins, holding nothing yet, its files those below.
         let paths = override_entry(&o.project, &o.index, "top", &a, &mut o.history).unwrap();
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base", "top"]);
-        assert!(root.join(".layers/top/g/a.node/native.texels").exists());
+        assert!(!root.join(".layers/top/g/a.node").exists());
+        assert!(!root.join(".layers/top/g/a.node/native.texels").exists());
+        assert!(o.index.assets["g/a"].files.iter().any(|f| f.name == "native.texels" && f.layer == "base"));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         // Renamed: the move goes with the override, its copy moved too.
         let paths = rename(&o.project, &o.index, "top", &a, "g/b.node", &mut o.history).unwrap();
@@ -616,9 +1008,27 @@ mod tests {
         let a = o.uid("g/a.node");
         let paths = override_entry(&o.project, &o.index, "top", &a, &mut o.history).unwrap();
         o.refresh(&paths);
-        // The base changes under the override: stale.
+        // A file it does not hold changes below: that reaches it.
         let texels = root.join(".layers/base/g/a.node/native.texels");
         std::fs::write(&texels, "retouched").unwrap();
+        o.refresh(std::slice::from_ref(&texels));
+        assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
+        // One it holds changes below: stale.
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            "top",
+            &a,
+            "native.texels",
+            b"mine",
+            "Edit".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
+        std::fs::write(&texels, "retouched again").unwrap();
         o.refresh(&[texels]);
         assert_eq!(o.index.problems, [Problem::Stale { layer: "top".into(), path: "g/a.node".into() }]);
         let paths = resolve(&o.project, &o.index, "top", &a, Resolution::KeepMine, &mut o.history).unwrap();

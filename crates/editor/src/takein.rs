@@ -340,8 +340,15 @@ impl Worker {
     fn sweep_aside(&self) {
         self.store.mark_swept();
         let (store, nodes) = (self.store.clone(), project::imports::live_nodes(&self.index));
+        let project = self.project.clone();
         let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
             let _ = project::imports::sweep_store(&store, &nodes);
+            // The layers' chunks too, where it is due: those nothing names, and long enough ago to be no write's.
+            if let Some(Ok((chunks, bytes))) = project::chunks::sweep_if_due(&project)
+                && chunks > 0
+            {
+                tracing::info!(chunks, bytes, "swept the chunk store");
+            }
         });
     }
 

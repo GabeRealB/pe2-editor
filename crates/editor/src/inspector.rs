@@ -792,7 +792,7 @@ pub fn content_edit(asset: &Asset, outcome: &pe2_ext::ContentOutcome) -> Result<
             .files
             .iter()
             .find(|f| f.name == *file)
-            .and_then(|f| std::fs::read(&f.path).ok())
+            .and_then(|f| project::content::read(&f.path).ok())
             .is_some_and(|now| now == *bytes);
         return Ok((!unchanged).then(|| EditRequest::Write {
             uid: asset.uid.clone().unwrap_or_default(),

@@ -961,6 +961,12 @@ fn browser_bar(ui: &mut egui::Ui, ws: &mut Workspace, opened: &mut Option<Opened
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let width = (ui.available_width() * 0.35).clamp(120.0, 260.0);
             ui.add_sized([width, ui.spacing().interact_size.y], filter_field(&mut ws.filter));
+            let files = ui.add(egui::Button::selectable(ws.browsing.show_files, icons::FILE)).on_hover_text(
+                "Show each node's files inside it, beside what is inside it, as the project's filesystem does",
+            );
+            if files.clicked() {
+                ws.browsing.show_files = !ws.browsing.show_files;
+            }
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let step = |ui: &mut egui::Ui, name: &str| {
@@ -1034,6 +1040,28 @@ fn assets_grid_ui(
                         ui.close();
                     }
                 });
+            }
+        }
+        // A node shown: its files, by the first step of their names (a font's folder once), each choosing the node.
+        let files = node.asset.as_deref().filter(|_| ws.browsing.show_files).and_then(|a| ws.index.assets.get(a));
+        if let Some(asset) = files {
+            let mut tops: Vec<(&str, bool)> = Vec::new();
+            for file in asset.on_disk().files.iter().filter(|f| f.made_by.is_none()) {
+                let (top, deeper) = file.name.split_once('/').map_or((file.name.as_str(), false), |(t, _)| (t, true));
+                if !tops.iter().any(|(t, _)| *t == top) && !node.children.contains_key(top) {
+                    tops.push((top, deeper));
+                }
+            }
+            for (top, folder) in tops {
+                // A folder of files draws as a folder: something inside it.
+                let mut shown = Node { file: !folder, ..Node::default() };
+                if folder {
+                    shown.children.insert(String::new(), Node::default());
+                }
+                let response = grid_cell(ui, ws, top, &shown, false);
+                if response.clicked() {
+                    *pick = Some(Pick { path: asset.path.clone(), keep: false });
+                }
             }
         }
     });
@@ -1120,7 +1148,8 @@ impl TreeView<'_> {
     fn ui(&self, ui: &mut egui::Ui, node: &Node, prefix: &str, pick: &mut Option<Pick>, chosen: &mut Option<Entry>) {
         for (name, child) in node.sorted_children() {
             let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-            if child.children.is_empty() {
+            let has_files = self.folders.is_none() && !self.files_of(child).is_empty();
+            if child.children.is_empty() && !has_files {
                 if self.folders.is_some() {
                     continue;
                 }
@@ -1176,13 +1205,46 @@ impl TreeView<'_> {
                         self.badge(ui, child);
                     }
                 })
-                .body(|ui| self.ui(ui, child, &path, pick, chosen));
+                .body(|ui| {
+                    self.ui(ui, child, &path, pick, chosen);
+                    self.files_ui(ui, child, &path, pick);
+                });
             if let Some(open) = set_open {
                 let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
                 state.set_open(open);
                 state.store(ui.ctx());
             }
         }
+    }
+
+    /// A node's files, where the browser shows them: by their names in it.
+    fn files_of(&self, node: &Node) -> Vec<String> {
+        if !self.ws.browsing.show_files {
+            return vec![];
+        }
+        let Some(asset) = node.asset.as_deref().and_then(|a| self.ws.index.assets.get(a)) else { return vec![] };
+        asset.on_disk().files.iter().filter(|f| f.made_by.is_none()).map(|f| f.name.clone()).collect()
+    }
+
+    /// A node's files, folded under one row so a node of many (a font's glyphs) costs nothing until it is opened; each
+    /// chooses its node.
+    fn files_ui(&self, ui: &mut egui::Ui, node: &Node, path: &str, pick: &mut Option<Pick>) {
+        let files = self.files_of(node);
+        let Some(asset) = node.asset.as_deref().filter(|_| !files.is_empty()) else { return };
+        let id = ui.make_persistent_id(("files", path));
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            .show_header(ui, |ui| {
+                ui.label(RichText::new(format!("{}  files ({})", icons::FILE, files.len())).color(theme::weak()));
+            })
+            .body(|ui| {
+                for file in &files {
+                    let text = RichText::new(format!("{}  {file}", icons::FILE)).color(theme::weak());
+                    let response = ui.add(egui::Button::selectable(false, text).frame(false).truncate());
+                    if response.clicked() {
+                        *pick = Some(Pick::of(&response, asset));
+                    }
+                }
+            });
     }
 
     /// A folder's name: beside a grid, the one the grid shows is marked.
@@ -2012,6 +2074,60 @@ fn build_problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>
     }
 }
 
+/// The repairs of what a layer's folder holds and does not list - put there by other means than the editor - which the
+/// user takes into the project or takes away.
+fn unlisted_repairs(
+    ui: &mut egui::Ui,
+    ws: &Workspace,
+    problem: &project::index::Problem,
+    edit: &mut Option<EditRequest>,
+) {
+    let project::index::Problem::Unlisted { layer, path } = problem else { return };
+    let Some(shown) = ws.layers.iter().find(|l| l.name == *layer && l.writable) else { return };
+    ui.horizontal(|ui| {
+        let adopt = ui.small_button("Adopt").on_hover_text(
+            "List it in the layer, with what is under it: a move outside the editor keeps its uids (an undoable step)",
+        );
+        if adopt.clicked() {
+            *edit = Some(EditRequest::Adopt(layer.clone(), path.clone()));
+        }
+        let remove = ui
+            .add_enabled(!shown.read_only, egui::Button::new("Remove").small())
+            .on_hover_text("Delete it from the layer's folder (an undoable step)");
+        if remove.clicked() {
+            *edit = Some(EditRequest::RemoveUnlisted(layer.clone(), path.clone()));
+        }
+    });
+}
+
+/// A stale override's repairs, where it is the active layer's (what a resolution applies to): kept, or given up for
+/// the version below; and what changed below since it was made.
+fn stale_repairs(ui: &mut egui::Ui, ws: &Workspace, problem: &project::index::Problem, edit: &mut Option<EditRequest>) {
+    use project::edit::Resolution;
+    let project::index::Problem::Stale { layer, path } = problem else { return };
+    let Some(entry) = ws.index.entries.get(path) else { return };
+    if ws.editable_layer().is_ok_and(|active| active.name == *layer) {
+        ui.horizontal(|ui| {
+            let keep = ui
+                .small_button("Keep mine")
+                .on_hover_text("Keep the layer's version: its base becomes the version below now");
+            if keep.clicked() {
+                *edit = Some(EditRequest::Resolve(entry.uid.clone(), Resolution::KeepMine));
+            }
+            if ui.small_button("Take below").on_hover_text("Drop the layer's version for the one below").clicked() {
+                *edit = Some(EditRequest::Resolve(entry.uid.clone(), Resolution::TakeBase));
+            }
+        });
+    } else {
+        ui.label(
+            RichText::new(format!("Make {layer} the active layer to keep or give up its version"))
+                .small()
+                .color(theme::weak()),
+        );
+    }
+    crate::layers::stale_parts_ui(ui, &ws.index.stale_parts(layer, &entry.uid), 0.0);
+}
+
 /// What the index finds wrong, each with the assets it is about; the references that resolve to nothing; whether the
 /// layers are watched and agents can connect.
 fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit: &mut Option<EditRequest>) {
@@ -2082,6 +2198,8 @@ fn problems_ui(ui: &mut egui::Ui, ws: &Workspace, nav: &mut Option<String>, edit
                 {
                     *edit = Some(EditRequest::Forget(layer.clone(), uid.to_string()));
                 }
+                unlisted_repairs(ui, ws, problem, edit);
+                stale_repairs(ui, ws, problem, edit);
                 ui.add_space(4.0);
             });
         }

@@ -6,6 +6,7 @@ members = [
     "crates/formats",
     "crates/codecs",
     "crates/typeface",
+    "crates/vfs",
     "crates/ext",
     "crates/ext-macros",
     "crates/setup",
@@ -57,6 +58,7 @@ formats = { path = "crates/formats" }
 pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }
 typeface = { path = "crates/typeface" }
+vfs = { path = "crates/vfs" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }
 pe2-ext-macros = { path = "crates/ext-macros" }
@@ -101,6 +103,8 @@ egui_kittest = { version = "0.37", default-features = false, features = ["eframe
 serde_json = "1"
 clap = { version = "4.5", features = ["derive"] }
 notify = "8"
+# Ending a served mount cleanly on Ctrl-C (`pe2-cli project mount`).
+ctrlc = { version = "3", features = ["termination"] }
 cpal = "0.15.3"
 # SQLite in Rust, for the project cache's index (no C to build for any target). Pinned: it is pre-1.0. Its default
 # features bring mimalloc (C) and full-text search, which the cache needs neither of.
@@ -124,6 +128,8 @@ tar = "0.4"
 toml = { version = "0.8", features = ["preserve_order"] }
 # Edits to project.toml that keep its comments and layout; the version `toml` reads with.
 toml_edit = "0.22"
+# Line diffs, for three-way merges of text (`project::merge::lines`).
+similar = "3"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 
 # Debug builds: line tables (file:line in backtraces) and no more, kept in the object files rather than the binary:

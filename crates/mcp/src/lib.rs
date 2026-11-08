@@ -33,6 +33,10 @@ pub enum Request {
     Read { uri: String },
     /// Events signaled, one epoch each: answered once they have ended, only by an editor.
     Signal { events: Vec<String>, config: Option<String> },
+    /// An edit of the project (the command line's, a program's through the served folder), made in a layer - by default
+    /// the one edits go to - by whoever holds the project, as a step of its history: answered with the step's label.
+    /// Never an agent's: no tool makes one.
+    Edit { op: vfs::ops::Op, layer: Option<String> },
 }
 
 /// Its answer.
@@ -43,6 +47,13 @@ pub enum Reply {
     Read(ReadResourceResult),
     /// The request could not be answered at all (a tool's own failures are results marked as errors).
     Error(String),
+    /// An edit made: the step's label, and the paths it touched, for a process serving the layers to take in.
+    Edited {
+        label: String,
+        touched: Vec<std::path::PathBuf>,
+    },
+    /// Not answered by this holder (the host answers edits alone): whoever asked takes the project for it.
+    Declined,
 }
 
 impl Reply {
@@ -57,7 +68,8 @@ impl Reply {
                 let said = texts.collect::<Vec<_>>().join("\n");
                 if result.is_error == Some(true) { Err(said) } else { Ok(said) }
             }
-            Reply::Read(_) => Err("it answered with something else".to_string()),
+            Reply::Edited { label, .. } => Ok(label.clone()),
+            Reply::Read(_) | Reply::Declined => Err("it answered with something else".to_string()),
             Reply::Error(why) => Err(why.clone()),
         }
     }
@@ -125,5 +137,6 @@ pub fn answer(view: &mut View, request: &Request) -> Reply {
             Err(e) => Reply::Error(e),
         },
         Request::Signal { .. } => Reply::Error("events are signaled to an editor".to_string()),
+        Request::Edit { .. } => Reply::Error("an edit is made by whoever holds the project, with its history".into()),
     }
 }

@@ -95,6 +95,10 @@ pub fn add_mount(
         bail!("the project has a layer or mount {at} already");
     }
     anyhow::ensure!(unmanaged || path.is_some(), "a mount says where its tree is, but for an unmanaged one");
+    anyhow::ensure!(
+        !(unmanaged && path.is_none() && at == crate::SERVED),
+        "{at} is where the project is served: an unmanaged mount there says where its tree is"
+    );
     let mut document = read(&project.root)?;
     let item = document.entry("mount").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let mounts = item.as_array_of_tables_mut().with_context(|| format!("`mount` in {FILE} is no list of tables"))?;

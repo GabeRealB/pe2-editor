@@ -814,7 +814,7 @@ fn share_alike(plan: &Plan, layer: &Path, record: &mut Record) -> usize {
         .collect();
     for (node, file) in &alike {
         let path = file_path(layer, node, file);
-        let _ = std::fs::remove_file(&path);
+        let _ = crate::content::remove(&path);
         if let Some(folder) = path.parent() {
             let _ = std::fs::remove_dir(folder);
         }
@@ -855,7 +855,7 @@ fn wanted(
                 })
                 .collect();
             let as_written = |((node, file), written): &(&(String, String), &Written)| {
-                let there = std::fs::metadata(on_disk(plan, layer, node, file, written)).map(|m| m.len()).ok();
+                let there = crate::content::len(&on_disk(plan, layer, node, file, written)).ok();
                 // What a release's own file was the same as is so still.
                 let alike = !written.shared
                     || plan.plain_of(file).is_some_and(|plain| {
@@ -1046,7 +1046,11 @@ pub fn run(
 /// Remove what no bundle is given any more: what the last run recorded and this one did not. How many went.
 fn remove_left(layer: &Path, old: &Record, record: &Record) -> usize {
     let left = old.files.keys().filter(|entry| !record.files.contains_key(*entry));
-    left.filter(|(node, file)| std::fs::remove_file(file_path(layer, node, file)).is_ok()).count()
+    left.filter(|(node, file)| {
+        let path = file_path(layer, node, file);
+        crate::content::exists(&path) && crate::content::remove(&path).is_ok()
+    })
+    .count()
 }
 
 const ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::AcqRel;
@@ -1115,16 +1119,13 @@ impl RunState<'_> {
                     let key = Plan::file_key(self.keys, given);
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
-                        let _ = std::fs::remove_file(file_path(self.layer, node, &file));
+                        let _ = crate::content::remove(&file_path(self.layer, node, &file));
                         self.lock_written()
                             .push(((node.clone(), file), Written { key, sha1: String::new(), size: 0, shared: false }));
                         continue;
                     };
                     let path = file_path(self.layer, node, &file);
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
-                    }
-                    std::fs::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
+                    crate::content::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
                     let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64, shared: false };
                     self.lock_written().push(((node.clone(), file), written));
                     self.progress.written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1413,7 +1414,7 @@ pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions
             for ((node, file), written) in held {
                 if written.key != key {
                     other += 1;
-                } else if written.present() && !on_disk(&plan, layer, node, file, written).exists() {
+                } else if written.present() && !crate::content::exists(&on_disk(&plan, layer, node, file, written)) {
                     gone += 1;
                 }
             }
@@ -1500,9 +1501,9 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
         }
         let path = on_disk(&plan, layer, node, file, written);
         if !written.present() {
-            return path.exists().then_some((2, name));
+            return crate::content::exists(&path).then_some((2, name));
         }
-        match crate::extract::sha1_file(&path) {
+        match crate::content::sha1(&path) {
             Err(_) => Some((0, name)),
             Ok(sha1) if sha1 != written.sha1 => Some((2, name)),
             Ok(_) => None,

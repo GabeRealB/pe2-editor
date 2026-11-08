@@ -1,0 +1,32 @@
+[package]
+name = "vfs"
+description = "A project's merged layers as a filesystem: one tree, served over FUSE or WebDAV, and scoped views of it"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The WebDAV transport (`dav.rs`): its handler, served over HTTP/1 on a runtime of its own.
+dav-server = { version = "0.11", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
+
+# The Cloud Files transport (`cloud.rs`): placeholders Windows fills as they are read, nothing to install.
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.7"
+nt-time = "0.15"
+windows-core = "0.62"

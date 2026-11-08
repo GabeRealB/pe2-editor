@@ -2,7 +2,9 @@
 //! editor state. It is never a layer and never the only copy of anything, so it may be deleted at any time at the cost
 //! of time only. It ignores itself (its own `.gitignore`, so no tracked file has to name it), and its `version` names
 //! the schema and the tools that wrote it: a cache written by others is wiped on opening - all but what whoever opens
-//! the cache holds: the project lock (`lock.rs`) and the socket agents reach its editor by (`SOCKET`).
+//! the cache holds: the project lock (`lock.rs`) and the socket agents reach its editor by (`SOCKET`) - and what the
+//! host serving the project has while it lends it (`host.rs`: its socket, lock and log, and what is written through
+//! what it serves).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ pub const DIR: &str = ".cache";
 /// The socket agents reach the editor holding the project by (`mcp::link`): listening from the moment it holds the
 /// project's lock, before it opens the cache.
 pub const SOCKET: &str = "editor.sock";
+/// Where what programs write through the filesystem served is staged until it is applied (`vfs::writes`).
+pub const STAGING: &str = "filesystem";
 /// Raised whenever what the cache holds changes shape.
 const SCHEMA: u32 = 2;
 
@@ -33,10 +37,12 @@ impl Cache {
         let version = format!("schema {SCHEMA}\nproject {}\n", env!("CARGO_PKG_VERSION"));
         let current = std::fs::read_to_string(dir.join("version")).ok();
         if current.as_deref() != Some(version.as_str()) && dir.exists() {
-            // Everything but what the process opening the cache holds: the project lock, and its agents' socket.
+            // Everything but what the process opening the cache holds - the project lock, and its agents' socket - and
+            // the host's.
             for entry in std::fs::read_dir(&dir).with_context(|| format!("{}", dir.display()))? {
                 let entry = entry?;
-                if entry.file_name().to_str().is_some_and(|n| n.starts_with("lock") || n == SOCKET) {
+                let kept = |n: &str| n.starts_with("lock") || n.starts_with("host.") || n == SOCKET || n == STAGING;
+                if entry.file_name().to_str().is_some_and(kept) {
                     continue;
                 }
                 let path = entry.path();
