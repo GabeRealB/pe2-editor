@@ -26,6 +26,10 @@ use project::index::Index;
 use crate::settings::{Preview, Upscale};
 use crate::{icons, theme};
 
+/// A view drawn under the player's controls in place of its picture: given where the asset plays, it answers what it
+/// asks of the player.
+pub type Body<'a> = dyn FnMut(&mut egui::Ui, Option<pe2_ext::Playing>) -> Vec<pe2_ext::Transport> + 'a;
+
 /// How far ahead of the picture the sound is fed, in items.
 const FEED: u64 = 8;
 
@@ -103,10 +107,11 @@ fn parts(item: &Value) -> (Option<Picture<'_>>, Option<Sound<'_>>) {
     }
 }
 
-/// The picture shown: through the texture, or a YCbCr frame by its key.
+/// The picture shown: through the texture, or a YCbCr frame by its key; or none, the item being sound alone.
 enum Showing {
     Texture,
     Yuv(VideoFrame, u64),
+    Sound,
 }
 
 /// A stream being opened, or open.
@@ -119,6 +124,8 @@ enum Opening {
 /// What is shown: its asset (as it was when opened), its stream, where it is.
 struct Shown {
     asset: Arc<project::index::Asset>,
+    /// The look it was opened in: a family's member, as a bank's slot.
+    look: Option<String>,
     opening: Opening,
     /// Items a second, how many there are where known, the number its first is called by.
     rate: f64,
@@ -140,6 +147,73 @@ struct Shown {
 }
 
 impl Shown {
+    /// Its stream, once it is opened: its rate, count and first item's number from its header.
+    fn take_opened(&mut self) {
+        if let Opening::Waiting(opening) = &self.opening
+            && let Ok(opened) = opening.try_recv()
+        {
+            self.opening = match opened {
+                Ok(stream) => {
+                    let header = stream.header();
+                    self.rate = header.get("rate").and_then(toml::Value::as_float).filter(|r| *r > 0.0).unwrap_or(15.0);
+                    self.count =
+                        header.get("count").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok());
+                    self.first = header
+                        .get("first")
+                        .and_then(toml::Value::as_integer)
+                        .and_then(|c| u64::try_from(c).ok())
+                        .unwrap_or(0);
+                    Opening::Open { picture: stream.reader(), sound: stream.reader() }
+                }
+                Err(e) => Opening::Failed(e),
+            };
+        }
+    }
+
+    /// Where it plays, in seconds, as a view is told.
+    fn playing(&self) -> pe2_ext::Playing {
+        #[expect(clippy::cast_precision_loss, reason = "a stream's items")]
+        let length = self.count.map(|count| count as f64 / self.rate);
+        pe2_ext::Playing {
+            at: self.at.max(0.0) / self.rate,
+            length,
+            playing: self.playing.is_some() || self.sounding.is_some() || self.held,
+        }
+    }
+
+    /// What a view asked: to play from where it is (from the start again where it ended), to pause, or to go to a
+    /// time, playing on from there if it played.
+    fn request(&mut self, request: pe2_ext::Transport) {
+        let playing = self.playing.is_some() || self.sounding.is_some();
+        match request {
+            pe2_ext::Transport::Play if !playing => {
+                #[expect(clippy::cast_precision_loss, reason = "a stream's items")]
+                if self.at >= self.last() as f64 {
+                    self.at = 0.0;
+                }
+                self.silent = self.silent.take().filter(|s| s.starts_with("it has none"));
+                self.by_clock();
+            }
+            pe2_ext::Transport::Pause => {
+                self.held = false;
+                self.playing = None;
+                self.sounding = None;
+            }
+            pe2_ext::Transport::Seek(seconds) => {
+                #[expect(clippy::cast_precision_loss, reason = "a stream's items")]
+                let last = self.last() as f64;
+                self.at = (seconds * self.rate).clamp(0.0, last);
+                self.silent = self.silent.take().filter(|s| s.starts_with("it has none"));
+                if playing {
+                    self.playing = None;
+                    self.sounding = None;
+                    self.by_clock();
+                }
+            }
+            pe2_ext::Transport::Play => {}
+        }
+    }
+
     fn last(&self) -> u64 {
         self.count.map_or(u64::MAX, |c| c.saturating_sub(1))
     }
@@ -265,13 +339,23 @@ impl Player {
     }
 
     /// Open an asset's stream on a thread of its own.
-    fn open(&self, ctx: &egui::Context, index: &Arc<Index>, asset: &Arc<project::index::Asset>) -> Shown {
+    fn open(
+        &self,
+        ctx: &egui::Context,
+        index: &Arc<Index>,
+        asset: &Arc<project::index::Asset>,
+        look: Option<&str>,
+    ) -> Shown {
         let (sent, opening) = mpsc::channel();
         let (extensions, index, path, ctx) = (self.extensions.clone(), index.clone(), asset.path.clone(), ctx.clone());
+        let chosen = look.map(str::to_string);
+        let opened_look = chosen.clone();
         let _ = std::thread::Builder::new().name("player open".into()).spawn(move || {
             let engine = extensions.engine();
             let opened = index.assets.get(&path).ok_or_else(|| "it is gone".to_string()).and_then(|asset| {
-                let output = extensions.stream_output(asset).ok_or_else(|| "it has no stream".to_string())?;
+                let output = extensions
+                    .stream_address(asset, chosen.as_deref())
+                    .ok_or_else(|| "it has no stream".to_string())?;
                 extensions.stream(&engine, &index, asset, &output).map_err(|e| format!("{e:#}"))
             });
             if let Ok(stream) = &opened {
@@ -283,6 +367,7 @@ impl Player {
         });
         Shown {
             asset: asset.clone(),
+            look: opened_look,
             opening: Opening::Waiting(opening),
             rate: 15.0,
             count: None,
@@ -299,7 +384,14 @@ impl Player {
     }
 
     /// An asset played: its picture where it is, the controls under it.
-    pub fn ui(&mut self, ui: &mut egui::Ui, (_, index): (&Extensions, &Arc<Index>), path: &str, view: &mut Preview) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        (_, index): (&Extensions, &Arc<Index>),
+        (path, look): (&str, Option<&str>),
+        view: &mut Preview,
+        mut body: Option<&mut Body<'_>>,
+    ) {
         // As the pictures are: the frame as it is, unless the setting says otherwise. Filling the pane is `fitting`'s.
         let smooth = matches!(view.upscale, Upscale::Bilinear | Upscale::Sharp);
         let sampling = if smooth { egui::TextureOptions::LINEAR } else { egui::TextureOptions::NEAREST };
@@ -307,41 +399,28 @@ impl Player {
         self.gain.store((volume * volume).to_bits(), Ordering::Relaxed);
         let Some(asset) = index.assets.get(path) else { return };
         // Opened again where it is another asset, or changed: where it was kept.
-        if self.shown.as_ref().is_none_or(|s| !Arc::ptr_eq(&s.asset, asset)) {
-            let at = self.shown.as_ref().filter(|s| s.asset.path == *path).map(|s| s.at);
-            let mut shown = self.open(ui.ctx(), index, asset);
+        if self.shown.as_ref().is_none_or(|s| !Arc::ptr_eq(&s.asset, asset) || s.look.as_deref() != look) {
+            let at = self.shown.as_ref().filter(|s| s.asset.path == *path && s.look.as_deref() == look).map(|s| s.at);
+            let mut shown = self.open(ui.ctx(), index, asset, look);
             shown.at = at.unwrap_or(0.0);
             self.shown = Some(shown);
             self.texture = None;
         }
         let Some(shown) = &mut self.shown else { return };
-        if let Opening::Waiting(opening) = &shown.opening
-            && let Ok(opened) = opening.try_recv()
-        {
-            shown.opening = match opened {
-                Ok(stream) => {
-                    let header = stream.header();
-                    shown.rate =
-                        header.get("rate").and_then(toml::Value::as_float).filter(|r| *r > 0.0).unwrap_or(15.0);
-                    shown.count =
-                        header.get("count").and_then(toml::Value::as_integer).and_then(|c| u64::try_from(c).ok());
-                    shown.first = header
-                        .get("first")
-                        .and_then(toml::Value::as_integer)
-                        .and_then(|c| u64::try_from(c).ok())
-                        .unwrap_or(0);
-                    Opening::Open { picture: stream.reader(), sound: stream.reader() }
-                }
-                Err(e) => Opening::Failed(e),
-            };
-        }
+        shown.take_opened();
         match &shown.opening {
             Opening::Waiting(_) => {
                 ui.label(RichText::new("Opening…").color(theme::weak()));
+                if let Some(body) = body {
+                    let _ = body(ui, None);
+                }
                 return;
             }
             Opening::Failed(why) => {
                 ui.label(RichText::new(format!("It could not be opened: {why}")).color(theme::weak()));
+                if let Some(body) = body {
+                    let _ = body(ui, None);
+                }
                 return;
             }
             Opening::Open { .. } => {}
@@ -370,7 +449,8 @@ impl Player {
                         self.keys += 1;
                         shown.showing = Some(Showing::Yuv(frame.clone(), self.keys));
                     }
-                    None => {}
+                    // Sound alone, as a sample's: nothing to show but where it is.
+                    None => shown.showing = shown.showing.take().or(Some(Showing::Sound)),
                 }
                 shown.at_item = Some(number);
             }
@@ -390,9 +470,18 @@ impl Player {
             }
             Poll::Failed(e) => shown.failed = Some(e),
         }
-        show(ui, shown, self.texture.as_ref(), self.id, smooth);
-        ui.add_space(6.0);
-        controls(ui, shown, number, view);
+        // A view of the asset's own under the controls, given where it plays, asking to play or go elsewhere.
+        if let Some(body) = body.as_mut() {
+            controls(ui, shown, number, view);
+            ui.add_space(6.0);
+            for request in body(ui, Some(shown.playing())) {
+                shown.request(request);
+            }
+        } else {
+            show(ui, shown, self.texture.as_ref(), self.id, smooth);
+            ui.add_space(6.0);
+            controls(ui, shown, number, view);
+        }
         // When the next item is due and not before: a movie changes far less often than a window can.
         if shown.playing.is_some() || shown.sounding.is_some() {
             let items = (shown.at.floor() + 1.0 - shown.at).clamp(0.01, 1.0);
@@ -425,6 +514,7 @@ fn show_centered(ui: &mut egui::Ui, shown: &Shown, texture: Option<&egui::Textur
             let draw = crate::yuv::Draw { frame: frame.clone(), key: *key, player, smooth };
             ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, draw));
         }
+        (Some(Showing::Sound), _) if shown.failed.is_none() => {}
         _ => {
             ui.add_space(8.0);
             ui.label(RichText::new(shown.failed.as_deref().unwrap_or("Making its first item…")).color(theme::weak()));

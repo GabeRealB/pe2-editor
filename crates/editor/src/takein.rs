@@ -316,7 +316,10 @@ impl Worker {
             let Some(uid) = old.uid.as_deref() else { continue };
             match self.index.assets.get(path) {
                 // What makes nothing has nothing to apply: whatever reads it has the settings as they are.
-                Some(now) if now.uid.as_deref() == Some(uid) && !makes_outputs(&self.extensions, now) => {}
+                // Nor has what its type applies at once.
+                Some(now)
+                    if now.uid.as_deref() == Some(uid)
+                        && (!makes_outputs(&self.extensions, now) || self.extensions.applied_at_once(now)) => {}
                 Some(now) if now.uid.as_deref() == Some(uid) => {
                     let _ = self.applied.changed(uid, old.text(), now.text());
                 }

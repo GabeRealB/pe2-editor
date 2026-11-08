@@ -5,6 +5,78 @@
 
 use crate::{Asset, Icon, Project, Rect, Texture, Value};
 
+/// A color of the host's theme, by what it is for, or a view's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Color {
+    Theme(Role),
+    Rgba(u8, u8, u8, u8),
+}
+
+/// What a color of the theme is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Text,
+    Weak,
+    Accent,
+    Background,
+    /// A surface raised over the panels: a card, a control.
+    Raised,
+    Border,
+    Link,
+    Error,
+}
+
+/// Where a text is placed from its point: its start, its middle or its end there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Start,
+    Middle,
+    End,
+}
+
+/// What a view paints (`Ui::paint`), in points from the corner of what it paints on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Shape {
+    Rect {
+        min: (f32, f32),
+        max: (f32, f32),
+        fill: Option<Color>,
+        stroke: Option<(f32, Color)>,
+        rounding: f32,
+    },
+    Line {
+        points: Vec<(f32, f32)>,
+        width: f32,
+        color: Color,
+    },
+    /// A text, its point on its baseline's middle height: vertically centered there.
+    Text {
+        at: (f32, f32),
+        text: String,
+        size: f32,
+        color: Color,
+        align: Align,
+    },
+}
+
+/// Where what the asset shown plays is, where it plays (`Ui::playback`): in seconds from its start, its length where
+/// known, and whether it is playing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Playing {
+    pub at: f64,
+    pub length: Option<f64>,
+    pub playing: bool,
+}
+
+/// What a view asks of what plays the asset it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transport {
+    Play,
+    Pause,
+    /// Go to this many seconds from the start, playing on if it plays.
+    Seek(f64),
+}
+
 /// A table's cell (`Ui::table`).
 #[derive(Clone, Debug)]
 pub enum Cell {
@@ -206,6 +278,19 @@ pub trait UiHost {
     /// The asset the view shows, lent for the frame; none for a panel.
     fn asset(&self) -> Option<Asset<'_>>;
     fn project(&self) -> &dyn Project;
+    /// Shapes painted on this many points, taking what the pointer and the keys do over them.
+    fn paint(&mut self, width: f32, height: f32, shapes: &[Shape]) -> ViewportInput {
+        let _ = (width, height, shapes);
+        ViewportInput::default()
+    }
+    /// Where what the asset shown plays is, where the view is drawn with it playing (under a player's transport).
+    fn playback(&self) -> Option<Playing> {
+        None
+    }
+    /// Ask what plays the asset shown to play, pause or go somewhere.
+    fn transport(&mut self, request: Transport) {
+        let _ = request;
+    }
 }
 
 /// A view's handle on the frame being drawn.
@@ -446,6 +531,23 @@ impl<'a> Ui<'a> {
     #[must_use]
     pub fn project(&self) -> &dyn Project {
         self.host.project()
+    }
+
+    /// Shapes painted on this many points, taking what the pointer and the keys do over them: what a view draws its
+    /// own way, a timeline's lanes and notes.
+    pub fn paint(&mut self, width: f32, height: f32, shapes: &[Shape]) -> ViewportInput {
+        self.host.paint(width, height, shapes)
+    }
+
+    /// Where what the asset shown plays is: none where the view is not drawn with it playing.
+    #[must_use]
+    pub fn playback(&self) -> Option<Playing> {
+        self.host.playback()
+    }
+
+    /// Ask what plays the asset shown to play, pause or go somewhere.
+    pub fn transport(&mut self, request: Transport) {
+        self.host.transport(request);
     }
 
     /// The host's widgets, for a host passing the frame on (to a component).

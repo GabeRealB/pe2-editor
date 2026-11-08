@@ -1493,7 +1493,7 @@ fn preview_ui(
     // One that plays, in the player.
     if crate::player::Player::plays(&ws.extensions, asset) {
         let path = asset.path.clone();
-        ws.play(ui, pane, &path, view);
+        ws.play(ui, pane, &path, (view, nav));
         return;
     }
     let shown = ws.previews_of(asset);

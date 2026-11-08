@@ -295,6 +295,26 @@ impl ValueType for Playback {
     }
 }
 
+/// An item of a stream of sound alone, whoever makes or reads it: a stretch of its samples. No picture comes with it, so
+/// what takes moving pictures (a video file) does not take it.
+pub struct Sound;
+
+impl ValueType for Sound {
+    type Value = Data;
+
+    fn ty() -> Type {
+        Type::Audio
+    }
+
+    fn decode(data: Data, _: &Call<'_>) -> Result<Data> {
+        Ok(data)
+    }
+
+    fn encode(value: Data) -> Data {
+        value
+    }
+}
+
 /// What is marked on a node's pictures.
 pub struct Marks;
 

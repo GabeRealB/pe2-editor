@@ -74,4 +74,7 @@ pub fn output_of(reference: &Value) -> Option<&str> {
     };
     (!output.is_empty()).then_some(output)
 }
-pub use ui::{Canvas, Cell, Marked, Modifiers, Placed, Style, Traced, Ui, UiHost, View, ViewportInput};
+pub use ui::{
+    Align, Canvas, Cell, Color, Marked, Modifiers, Placed, Playing, Role, Shape, Style, Traced, Transport, Ui, UiHost,
+    View, ViewportInput,
+};

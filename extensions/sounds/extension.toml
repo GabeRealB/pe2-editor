@@ -1,0 +1,5 @@
+id = "pe2.sounds"
+version = "0.1.0"
+description = "Sound: samples as WAV, the instruments and scripts that play them, and the banks that bind them, read and written exactly."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

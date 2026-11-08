@@ -1400,6 +1400,21 @@ impl Extensions {
         stream.map(|stream| stream.name.clone())
     }
 
+    /// The address of an asset's stream in one of its looks: a stream of a family played as the member of that label
+    /// (a bank's slot), its first where none is chosen or the look is not one of them.
+    #[must_use]
+    pub fn stream_address(&self, asset: &index::Asset, look: Option<&str>) -> Option<String> {
+        let outputs = self.outputs_of(asset);
+        let output = outputs.iter().find(|o| self.ops.get(&o.op).is_some_and(|op| op.output.is_stream()))?;
+        if !self.family(output) {
+            return Some(output.name.clone());
+        }
+        let members = output.members.as_ref().map_or_default(|members| members(&self.lend(asset)));
+        let chosen = look.and_then(|look| members.iter().find(|(_, label)| label == look));
+        let (key, _) = chosen.or_else(|| members.first())?;
+        Some(format!("{}/{key}", output.name))
+    }
+
     /// The output of an asset's type saying what is marked on its pictures, by name.
     #[must_use]
     pub fn marks_output(&self, asset: &index::Asset) -> Option<String> {
@@ -1988,6 +2003,12 @@ impl Extensions {
             .collect();
         out.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.name.cmp(&b.name)));
         out
+    }
+
+    /// Whether what is set on an asset is applied as soon as it is taken in: its type says so.
+    #[must_use]
+    pub fn applied_at_once(&self, asset: &index::Asset) -> bool {
+        self.node_types_of(asset).into_iter().any(|node_type| node_type.applied_at_once)
     }
 
     /// The views of an asset: its type's.

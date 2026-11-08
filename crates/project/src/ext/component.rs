@@ -1079,6 +1079,44 @@ impl host::HostUi for State {
         Ok(())
     }
 
+    fn paint(
+        &mut self,
+        ui: Resource<Frame>,
+        width: f32,
+        height: f32,
+        shapes: Vec<host::Shape>,
+    ) -> wasmtime::Result<host::ViewportInput> {
+        let shapes: Vec<pe2_ext::Shape> = shapes.into_iter().map(shape_of).collect();
+        let input = self.frame(&ui)?.paint(width, height, &shapes);
+        Ok(host::ViewportInput {
+            hovered: input.hovered,
+            pointer: input.pointer,
+            drag: input.drag,
+            held: input.held,
+            pressed: input.pressed,
+            released: input.released,
+            clicked: input.clicked,
+            scroll: input.scroll,
+            modifiers: (input.modifiers.shift, input.modifiers.ctrl, input.modifiers.alt),
+            keys: input.keys,
+        })
+    }
+
+    fn playback(&mut self, ui: Resource<Frame>) -> wasmtime::Result<Option<host::Playing>> {
+        let playing = self.frame(&ui)?.playback();
+        Ok(playing.map(|p| host::Playing { at: p.at, length: p.length, playing: p.playing }))
+    }
+
+    fn transport(&mut self, ui: Resource<Frame>, request: host::Transport) -> wasmtime::Result<()> {
+        let request = match request {
+            host::Transport::Play => pe2_ext::Transport::Play,
+            host::Transport::Pause => pe2_ext::Transport::Pause,
+            host::Transport::Seek(at) => pe2_ext::Transport::Seek(at),
+        };
+        self.frame(&ui)?.transport(request);
+        Ok(())
+    }
+
     fn time(&mut self, ui: Resource<Frame>) -> wasmtime::Result<f64> {
         Ok(self.frame(&ui)?.time())
     }
@@ -2153,6 +2191,9 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
                 Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
             });
         }
+        if node_type.applied_at_once {
+            builder = builder.applied_at_once();
+        }
         if node_type.data {
             builder = builder.data();
         }
@@ -3003,4 +3044,46 @@ fn start(
         described: Described::default(),
     };
     Ok((Arc::new(shared), about, registration))
+}
+
+/// A color a component paints with, as the host's.
+fn color_of(color: host::Color) -> pe2_ext::Color {
+    match color {
+        host::Color::Theme(role) => pe2_ext::Color::Theme(match role {
+            host::Role::Text => pe2_ext::Role::Text,
+            host::Role::Weak => pe2_ext::Role::Weak,
+            host::Role::Accent => pe2_ext::Role::Accent,
+            host::Role::Background => pe2_ext::Role::Background,
+            host::Role::Raised => pe2_ext::Role::Raised,
+            host::Role::Border => pe2_ext::Role::Border,
+            host::Role::Link => pe2_ext::Role::Link,
+            host::Role::Error => pe2_ext::Role::Error,
+        }),
+        host::Color::Rgba((r, g, b, a)) => pe2_ext::Color::Rgba(r, g, b, a),
+    }
+}
+
+/// A shape a component paints, as the host's.
+fn shape_of(shape: host::Shape) -> pe2_ext::Shape {
+    match shape {
+        host::Shape::Rect(r) => pe2_ext::Shape::Rect {
+            min: r.min,
+            max: r.max,
+            fill: r.fill.map(color_of),
+            stroke: r.stroke.map(|(width, color)| (width, color_of(color))),
+            rounding: r.rounding,
+        },
+        host::Shape::Line(l) => pe2_ext::Shape::Line { points: l.points, width: l.width, color: color_of(l.color) },
+        host::Shape::Text(t) => pe2_ext::Shape::Text {
+            at: t.at,
+            text: t.text,
+            size: t.size,
+            color: color_of(t.color),
+            align: match t.align {
+                host::Align::Start => pe2_ext::Align::Start,
+                host::Align::Middle => pe2_ext::Align::Middle,
+                host::Align::End => pe2_ext::Align::End,
+            },
+        },
+    }
 }

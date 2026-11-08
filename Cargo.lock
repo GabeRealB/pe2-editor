@@ -2006,6 +2006,7 @@ dependencies = [
  "pe2-movies",
  "pe2-packages",
  "pe2-render",
+ "pe2-sounds",
  "pe2-str",
  "project",
  "toml 0.8.23",
@@ -4260,6 +4261,16 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "ureq",
+]
+
+[[package]]
+name = "pe2-sounds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "formats",
+ "pe2-ext",
+ "toml 0.8.23",
 ]
 
 [[package]]

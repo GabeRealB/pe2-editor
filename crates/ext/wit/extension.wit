@@ -368,8 +368,45 @@ interface host {
         keys: list<string>,
     }
 
+    /// What a color of the theme is for.
+    enum role { text, weak, accent, background, raised, border, link, error }
+
+    /// A color of the host's theme, or a view's own.
+    variant color { theme(role), rgba(tuple<u8, u8, u8, u8>) }
+
+    /// Where a text is placed from its point.
+    enum align { start, middle, end }
+
+    record painted-rect {
+        min: tuple<f32, f32>,
+        max: tuple<f32, f32>,
+        fill: option<color>,
+        stroke: option<tuple<f32, color>>,
+        rounding: f32,
+    }
+
+    record painted-line { points: list<tuple<f32, f32>>, width: f32, color: color }
+
+    /// A text, its point at its middle height.
+    record painted-text { at: tuple<f32, f32>, text: string, size: f32, color: color, align: align }
+
+    /// What a view paints, in points from the corner of what it paints on.
+    variant shape { rect(painted-rect), line(painted-line), text(painted-text) }
+
+    /// Where what the asset shown plays is: seconds from its start, its length where known, whether it plays.
+    record playing { at: f64, length: option<f64>, playing: bool }
+
+    /// What a view asks of what plays the asset it shows.
+    variant transport { play, pause, seek(f64) }
+
     resource ui {
         label: func(text: string, style: style);
+        /// Shapes painted on this many points, taking what the pointer and the keys do over them.
+        paint: func(width: f32, height: f32, shapes: list<shape>) -> viewport-input;
+        /// Where what the asset shown plays is, where the view is drawn with it playing.
+        playback: func() -> option<playing>;
+        /// Ask what plays the asset shown to play, pause or go somewhere.
+        transport: func(request: transport);
         /// How much room is left here, in points, and how many pixels a point is: what a view sizes what it renders by.
         available: func() -> tuple<f32, f32, f32>;
         /// A texture published through `gpu`, filling this many points, taking what the pointer and the keys do over it.
@@ -725,6 +762,8 @@ interface guest {
         extends: bool,
         /// Whether a node of it holds only what is set on it: then an operation of the type's name makes those settings.
         data: bool,
+        /// Whether what is set on a node of it is applied as soon as it is taken in: its outputs made again at once.
+        applied-at-once: bool,
         /// The value types a node making one is of this type, by their qualified names.
         values: list<string>,
     }

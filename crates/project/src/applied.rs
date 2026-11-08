@@ -125,7 +125,7 @@ impl Applied {
                 let declaration = applied.map(|text| {
                     Arc::new(AppliedDeclaration {
                         written: written.clone(),
-                        fields: crate::graph::with_settings(toml::from_str(text).unwrap_or_default()),
+                        fields: written.fields_of(text),
                         text: text.clone(),
                     })
                 });

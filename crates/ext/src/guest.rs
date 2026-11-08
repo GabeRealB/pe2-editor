@@ -429,6 +429,23 @@ impl UiHost for Frame<'_> {
         self.ui().available()
     }
 
+    fn paint(&mut self, width: f32, height: f32, shapes: &[crate::Shape]) -> crate::ViewportInput {
+        let shapes: Vec<host::Shape> = shapes.iter().map(painted).collect();
+        viewport_input(self.ui().paint(width, height, &shapes))
+    }
+
+    fn playback(&self) -> Option<crate::Playing> {
+        self.ui().playback().map(|p| crate::Playing { at: p.at, length: p.length, playing: p.playing })
+    }
+
+    fn transport(&mut self, request: crate::Transport) {
+        self.ui().transport(match request {
+            crate::Transport::Play => host::Transport::Play,
+            crate::Transport::Pause => host::Transport::Pause,
+            crate::Transport::Seek(at) => host::Transport::Seek(at),
+        });
+    }
+
     fn gpu_viewport(&mut self, id: u64, width: f32, height: f32) -> crate::ViewportInput {
         let input = self.ui().gpu_viewport(id, width, height);
         crate::ViewportInput {
@@ -1050,6 +1067,7 @@ fn describe_type(handle: u32, ty: &TypeDef, numbered: &mut Registered) -> g::Val
         sniff: ty.sniff.is_some(),
         extends: ty.extends,
         data: ty.data,
+        applied_at_once: ty.applied_at_once,
         values: ty.values.clone(),
         alias: ty.alias.clone(),
         icon: ty.icon.map(|(i, t)| (icon(i), tint(t))),
@@ -1488,5 +1506,64 @@ struct Missing;
 impl View for Missing {
     fn show(&mut self, ui: &mut crate::Ui) {
         ui.error("this view shows an asset, and none was given");
+    }
+}
+
+/// What the pointer and the keys did, as the SDK says it.
+fn viewport_input(input: host::ViewportInput) -> crate::ViewportInput {
+    crate::ViewportInput {
+        hovered: input.hovered,
+        pointer: input.pointer,
+        drag: input.drag,
+        held: input.held,
+        pressed: input.pressed,
+        released: input.released,
+        clicked: input.clicked,
+        scroll: input.scroll,
+        modifiers: crate::Modifiers { shift: input.modifiers.0, ctrl: input.modifiers.1, alt: input.modifiers.2 },
+        keys: input.keys,
+    }
+}
+
+fn color(color: crate::Color) -> host::Color {
+    match color {
+        crate::Color::Theme(role) => host::Color::Theme(match role {
+            crate::Role::Text => host::Role::Text,
+            crate::Role::Weak => host::Role::Weak,
+            crate::Role::Accent => host::Role::Accent,
+            crate::Role::Background => host::Role::Background,
+            crate::Role::Raised => host::Role::Raised,
+            crate::Role::Border => host::Role::Border,
+            crate::Role::Link => host::Role::Link,
+            crate::Role::Error => host::Role::Error,
+        }),
+        crate::Color::Rgba(r, g, b, a) => host::Color::Rgba((r, g, b, a)),
+    }
+}
+
+/// A shape as the host takes it.
+fn painted(shape: &crate::Shape) -> host::Shape {
+    match shape {
+        crate::Shape::Rect { min, max, fill, stroke, rounding } => host::Shape::Rect(host::PaintedRect {
+            min: *min,
+            max: *max,
+            fill: fill.map(color),
+            stroke: stroke.map(|(width, c)| (width, color(c))),
+            rounding: *rounding,
+        }),
+        crate::Shape::Line { points, width, color: c } => {
+            host::Shape::Line(host::PaintedLine { points: points.clone(), width: *width, color: color(*c) })
+        }
+        crate::Shape::Text { at, text, size, color: c, align } => host::Shape::Text(host::PaintedText {
+            at: *at,
+            text: text.clone(),
+            size: *size,
+            color: color(*c),
+            align: match align {
+                crate::Align::Start => host::Align::Start,
+                crate::Align::Middle => host::Align::Middle,
+                crate::Align::End => host::Align::End,
+            },
+        }),
     }
 }

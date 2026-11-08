@@ -17,6 +17,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("pe2-movies", "movies"),
     ("pe2-packages", "packages"),
     ("pe2-str", "str"),
+    ("pe2-sounds", "sounds"),
     ("pe2-render", "render"),
 ];
 

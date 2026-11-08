@@ -30,6 +30,7 @@ pub type Sniff = dyn Fn(&str, u64, &[u8]) -> Option<Recognized> + Send + Sync;
 /// A type as registered: what a value is, recognized or not, and where it says how they show (`shows_nodes`) what a node
 /// making one is.
 #[derive(Clone)]
+#[expect(clippy::struct_excessive_bools, reason = "a type's facts, each independent, each said by its builder")]
 pub struct TypeDef {
     pub name: Name,
     pub label: String,
@@ -63,6 +64,9 @@ pub struct TypeDef {
     pub extracted: bool,
     /// A node of it holds only what is set on it: an operation of its name makes those settings, of this type.
     pub data: bool,
+    /// What is set on a node of it is applied as soon as it is taken in: its outputs are made again at once, as what it
+    /// is edited for (a script sequenced and played) is hearing or seeing them follow.
+    pub applied_at_once: bool,
     /// The value types a node making one is of this type, by their qualified names: a picture stored as `texels` or as
     /// `bs_picture` is an `image`.
     pub values: Vec<String>,

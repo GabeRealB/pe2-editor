@@ -1025,3 +1025,19 @@ fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
     assert!(!store.sweep_due(every), "swept a while ago only");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn what_extraction_sets_is_beneath_what_the_node_sets() {
+    let node: toml::Table = toml::from_str(
+        "[[stack]]\nop = \"x.ext@script\"\ninstruments = [\"uid://a\"]\nvolume = 90\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n",
+    )
+    .unwrap();
+    let generated: toml::Table = toml::from_str("volume = 80\npan = 64\ncommands = []\n").unwrap();
+    let fields = super::with_settings(super::with_generated(node, &generated));
+    // What the node sets wins; what only extraction sets is on its home layer, among its fields.
+    assert_eq!(fields["volume"].as_integer(), Some(90));
+    assert_eq!(fields["pan"].as_integer(), Some(64));
+    let home = fields["stack"].as_array().unwrap()[0].as_table().unwrap();
+    assert!(home.contains_key("commands") && home.contains_key("instruments"));
+    assert!(!fields["stack"].as_array().unwrap()[1].as_table().unwrap().contains_key("pan"));
+}

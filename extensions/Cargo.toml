@@ -22,4 +22,5 @@ pe2-events.workspace = true
 pe2-render.workspace = true
 pe2-packages.workspace = true
 pe2-str.workspace = true
+pe2-sounds.workspace = true
 toml.workspace = true

@@ -333,7 +333,35 @@ fn animation_types(r: &mut Registry) {
         .field(Field::new("base").label("Base"))
         .field(Field::new("clips").custom())
         .field(Field::new("order").custom())
+        // What its clips' cues play, described from the code that plays them: the sound bank, and for a clip slot the
+        // events in turn - at its start (after `delay` ticks) or at its next cue of `cue`'s bits, each a slot of the
+        // sound bank - the last cue's event again at every cue after.
+        .field(Field::new("sounds").label("Sounds"))
+        .field(Field::new("cues").label("Cue sounds").format(cues_text))
         .register();
+}
+
+/// A bank's cue sounds as they read: a clip slot a line, its events in turn - the sound bank's slot each plays, at the
+/// start (`+ticks` after it) or at a cue of these bits - the last cue's again at every cue after.
+fn cues_text(value: &pe2_ext::Value) -> Option<String> {
+    let lines = value.as_table()?.iter().map(|(slot, events)| {
+        let events = events.as_array()?.iter().map(|e| {
+            let e = e.as_table()?;
+            let played = e.get("slot")?.as_integer()?;
+            Some(match e.get("on")?.as_str()? {
+                "start" => match e.get("delay").and_then(pe2_ext::Value::as_integer) {
+                    Some(delay) => format!("{played} at start +{delay}"),
+                    None => format!("{played} at start"),
+                },
+                "cue" => format!("{played} at cue {}", e.get("cue")?.as_integer()?),
+                _ => return None,
+            })
+        });
+        let events = events.collect::<Option<Vec<_>>>()?;
+        let again = if events.iter().any(|e| e.contains("at cue")) { ", again" } else { "" };
+        Some(format!("{}: {}{again}", slot.replace('_', " "), events.join(" · ")))
+    });
+    Some(lines.collect::<Option<Vec<_>>>()?.join("\n"))
 }
 
 /// A material: its shader, surface, blend and effect, and its textures, extracted as authored.

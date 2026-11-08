@@ -30,6 +30,9 @@ use crate::{FILE, Layer, LayerKind, Project, uid};
 
 pub const BUNDLE_SUFFIX: &str = ".node";
 pub const NODE_FILE: &str = "node.toml";
+/// A node's settings a generated layer holds for it, made by extraction: beneath what its `node.toml` sets
+/// (`graph::with_generated`), so that what the game holds stays out of the node and is still edited as its fields.
+pub const SETTINGS_FILE: &str = "settings.toml";
 
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
@@ -65,6 +68,8 @@ pub struct Asset {
     /// Why its `node.toml` could not be parsed; its fields are then empty.
     pub error: Option<String>,
     text: Arc<str>,
+    /// Its `settings.toml`, where a generated layer holds one.
+    generated: Option<Arc<str>>,
     fields: OnceLock<toml::Table>,
     settings_text: OnceLock<String>,
     /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
@@ -110,9 +115,21 @@ impl Asset {
         &self.text
     }
 
-    /// Its `node.toml`'s fields; empty where it cannot be parsed.
+    /// Its `node.toml`'s fields, over its generated `settings.toml`'s; empty where it cannot be parsed.
     pub fn fields(&self) -> &toml::Table {
-        self.fields.get_or_init(|| crate::graph::with_settings(toml::from_str(&self.text).unwrap_or_default()))
+        self.fields.get_or_init(|| self.fields_of(&self.text))
+    }
+
+    /// A declaration's fields, as this asset's would be: over its generated settings.
+    #[must_use]
+    pub fn fields_of(&self, text: &str) -> toml::Table {
+        let declared = toml::from_str(text).unwrap_or_default();
+        let generated = self.generated.as_deref().and_then(|g| toml::from_str::<toml::Table>(g).ok());
+        let fields = match generated {
+            Some(generated) => crate::graph::with_generated(declared, &generated),
+            None => declared,
+        };
+        crate::graph::with_settings(fields)
     }
 
     /// Its settings as readers see them: its fields, with what its import derived in their places.
@@ -1154,7 +1171,7 @@ impl Index {
             if let Some(record) = known(file, size, modified) {
                 self.records.insert(file.clone(), Arc::new(record));
             } else {
-                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE)
+                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE || n == SETTINGS_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
                 pending.push(Pending { path: file.clone(), size, modified, declaration });
             }
@@ -1182,7 +1199,7 @@ impl Index {
             let kept = !reported.contains(file)
                 && self.records.get(file).is_some_and(|r| r.size == size && r.modified == modified);
             if !kept {
-                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE)
+                let declaration = file.file_name().is_some_and(|n| n == NODE_FILE || n == SETTINGS_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
                 pending.push(Pending { path: file.clone(), size, modified, declaration });
             }
@@ -1762,6 +1779,7 @@ impl Index {
                 layers: layers.map(|l| self.layers[l].name.clone()).collect(),
                 error: None,
                 text: Arc::from(""),
+                generated: None,
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
                 imported: None,
@@ -1776,6 +1794,11 @@ impl Index {
                     asset.variants.clone_from(&d.variants);
                     asset.error.clone_from(&d.error);
                     asset.text = d.text.clone();
+                }
+                if name == SETTINGS_FILE
+                    && let Some(d) = &record.declaration
+                {
+                    asset.generated = Some(d.text.clone());
                 }
                 asset.files.push(BundleFile {
                     name: name.clone(),
@@ -1810,6 +1833,7 @@ impl Index {
                 layers: vec![below.layer.clone()],
                 error: None,
                 text: Arc::from(""),
+                generated: None,
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
                 imported: None,
@@ -1822,6 +1846,11 @@ impl Index {
                 {
                     asset.shape = Arc::from(d.shape.as_str());
                     asset.text = d.text.clone();
+                }
+                if file_name == SETTINGS_FILE
+                    && let Some(d) = &record.declaration
+                {
+                    asset.generated = Some(d.text.clone());
                 }
                 asset.files.push(BundleFile {
                     name: file_name.clone(),

@@ -179,6 +179,9 @@ pub struct Workspace {
     pub folder_moved: bool,
     /// A player for each document tab playing, and the tabs that drew theirs this frame.
     players: HashMap<crate::panes::Pane, crate::player::Player>,
+    /// Where the asset of the view being drawn under a player plays, and what that view asked of the player.
+    view_playback: Option<pe2_ext::Playing>,
+    view_transport: Vec<pe2_ext::Transport>,
     played: HashSet<crate::panes::Pane>,
     /// The views the panes show, by (pane, asset, view): made when first shown, made again when the asset changes.
     views: HashMap<(egui::Id, String, usize), Box<dyn pe2_ext::View>>,
@@ -695,6 +698,8 @@ impl Workspace {
             in_browser: false,
             folder_moved: false,
             players: HashMap::new(),
+            view_playback: None,
+            view_transport: Vec::new(),
             played: HashSet::new(),
             extensions,
             store,
@@ -1846,18 +1851,35 @@ impl Workspace {
         !self.folders_forward.is_empty()
     }
 
-    /// A document tab's asset, played.
+    /// A document tab's asset, played: under the player's controls, its type's view where it has one, told where it
+    /// plays and asking the player to play or go elsewhere.
     pub fn play(
         &mut self,
         ui: &mut egui::Ui,
         pane: crate::panes::Pane,
         path: &str,
-        view: &mut crate::settings::Preview,
+        (view, nav): (&mut crate::settings::Preview, &mut Option<String>),
     ) {
         self.played.insert(pane);
         let (extensions, index) = (self.extensions.clone(), self.index.clone());
-        let player = self.players.entry(pane).or_insert_with(|| crate::player::Player::new(extensions.clone()));
-        player.ui(ui, (&extensions, &index), path, view);
+        let mut player = self.players.remove(&pane).unwrap_or_else(|| crate::player::Player::new(extensions.clone()));
+        let look = self.chosen.get(&(path.to_string(), project::ext::PICTURE.to_string())).cloned();
+        let make = index.assets.get(path).and_then(|asset| extensions.views(asset).first().map(|def| def.make.clone()));
+        let preview = *view;
+        match make {
+            Some(make) => {
+                let mut body = |ui: &mut egui::Ui, playing: Option<pe2_ext::Playing>| {
+                    self.view_playback = playing;
+                    let key = (egui::Id::unique(("played", pane)), path.to_string(), 0);
+                    self.draw_view(ui, key, &*make, (preview, 1), nav, None);
+                    self.view_playback = None;
+                    std::mem::take(&mut self.view_transport)
+                };
+                player.ui(ui, (&extensions, &index), (path, look.as_deref()), view, Some(&mut body));
+            }
+            None => player.ui(ui, (&extensions, &index), (path, look.as_deref()), view, None),
+        }
+        self.players.insert(pane, player);
     }
 
     /// Once every window is drawn: a tab gone takes its player, and one not shown pauses.
@@ -2224,7 +2246,16 @@ impl Workspace {
             chosen: Some(&self.chosen),
             revision: self.revision,
         };
-        let frame = crate::ext_ui::Frame { asset: Some(asset), preview, count, editable, part: part.as_deref(), shown };
+        let playback = self.view_playback;
+        let frame = crate::ext_ui::Frame {
+            asset: Some(asset),
+            preview,
+            count,
+            editable,
+            part: part.as_deref(),
+            shown,
+            playback,
+        };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));
@@ -2235,6 +2266,7 @@ impl Workspace {
         if let Some((group, member)) = sets.choose {
             self.choose_member(&path, group, member);
         }
+        self.view_transport.extend(sets.transport);
     }
 
     /// What a gesture in a view has made so far of a part's fields, as yet unwritten.
@@ -2344,6 +2376,7 @@ impl Workspace {
                 count: 1,
                 editable,
                 part: part.as_deref(),
+                playback: None,
             };
             let mut sets = crate::ext_ui::Sets::default();
             let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
@@ -2378,7 +2411,15 @@ impl Workspace {
         };
         // A panel's canvas is not a picture's: no texel grid over it.
         let preview = Preview { grid: false, ..preview };
-        let frame = crate::ext_ui::Frame { asset: None, preview, count: 1, editable: false, part: None, shown: None };
+        let frame = crate::ext_ui::Frame {
+            asset: None,
+            preview,
+            count: 1,
+            editable: false,
+            part: None,
+            shown: None,
+            playback: None,
+        };
         let mut sets = crate::ext_ui::Sets::default();
         let mut host = crate::ext_ui::Host::new(ui, &lens, &mut self.textures, nav, &mut sets, frame);
         view.show(&mut pe2_ext::Ui::new(&mut host));

@@ -604,6 +604,33 @@ fn holds_settings(op: &str) -> bool {
     ![OUTPUT, PREVIEW, GRAPH, BELOW, CONCATENATE].contains(&op)
 }
 
+/// A node's declaration with the settings a generated layer holds for it (its `settings.toml`, made by extraction) beneath
+/// its own: each it does not set put where a setting of its belongs - the layer holding it, else its home layer (the
+/// first of its own operations before anything is taken from it, else its stored file) - so that what is set over it
+/// there wins, and what the node's operations are set to includes it.
+#[must_use]
+pub fn with_generated(mut fields: Table, generated: &Table) -> Table {
+    let Some(layers) = fields.get_mut("stack").and_then(Toml::as_array_mut) else {
+        for (key, value) in generated {
+            fields.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        return fields;
+    };
+    let op = |layer: &Toml| layer.get("op").and_then(Toml::as_str).map(str::to_string);
+    let taken = layers.iter().position(|layer| matches!(op(layer).as_deref(), Some(OUTPUT | PREVIEW)));
+    let own = layers.iter().take(taken.unwrap_or(usize::MAX)).position(|layer| op(layer).as_deref() != Some(FILE));
+    let Some(home) = own.or_else(|| (!layers.is_empty()).then_some(0)) else { return fields };
+    for (key, value) in generated {
+        if layers.iter().any(|layer| layer.get(key).is_some()) {
+            continue;
+        }
+        if let Some(layer) = layers[home].as_table_mut() {
+            layer.insert(key.clone(), value.clone());
+        }
+    }
+    fields
+}
+
 /// A node's declaration with the settings on its layers among its fields: what each operation is set to, as the node's
 /// settings, for whatever reads them by name. Its `stack` stays as it is.
 #[must_use]

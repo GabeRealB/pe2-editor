@@ -117,6 +117,8 @@ pub struct Frame<'a> {
     pub part: Option<&'a str>,
     /// The output it is a viewer of, for a viewer.
     pub shown: Option<&'a str>,
+    /// Where what the asset plays is, where the view is drawn under its player.
+    pub playback: Option<pe2_ext::Playing>,
 }
 
 /// What a view set of the asset it shows this frame.
@@ -128,6 +130,8 @@ pub struct Sets {
     pub apart: bool,
     /// A member of a family to look at.
     pub choose: Option<(String, String)>,
+    /// What the view asked of what plays the asset.
+    pub transport: Vec<pe2_ext::Transport>,
 }
 
 /// What a gesture has made so far of a part's fields, nothing being written yet: until the asset next changes.
@@ -281,6 +285,70 @@ impl UiHost for Host<'_> {
 
     fn request_repaint(&mut self) {
         self.target.ui().ctx().request_repaint();
+    }
+
+    fn paint(&mut self, width: f32, height: f32, shapes: &[pe2_ext::Shape]) -> pe2_ext::ViewportInput {
+        let ui = self.target.ui();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let error = ui.visuals().error_fg_color;
+        let color = |color: pe2_ext::Color| match color {
+            pe2_ext::Color::Theme(role) => match role {
+                pe2_ext::Role::Text => theme::text(),
+                pe2_ext::Role::Weak => theme::weak(),
+                pe2_ext::Role::Accent => theme::accent(),
+                pe2_ext::Role::Background => theme::background(),
+                pe2_ext::Role::Raised => theme::raised(),
+                pe2_ext::Role::Border => theme::border(),
+                pe2_ext::Role::Link => theme::link(),
+                pe2_ext::Role::Error => error,
+            },
+            pe2_ext::Color::Rgba(r, g, b, a) => egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+        };
+        let at = |(x, y): (f32, f32)| rect.min + egui::vec2(x, y);
+        for shape in shapes {
+            match shape {
+                pe2_ext::Shape::Rect { min, max, fill, stroke, rounding } => {
+                    let r = egui::Rect::from_min_max(at(*min), at(*max));
+                    if let Some(fill) = fill {
+                        painter.rect_filled(r, *rounding, color(*fill));
+                    }
+                    if let Some((width, c)) = stroke {
+                        painter.rect_stroke(
+                            r,
+                            *rounding,
+                            egui::Stroke::new(*width, color(*c)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+                pe2_ext::Shape::Line { points, width, color: c } => {
+                    painter.add(egui::Shape::line(
+                        points.iter().map(|p| at(*p)).collect(),
+                        egui::Stroke::new(*width, color(*c)),
+                    ));
+                }
+                pe2_ext::Shape::Text { at: point, text, size, color: c, align } => {
+                    let anchor = match align {
+                        pe2_ext::Align::Start => egui::Align2::LEFT_CENTER,
+                        pe2_ext::Align::Middle => egui::Align2::CENTER_CENTER,
+                        pe2_ext::Align::End => egui::Align2::RIGHT_CENTER,
+                    };
+                    painter.text(at(*point), anchor, text, egui::FontId::proportional(*size), color(*c));
+                }
+            }
+        }
+        let input = crate::gpu_view::input(ui, &response, rect);
+        self.last = Some(response);
+        input
+    }
+
+    fn playback(&self) -> Option<pe2_ext::Playing> {
+        self.frame.playback
+    }
+
+    fn transport(&mut self, request: pe2_ext::Transport) {
+        self.sets.transport.push(request);
     }
 
     fn time(&mut self) -> f64 {

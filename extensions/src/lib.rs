@@ -55,6 +55,7 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
         pe2_movies::extension(),
         pe2_packages::extension(),
         pe2_str::extension(),
+        pe2_sounds::extension(),
     ]
 }
 

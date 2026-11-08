@@ -13,6 +13,7 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Ora>();
     let _ = r.value_type::<Zip>();
     let _ = r.value_type::<Text>();
+    let _ = r.value_type::<Wav>();
     Ok(())
 }
 
@@ -65,6 +66,21 @@ impl Registered for Zip {
 }
 
 impl Files for Zip {}
+
+/// A WAV file: a RIFF file whose form is `WAVE`.
+pub struct Wav;
+
+impl Registered for Wav {
+    const NAME: &str = "pe2.formats@wav";
+    const LABEL: &str = "WAV sound";
+    const MEDIA_TYPE: Option<&str> = Some("audio/wav");
+
+    fn signatures() -> Vec<Signature> {
+        vec![at(8, b"WAVE"), Signature::Name("*.wav".into())]
+    }
+}
+
+impl Files for Wav {}
 
 /// Text: UTF-8 without a NUL byte.
 pub struct Text;
