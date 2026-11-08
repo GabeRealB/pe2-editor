@@ -70,7 +70,10 @@ impl Uploads {
                     self.pages.extend(theirs.pages);
                 }
             }
-            let resources = list("resources").iter().filter_map(|r| r.get("palettes").and_then(Value::as_array));
+            // A bundle's palette resources, in the bundle node the slot names.
+            let bundle = slot.get("bundle").and_then(|t| project.resolve(t));
+            let resources: Vec<Value> = bundle.map_or_else(Vec::new, |b| b.array("resources").to_vec());
+            let resources = resources.iter().filter_map(|r| r.get("palettes").and_then(Value::as_array));
             for entry in list("palettes").iter().chain(resources.flatten()) {
                 if let Some(image) = entry.get("image").and_then(|t| project.resolve(t))
                     && let Some(name) = entry.get("palette").and_then(Value::as_str)

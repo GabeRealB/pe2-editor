@@ -9,7 +9,9 @@ use std::process::Command;
 const TARGET: &str = "wasm32-wasip3";
 /// The built-ins, by package: each a crate in a folder of this one.
 const BUILTINS: &[(&str, &str)] = &[
+    ("pe2-dialogue", "dialogue"),
     ("pe2-events", "events"),
+    ("pe2-flags", "flags"),
     ("pe2-fonts", "fonts"),
     ("pe2-formats", "formats"),
     ("pe2-game", "game"),
@@ -42,6 +44,7 @@ fn main() {
         workspace.join("crates/ext/Cargo.toml"),
         workspace.join("crates/codecs"),
         workspace.join("crates/formats"),
+        workspace.join("crates/typeface"),
         workspace.join("Cargo.lock"),
         workspace.join(".cargo/config.toml"),
     ];

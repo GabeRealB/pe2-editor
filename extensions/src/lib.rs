@@ -48,6 +48,8 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
     vec![
         pe2_render::extension(),
         pe2_events::extension(),
+        pe2_flags::extension(),
+        pe2_dialogue::extension(),
         pe2_fonts::extension(),
         pe2_formats::extension(),
         pe2_game::extension(),

@@ -2006,7 +2006,14 @@ impl Editor {
             if let Some(name) = outcome.nav.as_deref().and_then(|path| path.strip_prefix('#')) {
                 ws.select_part(name);
             } else if let Some(path) = outcome.nav {
-                ws.navigate(path);
+                // An asset with a part after `#`: the asset opened, the part selected in it.
+                match path.split_once('#') {
+                    Some((asset, part)) => {
+                        ws.navigate(asset.to_string());
+                        ws.select_part(part);
+                    }
+                    None => ws.navigate(path),
+                }
                 self.opened = None;
             } else if let Some(pick) = outcome.pick {
                 ws.select(pick.path.clone());

@@ -225,6 +225,12 @@ pub trait UiHost {
     /// A one-line text field over `text`, `id` keeping it apart; whether it was committed this frame (Enter, or the
     /// keyboard taken elsewhere).
     fn text_edit(&mut self, id: &str, text: &mut String, hint: &str, width: f32) -> bool;
+    /// A text field of several lines over `text`, `rows` high; whether it was committed this frame (the keyboard taken
+    /// elsewhere). Where a host has none, a one-line field.
+    fn text_area(&mut self, id: &str, text: &mut String, rows: u32, width: f32) -> bool {
+        let _ = rows;
+        self.text_edit(id, text, "", width)
+    }
     /// A dropdown showing `selected`; the option chosen this frame.
     fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize>;
     /// Whether the asset shown can be edited: its layer is not locked, nor outside a solo.
@@ -395,6 +401,11 @@ impl<'a> Ui<'a> {
         self.host.text_edit(id, text, hint, width)
     }
 
+    /// A text field of several lines, `rows` high, `width` points wide (the host's at 0); whether it was committed.
+    pub fn text_area(&mut self, id: &str, text: &mut String, rows: u32, width: f32) -> bool {
+        self.host.text_area(id, text, rows, width)
+    }
+
     /// A dropdown; the option chosen this frame.
     pub fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize> {
         self.host.combo(id, selected, options)
@@ -486,6 +497,7 @@ impl<'a> Ui<'a> {
         self.host.picture(path, look)
     }
 
+    /// Open an asset by its path; `path#part` selects a part of it too.
     pub fn navigate(&mut self, path: &str) {
         self.host.navigate(path);
     }

@@ -1,0 +1,13 @@
+[package]
+name = "typeface"
+description = "A font face as the game draws it - glyphs of 4-bit art - and as a UFO 3 font, read and written exactly"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+codecs.workspace = true
+png.workspace = true

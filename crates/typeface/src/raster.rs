@@ -12,7 +12,7 @@
 
 use codecs::ufo;
 
-use crate::atlas::{Art, TRANSPARENT};
+use crate::{Art, TRANSPARENT};
 
 /// Points a texel's coverage is counted on, along each side.
 const SAMPLES: usize = 8;
@@ -355,7 +355,7 @@ fn transform(cost: &[f64]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::{Raster, rasterize};
-    use crate::atlas::TRANSPARENT;
+    use crate::TRANSPARENT;
     use codecs::ufo;
 
     /// A square glyph, 4 x 4 units from (1, 0), a unit a texel.

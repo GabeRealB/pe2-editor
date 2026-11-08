@@ -499,6 +499,12 @@ impl UiHost for Frame<'_> {
         committed
     }
 
+    fn text_area(&mut self, id: &str, text: &mut String, rows: u32, width: f32) -> bool {
+        let (edited, committed) = self.ui().text_area(id, text, rows, width);
+        *text = edited;
+        committed
+    }
+
     fn combo(&mut self, id: &str, selected: &str, options: &[String]) -> Option<usize> {
         self.ui().combo(id, selected, options).map(|i| i as usize)
     }

@@ -434,6 +434,23 @@ fn stream_bits(stream: &[u8]) -> usize {
     }
 }
 
+/// A palette chunk's payload: its VRAM rectangle (x, y, rows, width), eight zero bytes, its colors row by row as one
+/// LZSS stream, and a zero byte (in every chunk). The stream holds `stored` bytes of them - all, in every chunk but those one byte short of it (38 of
+/// the 934 a room's bundles hold), which the game's tool wrote so.
+#[must_use]
+pub fn palette_payload(x: u16, y: u16, width: u16, colors: &[u16], stored: usize) -> Vec<u8> {
+    let rows = u16::try_from(colors.len() / usize::from(width.max(1))).unwrap_or(u16::MAX);
+    let mut out = Vec::with_capacity(16 + colors.len());
+    for word in [x, y, rows, width] {
+        out.extend(word.to_le_bytes());
+    }
+    out.extend([0; 8]);
+    let bytes: Vec<u8> = colors.iter().flat_map(|c| c.to_le_bytes()).collect();
+    out.extend(crate::lzss::encode(&bytes[..stored.min(bytes.len())]));
+    out.push(0);
+    out
+}
+
 /// An image chunk's payload: its column table (through the first strip's offset), then each strip encoded.
 #[must_use]
 pub fn image_payload(table: &[u8], strips: &[Vec<u8>], sector_len: u16) -> Vec<u8> {

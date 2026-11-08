@@ -3,7 +3,10 @@
 //! order, made from them by `inter`), the scenes' audio streams a stage stores (`scene_audio`), the executable, plain
 //! text and binary data. A file lists the streams its package plays (`streams`): each a movie or a scene's audio, by
 //! name, with what of its record does not follow from where it is. Each type's icon and label, and the fields read in
-//! hex: a file's sector length.
+//! hex: a file's sector length. A room's resource bundle is a node of its own (`bundle`), which the file's `bundle` slot
+//! names: its resources joined as the chunk stores them (`bundle.rs`).
+
+mod bundle;
 
 use pe2_ext::{Asset, Call, Data, Field, Icon, Registry, Result, Table, Tint, Typed, Value, anyhow, ty};
 
@@ -33,7 +36,7 @@ retain = "cache"
 "#;
 
 /// What a node's fields are, read by another's op.
-const SETTINGS: &str = "settings";
+pub(crate) const SETTINGS: &str = "settings";
 
 /// The groups or folders a stage's layout lists, by their nodes, in its order: stage 0's groups, a stage's folders.
 fn layout_parts(layout: &Table) -> Result<Vec<String>> {
@@ -185,6 +188,44 @@ fn group_files(asset: &Asset) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A room's resource bundle, joined of its resources (`bundle.rs`), and what extraction writes of one.
+fn bundle_types(r: &mut Registry) {
+    let _ = r
+        .op("join_bundle")
+        .label("Its resources joined")
+        .takes("bundle", &["pe2.game@bundle"])
+        .input::<ty::Bytes>("layout")
+        .input::<ty::Bytes>("stored")
+        .output::<ty::Bytes>()
+        .steps(bundle::join());
+    r.named_type("bundle")
+        .alias("bundle")
+        .label("Resource bundle")
+        .icon(Icon::Stack, Tint::Structure)
+        .data()
+        .extracted()
+        .stack(bundle::STACK)
+        .field(Field::new("resources").label("Resources"))
+        .register();
+    let _ = r
+        .op("extract_bundle")
+        .label("A bundle's layout and stored resources, read from its bytes")
+        .port("chunks", "bytes", true)
+        .output_described("bytes")
+        .run_described(|call| {
+            let given = call.inputs.first().map_or(&[][..], Vec::as_slice);
+            let chunk = match given.first() {
+                Some(Data::Typed(typed)) => call.read(typed.file()?)?,
+                _ => pe2_ext::bail!("no bundle given"),
+            };
+            let files = bundle::extract(&chunk, call.settings)?
+                .into_iter()
+                .map(|(name, bytes)| pe2_ext::File::new(&name, bytes))
+                .collect();
+            Ok(Data::Typed(Typed::new("bytes", files)))
+        });
+}
+
 #[expect(clippy::unnecessary_wraps, reason = "an entry point may fail; this one does not")]
 fn register(r: &mut Registry) -> Result<()> {
     let held = [
@@ -248,6 +289,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .field(Field::new("sector_len").label("Sector length").format(hex))
         .field(Field::new("streams").label("Streams"))
         .register();
+    bundle_types(r);
     // A disc's movie file, made of its stages' movies (`inter`).
     let _ = r
         .op("inter")

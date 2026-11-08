@@ -465,6 +465,18 @@ impl UiHost for Host<'_> {
         }
     }
 
+    fn text_area(&mut self, id: &str, text: &mut String, rows: u32, width: f32) -> bool {
+        let ui = self.target.ui();
+        let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+        let width = if width > 0.0 { width } else { ui.available_width() };
+        let rows = usize::try_from(rows.max(1)).unwrap_or(1);
+        let edit = egui::TextEdit::multiline(text).id_salt(id).desired_width(width).desired_rows(rows).background_color(fill);
+        let response = ui.add_enabled(self.frame.editable, edit);
+        let committed = response.lost_focus();
+        self.last = Some(response);
+        committed
+    }
+
     fn text_edit(&mut self, id: &str, text: &mut String, hint: &str, width: f32) -> bool {
         let ui = self.target.ui();
         // On a section's background a field has to stand out as a dropdown does.

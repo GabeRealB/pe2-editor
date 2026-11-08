@@ -22,8 +22,7 @@
 pub mod atlas;
 pub mod encoding;
 mod extract;
-pub mod face;
-pub mod raster;
+pub use typeface::{face, raster};
 pub mod render;
 
 use pe2_ext::ty::{self, Files, Registered};

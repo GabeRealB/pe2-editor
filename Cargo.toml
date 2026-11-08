@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/formats",
     "crates/codecs",
+    "crates/typeface",
     "crates/ext",
     "crates/ext-macros",
     "crates/setup",
@@ -16,6 +17,8 @@ members = [
     "crates/editor",
     "xtask",
     "extensions",
+    "extensions/dialogue",
+    "extensions/flags",
     "extensions/fonts",
     "extensions/formats",
     "extensions/game",
@@ -53,6 +56,7 @@ tracing-tracy = "0.12"
 formats = { path = "crates/formats" }
 pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }
+typeface = { path = "crates/typeface" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }
 pe2-ext-macros = { path = "crates/ext-macros" }
@@ -71,7 +75,9 @@ pe2-test-data = { path = "extensions/test_data" }
 pe2-game = { path = "extensions/game" }
 pe2-images = { path = "extensions/images" }
 pe2-movies = { path = "extensions/movies" }
+pe2-dialogue = { path = "extensions/dialogue" }
 pe2-events = { path = "extensions/events" }
+pe2-flags = { path = "extensions/flags" }
 pe2-render = { path = "extensions/render" }
 pe2-webgpu = { path = "crates/webgpu" }
 pe2-packages = { path = "extensions/packages" }

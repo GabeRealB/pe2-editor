@@ -1997,8 +1997,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codecs",
+ "pe2-dialogue",
  "pe2-events",
  "pe2-ext",
+ "pe2-flags",
  "pe2-fonts",
  "pe2-formats",
  "pe2-game",
@@ -4111,6 +4113,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pe2-dialogue"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "formats",
+ "pe2-ext",
+ "serde_json",
+ "sha1",
+ "toml 0.8.23",
+ "typeface",
+]
+
+[[package]]
 name = "pe2-events"
 version = "0.1.0"
 dependencies = [
@@ -4149,6 +4164,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-flags"
+version = "0.1.0"
+dependencies = [
+ "pe2-ext",
+]
+
+[[package]]
 name = "pe2-fonts"
 version = "0.1.0"
 dependencies = [
@@ -4159,6 +4181,7 @@ dependencies = [
  "serde",
  "sha1",
  "toml 0.8.23",
+ "typeface",
 ]
 
 [[package]]
@@ -4173,6 +4196,8 @@ dependencies = [
 name = "pe2-game"
 version = "0.1.0"
 dependencies = [
+ "codecs",
+ "formats",
  "pe2-ext",
 ]
 
@@ -6226,6 +6251,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "typeface"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "png",
 ]
 
 [[package]]

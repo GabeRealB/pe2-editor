@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use codecs::ufo::{self, Plist};
 
-use crate::atlas::{Art, Glyph, TRANSPARENT};
+use crate::{Art, Glyph, TRANSPARENT};
 use crate::raster::{self, Raster};
 
 const LIB: &str = "org.pe2decomp";
@@ -53,7 +53,8 @@ fn integers(values: &[i64]) -> Plist {
 }
 
 /// An art's PNG: 8-bit indexed, a gray ramp and a seventeenth entry painting nothing.
-pub(crate) fn art_png(art: &Art) -> Vec<u8> {
+#[must_use]
+pub fn art_png(art: &Art) -> Vec<u8> {
     let mut out = Vec::new();
     let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
     let mut encoder = png::Encoder::new(&mut out, to_u32(art.width.max(1)), to_u32(art.height.max(1)));
@@ -76,7 +77,10 @@ pub(crate) fn art_png(art: &Art) -> Vec<u8> {
 
 /// An image's art: an indexed PNG's indices as values (one past 15, or a clear entry, painting nothing), or gray levels
 /// of another PNG as the nearest values (clear pixels painting nothing).
-pub(crate) fn art_of(png: &[u8]) -> Result<Art, String> {
+///
+/// # Errors
+/// It is not a PNG, or not an indexed one.
+pub fn art_of(png: &[u8]) -> Result<Art, String> {
     let picture = codecs::ora::decode_png(png).map_err(|e| e.to_string())?;
     let texels =
         match picture.pixels {

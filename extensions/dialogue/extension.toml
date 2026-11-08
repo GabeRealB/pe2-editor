@@ -1,0 +1,5 @@
+id = "pe2.dialogue"
+version = "0.1.0"
+description = "Dialogue: the rooms' scripts of lines and scene steps as their structure, their text in string tables, and the faces they draw, read and written exactly."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"

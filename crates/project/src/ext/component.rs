@@ -1181,6 +1181,19 @@ impl host::HostUi for State {
         Ok((text, committed))
     }
 
+    fn text_area(
+        &mut self,
+        ui: Resource<Frame>,
+        id: String,
+        text: String,
+        rows: u32,
+        width: f32,
+    ) -> wasmtime::Result<(String, bool)> {
+        let mut text = text;
+        let committed = self.frame(&ui)?.text_area(&id, &mut text, rows, width);
+        Ok((text, committed))
+    }
+
     fn combo(
         &mut self,
         ui: Resource<Frame>,
