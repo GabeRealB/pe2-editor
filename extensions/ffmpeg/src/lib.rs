@@ -121,6 +121,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .output::<ty::File<Video>>()
         .parameter::<String>("encoding")
         .provides("video")
+        .exports("Video file", "mp4")
         .keeps(pe2_ext::Retain::Cache)
         .members(|_| vec![("lossless".to_string(), "Lossless".to_string())])
         .run(|call| {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use std::marker::PhantomData;
 
-use crate::data::{Call, OpDef, Port, Prepared, Provides, Retain, Type};
+use crate::data::{Call, Export, OpDef, Port, Prepared, Provides, Retain, Type};
 use crate::import::{Recognized, Signature, TypeDef};
 use crate::ty::ValueType;
 use crate::{Asset, Project, Result, Table, Value, View};
@@ -153,6 +153,8 @@ pub struct Field {
     pub absent: Option<String>,
     /// It has no value of its own to fall back on: left out, what it is set on is wrong.
     pub required: bool,
+    /// What it is where it is left out: the inspector shows it so, for a node made new to be set from.
+    pub default: Option<Value>,
 }
 
 impl Field {
@@ -168,7 +170,15 @@ impl Field {
             custom: false,
             absent: None,
             required: false,
+            default: None,
         }
+    }
+
+    /// What it is where it is left out (`127`): shown so, set where it is edited.
+    #[must_use]
+    pub fn default_value(mut self, value: impl Into<Value>) -> Field {
+        self.default = Some(value.into());
+        self
     }
 
     #[must_use]
@@ -1329,7 +1339,18 @@ impl<'a, Out: ValueType> OpBuilder<'a, Out> {
     /// says otherwise. What a node itself offers is no conversion: it is in its stack.
     #[must_use]
     pub fn provides(mut self, name: &str) -> Self {
-        self.def.provides = Some(Provides { name: name.to_string(), retain: Retain::Transient });
+        self.def.provides = Some(Provides { name: name.to_string(), retain: Retain::Transient, export: None });
+        self
+    }
+
+    /// An exporter: what it provides (by its name, or the operation's where it provides nothing yet) is a file a person
+    /// saves out of the project, offered by its label (`WAV file`), the file named with this extension (`wav`). It
+    /// is offered for every node making what it takes, as what it provides is.
+    #[must_use]
+    pub fn exports(mut self, label: &str, extension: &str) -> Self {
+        let name = self.def.name.as_str().rsplit('@').next().unwrap_or_default().to_string();
+        let provides = self.def.provides.get_or_insert(Provides { name, retain: Retain::Transient, export: None });
+        provides.export = Some(Export { label: label.to_string(), extension: extension.to_string() });
         self
     }
 

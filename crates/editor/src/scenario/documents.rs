@@ -138,3 +138,52 @@ fn a_point_of_the_history_is_shown_read_only_and_restored() {
     editor.undo();
     assert_eq!(pelvis(&editor.working("rig/skeleton")), [0, -800, 0]);
 }
+
+#[test]
+fn a_sound_is_exported_as_a_wav_file() {
+    let fixture = Fixture::beep();
+    let mut editor = Scenario::open(fixture);
+    editor.show("sfx/beep");
+    editor.shortcut(egui::Key::E);
+    editor.expect("Export beep");
+    editor.click_label("WAV file, as played  (.wav)");
+    editor.click_label("Export");
+    let file = editor.workspace().project.root.join("exports/beep.wav");
+    editor.until("the WAV file to be written", |_| file.exists());
+    let bytes = std::fs::read(&file).expect("the file");
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert!(bytes.len() > 44, "it holds what was played");
+}
+
+#[test]
+fn a_new_node_goes_beside_the_document_in_use_named_and_from_its_defaults() {
+    let mut editor = Scenario::open(Fixture::beep());
+    editor.show("sfx/beep");
+    editor.menu(&["File", "New node", "Sound script"]);
+    editor.expect("New sound script in sfx");
+    editor.expect("Rename");
+    // Named at once: what is typed replaces the template's name.
+    editor.typing("footstep");
+    editor.press(egui::Key::Enter);
+    editor.expect("Rename sound_script to footstep");
+    assert!(editor.assets().iter().any(|a| a == "sfx/footstep"), "{:?}", editor.assets());
+    editor.show("sfx/footstep");
+    // Made from nothing, its settings are its type's defaults, shown so.
+    editor.expect("Volume");
+    editor.expect("default");
+    editor.expect("Instruments: No instruments yet");
+    editor.expect("no other instrument in the project to add");
+}
+
+#[test]
+fn undoing_a_new_node_closes_its_tab() {
+    let mut editor = Scenario::open(Fixture::beep());
+    editor.show("sfx/beep");
+    editor.menu(&["File", "New node", "Sound script"]);
+    editor.escape();
+    editor.show("sfx/sound_script");
+    editor.editor().undo();
+    editor.settle();
+    assert!(!editor.assets().iter().any(|a| a == "sfx/sound_script"));
+    editor.expect_not("is no longer in the project");
+}

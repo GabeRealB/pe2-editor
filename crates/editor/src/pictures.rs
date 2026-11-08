@@ -29,6 +29,8 @@ struct Made {
     picture: Drawn,
     marks: Option<Arc<Marks>>,
     reads: Option<Reads>,
+    /// The declaration it was drawn of: its settings say how it is drawn, which what it read does not record.
+    declaration: String,
 }
 
 enum Slot {
@@ -92,10 +94,12 @@ impl Pictures {
     pub fn set_index(&mut self, index: Arc<Index>) {
         self.slots.retain(|(path, _), slot| match slot {
             Slot::Drawing(_) => true,
-            Slot::Drawn(made) => made
-                .reads
-                .as_ref()
-                .is_some_and(|reads| index.assets.get(path).is_some_and(|asset| reads.hold(&**asset, None))),
+            Slot::Drawn(made) => made.reads.as_ref().is_some_and(|reads| {
+                index
+                    .assets
+                    .get(path)
+                    .is_some_and(|asset| asset.text() == made.declaration && reads.hold(&**asset, None))
+            }),
         });
         self.index = index;
     }
@@ -143,7 +147,8 @@ impl Pictures {
 /// Make a picture asked for, and what its type marks on it: a failure of those leaves the picture unmarked.
 fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request: &Request) -> Made {
     let index = &request.index;
-    let failed = |why: String| Made { picture: Err(why), marks: None, reads: None };
+    let declared = index.assets.get(&request.path).map_or_default(|a| a.text().to_string());
+    let failed = |why: String| Made { picture: Err(why), marks: None, reads: None, declaration: declared.clone() };
     let Some(asset) = index.assets.get(&request.path) else { return failed("it has no picture".to_string()) };
     let Some(address) = extensions.picture_address(asset, request.look) else {
         return failed("it has no picture".to_string());
@@ -165,7 +170,7 @@ fn make(extensions: &Extensions, engine: &project::graph::exec::Engine, request:
             _ => None,
         }
     });
-    Made { picture: Ok(Arc::new(image.clone())), marks, reads: Some(reads) }
+    Made { picture: Ok(Arc::new(image.clone())), marks, reads: Some(reads), declaration: asset.text().to_string() }
 }
 
 impl Drop for Pictures {

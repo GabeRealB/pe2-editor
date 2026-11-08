@@ -8,6 +8,8 @@
 //! - In a script (not a bank, whose scripts are edited in their own nodes), a note's body drags it in time - its delay,
 //!   the next command's taking up the difference so that nothing after it moves - and its end drags its gate; Delete
 //!   removes it, "Copy after it" copies it, and its settings are typed in. Each is one undoable step.
+//! - A script is made from nothing there too: an instrument of the project added to those it plays, a note added at
+//!   its end.
 
 #![expect(
     clippy::cast_possible_truncation,
@@ -37,6 +39,10 @@ struct Made {
     score: engine::Score,
     commands: Vec<Command>,
     instruments: Vec<Option<String>>,
+    /// The instruments' references, as the script writes them.
+    references: Vec<String>,
+    /// The node's name: what its instruments' names share with it is left out of the lanes' labels.
+    name: String,
     /// The script's node, for a bank's slot: where it is edited.
     script: Option<String>,
 }
@@ -124,11 +130,20 @@ fn made_of(project: &dyn pe2_ext::Project, asset: &Asset<'_>, slot: Option<usize
         Some(Chunk::Entry { commands, .. }) => commands.clone(),
         _ => Vec::new(),
     };
-    let instruments = crate::preview::references(settings, "instruments")
-        .iter()
-        .map(|r| project.resolve(&Value::String(r.clone())).map(|a| a.path().to_string()))
-        .collect();
-    Ok(Made { score, commands, instruments, script })
+    let references = crate::preview::references(settings, "instruments");
+    let instruments =
+        references.iter().map(|r| project.resolve(&Value::String(r.clone())).map(|a| a.path().to_string())).collect();
+    let name = asset.path().rsplit('/').next().unwrap_or_default().to_string();
+    Ok(Made { score, commands, instruments, references, name, script })
+}
+
+/// An instrument's name without what it shares with the node's, up to a `_` (`level_1_instrument_0` beside
+/// `level_1_script_0`: `instrument_0`).
+fn beside(path: Option<&String>, name: &str) -> String {
+    let full = short(path);
+    let shared = full.chars().zip(name.chars()).take_while(|(a, b)| a == b).count();
+    let cut = full[..full.char_indices().nth(shared).map_or(full.len(), |(i, _)| i)].rfind('_').map_or(0, |i| i + 1);
+    if cut > 0 && cut < full.len() { full[cut..].to_string() } else { full }
 }
 
 fn short(path: Option<&String>) -> String {
@@ -229,7 +244,8 @@ impl Timeline {
             shapes.push(line((0.0, top + LANE), (width, top + LANE), 1.0, theme(Role::Border)));
             let Command::Voice(v) = &made.commands[command] else { continue };
             let instrument = made.instruments.get(usize::from(v.program)).and_then(Option::as_ref);
-            let label = fitted(&format!("#{command} L{} {}", v.layer, short(instrument)), LABEL - 16.0, 12.0);
+            let label =
+                fitted(&format!("#{command} L{} {}", v.layer, beside(instrument, &made.name)), LABEL - 16.0, 12.0);
             let color = if kept.selected == Some(command) { Role::Text } else { Role::Weak };
             shapes.push(Shape::Text {
                 at: (8.0, top + LANE / 2.0),
@@ -383,6 +399,29 @@ enum Edit {
     Copy(usize),
     /// A setting of a command typed in.
     Set(usize, String, Value),
+    /// A note added at the end, played on the instrument at this place among the script's.
+    Add(usize),
+}
+
+/// A note as a script made new plays it: at once, on its layer's envelope, centered, at full volume, middle C, for half a
+/// second.
+fn new_note(instrument: usize) -> Table {
+    let mut note = Table::new();
+    for (key, value) in [
+        ("op", Value::String("voice".into())),
+        ("instrument", Value::Integer(i64::try_from(instrument).unwrap_or(0))),
+        ("layer", Value::Integer(0)),
+        ("delay", Value::Integer(0)),
+        ("gate", Value::Integer(30)),
+        ("pan", Value::Integer(-1)),
+        ("volume", Value::Integer(127)),
+        ("reverb", Value::Integer(-1)),
+        ("priority", Value::Integer(0)),
+        ("pitch", Value::Integer(60 * 128)),
+    ] {
+        note.insert(key.into(), value);
+    }
+    note
 }
 
 /// The key a command's time is under, where it waits: a voice's or a loop's delay, a wait's ticks.
@@ -450,8 +489,45 @@ fn edited(mut commands: Vec<Table>, edit: Edit) -> Vec<Table> {
                 command.insert(key, value);
             }
         }
+        Edit::Add(instrument) => commands.push(new_note(instrument)),
     }
     commands
+}
+
+/// What a script is made of, added to: an instrument of the project to those it plays, a note at its end. The
+/// instruments' references as they become, where one was added.
+fn adding_ui(ui: &mut Ui<'_>, made: &Made, selected: Option<usize>, edit: &mut Option<Edit>) -> Option<Vec<Value>> {
+    let mut added = None;
+    ui.horizontal(|ui| {
+        let playing: Vec<String> = made.instruments.iter().map(|p| short(p.as_ref())).collect();
+        let says = if playing.is_empty() { "No instruments yet".to_string() } else { playing.join(", ") };
+        ui.styled(&format!("Instruments: {says}"), Style::Weak);
+        let project = ui.project();
+        let mut offered: Vec<(String, String)> = project
+            .find("pe2.sounds@instrument")
+            .iter()
+            .filter_map(|a| Some((a.path().to_string(), a.uid()?.to_string())))
+            .filter(|(path, _)| !made.instruments.iter().flatten().any(|p| p == path))
+            .collect();
+        offered.sort();
+        let names: Vec<String> = offered.iter().map(|(path, _)| path.clone()).collect();
+        if names.is_empty() {
+            ui.styled("· no other instrument in the project to add", Style::Weak);
+        } else if let Some(chosen) = ui.combo("add instrument", "Add an instrument", &names) {
+            let mut references: Vec<Value> = made.references.iter().map(|r| Value::String(r.clone())).collect();
+            references.push(Value::String(offered[chosen].1.clone()));
+            added = Some(references);
+        }
+        if !made.instruments.is_empty() && ui.button("Add a note") {
+            // On the instrument of the note selected, else the first.
+            let on = selected.and_then(|s| match made.commands.get(s) {
+                Some(Command::Voice(v)) => Some(usize::from(v.program)),
+                _ => None,
+            });
+            *edit = Some(Edit::Add(on.unwrap_or(0)));
+        }
+    });
+    added
 }
 
 impl Timeline {
@@ -580,10 +656,26 @@ impl View for Timeline {
         if let Some(from_settings) = self.settings_ui(ui, &made, editing) {
             edit = Some(from_settings);
         }
+        if editing && let Some(instruments) = adding_ui(ui, &made, self.kept.and_then(|k| k.selected), &mut edit) {
+            ui.set_step("instruments", Some(&Value::Array(instruments)));
+        }
         if let Some(edit) = edit.filter(|_| editing) {
             let changed: Vec<Value> = edited(commands, edit).into_iter().map(Value::Table).collect();
             ui.set_step("commands", Some(&Value::Array(changed)));
         }
         self.made = Some((key, Ok(made)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::beside;
+
+    #[test]
+    fn an_instrument_is_named_without_what_it_shares_with_its_script() {
+        let name = |path: &str| beside(Some(&path.to_string()), "level_1_script_0");
+        assert_eq!(name("pe/antibody/sounds/level_1_instrument_0"), "instrument_0");
+        assert_eq!(name("pe/shared/footstep"), "footstep");
+        assert_eq!(beside(None, "x"), "an instrument");
     }
 }

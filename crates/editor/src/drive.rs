@@ -49,6 +49,8 @@ struct Shared {
     tree_frame: u64,
     /// The main window's frames drawn.
     frames: u64,
+    /// Whether the frame being drawn was given an agent's input: what it does, an agent does.
+    fed: bool,
 }
 
 #[derive(Clone)]
@@ -74,7 +76,10 @@ impl egui::Plugin for Plugin {
         if input.viewport_id != egui::ViewportId::ROOT {
             return;
         }
-        if let Some(batch) = lock(&self.0).batches.pop_front() {
+        let mut shared = lock(&self.0);
+        let batch = shared.batches.pop_front();
+        shared.fed = batch.is_some();
+        if let Some(batch) = batch {
             input.events.extend(batch);
         }
     }
@@ -158,7 +163,11 @@ impl Driver {
         }
     }
 
-    /// Take requests that arrived.
+    /// Whether the frame being drawn was given an agent's input: what is done in it, an agent does.
+    pub fn fed(&self) -> bool {
+        lock(&self.shared).fed
+    }
+
     /// Why an agent may not act.
     pub fn refusal(&self) -> &'static str {
         if self.asking {

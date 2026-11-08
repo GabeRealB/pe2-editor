@@ -185,3 +185,85 @@ impl View for Vram {
         ui.canvas(&canvas);
     }
 }
+
+/// A slot where it is in VRAM, as its document shows it: the texture pages' grid, the other slots faintly, this one
+/// marked, and what it covers said under it.
+#[derive(Default)]
+pub struct SlotPlace;
+
+impl View for SlotPlace {
+    fn show(&mut self, ui: &mut Ui<'_>) {
+        use pe2_ext::{Align, Color, Role, Shape};
+        let (width, _, _) = ui.available();
+        let Some((own, path)) = ui.asset().map(|asset| (slot_rect(&asset), asset.path().to_string())) else { return };
+        let Some(own) = own else {
+            ui.label("It has no rectangle: set one, [x, y, width, height] in halfwords.");
+            return;
+        };
+        let k = width.max(240.0) / VRAM.0;
+        let at = |x: f32, y: f32| (x * k, y * k);
+        let theme = Color::Theme;
+        let mut shapes = vec![Shape::Rect {
+            min: (0.0, 0.0),
+            max: at(VRAM.0, VRAM.1),
+            fill: Some(theme(Role::Raised)),
+            stroke: Some((1.0, theme(Role::Border))),
+            rounding: 0.0,
+        }];
+        // The texture pages.
+        for x in (1..16_u8).map(|i| f32::from(i) * PAGE.0) {
+            shapes.push(Shape::Line {
+                points: vec![at(x, 0.0), at(x, VRAM.1)],
+                width: 1.0,
+                color: theme(Role::Border),
+            });
+        }
+        shapes.push(Shape::Line {
+            points: vec![at(0.0, PAGE.1), at(VRAM.0, PAGE.1)],
+            width: 1.0,
+            color: theme(Role::Border),
+        });
+        // The other slots, faintly, then this one.
+        let others: Vec<Rect> = ui
+            .project()
+            .find("pe2.images@vram_slot")
+            .iter()
+            .filter(|slot| slot.path() != path)
+            .filter_map(slot_rect)
+            .collect();
+        for slot in others {
+            shapes.push(Shape::Rect {
+                min: at(slot.x, slot.y),
+                max: at(slot.x + slot.width, slot.y + slot.height),
+                fill: None,
+                stroke: Some((1.0, theme(Role::Weak))),
+                rounding: 0.0,
+            });
+        }
+        let (min, max) = (at(own.x, own.y), at(own.x + own.width, own.y + own.height));
+        shapes.push(Shape::Rect {
+            min,
+            max,
+            fill: Some(Color::Rgba(80, 140, 255, 90)),
+            stroke: Some((2.0, theme(Role::Accent))),
+            rounding: 0.0,
+        });
+        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        let middle = (f32::midpoint(min.0, max.0), f32::midpoint(min.1, max.1));
+        shapes.push(Shape::Text { at: middle, text: name, size: 12.0, color: theme(Role::Text), align: Align::Middle });
+        let (_, height) = at(VRAM.0, VRAM.1);
+        let _ = ui.paint(width.max(240.0), height, &shapes);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "VRAM coordinates")]
+        let page = |x: f32, y: f32| (y / PAGE.1) as u32 * 16 + (x / PAGE.0) as u32;
+        let (first, last) = (page(own.x, own.y), page(own.x + own.width - 1.0, own.y + own.height - 1.0));
+        let pages =
+            if first == last { format!("texture page {first}") } else { format!("texture pages {first} to {last}") };
+        ui.styled(
+            &format!(
+                "{} × {} halfwords at ({}, {}) of VRAM's 1024 × 512: {pages}",
+                own.width, own.height, own.x, own.y
+            ),
+            Style::Weak,
+        );
+    }
+}

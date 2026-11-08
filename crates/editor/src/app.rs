@@ -127,6 +127,12 @@ pub struct Editor {
     closing: Option<Closing>,
     /// The window closing, its documents saved or let go: it closes unasked.
     quitting: bool,
+    /// An agent's command is being run: what it does, an agent does.
+    agent_running: bool,
+    /// An export being chosen, while it is.
+    exporting: Option<Exporting>,
+    /// Exports being made, off the window's thread: what each is, and what came of it once it has.
+    exports: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// An entry being renamed: its uid, its real path, the new name being typed.
     renaming: Option<(String, String, String)>,
     /// Code being overridden while an asset layer is active: which files layer takes it.
@@ -212,7 +218,9 @@ fn epoch_status(ui: &mut egui::Ui, ws: &Workspace) {
     if !ws.in_epoch() {
         return;
     }
-    ui.label(RichText::new("building").small().color(theme::weak()));
+    ui.label(RichText::new(ws.epoch_doing()).small().color(theme::weak())).on_hover_text(
+        "What is wired to the events signaled runs: a build, or what follows files changing (the Events pane)",
+    );
     ui.add(egui::Spinner::new().size(10.0));
     let cancel = ui.add(egui::Button::new(RichText::new("Cancel").small()).frame(false));
     if cancel.on_hover_text("Stop once what is running now is done").clicked() {
@@ -292,6 +300,9 @@ impl Editor {
             force: None,
             closing: None,
             quitting: false,
+            exporting: None,
+            exports: Vec::new(),
+            agent_running: false,
             renaming: None,
             choosing: None,
             layers_state: crate::layers::LayersState::default(),
@@ -499,6 +510,28 @@ impl Editor {
                 self.ask_what_it_needs();
             }
         }
+        self.close_gone_documents();
+    }
+
+    /// The tabs of assets gone - deleted, their making undone - closed: one moved finds it by its uid instead.
+    fn close_gone_documents(&mut self) {
+        let Some(ws) = &self.workspace else { return };
+        if ws.reading_until().is_some() {
+            return;
+        }
+        let gone: Vec<String> = self
+            .layouts
+            .states
+            .values()
+            .filter_map(|state| {
+                let path = state.pinned.as_ref()?;
+                let moved = state.uid.as_ref().is_some_and(|uid| ws.index.by_uid.contains_key(uid));
+                (!ws.exists(path) && !moved).then(|| path.clone())
+            })
+            .collect();
+        if !gone.is_empty() {
+            self.layouts.close_documents(|path| gone.iter().any(|g| g == path));
+        }
     }
 
     /// Undo the last step, or redo - of them all, or of one document; forced over what changed outside the editor.
@@ -551,13 +584,6 @@ impl Editor {
             return;
         }
         ws.history.set_author(author);
-        if let EditRequest::EditIn(uid) = request {
-            self.message = Some(match ws.edit_in(uid, &self.settings.tools) {
-                Ok(done) => done,
-                Err(e) => format!("{e:#}"),
-            });
-            return;
-        }
         if let EditRequest::Override(uid) = request {
             match ws.override_choice(uid) {
                 Err(why) => {
@@ -655,11 +681,24 @@ impl Editor {
                     RichText::new(real.trim_end_matches(project::index::BUNDLE_SUFFIX).to_string())
                         .color(theme::weak()),
                 );
-                let field = ui.add(egui::TextEdit::singleline(name).desired_width(320.0));
-                field.request_focus();
-                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let output = egui::TextEdit::singleline(name).desired_width(320.0).show(ui);
+                let field = output.response;
+                // Opened, the whole name is selected: what is typed replaces it.
+                if !field.has_focus() {
+                    let mut state = output.state;
+                    let all = egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(name.chars().count()),
+                    );
+                    state.cursor.set_char_range(Some(all));
+                    state.store(ui.ctx(), field.id);
+                }
+                // Leaving the field (Enter) renames; Escape cancels.
+                let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if field.lost_focus() && !escaped {
                     go = valid;
                 }
+                field.request_focus();
                 ui.horizontal(|ui| {
                     go |= ui.add_enabled(valid, egui::Button::new("Rename")).clicked();
                     cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -814,6 +853,7 @@ impl Editor {
                 self.document_uid().zip(ws).is_some_and(|(uid, ws)| ws.history.document(&uid).is_some())
             }
             Command::SaveAll => ws.is_some_and(|ws| !ws.history.documents().is_empty()),
+            Command::Export => self.document_path().is_some(),
             Command::Back => {
                 if self.in_browser {
                     ws.is_some_and(Workspace::can_folder_back)
@@ -891,6 +931,7 @@ impl Editor {
             | Command::Save
             | Command::SaveAll
             | Command::Revert => self.run_on_documents(command),
+            Command::Export => self.exporting = self.document_path().and_then(|path| self.export_choice(&path)),
             Command::Refresh => self.refresh(),
             Command::Back | Command::Forward => {
                 let forward = command == Command::Forward;
@@ -1072,17 +1113,159 @@ impl Editor {
         }
     }
 
-    /// Who makes what is done now: an agent driving the editor, or its user.
+    /// Who makes what is done now: an agent - its input fed to this frame, or its command being run - or the user.
     fn author(&self) -> &'static str {
-        if self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED) { "agent" } else { "user" }
+        if self.drive.fed() || self.agent_running { "agent" } else { "user" }
     }
 
     /// The uid of the document in use: the asset its tab in front shows, else the asset selected.
     fn document_uid(&self) -> Option<String> {
         let ws = self.workspace.as_ref()?;
+        ws.index.assets.get(&self.document_path()?)?.uid.clone()
+    }
+
+    /// The asset of the document in use: its tab in front's, else the asset selected.
+    fn document_path(&self) -> Option<String> {
+        let ws = self.workspace.as_ref()?;
         let shown = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane));
         let path = shown.or(ws.selected.as_deref())?;
-        ws.index.assets.get(path)?.uid.clone()
+        ws.index.assets.contains_key(path).then(|| path.to_string())
+    }
+
+    /// The export of an asset to choose: its exporters, the first chosen, its file in the project's `exports` folder.
+    fn export_choice(&self, path: &str) -> Option<Exporting> {
+        let ws = self.workspace.as_ref()?;
+        let asset = ws.index.assets.get(path)?;
+        let exporters = ws.extensions.exporters(asset);
+        let mut exporting = Exporting {
+            path: path.to_string(),
+            exporters,
+            chosen: 0,
+            member: 0,
+            to: String::new(),
+            typed: false,
+            reveal: false,
+        };
+        exporting.to = exporting.default_to(&ws.project.root);
+        Some(exporting)
+    }
+
+    /// The export being chosen: which exporter, which member, and where its file goes.
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(exporting) = &mut self.exporting else { return };
+        let Some(ws) = &self.workspace else { return };
+        let name = exporting.path.rsplit('/').next().unwrap_or(&exporting.path).to_string();
+        let (mut go, mut cancel) = (false, false);
+        egui::Window::new(format!("Export {name}"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                if exporting.exporters.is_empty() {
+                    ui.label(
+                        RichText::new("Nothing exports this asset: no extension makes a file of what it makes.")
+                            .color(theme::weak()),
+                    );
+                    cancel = ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    return;
+                }
+                let before = (exporting.chosen, exporting.member);
+                for (i, exporter) in exporting.exporters.iter().enumerate() {
+                    ui.radio_value(&mut exporting.chosen, i, format!("{}  (.{})", exporter.label, exporter.extension));
+                }
+                let members = &exporting.exporters[exporting.chosen].members;
+                if !members.is_empty() {
+                    exporting.member = exporting.member.min(members.len() - 1);
+                    ui.horizontal(|ui| {
+                        ui.label("Of");
+                        egui::ComboBox::from_id_salt("export member")
+                            .selected_text(&members[exporting.member].1)
+                            .show_ui(ui, |ui| {
+                                for (i, (_, label)) in members.iter().enumerate() {
+                                    ui.selectable_value(&mut exporting.member, i, label);
+                                }
+                            });
+                    });
+                }
+                if before != (exporting.chosen, exporting.member) && !exporting.typed {
+                    exporting.to = exporting.default_to(&ws.project.root);
+                }
+                ui.add_space(4.0);
+                ui.label("Save to");
+                let field = ui.add(egui::TextEdit::singleline(&mut exporting.to).desired_width(f32::INFINITY));
+                exporting.typed |= field.changed();
+                ui.checkbox(&mut exporting.reveal, "Show its folder when it is written");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    go = ui.button("Export").clicked();
+                    cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                });
+            });
+        if cancel {
+            self.exporting = None;
+        } else if go && let Some(exporting) = self.exporting.take() {
+            self.export(&exporting, ctx);
+        }
+    }
+
+    /// Make an export's file, off the window's thread: from the project as shown, unsaved changes and all.
+    fn export(&mut self, exporting: &Exporting, ctx: &egui::Context) {
+        let Some(ws) = &self.workspace else { return };
+        let exporter = exporting.exporters[exporting.chosen].clone();
+        let member = exporter.members.get(exporting.member).map(|(key, _)| key.clone());
+        let (extensions, index, path) = (ws.extensions.clone(), ws.index.clone(), exporting.path.clone());
+        let to = PathBuf::from(exporting.to.trim());
+        let (done, result) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let what = format!("{} as {}", path.rsplit('/').next().unwrap_or(&path), exporter.label);
+        let reveal = exporting.reveal;
+        let made = std::thread::Builder::new().name("export".into()).spawn(move || {
+            let made = (|| -> anyhow::Result<String> {
+                let asset = anyhow::Context::context(index.assets.get(&path), "the asset is gone")?;
+                let bytes = extensions.export(&index, asset, &exporter.output, member.as_deref())?;
+                if let Some(folder) = to.parent().filter(|f| !f.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(folder)?;
+                }
+                anyhow::Context::with_context(std::fs::write(&to, bytes), || to.display().to_string())?;
+                if reveal && let Some(folder) = to.parent() {
+                    let _ = crate::external::open_default(folder);
+                }
+                Ok(to.display().to_string())
+            })();
+            let _ = done.send(made.map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        match made {
+            Ok(_) => {
+                self.message = Some(format!("Exporting {what}"));
+                self.exports.push((what, result));
+            }
+            Err(e) => self.error = Some(format!("the export could not start: {e}")),
+        }
+    }
+
+    /// Exports done since the last frame, said.
+    fn exports_done(&mut self) {
+        let mut said = vec![];
+        self.exports.retain(|(what, result)| match result.try_recv() {
+            Ok(Ok(to)) => {
+                said.push(Ok(format!("Exported {what} to {to}")));
+                false
+            }
+            Ok(Err(e)) => {
+                said.push(Err(format!("Exporting {what}: {e}")));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for said in said {
+            match said {
+                Ok(message) => self.message = Some(message),
+                Err(error) => self.error = Some(error),
+            }
+        }
     }
 
     /// What undo (or redo) takes back now: the last edit of the document in use; with none, the last change to the
@@ -1095,6 +1278,21 @@ impl Editor {
             Some(_) => next(None).filter(|step| step.edits.is_empty()).map(|_| StepScope::Project),
             None => next(None).map(|_| StepScope::Project),
         }
+    }
+
+    /// Why undo (or redo) has nothing now, where the project has: the document in use has nothing of its own.
+    fn nothing_to_step(&self, redo: bool) -> Option<String> {
+        let ws = self.workspace.as_ref()?;
+        let step = if redo { ws.history.to_redo(None) } else { ws.history.to_undo(None) }?;
+        let path = self.document_path()?;
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        let (verb, anywhere) = if redo { ("redo", Command::RedoAnywhere) } else { ("undo", Command::UndoAnywhere) };
+        Some(format!(
+            "Nothing to {verb} in {name}. {} ({}): {}",
+            anywhere.title(),
+            anywhere.keys(&self.settings),
+            step.label
+        ))
     }
 
     /// The label of what undo (or redo) takes back now.
@@ -1120,6 +1318,8 @@ impl Editor {
         self.in_use_dialog(ctx);
         self.force_dialog(ctx);
         self.closing_dialog(ctx);
+        self.export_dialog(ctx);
+        self.exports_done();
         self.left_dialog(ctx);
         self.rename_dialog(ctx);
         self.choose_dialog(ctx);
@@ -1379,7 +1579,9 @@ impl Editor {
             return mcp::Reply::failed(format!("{id}: it cannot run now"));
         }
         self.drive.acted = Some(std::time::Instant::now());
+        self.agent_running = true;
         self.run(ctx, command);
+        self.agent_running = false;
         mcp::Reply::text(format!("ran {}", self.title_of(command)))
     }
 
@@ -1604,7 +1806,9 @@ impl Editor {
 
     fn mode_menu(&mut self, ui: &mut egui::Ui) {
         ui.scope(|ui| {
-            let title = format!("{}  {}", self.layouts.modes[self.layouts.mode].name, icons::CARET_DOWN);
+            // A mode, so said: a mode named Edit is not the Edit menu.
+            let name = &self.layouts.modes[self.layouts.mode].name;
+            let title = format!("{}  {name} mode  {}", icons::APP_WINDOW, icons::CARET_DOWN);
             ui.menu_button(title, |ui| {
                 let mut chosen = None;
                 for (at, mode) in self.layouts.modes.iter().enumerate() {
@@ -1836,13 +2040,8 @@ impl Editor {
         let view_edit = self.workspace.as_mut().and_then(|ws| ws.view_edit.take());
         if let Some(request) = outcome.edit.or(view_edit) {
             // An edit keeps what it edited open.
-            if matches!(
-                request,
-                EditRequest::Override(_)
-                    | EditRequest::OverrideIn(..)
-                    | EditRequest::EditIn(_)
-                    | EditRequest::Write { .. }
-            ) && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
+            if matches!(request, EditRequest::Override(_) | EditRequest::OverrideIn(..) | EditRequest::Write { .. })
+                && let Some(path) = self.workspace.as_ref().and_then(|ws| ws.selected.clone())
             {
                 self.layouts.keep(&path);
             }
@@ -1909,11 +2108,26 @@ impl Editor {
                 }
             }
         });
-        if let Some(name) = chosen
-            && let Some(ws) = &mut self.workspace
-            && let Err(why) = ws.new_node(&name, None)
-        {
-            self.error = Some(why);
+        if let Some(name) = chosen {
+            self.new_node(&name, None);
+        }
+    }
+
+    /// Make a node of a template - of a file, where it takes one - beside the document in use, else in the folder the
+    /// browser shows; it is then named, as it is made with the template's.
+    fn new_node(&mut self, template: &str, file: Option<&Path>) {
+        let in_use = self.document_path();
+        let Some(ws) = &mut self.workspace else { return };
+        let folder = ws.new_node_folder(in_use.as_deref());
+        match ws.new_node(template, file, &folder) {
+            Ok(made) => {
+                let place = if folder.is_empty() { "the project".to_string() } else { folder };
+                self.message = Some(format!("New {} in {place}", made.label.to_lowercase()));
+                let name = made.path.rsplit('/').next().unwrap_or(&made.path).to_string();
+                let real = format!("{}{}", made.path, project::index::BUNDLE_SUFFIX);
+                self.renaming = Some((made.uid, real, name));
+            }
+            Err(why) => self.error = Some(why),
         }
     }
 
@@ -1928,6 +2142,7 @@ impl Editor {
                 self.item(ui, Command::Save, "Save");
                 self.item(ui, Command::SaveAll, "Save all");
                 self.item(ui, Command::Revert, "Revert to saved");
+                self.item(ui, Command::Export, "Export…");
                 ui.separator();
                 self.item(ui, Command::ReloadProject, "Reload project");
                 ui.separator();
@@ -1986,6 +2201,7 @@ impl Editor {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let mut step = None;
+        let mut folder = None;
         ui.horizontal(|ui| {
             let hint = |command: Command| format!("{} ({})", command.title(), command.keys(&self.settings));
             let what = |command: Command, label: &str| {
@@ -1998,6 +2214,7 @@ impl Editor {
             }
             let done = self.step_label(false).map(|label| what(Command::Undo, &label));
             let undone = self.step_label(true).map(|label| what(Command::Redo, &label));
+            let nothing = |redo: bool| self.nothing_to_step(redo);
             let Some(ws) = &self.workspace else { return };
             for (command, icon) in [(Command::Back, icons::ARROW_LEFT), (Command::Forward, icons::ARROW_RIGHT)] {
                 let at = self.visit_at(command == Command::Forward);
@@ -2012,8 +2229,9 @@ impl Editor {
                 [(Command::Undo, icons::ARROW_ARC_LEFT, done), (Command::Redo, icons::ARROW_ARC_RIGHT, undone)]
             {
                 let enabled = step_of.is_some();
-                let tip = step_of.unwrap_or_else(|| hint(command));
-                if ui.add_enabled(enabled, egui::Button::new(icon)).on_hover_text(tip).clicked() {
+                let tip = step_of.or_else(|| nothing(command == Command::Redo)).unwrap_or_else(|| hint(command));
+                let button = ui.add_enabled(enabled, egui::Button::new(icon));
+                if button.on_hover_text(&tip).on_disabled_hover_text(&tip).clicked() {
                     step = Some(command);
                 }
             }
@@ -2024,11 +2242,21 @@ impl Editor {
                 if first > 0 {
                     ui.label(RichText::new("…").color(theme::weak()));
                 }
+                // Each folder of the way opens in the browser.
                 for (i, part) in parts.iter().enumerate().skip(first) {
                     if i + 1 == parts.len() {
                         ui.add(egui::Label::new(RichText::new(*part).strong()).truncate());
                     } else {
-                        ui.label(RichText::new(*part).color(theme::weak()));
+                        let link =
+                            egui::Label::new(RichText::new(*part).color(theme::weak())).sense(egui::Sense::click());
+                        if ui
+                            .add(link)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Show this folder")
+                            .clicked()
+                        {
+                            folder = Some(parts[..=i].join("/"));
+                        }
                         ui.label(RichText::new("/").color(theme::border().gamma_multiply(3.0)));
                     }
                 }
@@ -2036,6 +2264,12 @@ impl Editor {
         });
         if let Some(command) = step {
             self.run(ui.ctx(), command);
+        }
+        if let Some(folder) = folder
+            && let Some(ws) = &mut self.workspace
+        {
+            ws.open_folder(folder);
+            self.show_pane(Pane::first(PaneKind::Assets));
         }
     }
 
@@ -2410,11 +2644,7 @@ impl Editor {
             });
         if let Some((template, file)) = made {
             self.import = None;
-            if let Some(ws) = &mut self.workspace
-                && let Err(why) = ws.new_node(&template, Some(&file))
-            {
-                self.error = Some(why);
-            }
+            self.new_node(&template, Some(&file));
             return;
         }
         let Some(ws) = &self.workspace else { return };
@@ -2643,6 +2873,11 @@ impl eframe::App for Editor {
         let drive = (self.agents_drive || self.settings.agents.drive) && !self.drive.asking;
         self.drive.update(&ctx, drive);
         self.agent_commands(&ctx, drive);
+        // What is done this frame, by whoever gave its input.
+        let author = self.author();
+        if let Some(ws) = &mut self.workspace {
+            ws.history.set_author(author);
+        }
         self.note_place(&ctx);
         // A frame of the extensions' readings: one unused for long enough gives its memory back.
         if let Some(ws) = &self.workspace {
@@ -2748,6 +2983,34 @@ impl eframe::App for Editor {
         if let Ok(homes) = serde_json::to_string(&layouts.homes.iter().collect::<Vec<_>>()) {
             storage.set_string(HOMES_KEY, homes);
         }
+    }
+}
+
+/// An export being chosen: the asset, its exporters, the one chosen and its member, and where its file goes - written
+/// by the user (`typed`), or following what is chosen.
+struct Exporting {
+    path: String,
+    exporters: Vec<project::ext::Exporter>,
+    chosen: usize,
+    member: usize,
+    to: String,
+    typed: bool,
+    /// Its folder shown once it is written.
+    reveal: bool,
+}
+
+impl Exporting {
+    /// Where its file goes unless told: the project's `exports` folder, named after the asset and its member.
+    fn default_to(&self, root: &Path) -> String {
+        let exporter = &self.exporters.get(self.chosen);
+        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+        let member = exporter.and_then(|e| e.members.get(self.member)).map(|(_, label)| format!("-{label}"));
+        let extension = exporter.map_or("", |e| e.extension.as_str());
+        let file: String = format!("{name}{}.{extension}", member.unwrap_or_default())
+            .chars()
+            .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+            .collect();
+        root.join("exports").join(file).display().to_string()
     }
 }
 

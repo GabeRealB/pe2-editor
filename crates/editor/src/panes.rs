@@ -1079,6 +1079,11 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         egui::TextStyle::Small.resolve(ui.style()),
         theme::text(),
     );
+    // Marked where a layer that can be edited holds it, as in the tree.
+    let own = node.asset.as_deref().or(node.path.as_deref()).is_some_and(|path| ws.is_editable(path));
+    if own {
+        mark_own(&mut job, ui.style());
+    }
     job.wrap = egui::text::TextWrapping::truncate_at_width(CELL.x - 8.0);
     let galley = ui.painter().layout_job(job);
     let at = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.bottom() - galley.size().y - 4.0);
@@ -1182,8 +1187,8 @@ impl TreeView<'_> {
 
     /// A folder's name: beside a grid, the one the grid shows is marked.
     fn folder_label(&self, ui: &mut egui::Ui, icon: &str, name: &str, path: &str) -> egui::Response {
-        let strength = if self.ws.is_editable(path) { 1.0 } else { DIMMED };
-        let text = RichText::new(format!("{icon}  {name}")).color(theme::weak().gamma_multiply(strength));
+        let own = if self.ws.is_editable(path) { format!("  {}", icons::DOT) } else { String::new() };
+        let text = RichText::new(format!("{icon}  {name}{own}")).color(theme::weak());
         if self.folders.is_some() {
             let shown = self.ws.asset_folder == path;
             let text = if shown { text.color(theme::text()) } else { text };
@@ -1219,8 +1224,7 @@ impl TreeView<'_> {
 
     /// A virtual entry: a variant (its palette's icon) or an atlas part.
     fn entry_label(&self, ui: &mut egui::Ui, name: &str, entry: &Entry, chosen: &mut Option<Entry>) -> egui::Response {
-        let dim = !self.ws.is_editable(&entry.image);
-        let job = icon_and_name(ui.style(), icons::PALETTE, theme::weak(), theme::text(), name, dim);
+        let job = icon_and_name(ui.style(), icons::PALETTE, theme::weak(), theme::text(), name, false);
         let response = ui.add(egui::Button::selectable(self.ws.is_chosen(entry), job).truncate());
         if response.clicked() {
             *chosen = Some(entry.clone());
@@ -1241,7 +1245,7 @@ impl TreeView<'_> {
         // A star: unsaved changes.
         let starred = self.ws.unsaved(asset).then(|| format!("{name} *"));
         let name = starred.as_deref().unwrap_or(name);
-        let dim = !self.ws.is_editable(asset);
+        let own = self.ws.is_editable(asset);
         let selected = self.ws.selected.as_deref() == Some(asset);
         // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.
         let thumbnail = found
@@ -1250,14 +1254,15 @@ impl TreeView<'_> {
         let button = match thumbnail {
             Some(texture) => {
                 let side = ui.text_style_height(&egui::TextStyle::Body);
-                let tint = if dim { Color32::from_white_alpha(115) } else { Color32::WHITE };
-                let image = egui::Image::new((texture, egui::vec2(side, side))).maintain_aspect_ratio(true).tint(tint);
+                let image = egui::Image::new((texture, egui::vec2(side, side))).maintain_aspect_ratio(true);
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                let color = if dim { theme::text().gamma_multiply(DIMMED) } else { theme::text() };
-                let name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, color);
+                let mut name = egui::text::LayoutJob::simple_singleline(name.to_string(), font, theme::text());
+                if own {
+                    mark_own(&mut name, ui.style());
+                }
                 egui::Button::selectable(selected, (image, name))
             }
-            None => egui::Button::selectable(selected, labelled(&self.ws.extensions, ui.style(), kind, name, dim)),
+            None => egui::Button::selectable(selected, labelled(&self.ws.extensions, ui.style(), kind, name, own)),
         };
         let response = ui.add(button.truncate().sense(egui::Sense::click_and_drag()));
         response.dnd_set_drag_payload(Dragged::Asset(asset.to_string()));
@@ -1276,7 +1281,7 @@ impl TreeView<'_> {
     fn file_label(&self, ui: &mut egui::Ui, name: &str, node: &Node, pick: &mut Option<Pick>) {
         let Some(path) = node.path.as_deref() else { return };
         let icon = if node.file { icons::FILE } else { icons::FOLDER };
-        let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, !self.ws.is_editable(path));
+        let job = icon_and_name(ui.style(), icon, theme::weak(), theme::text(), name, self.ws.is_editable(path));
         ui.horizontal(|ui| {
             let response = ui.add(egui::Button::selectable(self.ws.selected.as_deref() == Some(path), job).truncate());
             if self.reveal == Some(path) {
@@ -1351,29 +1356,36 @@ fn labelled(
     style: &egui::Style,
     kind: Option<&str>,
     name: &str,
-    dim: bool,
+    own: bool,
 ) -> egui::text::LayoutJob {
     let (icon, tint) = icons::for_type(extensions, kind);
-    icon_and_name(style, icon, tint, theme::text(), name, dim)
+    icon_and_name(style, icon, tint, theme::text(), name, own)
 }
 
-/// What cannot be modified - from a locked layer, or not the soloed layer's - is drawn at this strength.
-const DIMMED: f32 = 0.45;
-
+/// An entry's icon and name; marked where a layer that can be edited holds it, or holds something inside it: what
+/// is the project's own rather than what it is made over.
 fn icon_and_name(
     style: &egui::Style,
     icon: &str,
     tint: Color32,
     color: Color32,
     name: &str,
-    dim: bool,
+    own: bool,
 ) -> egui::text::LayoutJob {
-    let strength = if dim { DIMMED } else { 1.0 };
     let mut job = egui::text::LayoutJob::default();
     let font = egui::TextStyle::Body.resolve(style);
-    job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), tint.gamma_multiply(strength)));
-    job.append(name, 7.0, egui::TextFormat::simple(font, color.gamma_multiply(strength)));
+    job.append(icon, 0.0, egui::TextFormat::simple(font.clone(), tint));
+    job.append(name, 7.0, egui::TextFormat::simple(font, color));
+    if own {
+        mark_own(&mut job, style);
+    }
     job
+}
+
+/// The mark of what the project's own layers hold.
+fn mark_own(job: &mut egui::text::LayoutJob, style: &egui::Style) {
+    let small = egui::TextStyle::Small.resolve(style);
+    job.append(icons::DOT, 4.0, egui::TextFormat::simple(small, theme::accent()));
 }
 
 fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Option<Pick>) {
@@ -1393,7 +1405,7 @@ fn filtered_ui(ui: &mut egui::Ui, ws: &Workspace, filter: &str, pick: &mut Optio
             ui.style(),
             ws.extensions.type_name(asset),
             &asset.path,
-            !ws.is_editable(&asset.path),
+            ws.is_editable(&asset.path),
         );
         let response = ui.add(egui::Button::selectable(selected, job).truncate().sense(egui::Sense::click_and_drag()));
         response.dnd_set_drag_payload(Dragged::Asset(asset.path.clone()));

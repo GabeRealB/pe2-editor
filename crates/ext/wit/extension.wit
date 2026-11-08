@@ -521,6 +521,8 @@ interface guest {
         read-only: bool,
         required: bool,
         custom: bool,
+        /// What it is where it is left out, as TOML.
+        default: option<string>,
     }
 
     /// The place a view has of its own, an inspector's tab or an editor beside the preview: its icon, and the fields that bring
@@ -636,6 +638,14 @@ interface guest {
     record provides {
         name: string,
         retain: retain,
+        /// Where it makes a file a person saves out of the project: an exporter.
+        exporter: option<exporter>,
+    }
+
+    /// What an exporter is offered as: its label (`WAV file`), and the extension of the file it makes (`wav`).
+    record exporter {
+        label: string,
+        extension: string,
     }
 
     record panel {

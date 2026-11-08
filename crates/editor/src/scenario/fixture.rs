@@ -208,6 +208,43 @@ retain = "cache"
         )
     }
 
+    /// A sound: a WAV file of 280 samples, stored and encoded as the game's, played raw.
+    #[must_use]
+    pub fn beep() -> Fixture {
+        let pcm: Vec<u8> = (0..280_i16).flat_map(|i| ((i % 28 - 14) * 800).to_le_bytes()).collect();
+        let size = u32::try_from(pcm.len()).unwrap_or(0);
+        let mut wav = b"RIFF".to_vec();
+        wav.extend((36 + size).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        for word in [16_u32, 0x0001_0001, 11025, 22050, 0x0010_0002] {
+            wav.extend(word.to_le_bytes());
+        }
+        wav.extend(b"data");
+        wav.extend(size.to_le_bytes());
+        wav.extend(pcm);
+        let stack = r#"[[stack]]
+op = "file"
+file = "sound.wav"
+
+[[stack]]
+id = "body"
+op = "pe2.sounds@wav"
+
+[[stack]]
+op = "output"
+name = "native"
+
+[[stack]]
+op = "pe2.sounds@play"
+body = { from = "body" }
+
+[[stack]]
+op = "preview"
+name = "played"
+"#;
+        Fixture::new().node("sfx/beep", stack).bytes("sfx/beep", "sound.wav", &wav)
+    }
+
     /// The skeleton, shown twice: the second a tab of its own.
     #[must_use]
     pub fn tapped() -> Fixture {

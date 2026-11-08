@@ -248,9 +248,15 @@ fn summary(layer: &LayerInfo) -> String {
         LayerKind::Assets => "assets".to_string(),
         LayerKind::Files if layer.mounted => format!("files, mounted at {}/", layer.at),
         LayerKind::Files => "files".to_string(),
-        LayerKind::Generated => format!("{}'s files", layer.fills.as_deref().unwrap_or("?")),
+        LayerKind::Generated => {
+            format!("the files of {}'s nodes, made by its plan", layer.fills.as_deref().unwrap_or("?"))
+        }
     };
-    let mut parts = vec![kind, format!("{} entr{}", layer.entries, if layer.entries == 1 { "y" } else { "ies" })];
+    let mut parts = vec![kind];
+    // A generated layer makes no entries of its own: it fills another's.
+    if layer.kind != LayerKind::Generated {
+        parts.push(format!("{} entr{}", layer.entries, if layer.entries == 1 { "y" } else { "ies" }));
+    }
     let ops = layer.overrides + layer.moves + layer.deletes;
     if ops > 0 {
         parts.push(format!("{ops} operation{}", if ops == 1 { "" } else { "s" }));

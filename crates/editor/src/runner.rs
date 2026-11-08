@@ -83,6 +83,8 @@ pub struct Runner {
     cancel: Arc<AtomicBool>,
     /// The epochs asked for and not ended.
     waiting: Arc<AtomicUsize>,
+    /// The events the epoch running was signaled by, while one runs.
+    running: Arc<std::sync::Mutex<Vec<String>>>,
     ctx: Arc<OnceLock<egui::Context>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -123,8 +125,9 @@ impl Runner {
         let (done, finished) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicUsize::new(0));
+        let running: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
-        let (stop, left, wake) = (cancel.clone(), waiting.clone(), ctx.clone());
+        let (stop, left, wake, now) = (cancel.clone(), waiting.clone(), ctx.clone(), running.clone());
         let thread = std::thread::Builder::new()
             .name("epochs".into())
             .spawn(move || {
@@ -157,6 +160,7 @@ impl Runner {
                         }
                     }
                     stop.store(false, Ordering::Relaxed);
+                    job.roots.clone_into(&mut now.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
                     let wiring = project::build::wiring(&job.index, &extensions, &job.config);
                     // What the user signaled: a group of its own, over what the editor does by itself.
                     let group =
@@ -176,6 +180,7 @@ impl Runner {
                         let _ = reply.send(text(&report));
                     }
                     left.fetch_sub(1, Ordering::Relaxed);
+                    now.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
                     let wired = wiring.counts();
                     let ended = Finished {
                         roots: job.roots,
@@ -193,7 +198,7 @@ impl Runner {
                 }
             })
             .ok();
-        Runner { jobs: Some(jobs), finished, cancel, waiting, ctx, thread }
+        Runner { jobs: Some(jobs), finished, cancel, waiting, running, ctx, thread }
     }
 
     /// The window to wake when an epoch ends.
@@ -222,6 +227,11 @@ impl Runner {
 
     pub fn busy(&self) -> bool {
         self.waiting.load(Ordering::Relaxed) > 0
+    }
+
+    /// The events the epoch running was signaled by; none between epochs.
+    pub fn running(&self) -> Vec<String> {
+        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// Stop the epoch running, once what it is running now is done.

@@ -64,19 +64,6 @@ impl Category {
         }
     }
 
-    /// The type of tool a media type (`image/openraster`) is edited in, by its top-level type; none for what no tool
-    /// of the settings takes.
-    pub fn of_media_type(media_type: &str) -> Option<Category> {
-        match media_type.split('/').next()? {
-            "image" => Some(Category::Image),
-            "audio" => Some(Category::Audio),
-            "video" => Some(Category::Video),
-            "text" => Some(Category::Text),
-            "model" => Some(Category::Model),
-            _ => None,
-        }
-    }
-
     /// The type of tool a file opens in, by its extension.
     pub fn of(file: &Path) -> Category {
         match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {

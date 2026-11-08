@@ -666,6 +666,7 @@ fn field(f: &Field, numbered: &mut Registered) -> g::Field {
         read_only: f.read_only,
         required: f.required,
         custom: f.custom,
+        default: f.default.as_ref().map(value_text),
     }
 }
 
@@ -1089,7 +1090,9 @@ fn describe_provides(provides: &crate::Provides) -> g::Provides {
         crate::Retain::Build => g::Retain::Build,
         crate::Retain::Transient => g::Retain::Transient,
     };
-    g::Provides { name: provides.name.clone(), retain }
+    let exporter =
+        provides.export.as_ref().map(|e| g::Exporter { label: e.label.clone(), extension: e.extension.clone() });
+    g::Provides { name: provides.name.clone(), retain, exporter }
 }
 
 /// What an extension registered, numbered as describing it numbers it - types' fields and views, panels,

@@ -4165,6 +4165,7 @@ dependencies = [
 name = "pe2-formats"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "pe2-ext",
 ]
 

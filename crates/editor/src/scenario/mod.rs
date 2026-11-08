@@ -647,7 +647,7 @@ impl Scenario {
             .filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
         let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
         for template in &templates {
-            self.workspace().new_node(template, None).map_err(|why| format!("{template}: {why}"))?;
+            self.workspace().new_node(template, None, "").map_err(|why| format!("{template}: {why}"))?;
             self.settle();
         }
         Ok(i64::try_from(templates.len()).unwrap_or(i64::MAX))

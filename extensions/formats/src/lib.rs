@@ -1,9 +1,11 @@
 //! pe2.formats: the common file types, recognized for every extension that takes them - by their own bytes, never by a
 //! file's name, which proves nothing. An operation takes one of these by its marker (`pe2_formats::Png`) or, not to
 //! depend on who recognizes it, by a marker of its media type (`image/png`).
+//!
+//! It exports pictures: any node making one is offered it as a PNG image (`png_file`).
 
-use pe2_ext::ty::{Files, Registered};
-use pe2_ext::{Registry, Result, Signature};
+use pe2_ext::ty::{self, Files, Registered};
+use pe2_ext::{Registry, Result, Signature, Typed, anyhow};
 
 pe2_ext::extension!(register);
 
@@ -14,6 +16,19 @@ fn register(r: &mut Registry) -> Result<()> {
     let _ = r.value_type::<Zip>();
     let _ = r.value_type::<Text>();
     let _ = r.value_type::<Wav>();
+    let _ = r
+        .op("png_file")
+        .label("PNG image")
+        .input::<ty::Image>("picture")
+        .output::<ty::File<Png>>()
+        .provides("png_file")
+        .exports("PNG image", "png")
+        .run(|call| {
+            let picture = call.take::<ty::Image>(0)?;
+            let bytes = codecs::texture::rgba_png(picture.width, picture.height, &picture.rgba)
+                .map_err(|e| anyhow!("the picture could not be written: {e}"))?;
+            Ok(Typed::new(Png::NAME, vec![pe2_ext::File::new("picture.png", bytes)]))
+        });
     Ok(())
 }
 

@@ -871,7 +871,9 @@ impl Extensions {
                 else {
                     continue;
                 };
-                if !def.inputs.first().is_some_and(|port| specific(&port.ty) && port.ty.unify(&ty, &mut Vec::new())) {
+                // A conversion taking what any node makes (`image`) is offered by none, but an exporter is offered by all.
+                let takes = |port: &pe2_ext::Port| specific(&port.ty) || provides.export.is_some();
+                if !def.inputs.first().is_some_and(|port| takes(port) && port.ty.unify(&ty, &mut Vec::new())) {
                     continue;
                 }
                 offered.push(pe2_ext::OutputDef {
@@ -1404,6 +1406,42 @@ impl Extensions {
         let chosen = look.and_then(|look| members.iter().find(|(_, label)| label == look));
         let (key, _) = chosen.or_else(|| members.first())?;
         Some(format!("{}/{key}", output.name))
+    }
+
+    /// The exporters an asset is offered: what saves a file of it out of the project (`OpBuilder::exports`), each with
+    /// the members to choose from where what it exports is a family.
+    #[must_use]
+    pub fn exporters(&self, asset: &index::Asset) -> Vec<Exporter> {
+        let lent = self.lend(asset);
+        let (plan, _) = self.plan(asset);
+        let outputs = self.outputs_of(asset).into_iter().filter(|o| !o.in_stack);
+        outputs
+            .filter_map(|output| {
+                let export = self.ops.get(&output.op)?.provides.as_ref()?.export.clone()?;
+                // Its own family's, else those of the family it takes from (a bank's slots).
+                let members = output.members.as_ref().map(|members| members(&lent)).or_else(|| {
+                    let op = self.ops.get(&plan.steps.get(output.step?)?.op)?;
+                    Some(op.members.as_ref()?(&lent))
+                });
+                let (label, extension) = (export.label, export.extension);
+                Some(Exporter { output: output.name, label, extension, members: members.unwrap_or_default() })
+            })
+            .collect()
+    }
+
+    /// The file an exporter makes of an asset - of one member, where what it exports is a family.
+    ///
+    /// # Errors
+    /// It could not be made.
+    pub fn export(
+        &self,
+        index: &index::Index,
+        asset: &index::Asset,
+        output: &str,
+        member: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let address = member.map_or_else(|| output.to_string(), |member| format!("{output}/{member}"));
+        self.bytes(index, asset, &address)
     }
 
     /// The output of an asset's type saying what is marked on its pictures, by name.
@@ -2005,6 +2043,16 @@ impl Extensions {
 
 /// The family an asset's looks are: the output it is shown by.
 pub const PICTURE: &str = "picture";
+
+/// An exporter an asset is offered (`Extensions::exporters`): the output it is, its label and its file's extension, and
+/// the members to choose from, each by its key and label, where what it exports is a family.
+#[derive(Clone, Debug)]
+pub struct Exporter {
+    pub output: String,
+    pub label: String,
+    pub extension: String,
+    pub members: Vec<(String, String)>,
+}
 
 /// By (asset, family of its outputs), the member chosen: what is being looked at, never written.
 pub type Chosen = HashMap<(String, String), String>;

@@ -1904,6 +1904,7 @@ fn field(shared: &Arc<Shared>, f: g::Field) -> Field {
     out.read_only = f.read_only;
     out.required = f.required;
     out.custom = f.custom;
+    out.default = f.default.as_deref().and_then(parse_value);
     out.choices = f.choices.into_iter().filter_map(|(value, label)| Some((parse_value(&value)?, label))).collect();
     if f.format {
         let shared = shared.clone();
@@ -2234,6 +2235,19 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
 /// Register a component's types, with what recognizes them in files; their sniffs call into it.
 /// Register a component's types and operations, their runs calls into it: each lent its node as an asset whose files
 /// are its values' contents, named by their hashes.
+/// What an operation provides, as its component declared it: kept as it says, an exporter where it is one.
+fn provided<'r>(builder: pe2_ext::OpBuilder<'r>, provides: &g::Provides) -> pe2_ext::OpBuilder<'r> {
+    let builder = builder.provides(&provides.name).keeps(match provides.retain {
+        g::Retain::Cache => pe2_ext::Retain::Cache,
+        g::Retain::Build => pe2_ext::Retain::Build,
+        g::Retain::Transient => pe2_ext::Retain::Transient,
+    });
+    match &provides.exporter {
+        Some(export) => builder.exports(&export.label, &export.extension),
+        None => builder,
+    }
+}
+
 fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
     for op in ops {
         let mut builder = registry.op(&op.name).label(&op.label).priority(op.priority);
@@ -2265,11 +2279,7 @@ fn apply_ops(registry: &mut Registry, ops: Vec<g::Op>, shared: &Arc<Shared>) {
             });
         }
         if let Some(provides) = &op.provides {
-            builder = builder.provides(&provides.name).keeps(match provides.retain {
-                g::Retain::Cache => pe2_ext::Retain::Cache,
-                g::Retain::Build => pe2_ext::Retain::Build,
-                g::Retain::Transient => pe2_ext::Retain::Transient,
-            });
+            builder = provided(builder, provides);
         }
         let (cap, shared, handle) = (shared.cap(&op.name), shared.clone(), op.handle);
         if op.stepped {

@@ -143,8 +143,14 @@ pub fn wav_of(body: &[u8], rate: u32) -> Result<(Vec<u8>, &'static str)> {
 }
 
 fn samples(r: &mut Registry) {
-    let wav_source =
-        r.op("wav_source").label("WAV, written").input::<Vag>("native").output::<ty::File<WavFile>>().run(|call| {
+    let wav_source = r
+        .op("wav_source")
+        .label("WAV, written")
+        .input::<Vag>("native")
+        .output::<ty::File<WavFile>>()
+        .provides("wav_file")
+        .exports("WAV file", "wav")
+        .run(|call| {
             let native = call.take::<Vag>(0)?;
             let body = call.read(native.file()?)?;
             let (bytes, _) = wav_of(&body, rate_of(&pe2_ext::merged(call.settings, &native.settings)))?;
@@ -207,6 +213,38 @@ fn played(r: &mut Registry) {
             let slot: String = call.parameter()?;
             let bank = call.take::<BankFile>(0)?;
             Ok(Box::new(preview::Played::new(preview::slot(call, &bank, slot.parse()?)?)))
+        });
+}
+
+/// What is played, as a WAV file (`played_wav`): a script, a bank's slot, a sample - exported as heard.
+fn recorded(r: &mut Registry) {
+    let _ = r
+        .op("played_wav")
+        .label("WAV, as played")
+        .input::<ty::Stream<ty::Sound>>("played")
+        .output::<ty::File<WavFile>>()
+        .provides("played_wav")
+        .exports("WAV file, as played", "wav")
+        .run(|call| {
+            let stream = call.take::<ty::Stream<ty::Sound>>(0)?;
+            let (mut pcm, mut format) = (Vec::new(), None);
+            while let Some(item) = stream.next()? {
+                let parts = if let pe2_ext::Data::List(parts) = item { parts } else { vec![item] };
+                for part in parts {
+                    if let pe2_ext::Data::Audio(heard) = part {
+                        if heard.format != pe2_ext::media::SampleFormat::S16Interleaved {
+                            anyhow::bail!("it takes s16-interleaved sound, not {}", heard.format.name());
+                        }
+                        format.get_or_insert((heard.channels, heard.sample_rate));
+                        let bytes = heard.buffer.read();
+                        pcm.extend(bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)));
+                    }
+                }
+            }
+            let (channels, rate) = format.ok_or_else(|| anyhow!("nothing was played"))?;
+            let channels = u16::try_from(channels).map_err(|_| anyhow!("{channels} channels"))?;
+            let bytes = wav::write_interleaved(&pcm, channels, rate);
+            Ok(Typed::new("audio/wav", vec![pe2_ext::File::new("played.wav", bytes)]))
         });
 }
 
@@ -393,6 +431,7 @@ fn register(r: &mut Registry) -> Result<()> {
     samples(r);
     preview(r);
     played(r);
+    recorded(r);
     planned(r);
     for (name, label, of, icon) in [
         ("sound", "Sound", Vag::NAME, Icon::Waveform),
@@ -416,6 +455,14 @@ fn register(r: &mut Registry) -> Result<()> {
         .icon(Icon::Music, Tint::Sound)
         .field(Field::new("instruments").custom())
         .field(Field::new("commands").custom())
+        // What a script made new starts from: what a bank makes of one that leaves them out (`bank::join`).
+        .field(Field::new("volume").label("Volume").default_value(127))
+        .field(Field::new("pan").label("Pan").default_value(64))
+        .field(Field::new("instances").label("Instances").default_value(1))
+        .field(Field::new("retrigger").label("Retrigger").default_value(0))
+        .field(Field::new("priority").label("Priority").default_value(0))
+        .field(Field::new("flags").label("Flags").default_value(0))
+        .field(Field::new("unknown_4").label("Header byte 4").default_value(0))
         .view("Timeline", |_| timeline::Timeline::of_script())
         .register();
     drop(r.template("sound", "pe2.sounds@sound", SOUND).label("Sound, from a WAV").files(&["*.wav"]));

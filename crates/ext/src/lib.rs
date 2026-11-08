@@ -35,7 +35,7 @@ mod ui;
 pub use anyhow::{Error, Result, anyhow, bail};
 pub use asset::{Asset, Source};
 pub use data::{
-    BuildConfig, Call, CallHost, Content, File, FileWriter, Generator, Lent, Members, Micro, MicroInput, Need,
+    BuildConfig, Call, CallHost, Content, Export, File, FileWriter, Generator, Lent, Members, Micro, MicroInput, Need,
     NodeNamed, OpDef, OutputDef, Pcm, Port, PrepareOp, Prepared, Provides, Retain, RunOp, StartStream, StreamInput,
     StreamSource, Type, Typed, Value as Data, Writer, merged, targeted,
 };

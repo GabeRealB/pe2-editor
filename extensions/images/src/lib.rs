@@ -162,6 +162,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .icon(Icon::Grid, Tint::Picture)
         .data()
         .field(Field::new("rect").label("Rectangle").required())
+        .editor("Place", Icon::Grid, &["rect"], |_| Box::new(vram::SlotPlace))
         .register();
     let grid = r.setting(
         Setting::new("vram_page_grid", true)

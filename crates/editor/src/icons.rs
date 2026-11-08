@@ -19,6 +19,7 @@ icons! {
     ARROW_ARC_LEFT = "\u{E014}",
     ARROW_LEFT = "\u{E058}",
     FLAG = "\u{E244}",
+    DOT = "\u{ECDE}",
     FLOPPY_DISK = "\u{E248}",
     SWAP = "\u{E83C}",
     ARROW_RIGHT = "\u{E06C}",

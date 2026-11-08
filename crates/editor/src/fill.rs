@@ -2,7 +2,8 @@
 //! or not as its plan says, whoever opened the project is shown what its plan makes the layer's files from - each disc,
 //! found or not, and where they are looked for, which they may change (`project.local.toml`) - and asked to run it, its
 //! progress shown, stopped where they like (what was written stays, and the next run goes on from there). Not now, it is
-//! asked again the next time the project is opened; the command asks it whatever the layers' states.
+//! not asked again while the layer stays as it was put off - kept in the project's cache (`fill-put-off.toml`) - but is
+//! once its state changes; the command asks it whatever the layers' states.
 //!
 //! A plan runs as the work graph's only work (`runner`): after the epoch running, which may be cancelled for it, and
 //! before any event signaled meanwhile, which waits until what it wrote is taken in.
@@ -32,6 +33,8 @@ struct Running {
 pub struct Fill {
     /// Not now: asked again when the project is opened again.
     put_off: bool,
+    /// The layers put off, each with its state then: not asked again while it stays so. Read from the cache once.
+    put_off_as: Option<std::collections::BTreeMap<String, String>>,
     /// Asked for (the command), whatever the layers' states.
     asked: bool,
     running: Option<Running>,
@@ -63,14 +66,29 @@ impl Fill {
     }
 }
 
-/// The generated layer to ask about: the one running, else the first not as its plan says, else - asked for - the first.
+const PUT_OFF: &str = "fill-put-off.toml";
+
+/// How a layer's state is remembered as put off.
+fn remembered(state: &State) -> String {
+    format!("{state:?}")
+}
+
+/// The generated layer to ask about: the one running, else the first not as its plan says and not put off as it is,
+/// else - asked for - the first.
 fn wanted(ws: &Workspace) -> Option<String> {
     let fill = &ws.fill;
     if let Some(running) = &fill.running {
         return Some(running.layer.clone());
     }
-    let to_fill = |state: Option<&Result<State, String>>| matches!(state, Some(Ok(State::Empty | State::Stale(_))));
-    let unfilled = ws.plans.layers.iter().find(|(_, p)| to_fill(p.state.as_ref())).map(|(name, _)| name.clone());
+    let put_off = |name: &str, state: &State| {
+        fill.put_off_as.as_ref().and_then(|put| put.get(name)).is_some_and(|then| *then == remembered(state))
+    };
+    let to_fill = |name: &str, state: Option<&Result<State, String>>| match state {
+        Some(Ok(state @ (State::Empty | State::Stale(_)))) => fill.asked || !put_off(name, state),
+        _ => false,
+    };
+    let unfilled =
+        ws.plans.layers.iter().find(|(name, p)| to_fill(name, p.state.as_ref())).map(|(name, _)| name.clone());
     match unfilled {
         Some(name) if !fill.put_off || fill.asked => Some(name),
         _ if fill.asked => ws.plans.layers.keys().next().cloned(),
@@ -126,6 +144,10 @@ fn finish(ws: &mut Workspace) -> Option<String> {
 
 /// The step, where there is one to show; what a run did, once it is done.
 pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
+    if ws.fill.put_off_as.is_none() {
+        let read = std::fs::read_to_string(ws.cache_path(PUT_OFF)).ok().and_then(|t| toml::from_str(&t).ok());
+        ws.fill.put_off_as = Some(read.unwrap_or_default());
+    }
     let said = finish(ws);
     let layer = wanted(ws)?;
     ws.plans.want_discs();
@@ -179,7 +201,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
                     format!("Run its plan of {}: only what is not there yet is made", whole.join(" and "))
                 };
                 extract = ui.add_enabled(!whole.is_empty(), egui::Button::new("Extract")).on_hover_text(hint).clicked();
-                close = ui.button("Not now").on_hover_text("Asked again next time").clicked();
+                close = ui.button("Not now").on_hover_text("Asked again once the layer changes").clicked();
             });
         }
     });
@@ -197,6 +219,15 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
     } else if close {
         ws.fill.put_off = true;
         ws.fill.asked = false;
+        // Put off as it is: not asked again until it changes.
+        if let Some(Ok(state)) = ws.plans.layers.get(&layer).and_then(|p| p.state.as_ref()) {
+            let state = remembered(state);
+            let put = ws.fill.put_off_as.get_or_insert_default();
+            put.insert(layer.clone(), state);
+            if let Ok(text) = toml::to_string(put) {
+                let _ = std::fs::write(ws.cache_path(PUT_OFF), text);
+            }
+        }
     }
     said
 }

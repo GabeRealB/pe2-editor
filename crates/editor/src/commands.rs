@@ -21,6 +21,7 @@ pub enum Command {
     Save,
     SaveAll,
     Revert,
+    Export,
     Undo,
     Redo,
     UndoAnywhere,
@@ -62,8 +63,8 @@ impl Command {
     /// Every command but the modes, which are the user's: a list that changes.
     pub fn all() -> Vec<Command> {
         use Command::{
-            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Fill,
-            Forward, Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NewProject, NextTab,
+            ActualSize, Back, Build, CancelEpoch, Clean, CloseTab, DeleteMode, DeleteSelected, DocumentsOnly, Export,
+            Fill, Forward, Fullscreen, GraphArrange, GraphFit, Import, KeepTab, Maximize, NewMode, NewProject, NextTab,
             OpenProject, Palette, PerformanceOverlay, PreviousTab, Quit, Redo, RedoAnywhere, Refresh, ReloadProject,
             ResetLayout, ResetMode, Revert, Save, SaveAll, Settings, ShowIn, Undo, UndoAnywhere, Up, ZoomIn, ZoomOut,
         };
@@ -79,6 +80,7 @@ impl Command {
             Save,
             SaveAll,
             Revert,
+            Export,
             Undo,
             Redo,
             UndoAnywhere,
@@ -143,6 +145,7 @@ impl Command {
             Command::Save => "file.save".to_string(),
             Command::SaveAll => "file.save_all".to_string(),
             Command::Revert => "file.revert".to_string(),
+            Command::Export => "file.export".to_string(),
             Command::Undo => "edit.undo".to_string(),
             Command::Redo => "edit.redo".to_string(),
             Command::UndoAnywhere => "edit.undo_anywhere".to_string(),
@@ -193,6 +196,7 @@ impl Command {
             Command::Save => "Save".to_string(),
             Command::SaveAll => "Save all".to_string(),
             Command::Revert => "Revert to saved".to_string(),
+            Command::Export => "Export…".to_string(),
             Command::Undo => "Undo".to_string(),
             Command::Redo => "Redo".to_string(),
             Command::UndoAnywhere => "Undo in the project".to_string(),
@@ -236,6 +240,7 @@ impl Command {
             Command::Palette => &["ctrl+shift+P", "F1"],
             Command::Save => &["ctrl+S"],
             Command::SaveAll => &["ctrl+alt+S"],
+            Command::Export => &["ctrl+E"],
             Command::Undo => &["ctrl+Z"],
             Command::Redo => &["ctrl+shift+Z", "ctrl+Y"],
             Command::UndoAnywhere => &["ctrl+alt+Z"],

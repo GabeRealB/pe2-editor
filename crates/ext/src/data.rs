@@ -1070,6 +1070,15 @@ pub type Members = dyn Fn(&Asset) -> Vec<(String, String)> + Send + Sync;
 pub struct Provides {
     pub name: String,
     pub retain: Retain,
+    /// Where it makes a file a person saves: an exporter (`OpBuilder::exports`).
+    pub export: Option<Export>,
+}
+
+/// What an exporter is offered as: its label (`WAV file`) and the extension of the file it makes (`wav`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Export {
+    pub label: String,
+    pub extension: String,
 }
 
 /// An output a node has, as what lists a node's outputs reads it.

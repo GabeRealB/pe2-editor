@@ -244,11 +244,22 @@ impl Scene {
         if positions.is_empty() {
             positions = scene.worlds().iter().map(|world| upright(world.position)).collect();
         }
-        let count = positions.len().max(1);
-        #[expect(clippy::cast_precision_loss, reason = "a model has far fewer vertices than that")]
-        let center = scale(positions.iter().fold([0.0; 3], |sum, v| add(sum, *v)), 1.0 / count as f32);
+        // Its bounds' middle, and the sphere around them: a tall model framed by its height, not by where most of its
+        // vertices are (a head has more than legs).
+        let mut low = [f32::MAX; 3];
+        let mut high = [f32::MIN; 3];
+        for v in &positions {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(v[axis]);
+                high[axis] = high[axis].max(v[axis]);
+            }
+        }
+        if positions.is_empty() {
+            (low, high) = ([0.0; 3], [0.0; 3]);
+        }
+        let center = scale(add(low, high), 0.5);
         scene.center = center;
-        scene.radius = positions.iter().map(|v| length(sub(*v, center))).fold(1.0, f32::max);
+        scene.radius = (length(sub(high, low)) / 2.0).max(1.0);
         scene
     }
 
@@ -576,6 +587,16 @@ mod tests {
             }],
             ..Model::default()
         }
+    }
+
+    #[test]
+    fn a_scene_is_framed_by_its_bounds() {
+        // The square's corners at y 0 and the second part's vertex at y 50: the middle of the bounds, not of the
+        // vertices (four of which are at 0).
+        let scene = Scene::new(square());
+        assert_eq!(scene.center, [0.0, 25.0, 0.0]);
+        let half_diagonal = (20.0_f32 * 20.0 + 50.0 * 50.0 + 20.0 * 20.0).sqrt() / 2.0;
+        assert!((scene.radius - half_diagonal).abs() < 1e-4, "{}", scene.radius);
     }
 
     #[test]

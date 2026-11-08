@@ -300,11 +300,19 @@ fn properties_ui(
                 .filter(|op| !op.derives.is_empty())
                 .map(|op| (op.label.clone(), op.derives.iter().filter(|p| !p.contains('.')).cloned().collect())),
         };
-        // The settings as resolved: what the import derives in its place.
-        let fields: Vec<(&String, &toml::Value)> = asset
-            .settings()
+        // The settings as resolved: what the import derives in its place; then what the type declares with a default
+        // and the node leaves out, shown at its default for it to be set from.
+        let settings = asset.settings();
+        let defaults: Vec<(String, toml::Value)> = sheet
+            .fields
+            .iter()
+            .filter(|f| !f.custom && !settings.contains_key(&f.key))
+            .filter_map(|f| Some((f.key.clone(), f.default.clone()?)))
+            .collect();
+        let fields: Vec<(&String, &toml::Value)> = settings
             .iter()
             .filter(|(k, _)| !HEADER_FIELDS.contains(&k.as_str()) && *k != "stack" && !sheet.custom(k))
+            .chain(defaults.iter().map(|(k, v)| (k, v)))
             .collect();
         let (lists, properties): (Vec<_>, Vec<_>) = fields.into_iter().partition(|(_, v)| is_table_list(v));
         let (field_edit, parts) = (&mut ws.field_edit, &mut ws.parts);
@@ -499,6 +507,12 @@ fn property_sheet(
             return;
         }
         let editable = editable && !field.is_some_and(|f| f.read_only);
+        // Left out, at its type's default: said so, beside it.
+        let set = !sheet.within.is_empty() || asset.settings().contains_key(key.as_str());
+        if !set {
+            ui.label(RichText::new("default").small().color(theme::weak()))
+                .on_hover_text("The node leaves it out: this is what it is then. Setting it writes it.");
+        }
         if let Some(axes) = three_numbers(value).filter(|_| editable) {
             let id = ui.scope_id().with(("axes", &asset.path, sheet.path(key)));
             let shown = (asset.path.as_str(), key.as_str());
@@ -1493,14 +1507,10 @@ fn stack_ui(
     let Some(layers) = asset.fields().get("stack").and_then(toml::Value::as_array) else { return };
     let import = project::graph::import_of(asset.fields());
     let name = import.as_ref().map_or("", |i| i.op);
-    let source = import.as_ref().map(|i| i.source);
     let importer = ws.extensions.op(name);
     let fits: Vec<(String, String)> =
         ws.extensions.ops_for(asset).into_iter().map(|op| (op.name.to_string(), op.label.clone())).collect();
     let recognized = recognized_files(&ws.extensions, asset, layers);
-    // Its source, edited in the tool its format is: in the active layer, copied there first where it is below.
-    let tool = ws.source_tool(&asset.path).map(|(category, file)| (category, file.layer.clone()));
-    let active = ws.editable_layer().map(|l| l.name.clone());
     // The importer's settings, as it describes them, in its layer.
     let importing = layers
         .iter()
@@ -1539,22 +1549,12 @@ fn stack_ui(
                     match op {
                         project::graph::FILE => {
                             ui.label(RichText::new("Stored file").color(theme::weak()));
-                            let source_layer = Some(i) == importing.map(|j| j - 1);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(text("file").unwrap_or_default()).monospace());
                                 for ty in &recognized[i] {
                                     badge(ui, ty);
                                 }
                             });
-                            // Edited in its tool: a row of its own, under the file.
-                            if let (true, Some((category, home)), Some(uid), Some(source)) =
-                                (source_layer, &tool, &asset.uid, source)
-                            {
-                                ui.end_row();
-                                ui.label("");
-                                ui.label("");
-                                edit_in_button(ui, *category, home, &active, source, uid, edit);
-                            }
                         }
                         project::graph::OUTPUT | project::graph::PREVIEW => output_row(ui, layer),
                         project::graph::GRAPH => {
@@ -1969,36 +1969,6 @@ fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: 
         ui.label("");
         ui.label("");
         ui.label(RichText::new(said.join("  ·  ")).small().color(theme::weak()));
-    }
-}
-
-/// The button editing a source in the tool its format is edited in: in the active layer, copied there first where the
-/// source is below it (`home`, the layer holding it).
-fn edit_in_button(
-    ui: &mut egui::Ui,
-    category: crate::external::Category,
-    home: &str,
-    active: &Result<String, String>,
-    source: &str,
-    uid: &str,
-    edit: &mut Option<EditRequest>,
-) {
-    let tool = category.label().to_lowercase();
-    let label = format!("{}  Edit in {tool}", icons::PENCIL_SIMPLE);
-    let (enabled, says) = match active {
-        Ok(l) if l == home => (
-            true,
-            format!(
-                "Open {source} in the {tool} set in the settings (External tools); what it saves is imported again"
-            ),
-        ),
-        Ok(l) => (true, format!("Copy the asset into {l} (an undoable step), then open its {source} there")),
-        Err(why) => (false, why.clone()),
-    };
-    let response = ui.add_enabled(enabled, egui::Button::new(label)).on_hover_text(&says);
-    let response = if enabled { response } else { response.on_disabled_hover_text(&says) };
-    if response.clicked() {
-        *edit = Some(EditRequest::EditIn(uid.to_string()));
     }
 }
 

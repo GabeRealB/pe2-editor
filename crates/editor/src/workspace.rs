@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use eframe::egui;
-use pe2_ext::events::{Event, FilesChanged, ProjectOpened};
+use pe2_ext::events::{Build, Clean, Event, FilesChanged, ProjectOpened};
 use project::Project;
 use project::cache::Cache;
 use project::ext::{Extensions, Lens};
@@ -308,9 +308,6 @@ pub enum EditRequest {
     /// its content read-only or not.
     Forget(String, String),
     Resolve(String, project::edit::Resolution),
-    /// Edit the asset's source in the tool its format is edited in: copied into the active layer first where it is
-    /// below it, and imported again when the tool saves it.
-    EditIn(String),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
     /// Write a file of the entry (its `node.toml`; empty: a plain file itself), labeled for the history; edits of one
@@ -322,6 +319,13 @@ pub enum EditRequest {
         label: String,
         merge: Option<String>,
     },
+}
+
+/// A node just made: its uid, its path, and what it was made as.
+pub struct NewNode {
+    pub uid: String,
+    pub path: String,
+    pub label: String,
 }
 
 /// A point of the history shown, read-only: the documents as after its first `point` steps - one, or all - or, while A/B
@@ -951,7 +955,7 @@ impl Workspace {
     ///
     /// # Errors
     /// No layer takes it, the template does not stamp, the file cannot be read or the node cannot be written.
-    pub fn new_node(&mut self, template: &str, file: Option<&Path>) -> Result<(), String> {
+    pub fn new_node(&mut self, template: &str, file: Option<&Path>, folder: &str) -> Result<NewNode, String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let found = self.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
         let name =
@@ -961,7 +965,7 @@ impl Workspace {
             stem.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let at = |n: usize| {
             let leaf = if n == 0 { slug.clone() } else { format!("{slug}_{n}") };
-            if self.asset_folder.is_empty() { leaf } else { format!("{}/{leaf}", self.asset_folder) }
+            if folder.is_empty() { leaf } else { format!("{folder}/{leaf}") }
         };
         let path = (0..=self.index.assets.len())
             .map(at)
@@ -987,9 +991,19 @@ impl Workspace {
         )
         .map_err(|e| format!("{e:#}"))?;
         // Shown once it is taken in: until then nothing is there to open.
+        let label = found.label.clone();
         let ticket = self.take_written();
-        self.selection_after = ticket.map(|ticket| (ticket, path));
-        Ok(())
+        self.selection_after = ticket.map(|ticket| (ticket, path.clone()));
+        Ok(NewNode { uid, path, label })
+    }
+
+    /// The folder new nodes go in: the one the asset in use is in, else the one the browser shows.
+    #[must_use]
+    pub fn new_node_folder(&self, in_use: Option<&str>) -> String {
+        match in_use.filter(|path| self.index.assets.contains_key(*path)) {
+            Some(path) => path.rsplit_once('/').map_or_else(String::new, |(folder, _)| folder.to_string()),
+            None => self.asset_folder.clone(),
+        }
     }
 
     /// Make a node of this declaration and these files, in the active layer: what a test works on.
@@ -1035,6 +1049,27 @@ impl Workspace {
     /// An epoch is running or waiting.
     pub fn in_epoch(&self) -> bool {
         self.runner.busy()
+    }
+
+    /// A file of the project's cache, by name.
+    pub fn cache_path(&self, name: &str) -> PathBuf {
+        self.cache_dir.join(name)
+    }
+
+    /// What the epoch running does, as the status bar says it: by the events it was signaled by.
+    pub fn epoch_doing(&self) -> String {
+        let roots = self.runner.running();
+        let said: Vec<String> = roots
+            .iter()
+            .map(|root| match root.as_str() {
+                name if name == Build::NAME => "building".to_string(),
+                name if name == Clean::NAME => "cleaning".to_string(),
+                name if name == FilesChanged::NAME => "following the files changed".to_string(),
+                name if name == ProjectOpened::NAME => "following the project opened".to_string(),
+                other => format!("running {other}"),
+            })
+            .collect();
+        if said.is_empty() { "waiting to run".to_string() } else { said.join(", ") }
     }
 
     fn signal_all(
@@ -1141,7 +1176,8 @@ impl Workspace {
             for change in watch.poll() {
                 match change {
                     Change::Paths(changed) => {
-                        let theirs: Vec<PathBuf> = changed.into_iter().filter(|p| !self.is_own(p)).collect();
+                        let theirs: Vec<PathBuf> =
+                            changed.into_iter().filter(|p| !self.is_own(p) && self.concerns(p)).collect();
                         self.pending.extend(theirs);
                     }
                     Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
@@ -1178,6 +1214,16 @@ impl Workspace {
         let now = std::time::Instant::now();
         self.own.extend(written.iter().map(|p| (p.clone(), stamp(p), now)));
         Some(self.takein.paths(written))
+    }
+
+    /// Whether a path changing concerns the project: in a layer, a layer's changeset, or one of its files at its root.
+    /// What else sits in its folders (exports, a user's notes) does not.
+    fn concerns(&self, path: &Path) -> bool {
+        let root = &self.project.root;
+        let at_root = path.parent() == Some(root.as_path())
+            && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
+        at_root || self.project.layers.iter().any(|l| path.starts_with(&l.path) || path == l.changeset)
     }
 
     /// Whether the watcher's report of a path is of what the editor wrote: as it left it.
@@ -1555,8 +1601,11 @@ impl Workspace {
     /// The layer edits go to: the active one, if it can be written now.
     ///
     /// # Errors
-    /// Why it cannot: none is active, it is locked (by nature, by hand, by a solo).
+    /// Why it cannot: none is active, it is locked (by nature, by hand, by a solo), or a point of the history is shown.
     pub fn editable_layer(&self) -> Result<&LayerInfo, String> {
+        if let Some(why) = self.read_only() {
+            return Err(why.to_string());
+        }
         let layer = self.active_layer().ok_or("no layer is active")?;
         if self.is_locked(layer) {
             let why = if self.locked_by_solo(layer) { "while another layer is soloed" } else { "it is locked" };
@@ -1757,7 +1806,6 @@ impl Workspace {
             | EditRequest::Delete(uid)
             | EditRequest::Forget(_, uid)
             | EditRequest::Resolve(uid, _)
-            | EditRequest::EditIn(uid)
             | EditRequest::Write { uid, .. } => uid.clone(),
             EditRequest::ShowGraph => return Ok(String::new()),
         };
@@ -1790,54 +1838,13 @@ impl Workspace {
                 self.send_working();
                 return Ok(label.clone());
             }
-            EditRequest::Rename(..) | EditRequest::EditIn(_) | EditRequest::ShowGraph => return Ok(String::new()),
+            EditRequest::Rename(..) | EditRequest::ShowGraph => return Ok(String::new()),
         };
         self.history.note_selection(self.selected.clone());
         let label = self.history.done().last().map_or_default(|s| s.label.clone());
         // What it wrote, taken in ahead of what other programs changed.
         self.take_written();
         Ok(label)
-    }
-
-    /// The tool an asset's source is edited in - by the media type of the format it is recognized as - and the source
-    /// file; none where it has no source, or no tool of the settings takes its format.
-    pub fn source_tool(&self, path: &str) -> Option<(crate::external::Category, &project::index::BundleFile)> {
-        let asset = self.index.assets.get(path)?;
-        let name = project::graph::import_of(asset.fields())?.source;
-        let file = asset.files.iter().find(|f| f.name == name && f.made_by.is_none())?;
-        let category = self
-            .extensions
-            .recognize(file)
-            .into_iter()
-            .find_map(|(format, _)| crate::external::Category::of_media_type(format.media_type.as_deref()?))?;
-        Some((category, file))
-    }
-
-    /// Edit an asset's source in the tool its format is edited in: where the asset is below the active layer, it is
-    /// overridden there first (a step of the history), so the tool writes the layer's own copy; the watcher brings
-    /// what the tool saves in, and the import runs again. Returns what was done.
-    ///
-    /// # Errors
-    /// No such asset, no source or tool for it, the active layer cannot take it, or the tool cannot be started.
-    pub fn edit_in(&mut self, uid: &str, tools: &crate::settings::Tools) -> anyhow::Result<String> {
-        let path_of =
-            |ws: &Workspace| ws.index.assets.values().find(|a| a.uid.as_deref() == Some(uid)).map(|a| a.path.clone());
-        let path = path_of(self).with_context(|| format!("{uid}: no such asset"))?;
-        let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
-        let (_, source) = self.source_tool(&path).context("it has no source a tool of the settings edits")?;
-        let mut done = vec![];
-        if source.layer != layer {
-            let label = self.edit(&EditRequest::Override(uid.to_string()))?;
-            done.push(label);
-            // The copy taken in, to open it.
-            self.settle();
-        }
-        let path = path_of(self).unwrap_or(path);
-        let (category, source) = self.source_tool(&path).context("its source is gone")?;
-        anyhow::ensure!(source.layer == layer, "its source is in {}, not in {layer}", source.layer);
-        let opened = crate::external::open_as(&source.path, &path, category, tools).map_err(anyhow::Error::msg)?;
-        done.push(format!("{opened} in the {}: saved, it is imported again", category.label().to_lowercase()));
-        Ok(done.join("; "))
     }
 
     /// The stack's own layers (not the mounts), bottom to top.

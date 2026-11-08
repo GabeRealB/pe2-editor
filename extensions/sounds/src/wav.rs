@@ -20,19 +20,7 @@ pub struct Wav {
     reason = "a sample's sizes are far under 4 GiB; a period of a positive rate"
 )]
 pub fn write(wav: &Wav) -> Vec<u8> {
-    let data: Vec<u8> = wav.pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let mut chunks = Vec::new();
-    chunks.extend(b"fmt ");
-    chunks.extend(16_u32.to_le_bytes());
-    chunks.extend(1_u16.to_le_bytes());
-    chunks.extend(1_u16.to_le_bytes());
-    chunks.extend(wav.rate.to_le_bytes());
-    chunks.extend((wav.rate * 2).to_le_bytes());
-    chunks.extend(2_u16.to_le_bytes());
-    chunks.extend(16_u16.to_le_bytes());
-    chunks.extend(b"data");
-    chunks.extend((data.len() as u32).to_le_bytes());
-    chunks.extend(&data);
+    let mut chunks = pcm_chunks(&wav.pcm, 1, wav.rate);
     if let Some(start) = wav.loop_start {
         let period = (1e9 / f64::from(wav.rate)).round() as u32;
         let words = [0, 0, period, 60, 0, 0, 0, 1, 0, 0, 0, start as u32, wav.pcm.len().saturating_sub(1) as u32, 0, 0];
@@ -42,6 +30,37 @@ pub fn write(wav: &Wav) -> Vec<u8> {
             chunks.extend(w.to_le_bytes());
         }
     }
+    riff(chunks)
+}
+
+/// Sound as a WAV file's bytes: 16-bit PCM, its channels interleaved, at a rate; no loop.
+#[must_use]
+pub fn write_interleaved(pcm: &[i16], channels: u16, rate: u32) -> Vec<u8> {
+    riff(pcm_chunks(pcm, channels, rate))
+}
+
+/// The format and data chunks of 16-bit PCM.
+#[expect(clippy::cast_possible_truncation, reason = "a sound's sizes are far under 4 GiB")]
+fn pcm_chunks(pcm: &[i16], channels: u16, rate: u32) -> Vec<u8> {
+    let data: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let mut chunks = Vec::new();
+    chunks.extend(b"fmt ");
+    chunks.extend(16_u32.to_le_bytes());
+    chunks.extend(1_u16.to_le_bytes());
+    chunks.extend(channels.to_le_bytes());
+    chunks.extend(rate.to_le_bytes());
+    chunks.extend((rate * 2 * u32::from(channels)).to_le_bytes());
+    chunks.extend((2 * channels).to_le_bytes());
+    chunks.extend(16_u16.to_le_bytes());
+    chunks.extend(b"data");
+    chunks.extend((data.len() as u32).to_le_bytes());
+    chunks.extend(&data);
+    chunks
+}
+
+/// A RIFF WAVE file of these chunks.
+#[expect(clippy::cast_possible_truncation, reason = "a sound's sizes are far under 4 GiB")]
+fn riff(chunks: Vec<u8>) -> Vec<u8> {
     let mut out = b"RIFF".to_vec();
     out.extend((4 + chunks.len() as u32).to_le_bytes());
     out.extend(b"WAVE");
