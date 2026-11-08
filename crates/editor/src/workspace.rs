@@ -233,8 +233,6 @@ pub struct Workspace {
     pub new_event_name: String,
     /// What the GPU said of what extensions gave it, first first.
     pub gpu_errors: Vec<String>,
-    /// The assets' settings as last applied (`project::applied`): what their outputs are made from.
-    applied: Arc<project::applied::Applied>,
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
     /// setting), before an agent is answered, or on View > Refresh.
     pending: BTreeSet<PathBuf>,
@@ -264,11 +262,11 @@ pub struct Workspace {
     /// drawn dimmed.
     editable: HashSet<String>,
     pub selected: Option<String>,
+    /// A point of the history shown, read-only, while it is.
+    pub viewing: Option<Viewing>,
     /// What is selected inside an asset: its path, and a path in its declaration (`stack.1`, `stack.0.ops.draw`). The one
     /// address every pane showing the asset shares.
     pub inner: Option<(String, String)>,
-    back: Vec<String>,
-    forward: Vec<String>,
     pub filter: String,
     /// An asset just navigated to: the tree opens its ancestors and scrolls to it once.
     pub reveal: Option<String>,
@@ -324,6 +322,15 @@ pub enum EditRequest {
         label: String,
         merge: Option<String>,
     },
+}
+
+/// A point of the history shown, read-only: the documents as after its first `point` steps - one, or all - or, while A/B
+/// flips to it, now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Viewing {
+    pub point: usize,
+    pub scope: Option<String>,
+    pub now: bool,
 }
 
 /// A field of an asset's declaration being edited in the inspector: the asset, the field, the text typed.
@@ -459,7 +466,6 @@ pub struct Opened {
     pub recovered: Option<String>,
     index: Index,
     store: project::graph::store::Store,
-    applied: Arc<project::applied::Applied>,
     extensions: Arc<Extensions>,
     extensions_found: Vec<extensions::Found>,
     imports: project::imports::Imports,
@@ -544,13 +550,12 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// The extensions as the project has them, and the assets as the user views them and as last applied.
+    /// The extensions as the project has them, and the assets as the user views them.
     pub fn of(
         project: Project,
         mut index: Index,
         cache: &Cache,
         store: &project::graph::store::Store,
-        applied: &project::applied::Applied,
         report: &project::index::Report<'_>,
     ) -> Loaded {
         // Without those it leaves off (`[extensions] disabled`). Those it holds before the built-ins.
@@ -565,7 +570,6 @@ impl Loaded {
             .unwrap_or_default();
         // The view first: hiding layers assembles the assets again, so the imports are attached to what it shows.
         index.set_hidden(&layer_view.hidden(&index.layers()));
-        applied.mark(&mut index, None);
         Loaded { project, index, extensions, found, layer_view }
     }
 }
@@ -598,7 +602,9 @@ impl Workspace {
         }
         let cache = Cache::open(&project, &lock)?;
         // The history first: a transaction a crash left half done is rolled back before the index reads the files.
+        // Journaled: a session a crash ends is offered back on the next opening.
         let (history, recovered) = History::open(&cache)?;
+        let history = history.journaled();
         let index = Index::open_reporting(&project, &cache, report)?;
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
@@ -606,10 +612,8 @@ impl Workspace {
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
-        // Their settings as last applied, which the work graph makes their outputs from.
-        let applied = Arc::new(project::applied::Applied::open(&cache)?);
         let Loaded { project, index, extensions, found: extensions_found, layer_view } =
-            Loaded::of(project, index, &cache, &store, &applied, report);
+            Loaded::of(project, index, &cache, &store, report);
         // What the assets' importers made of their sources, seen as their files.
         let imports = project::imports::Imports::open(&cache)?;
         report("Building the tree", 0, 0);
@@ -622,7 +626,6 @@ impl Workspace {
             recovered,
             index,
             store,
-            applied,
             extensions,
             extensions_found,
             imports,
@@ -642,7 +645,6 @@ impl Workspace {
             history,
             index,
             store,
-            applied,
             extensions,
             extensions_found,
             imports,
@@ -669,7 +671,6 @@ impl Workspace {
             index,
             cache,
             store: store.clone(),
-            applied: applied.clone(),
             imports,
             extensions: extensions.clone(),
             found: extensions_found.clone(),
@@ -686,7 +687,6 @@ impl Workspace {
             new_event_name: String::new(),
             gpu_errors: Vec::new(),
             project,
-            applied,
             history,
             tests: crate::tests_pane::Tests::default(),
             thumbs,
@@ -743,9 +743,8 @@ impl Workspace {
             tree,
             editable: HashSet::new(),
             selected: None,
+            viewing: None,
             inner: None,
-            back: vec![],
-            forward: vec![],
             filter: String::new(),
             reveal: None,
             pictures: HashMap::new(),
@@ -899,6 +898,10 @@ impl Workspace {
     pub fn leave(self) -> Leaving {
         // The extensions outlive a project in what is loaded: what it was asked should not.
         self.extensions.serve_requests(None);
+        // Closed cleanly, its session goes - unless documents are unsaved still: the next opening offers them back.
+        if self.history.documents().is_empty() {
+            self.history.close();
+        }
         Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock }
     }
 
@@ -1281,6 +1284,10 @@ impl Workspace {
                 }
             }
         }
+        // The documents follow the disk under them: stale where it changed, saved where it is their working copy.
+        if self.history.reconcile(&self.index) {
+            self.send_working();
+        }
         if let Some((ticket, path)) = self.selection_after.take() {
             if !self.takein.covers(ticket) {
                 self.selection_after = Some((ticket, path));
@@ -1330,17 +1337,27 @@ impl Workspace {
         self.signal(ProjectOpened::NAME);
     }
 
-    /// Undo the last step, or redo the one undone last; forced, over files changed since outside the editor. Its
-    /// files are taken in, and what was selected when the step was made is shown again once they are. Returns the
-    /// step's label.
+    /// Undo the last step, or redo the one undone last - of them all, or the last editing one document (`scope`);
+    /// forced, over what changed since outside the editor. What it changed is taken in, and what was selected when the
+    /// step was made is shown again once it is. Returns the step's label.
     ///
     /// # Errors
     /// Nothing to undo or redo, files changed outside the editor (unless forced), or a file not written.
-    pub fn step(&mut self, redo: bool, force: bool) -> Result<String, StepError> {
+    pub fn step(&mut self, redo: bool, force: bool, scope: Option<&str>) -> Result<String, StepError> {
+        if let Some(why) = self.read_only() {
+            return Err(StepError::Io(anyhow::anyhow!(why)));
+        }
         self.settle();
-        let step = if redo { self.history.redo(force)? } else { self.history.undo(force)? };
-        let (label, selection) = (step.label.clone(), step.selection.clone());
-        let ticket = self.take_written();
+        let step = if redo {
+            self.history.redo(&self.index, scope, force)?
+        } else {
+            self.history.undo(&self.index, scope, force)?
+        };
+        let (label, selection, edited) = (step.label.clone(), step.selection.clone(), !step.edits.is_empty());
+        let mut ticket = self.take_written();
+        if edited {
+            ticket = Some(self.send_working());
+        }
         self.selection_after = selection.zip(ticket).map(|(path, ticket)| (ticket, path));
         Ok(label)
     }
@@ -1548,58 +1565,168 @@ impl Workspace {
         Ok(layer)
     }
 
-    /// Whether an asset has settings not applied yet: its outputs are made from its settings as last applied.
-    pub fn unapplied(&self, path: &str) -> bool {
-        let uid = self.index.assets.get(path).and_then(|a| a.uid.as_deref());
-        uid.is_some_and(|uid| self.applied.text(uid).is_some())
+    // --- documents ------------------------------------------------------------------------------------------------
+
+    /// An asset's document, where it has unsaved changes.
+    pub fn document(&self, path: &str) -> Option<&project::history::Document> {
+        let uid = self.index.assets.get(path).and_then(|a| a.uid.as_deref())?;
+        self.history.document(uid)
     }
 
-    /// How many assets have settings not applied yet: of those the project has, not one since deleted.
-    pub fn unapplied_count(&self) -> usize {
-        self.applied.pending().iter().filter(|uid| self.index.by_uid.contains_key(*uid)).count()
+    /// Whether an asset has unsaved changes.
+    pub fn unsaved(&self, path: &str) -> bool {
+        self.document(path).is_some()
     }
 
-    /// Apply an asset's settings: its outputs made again from them.
-    pub fn apply_settings(&mut self, path: &str) {
-        let Some(uid) = self.index.assets.get(path).and_then(|a| a.uid.clone()) else { return };
-        if self.applied.apply(&uid) {
-            self.takein.applied(std::iter::once(path.to_string()).collect());
+    /// The documents with unsaved changes: their uids and paths.
+    pub fn unsaved_documents(&self) -> Vec<(String, String)> {
+        self.history.documents().iter().map(|(uid, d)| (uid.clone(), d.path.clone())).collect()
+    }
+
+    /// Show the working copies - as they are now, or as at the point of the history viewed: the index takes them in,
+    /// in place of the files on disk.
+    fn send_working(&mut self) -> u64 {
+        let working = match &self.viewing {
+            Some(viewing) if !viewing.now => self.history.working_at(viewing.point, viewing.scope.as_deref()),
+            _ => self.history.working(),
+        };
+        self.takein.working(working)
+    }
+
+    /// Why nothing can be edited now: a point of the history is viewed.
+    fn read_only(&self) -> Option<&'static str> {
+        self.viewing.as_ref().map(|_| "an earlier point of the history is shown: back to now to edit")
+    }
+
+    /// Show a point of the history, read-only - or now again.
+    pub fn view(&mut self, viewing: Option<Viewing>) {
+        if self.viewing != viewing {
+            self.viewing = viewing;
+            self.send_working();
         }
     }
 
-    /// Apply every asset's settings.
-    pub fn apply_all_settings(&mut self) {
-        let uids: std::collections::BTreeSet<String> = self.applied.apply_all().into_iter().collect();
-        let paths = self.index.assets.values().filter(|a| a.uid.as_ref().is_some_and(|u| uids.contains(u)));
-        let paths: std::collections::BTreeSet<String> = paths.map(|a| a.path.clone()).collect();
-        if !paths.is_empty() {
-            self.takein.applied(paths);
+    /// Put the documents back as at the point viewed, as a new step, and show now. Returns what was done.
+    pub fn restore_viewed(&mut self) -> String {
+        let Some(viewing) = self.viewing.take() else { return String::new() };
+        self.settle();
+        let at = viewing.point.checked_sub(1).and_then(|i| self.history.done().get(i));
+        let label = at
+            .map_or_else(|| "Restore to the start".to_string(), |step| format!("Restore to after \"{}\"", step.label));
+        let changed = self.history.restore(&self.index, viewing.point, viewing.scope.as_deref(), label.clone());
+        if changed {
+            self.history.note_selection(self.selected.clone());
+        }
+        self.send_working();
+        if changed { label } else { "Nothing to restore: the documents are as they were".into() }
+    }
+
+    /// Take back one step's edits, as a new step. Returns what was done.
+    ///
+    /// # Errors
+    /// It cannot be: a point is viewed, it is no edit, or what it edited was edited since.
+    pub fn revert_step(&mut self, at: usize) -> Result<String, String> {
+        if let Some(why) = self.read_only() {
+            return Err(why.into());
+        }
+        self.settle();
+        let label = format!("Take back {}", self.history.done().get(at).map_or("", |s| s.label.as_str()));
+        if self.history.revert_step(&self.index, at, label.clone())? {
+            self.history.note_selection(self.selected.clone());
+            self.send_working();
+        }
+        Ok(label)
+    }
+
+    /// Name the point the history is at.
+    pub fn checkpoint(&mut self, name: String) {
+        self.history.checkpoint(name);
+    }
+
+    /// Save a document: its working copy written into the active layer (overriding it there first where it comes
+    /// from below), a step undo passes over. Returns what was done.
+    ///
+    /// # Errors
+    /// The active layer cannot take it, or its files cannot be written.
+    pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {
+        if let Some(why) = self.read_only() {
+            anyhow::bail!(why);
+        }
+        self.settle();
+        let Some(document) = self.history.document(uid) else { return Ok(String::new()) };
+        let path = document.path.clone();
+        let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
+        if let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)? {
+            anyhow::bail!(
+                "code is overridden in a files layer ({})",
+                if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
+            );
+        }
+        let files = self.history.to_save(uid)?;
+        let label = format!("Save {}", path.rsplit('/').next().unwrap_or(&path));
+        if !files.is_empty() {
+            project::edit::save(&self.project, &self.index, &layer, uid, &files, label.clone(), &mut self.history)?;
+        }
+        self.history.saved(uid);
+        self.take_written();
+        self.send_working();
+        Ok(label)
+    }
+
+    /// Put a document back as on disk, a step undo takes back: its unsaved changes undone - or, stale, the disk's
+    /// taken. Returns what was done.
+    pub fn revert(&mut self, uid: &str) -> String {
+        if let Some(why) = self.read_only() {
+            return why.into();
+        }
+        self.settle();
+        let Some(document) = self.history.document(uid) else { return String::new() };
+        let name = document.path.rsplit('/').next().unwrap_or(&document.path).to_string();
+        let label = if document.stale.is_some() { format!("Take {name} as on disk") } else { format!("Revert {name}") };
+        self.history.revert(uid, label.clone());
+        self.history.note_selection(self.selected.clone());
+        self.send_working();
+        label
+    }
+
+    /// Keep a stale document's working copy: what is on disk now is what saving it overwrites.
+    pub fn keep_mine(&mut self, uid: &str) {
+        self.history.keep_mine(uid);
+    }
+
+    /// Let every unsaved change go (the project is closing without saving).
+    pub fn discard_unsaved(&mut self) {
+        self.history.discard_documents();
+        self.send_working();
+    }
+
+    /// The session a crash ended, where one was left and is not taken up or let go yet: how many steps and unsaved
+    /// documents it has.
+    pub fn left_session(&self) -> Option<(usize, usize)> {
+        self.history.left().map(|left| (left.done.len() + left.undone.len(), left.documents.len()))
+    }
+
+    /// Take up the session a crash ended, or let it go.
+    pub fn resume_left(&mut self, resume: bool) {
+        if resume {
+            self.history.resume();
+            self.history.reconcile(&self.index);
+            self.send_working();
+        } else {
+            self.history.discard_left();
         }
     }
 
-    /// The edit putting an asset's declaration back as last applied: its unapplied changes reverted, a step of the
-    /// history.
-    pub fn revert_settings(&self, path: &str) -> Option<EditRequest> {
-        let asset = self.index.assets.get(path)?;
-        let uid = asset.uid.clone()?;
-        let text = self.applied.text(&uid)?;
-        let name = path.rsplit('/').next().unwrap_or(path);
-        let label = format!("Revert the settings of {name}");
-        Some(EditRequest::Write {
-            uid,
-            file: project::index::NODE_FILE.to_string(),
-            bytes: text.into_bytes(),
-            label,
-            merge: None,
-        })
-    }
-
-    /// Make an edit in the active layer: a step of the history, the index taking it in at once. Returns what was done.
+    /// Make an edit: of a document, its working copy changed; anything else, made in the active layer at once. A step of
+    /// the history either way, the index taking it in at once. Returns what was done.
     ///
     /// # Errors
     /// The active layer cannot be written, the edit does not apply, or files cannot be written.
     pub fn edit(&mut self, request: &EditRequest) -> anyhow::Result<String> {
         use project::edit;
+        if let Some(why) = self.read_only() {
+            anyhow::bail!(why);
+        }
         // An edit reads the index (a layer's changeset): what was asked before is taken in first.
         self.settle();
         let name = match request {
@@ -1653,8 +1780,15 @@ impl Workspace {
             EditRequest::Forget(_, uid) => edit::forget(project, index, &name, uid, history)?,
             EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, uid, to, history)?,
             EditRequest::Resolve(uid, resolution) => edit::resolve(project, index, &name, uid, *resolution, history)?,
+            // An edit of a document: its working copy changes, saving writes it.
             EditRequest::Write { uid, file, bytes, label, merge } => {
-                edit::write_file(project, index, &name, uid, file, bytes, label.clone(), merge.clone(), history)?
+                let path = index.by_uid.get(uid).cloned().unwrap_or_default();
+                if !history.edit(index, uid, &path, file, bytes, label.clone(), merge.clone())? {
+                    return Ok(String::new());
+                }
+                self.history.note_selection(self.selected.clone());
+                self.send_working();
+                return Ok(label.clone());
             }
             EditRequest::Rename(..) | EditRequest::EditIn(_) | EditRequest::ShowGraph => return Ok(String::new()),
         };
@@ -1762,14 +1896,6 @@ impl Workspace {
     /// Another layer needs it, a generated layer fills it, it is a mount, or `project.toml` cannot be rewritten.
     pub fn remove_layer(&mut self, name: &str) -> Result<()> {
         project::stack::remove(&self.project, &self.layers, name, &mut self.history)
-    }
-
-    pub fn can_go_back(&self) -> bool {
-        !self.back.is_empty()
-    }
-
-    pub fn can_go_forward(&self) -> bool {
-        !self.forward.is_empty()
     }
 
     /// Run an extension's tool for a command, with no arguments; what it answers, briefly.
@@ -1986,10 +2112,6 @@ impl Workspace {
         if self.selected.as_ref() == Some(&path) {
             return;
         }
-        if let Some(current) = self.selected.take() {
-            self.back.push(current);
-        }
-        self.forward.clear();
         self.reveal = Some(path.clone());
         self.selected = Some(path);
     }
@@ -2023,25 +2145,6 @@ impl Workspace {
         self.reveal = None;
     }
 
-    pub fn go_back(&mut self) {
-        if let Some(path) = self.back.pop() {
-            if let Some(current) = self.selected.take() {
-                self.forward.push(current);
-            }
-            self.reveal = Some(path.clone());
-            self.selected = Some(path);
-        }
-    }
-
-    pub fn go_forward(&mut self) {
-        if let Some(path) = self.forward.pop() {
-            if let Some(current) = self.selected.take() {
-                self.back.push(current);
-            }
-            self.reveal = Some(path.clone());
-            self.selected = Some(path);
-        }
-    }
     /// The asset a reference value (`{ uid, path }`) names.
     pub fn target(&self, value: &toml::Value) -> Option<&Asset> {
         let (uid, path) = project::index::reference(value)?;

@@ -1,7 +1,6 @@
 //! Projects: what a `project.toml` declares - its layers, among them generated ones, each filled by its plan (`plan`)
 //! from the game's discs - and what is made of it.
 
-pub mod applied;
 pub mod build;
 pub mod cache;
 pub mod changeset;

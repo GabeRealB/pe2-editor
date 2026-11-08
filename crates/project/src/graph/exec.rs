@@ -67,8 +67,8 @@ pub trait Node: Sync {
     }
 }
 
-/// An asset of the index is a node: its stored files those of its bundle, not what imports made; its declaration as last
-/// applied (`applied`).
+/// An asset of the index is a node: its stored files those of its bundle, not what imports made; its declaration and
+/// files as its working copy has them, where it has unsaved changes.
 impl Node for crate::index::Asset {
     fn path(&self) -> &str {
         &self.path
@@ -79,11 +79,11 @@ impl Node for crate::index::Asset {
     }
 
     fn declaration(&self) -> &str {
-        self.applied.as_ref().map_or_else(|| self.text(), |a| a.text.as_str())
+        self.text()
     }
 
     fn fields(&self) -> &Table {
-        self.applied.as_ref().map_or_else(|| crate::index::Asset::fields(self), |a| &a.fields)
+        crate::index::Asset::fields(self)
     }
 
     fn file_sha1(&self, name: &str) -> Option<String> {

@@ -13,12 +13,11 @@
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use project::Project;
-use project::applied::Applied;
 use project::cache::Cache;
 use project::ext::Extensions;
 use project::imports::Imports;
-use project::index::{Asset, Index, LayerInfo};
-use std::collections::BTreeSet;
+use project::index::{Index, LayerInfo, Working};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -33,8 +32,8 @@ enum Job {
     Paths(Vec<PathBuf>),
     /// The layers hidden from view (the editor's eyes): every asset assembled again.
     Hidden(BTreeSet<String>),
-    /// These assets' settings were applied (`project::applied`): their outputs made again from them.
-    Applied(BTreeSet<String>),
+    /// The working copies of the assets with unsaved changes, by uid: the index shows them in place of their files.
+    Working(HashMap<String, Working>),
     /// A project just opened: what its importers made attached.
     Attach,
     /// The project read again, as this changed; its files too where `whole`, as they are otherwise followed already.
@@ -95,7 +94,6 @@ pub struct Worker {
     pub index: Index,
     pub cache: Cache,
     pub store: project::graph::store::Store,
-    pub applied: Arc<Applied>,
     pub imports: Imports,
     pub extensions: Arc<Extensions>,
     pub found: Vec<extensions::Found>,
@@ -161,9 +159,9 @@ impl TakeIn {
         self.send(Job::Hidden(names))
     }
 
-    /// Make these assets' outputs again from their settings as now applied; returns the job's ticket.
-    pub fn applied(&mut self, paths: BTreeSet<String>) -> u64 {
-        self.send(Job::Applied(paths))
+    /// Show the assets with unsaved changes as their working copies have them; returns the job's ticket.
+    pub fn working(&mut self, working: HashMap<String, Working>) -> u64 {
+        self.send(Job::Working(working))
     }
 
     /// Attach the imports of the project as opened; returns the job's ticket.
@@ -246,13 +244,13 @@ impl Worker {
         let ticket = jobs.iter().map(|(t, _)| *t).max().unwrap_or(0);
         let mut paths = Vec::new();
         let mut hidden = None;
-        let mut applied = BTreeSet::new();
+        let mut working = None;
         let (mut attach, mut reload, mut whole) = (false, None, false);
         for (_, job) in jobs {
             match job {
                 Job::Paths(p) => paths.extend(p),
                 Job::Hidden(names) => hidden = Some(names),
-                Job::Applied(assets) => applied.extend(assets),
+                Job::Working(copies) => working = Some(copies),
                 Job::Attach => attach = true,
                 Job::Reload { why, whole: all_of_it } => {
                     reload = Some(why);
@@ -271,8 +269,7 @@ impl Worker {
         if let Some(names) = hidden
             && self.index.set_hidden(&names)
         {
-            // Every asset assembled again, with its settings as applied: their imports attached again.
-            self.applied.mark(&mut self.index, None);
+            // Every asset assembled again: their imports attached again.
             let _ = self.imports.attach(&mut self.index, &self.extensions);
             all = true;
         }
@@ -281,20 +278,21 @@ impl Worker {
             self.reporter()("", 0, 0);
             all = true;
         }
-        if !applied.is_empty() {
-            // Their outputs made from their settings as now applied.
-            self.applied.mark(&mut self.index, Some(&applied));
-            let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &applied);
-            self.sweep_if_due();
+        let mut edited = BTreeSet::new();
+        if let Some(working) = working {
+            // The assets whose working copies changed, shown as they have them: what their imports make of them too.
+            edited = self.index.set_working(working);
+            if !edited.is_empty() {
+                let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &edited);
+                self.sweep_if_due();
+            }
         }
         if paths.is_empty() {
             return match reload {
                 Some(why) => self.reload(ticket, why, whole),
-                None => self.snapshot(ticket, applied, all, None),
+                None => self.snapshot(ticket, edited, all, None),
             };
         }
-        // What the assets were before: a declaration changed is noted unapplied, against what it was.
-        let before = self.index.assets.clone();
         let refreshed = match self.index.refresh(&self.project, &paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
@@ -309,29 +307,11 @@ impl Worker {
         if extensions::found(&self.project) != self.found {
             return self.reload(ticket, "an extension changed", whole);
         }
-        // The assets the refresh assembled again: their changed declarations noted, their settings as applied given
-        // them, their imports attached again; the others keep theirs.
-        for path in &refreshed.assets {
-            let Some(old) = before.get(path) else { continue };
-            let Some(uid) = old.uid.as_deref() else { continue };
-            match self.index.assets.get(path) {
-                // What makes nothing has nothing to apply: whatever reads it has the settings as they are.
-                // Nor has what its type applies at once.
-                Some(now)
-                    if now.uid.as_deref() == Some(uid)
-                        && (!makes_outputs(&self.extensions, now) || self.extensions.applied_at_once(now)) => {}
-                Some(now) if now.uid.as_deref() == Some(uid) => {
-                    let _ = self.applied.changed(uid, old.text(), now.text());
-                }
-                Some(_) => {}
-                None => self.applied.forget(uid),
-            }
-        }
-        self.applied.mark(&mut self.index, Some(&refreshed.assets));
+        // The assets the refresh assembled again: their imports attached again; the others keep theirs.
         let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
         self.sweep_if_due();
         let mut changed = refreshed.assets;
-        changed.extend(applied);
+        changed.extend(edited);
         match reload {
             Some(why) => self.reload(ticket, why, whole),
             None => self.snapshot(ticket, changed, all, None),
@@ -403,7 +383,7 @@ impl Worker {
         // extensions make of it is attached anew, and an index knows nothing of them.
         let read = whole || project.layers != self.project.layers;
         let index = if read { self.index.again(&project, &report)? } else { self.index.clone() };
-        let loaded = Loaded::of(project, index, &self.cache, &self.store, &self.applied, &report);
+        let loaded = Loaded::of(project, index, &self.cache, &self.store, &report);
         self.project = loaded.project;
         self.found = loaded.found;
         if !read && Arc::ptr_eq(&loaded.extensions, &self.extensions) {
@@ -433,11 +413,4 @@ impl Worker {
             files: false,
         }
     }
-}
-
-/// Whether anything is made from an asset's settings: more than the settings themselves.
-fn makes_outputs(extensions: &Extensions, asset: &Asset) -> bool {
-    let (ops, tail) = (extensions.operations(), extensions.tail(asset));
-    let plan = project::graph::Plan::of(asset.fields(), &ops, &tail).0;
-    plan.outputs.iter().any(|output| plan.steps[output.from].op != project::graph::SETTINGS)
 }

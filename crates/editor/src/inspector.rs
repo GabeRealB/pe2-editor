@@ -77,7 +77,7 @@ pub fn inspector_ui(
     // Short or narrow, it is the content that needs the room.
     let compact = ui.available_height() < 340.0 || ui.available_width() < 280.0;
     header_ui(ui, ws, &asset, compact);
-    unapplied_ui(ui, ws, &asset, nav, edit);
+    document_ui(ui, ws, &asset, message);
     let target = edit_target(ws, &asset);
     // A tab of its own for each, the room going to the one read. Something selected inside shows on its tab.
     let id = ui.scope_id().with("inspector tab");
@@ -1393,69 +1393,73 @@ fn count(n: usize, plural: &str) -> String {
 
 // --- import ---
 
-/// Where an asset's settings changed and are not applied: what applying makes again, and Apply, Revert, and Apply all
-/// where others wait too.
-fn unapplied_ui(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    asset: &Asset,
-    nav: &mut Option<String>,
-    edit: &mut Option<EditRequest>,
-) {
-    if !ws.unapplied(&asset.path) {
+/// Where an asset has unsaved changes: Save and Revert; and where its files changed on disk meanwhile, which to keep -
+/// the user's working copy, or the disk's.
+fn document_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, message: &mut Option<String>) {
+    let Some(uid) = asset.uid.clone() else { return };
+    let warn = ui.visuals().warn_fg_color;
+    // A point of the history shown: nothing is edited, saved or reverted until now is shown again.
+    if ws.viewing.as_ref().is_some_and(|v| !v.now) {
+        ui.label(
+            RichText::new(format!(
+                "{}  An earlier point of the history is shown: read-only",
+                icons::CLOCK_COUNTER_CLOCKWISE
+            ))
+            .color(warn),
+        );
+        if ui.button("Back to now").clicked() {
+            ws.view(None);
+        }
+        ui.add_space(4.0);
         return;
     }
-    // What applying makes again: its outputs, as its settings now say them.
-    let ops = ws.extensions.operations();
-    let tail = ws.extensions.tail(asset);
-    let (plan, _) = project::graph::Plan::of(asset.fields(), &ops, &tail);
-    let asked = |name: &str| tail.iter().any(|conversion| conversion.name == name);
-    let made = plan.outputs.iter().filter(|o| !o.preview && !asked(&o.name));
-    let outputs: Vec<&str> = made.map(|o| o.name.as_str()).collect();
-    // And what reads them, made again with them.
-    let dependents = ws.extensions.dependents(&ws.index, &std::iter::once(asset.path.clone()).collect());
-    let others = ws.unapplied_count().saturating_sub(1);
-    let (mut apply, mut apply_all) = (false, false);
-    theme::section(ui, "Unapplied changes", |ui| {
-        let says = if outputs.is_empty() {
-            "Its settings changed; it makes nothing from them.".to_string()
-        } else {
-            format!(
-                "Its outputs are made from its settings as last applied. Applying makes again: {}.",
-                outputs.join(", ")
-            )
-        };
-        ui.label(RichText::new(says).color(theme::weak()));
-        if !dependents.is_empty() {
-            let count = dependents.len();
-            ui.label(
-                RichText::new(format!("And what read{} them:", if count == 1 { "s" } else { "" })).color(theme::weak()),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for path in &dependents {
-                    if ui.link(path).on_hover_text("Show it").clicked() {
-                        *nav = Some(path.clone());
+    let Some(stale) = ws.history.document(&uid).map(|d| d.stale.is_some()) else { return };
+    let mut asked = None;
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, warn.gamma_multiply(0.6)))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if stale {
+                ui.label(RichText::new(format!("{}  Changed on disk while you edited it", icons::WARNING)).color(warn));
+                ui.label(
+                    RichText::new("Keep yours, which saving writes over the disk's, or take the disk's instead.")
+                        .color(theme::weak()),
+                );
+            } else {
+                ui.label(RichText::new("Unsaved changes").color(warn))
+                    .on_hover_text("What is shown and made follows them; saving writes them into the active layer");
+            }
+            ui.horizontal(|ui| {
+                if stale {
+                    if ui.button("Keep mine").clicked() {
+                        asked = Some("keep");
+                    }
+                    if ui.button("Take the disk's").on_hover_text("An undoable step").clicked() {
+                        asked = Some("revert");
+                    }
+                } else {
+                    if ui.button("Save").clicked() {
+                        asked = Some("save");
+                    }
+                    if ui.button("Revert").on_hover_text("Back as saved: an undoable step").clicked() {
+                        asked = Some("revert");
                     }
                 }
             });
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            apply =
-                ui.button("Apply").on_hover_text("Make its outputs again from its settings as they are now").clicked();
-            if ui.button("Revert").on_hover_text("Put its settings back as last applied (an undoable step)").clicked() {
-                *edit = ws.revert_settings(&asset.path);
-            }
-            if others > 0 {
-                let text = format!("Apply all ({})", others + 1);
-                apply_all = ui.button(text).on_hover_text("Apply every asset's changed settings").clicked();
-            }
         });
-    });
-    if apply_all {
-        ws.apply_all_settings();
-    } else if apply {
-        ws.apply_settings(&asset.path);
+    ui.add_space(4.0);
+    match asked {
+        Some("keep") => ws.keep_mine(&uid),
+        Some("revert") => *message = Some(ws.revert(&uid)),
+        Some(_) => {
+            *message = Some(match ws.save(&uid) {
+                Ok(label) => label,
+                Err(e) => format!("{e:#}"),
+            });
+        }
+        None => {}
     }
 }
 
@@ -1519,7 +1523,7 @@ fn stack_ui(
     let ops = ws.extensions.operations();
     let field_edit = &mut ws.field_edit;
     // What is wrong with it as it is written, told from its shape, and what comes down to each layer.
-    let (plan, wrong) = ws.extensions.plan_written(asset);
+    let (plan, wrong) = ws.extensions.plan(asset);
     let editable = target.is_ok();
     theme::section(ui, &format!("Stack  ·  {}", layers.len()), |ui| {
         egui::Grid::new(("stack", &asset.path)).num_columns(3).spacing([12.0, 6.0]).min_row_height(ROW_HEIGHT).show(

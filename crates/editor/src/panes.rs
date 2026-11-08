@@ -495,7 +495,7 @@ pub struct Panes<'a> {
     /// What tabs asked for, by tile.
     pub actions: Vec<(TileId, PaneAction)>,
     /// Steps the History pane asked to undo (false) or redo (true), and how many.
-    pub steps: Option<(bool, usize)>,
+    pub history: Option<crate::history_pane::HistoryAsk>,
     /// An edit asked for in a pane.
     pub edit: Option<EditRequest>,
     /// A line for the status bar: what an action did, or why it failed.
@@ -598,13 +598,13 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         let pinned = self.states.get(&pane).and_then(|s| s.pinned.clone());
         let editor = self.states.get(&pane).and_then(|s| s.editor);
         let subject = pinned.clone().or_else(|| ws.selected.clone().filter(|_| pane.kind != PaneKind::Document));
-        let (nav, pick, settings, layers, message, steps, edit) = (
+        let (nav, pick, settings, layers, message, history, edit) = (
             &mut self.nav,
             &mut self.pick,
             &mut *self.settings,
             &mut *self.layers,
             &mut self.message,
-            &mut self.steps,
+            &mut self.history,
             &mut self.edit,
         );
         let mut contents = |ui: &mut egui::Ui| {
@@ -632,7 +632,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                     PaneKind::Project => project_ui(ui, ws, nav),
                     PaneKind::Layers => crate::layers::layers_ui(ui, ws, layers, message),
                     PaneKind::Layer => crate::layers::layer_ui(ui, ws, nav, edit),
-                    PaneKind::History => history_ui(ui, ws, steps),
+                    PaneKind::History => crate::history_pane::history_ui(ui, ws, history),
                     PaneKind::Events => crate::events_pane::events_ui(ui, ws, nav, message),
                     PaneKind::Tests => crate::tests_pane::tests_ui(ui, ws),
                     PaneKind::Extensions => {
@@ -669,9 +669,11 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
                 .iter()
                 .filter(|(p, _)| p.kind == PaneKind::Document)
                 .filter_map(|(_, s)| s.pinned.as_deref());
+            // A star: unsaved changes.
+            let unsaved = if self.workspace.as_ref().is_some_and(|ws| ws.unsaved(path)) { " *" } else { "" };
             let text = match telling_apart(path, others) {
-                Some(folder) => RichText::new(format!("{icon}  {name}  ·  {folder}")),
-                None => RichText::new(format!("{icon}  {name}")),
+                Some(folder) => RichText::new(format!("{icon}  {name}{unsaved}  ·  {folder}")),
+                None => RichText::new(format!("{icon}  {name}{unsaved}")),
             };
             return if state.preview { text.italics() } else { text }.into();
         }
@@ -820,44 +822,6 @@ impl Panes<'_> {
 
 /// The session's history: what was done, the last of it marked, and what was undone and can be redone, greyed. A
 /// click on a step undoes or redoes everything up to it.
-fn history_ui(ui: &mut egui::Ui, ws: &Workspace, steps: &mut Option<(bool, usize)>) {
-    let (done, undone) = (ws.history.done(), ws.history.undone());
-    ui.label(
-        RichText::new("What was done since the project was opened: closing it ends the history.")
-            .small()
-            .color(theme::weak()),
-    );
-    ui.add_space(4.0);
-    if done.is_empty() && undone.is_empty() {
-        ui.label(RichText::new("Nothing done yet").color(theme::weak()));
-        return;
-    }
-    let row = |ui: &mut egui::Ui, step: &project::history::Step, current: bool, redone: bool| {
-        let mut text = RichText::new(&step.label);
-        if redone {
-            text = text.color(theme::weak());
-        }
-        let author = if step.author == "user" { String::new() } else { format!("  ·  {}", step.author) };
-        let response = ui.add(egui::Button::selectable(current, text).truncate()).on_hover_text(format!(
-            "{} file{}{author}",
-            step.paths().len(),
-            if step.paths().len() == 1 { "" } else { "s" }
-        ));
-        response.clicked()
-    };
-    for (i, step) in done.iter().enumerate() {
-        let last = i + 1 == done.len();
-        if row(ui, step, last, false) && !last {
-            *steps = Some((false, done.len() - 1 - i));
-        }
-    }
-    for (i, step) in undone.iter().rev().enumerate() {
-        if row(ui, step, false, true) {
-            *steps = Some((true, i + 1));
-        }
-    }
-}
-
 /// What does not fit is reached, never cut off: both ways, but for what wraps to its width.
 fn scroll(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::ScrollArea::both().id_salt(id).auto_shrink(false).show(ui, add_contents);
@@ -1108,8 +1072,10 @@ fn grid_cell(ui: &mut egui::Ui, ws: &Workspace, name: &str, node: &Node, marked:
         let font = egui::FontId::proportional(30.0);
         ui.painter().text(picture.center(), egui::Align2::CENTER_CENTER, icon, font, tint);
     }
+    // A star: unsaved changes.
+    let unsaved = node.asset.as_deref().is_some_and(|path| ws.unsaved(path));
     let mut job = egui::text::LayoutJob::simple_singleline(
-        name.to_string(),
+        if unsaved { format!("{name} *") } else { name.to_string() },
         egui::TextStyle::Small.resolve(ui.style()),
         theme::text(),
     );
@@ -1272,6 +1238,9 @@ impl TreeView<'_> {
         let asset = node.asset.as_deref()?;
         let found = self.ws.index.assets.get(asset);
         let kind = found.and_then(|a| self.ws.extensions.type_name(a));
+        // A star: unsaved changes.
+        let starred = self.ws.unsaved(asset).then(|| format!("{name} *"));
+        let name = starred.as_deref().unwrap_or(name);
         let dim = !self.ws.is_editable(asset);
         let selected = self.ws.selected.as_deref() == Some(asset);
         // An asset whose type makes thumbnails shows its own in place of its type's icon, once it is made.

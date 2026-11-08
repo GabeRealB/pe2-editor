@@ -851,7 +851,6 @@ impl Registry {
             takes: vec![],
             extracted: false,
             data: false,
-            applied_at_once: false,
             values: vec![],
             extends: false,
         };
@@ -1077,14 +1076,6 @@ impl TypeBuilder<'_> {
     #[must_use]
     pub fn data(mut self) -> Self {
         self.def.data = true;
-        self
-    }
-
-    /// What is set on a node of it is applied as soon as it is taken in, its outputs made again at once: for what is
-    /// edited to be heard or seen following (a script sequenced while it plays).
-    #[must_use]
-    pub fn applied_at_once(mut self) -> Self {
-        self.def.applied_at_once = true;
         self
     }
 

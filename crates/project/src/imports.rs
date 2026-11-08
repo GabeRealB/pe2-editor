@@ -80,8 +80,8 @@ struct Look {
 struct Known {
     importer: String,
     files: Vec<(String, Blob)>,
-    /// The settings it derived, the paths it derives them at, and its notes: resolved over the declaration as written
-    /// each time it is attached, as its settings may have changed unapplied.
+    /// The settings it derived, the paths it derives them at, and its notes: resolved over the declaration as it stands
+    /// each time it is attached, as its settings may have changed - unsaved, in a working copy.
     made: Table,
     derives: Vec<String>,
     notes: Vec<String>,
@@ -228,7 +228,7 @@ impl Imports {
         };
         report("Attaching what the importers made", 0, assets.len());
         // What an import reads of other nodes, made in the index as it is.
-        let world = crate::ext::Graph { index: &*index, extensions, written: false };
+        let world = crate::ext::Graph { index: &*index, extensions };
         let reach = graph::exec::Reach { engine: &engine, world: &world };
         // Each asset's by itself, at the same time, as all of it only reads.
         let held = &*known;

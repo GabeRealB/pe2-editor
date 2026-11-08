@@ -208,6 +208,7 @@ mod tests {
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let history = &mut history;
         let layers = [info("game", &[]), info("mod", &["game"])];
         let order = ["mod".to_string(), "game".to_string()];
@@ -220,7 +221,7 @@ mod tests {
         stack::add(&project, "patch", LayerKind::Files, history).unwrap();
         let read = Project::load(&root).unwrap();
         assert_eq!(read.layer("patch").unwrap().kind, LayerKind::Files);
-        history.undo(false).unwrap();
+        history.undo(&index, None, false).unwrap();
         let project = Project::load(&root).unwrap();
         let layers = [info("game", &[]), info("mod", &["game"]), info("fixes", &[])];
         let order: Vec<String> = ["game", "fixes", "mod"].map(String::from).into();
@@ -237,7 +238,7 @@ mod tests {
         assert!(root.join(".layers/fixes").is_dir());
         // Undone: taken out, reordered, added - back to the two layers, and the new layer's folder gone.
         for _ in 0..3 {
-            history.undo(false).unwrap();
+            history.undo(&index, None, false).unwrap();
         }
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
         assert!(!root.join(".layers/fixes").exists());

@@ -762,8 +762,6 @@ interface guest {
         extends: bool,
         /// Whether a node of it holds only what is set on it: then an operation of the type's name makes those settings.
         data: bool,
-        /// Whether what is set on a node of it is applied as soon as it is taken in: its outputs made again at once.
-        applied-at-once: bool,
         /// The value types a node making one is of this type, by their qualified names.
         values: list<string>,
     }

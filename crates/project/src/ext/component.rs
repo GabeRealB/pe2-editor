@@ -2191,9 +2191,6 @@ fn apply_types(registry: &mut Registry, types: Vec<g::ValueType>, shared: &Arc<S
                 Some(pe2_ext::Recognized { version: (!version.is_empty()).then_some(version) })
             });
         }
-        if node_type.applied_at_once {
-            builder = builder.applied_at_once();
-        }
         if node_type.data {
             builder = builder.data();
         }

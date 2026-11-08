@@ -8,6 +8,8 @@
 
 // What only the scenarios here use is left over in a build for running a project's tests.
 #[cfg(test)]
+mod documents;
+#[cfg(test)]
 mod fetching;
 #[cfg_attr(not(test), allow(dead_code))]
 mod fixture;
@@ -393,6 +395,16 @@ impl Scenario {
         self.settle();
     }
 
+    /// Click the topmost of what says this: the first of a list's alike rows, not what the status bar says of it.
+    #[track_caller]
+    pub fn click_topmost(&mut self, text: &str) {
+        self.steady(|editor| editor.harness.query_all(By::new().label_contains(text)).next().map(|node| node.rect()));
+        let found = self.harness.query_all(By::new().label_contains(text));
+        let top = found.min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+        top.unwrap_or_else(|| panic!("nothing says {text:?}")).click();
+        self.settle();
+    }
+
     /// Click what says exactly this: what is open in a menu, say.
     #[track_caller]
     pub fn click_label(&mut self, text: &str) {
@@ -755,6 +767,19 @@ impl Scenario {
         self.settle();
     }
 
+    /// Press a key with Alt held.
+    pub fn alt(&mut self, key: egui::Key) {
+        self.harness.key_press_modifiers(egui::Modifiers::ALT, key);
+        self.settle();
+    }
+
+    /// Press a key with the command key held (Ctrl, ⌘): a shortcut.
+    pub fn shortcut(&mut self, key: egui::Key) {
+        // As a keyboard on Linux says it: Ctrl, which is the command key there.
+        self.harness.key_press_modifiers(egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE }, key);
+        self.settle();
+    }
+
     /// Drop a file on the window.
     pub fn drop_file(&mut self, file: &std::path::Path) {
         self.harness.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(file.to_path_buf())));
@@ -772,6 +797,14 @@ impl Scenario {
     pub fn undo(&mut self) {
         assert!(self.harness.state_mut().undo(), "nothing to undo");
         self.settle();
+    }
+
+    /// A node's declaration as the editor shows it: its working copy's, where it has unsaved changes.
+    #[track_caller]
+    pub fn working(&mut self, path: &str) -> toml::Table {
+        let text = self.workspace().index.assets.get(path).map(|a| a.text().to_string());
+        let text = text.unwrap_or_else(|| panic!("{path}: no such asset"));
+        text.parse().unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
     /// A node's declaration, as written in the top layer that has it.

@@ -39,6 +39,7 @@ mod fill;
 mod gpu_stats;
 mod gpu_view;
 mod graph_pane;
+mod history_pane;
 mod icons;
 mod inspector;
 mod layers;

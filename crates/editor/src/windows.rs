@@ -369,7 +369,7 @@ impl Layouts {
     }
 
     /// The group in use and the tab in front of it: of the document in use, else of the group holding the first document.
-    fn tab_in_use(&self) -> Option<(Option<u64>, TileId, TileId)> {
+    pub fn tab_in_use(&self) -> Option<(Option<u64>, TileId, TileId)> {
         let anchor =
             self.focused.filter(|pane| self.find(*pane).is_some()).or_else(|| self.documents().first().copied())?;
         let (window, tile) = self.find(anchor)?;
@@ -574,6 +574,18 @@ impl Layouts {
                 self.act(window, tile, PaneAction::Close);
             }
         }
+    }
+
+    /// The asset a document tab shows, where it is the last tab showing it: closing it closes the document.
+    pub fn last_tab_of(&self, window: Option<u64>, tile: TileId) -> Option<String> {
+        let tree = match window {
+            None => &self.main,
+            Some(id) => &self.windows.iter().find(|w| w.id == id)?.tree,
+        };
+        let Some(Tile::Pane(pane)) = tree.tiles.get(tile) else { return None };
+        let path = self.subject(*pane).filter(|_| pane.kind == PaneKind::Document)?;
+        let elsewhere = self.documents().into_iter().any(|other| other != *pane && self.subject(other) == Some(path));
+        (!elsewhere).then(|| path.to_string())
     }
 
     /// Do what a tab asked: in the layout of `window` (none: the main one), for the pane in `tile`.

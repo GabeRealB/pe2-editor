@@ -64,7 +64,20 @@ struct Capture {
 /// What was asked while the project was being read, done once it has been.
 enum Deferred {
     Edit(EditRequest),
-    Step { redo: bool, force: bool },
+    Step { redo: bool, force: bool, scope: Option<String> },
+}
+
+/// What waits on the documents with unsaved changes being saved or let go.
+#[derive(Clone, Debug)]
+enum Closing {
+    /// The window, closing.
+    Quit,
+    /// Another project, opening.
+    Open(PathBuf),
+    /// A build or a clean, by its event.
+    Signal(&'static str),
+    /// A document's last tab: where it is, and the document's uid.
+    Tab { window: Option<u64>, tile: TileId, uid: String },
 }
 
 /// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
@@ -108,8 +121,12 @@ pub struct Editor {
     open_dialog: Option<String>,
     /// The directory a new project is to be made in, being typed.
     new_dialog: Option<String>,
-    /// A step that files changed outside the editor block: redo (true) or undo, and why.
-    force: Option<(bool, String)>,
+    /// A step that what changed outside the editor blocks: redo (true) or undo, of which document, and why.
+    force: Option<(bool, Option<String>, String)>,
+    /// What waits on unsaved documents being saved or let go, while it is asked.
+    closing: Option<Closing>,
+    /// The window closing, its documents saved or let go: it closes unasked.
+    quitting: bool,
     /// An entry being renamed: its uid, its real path, the new name being typed.
     renaming: Option<(String, String, String)>,
     /// Code being overridden while an asset layer is active: which files layer takes it.
@@ -131,6 +148,8 @@ pub struct Editor {
     palette: Option<Palette>,
     /// Whether the pointer is over the assets' browser: back and forward are then its own.
     in_browser: bool,
+    /// The documents brought into focus, oldest first, and which of them back and forward stand at.
+    visits: (Vec<Visit>, usize),
     /// What reads where the main window is, and the place it was last seen in.
     tracker: crate::windows::Tracker,
     place: Option<crate::windows::Place>,
@@ -210,6 +229,7 @@ fn active_config(settings: &EditorSettings, project: &project::Project) -> Optio
 }
 
 impl Editor {
+    #[expect(clippy::too_many_lines, reason = "what it starts with, one line each")]
     pub fn new(cc: &eframe::CreationContext<'_>, start: Start) -> Editor {
         let stored = |key| cc.storage.and_then(|s| s.get_string(key));
         let layout =
@@ -270,6 +290,8 @@ impl Editor {
             open_dialog: None,
             new_dialog: None,
             force: None,
+            closing: None,
+            quitting: false,
             renaming: None,
             choosing: None,
             layers_state: crate::layers::LayersState::default(),
@@ -281,6 +303,7 @@ impl Editor {
             naming: None,
             palette: None,
             in_browser: false,
+            visits: (Vec::new(), 0),
             tracker: crate::windows::Tracker::new(window.map(|window| window.place)),
             place: window.map(|window| window.place),
             filling: window.map_or((false, false), |window| (window.maximized, window.fullscreen)),
@@ -317,8 +340,17 @@ impl Editor {
         editor
     }
 
-    /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
+    /// Open a project - the documents of the one open with unsaved changes saved or let go first, as the user says.
     fn open(&mut self, dir: &Path) {
+        if self.workspace.as_ref().is_some_and(|ws| !ws.unsaved_documents().is_empty()) {
+            self.closing = Some(Closing::Open(dir.to_path_buf()));
+            return;
+        }
+        self.open_now(dir);
+    }
+
+    /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
+    fn open_now(&mut self, dir: &Path) {
         // The project open now lets go of its lock first: opening it again must find it free. It finishes what it is on to
         // do that, on the thread opening the next.
         let leaving = self.workspace.take().map(Workspace::leave);
@@ -439,7 +471,7 @@ impl Editor {
         for (_, deferred) in ready {
             match deferred {
                 Deferred::Edit(request) => self.edit(&request),
-                Deferred::Step { redo, force } => drop(self.step(redo, force)),
+                Deferred::Step { redo, force, scope } => drop(self.step(redo, force, scope)),
             }
         }
     }
@@ -469,22 +501,25 @@ impl Editor {
         }
     }
 
-    /// Undo the last step, or redo; forced over files changed outside the editor. Blocked by such files, it asks.
-    fn step(&mut self, redo: bool, force: bool) -> bool {
+    /// Undo the last step, or redo - of them all, or of one document; forced over what changed outside the editor.
+    /// Blocked by such changes, it asks.
+    fn step(&mut self, redo: bool, force: bool, scope: Option<String>) -> bool {
+        let author = self.author();
         let Some(ws) = &mut self.workspace else { return false };
         if let Some(ticket) = ws.reading_until() {
-            self.deferred.push((ticket, Deferred::Step { redo, force }));
+            self.deferred.push((ticket, Deferred::Step { redo, force, scope }));
             return true;
         }
+        ws.history.set_author(author);
         let verb = if redo { "Redo" } else { "Undo" };
-        match ws.step(redo, force) {
+        match ws.step(redo, force, scope.as_deref()) {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
             Ok(label) => {
                 self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
                 true
             }
             Err(StepError::Changed(paths)) => {
-                self.force = Some((redo, StepError::Changed(paths).to_string()));
+                self.force = Some((redo, scope, StepError::Changed(paths).to_string()));
                 false
             }
             Err(e) => {
@@ -509,11 +544,13 @@ impl Editor {
             }
             return;
         }
+        let author = self.author();
         let Some(ws) = &mut self.workspace else { return };
         if let Some(ticket) = ws.reading_until() {
             self.deferred.push((ticket, Deferred::Edit(request.clone())));
             return;
         }
+        ws.history.set_author(author);
         if let EditRequest::EditIn(uid) = request {
             self.message = Some(match ws.edit_in(uid, &self.settings.tools) {
                 Ok(done) => done,
@@ -641,15 +678,15 @@ impl Editor {
 
     /// Steps blocked by files changed outside the editor: undone or redone anyway, or left.
     fn force_dialog(&mut self, ctx: &egui::Context) {
-        let Some((redo, why)) = &self.force else { return };
-        let (redo, mut go, mut cancel) = (*redo, false, false);
+        let Some((redo, scope, why)) = &self.force else { return };
+        let (redo, scope, mut go, mut cancel) = (*redo, scope.clone(), false, false);
         egui::Window::new("Changed outside the editor")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.set_max_width(460.0);
-                ui.label(format!("Files this step touches {why}."));
+                ui.label(format!("What this step changed was {why}."));
                 ui.label(
                     RichText::new(
                         "Going on overwrites them; what it overwrites can be brought back by the opposite step.",
@@ -664,7 +701,7 @@ impl Editor {
             });
         if go {
             self.force = None;
-            self.step(redo, true);
+            self.step(redo, true, scope);
         } else if cancel {
             self.force = None;
         }
@@ -769,11 +806,27 @@ impl Editor {
             | Command::Pane(_)
             | Command::Mode(_) => true,
             Command::DeleteMode => self.layouts.modes.len() > 1,
-            Command::Undo => ws.is_some_and(|ws| !ws.history.done().is_empty()),
-            Command::Redo => ws.is_some_and(|ws| !ws.history.undone().is_empty()),
-            Command::Back => ws.is_some_and(|ws| if self.in_browser { ws.can_folder_back() } else { ws.can_go_back() }),
+            Command::Undo => self.step_scope(false).is_some(),
+            Command::Redo => self.step_scope(true).is_some(),
+            Command::UndoAnywhere => ws.is_some_and(|ws| ws.history.to_undo(None).is_some()),
+            Command::RedoAnywhere => ws.is_some_and(|ws| ws.history.to_redo(None).is_some()),
+            Command::Save | Command::Revert => {
+                self.document_uid().zip(ws).is_some_and(|(uid, ws)| ws.history.document(&uid).is_some())
+            }
+            Command::SaveAll => ws.is_some_and(|ws| !ws.history.documents().is_empty()),
+            Command::Back => {
+                if self.in_browser {
+                    ws.is_some_and(Workspace::can_folder_back)
+                } else {
+                    self.visit_at(false).is_some()
+                }
+            }
             Command::Forward => {
-                ws.is_some_and(|ws| if self.in_browser { ws.can_folder_forward() } else { ws.can_go_forward() })
+                if self.in_browser {
+                    ws.is_some_and(Workspace::can_folder_forward)
+                } else {
+                    self.visit_at(true).is_some()
+                }
             }
             Command::Up => ws.is_some_and(|ws| !ws.asset_folder.is_empty()),
             Command::CloseTab | Command::NextTab | Command::PreviousTab => self.layouts.has_tab(),
@@ -817,8 +870,8 @@ impl Editor {
                     ws.fill.ask();
                 }
             }
-            Command::Build => self.signal(Build::NAME),
-            Command::Clean => self.signal(Clean::NAME),
+            Command::Build => self.signal_saved(Build::NAME),
+            Command::Clean => self.signal_saved(Clean::NAME),
             Command::CancelEpoch => {
                 if let Some(ws) = &self.workspace {
                     ws.cancel_epoch();
@@ -831,18 +884,20 @@ impl Editor {
             }
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Settings => self.show_pane(Pane::first(PaneKind::Settings)),
-            Command::Undo => drop(self.step(false, false)),
-            Command::Redo => drop(self.step(true, false)),
+            Command::Undo
+            | Command::Redo
+            | Command::UndoAnywhere
+            | Command::RedoAnywhere
+            | Command::Save
+            | Command::SaveAll
+            | Command::Revert => self.run_on_documents(command),
             Command::Refresh => self.refresh(),
             Command::Back | Command::Forward => {
-                let (back, in_browser) = (command == Command::Back, self.in_browser);
-                if let Some(ws) = &mut self.workspace {
-                    match (in_browser, back) {
-                        (true, true) => ws.folder_back(),
-                        (true, false) => ws.folder_forward(),
-                        (false, true) => ws.go_back(),
-                        (false, false) => ws.go_forward(),
-                    }
+                let forward = command == Command::Forward;
+                match (self.in_browser, &mut self.workspace) {
+                    (true, Some(ws)) if forward => ws.folder_forward(),
+                    (true, Some(ws)) => ws.folder_back(),
+                    _ => self.visit(forward),
                 }
             }
             Command::Up => {
@@ -851,6 +906,11 @@ impl Editor {
                 }
             }
             Command::CloseTab => {
+                if let Some((window, _, tile)) = self.layouts.tab_in_use()
+                    && self.asks_to_close(window, tile)
+                {
+                    return;
+                }
                 self.layouts.close_tab();
                 self.select_in_use();
             }
@@ -895,6 +955,38 @@ impl Editor {
         }
     }
 
+    /// The commands acting on documents: saving them, reverting them, undoing and redoing.
+    fn run_on_documents(&mut self, command: Command) {
+        match command {
+            Command::Undo | Command::Redo => {
+                let redo = command == Command::Redo;
+                if let Some(scope) = self.step_scope(redo) {
+                    self.step(redo, false, scope.uid());
+                }
+            }
+            Command::UndoAnywhere => drop(self.step(false, false, None)),
+            Command::RedoAnywhere => drop(self.step(true, false, None)),
+            Command::Save => {
+                if let Some(uid) = self.document_uid() {
+                    self.save(&[uid]);
+                }
+            }
+            Command::SaveAll => self.save_all(),
+            Command::Revert => {
+                if let Some(uid) = self.document_uid() {
+                    self.revert(&uid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Save every document with unsaved changes.
+    fn save_all(&mut self) {
+        let all = self.workspace.as_ref().map_or_default(Workspace::unsaved_documents);
+        self.save(&all.into_iter().map(|(uid, _)| uid).collect::<Vec<_>>());
+    }
+
     /// The commands acting on what is selected, the graph in front, the window itself and what extensions offer.
     fn run_on_what_is_shown(&mut self, ctx: &egui::Context, command: Command) {
         match command {
@@ -928,6 +1020,314 @@ impl Editor {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Note the document in focus as visited, where it is another than the one back and forward stand at: what comes
+    /// after that is let go, as a browser does.
+    fn note_visit(&mut self) {
+        let Some(ws) = &self.workspace else { return };
+        let Some(pane) = self.layouts.focused.or_else(|| self.layouts.active_document()) else { return };
+        let Some(state) = self.layouts.states.get(&pane) else { return };
+        let Some(path) = state.pinned.clone() else { return };
+        let uid = ws.index.assets.get(&path).and_then(|a| a.uid.clone());
+        let (visits, at) = &mut self.visits;
+        if visits.get(*at).is_some_and(|v| v.path == path || (uid.is_some() && v.uid == uid)) {
+            visits[*at].editor = state.editor;
+            return;
+        }
+        visits.truncate(*at + 1);
+        visits.push(Visit { path, uid, editor: state.editor });
+        if visits.len() > VISITS {
+            visits.remove(0);
+        }
+        *at = visits.len() - 1;
+    }
+
+    /// Where back (or forward) goes: the next visit that is still there.
+    fn visit_at(&self, forward: bool) -> Option<usize> {
+        let ws = self.workspace.as_ref()?;
+        let (visits, at) = (&self.visits.0, self.visits.1);
+        let there = |visit: &Visit| visit.place(ws).is_some();
+        if forward {
+            (at + 1..visits.len()).find(|&i| there(&visits[i]))
+        } else {
+            (0..at.min(visits.len())).rev().find(|&i| there(&visits[i]))
+        }
+    }
+
+    /// Go back (or forward) to a document visited: focused, opened again where it was closed, shown as it was.
+    fn visit(&mut self, forward: bool) {
+        let Some(at) = self.visit_at(forward) else { return };
+        let Some(ws) = &mut self.workspace else { return };
+        let visit = self.visits.0[at].clone();
+        let Some(path) = visit.place(ws) else { return };
+        self.visits.1 = at;
+        self.visits.0[at].path.clone_from(&path);
+        ws.navigate(path.clone());
+        self.opened.clone_from(&ws.selected);
+        self.layouts.open(&path, true);
+        if let Some(editor) = visit.editor {
+            self.layouts.show_in(editor);
+        }
+    }
+
+    /// Who makes what is done now: an agent driving the editor, or its user.
+    fn author(&self) -> &'static str {
+        if self.drive.acted.is_some_and(|t| t.elapsed() < AGENT_ACTED) { "agent" } else { "user" }
+    }
+
+    /// The uid of the document in use: the asset its tab in front shows, else the asset selected.
+    fn document_uid(&self) -> Option<String> {
+        let ws = self.workspace.as_ref()?;
+        let shown = self.layouts.active_document().and_then(|pane| self.layouts.subject(pane));
+        let path = shown.or(ws.selected.as_deref())?;
+        ws.index.assets.get(path)?.uid.clone()
+    }
+
+    /// What undo (or redo) takes back now: the last edit of the document in use; with none, the last change to the
+    /// project that edited no document - never another document's edit. None: nothing.
+    fn step_scope(&self, redo: bool) -> Option<StepScope> {
+        let ws = self.workspace.as_ref()?;
+        let next = |scope: Option<&str>| if redo { ws.history.to_redo(scope) } else { ws.history.to_undo(scope) };
+        match self.document_uid() {
+            Some(uid) if next(Some(&uid)).is_some() => Some(StepScope::Document(uid)),
+            Some(_) => next(None).filter(|step| step.edits.is_empty()).map(|_| StepScope::Project),
+            None => next(None).map(|_| StepScope::Project),
+        }
+    }
+
+    /// The label of what undo (or redo) takes back now.
+    fn step_label(&self, redo: bool) -> Option<String> {
+        let ws = self.workspace.as_ref()?;
+        let scope = self.step_scope(redo)?.uid();
+        let step = if redo { ws.history.to_redo(scope.as_deref()) } else { ws.history.to_undo(scope.as_deref()) };
+        step.map(|step| step.label.clone())
+    }
+
+    /// What is asked of the user over the window this frame, and what comes in from outside it.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        self.open_dialog(ctx);
+        self.new_dialog(ctx);
+        self.naming_dialog(ctx);
+        self.palette_ui(ctx);
+        self.dropped_files(ctx);
+        self.import_dialog(ctx);
+        self.onboarding_ui(ctx);
+        self.fill_ui(ctx);
+        self.fetch(ctx);
+        self.keep_presence(ctx);
+        self.in_use_dialog(ctx);
+        self.force_dialog(ctx);
+        self.closing_dialog(ctx);
+        self.left_dialog(ctx);
+        self.rename_dialog(ctx);
+        self.choose_dialog(ctx);
+    }
+
+    /// The window closing with unsaved documents: they are asked about first.
+    fn ask_before_closing(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quitting
+            && self.workspace.as_ref().is_some_and(|ws| !ws.unsaved_documents().is_empty())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = Some(Closing::Quit);
+        }
+    }
+
+    /// Do what the status bar's list of unsaved documents asked.
+    fn unsaved_asked(&mut self, asked: Unsaved) {
+        match asked {
+            Unsaved::SaveAll => self.save_all(),
+            Unsaved::Save(uid) => drop(self.save(&[uid])),
+            Unsaved::Revert(uid) => self.revert(&uid),
+            Unsaved::Show(path) => {
+                if let Some(ws) = &mut self.workspace {
+                    ws.navigate(path.clone());
+                }
+                self.layouts.open(&path, true);
+            }
+        }
+    }
+
+    /// Save documents; the first that cannot be stops it, said.
+    fn save(&mut self, uids: &[String]) -> bool {
+        let author = self.author();
+        let Some(ws) = &mut self.workspace else { return false };
+        ws.history.set_author(author);
+        let mut saved = vec![];
+        for uid in uids {
+            match ws.save(uid) {
+                Ok(label) => saved.push(label),
+                Err(e) => {
+                    self.error = Some(format!("{e:#}"));
+                    return false;
+                }
+            }
+        }
+        self.message = match saved.as_slice() {
+            [] => None,
+            [one] => Some(one.clone()),
+            many => Some(format!("Saved {} documents", many.len())),
+        };
+        true
+    }
+
+    /// Put a document back as on disk: its unsaved changes undone, or - stale - the disk's taken.
+    fn revert(&mut self, uid: &str) {
+        let author = self.author();
+        if let Some(ws) = &mut self.workspace {
+            ws.history.set_author(author);
+            self.message = Some(ws.revert(uid));
+        }
+    }
+
+    /// A build or a clean, its documents saved first: it reads what is saved.
+    fn signal_saved(&mut self, event: &'static str) {
+        if self.workspace.as_ref().is_some_and(|ws| !ws.unsaved_documents().is_empty()) {
+            self.closing = Some(Closing::Signal(event));
+        } else {
+            self.signal(event);
+        }
+    }
+
+    /// Whether closing a tab waits to ask first: it is the last showing a document with unsaved changes.
+    fn asks_to_close(&mut self, window: Option<u64>, tile: TileId) -> bool {
+        let Some(path) = self.layouts.last_tab_of(window, tile) else { return false };
+        let Some(ws) = &self.workspace else { return false };
+        let Some(uid) = ws.index.assets.get(&path).and_then(|a| a.uid.clone()) else { return false };
+        if ws.history.document(&uid).is_none() {
+            return false;
+        }
+        self.closing = Some(Closing::Tab { window, tile, uid });
+        true
+    }
+
+    /// Unsaved documents asked about before what waits on them: saved, let go, or what waits left.
+    fn closing_dialog(&mut self, ctx: &egui::Context) {
+        let Some(closing) = self.closing.clone() else { return };
+        let Some(ws) = &self.workspace else {
+            self.closing = None;
+            return;
+        };
+        let documents: Vec<(String, String)> = match &closing {
+            Closing::Tab { uid, .. } => ws.unsaved_documents().into_iter().filter(|(u, _)| u == uid).collect(),
+            _ => ws.unsaved_documents(),
+        };
+        if documents.is_empty() {
+            self.closing = None;
+            self.go_on(closing, ctx);
+            return;
+        }
+        let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let what = match (&closing, documents.as_slice()) {
+            (_, [(_, path)]) => name(path),
+            (_, many) => format!("{} documents", many.len()),
+        };
+        let question = match &closing {
+            Closing::Quit => format!("Save the changes to {what} before quitting?"),
+            Closing::Open(_) => format!("Save the changes to {what} before opening another project?"),
+            Closing::Signal(_) => format!("What is built is what is saved: save the changes to {what} first?"),
+            Closing::Tab { .. } => format!("Save the changes to {what} before closing it?"),
+        };
+        let (mut save, mut discard, mut cancel) = (false, false, false);
+        egui::Modal::new(egui::Id::unique("unsaved")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new("Unsaved changes").strong());
+            ui.add_space(4.0);
+            ui.label(question);
+            if documents.len() > 1 {
+                for (_, path) in documents.iter().take(8) {
+                    ui.label(RichText::new(format!("  {path}")).color(theme::weak()));
+                }
+                if documents.len() > 8 {
+                    ui.label(RichText::new(format!("  and {} more", documents.len() - 8)).color(theme::weak()));
+                }
+            }
+            if !matches!(closing, Closing::Signal(_)) {
+                ui.label(RichText::new("Not saving them lets them go.").color(theme::weak()));
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                save = ui.button(if documents.len() > 1 { "Save all" } else { "Save" }).clicked();
+                if !matches!(closing, Closing::Signal(_)) {
+                    discard = ui.button("Don't save").clicked();
+                }
+                cancel = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        });
+        if save {
+            self.closing = None;
+            let uids: Vec<String> = documents.into_iter().map(|(uid, _)| uid).collect();
+            if self.save(&uids) {
+                self.go_on(closing, ctx);
+            }
+        } else if discard {
+            self.closing = None;
+            match &closing {
+                Closing::Tab { uid, .. } => self.revert(uid),
+                _ => {
+                    if let Some(ws) = &mut self.workspace {
+                        ws.discard_unsaved();
+                    }
+                }
+            }
+            self.go_on(closing, ctx);
+        } else if cancel {
+            self.closing = None;
+        }
+    }
+
+    /// What waited on unsaved documents, done.
+    fn go_on(&mut self, closing: Closing, ctx: &egui::Context) {
+        match closing {
+            Closing::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Closing::Open(dir) => self.open_now(&dir),
+            Closing::Signal(event) => self.signal(event),
+            Closing::Tab { window, tile, .. } => {
+                self.layouts.act(window, tile, PaneAction::Close);
+                self.select_in_use();
+            }
+        }
+    }
+
+    /// The session a crash ended, offered back: its unsaved documents and its history taken up, or let go.
+    fn left_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ws) = &self.workspace else { return };
+        if self.onboarding.is_some() || ws.reading_until().is_some() {
+            return;
+        }
+        let Some((steps, documents)) = ws.left_session() else { return };
+        let (mut resume, mut discard) = (false, false);
+        egui::Modal::new(egui::Id::unique("left session")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new("The last session did not close").strong());
+            ui.add_space(4.0);
+            let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+            ui.label(format!(
+                "The editor ended without closing this project. Its session left {} with unsaved changes and {} of \
+                 history.",
+                plural(documents, "document"),
+                plural(steps, "step")
+            ));
+            ui.label(
+                RichText::new("Resuming brings them back as they were; discarding lets them go.").color(theme::weak()),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                resume = ui.button("Resume").clicked();
+                discard = ui.button("Discard").clicked();
+            });
+        });
+        if let Some(ws) = &mut self.workspace
+            && (resume || discard)
+        {
+            ws.resume_left(resume);
+            self.message = Some(if resume { "Resumed the last session" } else { "Discarded the last session" }.into());
         }
     }
 
@@ -1274,7 +1674,7 @@ impl Editor {
                 windows: titles,
                 window: None,
                 actions: vec![],
-                steps: None,
+                history: None,
                 edit: None,
                 message: None,
                 opening,
@@ -1363,7 +1763,7 @@ impl Editor {
                         windows: titles,
                         window: Some(id),
                         actions: vec![],
-                        steps: None,
+                        history: None,
                         edit: None,
                         message: None,
                         opening: opening.clone(),
@@ -1415,6 +1815,9 @@ impl Editor {
         }
         for (window, tile, action) in outcome.actions {
             let closed = action == PaneAction::Close;
+            if closed && self.asks_to_close(window, tile) {
+                continue;
+            }
             self.layouts.act(window, tile, action);
             // What comes to the front is what is selected.
             if closed
@@ -1445,10 +1848,30 @@ impl Editor {
             }
             self.edit(&request);
         }
-        if let Some((redo, count)) = outcome.steps {
-            for _ in 0..count {
-                if !self.step(redo, false) {
-                    break;
+        if let Some(ask) = outcome.history {
+            self.history_asked(ask);
+        }
+    }
+
+    /// Do what the History pane asked.
+    fn history_asked(&mut self, ask: crate::history_pane::HistoryAsk) {
+        use crate::history_pane::HistoryAsk;
+        let author = self.author();
+        let Some(ws) = &mut self.workspace else { return };
+        ws.history.set_author(author);
+        match ask {
+            HistoryAsk::View(viewing) => ws.view(viewing),
+            HistoryAsk::Restore => self.message = Some(ws.restore_viewed()),
+            HistoryAsk::Revert(at) => match ws.revert_step(at) {
+                Ok(label) => self.message = Some(label),
+                Err(why) => self.message = Some(why),
+            },
+            HistoryAsk::Checkpoint(name) => ws.checkpoint(name),
+            HistoryAsk::Steps(redo, count) => {
+                for _ in 0..count {
+                    if !self.step(redo, false, None) {
+                        break;
+                    }
                 }
             }
         }
@@ -1501,21 +1924,29 @@ impl Editor {
                 self.item(ui, Command::OpenProject, "Open project…");
                 self.item(ui, Command::Import, "Import…");
                 self.new_node_menu(ui);
+                ui.separator();
+                self.item(ui, Command::Save, "Save");
+                self.item(ui, Command::SaveAll, "Save all");
+                self.item(ui, Command::Revert, "Revert to saved");
+                ui.separator();
                 self.item(ui, Command::ReloadProject, "Reload project");
                 ui.separator();
                 self.item(ui, Command::Quit, "Quit");
             });
             ui.menu_button("Edit", |ui| {
-                let labels = self.workspace.as_ref().map(|ws| {
+                let (undo, redo) = (self.step_label(false), self.step_label(true));
+                let anywhere = self.workspace.as_ref().map(|ws| {
                     let label = |step: Option<&project::history::Step>| step.map(|s| s.label.clone());
-                    (label(ws.history.done().last()), label(ws.history.undone().last()))
+                    (label(ws.history.to_undo(None)), label(ws.history.to_redo(None)))
                 });
-                let (undo, redo) = labels.unwrap_or_default();
+                let (undo_anywhere, redo_anywhere) = anywhere.unwrap_or_default();
                 let text = |verb: &str, label: &Option<String>| {
                     label.as_ref().map_or_else(|| verb.to_string(), |l| format!("{verb} {l}"))
                 };
                 self.item(ui, Command::Undo, &text("Undo", &undo));
                 self.item(ui, Command::Redo, &text("Redo", &redo));
+                self.item(ui, Command::UndoAnywhere, &text("Undo in the project:", &undo_anywhere));
+                self.item(ui, Command::RedoAnywhere, &text("Redo in the project:", &redo_anywhere));
                 ui.separator();
                 self.item(ui, Command::Settings, &format!("{}  Settings…", icons::GEAR));
             });
@@ -1560,13 +1991,23 @@ impl Editor {
             let what = |command: Command, label: &str| {
                 format!("{} {label} ({})", command.title(), command.keys(&self.settings))
             };
-            let Some(ws) = &mut self.workspace else {
+            if self.workspace.is_none() {
                 let text = if self.opening.is_some() { "Opening..." } else { "No project" };
                 ui.label(RichText::new(text).color(theme::weak()));
                 return;
-            };
-            let done = ws.history.done().last().map(|last| what(Command::Undo, &last.label));
-            let undone = ws.history.undone().last().map(|last| what(Command::Redo, &last.label));
+            }
+            let done = self.step_label(false).map(|label| what(Command::Undo, &label));
+            let undone = self.step_label(true).map(|label| what(Command::Redo, &label));
+            let Some(ws) = &self.workspace else { return };
+            for (command, icon) in [(Command::Back, icons::ARROW_LEFT), (Command::Forward, icons::ARROW_RIGHT)] {
+                let at = self.visit_at(command == Command::Forward);
+                let to = at.map(|at| self.visits.0[at].path.rsplit('/').next().unwrap_or_default().to_string());
+                let tip = to.map_or_else(|| hint(command), |to| what(command, &to));
+                if ui.add_enabled(at.is_some(), egui::Button::new(icon)).on_hover_text(tip).clicked() {
+                    step = Some(command);
+                }
+            }
+            ui.add_space(4.0);
             for (command, icon, step_of) in
                 [(Command::Undo, icons::ARROW_ARC_LEFT, done), (Command::Redo, icons::ARROW_ARC_RIGHT, undone)]
             {
@@ -1619,7 +2060,8 @@ impl Editor {
         open
     }
 
-    /// The status bar; whether its problem count was clicked, whether its unapplied count was, and a pane asked for.
+    /// The status bar; whether its problem count was clicked, what was asked of the unsaved documents, and a pane
+    /// asked for.
     /// Whether agents may use the editor, in the status bar, and whether they can connect.
     fn agents_status(&self, ui: &mut egui::Ui, ws: &Workspace) {
         if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
@@ -1649,12 +2091,13 @@ impl Editor {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) -> (bool, bool, Option<PaneKind>) {
-        let (mut show_problems, mut apply_all, mut open) = (false, false, None);
+    fn status_bar(&self, ui: &mut egui::Ui) -> (bool, Option<Unsaved>, Option<PaneKind>) {
+        let (mut show_problems, mut unsaved, mut open) = (false, None, None);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let zoom = ui.ctx().zoom_factor();
             let mode = if self.settings.appearance.zoom.is_some() { "set in Settings" } else { "the monitor's" };
-            ui.label(RichText::new(format!("{:.0}%", zoom * 100.0)).small().color(theme::weak())).on_hover_text(format!("Zoom: {mode}"));
+            ui.label(RichText::new(format!("{:.0}%", zoom * 100.0)).small().color(theme::weak()))
+                .on_hover_text(format!("Zoom: {mode}"));
             if let Some(ws) = &self.workspace {
                 ui.separator();
                 if !ws.index.dangling.is_empty() {
@@ -1674,15 +2117,10 @@ impl Editor {
                     ui.label(RichText::new("not watching").small().color(ui.visuals().warn_fg_color)).on_hover_text(e);
                     ui.separator();
                 }
-                // Assets whose outputs are made from their settings as last applied.
-                let unapplied = ws.unapplied_count();
-                if unapplied > 0 {
-                    let text = format!("{unapplied} unapplied");
-                    let label = egui::Label::new(RichText::new(text).small().color(ui.visuals().warn_fg_color))
-                        .sense(egui::Sense::click());
-                    let hint = "Assets with settings changed and not applied: their outputs are made from their settings \
-                                as last applied. Click to apply them all";
-                    apply_all = ui.add(label).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hint).clicked();
+                // The documents with unsaved changes, each to show, save or revert.
+                let documents = ws.unsaved_documents();
+                if !documents.is_empty() {
+                    unsaved = unsaved_menu(ui, ws, &documents);
                     ui.separator();
                 }
                 if fetch_status(ui, ws) {
@@ -1698,8 +2136,9 @@ impl Editor {
                 } else if ws.pending() > 0 {
                     let n = ws.pending();
                     let text = format!("{n} change{} on disk", if n == 1 { "" } else { "s" });
-                    ui.label(RichText::new(text).small().color(theme::weak()))
-                        .on_hover_text("Made by other programs: taken in when the editor regains focus, or now with F5");
+                    ui.label(RichText::new(text).small().color(theme::weak())).on_hover_text(
+                        "Made by other programs: taken in when the editor regains focus, or now with F5",
+                    );
                     ui.separator();
                 }
                 if let Some(why) = ws.unprotected() {
@@ -1728,7 +2167,7 @@ impl Editor {
                 }
             });
         });
-        (show_problems, apply_all, open)
+        (show_problems, unsaved, open)
     }
 
     /// A project another process holds: it cannot be opened until that process lets go of it.
@@ -2141,9 +2580,15 @@ impl Editor {
         !self.busy_with().is_empty()
     }
 
-    /// Undo the last step.
+    /// The asset the document in use shows.
+    pub fn document_in_use(&self) -> Option<String> {
+        let pane = self.layouts.active_document()?;
+        self.layouts.subject(pane).map(str::to_string)
+    }
+
+    /// Undo, as the command does: the last edit of the document in use, or the project's last change.
     pub fn undo(&mut self) -> bool {
-        self.step(false, false)
+        self.step_scope(false).is_some_and(|scope| self.step(false, false, scope.uid()))
     }
 
     /// Whether a project is asking something.
@@ -2183,6 +2628,7 @@ impl eframe::App for Editor {
             ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(side, side)));
         }
         self.zoom(&ctx);
+        self.ask_before_closing(&ctx);
         self.capture(&ctx);
         self.opened();
         self.follow_disk(&ctx);
@@ -2208,7 +2654,7 @@ impl eframe::App for Editor {
         egui::Panel::top("menu").frame(bar).show(ui, |ui| {
             self.menu_bar(ui);
         });
-        let (show_problems, apply_all, open) =
+        let (show_problems, unsaved, open) =
             egui::Panel::bottom("status").frame(bar).show(ui, |ui| self.status_bar(ui)).inner;
         if show_problems {
             self.show_pane(Pane::first(PaneKind::Problems));
@@ -2219,8 +2665,8 @@ impl eframe::App for Editor {
             Some(kind) => self.show_pane(Pane::first(kind)),
             None => {}
         }
-        if apply_all && let Some(ws) = self.workspace.as_mut() {
-            ws.apply_all_settings();
+        if let Some(unsaved) = unsaved {
+            self.unsaved_asked(unsaved);
         }
         let titles: Vec<(u64, String)> = self.layouts.windows.iter().map(|w| (w.id, w.title())).collect();
         let reveal = self.layouts.reveal.take();
@@ -2239,25 +2685,13 @@ impl eframe::App for Editor {
         let windows = self.show_windows(&ctx, &titles, reveal);
         outcome.merge(windows);
         self.apply(outcome);
+        self.note_visit();
         crate::dnd::ghost(&ctx);
         let layouts = &self.layouts;
         if let Some(ws) = self.workspace.as_mut() {
             ws.settle_players(|pane| layouts.find(pane).is_some());
         }
-        self.open_dialog(&ctx);
-        self.new_dialog(&ctx);
-        self.naming_dialog(&ctx);
-        self.palette_ui(&ctx);
-        self.dropped_files(&ctx);
-        self.import_dialog(&ctx);
-        self.onboarding_ui(&ctx);
-        self.fill_ui(&ctx);
-        self.fetch(&ctx);
-        self.keep_presence(&ctx);
-        self.in_use_dialog(&ctx);
-        self.force_dialog(&ctx);
-        self.rename_dialog(&ctx);
-        self.choose_dialog(&ctx);
+        self.dialogs(&ctx);
         if self.settings != self.saved {
             if self.settings.appearance != self.saved.appearance {
                 theme::apply(&ctx, &self.settings.appearance);
@@ -2271,6 +2705,14 @@ impl eframe::App for Editor {
             if reload && let Some(ws) = &mut self.workspace {
                 ws.reload("an extension's setting changed");
             }
+        }
+    }
+
+    /// Closing: the project's session closed cleanly, what it kept wiped - unless documents are still unsaved, which the
+    /// next opening offers back.
+    fn on_exit(&mut self) {
+        if let Some(ws) = self.workspace.take() {
+            drop(ws.leave());
         }
     }
 
@@ -2309,6 +2751,87 @@ impl eframe::App for Editor {
     }
 }
 
+/// What undo and redo take back: a document's last edit, or the project's last change.
+enum StepScope {
+    Document(String),
+    Project,
+}
+
+impl StepScope {
+    /// The document's uid; none: the project's.
+    fn uid(self) -> Option<String> {
+        match self {
+            StepScope::Document(uid) => Some(uid),
+            StepScope::Project => None,
+        }
+    }
+}
+
+/// How many documents back and forward remember.
+const VISITS: usize = 100;
+
+/// A document brought into focus: its path, its uid (which finds it where it moved), and how it was shown.
+#[derive(Clone, Debug)]
+struct Visit {
+    path: String,
+    uid: Option<String>,
+    editor: Option<EditorKind>,
+}
+
+impl Visit {
+    /// Where it is now: by its uid, else its path; none where it is gone.
+    fn place(&self, ws: &Workspace) -> Option<String> {
+        if let Some(path) = self.uid.as_ref().and_then(|uid| ws.index.by_uid.get(uid)) {
+            return Some(path.clone());
+        }
+        ws.exists(&self.path).then(|| self.path.clone())
+    }
+}
+
+/// What is asked of the documents with unsaved changes, in the status bar.
+enum Unsaved {
+    SaveAll,
+    Save(String),
+    Revert(String),
+    /// Its path: shown.
+    Show(String),
+}
+
+/// The unsaved documents' count in the status bar, opening their list: each shown, saved or reverted, or all saved.
+fn unsaved_menu(ui: &mut egui::Ui, ws: &Workspace, documents: &[(String, String)]) -> Option<Unsaved> {
+    let mut asked = None;
+    let n = documents.len();
+    let text = RichText::new(format!("{n} unsaved")).small().color(ui.visuals().warn_fg_color);
+    ui.menu_button(text, |ui| {
+        for (uid, path) in documents {
+            let stale = ws.history.document(uid).is_some_and(|d| d.stale.is_some());
+            ui.horizontal(|ui| {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let label = if stale { format!("{name}  (changed on disk)") } else { name.to_string() };
+                if ui.link(label).on_hover_text(path).clicked() {
+                    asked = Some(Unsaved::Show(path.clone()));
+                }
+                if ui.small_button("Save").clicked() {
+                    asked = Some(Unsaved::Save(uid.clone()));
+                }
+                if ui.small_button("Revert").clicked() {
+                    asked = Some(Unsaved::Revert(uid.clone()));
+                }
+            });
+        }
+        ui.separator();
+        if ui.button("Save all").clicked() {
+            asked = Some(Unsaved::SaveAll);
+        }
+        if asked.is_some() {
+            ui.close();
+        }
+    })
+    .response
+    .on_hover_text("Documents with changes not saved: what is shown and made follows them; saving writes them");
+    asked
+}
+
 /// Code being overridden: its uid, path and own layer, the files layers that can take it, a new one's name.
 struct Choosing {
     uid: String,
@@ -2327,7 +2850,7 @@ struct Outcome {
     message: Option<String>,
     docked: Vec<u64>,
     actions: Vec<(Option<u64>, TileId, PaneAction)>,
-    steps: Option<(bool, usize)>,
+    history: Option<crate::history_pane::HistoryAsk>,
     edit: Option<EditRequest>,
 }
 
@@ -2337,7 +2860,7 @@ impl Outcome {
         self.pick = self.pick.take().or(behavior.pick);
         self.focus = self.focus.take().or(behavior.focus);
         self.message = self.message.take().or(behavior.message);
-        self.steps = self.steps.take().or(behavior.steps);
+        self.history = self.history.take().or(behavior.history);
         self.edit = self.edit.take().or(behavior.edit);
         self.actions.extend(behavior.actions.into_iter().map(|(tile, action)| (window, tile, action)));
     }
@@ -2349,7 +2872,7 @@ impl Outcome {
         self.message = self.message.take().or(other.message);
         self.docked.extend(other.docked);
         self.actions.extend(other.actions);
-        self.steps = self.steps.take().or(other.steps);
+        self.history = self.history.take().or(other.history);
         self.edit = self.edit.take().or(other.edit);
     }
 }

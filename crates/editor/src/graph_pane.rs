@@ -4,8 +4,8 @@
 //! wire, refused where the types do not fit, ports lit while one is being drawn; dragging a wire off an input moves or
 //! removes it. Right-clicking the canvas adds an operation, a box is dragged to place it and Delete removes the one
 //! selected. A box selected is what is selected inside the asset, its settings in the inspector with everything else
-//! selected there. Every edit is written as any is: undoable, unapplied until applied, and what is wrong with the stack as
-//! written is told from its shape, under the canvas.
+//! selected there. Every edit is made as any is: undoable, unsaved until saved, and what is wrong with the stack as it
+//! stands is told from its shape, under the canvas.
 //!
 //! The canvas is a scene: the wheel zooms, dragging where nothing is pans and a double-click fits, as in the preview. A
 //! box not yet placed sits by how far it is from its sources, as Arrange puts them all.
@@ -626,7 +626,7 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
         .filter(|(of, _)| *of == at)
         .and_then(|(_, op)| op.map(str::to_string));
     let before = state.selected.clone();
-    let (plan, wrong) = ws.extensions.plan_written(&asset);
+    let (plan, wrong) = ws.extensions.plan(&asset);
     let mut nodes = nodes_of(ws, &layer, &plan, at);
     if let Some((moving, place)) = &state.moving
         && let Some(node) = nodes.iter_mut().find(|n| n.id == *moving)

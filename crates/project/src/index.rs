@@ -74,18 +74,23 @@ pub struct Asset {
     settings_text: OnceLock<String>,
     /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
     pub imported: Option<Arc<Imported>>,
-    /// Its declaration as last applied, where it has unapplied changes (`applied`): what the work graph makes its
-    /// outputs from.
-    pub applied: Option<Arc<AppliedDeclaration>>,
+    /// It as its files are on disk, where it is shown with unsaved changes (`Working`): what saving it overwrites.
+    pub disk: Option<Arc<Asset>>,
 }
 
-/// A declaration as last applied: its text, and its fields.
-#[derive(Clone, Debug)]
-pub struct AppliedDeclaration {
-    pub text: String,
-    pub fields: toml::Table,
-    /// The asset as it is written, for what follows it rather than what is applied.
-    pub written: Arc<Asset>,
+/// An asset's unsaved files, as the editor's working copy of it has them (`Index::set_working`): each by its name,
+/// its content kept at a path by its hash, or absent. The index shows the asset with them in place of the files on
+/// disk, so that what reads the index - outputs, views, previews - follows the edit before it is saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Working {
+    pub files: BTreeMap<String, Option<WorkingFile>>,
+}
+
+/// A file of a working copy: where its content is kept, and its hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkingFile {
+    pub path: PathBuf,
+    pub sha1: String,
 }
 
 /// An asset's settings with what its import derived from its source in their places.
@@ -103,13 +108,19 @@ pub struct Imported {
 }
 
 impl Asset {
-    /// It as it is written, where what is applied is older.
+    /// It as its files are on disk: itself, where nothing of it is unsaved.
     #[must_use]
-    pub fn written(&self) -> &Asset {
-        self.applied.as_ref().map_or(self, |applied| &applied.written)
+    pub fn on_disk(&self) -> &Asset {
+        self.disk.as_deref().unwrap_or(self)
     }
 
-    /// Its `node.toml` as written.
+    /// Whether it is shown with unsaved changes.
+    #[must_use]
+    pub fn unsaved(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// Its `node.toml`, as its working copy has it where it has one.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
@@ -918,6 +929,8 @@ pub struct Index {
     /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
     /// of a layer's content touches.
     winning: Arc<HashMap<(usize, String), String>>,
+    /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
+    working: Arc<HashMap<String, Working>>,
 }
 
 impl Index {
@@ -952,7 +965,9 @@ impl Index {
     /// # Errors
     /// A layer or the store cannot be read.
     pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
-        Index::over(self.store.clone(), project, report)
+        let mut index = Index::over(self.store.clone(), project, report)?;
+        index.set_working(self.working.as_ref().clone());
+        Ok(index)
     }
 
     fn over(store: Arc<Store>, project: &Project, report: &Report<'_>) -> Result<Index> {
@@ -980,6 +995,7 @@ impl Index {
             dependencies: vec![],
             hashes: Arc::default(),
             winning: Arc::default(),
+            working: Arc::default(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         report("Reading the files that changed", 0, files.len());
@@ -1587,6 +1603,94 @@ impl Index {
         true
     }
 
+    /// Show assets with their working copies' files in place of those on disk - these, by uid; the others as on
+    /// disk. The assets whose working copy changed are assembled and linked again; returns their paths.
+    pub fn set_working(&mut self, working: HashMap<String, Working>) -> BTreeSet<String> {
+        let mut uids: BTreeSet<&String> = working.keys().collect();
+        uids.extend(self.working.keys());
+        let changed: Vec<String> = uids
+            .into_iter()
+            .filter(|uid| working.get(*uid) != self.working.get(*uid))
+            .filter_map(|uid| self.by_uid.get(uid).cloned())
+            .collect();
+        // A working copy's files are kept by their hash: read once, as any file the index records.
+        let unread: Vec<Pending> = working
+            .values()
+            .flat_map(|w| w.files.iter())
+            .filter_map(|(name, file)| Some((name, file.as_ref()?)))
+            .filter(|(_, file)| !self.records.contains_key(&file.path))
+            .filter_map(|(name, file)| {
+                let meta = std::fs::metadata(&file.path).ok()?;
+                let modified = meta.modified().map_or((0, 0), stamp);
+                let declaration = name == NODE_FILE || name == SETTINGS_FILE;
+                Some(Pending { path: file.path.clone(), size: meta.len(), modified, declaration })
+            })
+            .collect();
+        for (file, record) in unread.iter().zip(read_all(&unread)) {
+            if let Some(record) = record {
+                self.records.insert(file.path.clone(), Arc::new(record));
+            }
+        }
+        self.working = Arc::new(working);
+        if changed.is_empty() {
+            return BTreeSet::new();
+        }
+        let before: HashMap<String, Vec<Reference>> =
+            changed.iter().map(|a| (a.clone(), self.references_from(a))).collect();
+        let paths: Vec<String> = changed.iter().map(|a| format!("{a}{BUNDLE_SUFFIX}")).collect();
+        self.assemble_assets(&paths);
+        let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.output.clone());
+        let references_changed = changed.iter().any(|a| {
+            let now: Vec<_> = self.references_from(a).iter().map(referring).collect();
+            before.get(a).is_none_or(|b| b.iter().map(referring).collect::<Vec<_>>() != now)
+        });
+        self.relink(&changed, &before);
+        if references_changed {
+            self.dependencies = self.dependencies();
+        }
+        changed.into_iter().collect()
+    }
+
+    /// An asset as assembled from disk, with its working copy's files in their places, where it has one.
+    fn with_working(&self, asset: Asset) -> Asset {
+        let Some(working) = asset.uid.as_ref().and_then(|uid| self.working.get(uid)) else { return asset };
+        let mut shown = asset.clone();
+        for (name, file) in &working.files {
+            let at = shown.files.iter().position(|f| f.name == *name);
+            let layer = at.map(|i| shown.files[i].layer.clone()).or_else(|| shown.layers.last().cloned());
+            if let Some(i) = at {
+                shown.files.remove(i);
+            }
+            let Some(file) = file else { continue };
+            let Some(record) = self.records.get(&file.path) else { continue };
+            if name == NODE_FILE
+                && let Some(d) = &record.declaration
+            {
+                shown.shape = Arc::from(d.shape.as_str());
+                shown.variants.clone_from(&d.variants);
+                shown.error.clone_from(&d.error);
+                shown.text = d.text.clone();
+            }
+            if name == SETTINGS_FILE
+                && let Some(d) = &record.declaration
+            {
+                shown.generated = Some(d.text.clone());
+            }
+            shown.files.push(BundleFile {
+                name: name.clone(),
+                path: file.path.clone(),
+                size: record.size,
+                modified: record.modified,
+                layer: layer.unwrap_or_default(),
+                sha1: record.sha1.clone(),
+                made_by: None,
+            });
+        }
+        shown.files.sort_by(|a, b| a.name.cmp(&b.name));
+        shown.disk = Some(Arc::new(asset));
+        shown
+    }
+
     /// Keep the content hash of each entry a writable layer holds, for the next pass to tell moves.
     fn remember_hashes(&mut self) {
         self.hashes = Arc::new(
@@ -1783,7 +1887,7 @@ impl Index {
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
                 imported: None,
-                applied: None,
+                disk: None,
             };
             for (name, file, held) in self.bundle_files(node.content.0, &node.content.1).into_iter().flatten() {
                 let Some(record) = self.records.get(&file) else { continue };
@@ -1812,6 +1916,7 @@ impl Index {
             }
             let (uid, top, overridden) = (node.uid.clone(), layer.name.clone(), !node.overrides.is_empty());
             let at = asset.path.clone();
+            let asset = self.with_working(asset);
             self.assets.insert(asset.path.clone(), Arc::new(asset));
             self.versions.retain(|version, _| version.trim_start_matches(BELOW) != uid);
             if overridden {
@@ -1837,7 +1942,7 @@ impl Index {
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
                 imported: None,
-                applied: None,
+                disk: None,
             };
             for (file_name, file) in &below.files {
                 let Some(record) = self.records.get(file) else { continue };

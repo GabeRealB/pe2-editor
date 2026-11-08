@@ -1116,14 +1116,6 @@ impl Extensions {
     /// An asset's plan: its stack, then its type's outputs; and what is wrong with it.
     #[must_use]
     pub fn plan(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
-        // Its stack as last applied.
-        let fields = graph::exec::Node::fields(asset);
-        graph::Plan::of(fields, &self.operations(), &self.tail(asset))
-    }
-
-    /// An asset's plan as its declaration is written, applied or not: what its stack would do, for whoever edits it.
-    #[must_use]
-    pub fn plan_written(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
         graph::Plan::of(asset.fields(), &self.operations(), &self.tail(asset))
     }
 
@@ -1194,7 +1186,7 @@ impl Extensions {
         address: &str,
     ) -> Result<Arc<graph::stream::Stream>> {
         let (plan, _) = self.plan(asset);
-        let world = Graph { index, extensions: self, written: false };
+        let world = Graph { index, extensions: self };
         let reach = graph::exec::Reach { engine, world: &world };
         let (output, parameter) =
             plan.output(address).with_context(|| format!("{} has no output `{address}`", asset.path))?;
@@ -1231,7 +1223,7 @@ impl Extensions {
         read: bool,
     ) -> Result<graph::exec::Given> {
         let (plan, _) = self.plan(asset);
-        let world = Graph { index, extensions: self, written: false };
+        let world = Graph { index, extensions: self };
         let reach = graph::exec::Reach { engine, world: &world };
         engine.output_in(Some(reach), &plan, asset, address, None, read)
     }
@@ -1246,7 +1238,7 @@ impl Extensions {
         plan: &graph::Plan,
         output: usize,
     ) -> bool {
-        let world = Graph { index, extensions: self, written: false };
+        let world = Graph { index, extensions: self };
         engine.kept_in(Some(graph::exec::Reach { engine, world: &world }), plan, asset, output, None).is_none()
     }
 
@@ -1255,7 +1247,7 @@ impl Extensions {
     /// # Errors
     /// No extension provides it, or it failed.
     pub fn run_hook(&self, engine: &graph::exec::Engine, index: &index::Index, op: &str, event: &str) -> Result<()> {
-        let world = Graph { index, extensions: self, written: false };
+        let world = Graph { index, extensions: self };
         let reach = graph::exec::Reach { engine, world: &world };
         let mut settings = Table::new();
         settings.insert("event".into(), event.into());
@@ -1366,15 +1358,14 @@ impl Extensions {
         found
     }
 
-    /// An output of an asset that is one file, whole, made from the settings of what it reads as they are written, not
-    /// as last applied: what a viewer shows of what is being edited follows the edit.
+    /// An output of an asset that is one file, whole: what a viewer shows of what is being edited, which follows the
+    /// edit as the index does.
     ///
     /// # Errors
     /// It has no such output, it is no file, or it could not be made.
     pub fn bytes(&self, index: &index::Index, asset: &index::Asset, address: &str) -> Result<Vec<u8>> {
-        let asset = asset.written();
         let (plan, _) = self.plan(asset);
-        let world = Graph { index, extensions: self, written: true };
+        let world = Graph { index, extensions: self };
         let engine = self.engine();
         let reach = graph::exec::Reach { engine: &engine, world: &world };
         let given = engine.output_in(Some(reach), &plan, asset, address, None, true)?;
@@ -1534,7 +1525,7 @@ impl Extensions {
         self.editors(asset).into_iter().chain(viewers).collect()
     }
 
-    /// An output of an asset that is a picture, as last applied.
+    /// An output of an asset that is a picture.
     ///
     /// # Errors
     /// It has no such output, or it is no picture, or it could not be made.
@@ -2005,12 +1996,6 @@ impl Extensions {
         out
     }
 
-    /// Whether what is set on an asset is applied as soon as it is taken in: its type says so.
-    #[must_use]
-    pub fn applied_at_once(&self, asset: &index::Asset) -> bool {
-        self.node_types_of(asset).into_iter().any(|node_type| node_type.applied_at_once)
-    }
-
     /// The views of an asset: its type's.
     #[must_use]
     pub fn views(&self, asset: &index::Asset) -> Vec<&ViewDef> {
@@ -2114,8 +2099,6 @@ impl Project for Lens<'_> {
 pub struct Graph<'a> {
     pub index: &'a index::Index,
     pub extensions: &'a Extensions,
-    /// The nodes as they are written, not as last applied.
-    pub written: bool,
 }
 
 impl graph::exec::World for Graph<'_> {
@@ -2135,7 +2118,6 @@ impl graph::exec::World for Graph<'_> {
             let (uid, path) = index::reference(reference)?;
             self.index.resolve(&uid, path.as_deref().unwrap_or_default())?
         };
-        let asset = if self.written { asset.written() } else { asset };
         let (plan, _) = self.extensions.plan(asset);
         Some((asset as &dyn graph::exec::Node, plan))
     }

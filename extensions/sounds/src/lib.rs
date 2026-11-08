@@ -412,7 +412,6 @@ fn register(r: &mut Registry) -> Result<()> {
         .alias("sound_script")
         .label("Sound script")
         .data()
-        .applied_at_once()
         .stack(SCRIPT)
         .icon(Icon::Music, Tint::Sound)
         .field(Field::new("instruments").custom())

@@ -732,6 +732,7 @@ mod tests {
         let project = project::Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let index = project::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
         assert_eq!(about.id, "pe2.events");
         let project = project::Project::load(&root).unwrap();
@@ -752,14 +753,14 @@ mod tests {
         std::fs::write(source.join("linux-x86_64/tool"), "#!/bin/sh\necho new\n").unwrap();
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
         assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\necho new\n");
-        history.undo(false).unwrap();
+        history.undo(&index, None, false).unwrap();
         assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\n");
         // Removed: the folder and what was required of it.
         remove_extension(&project, "pe2.events", &mut history, "remove".into()).unwrap();
         let project = project::Project::load(&root).unwrap();
         assert!(project.held_extensions().is_empty() && project.requires.is_empty());
-        history.undo(false).unwrap();
-        history.undo(false).unwrap();
+        history.undo(&index, None, false).unwrap();
+        history.undo(&index, None, false).unwrap();
         assert!(!held.exists(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
         add_extension(&project, &source, Some("game"), &mut history, "add".into()).unwrap();

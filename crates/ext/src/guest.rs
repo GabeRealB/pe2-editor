@@ -1067,7 +1067,6 @@ fn describe_type(handle: u32, ty: &TypeDef, numbered: &mut Registered) -> g::Val
         sniff: ty.sniff.is_some(),
         extends: ty.extends,
         data: ty.data,
-        applied_at_once: ty.applied_at_once,
         values: ty.values.clone(),
         alias: ty.alias.clone(),
         icon: ty.icon.map(|(i, t)| (icon(i), tint(t))),

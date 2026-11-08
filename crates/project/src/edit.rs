@@ -71,7 +71,7 @@ fn copy_in(
     Ok(())
 }
 
-fn save(tx: &mut crate::history::Transaction<'_>, layer: &Layer, changeset: &Changeset) -> Result<()> {
+fn write_changeset(tx: &mut crate::history::Transaction<'_>, layer: &Layer, changeset: &Changeset) -> Result<()> {
     tx.write(&layer.changeset, changeset.render().as_bytes())
 }
 
@@ -111,7 +111,7 @@ fn own(
     let files: Vec<(String, PathBuf)> = below.files.iter().filter(|(file, _)| keep(file)).cloned().collect();
     copy_in(tx, layer, &at, &files)?;
     changeset.ops.insert(uid.to_string(), Op::Override { base, to });
-    save(tx, layer, changeset)?;
+    write_changeset(tx, layer, changeset)?;
     Ok(at)
 }
 
@@ -138,17 +138,58 @@ pub fn write_file(
     if let Some(key) = merge {
         tx = tx.merging(key);
     }
-    let path = match (changeset.entries.get(uid).cloned(), changeset.ops.get(uid).cloned()) {
+    let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    let disk = if file.is_empty() { layer.disk(&path) } else { layer.disk(&path).join(file) };
+    tx.write(&disk, bytes)?;
+    tx.commit()
+}
+
+/// Where a layer's own version of an entry is: the layer's entry, its override's copy, or a copy made now.
+fn own_path(
+    tx: &mut crate::history::Transaction<'_>,
+    index: &Index,
+    layer: &Layer,
+    layer_name: &str,
+    changeset: &mut Changeset,
+    uid: &str,
+) -> Result<String> {
+    Ok(match (changeset.entries.get(uid).cloned(), changeset.ops.get(uid).cloned()) {
         (Some(path), _) => path,
         (None, Some(op @ Op::Override { .. })) => {
             let below = index.below(layer_name, uid).with_context(|| format!("{uid} is gone below {layer_name}"))?;
             target(Some(&op), &below.path)
         }
         (None, Some(Op::Delete)) => bail!("{layer_name} deletes {uid}"),
-        (None, _) => own_copy(&mut tx, index, layer, layer_name, &mut changeset, uid)?,
-    };
-    let disk = if file.is_empty() { layer.disk(&path) } else { layer.disk(&path).join(file) };
-    tx.write(&disk, bytes)?;
+        (None, _) => own_copy(tx, index, layer, layer_name, changeset, uid)?,
+    })
+}
+
+/// Save a document: write its files (each with its content, none to remove it) into the layer's own version of its
+/// entry - made first, in the same step, where the entry comes from below. A step undo passes over: what it undoes are
+/// the edits, which leave the document unsaved again.
+///
+/// # Errors
+/// The entry is deleted in the layer or not found, or files cannot be written.
+pub fn save(
+    project: &Project,
+    index: &Index,
+    layer_name: &str,
+    uid: &str,
+    files: &[(String, Option<Vec<u8>>)],
+    label: String,
+    history: &mut History,
+) -> Result<Vec<PathBuf>> {
+    let (layer, mut changeset) = layer(project, index, layer_name)?;
+    let mut tx = history.begin(label).kind(crate::history::Kind::Save);
+    let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    for (file, bytes) in files {
+        let disk = layer.disk(&path).join(file);
+        match bytes {
+            Some(bytes) => tx.write(&disk, bytes)?,
+            None if disk.exists() => tx.remove(&disk)?,
+            None => {}
+        }
+    }
     tx.commit()
 }
 
@@ -186,7 +227,7 @@ pub fn create(
         tx.write(&layer.disk(&bundle).join(name), bytes)?;
     }
     changeset.entries.insert(uid.to_string(), bundle);
-    save(&mut tx, layer, &changeset)?;
+    write_changeset(&mut tx, layer, &changeset)?;
     tx.commit()
 }
 
@@ -253,7 +294,7 @@ pub fn delete(
         }
         let inside = format!("{path}/");
         changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
-        save(&mut tx, layer, &changeset)?;
+        write_changeset(&mut tx, layer, &changeset)?;
         return tx.commit();
     }
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
@@ -276,7 +317,7 @@ pub fn delete(
         }
     }
     changeset.ops.insert(uid.to_string(), Op::Delete);
-    save(&mut tx, layer, &changeset)?;
+    write_changeset(&mut tx, layer, &changeset)?;
     tx.commit()
 }
 
@@ -303,7 +344,7 @@ pub fn forget(
     let mut tx = history.begin(format!("Forget {}", name(&path)));
     let inside = format!("{path}/");
     changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
-    save(&mut tx, layer, &changeset)?;
+    write_changeset(&mut tx, layer, &changeset)?;
     tx.commit()
 }
 
@@ -344,7 +385,7 @@ pub fn rename(
                 *path = format!("{to}/{rest}");
             }
         }
-        save(&mut tx, layer, &changeset)?;
+        write_changeset(&mut tx, layer, &changeset)?;
         return tx.commit();
     }
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
@@ -367,7 +408,7 @@ pub fn rename(
         // Moved back where it is below: no move left.
         None => changeset.ops.remove(uid),
     };
-    save(&mut tx, layer, &changeset)?;
+    write_changeset(&mut tx, layer, &changeset)?;
     tx.commit()
 }
 
@@ -394,7 +435,7 @@ pub fn resolve(
             let base = below.hash.with_context(|| format!("{}: no content below", below.path))?;
             let mut tx = history.begin(format!("Keep my version of {shown}"));
             changeset.ops.insert(uid.to_string(), Op::Override { base, to: to.clone() });
-            save(&mut tx, layer, &changeset)?;
+            write_changeset(&mut tx, layer, &changeset)?;
             tx.commit()
         }
         (Resolution::TakeBase | Resolution::Drop, Op::Override { to, .. }) => {
@@ -412,13 +453,13 @@ pub fn resolve(
                     changeset.ops.remove(uid);
                 }
             }
-            save(&mut tx, layer, &changeset)?;
+            write_changeset(&mut tx, layer, &changeset)?;
             tx.commit()
         }
         (Resolution::Drop, Op::Move { .. } | Op::Delete) => {
             let mut tx = history.begin(format!("Drop the operation on {shown}"));
             changeset.ops.remove(uid);
-            save(&mut tx, layer, &changeset)?;
+            write_changeset(&mut tx, layer, &changeset)?;
             tx.commit()
         }
         _ => bail!("{resolution:?} does not apply to {layer_name}'s {op:?}"),
@@ -511,7 +552,7 @@ mod tests {
         assert!(!root.join(".layers/top/g/a.node").exists());
         // Everything undone: the top as it began.
         for _ in 0..4 {
-            let step = o.history.undo(false).unwrap();
+            let step = o.history.undo(&o.index, None, false).unwrap();
             let paths = step.paths();
             o.refresh(&paths);
         }
@@ -560,7 +601,7 @@ mod tests {
         .unwrap();
         o.refresh(&paths);
         assert_eq!(o.history.done().len(), 1);
-        let paths = o.history.undo(false).unwrap().paths();
+        let paths = o.history.undo(&o.index, None, false).unwrap().paths();
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert!(!root.join(".layers/top/g").exists());

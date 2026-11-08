@@ -17,6 +17,11 @@ macro_rules! icons {
 icons! {
     FOLDER = "\u{E24A}",
     ARROW_ARC_LEFT = "\u{E014}",
+    ARROW_LEFT = "\u{E058}",
+    FLAG = "\u{E244}",
+    FLOPPY_DISK = "\u{E248}",
+    SWAP = "\u{E83C}",
+    ARROW_RIGHT = "\u{E06C}",
     ARROW_ARC_RIGHT = "\u{E016}",
     FOLDER_OPEN = "\u{E256}",
     FOLDERS = "\u{E260}",

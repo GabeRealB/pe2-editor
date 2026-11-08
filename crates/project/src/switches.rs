@@ -222,6 +222,7 @@ mod tests {
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
+        let index = crate::index::Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
         let depth = toml::Value::Integer(8);
         set_setting(&project, "pe2.images", "depth", Some(&depth), &mut history, "depth".into()).unwrap();
         set_disabled(&project, &["pe2.game".to_string()], &mut history, "off".into()).unwrap();
@@ -238,7 +239,7 @@ mod tests {
         set_setting(&read, "pe2.images", "depth", None, &mut history, "default".into()).unwrap();
         assert!(Project::load(&root).unwrap().extension_settings.is_empty());
         for _ in 0..3 {
-            history.undo(false).unwrap();
+            history.undo(&index, None, false).unwrap();
         }
         assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text);
         drop(lock);

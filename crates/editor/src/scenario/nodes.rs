@@ -1,7 +1,5 @@
 //! Making nodes, and how a stack reads.
 
-use eframe::egui;
-
 use super::{Fixture, Scenario};
 use crate::icons;
 
@@ -54,22 +52,6 @@ fn the_stack_tab_gives_wires_rather_than_settings() {
     editor.expect("node from skeleton");
     editor.expect("1 setting");
     editor.expect_not("joints =");
-}
-
-#[test]
-fn apply_lists_what_the_node_makes_and_leaves_nothing_waiting() {
-    let mut editor = Scenario::open(Fixture::rig());
-    editor.show("rig/skeleton");
-    editor.click("pelvis");
-    editor.number("Translation", 1);
-    editor.typing("-900");
-    editor.press(egui::Key::Enter);
-    editor.expect("UNAPPLIED CHANGES");
-    editor.expect("Applying makes again: native");
-    editor.expect_not("tokens");
-    editor.expect_not("thumbnail");
-    editor.click_label("Apply");
-    editor.expect_not("UNAPPLIED CHANGES");
 }
 
 #[test]
