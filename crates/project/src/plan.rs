@@ -928,6 +928,8 @@ pub fn run(
 ) -> Result<Ran> {
     let fills = generated.fills.as_deref().with_context(|| format!("{} is no generated layer", generated.name))?;
     let nodes = &project.layer(fills)?.path;
+    // What the nodes are, read as any layer's: a records layer's through its records.
+    crate::records::Set::open(project)?;
     let layer = generated.path.as_path();
     let mut plan = Plan::read(&generated.plan())?;
     let unmet = plan.unmet(extensions);

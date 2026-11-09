@@ -139,7 +139,13 @@ pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, hist
         tables.push(table);
     }
     let mut tx = history.begin(format!("Add the layer {name}"));
-    tx.make_dir(&project.root.join(LAYERS).join(name))?;
+    let folder = project.root.join(LAYERS).join(name);
+    tx.make_dir(&folder)?;
+    // An assets layer is records (`records`); code is a tree, worked on with its own tools.
+    if kind == LayerKind::Assets {
+        let marker = folder.join(crate::records::DIR).join(crate::records::MARKER);
+        tx.write(&marker, format!("format = {}\n", crate::records::FORMAT).as_bytes())?;
+    }
     tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)
 }

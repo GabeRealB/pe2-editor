@@ -23,7 +23,12 @@ enum Form {
         store: Store,
         at: PathBuf,
     },
-    /// In a packed layer's listing (`pack`).
+    /// Text a record holds inline (`records`).
+    Inline {
+        bytes: Vec<u8>,
+        modified: std::time::SystemTime,
+    },
+    /// In a packed layer's listing (`pack`), or kept in the store for a record.
     Packed {
         manifest: Manifest,
         store: Store,
@@ -46,6 +51,14 @@ fn form(path: &Path) -> io::Result<Form> {
     {
         return Ok(Form::Packed { manifest: entry.manifest, store: pack.store().clone(), modified: entry.modified });
     }
+    if let Some((content, modified, store)) = crate::records::Set::file(path) {
+        return Ok(match content {
+            crate::records::Content::Text(text) => Form::Inline { bytes: text.into_bytes(), modified },
+            crate::records::Content::Stored { sha1, .. } => {
+                Form::Packed { manifest: store.file_manifest(&sha1)?, store, modified }
+            }
+        });
+    }
     Err(io::Error::new(io::ErrorKind::NotFound, path.display().to_string()))
 }
 
@@ -56,6 +69,7 @@ fn form(path: &Path) -> io::Result<Form> {
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     match form(path)? {
         Form::Plain(path) => std::fs::read(path),
+        Form::Inline { bytes, .. } => Ok(bytes),
         Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
             manifest.read_range(&store, 0, usize::try_from(manifest.size).unwrap_or(usize::MAX))
         }
@@ -83,6 +97,10 @@ pub fn read_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
             file.take(len as u64).read_to_end(&mut out)?;
             Ok(out)
         }
+        Form::Inline { bytes, .. } => {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+            Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+        }
         Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
             manifest.read_range(&store, offset, len)
         }
@@ -109,6 +127,14 @@ pub fn exists(path: &Path) -> bool {
     path.is_file() || chunks::manifest_path(path).is_file() || crate::pack::is_file(path)
 }
 
+/// Refuse to write a records layer's file as a file: its records are written (`records`).
+fn not_a_record(path: &Path) -> io::Result<()> {
+    if crate::records::Set::is_folder(path).is_some() {
+        return Err(io::Error::other(format!("{}: a records layer is written by its records", path.display())));
+    }
+    Ok(())
+}
+
 /// The file on disk holding a path's content: itself, or its manifest; none where neither is.
 #[must_use]
 pub fn stored(path: &Path) -> Option<PathBuf> {
@@ -130,6 +156,7 @@ pub fn stat(path: &Path) -> io::Result<(u64, std::time::SystemTime)> {
         }
         Form::Chunked { manifest, at, .. } => Ok((manifest.size, std::fs::metadata(at)?.modified()?)),
         Form::Packed { manifest, modified, .. } => Ok((manifest.size, modified)),
+        Form::Inline { bytes, modified } => Ok((bytes.len() as u64, modified)),
     }
 }
 
@@ -140,6 +167,7 @@ pub fn stat(path: &Path) -> io::Result<(u64, std::time::SystemTime)> {
 pub fn sha1(path: &Path) -> io::Result<String> {
     match form(path)? {
         Form::Plain(path) => crate::extract::sha1_file(&path).map_err(io::Error::other),
+        Form::Inline { bytes, .. } => Ok(crate::extract::sha1_hex(&bytes)),
         Form::Chunked { manifest, .. } | Form::Packed { manifest, .. } => Ok(manifest.sha1),
     }
 }
@@ -162,6 +190,7 @@ pub fn chunked(path: &Path, bytes: &[u8]) -> io::Result<Option<String>> {
 /// # Errors
 /// Its folder cannot be made, its chunks stored, or it cannot be written.
 pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    not_a_record(path)?;
     // A packed layer's file is a line of its listing.
     if let Some((pack, rel)) = crate::pack::Pack::of(path) {
         remove_stored(path)?;
@@ -187,6 +216,7 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// # Errors
 /// It cannot be removed.
 pub fn remove(path: &Path) -> io::Result<()> {
+    not_a_record(path)?;
     remove_stored(path)?;
     if let Some((pack, rel)) = crate::pack::Pack::of(path) {
         pack.remove(&rel)?;
@@ -243,6 +273,7 @@ pub fn expose_with(
 pub fn for_program(path: &Path) -> io::Result<PathBuf> {
     match form(path)? {
         Form::Plain(path) => Ok(path),
+        Form::Inline { .. } => materialize(path),
         Form::Chunked { store, .. } | Form::Packed { store, .. } => {
             let exposer = {
                 let exposers = EXPOSERS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -265,6 +296,20 @@ pub fn for_program(path: &Path) -> io::Result<PathBuf> {
 pub fn materialize(path: &Path) -> io::Result<PathBuf> {
     match form(path)? {
         Form::Plain(path) => Ok(path),
+        Form::Inline { bytes, .. } => {
+            let layers = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == crate::LAYERS));
+            let project = layers.and_then(Path::parent).unwrap_or(Path::new("."));
+            let name = path.file_name().unwrap_or_default();
+            let sha1 = crate::extract::sha1_hex(&bytes);
+            let out = project.join(crate::cache::DIR).join("materialized").join(sha1).join(name);
+            if !out.is_file() {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::cache::write_atomic(&out, &bytes).map_err(io::Error::other)?;
+            }
+            Ok(out)
+        }
         Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
             let project = store.dir.parent().and_then(Path::parent).unwrap_or(Path::new("."));
             let name = path.file_name().unwrap_or_default();

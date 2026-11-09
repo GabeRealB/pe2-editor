@@ -21,6 +21,7 @@ pub mod merge;
 pub mod pack;
 pub mod plan;
 pub mod profile;
+pub mod records;
 pub mod schedule;
 pub mod setup;
 pub mod stack;
@@ -355,6 +356,8 @@ pub fn create(directory: &Path) -> Result<()> {
     let file = directory.join(FILE);
     anyhow::ensure!(!file.exists(), "{} holds a project already", directory.display());
     std::fs::create_dir_all(directory.join(".layers/project")).with_context(|| directory.display().to_string())?;
+    // Its own layer is records (`records`).
+    records::mark(&directory.join(".layers/project"), &records::Settings::default())?;
     std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())?;
     // Where it is served is no part of it, nor what was set aside from there.
     let ignore = directory.join(".gitignore");

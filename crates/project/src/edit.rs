@@ -56,14 +56,136 @@ fn target(op: Option<&Op>, below: &str) -> String {
     }
 }
 
-fn write_changeset(tx: &mut crate::history::Transaction<'_>, layer: &Layer, changeset: &Changeset) -> Result<()> {
-    tx.write(&layer.changeset, changeset.render().as_bytes())
+/// Whether a layer holds a file or a folder at a path: on disk, or as its store or records keep it.
+fn holds(path: &std::path::Path) -> bool {
+    path.exists() || crate::content::exists(path) || crate::pack::is_dir(path)
+}
+
+/// What an edit does to a layer's files and its list, through its step: on a layer stored as a tree, at once; on a
+/// records layer (`records`), what it writes of files is gathered, and written as its records with its changeset - one
+/// record an entry - so that undo takes back record files, as any.
+struct Out<'a, 'h> {
+    tx: &'a mut crate::history::Transaction<'h>,
+    project: &'a Project,
+    index: &'a Index,
+    layer: &'a Layer,
+    /// What a records layer's files become, by their path in it: written, or (none) removed.
+    records: Option<BTreeMap<String, Option<Vec<u8>>>>,
+}
+
+impl<'a, 'h> Out<'a, 'h> {
+    fn new(
+        tx: &'a mut crate::history::Transaction<'h>,
+        project: &'a Project,
+        index: &'a Index,
+        layer: &'a Layer,
+    ) -> Self {
+        let records = crate::records::is_records(&layer.path).then(BTreeMap::new);
+        Out { tx, project, index, layer, records }
+    }
+
+    /// A path's place in the layer, as its records name it.
+    fn rel(&self, path: &std::path::Path) -> Result<String> {
+        let rel =
+            path.strip_prefix(&self.layer.path).with_context(|| format!("{}: not in the layer", path.display()))?;
+        Ok(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn write(&mut self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+        if self.records.is_some() {
+            let rel = self.rel(path)?;
+            if let Some(records) = &mut self.records {
+                records.insert(rel, Some(bytes.to_vec()));
+            }
+            return Ok(());
+        }
+        self.tx.write(path, bytes)
+    }
+
+    /// Remove a file, or a folder and all in it.
+    fn remove(&mut self, path: &std::path::Path) -> Result<()> {
+        if self.records.is_some() {
+            let rel = self.rel(path)?;
+            if let Some(records) = &mut self.records {
+                let inside = format!("{rel}/");
+                for (at, bytes) in records.iter_mut() {
+                    if at.starts_with(&inside) {
+                        *bytes = None;
+                    }
+                }
+                records.insert(rel, None);
+            }
+            return Ok(());
+        }
+        self.tx.remove(path)
+    }
+
+    /// A folder made: a records layer's are where its entries are.
+    fn make_dir(&mut self, path: &std::path::Path) -> Result<()> {
+        if self.records.is_some() {
+            return Ok(());
+        }
+        self.tx.make_dir(path)
+    }
+
+    /// What a layer holds at a path moved: a records layer's goes with its entry's place.
+    fn rename(&mut self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+        if self.records.is_some() {
+            return Ok(());
+        }
+        self.tx.rename(from, to)
+    }
+
+    /// Whether the layer holds a file or a folder at a path, as this edit leaves it so far.
+    fn exists(&self, path: &std::path::Path) -> bool {
+        if let Some(records) = &self.records
+            && let Ok(rel) = self.rel(path)
+            && let Some(bytes) = records.get(&rel)
+        {
+            return bytes.is_some();
+        }
+        holds(path)
+    }
+
+    /// Done with the layer: what was written of a records layer's files must be in its records, or it would be lost.
+    fn done(self) -> Result<()> {
+        if self.records.as_ref().is_some_and(|written| !written.is_empty()) {
+            bail!("{}: files written, and its records not: an edit's mistake", self.layer.name);
+        }
+        Ok(())
+    }
+
+    /// What was written of a records layer's files, written into its records (nothing to do for a tree).
+    fn flush(&mut self, changeset: &Changeset) -> Result<()> {
+        if self.records.as_ref().is_some_and(|written| !written.is_empty()) {
+            return self.changeset(changeset);
+        }
+        Ok(())
+    }
+
+    /// Write the layer's list: its changeset, or its records as the changeset and the files written make them.
+    fn changeset(&mut self, changeset: &Changeset) -> Result<()> {
+        let Some(written) = &self.records else {
+            return self.tx.write(&self.layer.changeset, changeset.render().as_bytes());
+        };
+        let old = crate::records::Set::records_of(&self.layer.path).unwrap_or_default();
+        let (new, gone) = crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written)?;
+        for (uid, record) in &new {
+            self.tx.write(&crate::records::path_of(&self.layer.path, uid), record.render().as_bytes())?;
+        }
+        for uid in &gone {
+            self.tx.remove(&crate::records::path_of(&self.layer.path, uid))?;
+        }
+        // What is written is in the records now.
+        self.records = Some(BTreeMap::new());
+        Ok(())
+    }
 }
 
 /// Override an entry from below in a layer, recording it: the layer holds nothing of it yet - what it writes it holds,
 /// the rest coming from below as it is there. Where the override is.
 fn own_copy(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     index: &Index,
     layer: &Layer,
     layer_name: &str,
@@ -87,13 +209,13 @@ fn own_copy(
         for (file, source) in &below.files {
             let bytes = crate::content::read(source).with_context(|| source.display().to_string())?;
             let disk = if file.is_empty() { layer.disk(&at) } else { layer.disk(&at).join(file) };
-            tx.write(&disk, &bytes)?;
+            out.write(&disk, &bytes)?;
             let was = store.put_file(&bytes)?;
             files.insert(file.clone(), Base { was: Some(was), removed: false });
         }
     }
     changeset.ops.insert(uid.to_string(), Op::Override { files, to });
-    write_changeset(tx, layer, changeset)?;
+    out.changeset(changeset)?;
     Ok(at)
 }
 
@@ -126,9 +248,11 @@ pub fn write_file(
     if let Some(key) = merge {
         tx = tx.merging(key);
     }
-    let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    let path = own_path(&mut out, index, layer, layer_name, &mut changeset, uid)?;
     let at = Place { project, index, layer, layer_name, uid, path: &path };
-    put_files(&mut tx, &at, &mut changeset, &[(file, Some(bytes))])?;
+    put_files(&mut out, &at, &mut changeset, &[(file, Some(bytes))])?;
+    out.done()?;
     tx.commit()
 }
 
@@ -158,7 +282,7 @@ impl Place<'_> {
 /// # Errors
 /// A file cannot be written or kept.
 fn put_files(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     at: &Place<'_>,
     changeset: &mut Changeset,
     files: &[(&str, Option<&[u8]>)],
@@ -166,12 +290,13 @@ fn put_files(
     let Some(Op::Override { files: mut bases, to }) = changeset.ops.get(at.uid).cloned() else {
         for (file, bytes) in files {
             match bytes {
-                Some(bytes) => tx.write(&at.disk(file), bytes)?,
-                None if crate::content::exists(&at.disk(file)) => tx.remove(&at.disk(file))?,
+                Some(bytes) => out.write(&at.disk(file), bytes)?,
+                None if out.exists(&at.disk(file)) => out.remove(&at.disk(file))?,
                 None => {}
             }
         }
-        return Ok(());
+        // A records layer's files are its records': written as they now are.
+        return out.flush(changeset);
     };
     let below =
         at.index.below(at.layer_name, at.uid).with_context(|| format!("{} is gone below {}", at.uid, at.layer_name))?;
@@ -180,17 +305,17 @@ fn put_files(
         let disk = at.disk(file);
         let now = below.files.iter().find(|(name, _)| name == file).map(|(_, path)| path);
         let now_sha1 = below.sha1s.get(*file).cloned();
-        let held = crate::content::exists(&disk);
+        let held = out.exists(&disk);
         match bytes {
             Some(bytes) if now_sha1.as_deref() == Some(crate::extract::sha1_hex(bytes).as_str()) => {
                 // As it is below: nothing to hold.
                 if held {
-                    tx.remove(&disk)?;
+                    out.remove(&disk)?;
                 }
                 bases.remove(*file);
             }
             Some(bytes) => {
-                tx.write(&disk, bytes)?;
+                out.write(&disk, bytes)?;
                 if let Some(now) = now {
                     store.put_file(&crate::content::read(now)?)?;
                 }
@@ -198,7 +323,7 @@ fn put_files(
             }
             None => {
                 if held {
-                    tx.remove(&disk)?;
+                    out.remove(&disk)?;
                 }
                 match now_sha1 {
                     Some(was) => bases.insert((*file).to_string(), Base { was: Some(was), removed: true }),
@@ -208,12 +333,12 @@ fn put_files(
         }
     }
     changeset.ops.insert(at.uid.to_string(), Op::Override { files: bases, to });
-    write_changeset(tx, at.layer, changeset)
+    out.changeset(changeset)
 }
 
 /// Where a layer's own version of an entry is: the layer's entry, its override's copy, or a copy made now.
 fn own_path(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     index: &Index,
     layer: &Layer,
     layer_name: &str,
@@ -227,7 +352,7 @@ fn own_path(
             target(Some(&op), &below.path)
         }
         (None, Some(Op::Delete)) => bail!("{layer_name} deletes {uid}"),
-        (None, _) => own_copy(tx, index, layer, layer_name, changeset, uid)?,
+        (None, _) => own_copy(out, index, layer, layer_name, changeset, uid)?,
     })
 }
 
@@ -248,10 +373,12 @@ pub fn save(
 ) -> Result<Vec<PathBuf>> {
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let mut tx = history.begin(label).kind(crate::history::Kind::Save);
-    let path = own_path(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    let path = own_path(&mut out, index, layer, layer_name, &mut changeset, uid)?;
     let at = Place { project, index, layer, layer_name, uid, path: &path };
     let files: Vec<(&str, Option<&[u8]>)> = files.iter().map(|(f, b)| (f.as_str(), b.as_deref())).collect();
-    put_files(&mut tx, &at, &mut changeset, &files)?;
+    put_files(&mut out, &at, &mut changeset, &files)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -272,21 +399,23 @@ pub fn create(
     anyhow::ensure!(!changeset.entries.contains_key(uid), "{layer_name} already has {uid}");
     let bundle = format!("{path}{BUNDLE_SUFFIX}");
     let mut tx = history.begin(format!("New {}", name(&bundle)));
+    let mut out = Out::new(&mut tx, project, index, layer);
     let mut taken = HashSet::from([uid.to_string()]);
-    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
-    tx.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
+    make_parents(&mut out, index, layer, &mut changeset, path, &mut taken)?;
+    out.write(&layer.disk(&bundle).join(crate::index::NODE_FILE), declaration.as_bytes())?;
     for (name, bytes) in files {
-        tx.write(&layer.disk(&bundle).join(name), bytes)?;
+        out.write(&layer.disk(&bundle).join(name), bytes)?;
     }
     changeset.entries.insert(uid.to_string(), bundle);
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
 /// The folders a new entry at `path` is the first thing in, made in the step and listed: of this step, or the index
 /// lists them and the layer's list changes under the history. `taken` holds the uids given in the step.
 fn make_parents(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     index: &Index,
     layer: &Layer,
     changeset: &mut Changeset,
@@ -299,7 +428,7 @@ fn make_parents(
             continue;
         }
         let uid = new_uid(index, taken)?;
-        tx.make_dir(&layer.disk(folder))?;
+        out.make_dir(&layer.disk(folder))?;
         changeset.entries.insert(uid, folder.to_string());
     }
     Ok(())
@@ -332,12 +461,14 @@ pub fn create_file(
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     anyhow::ensure!(!index.entries.contains_key(path), "{path} is there already");
     let mut tx = history.begin(format!("New {}", name(path)));
+    let mut out = Out::new(&mut tx, project, index, layer);
     let mut taken = HashSet::new();
-    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
-    tx.write(&layer.disk(path), bytes)?;
+    make_parents(&mut out, index, layer, &mut changeset, path, &mut taken)?;
+    out.write(&layer.disk(path), bytes)?;
     let uid = new_uid(index, &mut taken)?;
     changeset.entries.insert(uid, path.to_string());
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -355,12 +486,14 @@ pub fn create_folder(
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     anyhow::ensure!(!index.entries.contains_key(path), "{path} is there already");
     let mut tx = history.begin(format!("New {}", name(path)));
+    let mut out = Out::new(&mut tx, project, index, layer);
     let mut taken = HashSet::new();
-    make_parents(&mut tx, index, layer, &mut changeset, path, &mut taken)?;
-    tx.make_dir(&layer.disk(path))?;
+    make_parents(&mut out, index, layer, &mut changeset, path, &mut taken)?;
+    out.make_dir(&layer.disk(path))?;
     let uid = new_uid(index, &mut taken)?;
     changeset.entries.insert(uid, path.to_string());
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -382,7 +515,9 @@ pub fn override_entry(
     }
     let shown = index.below(layer_name, uid).map_or_default(|b| target(changeset.ops.get(uid), &b.path));
     let mut tx = history.begin(format!("Override {} in {layer_name}", name(&shown)));
-    own_copy(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    own_copy(&mut out, index, layer, layer_name, &mut changeset, uid)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -424,17 +559,19 @@ pub fn delete(
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let shown = real_of(index, uid).unwrap_or_else(|| uid.to_string());
     let mut tx = history.begin(format!("Delete {}", name(&shown)));
-    delete_in(&mut tx, index, layer, layer_name, &mut changeset, uid)?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    delete_in(&mut out, index, layer, layer_name, &mut changeset, uid)?;
     if let Some(other) = paired(index, &shown).and_then(|p| uid_at(index, &p)) {
-        delete_in(&mut tx, index, layer, layer_name, &mut changeset, &other)?;
+        delete_in(&mut out, index, layer, layer_name, &mut changeset, &other)?;
     }
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
 /// Delete an entry within a step: its files, and what the changeset says of it.
 fn delete_in(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     index: &Index,
     layer: &Layer,
     layer_name: &str,
@@ -442,8 +579,8 @@ fn delete_in(
     uid: &str,
 ) -> Result<()> {
     if let Some(path) = changeset.entries.get(uid).cloned() {
-        if layer.disk(&path).exists() {
-            tx.remove(&layer.disk(&path))?;
+        if out.exists(&layer.disk(&path)) {
+            out.remove(&layer.disk(&path))?;
         }
         let inside = format!("{path}/");
         changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
@@ -451,8 +588,8 @@ fn delete_in(
     }
     let below = index.below(layer_name, uid).with_context(|| format!("no layer below {layer_name} has {uid}"))?;
     let at = target(changeset.ops.get(uid), &below.path);
-    if matches!(changeset.ops.get(uid), Some(Op::Override { .. })) && layer.disk(&at).exists() {
-        tx.remove(&layer.disk(&at))?;
+    if matches!(changeset.ops.get(uid), Some(Op::Override { .. })) && out.exists(&layer.disk(&at)) {
+        out.remove(&layer.disk(&at))?;
     }
     if below.kind == Kind::Folder {
         // A folder deleted subsumes what the layer did inside it.
@@ -461,8 +598,8 @@ fn delete_in(
                 && matches!(op, Op::Override { .. })
             {
                 let copy = layer.disk(&target(Some(&op), &path));
-                if copy.exists() {
-                    tx.remove(&copy)?;
+                if out.exists(&copy) {
+                    out.remove(&copy)?;
                 }
             }
         }
@@ -488,13 +625,15 @@ pub fn forget(
     let path = changeset.entries.get(uid).cloned().with_context(|| format!("{layer_name} does not list {uid}"))?;
     // What the index leaves out is no entry, whatever is on disk: an extension's folder, listed by an older editor.
     anyhow::ensure!(
-        index.leaves_out(layer_name, &path) || !layer.disk(&path).exists(),
+        index.leaves_out(layer_name, &path) || !holds(&layer.disk(&path)),
         "{layer_name} still holds {path}"
     );
     let mut tx = history.begin(format!("Forget {}", name(&path)));
+    let mut out = Out::new(&mut tx, project, index, layer);
     let inside = format!("{path}/");
     changeset.entries.retain(|_, p| *p != path && !p.starts_with(&inside));
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -515,8 +654,10 @@ pub fn adopt(
     let adopted = index.adoption(layer_name, path)?;
     anyhow::ensure!(!adopted.is_empty(), "{layer_name} lists all it holds at {path}");
     let mut tx = history.begin(format!("Adopt {}", name(path)));
+    let mut out = Out::new(&mut tx, project, index, layer);
     changeset.entries.extend(adopted);
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
@@ -535,7 +676,9 @@ pub fn remove_unlisted(
     let (layer, changeset) = layer(project, index, layer_name)?;
     anyhow::ensure!(!changeset.entries.values().any(|p| p == path), "{layer_name} lists {path}: delete it instead");
     let mut tx = history.begin(format!("Remove {} from {layer_name}", name(path)));
-    tx.remove(&layer.disk(path))?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    out.remove(&layer.disk(path))?;
+    out.done()?;
     tx.commit()
 }
 
@@ -565,22 +708,24 @@ pub fn rename(
     let (layer, mut changeset) = layer(project, index, layer_name)?;
     let from = real_of(index, uid).with_context(|| format!("{uid}: no entry"))?;
     let mut tx = history.begin(rename_label(&from, to));
-    rename_in(&mut tx, index, layer, layer_name, &mut changeset, uid, to)?;
+    let mut out = Out::new(&mut tx, project, index, layer);
+    rename_in(&mut out, index, layer, layer_name, &mut changeset, uid, to)?;
     if let Some(other) = paired(index, &from) {
         let other_to = match to.strip_suffix(BUNDLE_SUFFIX) {
             Some(folder) => folder.to_string(),
             None => format!("{to}{BUNDLE_SUFFIX}"),
         };
         let other_uid = uid_at(index, &other).with_context(|| format!("{other}: no entry"))?;
-        rename_in(&mut tx, index, layer, layer_name, &mut changeset, &other_uid, &other_to)?;
+        rename_in(&mut out, index, layer, layer_name, &mut changeset, &other_uid, &other_to)?;
     }
-    write_changeset(&mut tx, layer, &changeset)?;
+    out.changeset(&changeset)?;
+    out.done()?;
     tx.commit()
 }
 
 /// Rename an entry within a step: its files where the layer holds them, and what the changeset says of it.
 fn rename_in(
-    tx: &mut crate::history::Transaction<'_>,
+    out: &mut Out<'_, '_>,
     index: &Index,
     layer: &Layer,
     layer_name: &str,
@@ -592,7 +737,7 @@ fn rename_in(
         bail!("{to}: an entry is there already");
     }
     if let Some(from) = changeset.entries.get(uid).cloned() {
-        tx.rename(&layer.disk(&from), &layer.disk(to))?;
+        out.rename(&layer.disk(&from), &layer.disk(to))?;
         let inside = format!("{from}/");
         for path in changeset.entries.values_mut() {
             if *path == from {
@@ -614,8 +759,8 @@ fn rename_in(
         Some(Op::Override { files, .. }) => {
             // What it holds of it goes with it; it may hold nothing yet.
             let held = layer.disk(&from);
-            if held.is_dir() || crate::content::exists(&held) {
-                tx.rename(&held, &layer.disk(to))?;
+            if out.exists(&held) {
+                out.rename(&held, &layer.disk(to))?;
             }
             Some(Op::Override { files, to: back })
         }
@@ -651,6 +796,7 @@ pub fn resolve(
             let below = below.with_context(|| format!("{uid} is gone below {layer_name}"))?;
             let store = crate::chunks::Store::at(&project.root);
             let mut tx = history.begin(format!("Keep my version of {shown}"));
+            let mut out = Out::new(&mut tx, project, index, layer);
             let place = Place { project, index, layer, layer_name, uid, path: &at };
             let mut kept = BTreeMap::new();
             for (file, base) in files {
@@ -665,7 +811,7 @@ pub fn resolve(
                     let mine = crate::content::read(&place.disk(file))?;
                     let name = if file.is_empty() { name(&at) } else { file.as_str() };
                     let merged = crate::merge::merge(name, &old, &crate::content::read(now)?, &mine);
-                    tx.write(&place.disk(file), &merged.bytes)?;
+                    out.write(&place.disk(file), &merged.bytes)?;
                 }
                 if let Some(now) = now {
                     store.put_file(&crate::content::read(now)?)?;
@@ -673,15 +819,17 @@ pub fn resolve(
                 kept.insert(file.clone(), Base { was: now_sha1, removed: base.removed });
             }
             changeset.ops.insert(uid.to_string(), Op::Override { files: kept, to: to.clone() });
-            write_changeset(&mut tx, layer, &changeset)?;
+            out.changeset(&changeset)?;
+            out.done()?;
             tx.commit()
         }
         (Resolution::TakeBase | Resolution::Drop, Op::Override { to, .. }) => {
             let label =
                 if resolution == Resolution::TakeBase { "Take the version below of" } else { "Drop the override of" };
             let mut tx = history.begin(format!("{label} {shown}"));
-            if !at.is_empty() && layer.disk(&at).exists() {
-                tx.remove(&layer.disk(&at))?;
+            let mut out = Out::new(&mut tx, project, index, layer);
+            if !at.is_empty() && out.exists(&layer.disk(&at)) {
+                out.remove(&layer.disk(&at))?;
             }
             match to {
                 Some(to) if resolution == Resolution::TakeBase => {
@@ -691,13 +839,16 @@ pub fn resolve(
                     changeset.ops.remove(uid);
                 }
             }
-            write_changeset(&mut tx, layer, &changeset)?;
+            out.changeset(&changeset)?;
+            out.done()?;
             tx.commit()
         }
         (Resolution::Drop, Op::Move { .. } | Op::Delete) => {
             let mut tx = history.begin(format!("Drop the operation on {shown}"));
+            let mut out = Out::new(&mut tx, project, index, layer);
             changeset.ops.remove(uid);
-            write_changeset(&mut tx, layer, &changeset)?;
+            out.changeset(&changeset)?;
+            out.done()?;
             tx.commit()
         }
         _ => bail!("{resolution:?} does not apply to {layer_name}'s {op:?}"),
@@ -911,6 +1062,106 @@ mod tests {
         write(&mut o, "notes.txt", b"one\ntwo\nTHREE\n");
         assert!(!root.join(".layers/top/g/a.node/notes.txt").exists());
         assert!(matches!(o.op("g/a.node"), Some(Op::Override { files, .. }) if !files.contains_key("notes.txt")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_records_layer_is_edited_as_a_tree_is() {
+        let root = project("records");
+        crate::records::mark(&root.join(".layers/top"), &crate::records::Settings::default()).unwrap();
+        let mut o = open(&root);
+        let only_records = |root: &Path| {
+            let held: Vec<String> = std::fs::read_dir(root.join(".layers/top"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(held, [".records"], "a records layer holds no tree");
+        };
+        // A node made: its declaration and a file, read as any layer's.
+        let declaration = "stack = [{ op = \"t.file\" }]\n";
+        let paths = super::create(
+            &o.project,
+            &o.index,
+            "top",
+            "uid://made1",
+            "h/made",
+            (declaration, &[("extra.txt", b"hi".as_slice())]),
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        let made = &o.index.assets["h/made"];
+        assert_eq!((made.layers.as_slice(), made.text()), (["top".to_string()].as_slice(), declaration));
+        let extra = made.files.iter().find(|f| f.name == "extra.txt").unwrap();
+        assert_eq!(crate::content::read(&extra.path).unwrap(), b"hi");
+        assert!(o.index.entries.contains_key("h"), "the folder it is in, made with it");
+        // One of its files written again: its own record.
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            "top",
+            "uid://made1",
+            "extra.txt",
+            b"again",
+            "Edit".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        let extra = o.index.assets["h/made"].files.iter().find(|f| f.name == "extra.txt").unwrap().path.clone();
+        assert_eq!(crate::content::read(&extra).unwrap(), b"again");
+        only_records(&root);
+        // An override of a node below: what it writes held whole, merged over a change below.
+        let a = o.uid("g/a.node");
+        let mine = "stack = [{ op = \"t.image\" }]\nnote = \"x\"\n";
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            "top",
+            &a,
+            "node.toml",
+            mine.as_bytes(),
+            "Edit".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        assert_eq!(o.index.assets["g/a"].text(), mine);
+        let below = root.join(".layers/base/g/a.node/node.toml");
+        std::fs::write(&below, "stack = [{ op = \"t.image\" }]\nsize = 2\n").unwrap();
+        o.refresh(std::slice::from_ref(&below));
+        let text = o.index.assets["g/a"].text().to_string();
+        assert!(text.contains("note = \"x\"") && text.contains("size = 2"), "{text}");
+        only_records(&root);
+        // Renamed: one record changes, what is inside follows.
+        let folder = o.uid("h");
+        let records_before = crate::records::Set::records_of(&root.join(".layers/top")).unwrap();
+        let paths = rename(&o.project, &o.index, "top", &folder, "k", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(o.index.assets.contains_key("k/made") && !o.index.assets.contains_key("h/made"));
+        let records_after = crate::records::Set::records_of(&root.join(".layers/top")).unwrap();
+        let changed = records_after.iter().filter(|(uid, r)| records_before.get(*uid) != Some(*r)).count();
+        assert_eq!(changed, 1, "a rename is one record");
+        // Deleted, its own and one below.
+        let paths = delete(&o.project, &o.index, "top", "uid://made1", &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!o.index.assets.contains_key("k/made"));
+        let n = o.uid("n");
+        let paths = delete(&o.project, &o.index, "top", &n, &mut o.history).unwrap();
+        o.refresh(&paths);
+        assert!(!o.index.entries.contains_key("n"));
+        // All undone: nothing of it left.
+        while let Ok(step) = o.history.undo(&o.index, None, false) {
+            let paths = step.paths();
+            o.refresh(&paths);
+        }
+        assert!(crate::records::Set::records_of(&root.join(".layers/top")).unwrap().is_empty());
+        assert_eq!(o.index.assets["g/a"].layers, ["base"]);
+        assert!(o.index.entries.contains_key("n") && !o.index.entries.contains_key("h"));
+        assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
+        drop(o);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

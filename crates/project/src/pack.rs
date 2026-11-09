@@ -274,6 +274,12 @@ pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
             out.push((entry.file_name().to_string_lossy().into_owned(), entry.path(), kind.is_dir()));
         }
     }
+    // A records layer's tree, as its records make it.
+    for (name, folder) in crate::records::Set::list(dir).into_iter().flatten() {
+        if !out.iter().any(|(n, ..)| *n == name) {
+            out.push((name.clone(), dir.join(&name), folder));
+        }
+    }
     let packed = Pack::of(&dir.join(FILE)).map(|(pack, _)| pack).filter(|pack| dir.starts_with(&pack.root));
     if let Some(pack) = packed {
         let rel =
@@ -290,13 +296,17 @@ pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
 /// Whether a path is a folder, on disk or in a packed layer.
 #[must_use]
 pub fn is_dir(path: &Path) -> bool {
-    path.is_dir() || Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
+    path.is_dir()
+        || Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
+        || crate::records::Set::is_folder(path) == Some(true)
 }
 
 /// Whether a path is a file, on disk or in a packed layer.
 #[must_use]
 pub fn is_file(path: &Path) -> bool {
-    path.is_file() || Pack::of(path).is_some_and(|(pack, rel)| pack.get(&rel).is_some())
+    path.is_file()
+        || Pack::of(path).is_some_and(|(pack, rel)| pack.get(&rel).is_some())
+        || crate::records::Set::is_file(path) == Some(true)
 }
 
 /// Set how a layer is stored in `project.toml` (`storage`): none for the default, its files as files.

@@ -15,7 +15,7 @@
 //! them, a create each with a new uid (an `node.toml`'s own `uid`, as declarations wrote them before changesets, is
 //! kept); elsewhere they are reported.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -36,6 +36,11 @@ pub const SETTINGS_FILE: &str = "settings.toml";
 
 /// What names a version an asset overrides, before its uid: the graph's `below` operation reads it as a node.
 pub const BELOW: &str = "below:";
+
+/// Whether a path is a records layer's record (`records`).
+fn in_records(path: &Path) -> bool {
+    path.ancestors().any(|a| a.file_name().is_some_and(|n| n == crate::records::DIR))
+}
 
 /// A file an override merged over the one below, in the cache (`.cache/merged/<sha1>/<name>`), written where it is not
 /// yet: its folder is named by its content's SHA-1.
@@ -820,7 +825,8 @@ struct LayerState {
 
 impl LayerState {
     fn new(layer: &Layer) -> Result<LayerState> {
-        let changeset = Changeset::load(&layer.changeset)?;
+        let records = crate::records::is_records(&layer.path);
+        let changeset = LayerState::changeset_of(layer)?;
         let tree_ignore = if layer.mounted { tree_ignores(&layer.path) } else { vec![] };
         let mut ignore = changeset.ignore.clone();
         ignore.extend(tree_ignore.iter().cloned());
@@ -840,7 +846,7 @@ impl LayerState {
             mounted: layer.mounted,
             listing: if layer.mounted {
                 Listing::Always
-            } else if layer.changeset.exists() {
+            } else if records || layer.changeset.exists() {
                 Listing::Adopted
             } else {
                 Listing::Once
@@ -850,9 +856,22 @@ impl LayerState {
         })
     }
 
+    /// A layer's changeset: as its file says, or, for a records layer, as its records say (`records::Set::changeset`).
+    fn changeset_of(layer: &Layer) -> Result<Changeset> {
+        if crate::records::is_records(&layer.path) {
+            return crate::records::Set::changeset(&layer.path)
+                .with_context(|| format!("{}: its records are not read", layer.name));
+        }
+        Changeset::load(&layer.changeset)
+    }
+
     /// Its changeset read again, and the names it leaves out with it.
     fn reload_changeset(&mut self) -> Result<()> {
-        self.changeset = Changeset::load(&self.changeset_path)?;
+        self.changeset = if crate::records::is_records(&self.place.root) {
+            crate::records::Set::changeset(&self.place.root).context("its records are not read")?
+        } else {
+            Changeset::load(&self.changeset_path)?
+        };
         self.place.ignore = self.changeset.ignore.iter().chain(&self.tree_ignore).cloned().collect();
         Ok(())
     }
@@ -1092,6 +1111,8 @@ impl Index {
 
     fn over(store: Option<Arc<Store>>, project: &Project, report: &Report<'_>) -> Result<Index> {
         let mut known = store.as_ref().map(|s| s.load()).transpose()?.unwrap_or_default();
+        // Its records layers, placed through the stack: what their scans and changesets are read from.
+        crate::records::Set::open(project)?;
         let mut layers = Vec::new();
         for (i, layer) in project.layers.iter().enumerate() {
             report(&format!("Scanning {}", layer.name), i, project.layers.len());
@@ -1160,13 +1181,32 @@ impl Index {
         self.refresh_files(project, &changed)
     }
 
+    /// Records changed: the project's are read again, and each records layer as they make it now, rescanned whole.
+    /// Whether any records layer was.
+    fn take_in_records(&mut self, project: &Project, wanted: &mut Vec<(usize, String)>) -> Result<bool> {
+        crate::records::Set::open(project)?;
+        let mut any = false;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if crate::records::is_records(&layer.place.root) {
+                layer.reload_changeset()?;
+                any = true;
+                wanted.push((i, String::new()));
+            }
+        }
+        Ok(any)
+    }
+
     fn refresh_files(&mut self, project: &Project, changed: &[PathBuf]) -> Result<Refreshed> {
         let mut refreshed = Refreshed::default();
         let mut changesets = false;
         let mut wanted: Vec<(usize, String)> = Vec::new();
+        if changed.iter().any(|p| in_records(p)) {
+            changesets |= self.take_in_records(project, &mut wanted)?;
+        }
         for path in changed {
-            if *path == project.root.join(FILE) {
-                refreshed.project_file = true;
+            // `project.toml` is read again whole, records with their layers (above).
+            if *path == project.root.join(FILE) || in_records(path) {
+                refreshed.project_file |= *path == project.root.join(FILE);
                 continue;
             }
             for (i, layer) in self.layers.iter_mut().enumerate() {
@@ -1778,6 +1818,13 @@ impl Index {
     fn below_layer(&self, layer: &str) -> Option<Resolution> {
         let at = self.layers.iter().position(|l| l.name == layer)?;
         Some(self.resolve_stack(&(at..self.layers.len()).collect()))
+    }
+
+    /// What the layers below `layer` resolve, by path: each entry's uid and kind.
+    #[must_use]
+    pub fn entries_below(&self, layer: &str) -> HashMap<String, (String, Kind)> {
+        let Some(resolution) = self.below_layer(layer) else { return HashMap::new() };
+        resolution.resolved.iter().map(|(path, node)| (path.clone(), (node.uid.clone(), node.kind))).collect()
     }
 
     /// An entry as the layers below `layer` resolve it, by its uid.

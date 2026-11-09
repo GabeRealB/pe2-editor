@@ -170,6 +170,14 @@ impl Store {
         manifest.read_range(self, 0, len)
     }
 
+    /// The manifest of a file kept whole, by its SHA-1: for reading it by range.
+    ///
+    /// # Errors
+    /// It is not kept.
+    pub fn file_manifest(&self, sha1: &str) -> io::Result<Manifest> {
+        Manifest::parse(&std::fs::read_to_string(self.file_path(sha1))?)
+    }
+
     /// Whether a file is kept, by its SHA-1.
     #[must_use]
     pub fn has_file(&self, sha1: &str) -> bool {

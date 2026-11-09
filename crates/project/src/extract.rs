@@ -242,8 +242,8 @@ struct Written {
 impl Written {
     fn open(layers: [&Path; 2], path: &str, uid: &str) -> Result<Written> {
         let dirs = layers.map(|layer| layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX)));
-        let declaration =
-            fs::read_to_string(dirs[0].join("node.toml")).with_context(|| format!("{path}: its node.toml"))?;
+        let declaration = crate::content::read_to_string(&dirs[0].join("node.toml"))
+            .with_context(|| format!("{path}: its node.toml"))?;
         let fields =
             crate::graph::with_settings(declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
         Ok(Written {
@@ -371,7 +371,11 @@ pub(crate) fn assembled_sha1(
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
 ) -> Result<String> {
-    let changeset = Changeset::load(&layers[0].with_extension("toml"))?;
+    // A records layer's changeset is what its records say.
+    let changeset = match crate::records::Set::changeset(layers[0]) {
+        Some(changeset) => changeset,
+        None => Changeset::load(&layers[0].with_extension("toml"))?,
+    };
     let all = changeset
         .entries
         .iter()

@@ -211,6 +211,27 @@ enum LayerCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Make a layer's records those of a tree of files and its changeset (`<folder>.toml` beside it), in place of all it
+    /// had: what a tool writes as files (`tools/editor_project/init.py`)
+    Import {
+        name: String,
+        /// The tree
+        #[arg(long)]
+        from: PathBuf,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Write a records layer's entries out as a tree of files, its changeset beside it (`<folder>.toml`)
+    Export {
+        name: String,
+        /// Where
+        #[arg(long)]
+        to: PathBuf,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -310,6 +331,16 @@ enum StoreCommand {
     },
     /// Unpack a packed layer: its files written back as files
     Unpack {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The layer
+        #[arg(long)]
+        layer: String,
+    },
+    /// Store a layer stored as a tree of files as records (one a entry, by uid): kept only where the project shows the
+    /// same after, else the tree is put back
+    Convert {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
@@ -428,21 +459,27 @@ enum ProjectCommand {
     },
     /// Take an entry a layer lists and no longer holds out of its list (a problem's layer and path)
     Forget {
-        layer: String,
+        /// The layer holding it, as the problem names it
+        #[arg(value_name = "LAYER")]
+        of: String,
         path: String,
         #[command(flatten)]
         at: EditAt,
     },
     /// List what a layer holds unlisted at and under a path of it (a problem's layer and path)
     Adopt {
-        layer: String,
+        /// The layer holding it, as the problem names it
+        #[arg(value_name = "LAYER")]
+        of: String,
         path: String,
         #[command(flatten)]
         at: EditAt,
     },
     /// Remove what a layer holds unlisted at a path of it from its folder (a problem's layer and path)
     RemoveUnlisted {
-        layer: String,
+        /// The layer holding it, as the problem names it
+        #[arg(value_name = "LAYER")]
+        of: String,
         path: String,
         #[command(flatten)]
         at: EditAt,
@@ -1230,6 +1267,20 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
                 edit_project(&project, |p, history| project::stack::add_at(p, &name, kind, bottom, history))?;
             }
         }
+        ProjectCommand::Layer { command: LayerCommand::Import { name, from, project } } => {
+            let p = project::Project::load(&project)?;
+            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", |owner| {
+                eprintln!("waiting: the project is in use by {owner}");
+            })?;
+            let cache = project::cache::Cache::open(&p, &lock)?;
+            let count = project::records::import(&p, &cache, &name, &std::path::absolute(&from)?)?;
+            println!("{name}: {count} records");
+        }
+        ProjectCommand::Layer { command: LayerCommand::Export { name, to, project } } => {
+            let p = project::Project::load(&project)?;
+            let count = project::records::export(&p, &name, &std::path::absolute(&to)?)?;
+            println!("{name}: {count} entries written to {}", to.display());
+        }
         ProjectCommand::Mount { command: MountCommand::Add { at, path, read_only, unmanaged, project } } => {
             edit_project(&project, |p, history| {
                 project::setup::add_mount(p, &at, path.as_deref(), read_only, unmanaged, history)
@@ -1382,10 +1433,10 @@ fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> 
         ProjectCommand::Drop { path: p, at } => (Op::Drop { path: path(p) }, at),
         ProjectCommand::KeepMine { path: p, at } => (Op::KeepMine { path: path(p) }, at),
         ProjectCommand::TakeBase { path: p, at } => (Op::TakeBase { path: path(p) }, at),
-        ProjectCommand::Forget { layer, path: p, at } => (Op::Forget { layer: layer.clone(), path: path(p) }, at),
-        ProjectCommand::Adopt { layer, path: p, at } => (Op::Adopt { layer: layer.clone(), path: path(p) }, at),
-        ProjectCommand::RemoveUnlisted { layer, path: p, at } => {
-            (Op::RemoveUnlisted { layer: layer.clone(), path: path(p) }, at)
+        ProjectCommand::Forget { of, path: p, at } => (Op::Forget { layer: of.clone(), path: path(p) }, at),
+        ProjectCommand::Adopt { of, path: p, at } => (Op::Adopt { layer: of.clone(), path: path(p) }, at),
+        ProjectCommand::RemoveUnlisted { of, path: p, at } => {
+            (Op::RemoveUnlisted { layer: of.clone(), path: path(p) }, at)
         }
         ProjectCommand::Undo { at } => (Op::Undo, at),
         ProjectCommand::Redo { at } => (Op::Redo, at),
@@ -1441,7 +1492,8 @@ fn store(command: &StoreCommand) -> Result<()> {
     let (StoreCommand::Migrate { project }
     | StoreCommand::Gc { project }
     | StoreCommand::Pack { project, .. }
-    | StoreCommand::Unpack { project, .. }) = command;
+    | StoreCommand::Unpack { project, .. }
+    | StoreCommand::Convert { project, .. }) = command;
     let p = project::Project::load(project)?;
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", |owner| {
         eprintln!("waiting: the project is in use by {owner}");
@@ -1467,6 +1519,15 @@ fn store(command: &StoreCommand) -> Result<()> {
         StoreCommand::Unpack { layer, .. } => {
             let count = project::pack::unpack_layer(&p, layer)?;
             println!("{layer}: {count} files unpacked");
+        }
+        StoreCommand::Convert { layer, .. } => {
+            let cache = project::cache::Cache::open(&p, &lock)?;
+            let started = std::time::Instant::now();
+            let count = project::records::convert(&p, &cache, layer)?;
+            println!(
+                "{layer}: {count} records, the project showing the same ({:.1}s)",
+                started.elapsed().as_secs_f64()
+            );
         }
         StoreCommand::Gc { .. } => {
             let (gone, freed) = project::chunks::sweep(&p)?;
@@ -1701,4 +1762,15 @@ fn run(cli: Cli) -> Result<()> {
         Tool::Project { command } => project_command(&command)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every command parses: names unique, arguments well formed (clap's own checks, which otherwise run only when
+    /// a command is used).
+    #[test]
+    fn the_commands_are_well_formed() {
+        use clap::CommandFactory as _;
+        super::Cli::command().debug_assert();
+    }
 }
