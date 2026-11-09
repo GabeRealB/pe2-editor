@@ -48,6 +48,7 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
     vec![
         pe2_render::extension(),
         pe2_events::extension(),
+        pe2_graph::extension(),
         pe2_flags::extension(),
         pe2_dialogue::extension(),
         pe2_fonts::extension(),
@@ -912,6 +913,44 @@ mod tests {
         assert_eq!(wide.toggle, "Pages");
         let plain = marks("mode = \"indexed_8bpp\"\nsize = [64, 8]\n");
         assert_eq!(plain, pe2_ext::Marks::default());
+    }
+
+    #[test]
+    fn a_template_the_project_defines_is_offered_for_its_files_and_makes_a_node_using_its_operation() {
+        let dir = std::env::temp_dir().join(format!("pe2-ext-project-template-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        project::create(&dir).unwrap();
+        let p = super::Project::load(&dir).unwrap();
+        let lock = project::lock::Lock::try_acquire(&p.root, "a test").unwrap();
+        let cache = project::cache::Cache::open(&p, &lock).unwrap();
+        let (mut history, _) = project::history::History::open(&cache).unwrap();
+        let index = project::index::Index::open(&p, &cache).unwrap();
+        // An operation passing on what it is given, and a template importing a text file through it.
+        let group = "uid = \"uid://group\"\n\n[[stack]]\nop = \"pe2.graph@operation\"\nlabel = \"Passed\"\n\
+                     ops.given = { op = \"input\", name = \"text\" }\nops.out = { op = \"output\", name = \"text\", from = { value = \"given\" } }\n";
+        let template = "uid = \"uid://template\"\n\n[[stack]]\nop = \"pe2.graph@template\"\nlabel = \"Passed text\"\nfiles = [\"*.txt\"]\n\
+                        makes = [{ op = \"file\", file = \"{file}\" }, { op = \"uid://group\" }, { op = \"output\", name = \"text\" }]\n";
+        project::edit::create(&p, &index, "project", "uid://group", "graph/passed", (group, &[]), &mut history).unwrap();
+        project::edit::create(&p, &index, "project", "uid://template", "graph/template", (template, &[]), &mut history)
+            .unwrap();
+        let index = project::index::Index::open(&p, &cache).unwrap();
+        let extensions = super::for_project(&p);
+        assert_eq!(extensions.take_definitions(&index), []);
+        let offered: Vec<String> = extensions.templates_for("notes.TXT").into_iter().map(|t| t.label).collect();
+        assert_eq!(offered, ["Passed text"]);
+        let found = extensions.template("uid://template").unwrap();
+        let stack = extensions.stamp(&found, "notes.txt").unwrap();
+        assert!(stack.contains("file = \"notes.txt\""), "{stack}");
+        let made = format!("uid = \"uid://made\"\n\n{stack}");
+        let files: [(&str, &[u8]); 1] = [("notes.txt", b"hello")];
+        project::edit::create(&p, &index, "project", "uid://made", "notes", (&made, &files), &mut history).unwrap();
+        let index = project::index::Index::open(&p, &cache).unwrap();
+        let _ = extensions.take_definitions(&index);
+        let engine = extensions.engine();
+        let given = extensions.output(&engine, &index, &index.assets["notes"], "text", true).unwrap();
+        let project::graph::Value::Typed(typed) = &*given.value.unwrap() else { panic!("no file") };
+        assert_eq!(typed.files[0].name, "notes.txt");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

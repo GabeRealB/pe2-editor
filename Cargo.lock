@@ -1037,6 +1037,7 @@ dependencies = [
  "png",
  "project",
  "serde_json",
+ "toml 0.8.23",
  "tracing",
  "vfs",
 ]
@@ -2115,6 +2116,7 @@ dependencies = [
  "pe2-fonts",
  "pe2-formats",
  "pe2-game",
+ "pe2-graph",
  "pe2-images",
  "pe2-movies",
  "pe2-packages",
@@ -4527,6 +4529,13 @@ version = "0.1.0"
 dependencies = [
  "codecs",
  "formats",
+ "pe2-ext",
+]
+
+[[package]]
+name = "pe2-graph"
+version = "0.1.0"
+dependencies = [
  "pe2-ext",
 ]
 

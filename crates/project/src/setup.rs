@@ -168,6 +168,70 @@ pub fn add_config(
     write(&project.root, &document, history, format!("Add the config {name}"))
 }
 
+/// A TOML value as `toml_edit` writes it.
+fn item_of(v: &toml::Value) -> Result<Item> {
+    let document: DocumentMut = format!("v = {v}").parse().context("the value cannot be written")?;
+    document.get("v").cloned().context("the value cannot be written")
+}
+
+/// Set a config's property (`[config.<name>.properties]`), or leave it to its default (`None`). Its value is checked
+/// against what the project declares.
+///
+/// # Errors
+/// The project has no such config or property, the value is not as declared, or `project.toml` cannot be rewritten.
+pub fn set_property(
+    project: &Project,
+    config: &str,
+    property: &str,
+    to: Option<&toml::Value>,
+    history: &mut History,
+) -> Result<()> {
+    anyhow::ensure!(project.configs.iter().any(|c| c.name == config), "the project has no config {config}");
+    let declared = project.properties.iter().find(|p| p.name == property);
+    let declared = declared.with_context(|| format!("the project declares no property {property}"))?;
+    if let Some(why) = to.and_then(|v| declared.kind.refuses(v)) {
+        bail!("{property}: {why}");
+    }
+    let mut document = read(&project.root)?;
+    let configs = table(&mut document, "config")?;
+    let at = configs.get_mut(config).and_then(Item::as_table_mut);
+    let at = at.with_context(|| format!("`config.{config}` in {FILE} is not a table"))?;
+    let label = if let Some(v) = to {
+        let properties = at.entry("properties").or_insert(Item::Table(Table::new()));
+        let properties = properties.as_table_like_mut().context("its properties are not a table")?;
+        properties.insert(property, item_of(v)?);
+        format!("Set {config}'s {property} to {v}")
+    } else {
+        if let Some(properties) = at.get_mut("properties").and_then(Item::as_table_like_mut) {
+            properties.remove(property);
+        }
+        format!("Set {config}'s {property} to its default")
+    };
+    write(&project.root, &document, history, label)
+}
+
+/// Declare a property the project's configs can set (`[property.<name>]`): its shape, as written there (`type`, or
+/// `values`), and its default.
+///
+/// # Errors
+/// It is declared already, the declaration is not one, or `project.toml` cannot be rewritten.
+pub fn declare_property(project: &Project, name: &str, declaration: &toml::Table, history: &mut History) -> Result<()> {
+    anyhow::ensure!(project.properties.iter().all(|p| p.name != name), "the project declares {name} already");
+    let property = crate::property_of(name, &toml::Value::Table(declaration.clone())).map_err(anyhow::Error::msg)?;
+    if let Some(why) = property.default.as_ref().and_then(|d| property.kind.refuses(d)) {
+        bail!("its default: {why}");
+    }
+    let mut document = read(&project.root)?;
+    let properties = table(&mut document, "property")?;
+    properties.set_implicit(true);
+    let mut table = Table::new();
+    for (key, v) in declaration {
+        table.insert(key, item_of(v)?);
+    }
+    properties.insert(name, Item::Table(table));
+    write(&project.root, &document, history, format!("Declare the property {name}"))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Project;
@@ -197,6 +261,18 @@ mod tests {
         assert_eq!(made.unmanaged[0].path, dir.join("roms"));
         assert_eq!(made.resolve("res://roms/a.bin").unwrap(), dir.join("roms/a.bin"));
         assert_eq!(made.configs[0].release.as_deref(), Some("USA"));
+        let declaration: toml::Table = toml::from_str("values = [\"en\", \"fr\"]\ndefault = \"en\"").unwrap();
+        super::declare_property(&project(), "language", &declaration, &mut history).unwrap();
+        let fr = toml::Value::String("fr".into());
+        super::set_property(&project(), "usa", "language", Some(&fr), &mut history).unwrap();
+        let de = toml::Value::String("de".into());
+        assert!(super::set_property(&project(), "usa", "language", Some(&de), &mut history).is_err());
+        let set = project();
+        assert_eq!(set.properties_of(&set.configs[0]).get("language"), Some(&fr));
+        assert!(set.property_problems.is_empty(), "{:?}", set.property_problems);
+        super::set_property(&project(), "usa", "language", None, &mut history).unwrap();
+        let set = project();
+        assert_eq!(set.properties_of(&set.configs[0]).get("language").and_then(toml::Value::as_str), Some("en"));
         assert!(made.layers.iter().any(|l| l.name == "packages" && l.read_only));
         let at = |name: &str| made.layers.iter().position(|l| l.name == name).unwrap();
         assert!(at("game") < at("project"), "the game's layer is below the project's own");

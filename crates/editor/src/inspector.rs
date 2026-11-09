@@ -1711,7 +1711,9 @@ fn selected_ui(
     let values: Vec<(String, toml::Value)> =
         values.into_iter().filter(|(key, _)| key != "from" && key != project::graph::layers::POS).collect();
     let shown: Vec<(&String, &toml::Value)> = values.iter().map(|(key, value)| (key, value)).collect();
-    let label = ws.extensions.operations().get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    let ops = ws.extensions.operations();
+    let defined = || ops.definitions.get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    let label = ops.get(name).map_or_else(defined, |d| d.label.clone());
     let sheet =
         Sheet { index: &ws.index, extensions: &ws.extensions, fields, within: steps_of_layer(at, op), derived: None };
     let field_edit = &mut ws.field_edit;
@@ -1794,6 +1796,27 @@ fn layer_settings(
             vec![set("output", "native"), set("type", "")],
         ),
         graph::GRAPH => (vec![], vec![]),
+        // An operation the project defines: the settings it declares, each its default where the layer sets none.
+        _ if extensions.definition(op).is_some() => {
+            let definition = extensions.definition(op).unwrap_or_else(|| unreachable!("checked"));
+            // Each setting box a field: its label, its default, the values it can be.
+            let fields = definition
+                .settings
+                .iter()
+                .map(|(property, _)| {
+                    let mut field = Field::new(&property.name).label(property.label.as_deref().unwrap_or(&property.name));
+                    if let Some(default) = &property.default {
+                        field = field.default_value(default.clone());
+                    }
+                    if let project::PropertyKind::OneOf(values) = &property.kind {
+                        field.choices = values.iter().map(|v| (toml::Value::String(v.clone()), v.clone())).collect();
+                    }
+                    field
+                })
+                .collect();
+            let values = definition.values(layer.as_table().unwrap_or(&toml::Table::new())).into_iter().collect();
+            (fields, values)
+        }
         _ => {
             let fields = extensions.op(op).map_or_default(|def| def.fields.clone());
             let declared = fields.iter().filter(|f| !f.custom).map(|f| set(&f.key, ""));
@@ -1826,11 +1849,17 @@ struct Place<'a> {
 }
 
 /// A change to a stack's layers, as an edit: `change` the declaration's text to the text wanted.
+#[expect(clippy::unnecessary_wraps, reason = "what the panes take: an edit, or none")]
 pub(crate) fn layers_edit(asset: &Asset, label: String, text: anyhow::Result<String>) -> Option<EditRequest> {
+    // An edit that cannot be made is said, not dropped.
+    let bytes = match text {
+        Ok(text) => text.into_bytes(),
+        Err(why) => return Some(EditRequest::Refused(format!("{label}: {why:#}"))),
+    };
     Some(EditRequest::Write {
         uid: asset.uid.clone().unwrap_or_default(),
         file: project::index::NODE_FILE.to_string(),
-        bytes: text.ok()?.into_bytes(),
+        bytes,
         label,
         merge: None,
     })
@@ -1954,7 +1983,8 @@ fn problem_place(at: &str) -> String {
 fn operation_row(ui: &mut egui::Ui, ops: &project::graph::Ops, op: &str, layer: &toml::Value) {
     ui.label(RichText::new("Operation").color(theme::weak()));
     ui.horizontal_wrapped(|ui| {
-        ui.label(ops.get(op).map_or(op, |def| def.label.as_str()));
+        let defined = ops.definitions.get(op).map(|d| d.label.as_str());
+        ui.label(ops.get(op).map_or(defined.unwrap_or(op), |def| def.label.as_str()));
         ui.label(RichText::new(op).small().color(theme::weak()));
     });
     let own = layer.as_table().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "op" | "id"));

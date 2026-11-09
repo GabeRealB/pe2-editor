@@ -97,19 +97,30 @@ fn named(action: &Action) -> String {
 pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
     let folder = project.root.join("build").join(&config.name);
     let said = |config: &Config| {
-        [
-            Some(("name", config.name.clone())),
-            config.release.clone().map(|v| ("release", v)),
-            config.target.clone().map(|v| ("target", v)),
-        ]
+        let fixed = [
+            Some(("name".to_owned(), config.name.clone())),
+            config.release.clone().map(|v| ("release".to_owned(), v)),
+            config.target.clone().map(|v| ("target".to_owned(), v)),
+        ];
+        // What a property says in a word: text, a number, yes or no.
+        let properties = project.properties_of(config).into_iter().filter_map(|(key, value)| match value {
+            toml::Value::String(s) => Some((key, s)),
+            toml::Value::Integer(_) | toml::Value::Boolean(_) => Some((key, value.to_string())),
+            _ => None,
+        });
+        fixed.into_iter().flatten().chain(properties).collect::<Vec<_>>()
     };
-    let known = project.configs.iter().flat_map(said).flatten().map(|(key, value)| format!("{key}={value}")).collect();
+    let mut known: Vec<String> =
+        project.configs.iter().flat_map(said).map(|(key, value)| format!("{key}={value}")).collect();
+    let mut seen = std::collections::HashSet::new();
+    known.retain(|k| seen.insert(k.clone()));
     BuildConfig {
         name: config.name.clone(),
         release: config.release.clone(),
         target: config.target.clone(),
         folder: folder.display().to_string(),
         known,
+        properties: project.properties_of(config),
     }
 }
 

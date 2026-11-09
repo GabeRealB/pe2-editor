@@ -78,6 +78,9 @@ thread_local! {
     static SHARED: Cell<usize> = const { Cell::new(0) };
 }
 
+/// How many times `t.shout` ran, on any thread: what a for-each runs, at the same time.
+static SHOUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn ran(op: usize) {
     RUNS.with(|r| r[op].set(r[op].get() + 1));
 }
@@ -148,6 +151,17 @@ fn ops() -> Ops {
             parts.extend(bytes(call, input.value())?);
         }
         Ok(file(parts))
+    }));
+    ops.add(OpDef::new("t.shout", "Upper, counted", "1").input(port("in", file_type())).makes(file_type(), |call| {
+        SHOUTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let input = call.take(0)?;
+        let mut bytes = bytes(call, input.value())?;
+        bytes.make_ascii_uppercase();
+        Ok(file(bytes))
+    }));
+    ops.add(OpDef::new("t.split", "Texts as files", "1").makes(Type::List(Box::new(file_type())), |call| {
+        let texts = call.settings().get("texts").and_then(toml::Value::as_array).cloned().unwrap_or_default();
+        Ok(Value::List(texts.iter().filter_map(toml::Value::as_str).map(|t| file(t.as_bytes().to_vec())).collect()))
     }));
     ops.add(OpDef::new("t.repeat", "Repeat", "1").input(port("in", file_type())).parameter("times").makes(
         file_type(),
@@ -454,6 +468,7 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
         target: None,
         folder: String::new(),
         known: Vec::new(),
+        properties: toml::Table::new(),
     };
     engine.config = Some(config("EUR"));
     assert_eq!(read_for(&engine), "EUR/native.bin");
@@ -1042,4 +1057,386 @@ fn what_extraction_sets_is_beneath_what_the_node_sets() {
     let home = fields["stack"].as_array().unwrap()[0].as_table().unwrap();
     assert!(home.contains_key("commands") && home.contains_key("instruments"));
     assert!(!fields["stack"].as_array().unwrap()[1].as_table().unwrap().contains_key("pan"));
+}
+
+/// A config as the engine is told it: its language a property.
+fn config_of(name: &str, language: &str) -> pe2_ext::data::BuildConfig {
+    pe2_ext::data::BuildConfig {
+        name: name.to_string(),
+        release: Some("USA".to_string()),
+        target: None,
+        folder: String::new(),
+        known: Vec::new(),
+        properties: toml::Table::from_iter([("language".to_string(), toml::Value::String(language.to_string()))]),
+    }
+}
+
+/// Upper case where the language is French, joined (alone) elsewhere: the branches merged.
+const BRANCHED: &str = r#"
+[[stack]]
+op = "file"
+file = "a.txt"
+
+[[stack]]
+op = "graph"
+result = "either"
+ops.config = { op = "config" }
+ops.french = { op = "equals", field = "properties.language", to = "fr", from = { value = "config" } }
+ops.other = { op = "invert", from = { inputs = "french" } }
+ops.upper = { op = "t.upper", from = { in = "above", active = "french" } }
+ops.join = { op = "t.join", from = { parts = ["above"], active = "other" } }
+ops.either = { op = "merge", from = { inputs = ["upper", "join"] } }
+
+[[stack]]
+op = "output"
+name = "text"
+"#;
+
+#[test]
+fn a_step_not_active_is_not_made_and_a_merge_takes_the_branch_that_is() {
+    let (plan, problems) = Plan::of(&toml::from_str(BRANCHED).unwrap(), &ops(), &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let node = Bundle::new(BRANCHED, &[("a.txt", "abc")]);
+    let mut engine = Engine::new(ops(), None);
+    let world = Nodes(Vec::new(), engine.ops.clone());
+    let (text, _) = plan.output("text").unwrap();
+    let mut made_for = |language: &str| {
+        engine.config = Some(config_of(language, language));
+        let reach = super::exec::Reach { engine: &engine, world: &world };
+        let before = (runs(), shared());
+        let (made, reads) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+        let after = (runs(), shared());
+        let value = made.into_iter().next().unwrap().unwrap();
+        let text = String::from_utf8(data(&node, &value)).unwrap();
+        (text, after.0[0] - before.0[0], after.0[2] - before.0[2], reads, after.1 - before.1)
+    };
+    let (french, upper, join, reads, shared_given) = made_for("fr");
+    assert_eq!((french.as_str(), upper, join), ("ABC", 1, 0), "only the active branch runs");
+    assert_eq!(shared_given, 0, "the branch not taken let go of what both take: it was moved, not copied");
+    assert!(reads.config.is_some(), "the config was read");
+    let (english, upper, join, _, _) = made_for("en");
+    assert_eq!((english.as_str(), upper, join), ("abc", 0, 1));
+    // Nothing active: nothing made, said as such.
+    let lone = BRANCHED.replace("inputs = [\"upper\", \"join\"]", "inputs = [\"upper\"]");
+    let (plan, _) = Plan::of(&toml::from_str(&lone).unwrap(), &ops(), &[]);
+    engine.config = Some(config_of("en", "en"));
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+    let why = made.into_iter().next().unwrap().unwrap_err();
+    assert!(why.contains("not active"), "{why}");
+}
+
+#[test]
+fn what_says_whether_a_step_runs_is_a_boolean() {
+    let wrong = BRANCHED.replace("active = \"french\"", "active = \"config\"");
+    let said = problems(&wrong);
+    assert!(said.iter().any(|p| p.contains("`active` takes bool")), "{said:?}");
+    // A stack layer says it too.
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\nid = \"a\"\n\n[[stack]]\nop = \"t.count\"\nid = \"n\"\n\n\
+                 [[stack]]\nop = \"t.upper\"\nin = { from = \"a\" }\nactive = { from = \"n\" }\n";
+    let said = problems(stack);
+    assert!(said.iter().any(|p| p.contains("`active` takes bool")), "{said:?}");
+}
+
+#[test]
+fn a_config_read_for_what_it_says_holds_for_another_saying_the_same() {
+    let mut engine = Engine::new(ops(), None);
+    engine.config = Some(config_of("usa", "en"));
+    let said = super::exec::Reads {
+        config: Some(super::exec::config_hash(engine.config.as_ref(), false)),
+        ..Default::default()
+    };
+    let whole = super::exec::Reads {
+        config: Some(super::exec::config_hash(engine.config.as_ref(), true)),
+        ..Default::default()
+    };
+    engine.config = Some(config_of("usa_copy", "en"));
+    assert!(engine.holds_config(&said), "the same said by another config");
+    assert!(!engine.holds_config(&whole), "all of it read: its name too");
+    engine.config = Some(config_of("usa", "fr"));
+    assert!(!engine.holds_config(&said), "a property changed");
+    engine.config = None;
+    assert!(!engine.holds_config(&said), "no config");
+}
+
+/// A node choosing a table of another's by the language, laid over its own.
+const CHOOSING: &str = r#"
+[[stack]]
+op = "constant"
+value = { strings = { a = "one", b = "two" } }
+
+[[stack]]
+op = "graph"
+result = "either"
+ops.config = { op = "config" }
+ops.chosen = { op = "select", field = "properties.language", of = { fr = "fr", de = "de" }, from = { key = "config" } }
+ops.over = { op = "overlay", field = "strings", from = { over = "chosen", under = "above" } }
+ops.either = { op = "merge", from = { inputs = ["over", "above"] } }
+
+[[stack]]
+op = "output"
+name = "strings"
+"#;
+
+#[test]
+fn select_reads_only_the_node_it_chooses_and_nothing_where_it_names_none() {
+    let table = |strings: &str| format!("[[stack]]\nop = \"constant\"\nvalue = {{ strings = {{ {strings} }} }}\n");
+    let mut french = Bundle::new(&table("a = \"un\""), &[]);
+    french.path = "fr";
+    let mut german = Bundle::new(&table("a = \"eins\", b = \"zwei\""), &[]);
+    german.path = "de";
+    let node = Bundle::new(CHOOSING, &[]);
+    let mut engine = Engine::new(ops(), None);
+    let world = Nodes(vec![french, german], engine.ops.clone());
+    let (plan, problems) = Plan::of(&toml::from_str(CHOOSING).unwrap(), &engine.ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let (strings, _) = plan.output("strings").unwrap();
+    let mut made_for = |language: &str| {
+        engine.config = Some(config_of(language, language));
+        let reach = super::exec::Reach { engine: &engine, world: &world };
+        let (made, reads) = evaluate(&plan, &engine.ops, &node, &[(strings, None)], &Vec::new(), (None, Some(reach)));
+        let Value::Table(table) = &*made.into_iter().next().unwrap().unwrap() else { panic!("no table") };
+        (table["strings"].to_string(), reads.outputs.keys().cloned().collect::<Vec<_>>())
+    };
+    let (made, read) = made_for("fr");
+    assert_eq!(made, r#"{ a = "un", b = "two" }"#, "French over the source, key by key");
+    assert_eq!(read, ["fr#result"], "only the French table read");
+    let (made, read) = made_for("en");
+    assert_eq!(made, r#"{ a = "one", b = "two" }"#, "no table for English: the source");
+    assert!(read.is_empty(), "{read:?}");
+}
+
+/// Upper case where the config's language is the one it is set to, else as it was: a project's operation.
+const CHOOSE: &str = r#"
+[[stack]]
+op = "pe2.graph@operation"
+label = "Upper in a language"
+ops.text = { op = "input", name = "in" }
+ops.language = { op = "setting", values = ["fr", "en", "de"], default = "fr" }
+ops.config = { op = "config" }
+ops.chosen = { op = "equals", field = "properties.language", to = { setting = "language" }, from = { value = "config" } }
+ops.upper = { op = "t.upper", from = { in = "text", active = "chosen" } }
+ops.either = { op = "merge", from = { inputs = ["upper", "text"] } }
+ops.out = { op = "output", name = "text", from = { value = "either" } }
+"#;
+
+fn with_definitions(definitions: &[(&str, &str)]) -> Ops {
+    let mut ops = ops();
+    let defined = definitions.iter().map(|(uid, declaration)| {
+        let definition = super::Definition::of(uid, &toml::from_str(declaration).unwrap(), "1").unwrap();
+        (uid.to_string(), std::sync::Arc::new(definition))
+    });
+    ops.definitions = std::sync::Arc::new(defined.collect());
+    ops
+}
+
+#[test]
+fn an_operation_the_project_defines_is_laid_into_the_stacks_using_it() {
+    let ops = with_definitions(&[("uid://choose", CHOOSE)]);
+    let stack = r#"
+[[stack]]
+op = "file"
+file = "a.txt"
+
+[[stack]]
+op = "uid://choose"
+language = "en"
+
+[[stack]]
+op = "output"
+name = "text"
+"#;
+    let (plan, problems) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let node = Bundle::new(stack, &[("a.txt", "abc")]);
+    let mut engine = Engine::new(ops, None);
+    let world = Nodes(Vec::new(), engine.ops.clone());
+    let (text, _) = plan.output("text").unwrap();
+    let mut made_for = |language: &str| {
+        engine.config = Some(config_of(language, language));
+        let reach = super::exec::Reach { engine: &engine, world: &world };
+        let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+        String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap()
+    };
+    assert_eq!(made_for("en"), "ABC", "the layer's setting over the default");
+    assert_eq!(made_for("fr"), "abc");
+    // Its default where the layer does not set it; a changed definition, another plan.
+    let unset = stack.replace("language = \"en\"\n", "");
+    let (plan, _) = Plan::of(&toml::from_str(&unset).unwrap(), &engine.ops, &[]);
+    let before = plan.describe(text, &engine.ops);
+    assert!(before.contains("to = \"fr\""), "{before}");
+    let changed = with_definitions(&[("uid://choose", &CHOOSE.replace("default = \"fr\"", "default = \"de\""))]);
+    let (plan, _) = Plan::of(&toml::from_str(&unset).unwrap(), &changed, &[]);
+    assert_ne!(plan.describe(text, &changed), before);
+}
+
+#[test]
+fn an_operation_the_project_defines_may_not_use_itself() {
+    let looping = CHOOSE.replace("op = \"t.upper\"", "op = \"uid://choose\"");
+    let ops = with_definitions(&[("uid://choose", &looping)]);
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"uid://choose\"\n";
+    let (_, problems) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    assert!(problems.iter().any(|p| p.what.contains("uses itself")), "{problems:?}");
+    // A graph layer lays one in too, its inputs by its ports.
+    let ops = with_definitions(&[("uid://choose", CHOOSE)]);
+    let graph = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"graph\"\nresult = \"c\"\nops.c = { op = \"uid://choose\", language = \"en\", from = { in = \"above\" } }\n";
+    let (plan, problems) = Plan::of(&toml::from_str(graph).unwrap(), &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(plan.steps.iter().any(|s| s.op == "t.upper" && s.at.contains("Upper in a language")), "{:?}", plan.steps);
+}
+
+
+/// Two inputs, a boolean setting saying whether the first is made upper case, two outputs.
+const TWO: &str = r#"
+[[stack]]
+op = "pe2.graph@operation"
+label = "Two"
+ops.a = { op = "input", name = "first", index = 0 }
+ops.b = { op = "input", name = "second", index = 1 }
+ops.loud = { op = "setting", type = "boolean", default = false }
+ops.up = { op = "t.upper", from = { in = "a", active = "loud" } }
+ops.either = { op = "merge", from = { inputs = ["up", "a"] } }
+ops.joined = { op = "t.join", from = { parts = ["either", "b"] } }
+ops.main = { op = "output", name = "joined", index = 0, from = { value = "joined" } }
+ops.side = { op = "output", name = "second", index = 1, from = { value = "b" } }
+"#;
+
+#[test]
+fn an_operation_the_project_defines_says_what_it_is_with_its_boxes() {
+    let definition = super::Definition::of("uid://two", &toml::from_str(TWO).unwrap(), "1").unwrap();
+    let names = |ports: &[super::Port]| ports.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&definition.inputs), ["first", "second"]);
+    assert_eq!(definition.settings.iter().map(|(p, _)| p.name.as_str()).collect::<Vec<_>>(), ["loud"]);
+    assert_eq!(definition.outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["joined", "second"]);
+    let twice = TWO.replace("name = \"second\", index = 1, from = { value = \"b\" }", "name = \"joined\", from = { value = \"b\" }");
+    let refused = super::Definition::of("uid://two", &toml::from_str(&twice).unwrap(), "1").unwrap_err();
+    assert!(refused.contains("two outputs"), "{refused}");
+    let outputless = TWO.replace("op = \"output\"", "op = \"t.join\"");
+    assert!(super::Definition::of("uid://two", &toml::from_str(&outputless).unwrap(), "1").is_err());
+    // Used from a stack: its second output by name, its setting set.
+    let ops = with_definitions(&[("uid://two", TWO)]);
+    let stack = r#"
+[[stack]]
+op = "file"
+file = "a.txt"
+id = "a"
+
+[[stack]]
+op = "file"
+file = "b.txt"
+id = "b"
+
+[[stack]]
+op = "uid://two"
+id = "two"
+loud = true
+first = { from = "a" }
+second = { from = "b" }
+
+[[stack]]
+op = "output"
+name = "joined"
+
+[[stack]]
+op = "output"
+name = "side"
+value = { from = "two.second" }
+"#;
+    let (plan, problems) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let node = Bundle::new(stack, &[("a.txt", "ab"), ("b.txt", "cd")]);
+    let engine = Engine::new(ops, None);
+    let text = |name: &str| {
+        let (output, _) = plan.output(name).unwrap();
+        let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, None)], &Vec::new(), (None, None));
+        String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap()
+    };
+    assert_eq!(text("joined"), "ABcd", "the setting set: the first made upper case");
+    assert_eq!(text("side"), "cd", "its second output, by name");
+    // A graph box's outputs by name too; unset, the setting is its default.
+    let graph = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\nid = \"a\"\n\n[[stack]]\nop = \"graph\"\nresult = \"two.second\"\n\
+                 ops.f = { op = \"file\", file = \"b.txt\" }\nops.two = { op = \"uid://two\", from = { first = \"above\", second = \"f\" } }\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"out\"\n";
+    let (plan, problems) = Plan::of(&toml::from_str(graph).unwrap(), &engine.ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let (output, _) = plan.output("out").unwrap();
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(output, None)], &Vec::new(), (None, None));
+    assert_eq!(String::from_utf8(data(&node, &made.into_iter().next().unwrap().unwrap())).unwrap(), "cd");
+}
+
+/// Upper case, where the item is not `skip`: what a for-each runs.
+const LOUDER: &str = r#"
+[[stack]]
+op = "pe2.graph@operation"
+label = "Louder"
+ops.item = { op = "input", name = "item" }
+ops.skip = { op = "setting", type = "text", default = "skip" }
+ops.up = { op = "t.shout", from = { in = "item" } }
+ops.out = { op = "output", name = "out", from = { value = "up" } }
+"#;
+
+#[test]
+fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-each-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ops = with_definitions(&[("uid://louder", LOUDER)]);
+    let stack = |texts: &str| {
+        format!(
+            "[[stack]]\nop = \"t.split\"\ntexts = [{texts}]\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://louder\"\n\n\
+             [[stack]]\nop = \"concatenate\"\nname = \"all.txt\"\n\n[[stack]]\nop = \"output\"\nname = \"all\"\nretain = \"cache\"\n"
+        )
+    };
+    let engine = Engine::new(ops, Some(Store::at(dir.clone()).unwrap()));
+    let made = |texts: &str| {
+        let declaration = stack(texts);
+        let (plan, problems) = Plan::of(&toml::from_str(&declaration).unwrap(), &engine.ops, &[]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let node = Bundle::new(&declaration, &[]);
+        let before = SHOUTS.load(std::sync::atomic::Ordering::SeqCst);
+        let given = engine.output(&plan, &node, "all", true).unwrap();
+        let ran = SHOUTS.load(std::sync::atomic::Ordering::SeqCst) - before;
+        (String::from_utf8(data(&node, &given.value.unwrap())).unwrap(), ran)
+    };
+    assert_eq!(made("\"a\", \"b\", \"c\""), ("ABC".to_string(), 3), "each item made");
+    assert_eq!(made("\"a\", \"x\", \"c\""), ("AXC".to_string(), 1), "the changed item alone made again");
+    // A table's entries are items too, each its key and value; a body taking more than the item is given `with`.
+    let wrong = "[[stack]]\nop = \"constant\"\nvalue = { a = 1 }\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://louder\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"all\"\n";
+    let (plan, _) = Plan::of(&toml::from_str(wrong).unwrap(), &engine.ops, &[]);
+    let node = Bundle::new(wrong, &[]);
+    let why = engine.output(&plan, &node, "all", true).err().map_or_default(|e| format!("{e:#}"));
+    assert!(why.contains("items[0]"), "a failing item is named: {why}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What it is given where its `value` is set, nothing otherwise: a filter.
+const KEPT: &str = r#"
+[[stack]]
+op = "pe2.graph@operation"
+label = "Kept"
+ops.item = { op = "input", name = "item" }
+ops.keep = { op = "equals", field = "value", to = true, from = { value = "item" } }
+ops.out = { op = "output", name = "out", from = { value = "passed" } }
+ops.passed = { op = "merge", from = { inputs = ["item"], active = "keep" } }
+"#;
+
+#[test]
+fn a_for_each_leaves_out_what_its_body_makes_nothing_of() {
+    let ops = with_definitions(&[("uid://kept", KEPT)]);
+    let stack = "[[stack]]\nop = \"constant\"\nvalue = { a = true, b = false, c = true }\n\n[[stack]]\nop = \"for_each\"\nbody = \"uid://kept\"\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"kept\"\n";
+    let (plan, problems) = Plan::of(&toml::from_str(stack).unwrap(), &ops, &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let node = Bundle::new(stack, &[]);
+    let engine = Engine::new(ops, None);
+    let given = engine.output(&plan, &node, "kept", true).unwrap();
+    let Value::List(items) = &*given.value.unwrap() else { panic!("no list") };
+    let keys: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            Value::Table(t) => t["key"].as_str().unwrap().to_string(),
+            other => panic!("{}", other.ty()),
+        })
+        .collect();
+    assert_eq!(keys, ["a", "c"]);
 }

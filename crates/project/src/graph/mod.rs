@@ -251,6 +251,64 @@ pub const THUMBNAIL: &str = "thumbnail";
 pub const RESULT: &str = "result";
 /// What a graph layer's operations name the result above it by.
 pub const ABOVE: &str = "above";
+/// What any step may take besides its operation's ports: whether it runs (a boolean, true where it takes nothing). One
+/// that does not makes nothing - nor does what takes from it, but `merge`.
+pub const ACTIVE: &str = "active";
+/// The first of what it takes that is made: what takes branches together again.
+pub const MERGE: &str = "merge";
+/// The config being built, as a table: its `release`, `target` and `properties`.
+pub const CONFIG: &str = "config";
+/// Whether what it takes (at `field`, dotted, of a table) is `to`.
+pub const EQUALS: &str = "equals";
+/// Booleans, all true; any true; and one turned around. Named apart from the event gates, which take signals.
+pub const ALL: &str = "all";
+pub const ANY: &str = "any";
+pub const INVERT: &str = "invert";
+/// Another node's output, chosen by a key: what it takes (at `field`) names one of its `of` (key to reference), else
+/// its `default`'s, else nothing. Only the one chosen is read.
+pub const SELECT: &str = "select";
+/// A table over another, key by key, nested tables by theirs (at `field`, dotted, where only that part is).
+pub const OVERLAY: &str = "overlay";
+/// What `active` takes, and the logic operations make.
+pub const BOOL_TYPE: &str = "bool";
+/// An operation the project defines' boxes, inside it: what it takes (`name`, `type`, `many`, `index`), what it is set
+/// to (`name`, `type` or `values`, `default`, `label`, `index`: a property's shape), and - `output` - what it makes.
+pub const INPUT: &str = "input";
+pub const SETTING: &str = "setting";
+/// What stands for a value given from outside a plan: an operation's input, laid out alone (`Plan::of_definition`).
+pub const GIVEN: &str = "given";
+/// An operation the project defines (`body`, by uid) run for each item of a list - or of a table, each as its `key` and
+/// `value` - given too what `with` takes, each item made once for what it takes; what it makes of them, a list, those
+/// it makes nothing of left out.
+pub const FOR_EACH: &str = "for_each";
+
+/// A boolean, as the graph passes one.
+#[must_use]
+pub fn boolean(value: bool) -> Value {
+    let settings = Table::from_iter([("value".to_string(), Toml::Boolean(value))]);
+    Value::Typed(Typed { ty: BOOL_TYPE.to_string(), settings, ..Typed::default() })
+}
+
+/// A boolean passed, where it is one.
+#[must_use]
+pub fn truth(value: &Value) -> Option<bool> {
+    match value {
+        Value::Typed(typed) if typed.ty == BOOL_TYPE => typed.settings.get("value")?.as_bool(),
+        _ => None,
+    }
+}
+
+/// What an operation fails with to make nothing, as an inactive step does: `select` naming no node.
+#[derive(Debug)]
+pub struct Absent;
+
+impl std::fmt::Display for Absent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing is made")
+    }
+}
+
+impl std::error::Error for Absent {}
 
 /// An event as a box: it holds while its `event` is signaled. What it is the value of is no value: only a gate, a pull or a listen takes it.
 pub const EVENT: &str = "event";
@@ -303,6 +361,130 @@ pub struct Ops {
     defs: HashMap<String, Arc<OpDef>>,
     /// What a viewer takes: the host's own, and those extensions register.
     pub viewers: Arc<Vec<Type>>,
+    /// The operations the project defines, by uid (`uid://...`): laid into each stack using one.
+    pub definitions: Arc<Definitions>,
+}
+
+/// What a project defines an operation as: a node of this type (`pe2.graph@operation`).
+pub const DEFINED: &str = "pe2.graph@operation";
+/// What a project defines a template as.
+pub const DEFINED_TEMPLATE: &str = "pe2.graph@template";
+
+/// The operations a project defines, by uid.
+pub type Definitions = HashMap<String, Arc<Definition>>;
+
+/// An operation a project defines: a graph of others - laid into each stack naming it by its node's uid, as a graph
+/// layer is - whose boxes say what it is from outside: each `input` it takes, each `setting` it is set to (read inside it
+/// by the box's value, or where a value is `{ setting = "<name>" }`, its default where the layer does not set it) and
+/// each `output` it makes, the first its result.
+#[derive(Clone, Debug)]
+pub struct Definition {
+    pub uid: String,
+    pub label: String,
+    /// Its declaration's hash: what tells it changed.
+    pub version: String,
+    /// What it takes, in order, each with the box that stands for it inside.
+    pub inputs: Vec<Port>,
+    pub input_boxes: Vec<String>,
+    /// What it is set to: each a property's shape, default and label (`crate::Property`), with its box.
+    pub settings: Vec<(crate::Property, String)>,
+    /// What it makes, by name, in order - the first its result - each with its box.
+    pub outputs: Vec<(String, String)>,
+    pub ops: Table,
+}
+
+/// Its boxes of a kind, in the order of their `index`, else of their ids: each id and table.
+fn boxes<'a>(ops: &'a Table, kind: &str) -> Vec<(&'a String, &'a Table)> {
+    let mut found: Vec<(i64, &String, &Table)> = ops
+        .iter()
+        .filter_map(|(id, op)| Some((id, op.as_table()?)))
+        .filter(|(_, op)| op.get("op").and_then(Toml::as_str) == Some(kind))
+        .map(|(id, op)| (op.get("index").and_then(Toml::as_integer).unwrap_or(i64::MAX), id, op))
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    found.into_iter().map(|(_, id, op)| (id, op)).collect()
+}
+
+impl Definition {
+    /// A node's definition, from its declaration's layer that is one: its boxes.
+    ///
+    /// # Errors
+    /// It holds no such layer, it makes nothing, or a box is not one: two of a name, a type or setting not as one is
+    /// written.
+    pub fn of(uid: &str, fields: &Table, version: &str) -> Result<Definition, String> {
+        let layers = fields.get("stack").and_then(Toml::as_array).into_iter().flatten();
+        let layer =
+            layers.filter_map(Toml::as_table).find(|layer| layer.get("op").and_then(Toml::as_str) == Some(DEFINED));
+        let layer = layer.ok_or("it defines no operation")?;
+        let ops = layer.get("ops").and_then(Toml::as_table).cloned().unwrap_or_default();
+        let name_of = |id: &String, op: &Table| op.get("name").and_then(Toml::as_str).unwrap_or(id).to_string();
+        let mut seen = HashSet::new();
+        let mut once = |kind: &str, name: &str| {
+            if seen.insert((kind.to_string(), name.to_string())) {
+                Ok(())
+            } else {
+                Err(format!("it has two {kind}s `{name}`"))
+            }
+        };
+        let (mut inputs, mut input_boxes) = (Vec::new(), Vec::new());
+        for (id, op) in boxes(&ops, INPUT) {
+            let name = name_of(id, op);
+            once(INPUT, &name)?;
+            let ty = op.get("type").and_then(Toml::as_str).unwrap_or("any");
+            let ty = Type::parse(ty, "").map_err(|e| format!("its input `{name}`: {e}"))?;
+            let many = op.get("many").and_then(Toml::as_bool).unwrap_or(false);
+            inputs.push(Port { name, ty, many });
+            input_boxes.push(id.clone());
+        }
+        let mut settings = Vec::new();
+        for (id, op) in boxes(&ops, SETTING) {
+            let name = name_of(id, op);
+            once(SETTING, &name)?;
+            let property = crate::property_of(&name, &Toml::Table(op.clone()))
+                .map_err(|why| format!("its setting `{name}`: {why}"))?;
+            if let Some(why) = property.default.as_ref().and_then(|d| property.kind.refuses(d)) {
+                return Err(format!("its setting `{name}`'s default: {why}"));
+            }
+            settings.push((property, id.clone()));
+        }
+        let mut outputs = Vec::new();
+        for (id, op) in boxes(&ops, OUTPUT) {
+            let name = name_of(id, op);
+            once(OUTPUT, &name)?;
+            outputs.push((name, id.clone()));
+        }
+        if outputs.is_empty() {
+            return Err("it makes nothing: it has no `output` box".into());
+        }
+        let label = layer.get("label").and_then(Toml::as_str).map_or_else(|| uid.to_string(), str::to_owned);
+        Ok(Definition { uid: uid.to_string(), label, version: version.to_string(), inputs, input_boxes, settings, outputs, ops })
+    }
+
+    /// Its settings' values: the layer's, else their defaults.
+    #[must_use]
+    pub fn values(&self, layer: &Table) -> Table {
+        self.settings
+            .iter()
+            .filter_map(|(p, _)| Some((p.name.clone(), layer.get(&p.name).or(p.default.as_ref())?.clone())))
+            .collect()
+    }
+}
+
+/// A value with each `{ setting = "<name>" }` in it the value of that name.
+fn substituted(value: &Toml, settings: &Table) -> Result<Toml, String> {
+    Ok(match value {
+        Toml::Table(table) if table.len() == 1 && table.get("setting").is_some_and(Toml::is_str) => {
+            let name = table.get("setting").and_then(Toml::as_str).unwrap_or_default();
+            settings.get(name).cloned().ok_or_else(|| format!("its setting `{name}` is not set, and has no default"))?
+        }
+        Toml::Table(table) => Toml::Table(
+            table.iter().map(|(k, v)| Ok((k.clone(), substituted(v, settings)?))).collect::<Result<_, String>>()?,
+        ),
+        Toml::Array(items) => {
+            Toml::Array(items.iter().map(|v| substituted(v, settings)).collect::<Result<_, String>>()?)
+        }
+        other => other.clone(),
+    })
 }
 
 impl Ops {
@@ -362,6 +544,154 @@ fn add_signals(ops: &mut Ops) {
     }
 }
 
+/// The table a value holds: itself, or a typed value's settings.
+fn table_in(value: &Value) -> Option<&Table> {
+    match value {
+        Value::Table(table) => Some(table),
+        Value::Typed(typed) => Some(&typed.settings),
+        _ => None,
+    }
+}
+
+/// What a value holds at a dotted `field` of its table (all of it where none): a boolean as itself, a table as one.
+fn value_at(value: &Value, field: Option<&str>) -> Option<Toml> {
+    if field.is_none()
+        && let Some(truth) = truth(value)
+    {
+        return Some(Toml::Boolean(truth));
+    }
+    let table = table_in(value)?;
+    let Some(field) = field else { return Some(Toml::Table(table.clone())) };
+    let mut parts = field.split('.');
+    let mut at = table.get(parts.next()?)?;
+    for part in parts {
+        at = at.get(part)?;
+    }
+    Some(at.clone())
+}
+
+/// `over` laid on `under`, key by key, tables by theirs.
+fn laid_over(under: &mut Table, over: &Table) {
+    for (key, value) in over {
+        match (under.get_mut(key), value) {
+            (Some(Toml::Table(below)), Toml::Table(above)) => laid_over(below, above),
+            _ => {
+                under.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// The operations of choice: the config built, comparison, logic, choosing another node's output, merging branches and
+/// laying tables over others.
+fn add_logic(ops: &mut Ops) {
+    let bool_type = Type::Named(BOOL_TYPE.to_string());
+    let bools = |name: &str| Port { name: name.to_string(), ty: Type::Named(BOOL_TYPE.to_string()), many: true };
+    ops.add(OpDef::new(CONFIG, "The config built", "1").makes(Type::Table, |call| {
+        let mut table = Table::new();
+        if let Some((release, target, properties)) = call.config_said() {
+            table.extend(release.map(|r| ("release".to_string(), Toml::String(r))));
+            table.extend(target.map(|t| ("target".to_string(), Toml::String(t))));
+            table.insert("properties".into(), Toml::Table(properties));
+        }
+        Ok(Value::Table(table))
+    }));
+    ops.add(OpDef::new(EQUALS, "Equals", "1").input(port("value", Type::Any)).makes(bool_type.clone(), |call| {
+        let field = call.settings().get("field").and_then(Toml::as_str).map(str::to_owned);
+        let to = call.settings().get("to").cloned().context("it is compared `to` nothing")?;
+        let given = call.take(0)?;
+        Ok(boolean(value_at(given.value(), field.as_deref()).is_some_and(|v| v == to)))
+    }));
+    let logic = |name: &'static str, label: &'static str, gate: &'static str| {
+        let table = GATES.iter().find(|g| g.name == gate).map(|g| g.table);
+        OpDef::new(name, label, "1").input(bools("inputs")).makes(Type::Named(BOOL_TYPE.to_string()), move |call| {
+            let given = call.take_all(0);
+            let truths: Option<Vec<bool>> = given.iter().map(|v| truth(v.value())).collect();
+            let truths = truths.context("given what is no boolean")?;
+            Ok(boolean(table.is_some_and(|table| table(&truths))))
+        })
+    };
+    ops.add(logic(ALL, "All", "and"));
+    ops.add(logic(ANY, "Any", "or"));
+    ops.add(logic(INVERT, "Invert", "not"));
+    // Taken by the evaluation itself, asking for its inputs in turn: run, it is given those made.
+    ops.add(OpDef::new(MERGE, "Merge", "1").input(ports("inputs", Type::Any)).makes(Type::Any, |call| {
+        call.take_all(0).into_iter().next().map(exec::Input::take).ok_or_else(|| anyhow::Error::new(Absent))
+    }));
+    ops.add(OpDef::new(SELECT, "Select", "1").input(port("key", Type::Any)).makes(Type::Any, |call| {
+        let field = call.settings().get("field").and_then(Toml::as_str).map(str::to_owned);
+        let of = call.settings().get("of").and_then(Toml::as_table).context("it chooses `of` nothing")?.clone();
+        let address = call.settings().get("output").and_then(Toml::as_str).unwrap_or(RESULT).to_owned();
+        let given = call.take(0)?;
+        let key = value_at(given.value(), field.as_deref());
+        let key = key.as_ref().and_then(Toml::as_str).filter(|k| of.contains_key(*k));
+        let key = key.or_else(|| call.settings().get("default").and_then(Toml::as_str));
+        let Some(reference) = key.and_then(|k| of.get(k)) else { return Err(anyhow::Error::new(Absent)) };
+        Ok((*call.output_of(reference, &address)?).clone())
+    }));
+    ops.add(OpDef::new(OVERLAY, "Overlay", "1").input(port("over", Type::Any)).input(port("under", Type::Any)).makes(
+        Type::Table,
+        |call| {
+            let field = call.settings().get("field").and_then(Toml::as_str).map(str::to_owned);
+            let over = call.take(0)?;
+            let under = call.take(1)?;
+            let mut table = table_in(under.value()).cloned().context("laid over what is no table")?;
+            let over = value_at(over.value(), field.as_deref());
+            let Some(Toml::Table(over)) = over else { anyhow::bail!("lays what is no table") };
+            match field.as_deref() {
+                None => laid_over(&mut table, &over),
+                Some(field) => {
+                    let mut at = &mut table;
+                    let mut parts = field.split('.').peekable();
+                    while let Some(part) = parts.next() {
+                        let entry = at.entry(part.to_string()).or_insert_with(|| Toml::Table(Table::new()));
+                        let Toml::Table(inner) = entry else { anyhow::bail!("its `{field}` is no table below") };
+                        if parts.peek().is_none() {
+                            laid_over(inner, &over);
+                            break;
+                        }
+                        at = inner;
+                    }
+                }
+            }
+            Ok(Value::Table(table))
+        },
+    ));
+}
+
+/// The boxes of an operation the project defines - its inputs, settings - and what stands for a value given from
+/// outside a plan. An input and what is given are what the plan is given, never run; a setting makes its value: a
+/// boolean as one, anything else as a table's `value`.
+fn add_boxes(ops: &mut Ops) {
+    let declared = |settings: &Table| Type::parse(settings.get("type")?.as_str()?, "").ok();
+    ops.add(OpDef::new(INPUT, "Input", "1").output_of(declared).makes(Type::Any, |_| {
+        anyhow::bail!("an input is given only inside an operation the project defines")
+    }));
+    ops.add(OpDef::new(GIVEN, "Given", "1").output_of(declared).makes(Type::Any, |_| {
+        anyhow::bail!("what is given from outside is never made")
+    }));
+    // Run by the evaluation itself, which lays its body out (`exec::Evaluation::for_each`).
+    ops.add(
+        OpDef::new(FOR_EACH, "For each", "1")
+            .input(port("items", Type::Any))
+            .input(ports("with", Type::Any))
+            .makes(Type::List(Box::new(Type::Any)), |_| anyhow::bail!("a for-each is run by the evaluation")),
+    );
+    let made = |settings: &Table| {
+        Some(match settings.get("value")? {
+            Toml::Boolean(_) => Type::Named(BOOL_TYPE.to_string()),
+            _ => Type::Table,
+        })
+    };
+    ops.add(OpDef::new(SETTING, "Setting", "1").output_of(made).makes(Type::Any, |call| {
+        let value = call.settings().get("value").cloned().context("it is set to nothing")?;
+        Ok(match value {
+            Toml::Boolean(set) => boolean(set),
+            other => Value::Table(Table::from_iter([("value".to_string(), other)])),
+        })
+    }));
+}
+
 /// The operations of lists: other nodes' outputs, and files concatenated.
 fn add_lists(ops: &mut Ops) {
     ops.add(OpDef::new(REFERENCES, "Other nodes' outputs", "1").makes(Type::List(Box::new(Type::Any)), |call| {
@@ -408,7 +738,7 @@ fn add_lists(ops: &mut Ops) {
 
 impl Default for Ops {
     fn default() -> Ops {
-        let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()) };
+        let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()), definitions: Arc::default() };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             // A file the releases have apart is read as the release being built has it (`<release>/<file>`).
             let name = call.of_release(call.setting_str("file")?);
@@ -453,6 +783,8 @@ impl Default for Ops {
         }));
         add_signals(&mut ops);
         add_lists(&mut ops);
+        add_logic(&mut ops);
+        add_boxes(&mut ops);
         ops.add(OpDef::new(THUMBNAIL, "Thumbnail", "1").input(port("picture", Type::Image)).makes(
             Type::Image,
             |call| {
@@ -486,6 +818,34 @@ impl Ops {
     pub fn get(&self, name: &str) -> Option<&Arc<OpDef>> {
         self.defs.get(name)
     }
+
+    /// What an operation makes, by name - its first under none (`""`) - with its type: an extension's or the host's,
+    /// or one the project defines.
+    #[must_use]
+    pub fn outputs_of(&self, name: &str) -> Vec<(String, Type)> {
+        match (self.defs.get(name), self.definitions.get(name)) {
+            (Some(def), _) => std::iter::once((String::new(), def.output.clone().unwrap_or(Type::Any)))
+                .chain(def.also.iter().cloned())
+                .collect(),
+            (None, Some(definition)) => definition
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| (if i == 0 { String::new() } else { name.clone() }, Type::Any))
+                .collect(),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// What an operation takes, by port: an extension's, the host's, or one the project defines.
+    #[must_use]
+    pub fn ports_of(&self, name: &str) -> Vec<Port> {
+        match (self.defs.get(name), self.definitions.get(name)) {
+            (Some(def), _) => def.inputs.clone(),
+            (None, Some(definition)) => definition.inputs.clone(),
+            (None, None) => Vec::new(),
+        }
+    }
 }
 
 /// An operation of a plan: its type, its settings, and the steps each of its ports takes from.
@@ -498,6 +858,15 @@ pub struct Step {
     pub ty: Type,
     /// Where its node's declaration has it: `stack[1]`, `stack[2].ops.join`.
     pub at: String,
+    /// The step saying whether it runs (`ACTIVE`): it always does where none.
+    pub active: Option<usize>,
+}
+
+impl Step {
+    /// The steps it takes from: by its ports, and what says whether it runs.
+    pub fn sources(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inputs.iter().flatten().copied().chain(self.active)
+    }
 }
 
 /// An output of a node.
@@ -594,14 +963,33 @@ pub fn set_on(op: &str, settings: &Table) -> Table {
 
 /// Whether a layer's key is no setting of its node's, but how the stack is put together.
 fn structural(op: &str, key: &str) -> bool {
-    matches!(key, "op" | "id" | "pos" | "ops" | "result")
+    matches!(key, "op" | "id" | "pos" | "ops" | "result" | ACTIVE)
         || (op == FILE && matches!(key, "file" | "optional"))
         || (op == REFERENCES && matches!(key, "field" | "key" | "output"))
 }
 
 /// Whether a layer holds settings of its node's: an output says how it is kept, not what its node is.
 fn holds_settings(op: &str) -> bool {
-    ![OUTPUT, PREVIEW, GRAPH, BELOW, CONCATENATE].contains(&op)
+    ![
+        OUTPUT,
+        PREVIEW,
+        GRAPH,
+        BELOW,
+        CONCATENATE,
+        CONFIG,
+        EQUALS,
+        ALL,
+        ANY,
+        INVERT,
+        MERGE,
+        SELECT,
+        OVERLAY,
+        INPUT,
+        SETTING,
+        GIVEN,
+        FOR_EACH,
+    ]
+    .contains(&op)
 }
 
 /// A node's declaration with the settings a generated layer holds for it (its `settings.toml`, made by extraction) beneath
@@ -744,6 +1132,49 @@ impl Plan {
         Plan::of(&declaration, ops, tail)
     }
 
+    /// An operation the project defines laid out alone, set to `settings` over its defaults: each of its inputs a step
+    /// standing for what it is given (`GIVEN`, the first steps, in order), its outputs the plan's, by name, the first
+    /// its result. What a `for_each` runs for each item; what the graph view shows of one.
+    #[must_use]
+    pub fn of_definition(definition: &Arc<Definition>, settings: &Table, ops: &Ops, at: &str) -> (Plan, Vec<Problem>) {
+        let declaration = Table::new();
+        let mut lowering = Lowering {
+            ops,
+            declaration: &declaration,
+            plan: Plan::default(),
+            problems: Vec::new(),
+            named: HashMap::new(),
+            picks: HashMap::new(),
+            inlining: Vec::new(),
+            collecting: Vec::new(),
+            groups: HashMap::new(),
+        };
+        let Some(given) = ops.get(GIVEN).cloned() else { return (Plan::default(), Vec::new()) };
+        let mut inputs = Vec::new();
+        for port in &definition.inputs {
+            let step = lowering.step(&given, GIVEN, Table::new(), Vec::new(), at);
+            lowering.plan.steps[step].ty = port.ty.clone();
+            inputs.push(vec![step]);
+        }
+        if let Some(first) = lowering.inline(definition, settings, inputs, None, at) {
+            for (name, from) in lowering.groups.get(&first).cloned().unwrap_or_default() {
+                lowering.plan.outputs.push(Output {
+                    name,
+                    parameter: None,
+                    fixed: false,
+                    from,
+                    retain: Retain::Transient,
+                    preview: false,
+                    eager: false,
+                    at: at.to_string(),
+                    events: OutputEvents::default(),
+                });
+            }
+            lowering.plan.result = Some(first);
+        }
+        (lowering.plan, lowering.problems)
+    }
+
     /// A declaration's stack lowered and checked: the plan, and what is wrong with it. A plan with problems still has
     /// the steps and outputs that are sound, so a node keeps what it can make.
     #[must_use]
@@ -755,6 +1186,9 @@ impl Plan {
             problems: Vec::new(),
             named: HashMap::new(),
             picks: HashMap::new(),
+            inlining: Vec::new(),
+            collecting: Vec::new(),
+            groups: HashMap::new(),
         };
         let result = match declaration.get("stack") {
             None => None,
@@ -872,7 +1306,7 @@ impl Plan {
         let mut todo: Vec<usize> = steps.to_vec();
         while let Some(s) = todo.pop() {
             if !std::mem::replace(&mut needed[s], true) && !known.contains(&s) {
-                todo.extend(self.steps[s].inputs.iter().flatten());
+                todo.extend(self.steps[s].sources());
             }
         }
         needed
@@ -887,7 +1321,14 @@ impl Plan {
         for (i, step) in self.steps.iter().enumerate().filter(|(i, _)| needed[*i]) {
             let version = ops.get(&step.op).map_or("?", |d| d.version.as_str());
             let settings = toml::to_string(&step.settings).unwrap_or_default();
-            let _ = writeln!(text, "{i} {}@{version} {:?}\n{settings}", step.op, step.inputs);
+            match step.active {
+                Some(active) => {
+                    let _ = writeln!(text, "{i} {}@{version} {:?} active {active}\n{settings}", step.op, step.inputs);
+                }
+                None => {
+                    let _ = writeln!(text, "{i} {}@{version} {:?}\n{settings}", step.op, step.inputs);
+                }
+            }
         }
         let output = &self.outputs[output];
         let _ = writeln!(text, "output {} {:?} from {}", output.name, output.parameter, output.from);
@@ -921,6 +1362,12 @@ struct Lowering<'a> {
     named: HashMap<String, usize>,
     /// The steps picking outputs, by the step and the output.
     picks: HashMap<(usize, usize), usize>,
+    /// The operations the project defines being laid in, outermost first.
+    inlining: Vec<String>,
+    /// What the `output` boxes of each being laid in are given, by name.
+    collecting: Vec<Vec<(String, usize)>>,
+    /// The outputs of each operation the project defines laid in, by its first: what `id.<name>` takes.
+    groups: HashMap<usize, Vec<(String, usize)>>,
 }
 
 /// A layer's or graph operation's settings: its table without the keys that place it.
@@ -953,8 +1400,18 @@ impl Lowering<'_> {
         }
         let told = def.output_of.as_ref().and_then(|output_of| output_of(&settings));
         let ty = told.unwrap_or_else(|| def.output.as_ref().map_or(Type::Any, |t| t.bind(&bound)));
-        self.plan.steps.push(Step { op: op.to_string(), settings, inputs, ty, at: at.to_string() });
+        self.plan.steps.push(Step { op: op.to_string(), settings, inputs, ty, at: at.to_string(), active: None });
         self.plan.steps.len() - 1
+    }
+
+    /// Say what a step takes to tell whether it runs: a boolean.
+    fn activate(&mut self, step: usize, active: Option<usize>, at: &str) {
+        let Some(active) = active else { return };
+        let made = self.plan.steps[active].ty.clone();
+        if !Type::Named(BOOL_TYPE.to_string()).unify(&made, &mut Vec::new()) {
+            self.problem(at, &format!("its `{ACTIVE}` takes {BOOL_TYPE}, and is given {made}"));
+        }
+        self.plan.steps[step].active = Some(active);
     }
 
     /// A stack's layers: the step of its result, where it has one.
@@ -995,20 +1452,46 @@ impl Lowering<'_> {
                 }
                 GRAPH => above = self.graph(layer, above, &at),
                 _ => {
-                    let Some(def) = self.ops.get(op).cloned() else {
+                    let defined = self.ops.definitions.get(op).cloned();
+                    let def = self.ops.get(op).cloned();
+                    if def.is_none() && defined.is_none() {
                         self.problem(&at, &format!("`{op}`: no extension provides it"));
                         above = None;
                         continue;
-                    };
-                    let Some(inputs) = self.inputs_of(&def, layer, above, &at) else {
+                    }
+                    let ports = self.ops.ports_of(op);
+                    let Some(inputs) = self.inputs_of(&ports, layer, above, &at) else {
                         above = None;
                         continue;
                     };
-                    let settings = layer
-                        .iter()
-                        .filter(|(key, value)| !matches!(key.as_str(), "op" | "id") && wire_of(value).is_none());
-                    let settings = settings.map(|(key, value)| (key.clone(), value.clone())).collect();
+                    let settings = layer.iter().filter(|(key, value)| {
+                        !matches!(key.as_str(), "op" | "id" | ACTIVE) && wire_of(value).is_none()
+                    });
+                    let settings: Table = settings.map(|(key, value)| (key.clone(), value.clone())).collect();
+                    let active = match layer.get(ACTIVE).and_then(wire_of).map(|w| (w, w.as_str())) {
+                        Some((_, Some(wire))) => {
+                            let Some(step) = self.wire(wire, &at) else {
+                                above = None;
+                                continue;
+                            };
+                            Some(step)
+                        }
+                        Some((_, None)) => {
+                            self.problem(&at, &format!("its `{ACTIVE}` takes one value"));
+                            None
+                        }
+                        None => None,
+                    };
+                    let (Some(def), None) = (def, &defined) else {
+                        let defined = defined.unwrap_or_else(|| unreachable!("checked above"));
+                        above = self.inline(&defined, &settings, inputs, active, &at);
+                        if let (Some(id), Some(step)) = (layer.get("id").and_then(Toml::as_str), above) {
+                            self.named.insert(id.to_string(), step);
+                        }
+                        continue;
+                    };
                     let step = self.step(&def, op, settings, inputs, &at);
+                    self.activate(step, active, &at);
                     if let Some(id) = layer.get("id").and_then(Toml::as_str) {
                         self.named.insert(id.to_string(), step);
                     }
@@ -1058,6 +1541,7 @@ impl Lowering<'_> {
                         *input = made.get(input).copied().unwrap_or(*input);
                     }
                 }
+                step.active = step.active.map(|active| made.get(&active).copied().unwrap_or(active));
                 step.settings.insert("each".into(), key.clone().into());
                 self.plan.steps.push(step);
                 made.insert(at_step, self.plan.steps.len() - 1);
@@ -1071,9 +1555,9 @@ impl Lowering<'_> {
     }
 
     /// What a layer's ports take: what they say they are connected to, or the first what is above it.
-    fn inputs_of(&mut self, def: &OpDef, layer: &Table, above: Option<usize>, at: &str) -> Option<Vec<Vec<usize>>> {
-        let mut inputs = Vec::with_capacity(def.inputs.len());
-        for (place, port) in def.inputs.iter().enumerate() {
+    fn inputs_of(&mut self, ports: &[Port], layer: &Table, above: Option<usize>, at: &str) -> Option<Vec<Vec<usize>>> {
+        let mut inputs = Vec::with_capacity(ports.len());
+        for (place, port) in ports.iter().enumerate() {
             let given = match layer.get(&port.name).and_then(wire_of) {
                 Some(Toml::String(wire)) => vec![self.wire(wire, at)?],
                 Some(Toml::Array(wires)) => {
@@ -1099,6 +1583,20 @@ impl Lowering<'_> {
             self.problem(at, &format!("it takes from `{id}`, no layer above it"));
             return None;
         };
+        self.output_of(step, id, output, at)
+    }
+
+    /// One of the outputs of what a layer or box (`id`) is: its first where none is named. An operation the project
+    /// defines has its own, by name; one with several outputs (`also`), a step picking it.
+    fn output_of(&mut self, step: usize, id: &str, output: Option<&str>, at: &str) -> Option<usize> {
+        if let Some(outputs) = self.groups.get(&step) {
+            let Some(name) = output else { return Some(step) };
+            let found = outputs.iter().find(|(known, _)| known == name).map(|(_, step)| *step);
+            if found.is_none() {
+                self.problem(at, &format!("`{id}` has no output `{name}`"));
+            }
+            return found;
+        }
         let def = self.ops.get(&self.plan.steps[step].op).cloned()?;
         let first = def.output.clone().unwrap_or(Type::Any);
         match output {
@@ -1120,7 +1618,9 @@ impl Lowering<'_> {
             return *picked;
         }
         let settings = Table::from_iter([("output".to_string(), Toml::Integer(i64::try_from(output).unwrap_or(0)))]);
-        self.plan.steps.push(Step { op: PICK.to_string(), settings, inputs: vec![vec![step]], ty, at: at.to_string() });
+        let pick =
+            Step { op: PICK.to_string(), settings, inputs: vec![vec![step]], ty, at: at.to_string(), active: None };
+        self.plan.steps.push(pick);
         let picked = self.plan.steps.len() - 1;
         self.picks.insert((step, output), picked);
         picked
@@ -1162,7 +1662,7 @@ impl Lowering<'_> {
             if self.ops.get(&self.plan.steps[s].op).is_some_and(|d| d.parameter.is_some()) {
                 return true;
             }
-            todo.extend(self.plan.steps[s].inputs.iter().flatten());
+            todo.extend(self.plan.steps[s].sources());
         }
         false
     }
@@ -1211,6 +1711,7 @@ impl Lowering<'_> {
                 inputs: Vec::new(),
                 ty: Type::Named(SIGNAL_TYPE.to_string()),
                 at: at.to_string(),
+                active: None,
             });
             steps.push(self.plan.steps.len() - 1);
         }
@@ -1294,6 +1795,111 @@ impl Lowering<'_> {
                 return None;
             }
         };
+        let given: HashMap<String, Vec<usize>> =
+            above.map(|above| (ABOVE.to_string(), vec![above])).into_iter().collect();
+        let placed = self.graph_of(ops, &given, at);
+        match layer.get("result").and_then(Toml::as_str) {
+            Some(ABOVE) => above,
+            Some(result) => {
+                let (id, output) = result.split_once('.').map_or((result, None), |(id, o)| (id, Some(o)));
+                if let Some(&step) = placed.get(id) {
+                    return self.output_of(step, id, output, at);
+                }
+                // One that could not be lowered has said why.
+                if !ops.contains_key(id) {
+                    self.problem(at, &format!("its result `{id}` is none of its operations"));
+                }
+                None
+            }
+            None => {
+                self.problem(at, "names no result");
+                None
+            }
+        }
+    }
+
+    /// An operation the project defines laid in: its graph, its `input` boxes given what its inputs take, its
+    /// `setting` boxes the layer's settings over their defaults - read too where a value is `{ setting = "<name>" }` -
+    /// and what its `output` boxes are given its outputs, by name: each its own step, not made where `active` says so.
+    /// Its first output's step.
+    fn inline(
+        &mut self,
+        definition: &Arc<Definition>,
+        settings: &Table,
+        inputs: Vec<Vec<usize>>,
+        active: Option<usize>,
+        at: &str,
+    ) -> Option<usize> {
+        if self.inlining.contains(&definition.uid) {
+            self.problem(at, &format!("`{}` uses itself, through others or not", definition.label));
+            return None;
+        }
+        let here = format!("{at} ({})", definition.label);
+        let mut given: HashMap<String, Vec<usize>> = HashMap::new();
+        for ((port, from), id) in definition.inputs.iter().zip(inputs).zip(&definition.input_boxes) {
+            let mut bound = Vec::new();
+            for &step in &from {
+                let made = self.plan.steps[step].ty.clone();
+                if !port.ty.unify(&made, &mut bound) {
+                    self.problem(at, &format!("its `{}` takes {}, and is given {made}", port.name, port.ty));
+                }
+            }
+            given.insert(id.clone(), from);
+        }
+        let values = definition.values(settings);
+        let setting_op = self.ops.get(SETTING).cloned()?;
+        for (property, id) in &definition.settings {
+            let Some(value) = values.get(&property.name) else {
+                self.problem(at, &format!("its setting `{}` is not set, and has no default", property.name));
+                return None;
+            };
+            if let Some(why) = property.kind.refuses(value) {
+                self.problem(at, &format!("its setting `{}`: {why}", property.name));
+            }
+            let set = Table::from_iter([("value".to_string(), value.clone())]);
+            let step = self.step(&setting_op, SETTING, set, Vec::new(), &format!("{here}.ops.{id}"));
+            given.insert(id.clone(), vec![step]);
+        }
+        let inside: Table = definition
+            .ops
+            .iter()
+            .filter(|(id, _)| !given.contains_key(id.as_str()))
+            .map(|(id, op)| (id.clone(), op.clone()))
+            .collect();
+        let ops = match substituted(&Toml::Table(inside), &values) {
+            Ok(Toml::Table(ops)) => ops,
+            Ok(_) => return None,
+            Err(why) => {
+                self.problem(at, &format!("`{}`: {why}", definition.label));
+                return None;
+            }
+        };
+        self.inlining.push(definition.uid.clone());
+        self.collecting.push(Vec::new());
+        self.graph_of(&ops, &given, &here);
+        let made = self.collecting.pop().unwrap_or_default();
+        self.inlining.pop();
+        let merge = self.ops.get(MERGE).cloned()?;
+        let mut outputs = Vec::new();
+        for (name, _) in &definition.outputs {
+            let Some(&(_, from)) = made.iter().find(|(made, _)| made == name) else {
+                self.problem(at, &format!("`{}`: its output `{name}` is given nothing", definition.label));
+                return None;
+            };
+            // Each its own step: what tells this operation's outputs from others', and what says whether they are made.
+            let step = self.step(&merge, MERGE, Table::new(), vec![vec![from]], at);
+            self.plan.steps[step].ty = self.plan.steps[from].ty.clone();
+            self.activate(step, active, at);
+            outputs.push((name.clone(), step));
+        }
+        let first = outputs.first()?.1;
+        self.groups.insert(first, outputs);
+        Some(first)
+    }
+
+    /// A graph's operations, after those they take from - what it is given by name (`above`, an operation's inputs) -
+    /// and its result's step, where it has a sound one.
+    fn graph_of(&mut self, ops: &Table, given: &HashMap<String, Vec<usize>>, at: &str) -> HashMap<String, usize> {
         // Each operation's inputs by port, as ids.
         let mut wiring: BTreeMap<&str, (&Table, Vec<Vec<&str>>)> = BTreeMap::new();
         for (id, op) in ops {
@@ -1304,10 +1910,11 @@ impl Lowering<'_> {
             };
             let from = op.get("from").and_then(Toml::as_table);
             let name = op.get("op").and_then(Toml::as_str).unwrap_or_default();
-            let ports = self.ops.get(name).map_or_default(|d| d.inputs.clone());
-            let ins = ports
-                .iter()
-                .map(|port| match from.and_then(|f| f.get(&port.name)) {
+            let ports = self.ops.ports_of(name);
+            let names = ports.iter().map(|port| port.name.as_str()).chain([ACTIVE]);
+            // What says whether it runs last, after its ports.
+            let ins = names
+                .map(|port| match from.and_then(|f| f.get(port)) {
                     Some(Toml::String(id)) => vec![id.as_str()],
                     Some(Toml::Array(ids)) => ids.iter().filter_map(Toml::as_str).collect(),
                     _ => Vec::new(),
@@ -1322,16 +1929,20 @@ impl Lowering<'_> {
         let mut left: Vec<&str> = wiring.keys().copied().collect();
         loop {
             let ready = left.iter().position(|id| {
-                wiring[id].1.iter().flatten().all(|from| {
-                    *from == ABOVE || placed.contains_key(from) || failed.contains(from) || !wiring.contains_key(from)
+                wiring[id].1.iter().flatten().map(|from| from.split_once('.').map_or(*from, |(id, _)| id)).all(|from| {
+                    given.contains_key(from)
+                        || placed.contains_key(from)
+                        || failed.contains(from)
+                        || !wiring.contains_key(from)
                 })
             });
             let Some(i) = ready else { break };
             let id = left.remove(i);
             let (op, ins) = &wiring[id];
             let here = format!("{at}.ops.{id}");
-            let settled = !ins.iter().flatten().any(|from| failed.contains(from));
-            match settled.then(|| self.graph_op(op, ins, &placed, above, &here)).flatten() {
+            let settled =
+                !ins.iter().flatten().any(|from| failed.contains(from.split_once('.').map_or(*from, |(id, _)| id)));
+            match settled.then(|| self.graph_op(op, ins, &placed, given, &here)).flatten() {
                 Some(step) => {
                     placed.insert(id, step);
                 }
@@ -1343,20 +1954,24 @@ impl Lowering<'_> {
         for id in &left {
             self.problem(&format!("{at}.ops.{id}"), "is in a cycle: it takes, through others, from itself");
         }
-        match layer.get("result").and_then(Toml::as_str) {
-            Some(ABOVE) => above,
-            Some(id) => {
-                let step = placed.get(id).copied();
-                if step.is_none() && !left.contains(&id) && !wiring.contains_key(id) {
-                    self.problem(at, &format!("its result `{id}` is none of its operations"));
-                }
-                step
-            }
-            None => {
-                self.problem(at, "names no result");
-                None
-            }
+        placed.into_iter().map(|(id, step)| (id.to_string(), step)).collect()
+    }
+
+    /// The steps a graph's operation takes from by an id: what the graph is given by that name, or one of its
+    /// operations - one of its outputs where the id names one (`id.<name>`).
+    fn source(
+        &mut self,
+        id: &str,
+        placed: &HashMap<&str, usize>,
+        given: &HashMap<String, Vec<usize>>,
+        at: &str,
+    ) -> Option<Vec<usize>> {
+        if let Some(steps) = given.get(id) {
+            return Some(steps.clone());
         }
+        let (base, output) = id.split_once('.').map_or((id, None), |(base, o)| (base, Some(o)));
+        let step = *placed.get(base)?;
+        self.output_of(step, base, output, at).map(|step| vec![step])
     }
 
     fn graph_op(
@@ -1364,7 +1979,7 @@ impl Lowering<'_> {
         op: &Table,
         ins: &[Vec<&str>],
         placed: &HashMap<&str, usize>,
-        above: Option<usize>,
+        given: &HashMap<String, Vec<usize>>,
         at: &str,
     ) -> Option<usize> {
         let Some(name) = op.get("op").and_then(Toml::as_str) else {
@@ -1375,26 +1990,41 @@ impl Lowering<'_> {
             self.problem(at, "is a graph inside a graph");
             return None;
         }
-        let Some(def) = self.ops.get(name).cloned() else {
+        let defined = self.ops.definitions.get(name).cloned();
+        let def = self.ops.get(name).cloned();
+        if def.is_none() && defined.is_none() {
             self.problem(at, &format!("`{name}`: no extension provides it"));
             return None;
-        };
+        }
+        if [INPUT, SETTING, GIVEN].contains(&name) {
+            self.problem(at, &format!("`{name}` is a box of an operation the project defines, not of a graph layer"));
+            return None;
+        }
+        let ports = self.ops.ports_of(name);
         let mut inputs = Vec::new();
-        for (port, ids) in def.inputs.iter().zip(ins) {
-            if !port.many && ids.len() != 1 {
-                self.problem(at, &format!("its `{}` takes one value, and is given {}", port.name, ids.len()));
-                return None;
-            }
+        for (port, ids) in ports.iter().zip(ins) {
             let mut steps = Vec::new();
             for id in ids {
-                let step = if *id == ABOVE { above } else { placed.get(id).copied() };
-                let Some(step) = step else {
+                let Some(step) = self.source(id, placed, given, at) else {
                     self.problem(at, &format!("its `{}` takes from `{id}`, which makes nothing", port.name));
                     return None;
                 };
-                steps.push(step);
+                steps.extend(step);
+            }
+            if !port.many && steps.len() != 1 {
+                self.problem(at, &format!("its `{}` takes one value, and is given {}", port.name, steps.len()));
+                return None;
             }
             inputs.push(steps);
+        }
+        // In an operation the project defines, an output is one of its own.
+        if name == OUTPUT
+            && let Some(collected) = self.collecting.last_mut()
+        {
+            let id = at.rsplit_once(".ops.").map_or(at, |(_, id)| id);
+            let output = op.get("name").and_then(Toml::as_str).unwrap_or(id).to_string();
+            collected.push((output, inputs[0][0]));
+            return None;
         }
         if name == OUTPUT {
             self.output(op, inputs[0][0], at, &inputs[1..]);
@@ -1413,7 +2043,29 @@ impl Lowering<'_> {
             self.plan.rules.push(Rule { when, event: event.to_string(), at: at.to_string() });
             return None;
         }
-        Some(self.step(&def, name, settings_of(op, &["op", "from", layers::POS]), inputs, at))
+        let active = match ins.get(ports.len()).map(Vec::as_slice) {
+            None | Some([]) => None,
+            Some([id]) => {
+                let steps = self.source(id, placed, given, at);
+                let Some([step]) = steps.as_deref() else {
+                    self.problem(at, &format!("its `{ACTIVE}` takes from `{id}`, which makes no one value"));
+                    return None;
+                };
+                Some(*step)
+            }
+            Some(ids) => {
+                self.problem(at, &format!("its `{ACTIVE}` takes one value, and is given {}", ids.len()));
+                return None;
+            }
+        };
+        let settings = settings_of(op, &["op", "from", layers::POS]);
+        let Some(def) = def else {
+            let defined = defined?;
+            return self.inline(&defined, &settings, inputs, active, at);
+        };
+        let step = self.step(&def, name, settings, inputs, at);
+        self.activate(step, active, at);
+        Some(step)
     }
 }
 

@@ -131,10 +131,13 @@ fn make(call: &mut Call) -> Result<Typed> {
         bail!("extraction could not read it exactly: {why}");
     }
     let reads: Vec<String> = [reference(&given, "strings")?, reference(&given, "cast")?].into();
+    // The string table's text as the output its reference names has it - translated, say - else as it is set.
+    let strings_output = given.get("strings").and_then(pe2_ext::output_of).unwrap_or(SETTINGS).to_string();
+    let addresses: Vec<String> = [strings_output, SETTINGS.to_string()].into();
     let faces = given.get("faces").and_then(Value::as_table).cloned().unwrap_or_default();
     let face_nodes: Vec<String> = FACES.iter().map(|f| reference(&faces, f)).collect::<Result<_>>()?;
     #[request]
-    let tables: Vec<Table> = call.tables_of(reads.iter().map(|r| (r.as_str(), SETTINGS)))?;
+    let tables: Vec<Table> = call.tables_of(reads.iter().zip(&addresses).map(|(r, a)| (r.as_str(), a.as_str())))?;
     let registries: Vec<String> = dialogue::registries(&given);
     #[request]
     let ids: Vec<Table> = call.tables_of(registries.iter().map(|r| (r.as_str(), "ids")))?;

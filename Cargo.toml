@@ -81,6 +81,7 @@ pe2-images = { path = "extensions/images" }
 pe2-movies = { path = "extensions/movies" }
 pe2-dialogue = { path = "extensions/dialogue" }
 pe2-events = { path = "extensions/events" }
+pe2-graph = { path = "extensions/graph" }
 pe2-flags = { path = "extensions/flags" }
 pe2-render = { path = "extensions/render" }
 pe2-webgpu = { path = "crates/webgpu" }

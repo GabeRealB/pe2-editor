@@ -948,7 +948,7 @@ pub trait Generator: Send {
 }
 
 /// The config being built: `[config.<name>]`, with the folder its results go to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BuildConfig {
     pub name: String,
     pub release: Option<String>,
@@ -956,6 +956,8 @@ pub struct BuildConfig {
     pub folder: String,
     /// What every config of the project says, as `key=value`: what a source may test for.
     pub known: Vec<String>,
+    /// Its properties: each the project declares, as it sets it or else by default (`[property.<name>]`).
+    pub properties: toml::Table,
 }
 
 /// An operation as registered.

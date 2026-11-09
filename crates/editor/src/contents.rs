@@ -370,7 +370,10 @@ fn label_of(ws: &Workspace, name: &str) -> String {
     if name == graph::GRAPH {
         return "Graph".to_string();
     }
-    ws.extensions.operations().get(name).map_or_else(|| name.to_string(), |op| op.label.clone())
+    let ops = ws.extensions.operations();
+    // An operation the project defines goes by its label too.
+    let defined = || ops.definitions.get(name).map_or_else(|| name.to_string(), |d| d.label.clone());
+    ops.get(name).map_or_else(defined, |op| op.label.clone())
 }
 
 /// What tells a layer from others of its operation.

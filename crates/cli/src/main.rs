@@ -291,6 +291,54 @@ enum ConfigCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Set a config's property: a TOML value (`fr`, `2`, `["-O2"]`), text where it is none
+    Set {
+        config: String,
+        property: String,
+        value: String,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Leave a config's property to its default
+    Unset {
+        config: String,
+        property: String,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// Declare a property the configs can set: its type, or the values it can be, and its default
+    Declare {
+        name: String,
+        /// text, texts, integer, boolean, table or any
+        #[arg(long, conflicts_with = "values")]
+        r#type: Option<String>,
+        /// The values it can be, comma separated
+        #[arg(long, value_delimiter = ',')]
+        values: Option<Vec<String>>,
+        /// Its default: a TOML value, text where it is none
+        #[arg(long)]
+        default: Option<String>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// List the configs, each with its properties
+    List {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+}
+
+/// A value given on the command line: TOML where it reads as such, else text.
+fn toml_value(text: &str) -> toml::Value {
+    format!("v = {text}")
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|mut t| t.remove("v"))
+        .unwrap_or_else(|| toml::Value::String(text.to_owned()))
 }
 
 /// Which project an edit is of, and which of its layers it goes to.
@@ -563,6 +611,23 @@ enum ProjectCommand {
         /// This generated layer alone
         #[arg(long)]
         layer: Option<String>,
+    },
+    /// Make an output of assets for a config, saying what each made: a file's name, size and SHA-1, a table as TOML
+    Output {
+        /// The assets, by path or uid
+        assets: Vec<String>,
+        /// Every asset of this type besides (`pe2.dialogue@dialogue`)
+        #[arg(long)]
+        r#type: Option<String>,
+        /// The output, by its address
+        #[arg(long, default_value = "native")]
+        output: String,
+        /// The config built (the project's first by default)
+        #[arg(long)]
+        config: Option<String>,
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
     /// What a project's extensions offer whoever writes its nodes, as JSON: each template - its node type, the files it
     /// takes, its stack with `{file}` for the node's stored file - each operation a stack may name - its ports, output,
@@ -1269,6 +1334,58 @@ fn main() -> Result<()> {
 }
 
 /// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
+/// `pe2-cli project config ...`: a config added, a property declared, set or left to its default, the configs listed.
+fn config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Add { name, release, target, project } => {
+            edit_project(&project, |p, history| {
+                project::setup::add_config(p, &name, release.as_deref(), target.as_deref(), history)
+            })?;
+        }
+        ConfigCommand::Set { config, property, value, project } => {
+            let value = toml_value(&value);
+            edit_project(&project, |p, history| {
+                project::setup::set_property(p, &config, &property, Some(&value), history)
+            })?;
+        }
+        ConfigCommand::Unset { config, property, project } => {
+            edit_project(&project, |p, history| project::setup::set_property(p, &config, &property, None, history))?;
+        }
+        ConfigCommand::Declare { name, r#type, values, default, project } => {
+            let mut declaration = toml::Table::new();
+            if let Some(kind) = r#type {
+                declaration.insert("type".into(), toml::Value::String(kind));
+            }
+            if let Some(values) = values {
+                declaration
+                    .insert("values".into(), toml::Value::Array(values.into_iter().map(toml::Value::String).collect()));
+            }
+            if let Some(default) = default {
+                declaration.insert("default".into(), toml_value(&default));
+            }
+            edit_project(&project, |p, history| project::setup::declare_property(p, &name, &declaration, history))?;
+        }
+        ConfigCommand::List { project } => {
+            let p = project::Project::load(&project)?;
+            for config in &p.configs {
+                let said = [("release", &config.release), ("target", &config.target)]
+                    .into_iter()
+                    .filter_map(|(key, v)| v.as_ref().map(|v| format!("{key} = {v}")));
+                println!("{}: {}", config.name, said.collect::<Vec<_>>().join(", "));
+                for (name, value) in p.properties_of(config) {
+                    let set = if config.properties.contains_key(&name) { "" } else { " (default)" };
+                    println!("  {name} = {value}{set}");
+                }
+            }
+            for problem in &p.property_problems {
+                let at = problem.config.as_deref().map_or_else(String::new, |c| format!("{c}: "));
+                println!("problem: {at}{}: {}", problem.property, problem.why);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn setup_command(command: ProjectCommand) -> Result<()> {
     match command {
         ProjectCommand::New { directory } => {
@@ -1308,11 +1425,7 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
         ProjectCommand::Link { command: LinkCommand::Add { at, deployed, project } } => {
             project::setup::add_link(&project::Project::load(&project)?, &at, &deployed)?;
         }
-        ProjectCommand::Config { command: ConfigCommand::Add { name, release, target, project } } => {
-            edit_project(&project, |p, history| {
-                project::setup::add_config(p, &name, release.as_deref(), target.as_deref(), history)
-            })?;
-        }
+        ProjectCommand::Config { command } => config_command(command)?,
         ProjectCommand::Status { project, layer } => {
             let p = project::Project::load(&project)?;
             let extensions = project_extensions(&p);
@@ -1503,6 +1616,67 @@ fn problems(project: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `pe2-cli project output`: an output of assets made for a config, under the project's lock - a line an asset, its file
+/// by name, size and SHA-1, a table as TOML, or why nothing was made. Fails where any was not.
+fn outputs(project: &Path, assets: &[String], of_type: Option<&str>, output: &str, config: Option<&str>) -> Result<()> {
+    use project::graph::{Content, Value};
+    let p = project::Project::load(project)?;
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", |owner| {
+        eprintln!("waiting: the project is in use by {owner}");
+    })?;
+    let cache = project::cache::Cache::open(&p, &lock)?;
+    let mut index = project::index::Index::open(&p, &cache)?;
+    let extensions = project_extensions(&p);
+    let chosen = match config {
+        Some(name) => Some(p.configs.iter().find(|c| c.name == name).with_context(|| format!("no config {name}"))?),
+        None => p.configs.first(),
+    };
+    if let Some(chosen) = chosen {
+        extensions.set_config(Some(project::build::build_config(&p, chosen)), &chosen.disabled);
+    }
+    let _ = project::imports::Imports::open(&cache)?.attach(&mut index, &extensions);
+    extensions.keep_in(project::graph::store::Store::open(&cache)?);
+    let engine = extensions.engine();
+    let mut paths: Vec<String> = Vec::new();
+    for name in assets {
+        let path = index.by_uid.get(name).cloned().unwrap_or_else(|| name.clone());
+        anyhow::ensure!(index.assets.contains_key(&path), "the project has no asset {name}");
+        paths.push(path);
+    }
+    if let Some(of_type) = of_type {
+        paths.extend(extensions.find(&index, of_type).map(|a| a.path.clone()));
+    }
+    let mut failed = 0;
+    for path in &paths {
+        let asset = &index.assets[path];
+        let made = extensions.output(&engine, &index, asset, output, true).map_err(|e| format!("{e:#}"));
+        let said = match made.and_then(|given| given.value.ok_or_else(|| "made nothing".to_string())) {
+            Ok(value) => match &*value {
+                Value::Typed(typed) => typed
+                    .files
+                    .iter()
+                    .map(|f| match &f.content {
+                        Content::Inline(bytes) => {
+                            format!("{} {} {}", f.name, bytes.len(), project::extract::sha1_hex(bytes))
+                        }
+                        Content::Stored { sha1, size } => format!("{} {size} {sha1}", f.name),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+                Value::Table(table) => toml::to_string(table).unwrap_or_default(),
+                other => other.ty().to_string(),
+            },
+            Err(why) => {
+                failed += 1;
+                format!("failed: {why}")
+            }
+        };
+        println!("{path}\t{said}");
+    }
+    anyhow::ensure!(failed == 0, "{failed} of {} made nothing", paths.len());
+    Ok(())
+}
+
 /// `pe2-cli project store`.
 fn store(command: &StoreCommand) -> Result<()> {
     let (StoreCommand::Migrate { project }
@@ -1671,7 +1845,10 @@ fn verify_layer(project: &Path, only: Option<&str>) -> Result<()> {
 
 /// The project's extensions' registry, as JSON: of those that load, the rest said.
 fn print_registry(project: &Path) -> Result<()> {
-    let extensions = project_extensions(&project::Project::load(project)?);
+    let p = project::Project::load(project)?;
+    let extensions = project_extensions(&p);
+    // What the project defines - its own operations and templates - read off its nodes as they are.
+    let _ = extensions.take_definitions(&project::index::Index::without_store(&p)?);
     println!("{:#}", extensions.registry());
     Ok(())
 }
@@ -1724,6 +1901,9 @@ fn run(cli: Cli) -> Result<()> {
             verify_layer(&project, layer.as_deref())?;
         }
         Tool::Project { command: ProjectCommand::Registry { project } } => print_registry(&project)?,
+        Tool::Project { command: ProjectCommand::Output { assets, r#type, output, config, project } } => {
+            outputs(&project, &assets, r#type.as_deref(), &output, config.as_deref())?;
+        }
         Tool::Project { command: ProjectCommand::Clean { project, config } } => {
             signal(&project, config.as_deref(), &[Clean::NAME])?;
         }

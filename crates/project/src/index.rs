@@ -394,6 +394,8 @@ pub enum Problem {
     /// What an asset's import took otherwise than its source has it (colors matched to the nearest), as its importer
     /// said: the build goes on with it.
     Taken { asset: String, note: String },
+    /// A config's property that is not as the project declares it, or a property declared wrongly (no config).
+    Property { config: Option<String>, property: String, why: String },
 }
 
 impl Problem {
@@ -415,7 +417,7 @@ impl Problem {
             | Problem::Missing { path, .. }
             | Problem::Stale { path, .. } => vec![path],
             Problem::DuplicateUid { paths, .. } => paths.iter().map(String::as_str).collect(),
-            Problem::Unbound { .. } => vec![],
+            Problem::Unbound { .. } | Problem::Property { .. } => vec![],
         }
     }
 
@@ -447,6 +449,10 @@ impl Problem {
             }
             Problem::Extension { error, .. } => format!("the project holds it, and it is not loaded: {error}"),
             Problem::Taken { note, .. } => format!("its import: {note}"),
+            Problem::Property { config: Some(config), property, why } => {
+                format!("the config {config}'s property {property}: {why}")
+            }
+            Problem::Property { config: None, property, why } => format!("the property {property}: {why}"),
         }
     }
 
@@ -468,6 +474,7 @@ impl Problem {
             | Problem::Orphan { .. }
             | Problem::MissingOutput { .. }
             | Problem::Taken { .. }
+            | Problem::Property { .. }
             | Problem::Extension { .. } => vec![],
         }
     }
@@ -1052,6 +1059,8 @@ pub struct Index {
     /// References whose uid or path names no asset of the project.
     pub dangling: Vec<Reference>,
     pub problems: Vec<Problem>,
+    /// What is wrong with the project's config properties, as of its loading: among the problems.
+    properties: Vec<Problem>,
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
     records: Arc<HashMap<PathBuf, Arc<Record>>>,
@@ -1166,6 +1175,15 @@ impl Index {
             referenced_by: Arc::default(),
             dangling: vec![],
             problems: vec![],
+            properties: project
+                .property_problems
+                .iter()
+                .map(|p| Problem::Property {
+                    config: p.config.clone(),
+                    property: p.property.clone(),
+                    why: p.why.clone(),
+                })
+                .collect(),
             layers,
             records: Arc::default(),
             merged: project.root.join(crate::cache::DIR).join("merged"),
@@ -1749,6 +1767,7 @@ impl Index {
         self.list_unlisted()?;
         let full = self.resolve_stack(&HashSet::new());
         self.problems = full.problems;
+        self.problems.extend(self.properties.iter().cloned());
         self.ops = full.ops;
         self.full = Arc::new(full.resolved);
         self.resolved = if self.hidden.is_empty() {

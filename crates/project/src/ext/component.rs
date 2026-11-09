@@ -457,6 +457,7 @@ impl host::HostAsset for State {
             target: c.target,
             folder: c.folder,
             known: c.known,
+            properties: c.properties.to_string(),
         }))
     }
 

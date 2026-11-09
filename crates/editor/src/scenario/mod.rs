@@ -630,7 +630,7 @@ impl Scenario {
         }
         let ws = self.workspace();
         let found = ws.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
-        let stack = ws.extensions.stamp(found, file)?;
+        let stack = ws.extensions.stamp(&found, file)?;
         let text = project::graph::layers::settings_on_layers(&format!("{settings}\n\n{stack}"))
             .map_err(|e| format!("{e:#}"))?;
         let declaration = format!("uid = \"{uid}\"\n\n{text}");
@@ -646,6 +646,7 @@ impl Scenario {
         let made = ws
             .extensions
             .templates()
+            .into_iter()
             .filter(|template| !template.stored() && ws.extensions.stamp(template, "").is_ok());
         let templates: Vec<String> = made.map(|template| template.name.clone()).collect();
         for template in &templates {

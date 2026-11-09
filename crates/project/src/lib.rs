@@ -70,10 +70,13 @@ struct ProjectFile {
     /// The builds it can be: `[config.<name>]`.
     #[serde(default)]
     config: std::collections::BTreeMap<String, ConfigFile>,
+    /// What its configs say beyond their release and target: `[property.<name>]`, in order.
+    #[serde(default)]
+    property: toml::Table,
 }
 
 /// A build the project can be: `[config.<name>]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub name: String,
     pub release: Option<String>,
@@ -81,6 +84,112 @@ pub struct Config {
     pub target: Option<String>,
     /// The assets left out of it, by path: no event reaches them, and looking for a type's assets does not find them.
     pub disabled: Vec<String>,
+    /// The properties it sets (`[config.<name>.properties]`), as written: `Project::properties_of` gives them over
+    /// what the project declares.
+    pub properties: toml::Table,
+}
+
+/// What a project's configs can say beyond their release and target: `[property.<name>]`, with its shape and the value
+/// a config not setting it has.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Property {
+    pub name: String,
+    pub kind: PropertyKind,
+    /// What a config not setting it has: none where every config has to.
+    pub default: Option<toml::Value>,
+    pub label: Option<String>,
+    pub description: Option<String>,
+}
+
+/// The shape of a property's value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PropertyKind {
+    /// A line of text (`text`).
+    Text,
+    /// A list of them (`texts`): compiler flags, say.
+    Texts,
+    Integer,
+    Boolean,
+    /// A table of anything (`table`).
+    Table,
+    /// Anything (`any`).
+    Any,
+    /// One of these (`values = [...]`).
+    OneOf(Vec<String>),
+}
+
+impl PropertyKind {
+    /// What a value of it is not, if anything.
+    #[must_use]
+    pub fn refuses(&self, value: &toml::Value) -> Option<String> {
+        use toml::Value as V;
+        let fits = match (self, value) {
+            (PropertyKind::Text, V::String(_))
+            | (PropertyKind::Integer, V::Integer(_))
+            | (PropertyKind::Boolean, V::Boolean(_))
+            | (PropertyKind::Table, V::Table(_))
+            | (PropertyKind::Any, _) => true,
+            (PropertyKind::Texts, V::Array(items)) => items.iter().all(toml::Value::is_str),
+            (PropertyKind::OneOf(values), V::String(s)) => {
+                return (!values.contains(s)).then(|| format!("{s:?} is none of {}", values.join(", ")));
+            }
+            _ => false,
+        };
+        (!fits).then(|| format!("{value} is no {self}"))
+    }
+}
+
+impl std::fmt::Display for PropertyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PropertyKind::Text => f.write_str("text"),
+            PropertyKind::Texts => f.write_str("list of text"),
+            PropertyKind::Integer => f.write_str("integer"),
+            PropertyKind::Boolean => f.write_str("boolean"),
+            PropertyKind::Table => f.write_str("table"),
+            PropertyKind::Any => f.write_str("value"),
+            PropertyKind::OneOf(values) => write!(f, "one of {}", values.join(", ")),
+        }
+    }
+}
+
+/// What is wrong with a config's property, or with a property's declaration (no config).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyProblem {
+    pub config: Option<String>,
+    pub property: String,
+    pub why: String,
+}
+
+/// `[property.<name>]`: its shape (`type`, or `values`), its default, and what it is called.
+pub(crate) fn property_of(name: &str, value: &toml::Value) -> std::result::Result<Property, String> {
+    let toml::Value::Table(table) = value else {
+        return Err("is no table".into());
+    };
+    let text = |key: &str| table.get(key).and_then(toml::Value::as_str).map(str::to_owned);
+    let kind = match (table.get("values"), text("type").as_deref()) {
+        (Some(toml::Value::Array(values)), None | Some("one of")) => {
+            let values: Option<Vec<String>> = values.iter().map(|v| v.as_str().map(str::to_owned)).collect();
+            PropertyKind::OneOf(values.ok_or("its values are not all text")?)
+        }
+        (Some(_), _) => return Err("its values are no list of text, or it has a type too".into()),
+        (None, Some("text")) => PropertyKind::Text,
+        (None, Some("texts")) => PropertyKind::Texts,
+        (None, Some("integer")) => PropertyKind::Integer,
+        (None, Some("boolean")) => PropertyKind::Boolean,
+        (None, Some("table")) => PropertyKind::Table,
+        (None, Some("any") | None) => PropertyKind::Any,
+        (None, Some(other)) => {
+            return Err(format!("no type {other} (text, texts, integer, boolean, table, any, or values)"));
+        }
+    };
+    Ok(Property {
+        name: name.to_owned(),
+        kind,
+        default: table.get("default").cloned(),
+        label: text("label"),
+        description: text("description"),
+    })
 }
 
 /// `[config.<name>]`: a release, and the target that builds it.
@@ -92,6 +201,8 @@ struct ConfigFile {
     target: Option<String>,
     #[serde(default)]
     disabled: Vec<String>,
+    #[serde(default)]
+    properties: toml::Table,
 }
 
 /// `[build]` of `project.local.toml`: where this machine also wants a build's results.
@@ -332,12 +443,75 @@ pub struct Project {
     pub extension_settings: std::collections::BTreeMap<String, toml::Table>,
     /// The builds it can be, by name, in order.
     pub configs: Vec<Config>,
+    /// What its configs can say beyond their release and target, in the order declared; those declared wrongly are
+    /// left out, and said (`property_problems`).
+    pub properties: Vec<Property>,
+    /// What is wrong with the properties' declarations and the configs' values of them.
+    pub property_problems: Vec<PropertyProblem>,
     /// Links this machine wants to what is deployed (`project.local.toml`): where each goes, relative to the project,
     /// by the deployed file it stands for.
     pub links: build::Links,
     /// How this machine serves the project as a filesystem while it is open, at its `assets` folder
     /// (`project.local.toml`).
     pub filesystem: Filesystem,
+}
+
+/// The configs, the properties declared and what is wrong with those.
+fn configs_of(
+    configs: std::collections::BTreeMap<String, ConfigFile>,
+    declared: &toml::Table,
+) -> (Vec<Config>, Vec<Property>, Vec<PropertyProblem>) {
+    let configs: Vec<Config> = configs
+        .into_iter()
+        .map(|(name, c)| Config {
+            name,
+            release: c.release,
+            target: c.target,
+            disabled: c.disabled,
+            properties: c.properties,
+        })
+        .collect();
+    let (properties, problems) = properties_of(declared, &configs);
+    (configs, properties, problems)
+}
+
+/// The properties declared (those declared wrongly left out) and what is wrong with them and the configs' values.
+fn properties_of(declared: &toml::Table, configs: &[Config]) -> (Vec<Property>, Vec<PropertyProblem>) {
+    let mut problems = Vec::new();
+    let mut properties = Vec::new();
+    for (name, value) in declared {
+        match property_of(name, value) {
+            Ok(property) => {
+                if let Some(why) = property.default.as_ref().and_then(|d| property.kind.refuses(d)) {
+                    problems.push(PropertyProblem {
+                        config: None,
+                        property: name.clone(),
+                        why: format!("its default: {why}"),
+                    });
+                }
+                properties.push(property);
+            }
+            Err(why) => problems.push(PropertyProblem { config: None, property: name.clone(), why }),
+        }
+    }
+    for config in configs {
+        let problem = |property: &str, why: String| PropertyProblem {
+            config: Some(config.name.clone()),
+            property: property.to_owned(),
+            why,
+        };
+        for (name, value) in &config.properties {
+            match properties.iter().find(|p| p.name == *name) {
+                Some(property) => problems.extend(property.kind.refuses(value).map(|why| problem(name, why))),
+                None if declared.contains_key(name) => {}
+                None => problems.push(problem(name, "the project declares no such property".into())),
+            }
+        }
+        for property in properties.iter().filter(|p| p.default.is_none() && !config.properties.contains_key(&p.name)) {
+            problems.push(problem(&property.name, "is not set, and has no default".into()));
+        }
+    }
+    (properties, problems)
 }
 
 fn resolve_path(directory: &Path, value: &str) -> PathBuf {
@@ -520,11 +694,7 @@ impl Project {
             None => Serving::default_here(),
         };
         let filesystem = Filesystem { at: root.join(SERVED), serving, keep: local.filesystem.keep.unwrap_or(false) };
-        let configs = file
-            .config
-            .into_iter()
-            .map(|(name, c)| Config { name, release: c.release, target: c.target, disabled: c.disabled })
-            .collect();
+        let (configs, properties, property_problems) = configs_of(file.config, &file.property);
         Ok(Project {
             root,
             layers,
@@ -534,9 +704,23 @@ impl Project {
             requires,
             extension_settings,
             configs,
+            properties,
+            property_problems,
             links,
             filesystem,
         })
+    }
+
+    /// A config's properties: each the project declares, as the config sets it, else its default.
+    #[must_use]
+    pub fn properties_of(&self, config: &Config) -> toml::Table {
+        self.properties
+            .iter()
+            .filter_map(|p| {
+                let set = config.properties.get(&p.name).filter(|v| p.kind.refuses(v).is_none());
+                set.or(p.default.as_ref()).map(|v| (p.name.clone(), v.clone()))
+            })
+            .collect()
     }
 
     /// The extensions it holds: those its layers' records name (`records::EXTENSIONS`), each id's from the highest
@@ -628,6 +812,71 @@ mod tests {
         let project = super::Project::load(&dir).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["project"]);
         assert!(super::create(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn configs_have_the_properties_declared_and_say_what_is_not_as_declared() {
+        let dir = std::env::temp_dir().join(format!("pe2-properties-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::create(&dir).unwrap();
+        let file = dir.join(super::FILE);
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str(
+            r#"
+[property.language]
+values = ["en", "fr"]
+default = "en"
+
+[property.flags]
+type = "texts"
+default = []
+
+[property.level]
+type = "integer"
+
+[property.odd]
+type = "colour"
+
+[config.usa]
+release = "USA"
+properties = { level = 1 }
+
+[config.usa_fr]
+release = "USA"
+properties = { language = "fr", level = 2, flags = ["-O2"] }
+
+[config.wrong]
+properties = { language = "de", flags = [1], nothing = true }
+"#,
+        );
+        std::fs::write(&file, text).unwrap();
+        let project = super::Project::load(&dir).unwrap();
+        let names: Vec<&str> = project.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["language", "flags", "level"], "in order, the one declared wrongly left out");
+        let config = |name: &str| project.configs.iter().find(|c| c.name == name).unwrap();
+        let of = |name: &str| project.properties_of(config(name));
+        assert_eq!(of("usa").get("language").and_then(toml::Value::as_str), Some("en"), "by default");
+        assert_eq!(of("usa_fr").get("language").and_then(toml::Value::as_str), Some("fr"));
+        assert_eq!(of("wrong").get("language").and_then(toml::Value::as_str), Some("en"), "a wrong value: its default");
+        assert!(!of("wrong").contains_key("level"), "no default, not set");
+        let mut said: Vec<String> = project
+            .property_problems
+            .iter()
+            .map(|p| format!("{} {}", p.config.as_deref().unwrap_or("-"), p.property))
+            .collect();
+        said.sort();
+        assert_eq!(said, ["- odd", "wrong flags", "wrong language", "wrong level", "wrong nothing"]);
+        let built = crate::build::build_config(&project, config("usa_fr"));
+        assert!(built.known.contains(&"language=fr".to_owned()) && built.known.contains(&"language=en".to_owned()));
+        assert_eq!(built.properties.get("level").and_then(toml::Value::as_integer), Some(2));
+        let index = crate::index::Index::without_store(&project).unwrap();
+        assert_eq!(
+            index.problems.iter().filter(|p| matches!(p, crate::index::Problem::Property { .. })).count(),
+            5,
+            "{:?}",
+            index.problems
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

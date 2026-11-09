@@ -352,6 +352,9 @@ pub struct Extensions {
     ops: HashMap<String, pe2_ext::OpDef>,
     /// The operations as the work graph runs them, made once loaded.
     graph_ops: std::sync::OnceLock<graph::Ops>,
+    /// What the open project defines: its operations and templates, by uid (`take_definitions`).
+    definitions: RwLock<Arc<graph::Definitions>>,
+    project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
     /// The store outputs asked for in passing read and keep: the open project's, as these outlive it (`extensions::loaded`).
     store: std::sync::RwLock<Option<graph::store::Store>>,
     /// What is asked without waiting.
@@ -968,40 +971,45 @@ impl Extensions {
     pub fn stack_for(&self, asset: &index::Asset, file: &str) -> Option<std::result::Result<String, String>> {
         let name = self.type_name(asset)?;
         let template = self.templates_for(file).into_iter().find(|template| template.node_type == name)?;
-        Some(self.stamp(template, file))
+        Some(self.stamp(&template, file))
     }
 
     /// The templates that take a file, by its name.
     #[must_use]
-    pub fn templates_for(&self, file: &str) -> Vec<&pe2_ext::TemplateDef> {
+    pub fn templates_for(&self, file: &str) -> Vec<pe2_ext::TemplateDef> {
         let lower = file.to_lowercase();
-        self.templates
-            .values()
+        self.templates()
+            .into_iter()
             .filter(|template| template.files.iter().any(|pattern| name_matches(pattern, &lower)))
             .collect()
     }
 
-    /// Every template, by its name.
-    pub fn templates(&self) -> impl Iterator<Item = &pe2_ext::TemplateDef> {
-        self.templates.values()
+    /// Every template: the extensions', by name, then the project's, by uid.
+    #[must_use]
+    pub fn templates(&self) -> Vec<pe2_ext::TemplateDef> {
+        let project = self.project_templates.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        self.templates.values().chain(project.values()).cloned().collect()
     }
 
-    /// A template, by its name.
+    /// A template, by its name: an extension's, or the project's by its node's uid.
     #[must_use]
-    pub fn template(&self, name: &str) -> Option<&pe2_ext::TemplateDef> {
-        self.templates.get(name)
+    pub fn template(&self, name: &str) -> Option<pe2_ext::TemplateDef> {
+        self.templates.get(name).cloned().or_else(|| {
+            self.project_templates.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
+        })
     }
 
     /// What these extensions offer whoever writes a project's nodes, as JSON: each template - what it makes, the files it
     /// takes, its stack with `{file}` where its node's stored file is named - and each operation a stack may name - its
     /// ports, what it makes, its version, and for an extension's, the settings it derives and what undoes it - and each
-    /// extension's version as what it makes is kept by.
+    /// extension's version as what it makes is kept by. The project's own templates and operations among them, by uid,
+    /// where it has taken them (`take_definitions`).
     #[must_use]
     pub fn registry(&self) -> serde_json::Value {
         use serde_json::{Map, Value, json};
         let templates: Map<String, Value> = self
-            .templates
-            .values()
+            .templates()
+            .iter()
             .map(|t| {
                 let made = json!({
                     "label": t.label, "node_type": t.node_type, "files": t.files, "stack": t.stack, "offered": t.offered,
@@ -1031,6 +1039,23 @@ impl Extensions {
                 (name.clone(), made)
             })
             .collect();
+        // And those the project defines, by uid: what they take and the settings they are set to.
+        let mut operations = operations;
+        let definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        for (uid, d) in definitions.iter() {
+            let made = json!({
+                "label": d.label,
+                "version": d.version,
+                "inputs": d.inputs.iter().map(|p| port(&p.name, &p.ty, p.many)).collect::<Vec<_>>(),
+                "settings": d.settings.iter().map(|(p, _)| json!({
+                    "name": p.name, "type": p.kind.to_string(), "label": p.label,
+                    "default": p.default.as_ref().map(|v| serde_json::to_value(v).unwrap_or_default()),
+                })).collect::<Vec<_>>(),
+                "outputs": d.outputs.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+                "defined": true,
+            });
+            operations.insert(uid.clone(), made);
+        }
         let extensions: Map<String, Value> =
             self.loaded.iter().map(|l| (l.id.clone(), Value::String(self.version_of(&l.id)))).collect();
         // The host's own, which a stack names bare: a stored file, a constant, the version below, an output kept or shown,
@@ -1057,9 +1082,11 @@ impl Extensions {
         let layers = table.get("stack").and_then(toml::Value::as_array).map_or(&[][..], Vec::as_slice);
         let inner = layers.iter().filter_map(|l| l.get("ops")?.as_table()).flat_map(|o| o.values());
         let missing = layers.iter().chain(inner).filter_map(name_of).find(|name| {
-            ![graph::GRAPH, graph::OUTPUT, graph::PREVIEW].contains(&name.as_str()) && ops.get(name).is_none()
+            ![graph::GRAPH, graph::OUTPUT, graph::PREVIEW].contains(&name.as_str())
+                && ops.get(name).is_none()
+                && !ops.definitions.contains_key(name)
         });
-        missing.map_or(Ok(stack), |name| Err(format!("It takes {name}, which no extension provides")))
+        missing.map_or(Ok(stack), |name| Err(format!("It takes {name}, which no extension provides, nor the project")))
     }
 
     /// What may be asked of an asset beyond its stack, as its plan lowers it: the conversions of what it makes, then the
@@ -1133,6 +1160,12 @@ impl Extensions {
         let named =
             self.ops.iter().filter(|(name, def)| fits(def) && (**name != def.name.to_string() || !by_service(def)));
         let mut layers: Vec<(String, String)> = named.map(|(name, def)| (name.clone(), def.label.clone())).collect();
+        // And those the project defines that take it.
+        let definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let defined = definitions
+            .values()
+            .filter(|d| matches!(d.inputs.as_slice(), [port] if port.ty.unify(above, &mut Vec::new())));
+        layers.extend(defined.map(|d| (d.uid.clone(), d.label.clone())));
         layers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         layers
     }
@@ -1144,6 +1177,7 @@ impl Extensions {
         let operations = self.operations();
         let shown = operations.iter().filter(|(name, _)| name.as_str() != graph::GRAPH && !by_service(name));
         let mut listed: Vec<(String, String)> = shown.map(|(name, def)| (name.clone(), def.label.clone())).collect();
+        listed.extend(operations.definitions.values().map(|d| (d.uid.clone(), d.label.clone())));
         listed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         listed
     }
@@ -1165,8 +1199,10 @@ impl Extensions {
                     continue;
                 }
                 let Some(asset) = index.assets.get(from) else { continue };
+                // What uses an operation the project defines is made of it.
+                let uses = index.assets.get(path).is_some_and(|defined| self.defines(defined));
                 let (plan, _) = self.plan(asset);
-                if plan.steps.iter().any(|s| s.op == graph::REFERENCES) {
+                if uses || plan.steps.iter().any(|s| s.op == graph::REFERENCES) {
                     found.insert(from.to_string());
                     next.push(from);
                 }
@@ -1806,7 +1842,61 @@ impl Extensions {
     /// constants, outputs, the thumbnail) and the extensions', each lent its node as it runs.
     #[must_use]
     pub fn operations(&self) -> graph::Ops {
-        self.graph_ops.get_or_init(|| self.make_operations()).clone()
+        let mut ops = self.graph_ops.get_or_init(|| self.make_operations()).clone();
+        ops.definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        ops
+    }
+
+    /// Take what a project defines - its operations and templates (`pe2.graph`) - from its index: what stacks lay in
+    /// where they name an operation by its node's uid, and what is offered beside the extensions' templates. Where an
+    /// operation changed, what nodes are is read again. What is wrong with a definition, as its node's problem.
+    pub fn take_definitions(&self, index: &index::Index) -> Vec<index::Problem> {
+        let mut problems = Vec::new();
+        let mut definitions = graph::Definitions::new();
+        for asset in self.find(index, graph::DEFINED) {
+            let Some(uid) = asset.uid.clone() else { continue };
+            let version = graph::exec::Node::declaration_sha1(asset);
+            match graph::Definition::of(&uid, asset.fields_toml(), &version) {
+                Ok(definition) => {
+                    definitions.insert(uid, Arc::new(definition));
+                }
+                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.clone(), error }),
+            }
+        }
+        let mut templates = std::collections::BTreeMap::new();
+        for asset in self.find(index, graph::DEFINED_TEMPLATE) {
+            let Some(uid) = &asset.uid else { continue };
+            match project_template(uid, asset.fields_toml()) {
+                Ok(template) => {
+                    templates.insert(template.name.clone(), template);
+                }
+                Err(error) => problems.push(index::Problem::Stack { asset: asset.path.clone(), error }),
+            }
+        }
+        let versions = |d: &graph::Definitions| -> std::collections::BTreeMap<String, String> {
+            d.iter().map(|(uid, d)| (uid.clone(), d.version.clone())).collect()
+        };
+        let mut held = self.definitions.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if versions(&held) != versions(&definitions) {
+            *held = Arc::new(definitions);
+            self.shapes.write().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        }
+        drop(held);
+        *self.project_templates.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(templates);
+        problems
+    }
+
+    /// An operation the project defines, by its uid (`uid://...`).
+    #[must_use]
+    pub fn definition(&self, uid: &str) -> Option<Arc<graph::Definition>> {
+        self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(uid).cloned()
+    }
+
+    /// Whether an asset defines an operation the project's stacks may use.
+    #[must_use]
+    pub fn defines(&self, asset: &index::Asset) -> bool {
+        let definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        asset.uid.as_ref().is_some_and(|uid| definitions.contains_key(uid))
     }
 
     fn make_operations(&self) -> graph::Ops {
@@ -1992,6 +2082,28 @@ pub fn listed(member: &str) -> &str {
 }
 
 /// Whether a file's name is a pattern's: `*.png`, or the name itself.
+/// A template a project defines (`pe2.graph@template`): its `label`, the stack it makes (`makes`, its layers), the
+/// type of node that is (`node_type`), the files it takes (`files`) and whether it is offered (`offered`).
+fn project_template(uid: &str, fields: &toml::Table) -> std::result::Result<pe2_ext::TemplateDef, String> {
+    let layers = fields.get("stack").and_then(toml::Value::as_array).into_iter().flatten();
+    let layer = layers
+        .filter_map(toml::Value::as_table)
+        .find(|layer| layer.get("op").and_then(toml::Value::as_str) == Some(graph::DEFINED_TEMPLATE));
+    let layer = layer.ok_or("it defines no template")?;
+    let text = |key: &str| layer.get(key).and_then(toml::Value::as_str).map(str::to_owned);
+    let makes = layer.get("makes").and_then(toml::Value::as_array).ok_or("it makes no stack (`makes`)")?;
+    let stack = toml::Table::from_iter([("stack".to_string(), toml::Value::Array(makes.clone()))]);
+    let files = layer.get("files").and_then(toml::Value::as_array).into_iter().flatten();
+    Ok(pe2_ext::TemplateDef {
+        name: uid.to_string(),
+        label: text("label").unwrap_or_else(|| uid.to_string()),
+        node_type: text("node_type").unwrap_or_default(),
+        files: files.filter_map(toml::Value::as_str).map(str::to_owned).collect(),
+        stack: toml::to_string(&stack).map_err(|e| e.to_string())?,
+        offered: layer.get("offered").and_then(toml::Value::as_bool).unwrap_or(true),
+    })
+}
+
 fn name_matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_prefix('*') {
         Some(suffix) => name.ends_with(suffix),

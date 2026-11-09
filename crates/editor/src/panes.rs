@@ -567,7 +567,7 @@ impl egui_tiles::Behavior<Pane> for Panes<'_> {
         if pane.kind == PaneKind::Settings {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
-                settings_ui(ui, self.settings, self.workspace.as_deref(), &mut self.message);
+                settings_ui(ui, self.settings, self.workspace.as_deref_mut(), &mut self.message);
             });
             return UiResponse::None;
         }
@@ -2376,7 +2376,12 @@ impl SettingsPage {
 
 /// The editor's settings (global, per user) and the open project's (its `project.toml`): categories on the left, the
 /// chosen one's form on the right.
-fn settings_ui(ui: &mut egui::Ui, settings: &mut EditorSettings, ws: Option<&Workspace>, message: &mut Option<String>) {
+fn settings_ui(
+    ui: &mut egui::Ui,
+    settings: &mut EditorSettings,
+    ws: Option<&mut Workspace>,
+    message: &mut Option<String>,
+) {
     let id = egui::Id::unique("settings page");
     let mut page = ui.data(|d| d.get_temp::<u8>(id)).map_or(SettingsPage::Appearance, |i| PAGES[usize::from(i)]);
     // The pages take what they can: narrow, this gives way first.
@@ -2572,10 +2577,18 @@ fn tools_ui(ui: &mut egui::Ui, tools: &mut Tools) {
 fn project_settings_ui(
     ui: &mut egui::Ui,
     page: SettingsPage,
-    ws: &Workspace,
+    ws: &mut Workspace,
     tools: &Tools,
     message: &mut Option<String>,
 ) {
+    if page == SettingsPage::ProjectConfigurations {
+        if let Some((config, property, to)) = configurations_ui(ui, ws)
+            && let Err(e) = ws.set_property(&config, &property, to.as_ref())
+        {
+            *message = Some(e);
+        }
+        return;
+    }
     let p = &ws.project;
     let file = p.root.join(project::FILE);
     ui.horizontal(|ui| {
@@ -2659,24 +2672,146 @@ fn project_settings_ui(
                 grid(ui, "mounts", rows);
             });
         }
-        SettingsPage::ProjectConfigurations => {
-            let configs = raw.get("config").and_then(toml::Value::as_table);
-            if configs.is_none_or(toml::Table::is_empty) {
-                ui.label(RichText::new("No configurations ([config.<name>])").color(theme::weak()));
+        _ => {}
+    }
+    let _ = raw;
+}
+
+/// A config's property set to a value, or to its default (`None`).
+type PropertyEdit = (String, String, Option<toml::Value>);
+
+/// The configs, each with its release, target and properties - each property edited by its type - and the properties
+/// the project declares. Returns what was edited.
+fn configurations_ui(ui: &mut egui::Ui, ws: &Workspace) -> Option<PropertyEdit> {
+    let p = &ws.project;
+    let mut edit = None;
+    if p.configs.is_empty() {
+        ui.label(RichText::new("No configurations ([config.<name>])").color(theme::weak()));
+    }
+    for config in &p.configs {
+        theme::section(ui, &config.name, |ui| {
+            egui::Grid::new(("config", &config.name)).num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
+                let fixed = [("release", &config.release), ("target", &config.target)];
+                for (key, value) in fixed.into_iter().filter_map(|(k, v)| v.as_ref().map(|v| (k, v))) {
+                    ui.label(RichText::new(key).color(theme::weak()));
+                    theme::short(ui, value.as_str());
+                    ui.end_row();
+                }
+                if !config.disabled.is_empty() {
+                    ui.label(RichText::new("left out").color(theme::weak()));
+                    ui.label(format!("{} assets", config.disabled.len()));
+                    ui.end_row();
+                }
+                for property in &p.properties {
+                    let set = config.properties.get(&property.name).filter(|v| property.kind.refuses(v).is_none());
+                    let name = ui
+                        .label(RichText::new(property.label.as_deref().unwrap_or(&property.name)).color(theme::weak()));
+                    if let Some(description) = &property.description {
+                        name.on_hover_text(description);
+                    }
+                    let value = set.or(property.default.as_ref());
+                    if let Some(to) = property_editor(ui, (&config.name, property), value) {
+                        edit = Some((config.name.clone(), property.name.clone(), Some(to)));
+                    }
+                    ui.horizontal(|ui| {
+                        if set.is_some() {
+                            if property.default.is_some() && ui.small_button("Default").clicked() {
+                                edit = Some((config.name.clone(), property.name.clone(), None));
+                            }
+                        } else {
+                            ui.label(RichText::new("default").small().color(theme::weak()));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            for problem in p.property_problems.iter().filter(|q| q.config.as_deref() == Some(&config.name)) {
+                theme::warning(ui, &format!("{}: {}", problem.property, problem.why));
             }
-            for (name, keys) in configs.into_iter().flatten() {
-                theme::section(ui, name, |ui| {
-                    let rows = keys
-                        .as_table()
-                        .into_iter()
-                        .flatten()
-                        .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_string)))
-                        .collect();
-                    grid(ui, &format!("config {name}"), rows);
-                });
+        });
+    }
+    theme::section(ui, "Properties", |ui| {
+        if p.properties.is_empty() {
+            ui.label(RichText::new("None declared ([property.<name>])").color(theme::weak()));
+        }
+        egui::Grid::new("properties").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
+            for property in &p.properties {
+                ui.label(&property.name);
+                ui.label(RichText::new(property.kind.to_string()).color(theme::weak()));
+                let default = property.default.as_ref().map_or_else(|| "no default".to_owned(), ToString::to_string);
+                theme::short(ui, RichText::new(default).monospace().color(theme::weak()));
+                ui.end_row();
+            }
+        });
+        for problem in p.property_problems.iter().filter(|q| q.config.is_none()) {
+            theme::warning(ui, &format!("{}: {}", problem.property, problem.why));
+        }
+    });
+    edit
+}
+
+/// A property's value edited by its type: a choice, a box, a number, a line, lines, or TOML. Returns what it was set to.
+fn property_editor(
+    ui: &mut egui::Ui,
+    (config, property): (&str, &project::Property),
+    value: Option<&toml::Value>,
+) -> Option<toml::Value> {
+    use project::PropertyKind as K;
+    let id = ui.make_persistent_id(("property", config, &property.name));
+    match &property.kind {
+        K::OneOf(values) => {
+            let now = value.and_then(toml::Value::as_str).unwrap_or("");
+            let mut chosen = None;
+            egui::ComboBox::from_id_salt(id).selected_text(now).show_ui(ui, |ui| {
+                for v in values {
+                    if ui.selectable_label(v == now, v).clicked() && v != now {
+                        chosen = Some(toml::Value::String(v.clone()));
+                    }
+                }
+            });
+            chosen
+        }
+        K::Boolean => {
+            let mut on = value.and_then(toml::Value::as_bool).unwrap_or(false);
+            ui.checkbox(&mut on, "").changed().then_some(toml::Value::Boolean(on))
+        }
+        K::Integer => {
+            let mut n = value.and_then(toml::Value::as_integer).unwrap_or(0);
+            let response = ui.add(egui::DragValue::new(&mut n));
+            (response.changed() && !response.dragged() || response.drag_stopped()).then_some(toml::Value::Integer(n))
+        }
+        kind => {
+            // Text as it is edited, kept while it is; set where it is left.
+            let shown = match (kind, value) {
+                (K::Text, Some(toml::Value::String(s))) => s.clone(),
+                (K::Texts, Some(toml::Value::Array(items))) => {
+                    items.iter().filter_map(toml::Value::as_str).collect::<Vec<_>>().join("\n")
+                }
+                (_, Some(v)) => v.to_string(),
+                (_, None) => String::new(),
+            };
+            let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| shown.clone());
+            let editor = match kind {
+                K::Text => egui::TextEdit::singleline(&mut text),
+                _ => egui::TextEdit::multiline(&mut text).desired_rows(2).code_editor(),
+            };
+            let response = ui.add(editor.desired_width(220.0).id(id.with("text")));
+            if response.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, text.clone()));
+                return None;
+            }
+            ui.data_mut(|d| d.remove::<String>(id));
+            if !response.lost_focus() || text == shown {
+                return None;
+            }
+            match kind {
+                K::Text => Some(toml::Value::String(text)),
+                K::Texts => Some(toml::Value::Array(
+                    text.lines().filter(|l| !l.trim().is_empty()).map(|l| toml::Value::String(l.to_owned())).collect(),
+                )),
+                _ => format!("v = {text}").parse::<toml::Table>().ok().and_then(|mut t| t.remove("v")),
             }
         }
-        _ => {}
     }
 }
 

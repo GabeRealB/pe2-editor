@@ -325,6 +325,8 @@ pub enum EditRequest {
     Resolve(String, project::edit::Resolution),
     /// Show the graph pane, for the graph layer chosen.
     ShowGraph,
+    /// An edit that could not be made, and why: said to the user.
+    Refused(String),
     /// Write a file of the entry (its `node.toml`; empty: a plain file itself), labeled for the history; edits of one
     /// merge key made in a row are one step.
     Write {
@@ -1001,7 +1003,7 @@ impl Workspace {
             .map(at)
             .find(|path| !self.index.assets.contains_key(path))
             .unwrap_or_default();
-        let stack = self.extensions.stamp(found, &name)?;
+        let stack = self.extensions.stamp(&found, &name)?;
         // A stack naming its own file has the file under that name.
         let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
         let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
@@ -1069,6 +1071,15 @@ impl Workspace {
         step.write(&file, document.to_string().as_bytes()).map_err(|e| format!("{e:#}"))?;
         step.commit().map_err(|e| format!("{e:#}"))?;
         Ok(())
+    }
+
+    /// Set a config's property, or leave it to its default (`None`): written in `project.toml`, as a step.
+    ///
+    /// # Errors
+    /// The value is not as the project declares it, or it cannot be written.
+    pub fn set_property(&mut self, config: &str, property: &str, to: Option<&toml::Value>) -> Result<(), String> {
+        project::setup::set_property(&self.project, config, property, to, &mut self.history)
+            .map_err(|e| format!("{e:#}"))
     }
 
     /// Stop the epoch running.
@@ -1857,6 +1868,9 @@ impl Workspace {
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
         }
+        if let EditRequest::Refused(why) = request {
+            anyhow::bail!("{why}");
+        }
         // An edit reads the index (a layer's changeset): what was asked before is taken in first.
         self.settle();
         let name = match request {
@@ -1907,7 +1921,10 @@ impl Workspace {
             | EditRequest::Forget(_, uid)
             | EditRequest::Resolve(uid, _)
             | EditRequest::Write { uid, .. } => uid.clone(),
-            EditRequest::ShowGraph | EditRequest::Adopt(..) | EditRequest::RemoveUnlisted(..) => {
+            EditRequest::ShowGraph
+            | EditRequest::Refused(_)
+            | EditRequest::Adopt(..)
+            | EditRequest::RemoveUnlisted(..) => {
                 return Ok(String::new());
             }
         };
@@ -1942,6 +1959,7 @@ impl Workspace {
             }
             EditRequest::Rename(..)
             | EditRequest::ShowGraph
+            | EditRequest::Refused(_)
             | EditRequest::Adopt(..)
             | EditRequest::RemoveUnlisted(..) => return Ok(String::new()),
         };

@@ -11,6 +11,7 @@ const TARGET: &str = "wasm32-wasip3";
 const BUILTINS: &[(&str, &str)] = &[
     ("pe2-dialogue", "dialogue"),
     ("pe2-events", "events"),
+    ("pe2-graph", "graph"),
     ("pe2-flags", "flags"),
     ("pe2-fonts", "fonts"),
     ("pe2-formats", "formats"),

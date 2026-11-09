@@ -129,10 +129,30 @@ pub struct Reads {
     /// The project's plain files read, each by its path, with its hash; a folder listed, by its path and a `/`, with its list's.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entries: BTreeMap<String, String>,
-    /// The config it was made for, where it read which.
+    /// What it read of the config being built, where it read it: the hash of all of it, or of what it says
+    /// (`config_hash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
 }
+
+/// What reading the config being built is recorded as: the hash of all of it (`whole`: its name and folder too), or of
+/// what it says alone - its release, target and properties, which two configs can share; empty where none is built.
+#[must_use]
+pub fn config_hash(config: Option<&pe2_ext::data::BuildConfig>, whole: bool) -> String {
+    let Some(config) = config else { return String::new() };
+    let mut text = format!("{:?}\n{:?}\n{}", config.release, config.target, config.properties);
+    if whole {
+        text = format!("whole\n{}\n{}\n{text}", config.name, config.folder);
+    }
+    let hash = crate::extract::sha1_hex(text.as_bytes());
+    if whole { format!("{WHOLE}{hash}") } else { hash }
+}
+
+/// What a `for_each`'s items are traced as made by.
+const FOR_EACH_MADE: &str = "for_each@1";
+
+/// What marks a reading of all of a config.
+const WHOLE: &str = "all:";
 
 impl Reads {
     /// Add what another read: an output made from a kept one read what that one did.
@@ -143,7 +163,8 @@ impl Reads {
         if other.declaration.is_some() {
             self.declaration.clone_from(&other.declaration);
         }
-        if other.config.is_some() {
+        // What read all of the config wins over what read what it says.
+        if other.config.is_some() && !self.config.as_ref().is_some_and(|c| c.starts_with(WHOLE)) {
             self.config.clone_from(&other.config);
         }
     }
@@ -616,13 +637,27 @@ impl<'a> Call<'a> {
         Some(self.reach?.world.place(path)?.display().to_string())
     }
 
-    /// The config being built, recorded as read.
+    /// The config being built, recorded as read (all of it; none built is a reading too).
     #[must_use]
     pub fn config(&self) -> Option<pe2_ext::data::BuildConfig> {
-        let config = self.reach?.engine.config.clone()?;
+        let config = self.reach?.engine.config.clone();
         self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config =
-            Some(config.name.clone());
-        Some(config)
+            Some(config_hash(config.as_ref(), true));
+        config
+    }
+
+    /// What the config being built says - its release, target and properties - recorded as read so: two configs
+    /// saying the same share what is made of it.
+    #[must_use]
+    pub fn config_said(&self) -> Option<(Option<String>, Option<String>, toml::Table)> {
+        let config = self.reach?.engine.config.clone();
+        let mut reads = self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // What reads all of it keeps that.
+        if reads.config.is_none() {
+            reads.config = Some(config_hash(config.as_ref(), false));
+        }
+        drop(reads);
+        config.map(|c| (c.release, c.target, c.properties))
     }
 
     /// Its node's settings, recorded as read (its declaration as a whole).
@@ -883,7 +918,14 @@ pub fn evaluate(
             made[i] = Some(value);
         }
     }
-    let made = made.into_iter().map(|m| m.unwrap_or_else(|| Err("not made".into()))).collect();
+    let made = made
+        .into_iter()
+        .map(|m| match m {
+            Some(Err(e)) if is_absent(&e) => Err(Arc::from("it makes nothing: what makes it is not active")),
+            Some(made) => made,
+            None => Err("not made".into()),
+        })
+        .collect();
     (made, reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
@@ -893,6 +935,49 @@ fn making_made(chain: &[String], work: impl FnOnce() -> Made) -> Made {
     let done = work();
     MAKING.with(|making| *making.borrow_mut() = own);
     done
+}
+
+/// What a step that does not run makes, among the reasons nothing is made: it goes on to what takes from it, as a
+/// failure does, until a `merge` passes it by; an output it reaches says it is inactive.
+pub(crate) const ABSENT: &str = "\u{0}nothing is made: it is not active";
+
+/// Whether nothing was made for not being active, rather than for failing.
+#[must_use]
+pub fn is_absent(e: &str) -> bool {
+    e == ABSENT
+}
+
+/// A run's values, made and still to be taken.
+struct Run<'a> {
+    slots: Vec<Option<Made>>,
+    left: Vec<usize>,
+    known: HashMap<usize, (&'a Arc<Value>, &'a Reads)>,
+    /// The steps needed, and those taking each one's value by a port.
+    needed: Vec<bool>,
+    takers: Vec<Vec<usize>>,
+    /// The steps told they run, and those being made.
+    passed: Vec<bool>,
+    making: Vec<bool>,
+}
+
+impl Run<'_> {
+    /// A step's value taken: moved out where nothing else will take it.
+    fn take(&mut self, s: usize) -> Made {
+        self.left[s] -= 1;
+        let made = if self.left[s] == 0 { self.slots[s].take() } else { self.slots[s].clone() };
+        made.unwrap_or_else(|| Err("not made".into()))
+    }
+
+    /// A step's value that will not be taken where it was counted: let go of where nothing else takes it, and what it
+    /// takes too where it was not made.
+    fn release(&mut self, plan: &Plan, s: usize) {
+        self.left[s] -= 1;
+        if self.left[s] == 0 && self.slots[s].take().is_none() && !self.known.contains_key(&s) {
+            for from in plan.steps[s].sources() {
+                self.release(plan, from);
+            }
+        }
+    }
 }
 
 /// What an evaluation runs with.
@@ -914,55 +999,264 @@ impl Evaluation<'_> {
         self.run_steps(&steps, parameter)
     }
 
-    /// The values of these steps, made as `run` makes outputs'.
+    /// The values of these steps, made as `run` makes outputs': each asked for - what says whether it runs first, and
+    /// only where it does what it takes - and made once. What is never asked for is never made.
     fn run_steps(&self, targets: &[usize], parameter: Option<&str>) -> Vec<Made> {
         let plan = self.plan;
         let known: HashMap<usize, (&Arc<Value>, &Reads)> = self.known.iter().map(|(s, v, r)| (*s, (v, r))).collect();
         let needed = plan.steps_reached(targets, &known.keys().copied().collect());
-        // How many times each step's value is still to be taken: by the steps needed, and by the outputs.
+        // How many times each step's value may still be taken: by the steps needed, and by the outputs. What turns out
+        // not to be taken is let go of (`Run::release`), so that a value is still moved on its last taking.
         let mut left = vec![0usize; plan.steps.len()];
-        for (s, step) in plan.steps.iter().enumerate().filter(|(s, _)| needed[*s] && !known.contains_key(s)) {
-            let _ = s;
-            for &from in step.inputs.iter().flatten() {
+        for (_, step) in plan.steps.iter().enumerate().filter(|(s, _)| needed[*s] && !known.contains_key(s)) {
+            for from in step.sources() {
                 left[from] += 1;
             }
         }
         for &t in targets {
             left[t] += 1;
         }
-        let mut slots: Vec<Option<Made>> = vec![None; plan.steps.len()];
-        let take = |slots: &mut Vec<Option<Made>>, left: &mut Vec<usize>, s: usize| -> Made {
-            left[s] -= 1;
-            let made = if left[s] == 0 { slots[s].take() } else { slots[s].clone() };
-            made.unwrap_or_else(|| Err("not made".into()))
+        let mut takers = vec![Vec::new(); plan.steps.len()];
+        for (s, step) in plan.steps.iter().enumerate().filter(|(s, _)| needed[*s] && !known.contains_key(s)) {
+            for &from in step.inputs.iter().flatten() {
+                takers[from].push(s);
+            }
+        }
+        let steps = plan.steps.len();
+        let mut run = Run {
+            slots: vec![None; steps],
+            left,
+            known,
+            needed,
+            takers,
+            passed: vec![false; steps],
+            making: vec![false; steps],
         };
         let recorder = Recorder { node: self.node, reads: self.reads };
-        for s in (0..plan.steps.len()).filter(|&s| needed[s]) {
-            if let Some((value, reads)) = known.get(&s) {
-                self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(reads);
-                slots[s] = Some(Ok(Arc::clone(value)));
+        targets
+            .iter()
+            .map(|&t| {
+                self.make(t, &mut run, parameter, recorder);
+                run.take(t)
+            })
+            .collect()
+    }
+
+    /// Make a step, where it is not made: what says whether it runs asked for first; where it does not, nothing, and
+    /// what it takes let go of. A `merge` asks for what it takes in turn, until one is made.
+    fn make(&self, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) {
+        if run.slots[s].is_some() {
+            return;
+        }
+        if let Some((value, reads)) = run.known.get(&s) {
+            self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(reads);
+            run.slots[s] = Some(Ok(Arc::clone(value)));
+            return;
+        }
+        let step = &self.plan.steps[s];
+        run.making[s] = true;
+        let runs = self.gate(s, run, parameter, recorder);
+        if runs && step.op == super::MERGE {
+            let mut made = None;
+            for &from in step.inputs.iter().flatten() {
+                if made.is_some() {
+                    run.release(self.plan, from);
+                    continue;
+                }
+                self.settle_takers(from, s, run, parameter, recorder);
+                self.make(from, run, parameter, recorder);
+                match run.take(from) {
+                    Err(e) if is_absent(&e) => {}
+                    other => made = Some(other),
+                }
+            }
+            run.slots[s] = Some(made.unwrap_or_else(|| Err(Arc::from(ABSENT))));
+        }
+        if !runs || step.op == super::MERGE {
+            run.making[s] = false;
+            return;
+        }
+        let mut inputs = Vec::with_capacity(step.inputs.len());
+        let mut failed = None;
+        for port in &step.inputs {
+            let mut values = Vec::with_capacity(port.len());
+            for &from in port {
+                // What a step that cannot run takes is not made.
+                if failed.is_some() {
+                    run.release(self.plan, from);
+                    continue;
+                }
+                self.settle_takers(from, s, run, parameter, recorder);
+                self.make(from, run, parameter, recorder);
+                match run.take(from) {
+                    Ok(value) => values.push(Input(value)),
+                    Err(e) => failed = Some(e),
+                }
+            }
+            inputs.push(values);
+        }
+        run.slots[s] = Some(match failed {
+            Some(e) => Err(e),
+            None => self.step(step, inputs, parameter, recorder),
+        });
+        run.making[s] = false;
+    }
+
+    /// Whether a step runs, asking what says so where it was not asked yet. One that does not makes nothing - its
+    /// value said - and lets go of what it takes.
+    fn gate(&self, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) -> bool {
+        let step = &self.plan.steps[s];
+        let Some(active) = step.active.filter(|_| !run.passed[s]) else {
+            run.passed[s] = true;
+            return true;
+        };
+        self.make(active, run, parameter, recorder);
+        let runs = match run.take(active) {
+            Ok(value) => super::truth(&value)
+                .ok_or_else(|| Arc::from(format!("{}: its `active` is given {}, no boolean", step.at, value.ty()))),
+            Err(e) => Err(e),
+        };
+        run.passed[s] = true;
+        if runs == Ok(true) {
+            return true;
+        }
+        for from in step.inputs.iter().flatten() {
+            run.release(self.plan, *from);
+        }
+        run.slots[s] = Some(runs.and(Err(Arc::from(ABSENT))));
+        false
+    }
+
+    /// Before a step takes a value others take too, ask the others whether they run: one that does not lets go of it,
+    /// so that the value is moved to its last taker, not copied. Not where asking would reach a step being made.
+    fn settle_takers(&self, from: usize, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) {
+        if run.left[from] <= 1 {
+            return;
+        }
+        let others: Vec<usize> = run.takers[from]
+            .iter()
+            .copied()
+            .filter(|&c| c != s && run.needed[c] && run.slots[c].is_none() && !run.making[c] && !run.passed[c])
+            .collect();
+        for c in others {
+            let Some(active) = self.plan.steps[c].active else { continue };
+            let reaches = self.plan.steps_reached(&[active], &run.known.keys().copied().collect());
+            if reaches.iter().enumerate().any(|(x, reached)| *reached && run.making[x]) {
                 continue;
             }
-            let step = &plan.steps[s];
-            let mut inputs = Vec::with_capacity(step.inputs.len());
-            let mut failed = None;
-            for port in &step.inputs {
-                let mut values = Vec::with_capacity(port.len());
-                for &from in port {
-                    match take(&mut slots, &mut left, from) {
-                        Ok(value) => values.push(Input(value)),
-                        Err(e) => failed = Some(e),
-                    }
-                }
-                inputs.push(values);
-            }
-            let made = match failed {
-                Some(e) => Err(e),
-                None => self.step(step, inputs, parameter, recorder),
-            };
-            slots[s] = Some(made);
+            self.gate(c, run, parameter, recorder);
         }
-        targets.iter().map(|&t| take(&mut slots, &mut left, t)).collect()
+    }
+
+    /// A `for_each`: its body - an operation the project defines - laid out alone and run for each item it is given,
+    /// with what `with` takes, at the same time; each item kept by what it is given and what the body is, so that an item
+    /// changed is made again alone. What the body makes nothing of is left out; an item failing fails it, named.
+    fn for_each(&self, step: &super::Step, mut inputs: Vec<Vec<Input>>, parameter: Option<&str>) -> Made {
+        let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
+        let Some(uid) = step.settings.get("body").and_then(toml::Value::as_str) else {
+            return fail("it runs no `body`".into());
+        };
+        let Some(definition) = self.ops.definitions.get(uid) else {
+            return fail(format!("`{uid}`: the project defines no such operation"));
+        };
+        let settings: Table = step.settings.iter().filter(|(k, _)| *k != "body").map(|(k, v)| (k.clone(), v.clone())).collect();
+        let (plan, problems) = Plan::of_definition(definition, &settings, self.ops, &format!("{}: body", step.at));
+        if let Some(problem) = problems.first() {
+            return fail(format!("{}: {}", problem.at, problem.what));
+        }
+        let with: Vec<Arc<Value>> = inputs.get_mut(1).map_or_default(std::mem::take).into_iter().map(|i| i.0).collect();
+        if definition.inputs.len() != 1 + with.len() {
+            return fail(format!(
+                "`{}` takes {} inputs, and is given an item and {} more",
+                definition.label,
+                definition.inputs.len(),
+                with.len()
+            ));
+        }
+        let Some(given) = inputs.first_mut().and_then(Vec::pop) else { return fail("given no items".into()) };
+        let items: Vec<Arc<Value>> = match given.take() {
+            Value::List(items) => items.into_iter().map(Arc::new).collect(),
+            Value::Table(table) => table
+                .into_iter()
+                .map(|(key, value)| {
+                    let item = Table::from_iter([("key".to_string(), toml::Value::String(key)), ("value".to_string(), value)]);
+                    Arc::new(Value::Table(item))
+                })
+                .collect(),
+            other => return fail(format!("its `items` is {}, no list or table", other.ty())),
+        };
+        let Some(result) = plan.outputs.first() else { return fail(format!("`{}` makes nothing", definition.label)) };
+        let body = plan.describe(0, self.ops);
+        let with_hashes: Vec<String> = with.iter().map(|value| super::hash(value)).collect();
+        let chain = MAKING.with(|making| making.borrow().clone());
+        let numbered: Vec<(usize, Arc<Value>)> = items.into_iter().enumerate().collect();
+        let made = crate::parallel(&numbered, |(n, item)| {
+            making_made(&chain, || self.item(&plan, result.from, (&body, &with_hashes), (*n, item), &with, parameter))
+        });
+        let mut list = Vec::with_capacity(made.len());
+        for (n, made) in made.into_iter().enumerate() {
+            match made {
+                Ok(value) => list.push(Arc::unwrap_or_clone(value)),
+                Err(e) if is_absent(&e) => {}
+                Err(e) => return fail(format!("items[{n}]: {e}")),
+            }
+        }
+        Ok(Arc::new(Value::List(list)))
+    }
+
+    /// One item of a `for_each`: kept where its trace holds, else made by the body's plan given it.
+    fn item(
+        &self,
+        plan: &Plan,
+        result: usize,
+        (body, with_hashes): (&str, &[String]),
+        (n, item): (usize, &Arc<Value>),
+        with: &[Arc<Value>],
+        parameter: Option<&str>,
+    ) -> Made {
+        let text = format!(
+            "{VALUES}\n{}\nfor_each\n{body}\n{}\n{with_hashes:?}\n{parameter:?}",
+            id(self.node),
+            super::hash(item)
+        );
+        let key = crate::extract::sha1_hex(text.as_bytes());
+        if let Some(store) = self.store
+            && let Some(trace) = store.trace(&key).filter(|trace| {
+                trace.reads.hold(self.node, self.reach)
+                    && self.reach.is_none_or(|reach| reach.engine.holds_config(&trace.reads))
+            })
+            && let Ok(value) = store.get(&trace.value)
+        {
+            self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&trace.reads);
+            return Ok(Arc::new(value));
+        }
+        let reads = Mutex::new(Reads::default());
+        let known: Known = std::iter::once(Arc::clone(item))
+            .chain(with.iter().cloned())
+            .enumerate()
+            .map(|(step, value)| (step, value, Reads::default()))
+            .collect();
+        let own = Evaluation { plan, known: &known, reads: &reads, ..*self };
+        let made = own.run_steps(&[result], parameter).pop().unwrap_or_else(|| Err("not made".into()));
+        let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Ok(value), Some(store)) = (&made, self.store) {
+            let hash = super::hash(value);
+            let keep = store.put(&hash, value, &|sha1| self.node.read_content(sha1).ok()).and_then(|()| {
+                let trace = Trace {
+                    value: hash,
+                    reads: reads.clone(),
+                    node: id(self.node).to_string(),
+                    output: format!("item/{n}"),
+                    made: FOR_EACH_MADE.to_string(),
+                };
+                store.put_trace(&key, &trace)
+            });
+            if let Err(why) = keep {
+                return Err(Arc::from(format!("{why:#}")));
+            }
+        }
+        self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&reads);
+        made
     }
 
     /// Run a step: what it is given checked against its ports (their variables bound by it), what it makes against
@@ -974,6 +1268,9 @@ impl Evaluation<'_> {
         parameter: Option<&str>,
         recorder: Recorder<'_>,
     ) -> Made {
+        if step.op == super::FOR_EACH {
+            return self.for_each(step, inputs, parameter);
+        }
         let fail = |what: String| -> Made { Err(Arc::from(format!("{}: {what}", step.at))) };
         let Some(def) = self.ops.get(&step.op) else { return fail(format!("`{}`: no extension provides it", step.op)) };
         let Some(run) = def.run.as_ref() else {
@@ -1047,6 +1344,7 @@ impl Evaluation<'_> {
         let Some(given) = given else {
             let value = match tracing::info_span!("op", of = %step.op).in_scope(|| run(&mut call)) {
                 Ok(value) => value,
+                Err(e) if e.downcast_ref::<super::Absent>().is_some() => return Err(Arc::from(ABSENT)),
                 Err(e) => return fail(format!("{e:#}")),
             };
             return Self::made(step, def, &bound, value);
@@ -1311,7 +1609,10 @@ impl Evaluation<'_> {
         let key = crate::extract::sha1_hex(text.as_bytes());
         let store = self.store.filter(|_| micro.keep);
         if let Some(store) = store
-            && let Some(trace) = store.trace(&key).filter(|trace| trace.reads.hold(self.node, self.reach))
+            && let Some(trace) = store.trace(&key).filter(|trace| {
+                trace.reads.hold(self.node, self.reach)
+                    && self.reach.is_none_or(|reach| reach.engine.holds_config(&trace.reads))
+            })
             && let Ok(value) = store.get(&trace.value)
         {
             self.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&trace.reads);
@@ -1319,8 +1620,14 @@ impl Evaluation<'_> {
         }
         let reads = Mutex::new(Reads::default());
         let own = Evaluation { reads: &reads, ..*self };
-        let piece =
-            super::Step { op, settings: micro.settings.clone(), inputs: Vec::new(), ty: pe2_ext::Type::Any, at };
+        let piece = super::Step {
+            op,
+            settings: micro.settings.clone(),
+            inputs: Vec::new(),
+            ty: pe2_ext::Type::Any,
+            at,
+            active: None,
+        };
         let value = own.step(&piece, ports, parameter, Recorder { node: self.node, reads: &reads })?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(store) = store {
@@ -1420,6 +1727,14 @@ impl Engine {
         self.kept_in(None, plan, node, output, parameter)
     }
 
+    /// Whether what was read of the config being built is as it is now.
+    #[must_use]
+    pub fn holds_config(&self, reads: &Reads) -> bool {
+        reads.config.as_ref().is_none_or(|read| {
+            *read == config_hash(self.config.as_ref(), true) || *read == config_hash(self.config.as_ref(), false)
+        })
+    }
+
     /// An output's trace as `kept` finds it, what it read of other nodes told in `reach`.
     #[must_use]
     pub fn kept_in(
@@ -1432,11 +1747,7 @@ impl Engine {
     ) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
-        let same_config = trace
-            .reads
-            .config
-            .as_ref()
-            .is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
+        let same_config = self.holds_config(&trace.reads);
         (trace.node == id(node) && same_config && trace.reads.hold(node, reach) && store.has(&trace.value))
             .then_some(trace)
     }
@@ -1454,11 +1765,7 @@ impl Engine {
     ) -> Option<Trace> {
         let store = self.store.as_ref()?;
         let trace = store.trace(&self.key(plan, node, output, parameter))?;
-        let same_config = trace
-            .reads
-            .config
-            .as_ref()
-            .is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
+        let same_config = self.holds_config(&trace.reads);
         (trace.node == id(node) && same_config && trace.reads.hold(node, reach)).then_some(trace)
     }
 
@@ -1581,6 +1888,14 @@ impl Engine {
             reads: &reads,
             others: &others,
         };
+        if let Some(active) = step.active {
+            let runs = context.run_steps(&[active], parameter).pop().unwrap_or_else(|| Err("not made".into()));
+            match runs.map(|value| super::truth(&value)) {
+                Ok(Some(true)) => {}
+                Ok(_) => anyhow::bail!("{address} is not active"),
+                Err(e) => anyhow::bail!("{e}"),
+            }
+        }
         let mut inputs = Vec::with_capacity(step.inputs.len());
         for port in &step.inputs {
             let values = context.run_steps(port, parameter);

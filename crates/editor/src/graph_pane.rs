@@ -56,9 +56,25 @@ struct Node {
     at: Pos2,
     placed: bool,
     ports: Vec<Port>,
-    made: Option<Type>,
+    /// What it makes, each by name - its first under none - and type where known: a dot each.
+    outs: Vec<(String, Option<Type>)>,
     /// What each port takes from, by its place.
     wired: Vec<Vec<String>>,
+    /// The settings of the operation it is in that it reads (`{ setting = "<name>" }`); and, a setting box, its name.
+    reads: Vec<String>,
+    setting: Option<String>,
+}
+
+/// The settings a value reads, where it is `{ setting = "<name>" }`, in it.
+fn settings_read(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Table(table) if table.len() == 1 && table.get("setting").is_some_and(Value::is_str) => {
+            found.extend(table.get("setting").and_then(Value::as_str).map(str::to_string));
+        }
+        Value::Table(table) => table.values().for_each(|v| settings_read(v, found)),
+        Value::Array(items) => items.iter().for_each(|v| settings_read(v, found)),
+        _ => {}
+    }
 }
 
 /// A count of rows or columns, in points.
@@ -69,7 +85,7 @@ fn rows(count: usize) -> f32 {
 
 impl Node {
     fn size(&self) -> Vec2 {
-        vec2(WIDTH, HEADER + ROW * rows(self.ports.len() + 1) + 6.0)
+        vec2(WIDTH, HEADER + ROW * rows((self.ports.len() + self.outs.len()).max(1)) + 6.0)
     }
 
     fn rect(&self) -> Rect {
@@ -80,21 +96,36 @@ impl Node {
         self.at + vec2(0.0, HEADER + ROW * (rows(port) + 0.5))
     }
 
-    fn output(&self) -> Pos2 {
-        self.at + vec2(WIDTH, HEADER + ROW * (rows(self.ports.len()) + 0.5))
+    fn output(&self, n: usize) -> Pos2 {
+        self.at + vec2(WIDTH, HEADER + ROW * (rows(self.ports.len() + n) + 0.5))
+    }
+
+    /// What a wire from its output names: its id, or `id.<name>`.
+    fn source(&self, name: &str) -> String {
+        if name.is_empty() { self.id.clone() } else { format!("{}.{name}", self.id) }
+    }
+
+    /// What it makes first.
+    fn made(&self) -> Option<&Type> {
+        self.outs.first().and_then(|(_, ty)| ty.as_ref())
     }
 }
 
 /// Whether an asset's stack has a graph layer.
 pub fn has_graph(asset: &Asset) -> bool {
     let layers = asset.fields_toml().get("stack").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some(graph::GRAPH))
+    layers.iter().any(is_graph_layer)
+}
+
+/// Whether a layer holds a graph: a graph layer, or the graph of an operation the project defines.
+fn is_graph_layer(layer: &Value) -> bool {
+    matches!(layer.get("op").and_then(Value::as_str), Some(graph::GRAPH | graph::DEFINED))
 }
 
 /// The graph layer a pane shows of an asset: the one selected, else its first.
 fn layer_of(ws: &Workspace, asset: &Asset) -> Option<usize> {
     let layers = asset.fields_toml().get("stack")?.as_array()?;
-    let is_graph = |at: usize| layers.get(at).and_then(|l| l.get("op")?.as_str()) == Some(graph::GRAPH);
+    let is_graph = |at: usize| layers.get(at).is_some_and(is_graph_layer);
     let chosen = ws.inner_of(&asset.path).and_then(inspector::layer_of_inner).map(|(at, _)| at);
     chosen.filter(|at| is_graph(*at)).or_else(|| (0..layers.len()).find(|at| is_graph(*at)))
 }
@@ -108,13 +139,18 @@ fn sources(from: Option<&Value>) -> Vec<String> {
     }
 }
 
+/// The box a wire's source names: its id, without the output (`id.<name>`).
+fn base(source: &str) -> &str {
+    source.split_once('.').map_or(source, |(id, _)| id)
+}
+
 /// Where each box goes, by its id: in columns by how far it is from what has no source here, each column ordered by
 /// where its sources are, so wires cross little, and spaced so no box touches another.
 fn arrangement(nodes: &[Node]) -> HashMap<String, Pos2> {
     let mut depth: HashMap<&str, usize> = nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
     for _ in 0..nodes.len() {
         for node in nodes {
-            let deepest = node.wired.iter().flatten().filter_map(|s| depth.get(s.as_str())).max().map(|d| d + 1);
+            let deepest = node.wired.iter().flatten().filter_map(|s| depth.get(base(s))).max().map(|d| d + 1);
             if let Some(deepest) = deepest {
                 depth.insert(&node.id, deepest);
             }
@@ -128,7 +164,7 @@ fn arrangement(nodes: &[Node]) -> HashMap<String, Pos2> {
             .filter(|n| depth[n.id.as_str()] == column)
             .map(|node| {
                 let heights: Vec<f32> =
-                    node.wired.iter().flatten().filter_map(|s| places.get(s)).map(|p| p.y).collect();
+                    node.wired.iter().flatten().filter_map(|s| places.get(base(s))).map(|p| p.y).collect();
                 (node, heights.iter().sum::<f32>() / rows(heights.len().max(1)))
             })
             .collect();
@@ -142,8 +178,9 @@ fn arrangement(nodes: &[Node]) -> HashMap<String, Pos2> {
     places
 }
 
-/// A graph layer's operations: those not placed where they would be arranged.
-fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, at: usize) -> Vec<Node> {
+/// A graph's operations as boxes, those not placed where they would be arranged: their steps found in the plan by where
+/// they are (`<prefix>.ops.<id>`), in an operation the project defines its boxes as it is from outside.
+fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, prefix: &str, defined: bool) -> Vec<Node> {
     let ops = ws.extensions.operations();
     let table = layer.get("ops").and_then(Value::as_table);
     let mut nodes: Vec<Node> = table
@@ -152,22 +189,60 @@ fn nodes_of(ws: &Workspace, layer: &Value, plan: &graph::Plan, at: usize) -> Vec
         .map(|(id, op)| {
             let name = op.get("op").and_then(Value::as_str).unwrap_or_default().to_string();
             let def = ops.get(&name);
-            let ports = def.map_or_default(|d| d.inputs.clone());
+            let group = ops.definitions.get(&name);
+            let output = name == graph::OUTPUT;
+            let boxed = [graph::INPUT, graph::SETTING].contains(&name.as_str()) || (defined && output);
+            let mut ports = ops.ports_of(&name);
+            // An operation the project defines' output takes one value, and says nothing of events.
+            if defined && output {
+                ports.truncate(1);
+            }
+            // Any operation that makes a value may be told whether it runs; boxes of signals and of an operation's
+            // interface may not.
+            let signals = [graph::OUTPUT, graph::PREVIEW, graph::SIGNAL, graph::EVENT];
+            let gate = graph::GATES.iter().any(|g| g.name == name);
+            if (def.is_some() || group.is_some()) && !boxed && !signals.contains(&name.as_str()) && !gate {
+                ports.push(pe2_ext::Port {
+                    name: graph::ACTIVE.to_string(),
+                    ty: Type::Named(graph::BOOL_TYPE.to_string()),
+                    many: false,
+                });
+            }
             let from = op.get("from");
             let wired = ports.iter().map(|p| sources(from.and_then(|f| f.get(&p.name)))).collect();
-            let here = format!("stack[{at}].ops.{id}");
-            let made = plan
-                .steps
-                .iter()
-                .find(|s| s.at == here)
-                .map(|s| s.ty.clone())
-                .or_else(|| def.and_then(|d| d.output.clone()));
+            let here = format!("{prefix}.ops.{id}");
+            let stepped = plan.steps.iter().find(|s| s.at == here).map(|s| s.ty.clone());
+            let declared = || Type::parse(op.get("type")?.as_str()?, "").ok();
+            let outs = match name.as_str() {
+                graph::OUTPUT | graph::PREVIEW | graph::SIGNAL => Vec::new(),
+                graph::INPUT => vec![(String::new(), Some(declared().unwrap_or(Type::Any)))],
+                _ => {
+                    let mut outs: Vec<(String, Option<Type>)> =
+                        ops.outputs_of(&name).into_iter().map(|(name, ty)| (name, Some(ty))).collect();
+                    if outs.is_empty() {
+                        outs.push((String::new(), None));
+                    }
+                    if stepped.is_some() {
+                        outs[0].1 = stepped;
+                    }
+                    outs
+                }
+            };
             let place = op.get(layers::POS).and_then(Value::as_array);
             let number = |i: usize| place.and_then(|p| p.get(i)?.as_float());
             #[expect(clippy::cast_possible_truncation, reason = "a place on a canvas")]
             let placed = number(0).zip(number(1)).map(|(x, y)| pos2(x as f32, y as f32));
-            let label = def.map_or_else(|| name.clone(), |d| d.label.clone());
-            Node { id: id.clone(), label, at: placed.unwrap_or_default(), placed: placed.is_some(), ports, made, wired }
+            let named = op.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
+            let boxed_label = || Some(format!("{}: {named}", def.map_or("", |d| d.label.as_str())));
+            let label = if boxed { boxed_label() } else { None }
+                .or_else(|| def.map(|d| d.label.clone()))
+                .or_else(|| group.map(|g| g.label.clone()))
+                .unwrap_or_else(|| name.clone());
+            let mut reads = Vec::new();
+            settings_read(op, &mut reads);
+            let setting = (name == graph::SETTING).then_some(named);
+            let at = placed.unwrap_or_default();
+            Node { id: id.clone(), label, at, placed: placed.is_some(), ports, outs, wired, reads, setting }
         })
         .collect();
     let arranged = arrangement(&nodes);
@@ -191,6 +266,7 @@ fn type_color(ty: Option<&Type>) -> Color32 {
         Some(Type::Stream(_) | Type::Video | Type::Audio | Type::List(_)) => Color32::from_rgb(178, 132, 226),
         Some(Type::Image) => Color32::from_rgb(86, 196, 168),
         Some(Type::Table | Type::Marks) => Color32::from_rgb(224, 172, 86),
+        Some(Type::Named(name)) if name == graph::BOOL_TYPE => Color32::from_rgb(228, 112, 128),
         Some(Type::Named(_) | Type::Union(_) | Type::Bytes) => Color32::from_rgb(98, 160, 232),
         _ => theme::weak(),
     }
@@ -273,8 +349,13 @@ fn add_menu(
     let taken: Vec<&str> =
         layer.get("ops").and_then(Value::as_table).into_iter().flatten().map(|(id, _)| id.as_str()).collect();
     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+        let defined = layer.get("op").and_then(Value::as_str) == Some(graph::DEFINED);
         for (op, label) in ws.extensions.graph_operations() {
             if !label.to_lowercase().contains(&filter) && !op.to_lowercase().contains(&filter) {
+                continue;
+            }
+            // What stands for a value from outside is never added; an operation's interface, only to one.
+            if op == graph::GIVEN || (!defined && [graph::INPUT, graph::SETTING].contains(&op.as_str())) {
                 continue;
             }
             if ui.button(&label).on_hover_text(&op).clicked() {
@@ -288,7 +369,7 @@ fn add_menu(
                             asset.files.iter().find(|f| f.made_by.is_none() && f.name != project::index::NODE_FILE);
                         table.insert("file".into(), stored.map_or("", |f| f.name.as_str()).into());
                     }
-                    graph::OUTPUT | graph::PREVIEW => {
+                    graph::OUTPUT | graph::PREVIEW | graph::INPUT | graph::SETTING => {
                         table.insert("name".into(), id.as_str().into());
                     }
                     _ => {}
@@ -323,9 +404,13 @@ fn end_rect(at: Pos2) -> Rect {
 }
 
 /// What is on the canvas, all of it: what fitting shows.
-fn extent(nodes: &[Node], from_above: bool) -> Rect {
+fn extent(nodes: &[Node], sources: usize) -> Rect {
     let (above, below) = ends(nodes);
-    let all = nodes.iter().map(Node::rect).chain([end_rect(below)]).chain(from_above.then(|| end_rect(above)));
+    let all = nodes
+        .iter()
+        .map(Node::rect)
+        .chain([end_rect(below)])
+        .chain((0..sources).map(|n| end_rect(source_at(above, n))));
     all.fold(Rect::NOTHING, Rect::union).expand(MARGIN)
 }
 
@@ -336,8 +421,21 @@ struct Canvas<'a> {
     at: usize,
     layer: &'a Value,
     nodes: Vec<Node>,
-    above: Option<Type>,
+    /// What the graph is given, a box each: what comes from above, by the name its operations take it by, what it is
+    /// called, and its type. None in an operation the project defines, whose input boxes are its own.
+    sources: Vec<(String, String, Type)>,
     wrong: Vec<graph::Problem>,
+    /// Where its operations' steps are in the plan (`<prefix>.ops.<id>`).
+    prefix: String,
+    /// Whether it is an operation the project defines: what it makes is its output boxes', passed on to no layer.
+    defined: bool,
+}
+
+/// Where a graph's `n`th source box is.
+fn source_at(above: Pos2, n: usize) -> Pos2 {
+    #[expect(clippy::cast_precision_loss, reason = "a handful of boxes")]
+    let n = n as f32;
+    above + vec2(0.0, n * (HEADER + ROW + 6.0 + GAP.y))
 }
 
 impl Canvas<'_> {
@@ -362,7 +460,7 @@ impl Canvas<'_> {
     }
 
     /// The wires, under the boxes.
-    fn wires(&self, ui: &egui::Ui, outs: &HashMap<&str, (Pos2, Option<Type>)>, into: Option<(Pos2, &str)>) {
+    fn wires(&self, ui: &egui::Ui, outs: &HashMap<String, (Pos2, Option<Type>)>, into: Option<(Pos2, &str)>) {
         let painter = ui.painter();
         let bad = ui.visuals().error_fg_color;
         for node in &self.nodes {
@@ -372,6 +470,14 @@ impl Canvas<'_> {
                     let fits = made.as_ref().is_none_or(|ty| port.ty.unify(ty, &mut Vec::new()));
                     wire(painter, *from, node.input(i), if fits { type_color(made.as_ref()) } else { bad });
                 }
+            }
+        }
+        // What reads a setting, by a faint line from the setting's box to the reader's title.
+        for node in &self.nodes {
+            for name in &node.reads {
+                let Some(setting) = self.nodes.iter().find(|n| n.setting.as_deref() == Some(name)) else { continue };
+                let color = type_color(setting.made()).gamma_multiply(0.35);
+                wire(painter, setting.output(0), node.at + vec2(0.0, HEADER * 0.5), color);
             }
         }
         if let Some((to, source)) = into
@@ -411,9 +517,9 @@ impl Canvas<'_> {
             *edit = self.edit(format!("Move {id}"), layers::place(self.asset.text(), self.at, &id, to));
         }
         let selected = state.selected.as_deref() == Some(&node.id);
-        let here = format!("stack[{}].ops.{}", self.at, node.id);
-        let wrong = self.wrong.iter().any(|p| p.at == here);
-        box_at(painter, node.rect(), &node.label, type_color(node.made.as_ref()), (selected, wrong), ui);
+        let here = format!("{}.ops.{}", self.prefix, node.id);
+        let wrong = self.wrong.iter().any(|p| p.at == here || p.at.starts_with(&format!("{here} ")));
+        box_at(painter, node.rect(), &node.label, type_color(node.made()), (selected, wrong), ui);
         for (i, port) in node.ports.iter().enumerate() {
             let place = node.input(i);
             let lit = drawing.is_some_and(|made| made.as_ref().is_none_or(|ty| port.ty.unify(ty, &mut Vec::new())));
@@ -428,14 +534,16 @@ impl Canvas<'_> {
                 state.wire = Some((source.clone(), Some((node.id.clone(), port.name.clone()))));
             }
         }
-        let place = node.output();
-        port_dot(painter, place, type_color(node.made.as_ref()), false);
-        let made = node.made.as_ref().map_or_else(|| "any".to_string(), ToString::to_string);
-        text_at(painter, place - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, &short(&made), small, theme::text());
-        if port_response(ui, ("graph out", &node.id, ""), place, &format!("output of {}: makes {made}", node.id))
-            .drag_started()
-        {
-            state.wire = Some((node.id.clone(), None));
+        for (n, (name, ty)) in node.outs.iter().enumerate() {
+            let place = node.output(n);
+            port_dot(painter, place, type_color(ty.as_ref()), false);
+            let made = ty.as_ref().map_or_else(|| "any".to_string(), ToString::to_string);
+            let text = if name.is_empty() { short(&made) } else { format!("{name}  ·  {}", short(&made)) };
+            text_at(painter, place - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, &text, small.clone(), theme::text());
+            let says = format!("output {} of {}: makes {made}", if name.is_empty() { "first" } else { name }, node.id);
+            if port_response(ui, ("graph out", &node.id, name), place, &says).drag_started() {
+                state.wire = Some((node.source(name), None));
+            }
         }
     }
 
@@ -443,9 +551,10 @@ impl Canvas<'_> {
     fn ends_ui(&self, ui: &egui::Ui, (above, below): (Pos2, Pos2), passed: Option<&str>, state: &mut State) {
         let painter = ui.painter();
         let small = egui::TextStyle::Small.resolve(ui.style());
-        if let Some(ty) = &self.above {
-            box_at(painter, end_rect(above), "From above", type_color(Some(ty)), (false, false), ui);
-            let place = above + vec2(END_WIDTH, HEADER + ROW * 0.5);
+        for (n, (id, label, ty)) in self.sources.iter().enumerate() {
+            let at = source_at(above, n);
+            box_at(painter, end_rect(at), label, type_color(Some(ty)), (false, false), ui);
+            let place = at + vec2(END_WIDTH, HEADER + ROW * 0.5);
             let text = ty.to_string();
             text_at(
                 painter,
@@ -456,9 +565,13 @@ impl Canvas<'_> {
                 theme::text(),
             );
             port_dot(painter, place, type_color(Some(ty)), false);
-            if port_response(ui, ("graph out", ABOVE, ""), place, &format!("from above: {text}")).drag_started() {
-                state.wire = Some((ABOVE.to_string(), None));
+            if port_response(ui, ("graph out", id.as_str(), ""), place, &format!("{label}: {text}")).drag_started() {
+                state.wire = Some((id.clone(), None));
             }
+        }
+        // What an operation the project defines makes is its output boxes': nothing goes on down.
+        if self.defined {
+            return;
         }
         box_at(painter, end_rect(below), "Passed on down", theme::weak(), (false, false), ui);
         let place = below + vec2(0.0, HEADER + ROW * 0.5);
@@ -477,7 +590,7 @@ impl Canvas<'_> {
         at: Pos2,
         sink: Pos2,
         (source, off): (String, Option<(String, String)>),
-        outs: &HashMap<&str, (Pos2, Option<Type>)>,
+        outs: &HashMap<String, (Pos2, Option<Type>)>,
         state: &mut State,
     ) -> Option<EditRequest> {
         let (layer, mut text) = (self.at, Ok(self.asset.text().to_string()));
@@ -496,7 +609,7 @@ impl Canvas<'_> {
         let port = self.nodes.iter().find_map(|node| {
             (0..node.ports.len()).find(|i| node.input(*i).distance(at) <= PORT).map(|i| (node, &node.ports[i]))
         });
-        if sink.distance(at) <= PORT {
+        if !self.defined && sink.distance(at) <= PORT {
             text = text.and_then(|t| layers::set_result(&t, layer, Some(&source)));
             label = format!("Pass {source} on down");
             wrote = true;
@@ -519,12 +632,17 @@ impl Canvas<'_> {
     fn contents(&self, ui: &egui::Ui, state: &mut State, edit: &mut Option<EditRequest>) {
         Self::dots(ui);
         let (above, below) = ends(&self.nodes);
-        let source = above + vec2(END_WIDTH, HEADER + ROW * 0.5);
+        let source = |n: usize| source_at(above, n) + vec2(END_WIDTH, HEADER + ROW * 0.5);
         let sink = below + vec2(0.0, HEADER + ROW * 0.5);
-        let mut outs: HashMap<&str, (Pos2, Option<Type>)> =
-            self.nodes.iter().map(|n| (n.id.as_str(), (n.output(), n.made.clone()))).collect();
-        outs.insert(ABOVE, (source, self.above.clone()));
-        let passed = self.layer.get("result").and_then(Value::as_str);
+        let mut outs: HashMap<String, (Pos2, Option<Type>)> = self
+            .nodes
+            .iter()
+            .flat_map(|n| n.outs.iter().enumerate().map(move |(i, (name, ty))| (n.source(name), (n.output(i), ty.clone()))))
+            .collect();
+        for (n, (id, _, ty)) in self.sources.iter().enumerate() {
+            outs.insert(id.clone(), (source(n), Some(ty.clone())));
+        }
+        let passed = self.layer.get("result").and_then(Value::as_str).filter(|_| !self.defined);
         self.wires(ui, &outs, passed.map(|p| (sink, p)));
         let drawing = state.wire.as_ref().and_then(|(source, _)| outs.get(source.as_str()).cloned());
         for node in &self.nodes {
@@ -548,7 +666,7 @@ impl Canvas<'_> {
 
 /// The canvas, its background the scene's: a click there selects nothing, a right-click adds, a double-click fits.
 fn canvas_ui(ui: &mut egui::Ui, canvas: &Canvas<'_>, state: &mut State, edit: &mut Option<EditRequest>) {
-    let mut view = state.view.unwrap_or_else(|| extent(&canvas.nodes, canvas.above.is_some()));
+    let mut view = state.view.unwrap_or_else(|| extent(&canvas.nodes, canvas.sources.len()));
     let scene = egui::Scene::new().zoom_range(0.2..=1.0).scroll_zooms(true);
     let shown = scene.show(ui, &mut view, |ui| canvas.contents(ui, state, edit));
     state.view = Some(view);
@@ -627,16 +745,38 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
         .filter(|(of, _)| *of == at)
         .and_then(|(_, op)| op.map(str::to_string));
     let before = state.selected.clone();
-    let (plan, wrong) = ws.extensions.plan(&asset);
-    let mut nodes = nodes_of(ws, &layer, &plan, at);
+    // An operation the project defines is laid out alone, its settings their defaults: what its boxes make, and what
+    // is wrong with it. A graph layer is its node's plan.
+    let defined = layer.get("op").and_then(Value::as_str) == Some(graph::DEFINED);
+    let found = asset.uid.as_deref().and_then(|uid| ws.extensions.definition(uid)).filter(|_| defined);
+    let (plan, wrong, prefix) = if let Some(definition) = &found {
+        let ops = ws.extensions.operations();
+        let (plan, wrong) = graph::Plan::of_definition(definition, &toml::Table::new(), &ops, &format!("stack[{at}]"));
+        (plan, wrong, format!("stack[{at}] ({})", definition.label))
+    } else {
+        let (plan, wrong) = ws.extensions.plan(&asset);
+        (plan, wrong, format!("stack[{at}]"))
+    };
+    let mut nodes = nodes_of(ws, &layer, &plan, &prefix, defined);
     if let Some((moving, place)) = &state.moving
         && let Some(node) = nodes.iter_mut().find(|n| n.id == *moving)
     {
         node.at = *place;
     }
-    let above = plan.above.get(at).cloned().flatten();
+    // What a graph layer is given: what is above it. An operation the project defines has input boxes of its own.
+    let sources = if defined {
+        Vec::new()
+    } else {
+        plan.above
+            .get(at)
+            .cloned()
+            .flatten()
+            .map(|ty| (ABOVE.to_string(), "From above".to_string(), ty))
+            .into_iter()
+            .collect()
+    };
     let ask = ws.graph_ask.take();
-    let canvas = Canvas { ws, asset: &asset, at, layer: &layer, nodes, above, wrong };
+    let canvas = Canvas { ws, asset: &asset, at, layer: &layer, nodes, sources, wrong, prefix, defined };
     match ask {
         Some(GraphAsk::Fit) => state.view = None,
         Some(GraphAsk::Arrange) if inspector::edit_target(canvas.ws, canvas.asset).is_ok() => {
@@ -676,7 +816,9 @@ mod tests {
             at: Pos2::ZERO,
             placed: false,
             ports: (0..wired.len()).map(port).collect(),
-            made: None,
+            outs: vec![(String::new(), None)],
+            reads: Vec::new(),
+            setting: None,
             wired: wired.iter().map(|w| vec![(*w).to_string()]).collect(),
         }
     }

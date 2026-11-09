@@ -197,6 +197,8 @@ interface host {
         folder: string,
         /// What every config of the project says, as `key=value`.
         known: list<string>,
+        /// Its properties, each the project declares as it sets it or by default (a TOML table).
+        properties: string,
     }
 
     use types.{image, rect, style, icon, file, value};

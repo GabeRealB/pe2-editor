@@ -185,11 +185,14 @@ pub fn shift(text: &str, from: usize, to: usize) -> Result<String> {
     })
 }
 
-/// A graph layer's table, in a stack's layers.
+/// A graph layer's table, in a stack's layers: a graph layer, or an operation the project defines.
 fn graph_layer(layers: &mut [Value], at: usize) -> Result<&mut Table> {
     let layer =
         layers.get_mut(at).and_then(Value::as_table_mut).with_context(|| format!("the stack has no layer {at}"))?;
-    anyhow::ensure!(layer.get("op").and_then(Value::as_str) == Some(super::GRAPH), "layer {at} is no graph");
+    anyhow::ensure!(
+        matches!(layer.get("op").and_then(Value::as_str), Some(super::GRAPH | super::DEFINED)),
+        "layer {at} is no graph"
+    );
     Ok(layer)
 }
 
@@ -233,10 +236,12 @@ pub fn remove_operation(text: &str, at: usize, id: &str) -> Result<String> {
         ops.remove(id).with_context(|| format!("no operation `{id}`"))?;
         for op in ops.iter_mut().filter_map(|(_, op)| op.as_table_mut()) {
             let Some(from) = op.get_mut("from").and_then(Value::as_table_mut) else { continue };
+            // Wires to it, or to one of its outputs (`id.<name>`).
+            let to_it = |source: &str| source == id || source.strip_prefix(id).is_some_and(|rest| rest.starts_with('.'));
             from.retain(|_, wired| match wired {
-                Value::String(source) => source != id,
+                Value::String(source) => !to_it(source),
                 Value::Array(sources) => {
-                    sources.retain(|s| s.as_str() != Some(id));
+                    sources.retain(|s| !s.as_str().is_some_and(to_it));
                     !sources.is_empty()
                 }
                 _ => true,

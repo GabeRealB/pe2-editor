@@ -239,6 +239,7 @@ impl Source for Lent<'_> {
             target: c.target,
             folder: c.folder,
             known: c.known,
+            properties: c.properties.parse().unwrap_or_default(),
         })
     }
 

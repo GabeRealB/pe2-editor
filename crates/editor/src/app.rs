@@ -2102,6 +2102,7 @@ impl Editor {
         let mut listed: Vec<(String, String)> = ws
             .extensions
             .templates()
+            .into_iter()
             .filter(|template| template.offered && !template.stored())
             .map(|template| (template.label.clone(), template.name.clone()))
             .collect();
@@ -2657,7 +2658,7 @@ impl Editor {
                 // A node of its own, as the templates taking it make one.
                 if let [file] = files.as_slice() {
                     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                    for template in ws.extensions.templates_for(name).into_iter().filter(|_| file.is_file()) {
+                    for template in ws.extensions.templates_for(name).into_iter().filter(|t| t.offered && file.is_file()) {
                         if ui.button(format!("New node: {}", template.label)).clicked() {
                             made = Some((template.name.clone(), file.clone()));
                         }

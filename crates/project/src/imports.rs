@@ -261,6 +261,8 @@ impl Imports {
     ) -> Attached {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
+        // What the project defines, for the stacks laying it in.
+        let defined = extensions.take_definitions(index);
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
         forget_imports(index, &of);
         let engine = self.engine(extensions);
@@ -354,7 +356,9 @@ impl Imports {
             Problem::Extension { .. } | Problem::Required { .. } => false,
             _ => true,
         });
+        index.problems.retain(|p| !defined.contains(p));
         index.problems.extend(problems);
+        index.problems.extend(defined);
         attached
     }
 
