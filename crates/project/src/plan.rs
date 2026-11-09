@@ -59,8 +59,17 @@ struct Op {
     inputs: BTreeMap<String, Vec<Vec<String>>>,
     /// What it comes after, taking nothing of it: its key is theirs too.
     after: Vec<String>,
-    args: Value,
+    /// Its arguments, as JSON written as `serde_json` writes them: what its key hashes, read again where they are used.
+    /// A plan's arguments are most of it, and held as values they would take several times its size.
+    args: Box<str>,
     sha1: Option<String>,
+}
+
+impl Op {
+    /// Its arguments.
+    fn args(&self) -> Value {
+        serde_json::from_str(&self.args).unwrap_or(Value::Null)
+    }
 }
 
 /// What a bundle is given: its files, each by the operation making it.
@@ -270,7 +279,7 @@ impl Plan {
                     "line {at}: it comes after {earlier}, which nothing before makes"
                 );
             }
-            let args = line.get("args").cloned().unwrap_or(Value::Null);
+            let args = serde_json::to_string(line.get("args").unwrap_or(&Value::Null))?.into_boxed_str();
             let sha1 = line.pointer("/expect/sha1").and_then(Value::as_str).map(str::to_string);
             anyhow::ensure!(!by_id.contains_key(&id), "line {at}: {id} is made twice");
             by_id.insert(id.clone(), ops.len());
@@ -323,7 +332,7 @@ impl Plan {
                 None => VERSION.to_string(),
             };
             let after: Vec<&String> = op.after.iter().map(|id| &keys[self.by_id[id]]).collect();
-            let what = json!({"op": op.kind, "version": version, "args": op.args, "sha1": op.sha1, "in": taken, "after": after});
+            let what = json!({"op": op.kind, "version": version, "args": op.args(), "sha1": op.sha1, "in": taken, "after": after});
             keys.push(sha1_hex(what.to_string().as_bytes()));
         }
         keys
@@ -351,7 +360,7 @@ impl Plan {
         for at in 0..self.ops.len() {
             let op = &self.ops[at];
             possible[at] = if op.kind == "disc" {
-                op.args.get("release").and_then(Value::as_str).is_some_and(|r| releases.contains(r))
+                op.args().get("release").and_then(Value::as_str).is_some_and(|r| releases.contains(r))
             } else {
                 let mut ok = op.after.iter().all(|id| possible[self.by_id[id]]);
                 let mut takes = BTreeMap::new();
@@ -896,7 +905,8 @@ fn joined(
 ) -> Result<()> {
     let joined = crate::parallel(last, |&at| -> Result<usize> {
         let op = &plan.ops[at];
-        let node = op.args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
+        let args = op.args();
+        let node = args.get("node").and_then(Value::as_str).with_context(|| format!("{}: no node", op.id))?;
         let want = op.sha1.as_deref().with_context(|| format!("{}: no sha1 to hold it to", op.id))?;
         let got = crate::extract::assembled_sha1(layers, node, engine, extensions).with_context(|| op.id.clone())?;
         anyhow::ensure!(got == want, "{}: what it joins has sha1 {got}, where the plan says {want}", op.id);
@@ -1197,7 +1207,7 @@ impl RunState<'_> {
             let values = ids.iter().map(|id| self.made_by(id)?.value()).collect::<Result<Vec<_>>>()?;
             inputs.push(values);
         }
-        let settings = match &op.args {
+        let settings = match &op.args() {
             Value::Null => toml::Table::new(),
             args => toml::Table::try_from(args).context("its args as settings")?,
         };
@@ -1222,7 +1232,8 @@ impl RunState<'_> {
     /// its settings with those its import derives).
     fn source(&self, op: &Op) -> Result<Made> {
         let Made::Files(native) = self.taken(op, "native")? else { bail!("its native form is no files") };
-        let text = |name: &str| op.args.get(name).and_then(Value::as_str).with_context(|| format!("no {name}"));
+        let args = op.args();
+        let text = |name: &str| args.get(name).and_then(Value::as_str).with_context(|| format!("no {name}"));
         // TOML text, whose tables keep their order: what a source is written in.
         let declared = text("declared")?.to_string();
         let native = native.iter().map(|(name, bytes)| (name.clone(), bytes.to_vec())).collect();
@@ -1247,7 +1258,7 @@ impl RunState<'_> {
     }
 
     fn make(&self, op: &Op) -> Result<Made> {
-        let args = &op.args;
+        let args = &op.args();
         let text = |name: &str| args.get(name).and_then(Value::as_str).with_context(|| format!("no {name}"));
         let number = |name: &str| args.get(name).and_then(Value::as_u64).with_context(|| format!("no {name}"));
         let folder = || args.get("folder").and_then(Value::as_u64).map(u32::try_from).transpose();

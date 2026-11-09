@@ -441,6 +441,8 @@ impl Table {
         if let Some(at) = found {
             return Some(std::mem::replace(&mut inner.list[at].1, value));
         }
+        // A table is built whole and seldom grown: by one, not doubled.
+        inner.list.reserve_exact(1);
         inner.list.push((key, value));
         inner.sorted = OnceLock::new();
         None

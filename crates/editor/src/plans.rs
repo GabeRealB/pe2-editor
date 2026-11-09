@@ -98,6 +98,8 @@ impl Plans {
                 layers.insert(layer.name.clone(), Planned { fills, header, state: Some(state), discs });
             }
             let _ = sender.send(layers);
+            // What reading the plans freed, given back.
+            project::give_back_memory();
             ctx.request_repaint();
         };
         if std::thread::Builder::new().name("plans".into()).spawn(work).is_ok() {
