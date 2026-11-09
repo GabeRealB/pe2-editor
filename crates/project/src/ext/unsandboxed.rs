@@ -38,7 +38,16 @@ pub fn program(folder: Option<&Path>, fetched: &[PathBuf], tool: &str) -> PathBu
     let shipped = folder.into_iter().flat_map(|folder| [folder.join(platform()).join(tool), folder.join(tool)]);
     let shipped = shipped.chain(fetched.iter().map(|place| place.join(tool)));
     let named = shipped.flat_map(|path| [path.with_added_extension(std::env::consts::EXE_EXTENSION), path]);
-    named.into_iter().find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(tool))
+    named.into_iter().find(|p| crate::pack::is_file(p)).map_or_else(|| PathBuf::from(tool), |p| runnable(&p))
+}
+
+/// A path a program can be handed for a place in an extension's tree: itself on disk; one a project holds, through the
+/// filesystem the project is served as (`content::for_program`), its tree laid out nowhere.
+fn runnable(path: &Path) -> PathBuf {
+    if crate::records::held_at(path).is_some() {
+        return crate::content::for_program(path).unwrap_or_else(|_| path.to_path_buf());
+    }
+    path.to_path_buf()
 }
 
 /// A program an extension starts by name that is another program with arguments (`[[launch]]` of its manifest): a
@@ -82,18 +91,21 @@ impl Launch {
 #[must_use]
 pub fn in_tree(folder: Option<&Path>, fetched: &[PathBuf], place: &str) -> Option<PathBuf> {
     let shipped = folder.into_iter().flat_map(|folder| [folder.join(platform()).join(place), folder.join(place)]);
-    shipped.chain(fetched.iter().map(|at| at.join(place))).find(|path| path.exists())
+    let found = shipped.chain(fetched.iter().map(|at| at.join(place)));
+    found.into_iter().find(|path| crate::pack::is_file(path) || crate::pack::is_dir(path)).map(|path| runnable(&path))
 }
 
-/// The files in a folder, by their paths within it, in order.
+/// The files in a folder - on disk, or an extension's a project holds (`records::held_at`) - by their paths within it,
+/// in order.
 fn files_in(folder: &Path, within: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
-    let mut entries = std::fs::read_dir(folder)
-        .with_context(|| folder.display().to_string())?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let (path, name) = (entry.path(), within.join(entry.file_name()));
-        if path.is_dir() {
+    if !crate::pack::is_dir(folder) {
+        anyhow::bail!("{}: no such folder", folder.display());
+    }
+    let mut entries = crate::pack::read_dir(folder);
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path, is_folder) in entries {
+        let name = within.join(name);
+        if is_folder {
             files_in(&path, &name, files)?;
         } else {
             files.push((name, path));
@@ -114,7 +126,7 @@ pub const TESTS: &str = "tests";
 /// What it holds cannot be read.
 pub fn trust(file: &Path, folder: Option<&Path>, about: &super::component::About) -> Result<String> {
     let Some(folder) = folder else {
-        return crate::extract::sha1_file(file).with_context(|| file.display().to_string());
+        return crate::content::sha1(file).with_context(|| file.display().to_string());
     };
     let mut files = Vec::new();
     files_in(folder, Path::new(""), &mut files)?;
@@ -123,7 +135,8 @@ pub fn trust(file: &Path, folder: Option<&Path>, about: &super::component::About
     };
     let mut listing = String::new();
     for (name, path) in files.into_iter().filter(|(name, _)| counts(name)) {
-        let sha1 = crate::extract::sha1_file(&path).with_context(|| path.display().to_string())?;
+        // A held one's from its tree, read from nothing.
+        let sha1 = crate::content::sha1(&path).with_context(|| path.display().to_string())?;
         let _ = writeln!(listing, "{} {sha1}", name.display());
     }
     Ok(crate::extract::sha1_hex(listing.as_bytes()))

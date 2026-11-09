@@ -93,7 +93,7 @@ fn what_is_kept_archived_is_unpacked_into_the_project() {
     editor.until("the project to hold it", |editor| {
         editor.workspace().extensions.loaded.iter().any(|l| {
             l.id == "pe2.formats"
-                && matches!(&l.origin, project::ext::Origin::Project(folder) if folder.join("extension.toml").is_file())
+                && matches!(&l.origin, project::ext::Origin::Project(folder) if project::pack::is_file(&folder.join("extension.toml")))
         })
     });
     drop(kept);

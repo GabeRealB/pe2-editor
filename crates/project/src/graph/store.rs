@@ -1,7 +1,8 @@
 //! The store: retained outputs, kept by content in the project cache (`.cache/store`). A value is kept under its hash
-//! (`values/<hash>.toml`, which says its type and holds or names its contents), its bytes as blobs by their own hashes
+//! (`values/<hash>.cbor`, which says its type and holds or names its contents), its bytes as blobs by their own hashes
 //! (`blobs/<aa>/<sha1>`), shared by every value holding them - an import made twice of one source is kept once. An
-//! output's trace (`traces/<key>.toml`) names its value and what it read, under the key of what makes it. Like the rest
+//! output's trace (`traces/<key>.cbor`) names its value and what it read, under the key of what makes it. Both are CBOR:
+//! nobody reads them but the store, and settings read back as the values the editor holds (`pe2_value`). Like the rest
 //! of the cache, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
 //! a trace never names what is not there.
 
@@ -9,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use pe2_value::Table;
 use serde::{Deserialize, Serialize};
-use toml::Table;
 
 use super::exec::Reads;
 use super::{Content, File, Image, Pcm, Typed, Value};
@@ -18,6 +19,18 @@ use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 
 const DIR: &str = "store";
+
+/// What the store writes, as CBOR.
+fn encode<T: Serialize>(what: &T) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(what, &mut bytes).map_err(|e| anyhow::anyhow!("it does not encode: {e}"))?;
+    Ok(bytes)
+}
+
+/// What the store wrote, read back; none where it is not what it should be (written otherwise: made again).
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    ciborium::from_reader(bytes).ok()
+}
 
 /// An output's trace: its value's hash, what it read, whose output it is (its node, as traces name it, and its
 /// address), and what made it (`made`: the operations and their versions, extensions' builds among them - not their
@@ -56,7 +69,7 @@ pub struct KeptFile {
     pub blob: Blob,
 }
 
-/// A kept value as its `values/<hash>.toml` describes it: contents as blobs, read back by reference.
+/// A kept value as its `values/<hash>.cbor` describes it: contents as blobs, read back by reference.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Kept {
@@ -285,7 +298,7 @@ impl Store {
     }
 
     fn value_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("values").join(format!("{hash}.toml"))
+        self.dir.join("values").join(format!("{hash}.cbor"))
     }
 
     /// Keep a content as a blob: inline, written; stored elsewhere (`locate` reads it, by its hash), copied.
@@ -317,8 +330,8 @@ impl Store {
     /// It cannot be written, or a content of it found.
     pub fn put(&self, hash: &str, value: &Value, locate: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<()> {
         let _span = tracing::info_span!("store put").entered();
-        // Kept already, as this store reads values (one written otherwise is written again).
-        if self.describe(hash).is_some() {
+        // Kept already (one this store cannot read is found when it is read, and made again).
+        if self.has(hash) {
             return Ok(());
         }
         let path = self.value_path(hash);
@@ -327,13 +340,13 @@ impl Store {
                 ty: typed.ty.clone(),
                 also: typed.also.clone(),
                 files: typed.files.iter().map(|f| self.put_file(f, locate)).collect::<Result<_>>()?,
-                settings: typed.settings.clone(),
+                settings: Table::from(&typed.settings),
                 notes: typed.notes.clone(),
             },
             Value::Image(image) => {
                 Kept::Image { width: image.width, height: image.height, blob: self.put_blob(&image.rgba)? }
             }
-            Value::Table(table) => Kept::Table { table: table.clone() },
+            Value::Table(table) => Kept::Table { table: Table::from(table) },
             Value::Pcm(pcm) => {
                 let bytes: Vec<u8> = pcm.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
                 Kept::Pcm { rate: pcm.rate, channels: pcm.channels, blob: self.put_blob(&bytes)? }
@@ -369,7 +382,7 @@ impl Store {
                 Kept::List { items: hashes }
             }
         };
-        write_atomic(&path, toml::to_string(&kept)?.as_bytes())
+        write_atomic(&path, &encode(&kept)?)
     }
 
     /// Whether a value is kept. (One this store cannot read - written otherwise - is found when it is read, and made
@@ -382,7 +395,7 @@ impl Store {
     /// A kept value's description, without reading its blobs.
     #[must_use]
     pub fn describe(&self, hash: &str) -> Option<Kept> {
-        toml::from_str(&std::fs::read_to_string(self.value_path(hash)).ok()?).ok()
+        decode(&std::fs::read(self.value_path(hash)).ok()?)
     }
 
     /// A kept value: its files' contents by reference (read through `blob_path`), what is not a file's read now. One
@@ -401,6 +414,7 @@ impl Store {
                 if let Some(gone) = files.iter().find(|f| !self.blob_path(&f.blob.sha1).exists()) {
                     anyhow::bail!("{hash}: its {} is no longer kept", gone.name);
                 }
+                let settings = settings.to_toml();
                 Value::Typed(Typed { ty, also, files: files.into_iter().map(file).collect(), settings, notes })
             }
             Kept::Image { width, height, blob } => Value::Image(Image { width, height, rgba: self.read_blob(&blob)? }),
@@ -420,7 +434,7 @@ impl Store {
                 channels,
                 timestamp,
             }),
-            Kept::Table { table } => Value::Table(table),
+            Kept::Table { table } => Value::Table(table.to_toml()),
             Kept::Marks { boxes, summary, toggle, legend } => Value::Marks(pe2_ext::Marks {
                 boxes: boxes.into_iter().map(KeptMark::into_mark).collect(),
                 summary,
@@ -437,13 +451,13 @@ impl Store {
     }
 
     fn trace_path(&self, key: &str) -> PathBuf {
-        self.dir.join("traces").join(format!("{key}.toml"))
+        self.dir.join("traces").join(format!("{key}.cbor"))
     }
 
     /// The trace kept under a key.
     #[must_use]
     pub fn trace(&self, key: &str) -> Option<Trace> {
-        toml::from_str(&std::fs::read_to_string(self.trace_path(key)).ok()?).ok()
+        decode(&std::fs::read(self.trace_path(key)).ok()?)
     }
 
     /// Keep a trace under a key.
@@ -451,7 +465,7 @@ impl Store {
     /// # Errors
     /// It cannot be written.
     pub fn put_trace(&self, key: &str, trace: &Trace) -> Result<()> {
-        write_atomic(&self.trace_path(key), toml::to_string(trace)?.as_bytes())
+        write_atomic(&self.trace_path(key), &encode(trace)?)
     }
 
     /// Forget a trace: what it was the trace of is made again when next asked for, though its value stays.

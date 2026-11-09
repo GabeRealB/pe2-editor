@@ -222,9 +222,17 @@ impl Allowed {
     }
 }
 
+/// Where a path really is: what of it is on disk canonicalized, what is not (an extension's files a project holds,
+/// read from its tree: `records::held_folder`) kept as it is below that.
+#[must_use]
+pub fn real(path: &Path) -> Option<PathBuf> {
+    let (on_disk, real) = path.ancestors().find_map(|a| Some((a, a.canonicalize().ok()?)))?;
+    Some(real.join(path.strip_prefix(on_disk).ok()?))
+}
+
 /// Which of these places holds a file, where it really is.
 fn holding<'a>(file: &Path, mut places: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
-    let real = file.canonicalize().ok()?;
+    let real = real(file)?;
     places.find(|place| real.starts_with(place)).cloned()
 }
 

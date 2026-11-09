@@ -1,0 +1,16 @@
+[package]
+name = "pe2-value"
+description = "Values as the editor and its tools hold them: a node's fields and settings, compact, immutable and shared"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+ciborium = "0.2"

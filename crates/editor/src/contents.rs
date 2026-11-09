@@ -437,8 +437,12 @@ pub fn contents_ui(
         ui.colored_label(ui.visuals().error_fg_color, "Its extension could not say what is inside it")
             .on_hover_text(problem);
     }
-    let layers =
-        asset.fields().get("stack").and_then(Value::as_array).filter(|_| contents.stack).map_or(&[][..], Vec::as_slice);
+    let layers = asset
+        .fields_toml()
+        .get("stack")
+        .and_then(Value::as_array)
+        .filter(|_| contents.stack)
+        .map_or(&[][..], Vec::as_slice);
     let has_views = !ws.extensions.contents_views(&asset).is_empty();
     if layers.is_empty() && contents.rows.is_empty() && contents.actions.is_empty() {
         if !has_views && contents.problem.is_none() {

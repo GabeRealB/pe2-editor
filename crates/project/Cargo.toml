@@ -9,6 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ciborium = "0.2"
+pe2-value.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-tracy = { workspace = true, optional = true }

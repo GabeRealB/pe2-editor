@@ -42,7 +42,7 @@ fn totals_map() -> &'static Mutex<HashMap<String, Total>> {
 
 /// The crates whose spans are kept: the editor's and its tools'. Libraries' own (turso's, per page and instruction:
 /// millions in an extraction) would cost more than what they time.
-const OURS: [&str; 6] = ["project", "cli", "editor", "mcp", "extensions", "pe2_ext"];
+const OURS: [&str; 7] = ["project", "cli", "pe2_cli", "editor", "mcp", "extensions", "pe2_ext"];
 
 /// Install the spans' subscriber for this process: the totals, and Tracy where built with it, of this workspace's
 /// crates alone. A second call, or one after another subscriber took the process, does nothing.

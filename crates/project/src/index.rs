@@ -18,7 +18,7 @@
 use anyhow::{Context as _, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::Cache;
@@ -40,6 +40,13 @@ pub const BELOW: &str = "below:";
 /// Whether a path is a records layer's record (`records`).
 fn in_records(path: &Path) -> bool {
     path.ancestors().any(|a| a.file_name().is_some_and(|n| n == crate::records::DIR))
+}
+
+/// Whether a path is a layer's record of an extension it holds: no entry, nothing of the index's.
+fn of_extensions(path: &Path) -> bool {
+    let folder = path.parent();
+    folder.and_then(Path::file_name).is_some_and(|n| n == crate::records::EXTENSIONS)
+        && folder.and_then(Path::parent).and_then(Path::file_name).is_some_and(|n| n == crate::records::DIR)
 }
 
 /// A file an override merged over the one below, in the cache (`.cache/merged/<sha1>/<name>`), written where it is not
@@ -98,8 +105,12 @@ pub struct Asset {
     text: Arc<str>,
     /// Its `settings.toml`, where a generated layer holds one.
     generated: Option<Arc<str>>,
-    fields: OnceLock<toml::Table>,
+    fields: OnceLock<pe2_value::Table>,
     settings_text: OnceLock<String>,
+    /// Its fields and its settings as `toml` holds them, for what reads them so still (the editor's panes, a linked
+    /// extension): made when first asked for, of the asset it is asked of alone.
+    fields_toml: OnceLock<toml::Table>,
+    settings_toml: OnceLock<toml::Table>,
     /// Its settings as its import resolves them (`imports`), where its importer derives some from its source.
     pub imported: Option<Arc<Imported>>,
     /// It as its files are on disk, where it is shown with unsaved changes (`Working`): what saving it overwrites.
@@ -124,7 +135,7 @@ pub struct WorkingFile {
 /// An asset's settings with what its import derived from its source in their places.
 #[derive(Clone, Debug, Default)]
 pub struct Imported {
-    pub settings: toml::Table,
+    pub settings: pe2_value::Table,
     /// The settings as TOML, for what reads a declaration's text; written the first time it is asked for.
     pub text: OnceLock<String>,
     /// Settings the declaration gives that the import overrides (`size`, `cells.dot.rect`).
@@ -155,35 +166,45 @@ impl Asset {
     }
 
     /// Its `node.toml`'s fields, over its generated `settings.toml`'s; empty where it cannot be parsed.
-    pub fn fields(&self) -> &toml::Table {
+    pub fn fields(&self) -> &pe2_value::Table {
         self.fields.get_or_init(|| self.fields_of(&self.text))
     }
 
     /// A declaration's fields, as this asset's would be: over its generated settings.
     #[must_use]
-    pub fn fields_of(&self, text: &str) -> toml::Table {
+    pub fn fields_of(&self, text: &str) -> pe2_value::Table {
         let declared = toml::from_str(text).unwrap_or_default();
-        let generated = self.generated.as_deref().and_then(|g| toml::from_str::<toml::Table>(g).ok());
+        let generated = self.generated.as_deref().and_then(|g| toml::from_str::<pe2_value::Table>(g).ok());
         let fields = match generated {
-            Some(generated) => crate::graph::with_generated(declared, &generated),
+            Some(generated) => crate::graph::with_generated_values(declared, &generated),
             None => declared,
         };
-        crate::graph::with_settings(fields)
+        crate::graph::with_settings_values(fields)
     }
 
     /// Its settings as readers see them: its fields, with what its import derived in their places.
     #[must_use]
-    pub fn settings(&self) -> &toml::Table {
+    pub fn settings(&self) -> &pe2_value::Table {
         self.imported.as_ref().map_or_else(|| self.fields(), |i| &i.settings)
+    }
+
+    /// Its fields, as `toml` holds them: made of `fields` when first asked for.
+    pub fn fields_toml(&self) -> &toml::Table {
+        self.fields_toml.get_or_init(|| self.fields().to_toml())
+    }
+
+    /// Its settings, as `toml` holds them: made of `settings` when first asked for.
+    pub fn settings_toml(&self) -> &toml::Table {
+        self.settings_toml.get_or_init(|| self.settings().to_toml())
     }
 
     /// Its settings as TOML.
     #[must_use]
     pub fn settings_text(&self) -> &str {
-        let written = |settings: &toml::Table| {
-            let settings = settings.iter().filter(|(key, _)| *key != "stack");
-            toml::to_string(&settings.map(|(key, value)| (key.clone(), value.clone())).collect::<toml::Table>())
-                .unwrap_or_default()
+        let written = |settings: &pe2_value::Table| {
+            let settings: pe2_value::Table =
+                settings.iter().filter(|(key, _)| *key != "stack").map(|(k, v)| (k.into(), v.clone())).collect();
+            toml::to_string(&settings).unwrap_or_default()
         };
         match &self.imported {
             Some(imported) => imported.text.get_or_init(|| written(&imported.settings)).as_str(),
@@ -509,7 +530,7 @@ fn declaration(bytes: &[u8]) -> Declaration {
             out.shape = crate::graph::shape(&table);
             out.uid = string("uid");
             // An image's looks: its variants, keyed by name.
-            let settings = crate::graph::with_settings(table.clone());
+            let settings = crate::graph::with_settings(&table);
             out.variants = settings
                 .get("variants")
                 .and_then(toml::Value::as_table)
@@ -934,6 +955,12 @@ struct Resolution {
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
 }
 
+/// What the layers below one resolve, with where each uid is.
+struct Beneath {
+    resolution: Resolution,
+    by_uid: HashMap<String, String>,
+}
+
 /// The asset a path relative to a layer's root lies in: the path up to its first `.node` component, without the
 /// suffix. None outside any bundle.
 fn bundle_of(rel: &str) -> Option<String> {
@@ -999,7 +1026,8 @@ fn references(value: &toml::Value, field: &str, out: &mut Vec<(String, String, S
 /// The paths at or under `path`.
 fn subtree<V>(map: &BTreeMap<String, V>, path: &str) -> Vec<String> {
     let prefix = format!("{path}/");
-    map.keys().filter(|p| *p == path || p.starts_with(&prefix)).cloned().collect()
+    let under = map.range(prefix.clone()..).map(|(p, _)| p).take_while(|p| p.starts_with(&prefix));
+    map.get_key_value(path).map(|(p, _)| p).into_iter().chain(under).cloned().collect()
 }
 
 /// How far a long piece of work is: its stage, and how many of how many it has done (both 0 where it cannot say).
@@ -1008,10 +1036,11 @@ pub type Report<'a> = dyn Fn(&str, usize, usize) + 'a;
 #[derive(Clone)]
 pub struct Index {
     /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
-    pub assets: BTreeMap<String, Arc<Asset>>,
+    /// Shared with the snapshots made of the index, copied where one is changed while they hold it.
+    pub assets: Arc<BTreeMap<String, Arc<Asset>>>,
     /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
     /// nodes of their own, read through the graph's `below` operation.
-    versions: HashMap<String, Arc<Asset>>,
+    versions: Arc<HashMap<String, Arc<Asset>>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
     pub entries: Arc<BTreeMap<String, Entry>>,
@@ -1025,10 +1054,13 @@ pub struct Index {
     pub problems: Vec<Problem>,
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
-    records: HashMap<PathBuf, Arc<Record>>,
+    records: Arc<HashMap<PathBuf, Arc<Record>>>,
     /// Where the records are kept between runs: none while another process has it (`let_go_of_store`).
     store: Option<Arc<Store>>,
     resolved: Arc<BTreeMap<String, Node>>,
+    /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
+    /// where nothing is hidden.
+    full: Arc<BTreeMap<String, Node>>,
     /// The layers left out of the view (the editor's eyes); problems and statuses are the full stack's.
     hidden: HashSet<usize>,
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
@@ -1041,6 +1073,9 @@ pub struct Index {
     winning: Arc<HashMap<(usize, String), String>>,
     /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
     working: Arc<HashMap<String, Working>>,
+    /// What the layers below each layer resolve (`below_layer`), as asked since the stack was last applied: made anew,
+    /// not cleared, as the stack is applied, so a snapshot keeps what was so of it.
+    beneath: Arc<Mutex<HashMap<usize, Arc<Beneath>>>>,
     /// Where what overrides merged is kept (`merged_file`), and what each merge made (`Memo`).
     merged: PathBuf,
     /// The store keeping the versions overrides were made from (`changeset::Base`).
@@ -1110,17 +1145,21 @@ impl Index {
     }
 
     fn over(store: Option<Arc<Store>>, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let mut known = store.as_ref().map(|s| s.load()).transpose()?.unwrap_or_default();
+        let mut known = {
+            let _span = tracing::info_span!("index store load").entered();
+            store.as_ref().map(|s| s.load()).transpose()?.unwrap_or_default()
+        };
         // Its records layers, placed through the stack: what their scans and changesets are read from.
         crate::records::Set::open(project)?;
         let mut layers = Vec::new();
         for (i, layer) in project.layers.iter().enumerate() {
             report(&format!("Scanning {}", layer.name), i, project.layers.len());
+            let _span = tracing::info_span!("layer scan").entered();
             layers.push(LayerState::new(layer)?);
         }
         let mut index = Index {
-            assets: BTreeMap::new(),
-            versions: HashMap::new(),
+            assets: Arc::default(),
+            versions: Arc::default(),
             entries: Arc::default(),
             read: 0,
             by_uid: Arc::default(),
@@ -1128,7 +1167,7 @@ impl Index {
             dangling: vec![],
             problems: vec![],
             layers,
-            records: HashMap::new(),
+            records: Arc::default(),
             merged: project.root.join(crate::cache::DIR).join("merged"),
             objects: crate::chunks::Store::at(&project.root),
             store,
@@ -1139,25 +1178,87 @@ impl Index {
             hashes: Arc::default(),
             winning: Arc::default(),
             working: Arc::default(),
+            beneath: Arc::default(),
+            full: Arc::default(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         report("Reading the files that changed", 0, files.len());
-        let read = index.load_records(&files, |path, size, modified| {
-            known.remove(path).filter(|r| r.size == size && r.modified == modified && modified < r.recorded)
-        });
+        let read = {
+            let _span = tracing::info_span!("index stat and read").entered();
+            index.load_records(&files, |path, size, modified| {
+                known.remove(path).filter(|r| r.size == size && r.modified == modified && modified < r.recorded)
+            })
+        };
         index.read = read.len();
         // What is left of what the store knew no layer holds any more.
         let gone: Vec<&Path> = known.keys().map(PathBuf::as_path).collect();
         if let Some(store) = &index.store {
+            let _span = tracing::info_span!("index store write").entered();
             store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
         }
         report("Resolving the layers", 0, 0);
-        index.apply_stack()?;
+        {
+            let _span = tracing::info_span!("index apply stack").entered();
+            index.apply_stack()?;
+        }
         report("Assembling the assets", 0, 0);
         let paths: Vec<String> = index.resolved.keys().cloned().collect();
-        index.assemble(&paths);
-        index.link();
+        {
+            let _span = tracing::info_span!("index assemble").entered();
+            index.assemble(&paths);
+        }
+        {
+            let _span = tracing::info_span!("index link").entered();
+            index.link();
+        }
         Ok(index)
+    }
+
+    /// What is served as files of the project (`vfs`): the whole stack - whatever the view hides - each folder, plain
+    /// file and node by its path (a node's without `.node`), then each node's files in its folder, but where an entry of
+    /// the same name holds that place. Files as they are on disk, never an unsaved working copy.
+    #[must_use]
+    pub fn served(&self) -> crate::host::Listing {
+        use crate::host::Shown;
+        let stamp = |file: &Path| {
+            let (size, modified) =
+                self.file_stat(file).or_else(|| crate::content::stat(file).ok()).unwrap_or((0, UNIX_EPOCH));
+            let time = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+            (size, (time.as_secs(), time.subsec_nanos()))
+        };
+        let mut listing = crate::host::Listing::new();
+        for (path, node) in self.full.iter() {
+            match node.kind {
+                Kind::Folder => drop(listing.insert(path.clone(), Shown::Folder)),
+                Kind::File => {
+                    if let Some((_, disk, _)) = self.node_files(node).into_iter().next() {
+                        let (size, modified) = stamp(&disk);
+                        listing.insert(path.clone(), Shown::File { disk, size, modified, of_files: false });
+                    }
+                }
+                Kind::Asset => drop(listing.insert(asset_of(path).to_string(), Shown::Node)),
+            }
+        }
+        for (path, node) in self.full.iter().filter(|(_, n)| n.kind == Kind::Asset) {
+            let name = asset_of(path);
+            for (file, disk, _) in self.node_files(node) {
+                let first = file.split('/').next().unwrap_or(&file);
+                let child = format!("{name}/{first}");
+                if self.full.contains_key(&child) || self.full.contains_key(&format!("{child}{BUNDLE_SUFFIX}")) {
+                    continue;
+                }
+                let (size, modified) = stamp(&disk);
+                listing.insert(format!("{name}/{file}"), Shown::File { disk, size, modified, of_files: true });
+            }
+        }
+        listing
+    }
+
+    /// A file's length and time as the index read them; none for a file it has not read.
+    #[must_use]
+    pub fn file_stat(&self, path: &Path) -> Option<(u64, SystemTime)> {
+        let record = self.records.get(path)?;
+        Some((record.size, UNIX_EPOCH + std::time::Duration::new(record.modified.0, record.modified.1)))
     }
 
     /// Bring the index up to date with paths a watcher reports changed: what they lie in is scanned again (a file
@@ -1170,6 +1271,9 @@ impl Index {
     /// # Errors
     /// A changeset cannot be read or written.
     pub fn refresh(&mut self, project: &Project, changed: &[PathBuf]) -> Result<Refreshed> {
+        let _span = tracing::info_span!("index refresh").entered();
+        // A packed layer's listing changed (written by another process, or this one): read again.
+        crate::pack::reread_changed(changed);
         // A manifest changing is the file it stands for changing; a packed layer's listing, its whole layer.
         let changed: Vec<PathBuf> = changed
             .iter()
@@ -1183,14 +1287,36 @@ impl Index {
 
     /// Records changed: the project's are read again, and each records layer as they make it now, rescanned whole.
     /// Whether any records layer was.
+    /// Take in what changed of the records layers: their records read again (those whose files are as they were taken
+    /// as they were), their changesets made again - each changed where it says otherwise - and the entries whose records
+    /// changed scanned again where they were and where they are, in their layer and, where any is placed otherwise, in
+    /// the records layers above it, whose entries may be placed through it. Whether a changeset changed.
     fn take_in_records(&mut self, project: &Project, wanted: &mut Vec<(usize, String)>) -> Result<bool> {
-        crate::records::Set::open(project)?;
-        let mut any = false;
+        let before = crate::records::Set::current(&project.root);
+        let now = crate::records::Set::open(project)?;
+        let differences = crate::records::Set::differences(before.as_deref(), &now);
+        let (changed, placed) = (&differences.paths, differences.placed);
+        // An override changed merges again as the stack is applied.
+        let mut any = differences.overrides;
+        let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            if crate::records::is_records(&layer.place.root) {
-                layer.reload_changeset()?;
-                any = true;
-                wanted.push((i, String::new()));
+            if !crate::records::is_records(&layer.place.root) {
+                continue;
+            }
+            let was = layer.changeset.clone();
+            layer.reload_changeset()?;
+            any |= layer.changeset != was;
+            if let Some((_, paths)) = changed.iter().find(|(dir, _)| *dir == layer.place.root) {
+                lowest_changed.get_or_insert(i);
+                wanted.extend(paths.iter().map(|path| (i, path.clone())));
+            }
+        }
+        if placed && let Some(lowest) = lowest_changed {
+            let paths: BTreeSet<&String> = changed.iter().flat_map(|(_, paths)| paths).collect();
+            for (i, layer) in self.layers.iter().enumerate().skip(lowest + 1) {
+                if crate::records::is_records(&layer.place.root) {
+                    wanted.extend(paths.iter().map(|path| (i, (*path).clone())));
+                }
             }
         }
         Ok(any)
@@ -1200,7 +1326,7 @@ impl Index {
         let mut refreshed = Refreshed::default();
         let mut changesets = false;
         let mut wanted: Vec<(usize, String)> = Vec::new();
-        if changed.iter().any(|p| in_records(p)) {
+        if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
             changesets |= self.take_in_records(project, &mut wanted)?;
         }
         for path in changed {
@@ -1261,7 +1387,7 @@ impl Index {
             files.extend(after.all_files().cloned());
         }
         for file in &gone {
-            self.records.remove(file);
+            Arc::make_mut(&mut self.records).remove(file);
         }
         let reported: HashSet<&PathBuf> = changed.iter().collect();
         let (read, vanished) = self.reload(&files, &reported);
@@ -1358,7 +1484,7 @@ impl Index {
         for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
             let Some(size) = size else { continue };
             if let Some(record) = known(file, size, modified) {
-                self.records.insert(file.clone(), Arc::new(record));
+                Arc::make_mut(&mut self.records).insert(file.clone(), Arc::new(record));
             } else {
                 let declaration = file.file_name().is_some_and(|n| n == NODE_FILE || n == SETTINGS_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
@@ -1368,7 +1494,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                self.records.insert(file.path.clone(), Arc::new(record));
+                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -1381,7 +1507,7 @@ impl Index {
         let (mut pending, mut vanished) = (Vec::new(), Vec::new());
         for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
             let Some(size) = size else {
-                self.records.remove(file);
+                Arc::make_mut(&mut self.records).remove(file);
                 vanished.push(file.clone());
                 continue;
             };
@@ -1396,7 +1522,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                self.records.insert(file.path.clone(), Arc::new(record));
+                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -1619,12 +1745,17 @@ impl Index {
     /// is listed in its changeset first (written), so applying never meets it again. Problems, statuses and
     /// dependencies are the whole stack's; the view leaves out the hidden layers.
     fn apply_stack(&mut self) -> Result<()> {
+        self.beneath = Arc::default();
         self.list_unlisted()?;
         let full = self.resolve_stack(&HashSet::new());
         self.problems = full.problems;
         self.ops = full.ops;
-        self.resolved =
-            Arc::new(if self.hidden.is_empty() { full.resolved } else { self.resolve_stack(&self.hidden).resolved });
+        self.full = Arc::new(full.resolved);
+        self.resolved = if self.hidden.is_empty() {
+            self.full.clone()
+        } else {
+            Arc::new(self.resolve_stack(&self.hidden).resolved)
+        };
         self.dependencies = self.dependencies();
         self.remember_hashes();
         self.winning =
@@ -1815,23 +1946,31 @@ impl Index {
     }
 
     /// The stack resolved without a layer and those above it: what that layer stands on.
-    fn below_layer(&self, layer: &str) -> Option<Resolution> {
+    fn below_layer(&self, layer: &str) -> Option<Arc<Beneath>> {
         let at = self.layers.iter().position(|l| l.name == layer)?;
-        Some(self.resolve_stack(&(at..self.layers.len()).collect()))
+        let mut beneath = self.beneath.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = beneath.get(&at) {
+            return Some(found.clone());
+        }
+        let resolution = self.resolve_stack(&(at..self.layers.len()).collect());
+        let by_uid = resolution.resolved.iter().map(|(path, node)| (node.uid.clone(), path.clone())).collect();
+        let found = Arc::new(Beneath { resolution, by_uid });
+        beneath.insert(at, found.clone());
+        Some(found)
     }
 
     /// What the layers below `layer` resolve, by path: each entry's uid and kind.
     #[must_use]
     pub fn entries_below(&self, layer: &str) -> HashMap<String, (String, Kind)> {
-        let Some(resolution) = self.below_layer(layer) else { return HashMap::new() };
-        resolution.resolved.iter().map(|(path, node)| (path.clone(), (node.uid.clone(), node.kind))).collect()
+        let Some(beneath) = self.below_layer(layer) else { return HashMap::new() };
+        beneath.resolution.resolved.iter().map(|(path, node)| (path.clone(), (node.uid.clone(), node.kind))).collect()
     }
 
     /// An entry as the layers below `layer` resolve it, by its uid.
     #[must_use]
     pub fn below(&self, layer: &str, uid: &str) -> Option<Below> {
-        let resolution = self.below_layer(layer)?;
-        let (path, node) = resolution.resolved.iter().find(|(_, n)| n.uid == uid)?;
+        let beneath = self.below_layer(layer)?;
+        let (path, node) = beneath.resolution.resolved.get_key_value(beneath.by_uid.get(uid)?)?;
         let source = &self.layers[node.content.0];
         let files: Vec<(String, PathBuf)> =
             self.node_files(node).into_iter().map(|(name, file, _)| (name, file)).collect();
@@ -1849,11 +1988,13 @@ impl Index {
     /// The entries the layers below `layer` resolve inside a folder (its path), by uid.
     #[must_use]
     pub fn below_inside(&self, layer: &str, folder: &str) -> Vec<(String, String)> {
-        let Some(resolution) = self.below_layer(layer) else { return vec![] };
+        let Some(beneath) = self.below_layer(layer) else { return vec![] };
         let prefix = format!("{folder}/");
-        resolution
+        beneath
+            .resolution
             .resolved
-            .iter()
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
             .filter(|(path, _)| path.starts_with(&prefix))
             .map(|(path, node)| (node.uid.clone(), path.clone()))
             .collect()
@@ -1985,7 +2126,7 @@ impl Index {
         }
         self.hidden = hidden;
         self.resolved = Arc::new(self.resolve_stack(&self.hidden).resolved);
-        self.assets.clear();
+        Arc::make_mut(&mut self.assets).clear();
         let paths: Vec<String> = self.resolved.keys().cloned().collect();
         self.assemble(&paths);
         self.link();
@@ -2016,7 +2157,7 @@ impl Index {
             .collect();
         for (file, record) in unread.iter().zip(read_all(&unread)) {
             if let Some(record) = record {
-                self.records.insert(file.path.clone(), Arc::new(record));
+                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
             }
         }
         self.working = Arc::new(working);
@@ -2043,6 +2184,11 @@ impl Index {
     fn with_working(&self, asset: Asset) -> Asset {
         let Some(working) = asset.uid.as_ref().and_then(|uid| self.working.get(uid)) else { return asset };
         let mut shown = asset.clone();
+        // What was read of its files is read again of the working copy's.
+        shown.fields = OnceLock::new();
+        shown.settings_text = OnceLock::new();
+        shown.fields_toml = OnceLock::new();
+        shown.settings_toml = OnceLock::new();
         for (name, file) in &working.files {
             let at = shown.files.iter().position(|f| f.name == *name);
             let layer = at.map(|i| shown.files[i].layer.clone()).or_else(|| shown.layers.last().cloned());
@@ -2297,7 +2443,7 @@ impl Index {
     fn assemble_assets(&mut self, paths: &[String]) {
         for path in paths {
             let Some(node) = self.resolved.get(path).filter(|n| n.kind == Kind::Asset) else {
-                self.assets.remove(asset_of(path));
+                Arc::make_mut(&mut self.assets).remove(asset_of(path));
                 continue;
             };
             let layer = &self.layers[node.content.0];
@@ -2314,6 +2460,8 @@ impl Index {
                 generated: None,
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
+                fields_toml: OnceLock::new(),
+                settings_toml: OnceLock::new(),
                 imported: None,
                 disk: None,
             };
@@ -2330,7 +2478,7 @@ impl Index {
                 .collect();
             for (file, record) in unread.iter().zip(read_all(&unread)) {
                 if let Some(record) = record {
-                    self.records.insert(file.path.clone(), Arc::new(record));
+                    Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 }
             }
             for (name, file, held) in files {
@@ -2361,8 +2509,12 @@ impl Index {
             let (uid, top, overridden) = (node.uid.clone(), layer.name.clone(), !node.overrides.is_empty());
             let at = asset.path.clone();
             let asset = self.with_working(asset);
-            self.assets.insert(asset.path.clone(), Arc::new(asset));
-            self.versions.retain(|version, _| version.trim_start_matches(BELOW) != uid);
+            Arc::make_mut(&mut self.assets).insert(asset.path.clone(), Arc::new(asset));
+            // Its versions below, as they were: `below:<uid>`, `below:below:<uid>`, ...
+            let mut version = format!("{BELOW}{uid}");
+            while Arc::make_mut(&mut self.versions).remove(&version).is_some() {
+                version.insert_str(0, BELOW);
+            }
             if overridden {
                 self.assemble_versions(&at, &uid, top);
             }
@@ -2385,6 +2537,8 @@ impl Index {
                 generated: None,
                 fields: OnceLock::new(),
                 settings_text: OnceLock::new(),
+                fields_toml: OnceLock::new(),
+                settings_toml: OnceLock::new(),
                 imported: None,
                 disk: None,
             };
@@ -2411,7 +2565,7 @@ impl Index {
                     made_by: None,
                 });
             }
-            self.versions.insert(name.clone(), Arc::new(asset));
+            Arc::make_mut(&mut self.versions).insert(name.clone(), Arc::new(asset));
             name.insert_str(0, BELOW);
             layer = below.layer;
         }
@@ -2751,7 +2905,7 @@ mod tests {
     fn shown(index: &Index) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        for (path, a) in &index.assets {
+        for (path, a) in index.assets.iter() {
             let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
             let _ = writeln!(
                 out,

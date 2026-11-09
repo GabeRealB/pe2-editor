@@ -3,9 +3,9 @@
 //! kept) as a step of the project's history, so it can be undone. The editor opens the project again when
 //! `project.toml` changes, loading its extensions as it now says.
 //!
-//! The extensions it holds are copies, in `extensions/` of a layer (`ext::folder`): one is added from wherever it is
-//! kept - and updated the same way - and removed, each as one step with what the project requires of it
-//! (`[[extension]]`).
+//! The extensions it holds are sealed, kept whole as trees in its store and named by its layers' records
+//! (`records::EXTENSIONS`): one is added from wherever it is kept - and updated the same way - and removed, each as one
+//! step with what the project requires of it (`[[extension]]`).
 
 use std::path::Path;
 
@@ -43,14 +43,29 @@ pub fn set_disabled(project: &Project, disabled: &[String], history: &mut Histor
     write(&project.root, &document, history, label)
 }
 
-/// Add an extension to the project, or update the one it holds of its id: its folder copied into `extensions/` of a
-/// layer, whole, in place of what was there, and required at the versions of its line (`^0.1`). The layer is the one
-/// named (`into`), else the one holding it already, else the project's highest that is written. What it is is checked
-/// first, as loading checks it.
+/// What a layer's records say of an extension.
+#[derive(PartialEq, Eq)]
+enum Says {
+    /// It holds it, as this tree.
+    Holds(String),
+    /// It leaves the one below off.
+    LeavesOff,
+}
+
+/// What a layer's records say of an extension; nothing where they say nothing of it.
+fn held_in(layer: &crate::Layer, id: &str) -> Option<Says> {
+    let said = crate::records::extensions_of(&layer.path).ok()?.remove(id)?;
+    Some(said.map_or(Says::LeavesOff, Says::Holds))
+}
+
+/// Add an extension to the project, or update the one it holds of its id: its folder kept whole as a tree in the
+/// store, named by a layer's record in place of what was there, and required at the versions of its line (`^0.1`). The
+/// layer is the one named (`into`), else the one holding it already, else the project's highest that is written. What
+/// it is is checked first, as loading checks it.
 ///
 /// # Errors
-/// It is no extension's folder, the project has no such layer or none to hold it, or it cannot be copied or
-/// `project.toml` written.
+/// It is no extension's folder, the project has no such layer or none to hold it, or it cannot be kept or
+/// `project.toml` written. Held as it is already, and required so, it is no step.
 pub fn add_extension(
     project: &Project,
     from: &Path,
@@ -61,8 +76,8 @@ pub fn add_extension(
     let component = from.join(EXTENSION_COMPONENT);
     let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
     let about = folder::checked(from, &bytes).with_context(|| from.display().to_string())?;
-    let name = format!("{}{}", about.id, folder::SUFFIX);
-    let holding = || project.layers.iter().rev().find(|l| !l.mounted && l.path.join(folder::HELD).join(&name).is_dir());
+    let holding =
+        || project.layers.iter().rev().find(|l| !l.mounted && matches!(held_in(l, &about.id), Some(Says::Holds(_))));
     let layer = match into {
         Some(into) => project.layer(into)?,
         None => {
@@ -74,60 +89,61 @@ pub fn add_extension(
         "{} cannot hold extensions: the project does not write it",
         layer.name
     );
-    let to = layer.path.join(folder::HELD).join(format!("{}{}", about.id, folder::SUFFIX));
-    if same(from, &to) {
-        bail!("{}: the project holds it there already", from.display());
-    }
+    let (tree, _) = crate::chunks::Store::at(&project.root).put_folder(from)?;
+    let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree.clone()));
     let mut document = read(&project.root)?;
+    let before = document.to_string();
     let line = about.version.rsplit_once('.').map_or(about.version.as_str(), |(line, _)| line);
     require(&mut document, &Requirement { id: about.id.clone(), version: Some(format!("^{line}")) })?;
-    let mut tx = history.begin(label);
-    if to.exists() {
-        tx.remove(&to)?;
+    // Held as it is, and required so: nothing to do.
+    if held_already && document.to_string() == before {
+        return Ok(about);
     }
-    tx.place(from, &to)?;
+    let mut tx = history.begin(label);
+    if !held_already {
+        let record = crate::records::extension_path(&layer.path, &about.id);
+        tx.write(&record, crate::records::extension_record(Some(&tree)).as_bytes())?;
+    }
     tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
     tx.commit()?;
     Ok(about)
 }
 
-/// Remove an extension from the project: its folder from the layers written that hold it, and what the project requires
-/// of it.
+/// Remove an extension from the project: the records of the layers written that hold it, and what the project requires
+/// of it. Where a layer the project does not write holds it still, its highest written layer leaves that one off (a
+/// record deleting it).
 ///
 /// # Errors
-/// The project neither holds nor requires it, one of its layers that cannot be written holds it, or it cannot be
-/// removed or `project.toml` written.
+/// The project neither holds nor requires it, a layer the project does not write holds it and none written can leave it
+/// off, or what holds it cannot be removed or `project.toml` written.
 pub fn remove_extension(project: &Project, id: &str, history: &mut History, label: String) -> Result<()> {
-    let name = format!("{id}{}", folder::SUFFIX);
-    let holding: Vec<&crate::Layer> = project
-        .layers
-        .iter()
-        .filter(|layer| !layer.mounted && layer.path.join(folder::HELD).join(&name).is_dir())
-        .collect();
-    if let Some(fixed) = holding.iter().find(|layer| layer.read_only) {
-        bail!("{id} is in {}, which the project does not write", fixed.name);
-    }
+    let saying: Vec<&crate::Layer> =
+        project.layers.iter().filter(|layer| !layer.mounted && held_in(layer, id).is_some()).collect();
+    let holding = |layer: &crate::Layer| matches!(held_in(layer, id), Some(Says::Holds(_)));
+    let fixed = saying.iter().find(|layer| holding(layer) && layer.read_only);
+    let off_in = match fixed {
+        Some(fixed) => {
+            let layer = project.extensions_layer().filter(|l| l.kind == crate::LayerKind::Assets);
+            Some(layer.with_context(|| format!("{id} is in {}, and no layer written can leave it off", fixed.name))?)
+        }
+        None => None,
+    };
     let mut document = read(&project.root)?;
     let required = unrequire(&mut document, id);
-    if holding.is_empty() && !required {
+    if !saying.iter().any(|layer| holding(layer)) && !required {
         bail!("the project neither holds nor requires {id}");
     }
     let mut tx = history.begin(label);
-    for layer in holding {
-        tx.remove(&layer.path.join(folder::HELD).join(&name))?;
+    for layer in saying.iter().filter(|layer| !layer.read_only) {
+        tx.remove(&crate::records::extension_path(&layer.path, id))?;
+    }
+    if let Some(layer) = off_in {
+        tx.write(&crate::records::extension_path(&layer.path, id), crate::records::extension_record(None).as_bytes())?;
     }
     if required {
         tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
     }
     tx.commit().map(drop)
-}
-
-/// Whether two paths are the same place.
-fn same(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Require an extension: what is said of it replaces what was.

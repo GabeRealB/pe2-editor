@@ -480,16 +480,18 @@ fn a_kept_output_holds_while_what_it_read_does() {
     let again = engine.output(&plan, &node, "source", true).unwrap();
     assert!(again.kept);
     assert_eq!(data(&node, again.value.as_deref().unwrap()), b"abc");
-    // A transient output is never kept.
+    // A transient output is never kept: its trace alone is, for what reads it to know its hash.
     assert!(!engine.output(&plan, &node, "upper", false).unwrap().kept);
+    let (upper, _) = plan.output("upper").unwrap();
+    assert!(engine.traced(None, &plan, &node, upper, None).is_some());
     // The file changed: made again.
     node.files.lock().unwrap().insert("a.txt".into(), b"abcd".to_vec());
     let changed = engine.output(&plan, &node, "source", true).unwrap();
     assert!(!changed.kept);
     assert_eq!(data(&node, changed.value.as_deref().unwrap()), b"abcd");
-    // Swept: the trace no longer live, its value and blob go.
+    // Swept: the traces no longer live (the transient's too), their values and blobs go.
     let swept = engine.store().unwrap().sweep_older(&HashSet::new(), &HashSet::new(), later());
-    assert_eq!(swept, (1, 2, 2));
+    assert_eq!(swept, (2, 2, 2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1033,7 +1035,7 @@ fn what_extraction_sets_is_beneath_what_the_node_sets() {
     )
     .unwrap();
     let generated: toml::Table = toml::from_str("volume = 80\npan = 64\ncommands = []\n").unwrap();
-    let fields = super::with_settings(super::with_generated(node, &generated));
+    let fields = super::with_settings(&super::with_generated(&node, &generated));
     // What the node sets wins; what only extraction sets is on its home layer, among its fields.
     assert_eq!(fields["volume"].as_integer(), Some(90));
     assert_eq!(fields["pan"].as_integer(), Some(64));

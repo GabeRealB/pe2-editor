@@ -51,7 +51,8 @@ pub enum Answer {
 
 /// The place an extension is in: the layer or mount holding it, else its own folder.
 pub fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
-    let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    // One the project holds is read where its folder was in its layer, on no disk.
+    let real = extensions::trust::real(file).unwrap_or_else(|| file.to_path_buf());
     let holding = ws
         .project
         .layers

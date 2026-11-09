@@ -1102,8 +1102,16 @@ fn set_up(p: &project::Project, only: Option<&str>, enable: &[String], disable: 
 fn added(p: &project::Project, about: &project::ext::component::About) {
     println!("{} {}", about.id, about.version);
     let held = p.held_extensions().into_iter().find(|f| project::ext::folder::id_of(f) == Some(about.id.as_str()));
-    if let Some(install) = about.described.install.as_ref().zip(held.as_ref()).map(|(page, held)| held.join(page)) {
-        println!("What it needs on this machine, fetched or installed: {}", install.display());
+    // Its page read from what the project holds: a held extension's files are on no disk to point at.
+    let install = about.described.install.as_ref().zip(held.as_ref());
+    if let Some((page, text)) =
+        install.and_then(|(page, held)| Some((page, project::content::read_to_string(&held.join(page)).ok()?)))
+    {
+        println!("What it needs on this machine, fetched or installed ({page}):\n");
+        for line in text.lines() {
+            println!("    {line}");
+        }
+        println!();
     }
     let extensions = extensions::for_project(p);
     let present = extensions.present.iter().find(|present| present.id == about.id);
@@ -1120,9 +1128,32 @@ fn added(p: &project::Project, about: &project::ext::component::About) {
     }
 }
 
+/// `pe2-cli project extension list`: each extension, how it stands, and where it is from.
+fn list_extensions(p: &project::Project) {
+    use project::ext::Status;
+    let extensions = extensions::for_project(p);
+    for present in &extensions.present {
+        let status = match &present.status {
+            Status::Loaded => "loaded".to_string(),
+            Status::Disabled => "left off".to_string(),
+            Status::Refused(why) => format!("not loaded: {why}"),
+            Status::NotEnabled { .. } => "not trusted".to_string(),
+            Status::Available => format!("to be added: `pe2-cli project extension add {}`", present.id),
+            Status::Replaced(by) => format!("replaced by {by}"),
+        };
+        let required = p.requires.iter().any(|required| required.id == present.id);
+        println!(
+            "{} {}  {}{status}  ({})",
+            present.id,
+            present.version,
+            if required { "required, " } else { "" },
+            present.origin.said()
+        );
+    }
+}
+
 /// `pe2-cli project extension`.
 fn extension(command: ExtensionCommand) -> Result<()> {
-    use project::ext::Status;
     let (ExtensionCommand::List { project }
     | ExtensionCommand::Add { project, .. }
     | ExtensionCommand::Update { project, .. }
@@ -1130,32 +1161,17 @@ fn extension(command: ExtensionCommand) -> Result<()> {
     | ExtensionCommand::Remove { project, .. }) = &command;
     let project = project.clone();
     let p = project::Project::load(&project)?;
+    // Listing them reads what the project holds and changes nothing: it does not wait for the project.
+    if let ExtensionCommand::List { .. } = command {
+        list_extensions(&p);
+        return Ok(());
+    }
     let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
     match command {
-        ExtensionCommand::List { .. } => {
-            let extensions = extensions::for_project(&p);
-            for present in &extensions.present {
-                let status = match &present.status {
-                    Status::Loaded => "loaded".to_string(),
-                    Status::Disabled => "left off".to_string(),
-                    Status::Refused(why) => format!("not loaded: {why}"),
-                    Status::NotEnabled { .. } => "not trusted".to_string(),
-                    Status::Available => format!("to be added: `pe2-cli project extension add {}`", present.id),
-                    Status::Replaced(by) => format!("replaced by {by}"),
-                };
-                let required = p.requires.iter().any(|required| required.id == present.id);
-                println!(
-                    "{} {}  {}{status}  ({})",
-                    present.id,
-                    present.version,
-                    if required { "required, " } else { "" },
-                    present.origin.said()
-                );
-            }
-        }
+        ExtensionCommand::List { .. } => list_extensions(&p),
         ExtensionCommand::Add { what, layer, .. } => {
             let from = kept_folder(&p, &what)?;
             let about = add_from(&p, &from, layer.as_deref(), &mut history, format!("Add {what}"))?;
@@ -1523,11 +1539,14 @@ fn store(command: &StoreCommand) -> Result<()> {
         StoreCommand::Convert { layer, .. } => {
             let cache = project::cache::Cache::open(&p, &lock)?;
             let started = std::time::Instant::now();
-            let count = project::records::convert(&p, &cache, layer)?;
-            println!(
-                "{layer}: {count} records, the project showing the same ({:.1}s)",
-                started.elapsed().as_secs_f64()
-            );
+            let converted = project::records::convert(&p, &cache, layer)?;
+            let took = started.elapsed().as_secs_f64();
+            if converted.records > 0 {
+                println!("{layer}: {} records, the project showing the same ({took:.1}s)", converted.records);
+            }
+            if converted.extensions > 0 {
+                println!("{layer}: {} extensions held as records", converted.extensions);
+            }
         }
         StoreCommand::Gc { .. } => {
             let (gone, freed) = project::chunks::sweep(&p)?;

@@ -4645,6 +4645,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-value"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "pe2-webgpu"
 version = "0.1.0"
 dependencies = [
@@ -4947,6 +4956,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "branches",
+ "ciborium",
  "codecs",
  "fastcdc",
  "formats",
@@ -4954,6 +4964,7 @@ dependencies = [
  "interprocess",
  "pe2-ext",
  "pe2-setup",
+ "pe2-value",
  "png",
  "pollster 0.4.0",
  "serde",

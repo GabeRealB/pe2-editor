@@ -137,7 +137,7 @@ pub fn settings_on_layers(text: &str) -> Result<String> {
 /// It is not TOML, or the stack is not.
 pub fn with_new_stack(text: &str, stack: &str) -> Result<String> {
     let fields: Table = toml::from_str(text).context("its declaration")?;
-    let settings = super::with_settings(fields.clone());
+    let settings = super::with_settings(&fields);
     let bare = without_stack(text)?;
     let rest: Table = toml::from_str(&bare).context("its declaration")?;
     let held =
@@ -387,7 +387,7 @@ sha1 = "ab"
         assert_eq!(layers[1]["mode"].as_str(), Some("indexed_4bpp"));
         assert!(layers[1]["cells"]["a"]["rect"].is_array() && layers[0].get("mode").is_none(), "{placed}");
         // Read back, they are what the node is set to, and a node's plan is shared with those alike.
-        let settings = crate::graph::with_settings(fields);
+        let settings = crate::graph::with_settings(&fields);
         assert_eq!(settings["mode"].as_str(), Some("indexed_4bpp"));
         assert!(!settings.contains_key("name") && !settings.contains_key("file"));
         assert!(!crate::graph::shape(&settings).contains("mode"));

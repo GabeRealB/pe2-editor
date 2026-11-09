@@ -2708,7 +2708,7 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
 /// # Errors
 /// It cannot be read, compiled or instantiated, or its registration fails.
 pub fn load(path: &Path) -> Result<Loadable> {
-    let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
+    let bytes = crate::content::read(path).with_context(|| path.display().to_string())?;
     load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.to_path_buf()))
 }
 

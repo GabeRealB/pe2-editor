@@ -276,7 +276,7 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
             Origin::Project(folder) => Some(folder.clone()),
             _ => None,
         })
-        .filter(|folder| folder.join("tests").join("tests.wasm").is_file())
+        .filter(|folder| project::pack::is_file(&folder.join("tests").join("tests.wasm")))
         .map(|folder| folder.display().to_string())
         .collect();
     if !folders.is_empty() {

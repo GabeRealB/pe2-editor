@@ -9,9 +9,12 @@
 //!   `CHANGELOG.md`, its icon, and `tests/`. None of it counts toward trusting it, so a fixed typo is not another
 //!   extension.
 //!
-//! A project holds extensions in `extensions/` of its layers, a higher layer's in place of a lower one's - the folder is
-//! theirs, and no asset is in it; it loads those and the built-ins, nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them
-//! from, by copying - or from an archive of a folder (`<id>-<version>.extension.zip`), unpacked.
+//! A project holds extensions in its layers, sealed: each one object, a tree in the project's store, named by a record
+//! of the layer's (`records::EXTENSIONS`), a higher layer's in place of a lower one's. What is in one is named by its
+//! path within it, read where its folder was (`records::held_folder`), through `content`: nothing is laid out, and a
+//! program is handed a path through the filesystem the project is served as (`content::for_program`). It loads those
+//! and the built-ins, nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them from,
+//! kept as a tree when added - or from an archive of a folder (`<id>-<version>.extension.zip`), unpacked.
 
 use std::path::Path;
 
@@ -26,7 +29,8 @@ pub const SUFFIX: &str = ".extension";
 /// What an archive of an extension's folder is named with: `<id>-<version>.extension.zip`, its folder whole inside.
 pub const ARCHIVE_SUFFIX: &str = ".extension.zip";
 
-/// The folder of a project's layer that holds its extensions.
+/// The folder of a project's layer its extensions' files are read at (`records::held_folder`): where they were folders
+/// before they were records (`records::hold_extensions`).
 pub const HELD: &str = "extensions";
 
 /// An extension's manifest, in its folder.
@@ -56,7 +60,7 @@ pub fn id_of(folder: &Path) -> Option<&str> {
 /// It has none, or it cannot be read.
 pub fn manifest(folder: &Path) -> Result<About> {
     let file = folder.join(MANIFEST);
-    let text = std::fs::read_to_string(&file).with_context(|| format!("it has no {MANIFEST}"))?;
+    let text = crate::content::read_to_string(&file).with_context(|| format!("it has no {MANIFEST}"))?;
     toml::from_str(&text).with_context(|| file.display().to_string())
 }
 
@@ -65,7 +69,8 @@ pub fn manifest(folder: &Path) -> Result<About> {
 /// # Errors
 /// It has no manifest, its component carries another or none, or its folder is named for another id.
 pub fn checked(folder: &Path, bytes: &[u8]) -> Result<About> {
-    let text = std::fs::read_to_string(folder.join(MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
+    let text =
+        crate::content::read_to_string(&folder.join(MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
     let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
     checked_text(&text, &name, bytes)
 }

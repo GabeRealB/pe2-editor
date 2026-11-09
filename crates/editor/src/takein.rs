@@ -70,6 +70,8 @@ pub struct Snapshot {
     pub said: Option<String>,
     /// What went wrong taking a change in.
     pub error: Option<String>,
+    /// What is served of the project now, where anything changed: for its host (`Files::show`).
+    pub served: Option<Arc<project::host::Listing>>,
 }
 
 /// The worker, as the UI holds it.
@@ -407,6 +409,10 @@ impl Worker {
         if all || !changed.is_empty() {
             self.tree = Arc::new(Node::build(&self.index, &self.extensions));
         }
+        // What is served, listed each time: a plain file changed is no asset changed; what is sent is what differs.
+        let served = Some(Arc::new(self.index.served()));
+        // What the job freed, given back: the worker's threads each keep what they freed otherwise.
+        project::give_back_memory();
         Snapshot {
             ticket,
             index: Arc::new(self.index.clone()),
@@ -418,6 +424,7 @@ impl Worker {
             said: None,
             error,
             files: false,
+            served,
         }
     }
 }

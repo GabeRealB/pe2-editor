@@ -10,6 +10,8 @@
 #[cfg(test)]
 mod documents;
 #[cfg(test)]
+mod edits;
+#[cfg(test)]
 mod fetching;
 #[cfg_attr(not(test), allow(dead_code))]
 mod fixture;
@@ -614,7 +616,7 @@ impl Scenario {
             Some(project::ext::Origin::Component(file)) => file.with_file_name("data").join(name),
             _ => return Err(format!("{id} has no folder")),
         };
-        std::fs::read(&at).map_err(|e| format!("{}: {e}", at.display()))
+        project::content::read(&at).map_err(|e| format!("{}: {e}", at.display()))
     }
 
     /// A node a test asked for, as its template makes one, in the active layer: a step of the history, so that it can go.

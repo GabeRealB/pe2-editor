@@ -2447,8 +2447,8 @@ impl Editor {
                     let text = self
                         .workspace
                         .as_ref()
-                        .map(|ws| ws.project.root.display().to_string())
-                        .or_else(|| self.opening.as_ref().map(|o| format!("Opening {}", o.dir.display())))
+                        .map(|ws| project::host::shown(&ws.project.root))
+                        .or_else(|| self.opening.as_ref().map(|o| format!("Opening {}", project::host::shown(&o.dir))))
                         .unwrap_or_else(|| "No project open".to_string());
                     ui.add(egui::Label::new(RichText::new(text).small().color(theme::weak())).truncate());
                 }

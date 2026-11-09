@@ -55,7 +55,7 @@ pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>
             .filter_map(|asset| {
                 let uid = asset.uid.clone()?;
                 let name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
-                let label = asset.fields().get("label").and_then(toml::Value::as_str).unwrap_or(name).to_string();
+                let label = asset.fields_toml().get("label").and_then(toml::Value::as_str).unwrap_or(name).to_string();
                 Some(Row { id: uid, label, asset: Some(asset.path.clone()) })
             })
             .collect();

@@ -87,13 +87,13 @@ impl Node {
 
 /// Whether an asset's stack has a graph layer.
 pub fn has_graph(asset: &Asset) -> bool {
-    let layers = asset.fields().get("stack").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let layers = asset.fields_toml().get("stack").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
     layers.iter().any(|layer| layer.get("op").and_then(Value::as_str) == Some(graph::GRAPH))
 }
 
 /// The graph layer a pane shows of an asset: the one selected, else its first.
 fn layer_of(ws: &Workspace, asset: &Asset) -> Option<usize> {
-    let layers = asset.fields().get("stack")?.as_array()?;
+    let layers = asset.fields_toml().get("stack")?.as_array()?;
     let is_graph = |at: usize| layers.get(at).and_then(|l| l.get("op")?.as_str()) == Some(graph::GRAPH);
     let chosen = ws.inner_of(&asset.path).and_then(inspector::layer_of_inner).map(|(at, _)| at);
     chosen.filter(|at| is_graph(*at)).or_else(|| (0..layers.len()).find(|at| is_graph(*at)))
@@ -614,7 +614,8 @@ pub fn graph_ui(ui: &mut egui::Ui, ws: &mut Workspace, subject: Option<&str>, ed
         );
         return;
     };
-    let Some(layer) = asset.fields().get("stack").and_then(Value::as_array).and_then(|l| l.get(at)).cloned() else {
+    let Some(layer) = asset.fields_toml().get("stack").and_then(Value::as_array).and_then(|l| l.get(at)).cloned()
+    else {
         return;
     };
     let id = egui::Id::unique(("graph pane", &asset.path, at));

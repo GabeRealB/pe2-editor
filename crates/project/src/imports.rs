@@ -15,10 +15,10 @@
 //! so a project opens without importing. Like the rest of the cache, any of it may be deleted at the cost of time only.
 
 use anyhow::{Context, Result};
+use pe2_value as V;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use toml::{Table, Value};
 
 use crate::cache::Cache;
 use crate::ext::{Extensions, Origin, Status};
@@ -49,14 +49,62 @@ pub struct Imports {
     known: Mutex<HashMap<String, (Reads, Arc<Known>)>>,
     /// The nodes each asset's last import read outputs of (as traces name them), by its path.
     read_from: Mutex<HashMap<String, BTreeSet<String>>>,
-    /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from.
+    /// The addresses each referenced asset has, by its path, with the hash of the settings they were listed from: kept
+    /// in the cache (`LISTED`) for the extensions that listed them, as listing a family's members asks its extension.
     addresses: Mutex<HashMap<String, Listed>>,
+    /// Where they are kept.
+    listed_at: std::path::PathBuf,
     /// Set when what is attaching is no longer wanted.
     stop: Arc<AtomicBool>,
 }
 
 /// An asset's addresses, with the hash of the settings they were listed from.
 type Listed = (String, Arc<HashSet<String>>);
+
+/// Where the addresses listed are kept, in the cache, with the extensions that listed them.
+const LISTED: &str = "listed.json";
+
+/// What tells the extensions loaded apart from others: each one's id, version and build.
+fn builds_of(extensions: &Extensions) -> String {
+    let mut builds: Vec<String> = extensions
+        .loaded
+        .iter()
+        .map(|l| format!("{} {} {}", l.id, l.version, l.build.as_deref().unwrap_or("linked")))
+        .collect();
+    builds.sort();
+    sha1_hex(builds.join("\n").as_bytes())
+}
+
+/// The addresses kept in the cache, where these extensions listed them.
+fn listed_kept(at: &std::path::Path, builds: &str) -> HashMap<String, Listed> {
+    let Ok(text) = std::fs::read_to_string(at) else { return HashMap::new() };
+    let Ok(kept) = serde_json::from_str::<serde_json::Value>(&text) else { return HashMap::new() };
+    if kept["builds"].as_str() != Some(builds) {
+        return HashMap::new();
+    }
+    let listed = kept["listed"].as_object().into_iter().flatten();
+    listed
+        .filter_map(|(target, entry)| {
+            let digest = entry[0].as_str()?.to_string();
+            let addresses = entry[1].as_array()?.iter().filter_map(|a| Some(a.as_str()?.to_string())).collect();
+            Some((target.clone(), (digest, Arc::new(addresses))))
+        })
+        .collect()
+}
+
+/// Keep the addresses listed in the cache, for the extensions that listed them.
+fn keep_listed(at: &std::path::Path, builds: &str, listed: &HashMap<String, Listed>) {
+    let mut sorted: Vec<(&String, &Listed)> = listed.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut entries = serde_json::Map::new();
+    for (target, (digest, addresses)) in sorted {
+        let mut addresses: Vec<&String> = addresses.iter().collect();
+        addresses.sort();
+        entries.insert(target.clone(), serde_json::json!([digest, addresses]));
+    }
+    let kept = serde_json::json!({ "builds": builds, "listed": entries });
+    let _ = crate::cache::write_atomic(at, kept.to_string().as_bytes());
+}
 
 /// What there is of an asset's import, found without making anything.
 enum Import {
@@ -82,10 +130,10 @@ struct Known {
     files: Vec<(String, Blob)>,
     /// The settings it derived, the paths it derives them at, and its notes: resolved over the declaration as it stands
     /// each time it is attached, as its settings may have changed - unsaved, in a working copy.
-    made: Table,
+    made: pe2_value::Table,
     derives: Vec<String>,
     notes: Vec<String>,
-    /// Its last resolution, with the declaration it was over: resolved again only when that changed.
+    /// Its last resolution, with the hash of the declaration it was over: resolved again only when that changed.
     resolved: Mutex<Option<(String, Arc<Imported>)>>,
 }
 
@@ -93,8 +141,9 @@ impl Known {
     /// Its settings resolved over a declaration (`resolve`): as last resolved, where that was this declaration.
     fn resolved(&self, asset: &Asset) -> Arc<Imported> {
         let mut last = self.resolved.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((text, resolved)) = last.as_ref()
-            && text == asset.text()
+        let declared = sha1_hex(asset.text().as_bytes());
+        if let Some((was, resolved)) = last.as_ref()
+            && *was == declared
         {
             return resolved.clone();
         }
@@ -102,7 +151,7 @@ impl Known {
         fill(&mut resolved.settings, &self.made);
         resolved.notes.clone_from(&self.notes);
         let resolved = Arc::new(resolved);
-        *last = Some((asset.text().to_string(), resolved.clone()));
+        *last = Some((declared, resolved.clone()));
         resolved
     }
 }
@@ -122,6 +171,7 @@ impl Imports {
             known: Mutex::default(),
             read_from: Mutex::default(),
             addresses: Mutex::default(),
+            listed_at: cache.path(LISTED),
             stop: Arc::default(),
         })
     }
@@ -212,14 +262,7 @@ impl Imports {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
-        // Copied where shared with a snapshot, and only where something goes.
-        for asset in index.assets.values_mut().filter(|a| of(&a.path)) {
-            if asset.imported.is_some() || asset.files.iter().any(|f| f.made_by.is_some()) {
-                let asset = Arc::make_mut(asset);
-                asset.files.retain(|f| f.made_by.is_none());
-                asset.imported = None;
-            }
-        }
+        forget_imports(index, &of);
         let engine = self.engine(extensions);
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let assets: Vec<&Asset> = match only {
@@ -325,7 +368,7 @@ impl Imports {
         });
         for ((path, _, import), resolved) in found.into_iter().zip(resolved) {
             let Some((layer, resolved)) = resolved else { continue };
-            let Some(asset) = index.assets.get_mut(&path).map(Arc::make_mut) else { continue };
+            let Some(asset) = Arc::make_mut(&mut index.assets).get_mut(&path).map(Arc::make_mut) else { continue };
             asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
             for (name, blob) in &import.files {
                 asset.files.push(BundleFile {
@@ -358,6 +401,11 @@ impl Imports {
     /// are among them. An asset's outputs are listed again only when its settings change.
     fn missing_outputs(&self, index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
         let mut known = self.addresses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // What an earlier run listed, with these extensions.
+        let builds = builds_of(extensions);
+        if known.is_empty() {
+            *known = listed_kept(&self.listed_at, &builds);
+        }
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         let targets: Vec<_> = index.referenced_by.iter().collect();
         // Each by itself, listed where its settings changed.
@@ -400,9 +448,14 @@ impl Imports {
             Some(((*target).clone(), digest, addresses, problems))
         });
         let mut problems = Vec::new();
+        let mut new = false;
         for (target, digest, addresses, missing) in listed.into_iter().flatten() {
+            new |= known.get(&target).is_none_or(|(was, _)| *was != digest);
             known.insert(target, (digest, addresses));
             problems.extend(missing);
+        }
+        if new {
+            keep_listed(&self.listed_at, &builds, &known);
         }
         problems
     }
@@ -488,6 +541,25 @@ impl Imports {
         let kept = self.store.describe(&trace.value).context("its import was not kept")?;
         let (reads, import) = known_of(extensions, importer, kept, trace.reads)?;
         Ok((true, reads, import))
+    }
+}
+
+/// What earlier imports made of the assets `of` takes, gone. Copied where shared with a snapshot, and only where
+/// something goes.
+fn forget_imports(index: &mut Index, of: &dyn Fn(&str) -> bool) {
+    let imported = |a: &Asset| a.imported.is_some() || a.files.iter().any(|f| f.made_by.is_some());
+    let going: Vec<String> =
+        index.assets.values().filter(|a| of(&a.path) && imported(a)).map(|a| a.path.clone()).collect();
+    if going.is_empty() {
+        return;
+    }
+    let assets = Arc::make_mut(&mut index.assets);
+    for path in going {
+        if let Some(asset) = assets.get_mut(&path) {
+            let asset = Arc::make_mut(asset);
+            asset.files.retain(|f| f.made_by.is_none());
+            asset.imported = None;
+        }
     }
 }
 
@@ -585,7 +657,7 @@ fn import_output(plan: &Plan, extensions: &Extensions) -> Option<(String, usize)
 
 /// The file an asset's stack takes as its import's source, from its bundle.
 fn source_file(asset: &Asset) -> Option<&BundleFile> {
-    let name = graph::import_of(graph::exec::Node::fields(asset))?.source;
+    let (name, _) = graph::import_of_fields(asset.fields())?;
     asset.files.iter().find(|f| f.name == name && f.made_by.is_none())
 }
 
@@ -597,9 +669,10 @@ fn steps(path: &str) -> Vec<&str> {
 /// The declaration's settings with an import's derived ones in their places: at each path the importer derives, the
 /// import's value (a declared one there is overridden); under a `*`, the parts the import has - the declaration's
 /// settings of each kept beside what the import derives of it, a part only the import has added after the
-/// declaration's, a part only the declaration has kept and orphaned.
+/// declaration's, a part only the declaration has kept and orphaned. What it leaves be is the declaration's, shared;
+/// what it places, the import's, shared: only the tables on the way to a place are copied.
 #[must_use]
-pub fn resolve(declared: &Table, made: &Table, paths: &[String]) -> Imported {
+pub fn resolve(declared: &V::Table, made: &V::Table, paths: &[String]) -> Imported {
     let mut settings = declared.clone();
     let (mut overridden, mut orphans) = (Vec::new(), Vec::new());
     for path in paths {
@@ -608,21 +681,35 @@ pub fn resolve(declared: &Table, made: &Table, paths: &[String]) -> Imported {
     Imported { settings, text: std::sync::OnceLock::new(), overridden, orphans, notes: vec![] }
 }
 
+/// Whether `fill` would add anything to `into`.
+fn fills(into: &V::Table, made: &V::Table) -> bool {
+    made.iter().any(|(key, value)| match (into.get(key), value) {
+        (None, _) => true,
+        (Some(V::Value::Table(mine)), V::Value::Table(made)) => fills(mine, made),
+        _ => false,
+    })
+}
+
 /// What an import made beyond what it says it derives, under what the node says: a node reads what its import came up with,
-/// which is what lists the members of what it makes, though no declaration has them.
-fn fill(into: &mut Table, made: &Table) {
-    for (key, value) in made {
-        match (into.get_mut(key), value) {
-            (None, _) => drop(into.insert(key.clone(), value.clone())),
-            (Some(Value::Table(mine)), Value::Table(made)) => fill(mine, made),
+/// which is what lists the members of what it makes, though no declaration has them. A table it adds nothing to stays
+/// shared.
+fn fill(into: &mut V::Table, made: &V::Table) {
+    for (key, value) in made.iter() {
+        match (into.get(key), value) {
+            (None, _) => drop(into.insert(key, value.clone())),
+            (Some(V::Value::Table(mine)), V::Value::Table(made)) if fills(mine, made) => {
+                if let Some(V::Value::Table(mine)) = into.get_mut(key) {
+                    fill(mine, made);
+                }
+            }
             _ => {}
         }
     }
 }
 
 fn place(
-    into: &mut Table,
-    from: &Table,
+    into: &mut V::Table,
+    from: &V::Table,
     steps: &[&str],
     at: &str,
     overridden: &mut Vec<String>,
@@ -633,30 +720,37 @@ fn place(
     match (step, rest.first()) {
         // The parts of a keyed table: each the import has, and the declaration's others orphaned.
         (_, Some(&"*")) => {
-            let Some(Value::Table(parts)) = from.get(step) else { return };
-            let table = into.entry(step).or_insert_with(|| Value::Table(Table::new()));
-            if !table.is_table() {
-                overridden.push(join(step));
-                *table = Value::Table(Table::new());
+            let Some(V::Value::Table(parts)) = from.get(step) else { return };
+            match into.get(step) {
+                Some(V::Value::Table(_)) => {}
+                Some(_) => {
+                    overridden.push(join(step));
+                    into.insert(step, V::Value::Table(V::Table::new()));
+                }
+                None => drop(into.insert(step, V::Value::Table(V::Table::new()))),
             }
-            let Value::Table(table) = table else { return };
+            let Some(V::Value::Table(table)) = into.get_mut(step) else { return };
             for name in table.keys() {
                 if !parts.contains_key(name) {
                     orphans.push(format!("{}.{name}", join(step)));
                 }
             }
-            for (name, part) in parts {
-                let Value::Table(part) = part else { continue };
-                let mine = table.entry(name.as_str()).or_insert_with(|| Value::Table(Table::new()));
-                if let Value::Table(mine) = mine {
+            for (name, part) in parts.iter() {
+                let V::Value::Table(part) = part else { continue };
+                if !table.contains_key(name) {
+                    table.insert(name, V::Value::Table(V::Table::new()));
+                }
+                if let Some(V::Value::Table(mine)) = table.get_mut(name) {
                     place(mine, part, &rest[1..], &format!("{}.{name}", join(step)), overridden, orphans);
                 }
             }
         }
         (_, Some(_)) => {
-            let Some(Value::Table(from)) = from.get(step) else { return };
-            let table = into.entry(step).or_insert_with(|| Value::Table(Table::new()));
-            if let Value::Table(table) = table {
+            let Some(V::Value::Table(from)) = from.get(step) else { return };
+            if !into.contains_key(step) {
+                into.insert(step, V::Value::Table(V::Table::new()));
+            }
+            if let Some(V::Value::Table(table)) = into.get_mut(step) {
                 place(table, from, rest, &join(step), overridden, orphans);
             }
         }
@@ -665,7 +759,7 @@ fn place(
             if into.get(step).is_some_and(|v| v != value) {
                 overridden.push(join(step));
             }
-            into.insert(step.to_string(), value.clone());
+            into.insert(step, value.clone());
         }
     }
 }
@@ -730,16 +824,25 @@ op = "pe2.images@ora"
 
     #[test]
     fn derived_settings_take_their_places() {
+        use pe2_value as V;
         let derives = ["size".to_string(), "cells.*.rect".to_string()];
-        let declared: toml::Table = toml::from_str(DECLARED).unwrap();
-        let made: toml::Table =
+        let declared: V::Table = toml::from_str(DECLARED).unwrap();
+        let made: V::Table =
             toml::from_str("size = [8, 3]\ncells.wide = { rect = [4, 0, 4, 2] }\ncells.new = { rect = [0, 2, 2, 1] }")
                 .unwrap();
         let resolved = resolve(&declared, &made, &derives);
-        assert_eq!(resolved.settings["size"].as_array().unwrap()[1].as_integer(), Some(3));
-        assert_eq!(resolved.settings["cells"]["wide"]["palette"].as_str(), Some("cold"));
-        assert_eq!(resolved.settings["cells"]["new"]["rect"].as_array().unwrap().len(), 4);
-        let order: Vec<&String> = resolved.settings["cells"].as_table().unwrap().keys().collect();
+        // What it leaves be is the declaration's, shared, not copied.
+        let (Some(V::Value::Array(a)), Some(V::Value::Array(b))) =
+            (resolved.settings.get("stack"), declared.get("stack"))
+        else {
+            panic!("stacks")
+        };
+        assert!(std::sync::Arc::ptr_eq(a, b), "the stack, left be, is shared");
+        let settings = resolved.settings.to_toml();
+        assert_eq!(settings["size"].as_array().unwrap()[1].as_integer(), Some(3));
+        assert_eq!(settings["cells"]["wide"]["palette"].as_str(), Some("cold"));
+        assert_eq!(settings["cells"]["new"]["rect"].as_array().unwrap().len(), 4);
+        let order: Vec<&String> = settings["cells"].as_table().unwrap().keys().collect();
         assert_eq!(order, ["wide", "gone", "new"]);
         assert_eq!(resolved.overridden, ["size"]);
         assert_eq!(resolved.orphans, ["cells.gone"]);
@@ -1442,7 +1545,7 @@ mod attaching {
         let made = s.files.iter().find(|f| f.name == "native.bin").unwrap();
         assert_eq!(made.made_by.as_deref(), Some("test.strips@line"));
         assert_eq!(std::fs::read(&made.path).unwrap(), b"b a");
-        let settings = s.settings();
+        let settings = s.settings().to_toml();
         assert_eq!(settings["size"].as_array().unwrap()[0].as_integer(), Some(2));
         assert_eq!(settings["cells"]["a"]["palette"].as_str(), Some("warm"));
         assert!(settings["cells"]["b"]["rect"].is_array());
@@ -1499,7 +1602,7 @@ mod attaching {
         );
         assert!(extensions.problems.is_empty(), "{:?}", extensions.problems);
         let (index, _) = open(&root, &extensions);
-        let settings = index.assets["s"].settings();
+        let settings = index.assets["s"].settings().to_toml();
         assert_eq!(settings["cells"]["a"]["palette"].as_str(), Some("warm"));
         assert!(settings["cells"]["a"]["rect"].is_array(), "what the node says stays, what was made joins it");
         assert!(settings["cells"]["b"]["rect"].is_array());

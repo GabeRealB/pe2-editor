@@ -464,7 +464,7 @@ impl Parts {
 
 /// A field's array; empty where it has none.
 fn array<'a>(asset: &'a Asset, key: &str) -> &'a [toml::Value] {
-    asset.fields().get(key).and_then(toml::Value::as_array).map_or(&[][..], Vec::as_slice)
+    asset.fields_toml().get(key).and_then(toml::Value::as_array).map_or(&[][..], Vec::as_slice)
 }
 
 /// A decoded picture uploaded, scaled by the upscaling method.
@@ -610,11 +610,6 @@ impl Workspace {
     ) -> Result<Opened> {
         report("Reading project.toml", 0, 0);
         let project = Project::load(dir)?;
-        // The host serving its files, started where none runs: it takes the project, and lends it at once.
-        if project.filesystem.serving != project::Serving::None {
-            report("Serving its files", 0, 0);
-        }
-        let files = crate::files::Files::keep(&project);
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
         let lock = match Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2)) {
             // An agent's server answering a request of its own: brief, if longer than that - it lets go.
@@ -623,6 +618,9 @@ impl Workspace {
             }
             locked => locked?,
         };
+        // The host serving its files, started where none runs, beside the opening: it takes the project once the
+        // editor lets go of it.
+        let files = crate::files::Files::keep(&project);
         // Agents reach it from now on: what they ask of the window is answered as it opens.
         let link = listen(&project.root, agents.0, agents.1);
         if link.is_ok() {
@@ -634,6 +632,10 @@ impl Workspace {
         let (history, recovered) = History::open(&cache)?;
         let history = history.journaled();
         let index = Index::open_reporting(&project, &cache, report)?;
+        // What is served of it, listed for its host, which keeps no index of its own while the editor holds it.
+        if let Some(files) = &files {
+            files.show(Arc::new(index.served()));
+        }
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
         let old = cache.path("artifacts");
@@ -1318,6 +1320,9 @@ impl Workspace {
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
             }
+            if let (Some(files), Some(served)) = (&self.files, snapshot.served) {
+                files.show(served);
+            }
             if let Some(pictures) = &mut self.textures.pictures {
                 if snapshot.all {
                     pictures.clear();
@@ -1487,7 +1492,8 @@ impl Workspace {
                 || !self.extensions.contents_views(&asset).is_empty();
         }
         crate::inspector::layer_of_inner(&inner).is_none_or(|(at, op)| {
-            let layer = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
+            let layer =
+                asset.fields_toml().get("stack").and_then(toml::Value::as_array).and_then(|layers| layers.get(at));
             layer.is_some_and(|layer| op.is_none_or(|op| layer.get("ops").and_then(|ops| ops.get(op)).is_some()))
         })
     }

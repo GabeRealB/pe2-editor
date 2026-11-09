@@ -63,6 +63,16 @@ impl Fixture {
         self
     }
 
+    /// The notes (`notes`), under a layer of records the project writes to (`top`).
+    #[must_use]
+    pub fn notes_under_records() -> Fixture {
+        let fixture = Fixture::notes();
+        fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"top\"\n"));
+        project::records::mark(&fixture.root.join(".layers/top"), &project::records::Settings::default())
+            .expect("a records layer");
+        fixture
+    }
+
     /// A node with no field of its own: a stored file, with what is taken from it.
     #[must_use]
     pub fn notes() -> Fixture {
@@ -72,8 +82,9 @@ impl Fixture {
         Fixture::new().node("notes", stack).stored("notes", "notes.txt")
     }
 
-    /// An extension held as a layer holds one (`extensions/<id>.extension`): its component, with the manifest it
-    /// carries. Its folder.
+    /// An extension to be held by a layer: its component, with the manifest it carries, in a folder of its own in the
+    /// layer's (`extensions/<id>.extension`, as layers held them before records), which `settle` makes the layer hold.
+    /// Its folder, for what else it is to have.
     fn hold(&self, layer: &str, component: &[u8]) -> std::path::PathBuf {
         let about = project::ext::component::about(component).expect("who it is");
         let at = self.root.join(format!(".layers/{layer}/extensions/{}.extension", about.id));
@@ -100,7 +111,16 @@ impl Fixture {
         }
         fixture.write("project.toml", &file);
         fixture.hold("mods", &bytes);
+        fixture.settle("mods");
         fixture
+    }
+
+    /// Make a layer hold the extensions `hold` put in it, as a project holds them: each named by a record of the layer's,
+    /// its tree in the store.
+    fn settle(&self, layer: &str) {
+        let at = self.root.join(".layers").join(layer);
+        let project = project::Project::load(&self.root).expect("the project");
+        project::records::hold_extensions(&project, &at).expect("its extensions held");
     }
 
     /// A project of what a suite declares, holding its tests.
@@ -134,6 +154,7 @@ impl Fixture {
         for entry in std::fs::read_dir(suite.folder.join("data")).into_iter().flatten().flatten() {
             std::fs::copy(entry.path(), at.join("data").join(entry.file_name())).expect("its data");
         }
+        fixture.settle(layers[0]);
         if declared.trust {
             extensions::trust::trust(&fixture.root, std::slice::from_ref(&fixture.root)).expect("what is trusted");
         }
@@ -154,6 +175,7 @@ impl Fixture {
         std::fs::create_dir_all(at.join("tests/data")).expect("its tests' folder");
         std::fs::write(at.join("tests/tests.wasm"), tests).expect("its tests");
         std::fs::copy(suite.join("data/doll.usda"), at.join("tests/data/doll.usda")).expect("its data");
+        fixture.settle(LAYER);
         fixture
     }
 

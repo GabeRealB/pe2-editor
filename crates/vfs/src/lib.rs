@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
-use project::index::{BUNDLE_SUFFIX, Index, Kind};
+use project::index::Index;
 
 #[cfg(windows)]
 pub mod cloud;
@@ -125,11 +125,18 @@ impl Inodes {
 }
 
 impl Tree {
-    /// The tree an index resolves, its inode numbers those `inodes` gave before, new paths given new ones. Each asset is
-    /// its bundle's folder with the files of the version on disk (not an unsaved working copy, nor what an import
-    /// made); each folder and plain file is where it is.
+    /// The tree an index resolves (`Index::served`), its inode numbers those `inodes` gave before, new paths given new
+    /// ones. Each node is its bundle's folder with the files of the version on disk (not an unsaved working copy, nor
+    /// what an import made); each folder and plain file is where it is.
     #[must_use]
     pub fn of(index: &Index, inodes: &mut Inodes) -> Tree {
+        Tree::of_listing(&index.served(), inodes)
+    }
+
+    /// The tree of what is served, as listed (`project::host::Listing`): its entries first, then the nodes' files.
+    #[must_use]
+    pub fn of_listing(listing: &project::host::Listing, inodes: &mut Inodes) -> Tree {
+        use project::host::Shown;
         let mut tree = Tree::default();
         tree.nodes.insert(
             ROOT,
@@ -143,39 +150,28 @@ impl Tree {
                 of_files: false,
             },
         );
-        for (path, entry) in index.entries.iter() {
-            match entry.kind {
-                Kind::Folder => {
-                    tree.folder(path, inodes);
-                }
-                Kind::File => {
-                    let (size, modified) = project::content::stat(&entry.disk).unwrap_or((0, SystemTime::UNIX_EPOCH));
-                    tree.file(path, entry.disk.clone(), size, modified, inodes);
-                }
-                Kind::Asset => {
+        let time = |(secs, nanos): (u64, u32)| SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+        for (path, shown) in listing {
+            match shown {
+                Shown::Folder => drop(tree.folder(path, inodes)),
+                Shown::Node => {
                     // A node is the folder of its name, beside - one with - its folder of children.
-                    let ino = tree.folder(path.strip_suffix(BUNDLE_SUFFIX).unwrap_or(path), inodes);
+                    let ino = tree.folder(path, inodes);
                     if let Some(node) = tree.nodes.get_mut(&ino) {
                         node.asset = true;
                     }
                 }
+                Shown::File { disk, size, modified, of_files: false } => {
+                    tree.file(path, disk.clone(), *size, time(*modified), inodes);
+                }
+                Shown::File { of_files: true, .. } => {}
             }
         }
-        // Then each node's files in its folder: a child of the same name keeps its place (the index reports the clash).
-        for path in index.entries.iter().filter(|(_, e)| e.kind == Kind::Asset).map(|(p, _)| p) {
-            let name = path.strip_suffix(BUNDLE_SUFFIX).unwrap_or(path);
-            let Some(asset) = index.assets.get(name) else { continue };
-            for file in asset.on_disk().files.iter().filter(|f| f.made_by.is_none()) {
-                let first = file.name.split('/').next().unwrap_or(&file.name);
-                let child = format!("{name}/{first}");
-                if index.entries.contains_key(&child) || index.entries.contains_key(&format!("{child}{BUNDLE_SUFFIX}"))
-                {
-                    continue;
-                }
-                let modified = SystemTime::UNIX_EPOCH + std::time::Duration::new(file.modified.0, file.modified.1);
-                // The folders a file's name makes are the node's, not entries.
+        // Then each node's files in its folder: the folders their names make are the node's, not entries.
+        for (path, shown) in listing {
+            if let Shown::File { disk, size, modified, of_files: true } = shown {
                 tree.of_files = true;
-                tree.file(&format!("{name}/{}", file.name), file.path.clone(), file.size, modified, inodes);
+                tree.file(path, disk.clone(), *size, time(*modified), inodes);
                 tree.of_files = false;
             }
         }
@@ -386,9 +382,14 @@ impl Served {
 
     /// Serve the tree of a newer index of the project.
     pub fn update(&self, index: &Index) {
+        self.show(&index.served());
+    }
+
+    /// Serve what is listed (`Index::served`, as whoever holds the project sends it).
+    pub fn show(&self, listing: &project::host::Listing) {
         let mut tree = {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            Tree::of(index, &mut inodes)
+            Tree::of_listing(listing, &mut inodes)
         };
         tree.keep_times(&self.tree(), SystemTime::now());
         *self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(tree);

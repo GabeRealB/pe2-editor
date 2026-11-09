@@ -110,54 +110,55 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires:
             });
             continue;
         }
-        let loaded = std::fs::read(&found.file).map_err(|e| format!("it cannot be read: {e}")).and_then(|bytes| {
-            if !bytes.starts_with(b"\0asm") {
-                return Err("it is not a WebAssembly component".to_string());
-            }
-            // In a folder of its own, its manifest is its component's: what says whether it needs trusting.
-            let about = match found.origin.folder() {
-                Some(held) => Some(folder::checked(held, &bytes).map_err(|e| format!("{e:#}"))?),
-                None => component::about(&bytes),
-            };
-            if let Some(why) = about.as_ref().and_then(|a| unsandboxed::elsewhere(&a.platforms)) {
-                return Err(why);
-            }
-            if let Some(about) = about.as_ref().filter(|_| kept_apart) {
-                unloadable.push(shown(about.clone(), found, &bytes, Status::Available, None));
-                return Ok(None);
-            }
-            let name = found.origin.said();
-            // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
-            let held = match about.filter(|a| a.unsandboxed) {
-                Some(about) => {
-                    let trust = unsandboxed::trust(&found.file, found.folder.as_deref(), &about)
-                        .map_err(|e| format!("{e:#}"))?;
-                    if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
-                        let changed = enabled.values().any(|id| *id == about.id);
-                        unloadable.push(shown(about, found, &bytes, Status::NotEnabled { changed }, Some(trust)));
-                        return Ok(None);
-                    }
-                    let install = about.described.install.as_ref();
-                    let install = install.and_then(|page| Some(found.folder.as_ref()?.join(page)));
-                    // What its setup fetches here, where it is kept, and what of it the user turned off.
-                    let setup = about.setup.iter().filter(|s| s.here()).cloned().collect();
-                    let launch = about.launch.iter().filter(|l| l.here()).cloned().collect();
-                    let (store, off) = (setup_folder(), trust::optional_off());
-                    Some(Unsandboxed { folder: found.folder.clone(), trust, install, store, setup, off, launch })
+        let loaded =
+            project::content::read(&found.file).map_err(|e| format!("it cannot be read: {e}")).and_then(|bytes| {
+                if !bytes.starts_with(b"\0asm") {
+                    return Err("it is not a WebAssembly component".to_string());
                 }
-                None => None,
-            };
-            // The first line of what went wrong: the parser's is followed by the bytes it found.
-            let loaded = match held {
-                Some(held) => component::load_unsandboxed(&name, &bytes, found.origin.clone(), held),
-                None => component::load_bytes(&name, &bytes, found.origin.clone()),
-            };
-            let loaded = loaded.map_err(|e| {
-                let why = format!("{e:#}");
-                why.lines().next().unwrap_or_default().trim_end_matches(['[', ' ', '=']).to_string()
+                // In a folder of its own, its manifest is its component's: what says whether it needs trusting.
+                let about = match found.origin.folder() {
+                    Some(held) => Some(folder::checked(held, &bytes).map_err(|e| format!("{e:#}"))?),
+                    None => component::about(&bytes),
+                };
+                if let Some(why) = about.as_ref().and_then(|a| unsandboxed::elsewhere(&a.platforms)) {
+                    return Err(why);
+                }
+                if let Some(about) = about.as_ref().filter(|_| kept_apart) {
+                    unloadable.push(shown(about.clone(), found, &bytes, Status::Available, None));
+                    return Ok(None);
+                }
+                let name = found.origin.said();
+                // Unsandboxed, it runs only as the user trusts it; until then, it is read for who it is.
+                let held = match about.filter(|a| a.unsandboxed) {
+                    Some(about) => {
+                        let trust = unsandboxed::trust(&found.file, found.folder.as_deref(), &about)
+                            .map_err(|e| format!("{e:#}"))?;
+                        if !enabled.contains_key(&trust) && trust::allowed_by(&found.origin).is_none() {
+                            let changed = enabled.values().any(|id| *id == about.id);
+                            unloadable.push(shown(about, found, &bytes, Status::NotEnabled { changed }, Some(trust)));
+                            return Ok(None);
+                        }
+                        let install = about.described.install.as_ref();
+                        let install = install.and_then(|page| Some(found.folder.as_ref()?.join(page)));
+                        // What its setup fetches here, where it is kept, and what of it the user turned off.
+                        let setup = about.setup.iter().filter(|s| s.here()).cloned().collect();
+                        let launch = about.launch.iter().filter(|l| l.here()).cloned().collect();
+                        let (store, off) = (setup_folder(), trust::optional_off());
+                        Some(Unsandboxed { folder: found.folder.clone(), trust, install, store, setup, off, launch })
+                    }
+                    None => None,
+                };
+                // The first line of what went wrong: the parser's is followed by the bytes it found.
+                let loaded = match held {
+                    Some(held) => component::load_unsandboxed(&name, &bytes, found.origin.clone(), held),
+                    None => component::load_bytes(&name, &bytes, found.origin.clone()),
+                };
+                let loaded = loaded.map_err(|e| {
+                    let why = format!("{e:#}");
+                    why.lines().next().unwrap_or_default().trim_end_matches(['[', ' ', '=']).to_string()
+                });
+                loaded.map(Some)
             });
-            loaded.map(Some)
-        });
         match loaded {
             Ok(Some(extension)) => loadable.push(extension),
             Ok(None) => {}
@@ -411,7 +412,7 @@ pub fn user_settings() -> BTreeMap<String, Table> {
 /// The tests in an extension's folder.
 fn tests_of(folder: &Path) -> Option<Found> {
     let file = folder.join(unsandboxed::TESTS).join("tests.wasm");
-    file.is_file().then(|| Found {
+    project::pack::is_file(&file).then(|| Found {
         origin: Origin::Component(file.clone()),
         stamp: file_stamp(&file),
         folder: file.parent().map(PathBuf::from),
@@ -517,13 +518,17 @@ pub fn install_folder() -> Option<PathBuf> {
 
 /// What tells a file's version from another: its size and time.
 fn file_stamp(file: &std::path::Path) -> String {
-    let meta = std::fs::metadata(file).ok();
-    let time = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-    format!("{} {}", meta.map_or(0, |m| m.len()), time.map_or(0, |t| t.as_nanos()))
+    let stat = project::content::stat(file).ok();
+    let time = stat.and_then(|(_, t)| t.duration_since(std::time::UNIX_EPOCH).ok());
+    format!("{} {}", stat.map_or(0, |(len, _)| len), time.map_or(0, |t| t.as_nanos()))
 }
 
-/// The stamps of what an extension's folder holds: its tests are not it.
+/// The stamps of what an extension's folder holds: its tests are not it. One a project holds is its tree, whose hash
+/// tells its versions apart.
 fn own_stamp(folder: &Path) -> String {
+    if let Some(held) = project::records::held(folder) {
+        return held.tree.clone();
+    }
     let mut entries: Vec<PathBuf> =
         std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
     entries.retain(|entry| entry.file_name().is_none_or(|name| name != unsandboxed::TESTS));
@@ -558,12 +563,12 @@ fn components_in(folder: &std::path::Path, origin: fn(PathBuf) -> Origin) -> Vec
 
 /// The extension in a folder of its own (`<id>.extension`), holding its component and what it ships.
 fn component_at(entry: PathBuf, origin: fn(PathBuf) -> Origin) -> Option<Found> {
-    if !entry.is_dir() || folder::id_of(&entry).is_none() {
+    if !project::pack::is_dir(&entry) || folder::id_of(&entry).is_none() {
         return None;
     }
     let file = entry.join(EXTENSION_COMPONENT);
     let stamp = own_stamp(&entry);
-    file.is_file().then(|| Found { origin: origin(entry.clone()), file, folder: Some(entry), stamp })
+    project::pack::is_file(&file).then(|| Found { origin: origin(entry.clone()), file, folder: Some(entry), stamp })
 }
 
 /// The extensions in the user's folder, to be added to a project.
@@ -731,6 +736,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("project.toml"), "[[layer]]\nname = \"game\"\n\n[[layer]]\nname = \"mine\"\n")
             .unwrap();
+        for layer in ["game", "mine"] {
+            project::records::mark(&root.join(".layers").join(layer), &project::records::Settings::default()).unwrap();
+        }
         let project = project::Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
@@ -738,40 +746,71 @@ mod tests {
         let about = add_extension(&project, &source, None, &mut history, "add".into()).unwrap();
         assert_eq!(about.id, "pe2.events");
         let project = project::Project::load(&root).unwrap();
-        let held = root.join(".layers/mine/extensions/pe2.events.extension");
-        assert_eq!(project.held_extensions(), std::slice::from_ref(&held));
+        // Held by a record of the layer's: its files read where its folder was, from its tree, on no disk.
+        let record = root.join(".layers/mine/.records/extensions/pe2.events.toml");
+        let [held] = project.held_extensions().try_into().unwrap();
+        assert_eq!(held, root.join(".layers/mine/extensions/pe2.events.extension"));
+        assert!(record.is_file() && !held.exists() && !root.join(".cache/extensions").exists());
+        assert_eq!(project::records::held(&held).unwrap().layer, root.join(".layers/mine"));
         assert_eq!(project.requires, [project::Requirement { id: "pe2.events".into(), version: Some("^0.1".into()) }]);
+        // Trusted as the folder it came from was: the hash read from its tree is the folder's.
+        let trust = |folder: &std::path::Path| {
+            project::ext::unsandboxed::trust(&folder.join("extension.wasm"), Some(folder), &about).unwrap()
+        };
+        assert_eq!(trust(&held), trust(&source));
+        // A program it ships, handed over in place: its object, read-only, still a program.
+        let tool = project::ext::unsandboxed::program(Some(&held), &[], "tool");
+        assert!(tool.starts_with(root.join(".layers/.store/objects")), "{}", tool.display());
+        assert!(std::fs::metadata(&tool).unwrap().permissions().readonly());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(held.join("linux-x86_64/tool")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&tool).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "a program is still one");
         }
         let extensions =
             super::load_without(&super::found(&project), &[], &super::Kept::new(), Some(&project.requires));
         let loaded = extensions.loaded.iter().find(|l| l.id == "pe2.events").unwrap();
         assert_eq!(loaded.origin, project::ext::Origin::Project(held.clone()));
-        // Updated: added again, in place of what was there; undone, what was there is back.
+        // Updated: added again, in place of what was there; undone, what was there is back. As it is, it is no step.
+        let tool = |project: &project::Project| {
+            project::content::read_to_string(&project.held_extensions()[0].join("linux-x86_64/tool")).unwrap()
+        };
+        let steps = history.done().len();
+        add_extension(&project, &source, None, &mut history, "again".into()).unwrap();
+        assert_eq!(history.done().len(), steps, "added as it is, nothing was done");
         std::fs::write(source.join("linux-x86_64/tool"), "#!/bin/sh\necho new\n").unwrap();
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
-        assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\necho new\n");
+        assert_eq!(tool(&project), "#!/bin/sh\necho new\n");
         history.undo(&index, None, false).unwrap();
-        assert_eq!(std::fs::read_to_string(held.join("linux-x86_64/tool")).unwrap(), "#!/bin/sh\n");
-        // Removed: the folder and what was required of it.
+        assert_eq!(tool(&project), "#!/bin/sh\n");
+        // Removed: its record and what was required of it.
         remove_extension(&project, "pe2.events", &mut history, "remove".into()).unwrap();
         let project = project::Project::load(&root).unwrap();
         assert!(project.held_extensions().is_empty() && project.requires.is_empty());
         history.undo(&index, None, false).unwrap();
         history.undo(&index, None, false).unwrap();
-        assert!(!held.exists(), "undone, it was never added");
+        assert!(!record.exists(), "undone, it was never added");
         // Added to a layer named, then updated where it is, though a higher layer is written.
         add_extension(&project, &source, Some("game"), &mut history, "add".into()).unwrap();
-        let in_game = root.join(".layers/game/extensions/pe2.events.extension");
-        assert!(in_game.is_dir());
+        let in_game = root.join(".layers/game/.records/extensions/pe2.events.toml");
+        assert!(in_game.is_file());
         let project = project::Project::load(&root).unwrap();
+        std::fs::write(source.join("linux-x86_64/tool"), "#!/bin/sh\necho newer\n").unwrap();
         add_extension(&project, &source, None, &mut history, "update".into()).unwrap();
-        assert_eq!(project::Project::load(&root).unwrap().held_extensions(), [in_game]);
+        assert!(!record.exists());
+        assert_eq!(tool(&project), "#!/bin/sh\necho newer\n");
         assert!(add_extension(&project, &source, Some("nowhere"), &mut history, "add".into()).is_err());
+        // Held by a layer the project does not write: removed, the layer written above leaves it off.
+        let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
+        std::fs::write(
+            root.join("project.toml"),
+            text.replacen("name = \"game\"", "name = \"game\"\nread_only = true", 1),
+        )
+        .unwrap();
+        let project = project::Project::load(&root).unwrap();
+        remove_extension(&project, "pe2.events", &mut history, "remove".into()).unwrap();
+        assert!(in_game.is_file() && record.is_file() && project.held_extensions().is_empty());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }

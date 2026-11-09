@@ -607,45 +607,80 @@ fn holds_settings(op: &str) -> bool {
 /// A node's declaration with the settings a generated layer holds for it (its `settings.toml`, made by extraction) beneath
 /// its own: each it does not set put where a setting of its belongs - the layer holding it, else its home layer (the
 /// first of its own operations before anything is taken from it, else its stored file) - so that what is set over it
-/// there wins, and what the node's operations are set to includes it.
+/// there wins, and what the node's operations are set to includes it. As `toml` holds them (`with_generated_values`).
 #[must_use]
-pub fn with_generated(mut fields: Table, generated: &Table) -> Table {
-    let Some(layers) = fields.get_mut("stack").and_then(Toml::as_array_mut) else {
-        for (key, value) in generated {
-            fields.entry(key.clone()).or_insert_with(|| value.clone());
+pub fn with_generated(fields: &Table, generated: &Table) -> Table {
+    with_generated_values(pe2_value::Table::from(fields), &pe2_value::Table::from(generated)).to_toml()
+}
+
+/// `with_generated`, of the values the editor holds: what it puts in place is shared, not copied.
+#[must_use]
+pub fn with_generated_values(mut fields: pe2_value::Table, generated: &pe2_value::Table) -> pe2_value::Table {
+    use pe2_value::Value as V;
+    let Some(mut layers) = fields.get("stack").and_then(V::as_values).map(<[V]>::to_vec) else {
+        for (key, value) in generated.iter() {
+            if !fields.contains_key(key) {
+                fields.insert(key, value.clone());
+            }
         }
         return fields;
     };
-    let op = |layer: &Toml| layer.get("op").and_then(Toml::as_str).map(str::to_string);
+    let op = |layer: &V| layer.as_table().and_then(|t| t.get("op")).and_then(V::as_str).map(str::to_string);
     let taken = layers.iter().position(|layer| matches!(op(layer).as_deref(), Some(OUTPUT | PREVIEW)));
     let own = layers.iter().take(taken.unwrap_or(usize::MAX)).position(|layer| op(layer).as_deref() != Some(FILE));
     let Some(home) = own.or_else(|| (!layers.is_empty()).then_some(0)) else { return fields };
-    for (key, value) in generated {
-        if layers.iter().any(|layer| layer.get(key).is_some()) {
+    let mut changed = false;
+    for (key, value) in generated.iter() {
+        if layers.iter().any(|layer| layer.as_table().is_some_and(|t| t.contains_key(key))) {
             continue;
         }
         if let Some(layer) = layers[home].as_table_mut() {
-            layer.insert(key.clone(), value.clone());
+            layer.insert(key, value.clone());
+            changed = true;
         }
+    }
+    if changed {
+        fields.insert("stack", V::Array(layers.into()));
     }
     fields
 }
 
 /// A node's declaration with the settings on its layers among its fields: what each operation is set to, as the node's
-/// settings, for whatever reads them by name. Its `stack` stays as it is.
+/// settings, for whatever reads them by name. Its `stack` stays as it is. As `toml` holds them (`with_settings_values`).
 #[must_use]
-pub fn with_settings(mut fields: Table) -> Table {
-    let mut found = Vec::new();
-    for layer in fields.get("stack").and_then(Toml::as_array).into_iter().flatten() {
-        let op = layer.get("op").and_then(Toml::as_str).unwrap_or_default();
-        let held = layer.as_table().filter(|_| holds_settings(op)).into_iter().flatten();
+pub fn with_settings(fields: &Table) -> Table {
+    with_settings_values(pe2_value::Table::from(fields)).to_toml()
+}
+
+/// `with_settings`, of the values the editor holds: a setting is the layer's, shared, not a copy of it.
+#[must_use]
+pub fn with_settings_values(mut fields: pe2_value::Table) -> pe2_value::Table {
+    use pe2_value::Value as V;
+    let wired = |value: &V| {
+        value
+            .as_table()
+            .filter(|t| t.len() == 1)
+            .and_then(|t| t.get("from"))
+            .is_some_and(|from| matches!(from, V::String(_) | V::Array(_)))
+    };
+    let mut found: Vec<(String, V)> = Vec::new();
+    for layer in fields.get("stack").and_then(V::as_values).into_iter().flatten() {
+        let Some(table) = layer.as_table() else { continue };
+        let op = table.get("op").and_then(V::as_str).unwrap_or_default();
+        if !holds_settings(op) {
+            continue;
+        }
         found.extend(
-            held.filter(|(key, value)| !structural(op, key) && wire_of(value).is_none())
-                .map(|(key, value)| (key.clone(), value.clone())),
+            table
+                .iter()
+                .filter(|(key, value)| !structural(op, key) && !wired(value))
+                .map(|(k, v)| (k.to_string(), v.clone())),
         );
     }
     for (key, value) in found {
-        fields.entry(key).or_insert(value);
+        if !fields.contains_key(&key) {
+            fields.insert(key, value);
+        }
     }
     fields
 }
@@ -690,6 +725,23 @@ impl Plan {
             Some(gate) => Expr::Gate(gate, inputs()),
             None => Expr::Event(step.settings.get("event").and_then(Toml::as_str).unwrap_or_default().to_string()),
         }
+    }
+
+    /// A node's plan, of its fields as the editor holds them: its stack, and the tables its layers take a key each of
+    /// (`each`), are what the plan reads of it (`of`).
+    #[must_use]
+    pub fn of_fields(fields: &pe2_value::Table, ops: &Ops, tail: &[Tail]) -> (Plan, Vec<Problem>) {
+        let mut declaration = Table::new();
+        if let Some(stack) = fields.get("stack") {
+            declaration.insert("stack".into(), stack.to_toml());
+            for layer in stack.as_values().into_iter().flatten() {
+                let each = layer.as_table().and_then(|t| t.get("each")).and_then(pe2_value::Value::as_str);
+                if let Some((each, table)) = each.and_then(|each| Some((each, fields.get(each)?))) {
+                    declaration.insert(each.into(), table.to_toml());
+                }
+            }
+        }
+        Plan::of(&declaration, ops, tail)
     }
 
     /// A declaration's stack lowered and checked: the plan, and what is wrong with it. A plan with problems still has
@@ -1371,6 +1423,18 @@ pub struct Import<'a> {
     pub source: &'a str,
     pub op: &'a str,
     pub settings: Table,
+}
+
+/// A node's import, of its fields as the editor holds them (`import_of`): its source file's name and its importer.
+#[must_use]
+pub fn import_of_fields(fields: &pe2_value::Table) -> Option<(String, String)> {
+    use pe2_value::Value as V;
+    let stack = fields.get("stack")?.as_values()?;
+    let top = stack.first()?.as_table()?;
+    let source = top.get("file")?.as_str().filter(|_| top.get("op").and_then(V::as_str) == Some(FILE))?;
+    let below = stack.get(1)?.as_table()?;
+    let op = below.get("op")?.as_str().filter(|op| ![FILE, CONSTANT, OUTPUT, PREVIEW, GRAPH].contains(op))?;
+    Some((source.to_string(), op.to_string()))
 }
 
 /// A declaration's import, where its stack begins with a stored file and an operation taking it.

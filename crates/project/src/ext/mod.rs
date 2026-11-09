@@ -1118,7 +1118,7 @@ impl Extensions {
     /// An asset's plan: its stack, then its type's outputs; and what is wrong with it.
     #[must_use]
     pub fn plan(&self, asset: &index::Asset) -> (graph::Plan, Vec<graph::Problem>) {
-        graph::Plan::of(asset.fields(), &self.operations(), &self.tail(asset))
+        graph::Plan::of_fields(asset.fields(), &self.operations(), &self.tail(asset))
     }
 
     /// The operations a stack's layer may be that take what comes down to it, each by the name it goes by - a service's,
@@ -1639,9 +1639,13 @@ impl Extensions {
             }
             // One for a key of a table lists its members under that key.
             let family = outputs.filter(|o| {
-                o.each
-                    .as_ref()
-                    .is_some_and(|table| asset.settings().get(table).is_some_and(|table| table.get(name).is_some()))
+                o.each.as_ref().is_some_and(|table| {
+                    asset
+                        .settings()
+                        .get(table)
+                        .and_then(pe2_value::Value::as_table)
+                        .is_some_and(|t| t.contains_key(name))
+                })
             });
             let listed = family.filter_map(|o| Some(o.members.as_ref()?(&lent))).flatten();
             let under = |(address, label): (String, String)| {
@@ -1789,7 +1793,7 @@ impl Extensions {
     /// An asset's import: the operation its stack takes its source through.
     #[must_use]
     pub fn import_op(&self, asset: &index::Asset) -> Option<&pe2_ext::OpDef> {
-        self.ops.get(graph::import_of(asset.fields())?.op)
+        self.ops.get(&graph::import_of_fields(asset.fields())?.1)
     }
 
     /// An operation, by its qualified name.
@@ -2040,7 +2044,7 @@ impl Extensions {
     #[must_use]
     pub fn ops_for(&self, asset: &index::Asset) -> Vec<&pe2_ext::OpDef> {
         use pe2_ext::Type;
-        let Some(source) = graph::import_of(asset.fields()).map(|i| i.source) else { return vec![] };
+        let Some((source, _)) = graph::import_of_fields(asset.fields()) else { return vec![] };
         let Some(file) = asset.files.iter().find(|f| f.name == source && f.made_by.is_none()) else { return vec![] };
         let names = type_names(self.recognize(file).into_iter().map(|(t, _)| t));
         let given = Type::Union(names.into_iter().map(Type::Named).collect());
@@ -2431,7 +2435,7 @@ impl Source for index::Asset {
     }
 
     fn fields(&self) -> &toml::Table {
-        self.settings()
+        self.settings_toml()
     }
 
     fn declaration(&self) -> &str {

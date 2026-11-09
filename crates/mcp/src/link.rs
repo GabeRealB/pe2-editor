@@ -1,11 +1,11 @@
 //! The editor's link: a local socket through which a running editor answers the requests made of the project it has
-//! open - a Unix domain socket at `.cache/editor.sock`, a named pipe on Windows. One JSON request a line, one JSON
-//! reply a line. Only the process holding the project lock listens, so a socket left by an editor that crashed is
+//! open - a Unix domain socket at `.cache/editor.sock`, a named pipe on Windows. One CBOR request a frame, one CBOR reply
+//! a frame (`project::wire`). Only the process holding the project lock listens, so a socket left by an editor that crashed is
 //! taken over, never shared.
 
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,22 +38,20 @@ pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Opt
 
 fn forward_to_holder(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
     let stream = Stream::connect(name(root).ok()?).ok()?;
-    let line = serde_json::to_string(request).ok()?;
+    let request = request.clone();
     // Read on a thread of its own, so an editor that does not answer is given up on.
     let (send, receive) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut stream = BufReader::new(stream);
-        let result = (|| -> std::io::Result<String> {
-            stream.get_mut().write_all(format!("{line}\n").as_bytes())?;
-            let mut reply = String::new();
-            stream.read_line(&mut reply)?;
-            Ok(reply)
+        let result = (|| -> std::io::Result<Option<Reply>> {
+            project::wire::send(stream.get_mut(), &request)?;
+            project::wire::receive(&mut stream)
         })();
         let _ = send.send(result);
     });
     Some(match receive.recv_timeout(patience) {
-        Ok(Ok(reply)) => serde_json::from_str(&reply)
-            .unwrap_or_else(|e| Reply::Error(format!("the editor's reply could not be read: {e}"))),
+        Ok(Ok(Some(reply))) => reply,
+        Ok(Ok(None)) => Reply::Error("the editor closed its link without answering".into()),
         Ok(Err(e)) => Reply::Error(format!("the editor's link failed: {e}")),
         Err(_) => Reply::Error("the editor did not answer in time (is it minimized?)".into()),
     })
@@ -111,16 +109,14 @@ impl Drop for Listener {
 
 fn serve(stream: Stream, answer: &dyn Fn(Request) -> Reply) {
     let mut stream = BufReader::new(stream);
-    let mut line = String::new();
-    while matches!(stream.read_line(&mut line), Ok(n) if n > 0) {
-        let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => answer(request),
-            Err(e) => Reply::Error(format!("not a request: {e}")),
+    loop {
+        let reply = match project::wire::receive::<Request>(&mut stream) {
+            Ok(Some(request)) => answer(request),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Reply::Error(format!("not a request: {e}")),
+            Ok(None) | Err(_) => break,
         };
-        let Ok(text) = serde_json::to_string(&reply) else { break };
-        if stream.get_mut().write_all(format!("{text}\n").as_bytes()).is_err() {
+        if project::wire::send(stream.get_mut(), &reply).is_err() {
             break;
         }
-        line.clear();
     }
 }

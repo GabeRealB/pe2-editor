@@ -15,6 +15,26 @@
 //!
 //! It is the only copy of what it names: the store is not cache. What no manifest of any layer, nor the history, names
 //! any more is swept (`unreferenced`).
+//!
+//! The store keeps files three ways, by what they are:
+//!
+//! - **chunked** (`files/<aa>/<sha1>`): a manifest of chunks, for content that is edited, or shared in parts with other
+//!   versions - what a record keeps of a binary file (`put_file`);
+//! - **whole** (`objects/<aa>/<sha1>`): the bytes themselves, written once and read in one go, for what is only ever
+//!   taken or replaced whole and shares nothing in part with its other versions (`put_object`);
+//! - **trees** (`trees/<aa>/<sha1>`): a listing of named whole objects, one hash for a set of files kept as one - an
+//!   extension (`put_tree`):
+//!
+//! ```text
+//! pe2 tree 1
+//! <sha1> <size> <mode> <name>
+//! ...
+//! ```
+//!
+//! where the mode says whether the file is run (`755`, a program it ships) or not (`644`).
+//!
+//! Each says its own format (a manifest's and a tree's header; an object is its bytes), so none needs a mark of the
+//! store's.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -31,6 +51,10 @@ pub const STORE: &str = ".store";
 /// Where the store keeps whole files by their SHA-1 - a manifest of chunks each, whatever their size: the versions an
 /// override was made from (`changeset::Base`), what a layer holds of its own.
 const FILES: &str = "files";
+/// Where it keeps whole objects, and trees of them.
+const OBJECTS: &str = "objects";
+const TREES: &str = "trees";
+const TREE_HEADER: &str = "pe2 tree 1";
 const HEADER: &str = "pe2 chunks 1";
 const MIN: usize = 16 << 10;
 const AVG: usize = 64 << 10;
@@ -122,6 +146,67 @@ impl Manifest {
     }
 }
 
+/// A file of a tree: a whole object, by its SHA-1 and length, and whether it is run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeFile {
+    pub sha1: String,
+    pub size: u64,
+    pub executable: bool,
+}
+
+/// Files kept as one, by name (`/` between folders).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Tree {
+    pub files: std::collections::BTreeMap<String, TreeFile>,
+}
+
+impl Tree {
+    /// A tree's text read.
+    ///
+    /// # Errors
+    /// It is not a tree.
+    pub fn parse(text: &str) -> io::Result<Tree> {
+        let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("a tree: {why}"));
+        let mut lines = text.lines();
+        if lines.next() != Some(TREE_HEADER) {
+            return Err(bad("no header, or one this program does not know"));
+        }
+        let mut files = std::collections::BTreeMap::new();
+        for line in lines.filter(|l| !l.is_empty()) {
+            let mut parts = line.splitn(4, ' ');
+            let (Some(sha1), Some(size), Some(mode), Some(name)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(bad("a file"));
+            };
+            let executable = match mode {
+                "755" => true,
+                "644" => false,
+                _ => return Err(bad("a file's mode")),
+            };
+            let size = size.parse().map_err(|_| bad("a file's length"))?;
+            files.insert(name.to_string(), TreeFile { sha1: sha1.to_string(), size, executable });
+        }
+        Ok(Tree { files })
+    }
+
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = format!("{TREE_HEADER}\n");
+        for (name, file) in &self.files {
+            let mode = if file.executable { "755" } else { "644" };
+            let _ = writeln!(out, "{} {} {mode} {name}", file.sha1, file.size);
+        }
+        out
+    }
+
+    /// Its hash: its text's SHA-1.
+    #[must_use]
+    pub fn sha1(&self) -> String {
+        crate::extract::sha1_hex(self.render().as_bytes())
+    }
+}
+
 /// A project's chunk store.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -178,6 +263,129 @@ impl Store {
         Manifest::parse(&std::fs::read_to_string(self.file_path(sha1))?)
     }
 
+    /// Where a whole object is: a file only ever read, never written once kept.
+    #[must_use]
+    pub fn object_path(&self, sha1: &str) -> PathBuf {
+        self.dir.join(OBJECTS).join(&sha1[..2.min(sha1.len())]).join(sha1)
+    }
+
+    fn tree_path(&self, sha1: &str) -> PathBuf {
+        self.dir.join(TREES).join(&sha1[..2.min(sha1.len())]).join(sha1)
+    }
+
+    /// Write `bytes` at `path` once: where it is there already, it is touched instead (as new to a sweep as one written
+    /// now), as what is named by its hash holds the same.
+    fn write_once(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        if path.exists() {
+            // A read-only object is touched through a handle opened to read: its owner may set its times.
+            let opened = std::fs::File::options().write(true).open(path).or_else(|_| std::fs::File::open(path));
+            let _ = opened.and_then(|f| f.set_modified(SystemTime::now()));
+            return Ok(());
+        }
+        std::fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(&temporary, path)
+    }
+
+    /// Keep bytes as one whole object, by their SHA-1 (given).
+    ///
+    /// # Errors
+    /// It cannot be written.
+    pub fn put_object(&self, bytes: &[u8]) -> io::Result<String> {
+        let sha1 = crate::extract::sha1_hex(bytes);
+        let path = self.object_path(&sha1);
+        self.write_once(&path, bytes)?;
+        // Read-only: an object is what its hash says, and what reads it in place must not change it.
+        let mut permissions = std::fs::metadata(&path)?.permissions();
+        if !permissions.readonly() {
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&path, permissions)?;
+        }
+        Ok(sha1)
+    }
+
+    /// A whole object, by its SHA-1.
+    ///
+    /// # Errors
+    /// It is not kept.
+    pub fn get_object(&self, sha1: &str) -> io::Result<Vec<u8>> {
+        std::fs::read(self.object_path(sha1))
+    }
+
+    /// Keep a tree (its objects kept already), by the SHA-1 of its text (given).
+    ///
+    /// # Errors
+    /// It cannot be written.
+    pub fn put_tree(&self, tree: &Tree) -> io::Result<String> {
+        let text = tree.render();
+        let sha1 = crate::extract::sha1_hex(text.as_bytes());
+        self.write_once(&self.tree_path(&sha1), text.as_bytes())?;
+        Ok(sha1)
+    }
+
+    /// A tree, by its SHA-1.
+    ///
+    /// # Errors
+    /// It is not kept, or is no tree.
+    pub fn get_tree(&self, sha1: &str) -> io::Result<Tree> {
+        Tree::parse(&std::fs::read_to_string(self.tree_path(sha1))?)
+    }
+
+    /// Keep a folder's files as a tree of whole objects, by the tree's SHA-1 (given), with the tree.
+    ///
+    /// # Errors
+    /// A file cannot be read, or kept.
+    pub fn put_folder(&self, folder: &Path) -> io::Result<(String, Tree)> {
+        fn walk(dir: &Path, at: &str, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = if at.is_empty() { name } else { format!("{at}/{name}") };
+                if entry.file_type()?.is_dir() {
+                    walk(&entry.path(), &path, out)?;
+                } else {
+                    out.push((path, entry.path()));
+                }
+            }
+            Ok(())
+        }
+        let mut found = Vec::new();
+        walk(folder, "", &mut found)?;
+        let mut tree = Tree::default();
+        for (name, path) in found {
+            let bytes = std::fs::read(&path)?;
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&path)?.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+            let sha1 = self.put_object(&bytes)?;
+            // A program is run where it is kept: its object says so, whatever else holds the same bytes.
+            #[cfg(unix)]
+            if executable {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(self.object_path(&sha1), std::fs::Permissions::from_mode(0o555))?;
+            }
+            tree.files.insert(name, TreeFile { sha1, size: bytes.len() as u64, executable });
+        }
+        Ok((self.put_tree(&tree)?, tree))
+    }
+
+    /// Every whole object and tree kept, by SHA-1, with where.
+    fn kept_in(&self, kind: &str) -> Vec<(String, PathBuf)> {
+        let shards = std::fs::read_dir(self.dir.join(kind)).into_iter().flatten().flatten();
+        shards
+            .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
+            .filter_map(|file| {
+                let name = file.file_name().to_str().filter(|n| Path::new(n).extension().is_none())?.to_string();
+                Some((name, file.path()))
+            })
+            .collect()
+    }
+
     /// Whether a file is kept, by its SHA-1.
     #[must_use]
     pub fn has_file(&self, sha1: &str) -> bool {
@@ -186,14 +394,7 @@ impl Store {
 
     /// Every file kept whole, by SHA-1, with its manifest's text.
     fn files(&self) -> Vec<(String, PathBuf)> {
-        let shards = std::fs::read_dir(self.dir.join(FILES)).into_iter().flatten().flatten();
-        shards
-            .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
-            .filter_map(|file| {
-                let name = file.file_name().to_str().filter(|n| Path::new(n).extension().is_none())?.to_string();
-                Some((name, file.path()))
-            })
-            .collect()
+        self.kept_in(FILES)
     }
 
     /// The store of the project whose layers hold a path: none for a path in no project's `.layers`.
@@ -243,7 +444,7 @@ impl Store {
     /// Every chunk it holds, by hash.
     #[must_use]
     pub fn hashes(&self) -> BTreeSet<String> {
-        // Chunks are sharded by two characters; the files kept whole are elsewhere.
+        // Chunks are sharded by two characters; files, objects and trees are elsewhere.
         let shards = std::fs::read_dir(&self.dir).into_iter().flatten().flatten().filter(|s| s.file_name().len() == 2);
         shards
             .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
@@ -416,8 +617,26 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
         let modified = std::fs::metadata(path).and_then(|m| m.modified());
         settled.is_zero() || modified.ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= settled)
     };
-    // A file kept whole that nothing names goes; one named keeps its chunks.
+    // A tree named keeps its objects; one nothing names goes, and so does an object neither a tree nor a text names.
     let (mut gone_files, mut freed) = (0, 0);
+    for (sha1, path) in store.kept_in(TREES) {
+        if kept.contains(&sha1) || !old(&path) {
+            let tree = std::fs::read_to_string(&path).ok().and_then(|t| Tree::parse(&t).ok()).unwrap_or_default();
+            kept.extend(tree.files.into_values().map(|file| file.sha1));
+        } else {
+            freed += std::fs::metadata(&path).map_or(0, |m| m.len());
+            gone_files += 1;
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    for (sha1, path) in store.kept_in(OBJECTS) {
+        if !kept.contains(&sha1) && old(&path) {
+            freed += std::fs::metadata(&path).map_or(0, |m| m.len());
+            gone_files += 1;
+            remove_object(&path);
+        }
+    }
+    // A file kept whole that nothing names goes; one named keeps its chunks.
     for (sha1, path) in store.files() {
         let text = std::fs::read(&path).unwrap_or_default();
         if kept.contains(&sha1) || !old(&path) {
@@ -432,6 +651,17 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     gone.retain(|hash| old(&store.path(hash)));
     freed += store.remove(&gone);
     Ok((gone.len() + gone_files, freed))
+}
+
+/// Remove a whole object, read-only as it is: Windows refuses to remove a read-only file.
+fn remove_object(path: &Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut permissions = meta.permissions();
+        #[expect(clippy::permissions_set_readonly_false, reason = "it is removed at once")]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// What may be a file's SHA-1 in a text: every run of forty hexadecimal digits.
@@ -481,6 +711,33 @@ mod tests {
         assert!(new <= 3, "{new} chunks stored for a ten-byte edit");
         assert_eq!(again.read_range(&store, 0, edited.len()).expect("read"), edited);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_tree_keeps_its_objects_from_a_sweep_while_something_names_it() {
+        let root = std::env::temp_dir().join(format!("pe2-chunks-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        crate::create(&root).unwrap();
+        let project = crate::Project::load(&root).unwrap();
+        let store = Store::at(&root);
+        let folder = root.join("x.extension");
+        std::fs::create_dir_all(folder.join("docs")).unwrap();
+        std::fs::write(folder.join("extension.wasm"), content(300_000, 4)).unwrap();
+        std::fs::write(folder.join("docs/a b.md"), "# A\n").unwrap();
+        let (sha1, tree) = store.put_folder(&folder).unwrap();
+        assert_eq!(super::Tree::parse(&tree.render()).unwrap(), tree);
+        assert_eq!(store.get_tree(&sha1).unwrap(), tree);
+        assert_eq!(store.get_object(&tree.files["docs/a b.md"].sha1).unwrap(), b"# A\n");
+        // Kept again: the same hash, nothing new.
+        assert_eq!(store.put_folder(&folder).unwrap().0, sha1);
+        // Named in a layer's text, the tree and its objects stay; named by nothing, they go.
+        let named = root.join(crate::LAYERS).join("project").join("named.toml");
+        std::fs::write(&named, format!("tree = \"{sha1}\"\n")).unwrap();
+        assert_eq!(super::sweep(&project).unwrap().0, 0);
+        std::fs::remove_file(&named).unwrap();
+        assert_eq!(super::sweep(&project).unwrap().0, 3);
+        assert!(store.get_tree(&sha1).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

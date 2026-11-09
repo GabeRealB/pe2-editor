@@ -1066,6 +1066,78 @@ mod tests {
     }
 
     #[test]
+    fn what_is_served_is_the_whole_stack_whatever_the_view_hides() {
+        use crate::host::Shown;
+        let root = project("served");
+        let mut o = open(&root);
+        let paths = super::create(
+            &o.project,
+            &o.index,
+            "top",
+            "uid://made1",
+            "h/made",
+            ("stack = [{ op = \"t.file\" }]\n", &[("extra.txt", b"hi".as_slice())]),
+            &mut o.history,
+        )
+        .unwrap();
+        o.refresh(&paths);
+        let served = o.index.served();
+        assert_eq!(served.get("g/a"), Some(&Shown::Node));
+        assert_eq!(served.get("h/made"), Some(&Shown::Node));
+        assert!(matches!(served.get("n"), Some(Shown::File { of_files: false, size: 5, .. })));
+        assert!(matches!(served.get("h/made/extra.txt"), Some(Shown::File { of_files: true, size: 2, .. })));
+        // The top layer hidden from the view: gone from its entries, served still.
+        o.index.set_hidden(&std::collections::BTreeSet::from(["top".to_string()]));
+        assert!(!o.index.entries.contains_key("h/made.node"));
+        assert_eq!(o.index.served(), served);
+    }
+
+    #[test]
+    fn an_edit_to_a_records_layer_refreshes_what_it_changed_alone() {
+        let root = project("records-refresh");
+        crate::records::mark(&root.join(".layers/top"), &crate::records::Settings::default()).unwrap();
+        let mut o = open(&root);
+        let declaration = "stack = [{ op = \"t.file\" }]\n";
+        for (uid, path) in [("uid://one1", "h/one"), ("uid://two2", "h/two")] {
+            let paths = super::create(
+                &o.project,
+                &o.index,
+                "top",
+                uid,
+                path,
+                (declaration, &[("extra.txt", b"hi".as_slice())]),
+                &mut o.history,
+            )
+            .unwrap();
+            o.refresh(&paths);
+        }
+        // One file of one: that asset alone, the stack standing.
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            "top",
+            "uid://one1",
+            "extra.txt",
+            b"again",
+            "Edit".into(),
+            None,
+            &mut o.history,
+        )
+        .unwrap();
+        let refreshed = o.index.refresh(&o.project, &paths).unwrap();
+        assert_eq!(refreshed.assets.iter().map(String::as_str).collect::<Vec<_>>(), ["h/one"]);
+        assert!(!refreshed.restacked, "a content changed applies the stack again");
+        let extra = o.index.assets["h/one"].files.iter().find(|f| f.name == "extra.txt").unwrap().path.clone();
+        assert_eq!(crate::content::read(&extra).unwrap(), b"again");
+        // Renamed: the stack applied again, both places taken in.
+        let paths = super::rename(&o.project, &o.index, "top", "uid://one1", "h/won", &mut o.history).unwrap();
+        let refreshed = o.index.refresh(&o.project, &paths).unwrap();
+        assert!(refreshed.restacked);
+        assert!(o.index.assets.contains_key("h/won") && !o.index.assets.contains_key("h/one"));
+        assert!(o.index.assets.contains_key("h/two"));
+    }
+
+    #[test]
     fn a_records_layer_is_edited_as_a_tree_is() {
         let root = project("records");
         crate::records::mark(&root.join(".layers/top"), &crate::records::Settings::default()).unwrap();
@@ -1227,7 +1299,7 @@ mod tests {
         .unwrap();
         o.refresh(&paths);
         assert_eq!(o.index.assets["g/a"].layers, ["base", "top"]);
-        assert_eq!(o.index.assets["g/a"].fields().get("note").and_then(toml::Value::as_str), Some("x"));
+        assert_eq!(o.index.assets["g/a"].fields().get("note").and_then(pe2_value::Value::as_str), Some("x"));
         // A continued edit joins the step; undone, the copy goes with it.
         let text = b"stack = [{ op = \"t.image\" }]\nnote = \"xy\"\n";
         let paths = super::write_file(

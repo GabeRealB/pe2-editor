@@ -150,7 +150,7 @@ impl Sourcing<'_> {
         };
         let lent = Lent { path, uid: Some(uid), fields: fields.clone(), declaration: &toml, files: BTreeMap::new() };
         let files = native.iter().map(|(name, bytes)| pe2_ext::File::new(name, bytes.clone())).collect();
-        let settings = crate::graph::with_settings(fields.clone());
+        let settings = crate::graph::with_settings(&fields);
         let native_form =
             crate::graph::Value::Typed(pe2_ext::Typed { ty: ty.clone(), files, settings, ..pe2_ext::Typed::default() });
         let written = self.engine.run(&inverse, vec![vec![native_form]], &toml::Table::new(), &lent);
@@ -175,7 +175,7 @@ impl Sourcing<'_> {
         let lent = Lent {
             path,
             uid: Some(uid),
-            fields: crate::graph::with_settings(placed.parse()?),
+            fields: crate::graph::with_settings(&placed.parse()?),
             declaration: &written,
             files: written_files.iter().cloned().collect(),
         };
@@ -202,13 +202,14 @@ impl Sourcing<'_> {
                 native_map.keys().chain(made_map.keys()).filter(|n| native_map.get(*n) != made_map.get(*n)).collect();
             bail!("{path}: its {source} does not import back into the disc's files ({differ:?} differ)");
         }
-        let resolved = crate::imports::resolve(&lent.fields, &made.settings, &def.derives);
+        let (declared, settings) = (pe2_value::Table::from(&lent.fields), pe2_value::Table::from(&made.settings));
+        let resolved = crate::imports::resolve(&declared, &settings, &def.derives);
         let settings_of = |fields: &toml::Table| {
             let mut settings = fields.clone();
             settings.remove("stack");
             settings
         };
-        if settings_of(&resolved.settings) != settings_of(&fields) || !resolved.orphans.is_empty() {
+        if settings_of(&resolved.settings.to_toml()) != settings_of(&fields) || !resolved.orphans.is_empty() {
             bail!(
                 "{path}: the settings its {source} gives are not the declaration's (orphaned: {:?})",
                 resolved.orphans
@@ -245,7 +246,7 @@ impl Written {
         let declaration = crate::content::read_to_string(&dirs[0].join("node.toml"))
             .with_context(|| format!("{path}: its node.toml"))?;
         let fields =
-            crate::graph::with_settings(declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
+            crate::graph::with_settings(&declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
         Ok(Written {
             path: path.to_string(),
             uid: uid.to_string(),

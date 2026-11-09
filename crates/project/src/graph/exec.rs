@@ -83,7 +83,8 @@ impl Node for crate::index::Asset {
     }
 
     fn fields(&self) -> &Table {
-        crate::index::Asset::fields(self)
+        // Asked of the operations that read a node's fields by name: made for those nodes alone.
+        crate::index::Asset::fields_toml(self)
     }
 
     fn file_sha1(&self, name: &str) -> Option<String> {
@@ -263,10 +264,23 @@ impl<'a> Reach<'a> {
         }
     }
 
-    /// The hash another node's output has now, by how a trace names it (`<node>#<address>`).
+    /// The hash another node's output has now, by how a trace names it (`<node>#<address>`): its trace's, where that
+    /// still holds - its value neither read nor made, though it is not kept (`Engine::traced`) - else made now.
     fn hash(&self, read: &str) -> Option<String> {
         let (node, address) = read.rsplit_once('#')?;
-        self.output(&toml::Value::String(node.to_string()), address).ok().map(|(_, given, _)| given.hash)
+        let (found, plan) = self.world.node(&toml::Value::String(node.to_string()))?;
+        let (output, parameter) = plan.output(address)?;
+        if let Some(trace) = self.engine.traced(Some(*self), &plan, found, output, parameter.as_deref()) {
+            return Some(trace.value);
+        }
+        let read = format!("{}#{address}", id(found));
+        if MAKING.with(|m| m.borrow().contains(&read)) {
+            return None;
+        }
+        MAKING.with(|m| m.borrow_mut().push(read));
+        let given = self.engine.output_in(Some(*self), &plan, found, address, None, false);
+        MAKING.with(|m| m.borrow_mut().pop());
+        given.ok().map(|given| given.hash)
     }
 }
 
@@ -1427,6 +1441,27 @@ impl Engine {
             .then_some(trace)
     }
 
+    /// An output's trace where it holds - made by this node, of the config, from what is still as it read it - whether
+    /// or not its value is kept: what its hash is, for what read it.
+    #[must_use]
+    pub fn traced(
+        &self,
+        reach: Option<Reach<'_>>,
+        plan: &Plan,
+        node: &dyn Node,
+        output: usize,
+        parameter: Option<&str>,
+    ) -> Option<Trace> {
+        let store = self.store.as_ref()?;
+        let trace = store.trace(&self.key(plan, node, output, parameter))?;
+        let same_config = trace
+            .reads
+            .config
+            .as_ref()
+            .is_none_or(|read| self.config.as_ref().is_some_and(|config| config.name == *read));
+        (trace.node == id(node) && same_config && trace.reads.hold(node, reach)).then_some(trace)
+    }
+
     /// An output by its address (`native`, `picture/night`): found kept where its trace holds - its value then read only
     /// where `read` asks - else made now, from what its plan's other kept outputs hold, and kept as it says.
     ///
@@ -1498,8 +1533,11 @@ impl Engine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key, (value.clone(), hash.clone(), reads.clone()));
         }
-        if retained && let Some(store) = &self.store {
-            store.put(&hash, &value, &|sha1| node.read_content(sha1).ok())?;
+        // What it is kept as, where it is; and what it was made of, kept or not: what read it asks its hash alone.
+        if let Some(store) = &self.store {
+            if retained {
+                store.put(&hash, &value, &|sha1| node.read_content(sha1).ok())?;
+            }
             let trace = Trace {
                 value: hash.clone(),
                 reads: reads.clone(),

@@ -28,6 +28,24 @@ pub mod stack;
 pub mod store;
 pub mod switches;
 pub mod uid;
+pub mod wire;
+
+/// Give the memory freed lately back to the system, where the allocator keeps it: what holds a project for long (the
+/// host, the editor) calls it once a refresh is done. glibc keeps what a thread freed in that thread's arena, and work
+/// spread over every core leaves each with its own: a long-lived process grows by what its refreshes freed, up to its
+/// arenas' count. Capping them would cost the parallel work far more.
+pub fn give_back_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: `malloc_trim` only releases memory glibc's allocator holds unused; it takes no pointer of ours.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -521,21 +539,43 @@ impl Project {
         })
     }
 
-    /// The extensions it holds: the folders in `extensions/` of its layers (`ext::folder`), each id's from the highest
-    /// layer holding it, in name order.
+    /// The extensions it holds: those its layers' records name (`records::EXTENSIONS`), each id's from the highest
+    /// layer holding it or leaving it off, as the folders their files are read at (`records::held_folder`: on no disk,
+    /// read through `content`), in name order. One whose tree is not in the store is said, and left out.
     #[must_use]
     pub fn held_extensions(&self) -> Vec<PathBuf> {
-        let mut held: std::collections::BTreeMap<std::ffi::OsString, PathBuf> = std::collections::BTreeMap::new();
+        let mut held: std::collections::BTreeMap<String, Option<PathBuf>> = std::collections::BTreeMap::new();
         for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            let entries = std::fs::read_dir(layer.path.join(ext::folder::HELD)).into_iter().flatten().flatten();
-            for entry in entries {
-                let path = entry.path();
-                if path.is_dir() && ext::folder::id_of(&path).is_some() {
-                    held.entry(entry.file_name()).or_insert(path);
+            if layer.path.join(ext::folder::HELD).is_dir() {
+                eprintln!(
+                    "{} holds extensions as folders, as layers held them before records: \
+                     `pe2-cli project store convert --layer {}` holds them as records",
+                    layer.name, layer.name
+                );
+            }
+            let records = match records::extensions_of(&layer.path) {
+                Ok(records) => records,
+                Err(e) => {
+                    eprintln!("the extensions {} holds: {e:#}", layer.name);
+                    continue;
                 }
+            };
+            for (id, tree) in records {
+                if held.contains_key(&id) {
+                    continue;
+                }
+                let folder = tree.and_then(|tree| {
+                    let folder = records::held_folder(&layer.path, &id);
+                    if records::held(&folder).is_none() {
+                        eprintln!("{}: {id}: its tree {tree} is not in the store", layer.name);
+                        return None;
+                    }
+                    Some(folder)
+                });
+                held.insert(id, folder);
             }
         }
-        held.into_values().collect()
+        held.into_values().flatten().collect()
     }
 
     /// The layer an extension added to it goes in: its highest that is written.

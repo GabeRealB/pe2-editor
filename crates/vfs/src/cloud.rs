@@ -299,6 +299,8 @@ struct Worker {
 impl Worker {
     fn run(&self, stop: &AtomicBool) {
         let mut last = self.served.tree();
+        // What was left of an earlier serving, brought in step: the tree may have changed while nothing served it.
+        Self::sync(&last, &self.root, "");
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(250));
             self.settle();
@@ -394,7 +396,8 @@ impl Worker {
 
     /// Bring what is on disk under a folder in step with the tree: a file in sync whose node changed emptied, to be
     /// read again; one no longer in the tree removed; a folder recursed into, and given placeholders of the nodes new
-    /// in it where it was filled. What changed here, and is not applied yet, is left as it is.
+    /// in it where Windows filled it already (one it has not is filled when read, as the tree is then). What changed
+    /// here, and is not applied yet, is left as it is.
     fn sync(tree: &Tree, dir: &Path, at: &str) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let mut here: Vec<String> = Vec::new();
@@ -423,9 +426,11 @@ impl Worker {
                 }
             }
         }
-        // A folder filled shows what is new in it.
+        // A folder filled shows what is new in it - filled empty too: a project's top, served before it held anything.
+        let state = Placeholder::open(dir).ok().and_then(|p| p.state().ok().flatten());
+        let filled = state.map_or(!here.is_empty(), |state| !state.partial());
         if let Some((_, Node { what: What::Folder(children), .. })) = tree.at(at)
-            && !here.is_empty()
+            && filled
         {
             for (name, ino) in children.iter().filter(|(name, _)| !here.contains(name)) {
                 let Some(node) = tree.node(*ino) else { continue };

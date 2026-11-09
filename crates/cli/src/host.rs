@@ -7,7 +7,7 @@
 //! write to whoever holds the project now (an editor answers on its link); it takes the project back once let go.
 
 use anyhow::{Context, Result, bail};
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -34,10 +34,37 @@ struct Held {
 }
 
 struct State {
-    index: Index,
+    /// Its index, while it holds the project; none while another does, which sends what is served (`listing`).
+    index: Option<Index>,
+    /// What it serves, as the holder last listed it (or as its own index did, when it let go).
+    listing: project::host::Listing,
+    /// What answering reads takes, made at the first and kept while it holds the project and nothing changes.
+    reading: Option<Reading>,
     held: Option<Held>,
     /// Who it lent the project to, while they have it.
     lent_to: Option<String>,
+    /// The files its own edits wrote, as they were then: reported again as they are - by its watch, by the program that
+    /// asked for the edit - they are taken in already.
+    written: std::collections::HashMap<PathBuf, Option<Stamp>>,
+}
+
+/// What answering an agent's read takes (`mcp::answer`): the extensions, the imports attached, the store kept; and when
+/// it last answered one.
+struct Reading {
+    extensions: std::sync::Arc<project::ext::Extensions>,
+    store: project::graph::store::Store,
+    last: Instant,
+}
+
+/// How long what answering reads takes is kept without a read: it is most of what a host holding the project holds.
+const READING_KEPT: Duration = Duration::from_mins(2);
+
+/// What tells a file's version from another: its time and length; none where it is gone.
+type Stamp = (std::time::SystemTime, u64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 struct Host {
@@ -71,30 +98,46 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     if one.try_lock().is_err() {
         bail!("{}: a host serves it already", project::host::shown(&p.root));
     }
+    let served = vfs::Served::default();
     let (index, held) = match Lock::try_take(&p.root, WHO) {
         Ok(lock) => {
             let (index, history) = hold(&p, &lock)?;
-            (index, Some(Held { link: None, history, lock }))
+            served.update(&index);
+            (Some(index), Some(Held { link: None, history, lock }))
         }
         Err(LockError::Held(owner)) => {
-            println!("{owner} holds the project: serving what its layers hold, and taking it once let go");
-            (Index::without_store(&p)?, None)
+            // Its holder sends what is served; what is read of it, its layers give - records read here.
+            println!("{owner} holds the project: serving what it lists, and taking it once let go");
+            if let Err(e) = project::records::Set::open(&p) {
+                eprintln!("its records: {e:#}");
+            }
+            (None, None)
         }
         Err(e) => return Err(e.into()),
     };
     let inherited = held.as_ref().is_some_and(|h| h.lock.inherited());
+    let state = State {
+        index,
+        listing: project::host::Listing::new(),
+        reading: None,
+        held,
+        lent_to: None,
+        written: std::collections::HashMap::new(),
+    };
     let host = Arc::new(Host {
-        served: vfs::Served::of(&index),
+        served,
         project: p.clone(),
         at: Mutex::new(String::new()),
         note: Mutex::new(None),
-        state: Mutex::new(State { index, held, lent_to: None }),
+        state: Mutex::new(state),
         leases: AtomicUsize::new(0),
         quiet_since: Mutex::new(Instant::now()),
         stopping: AtomicBool::new(false),
         inherited,
         kept: AtomicBool::new(false),
     });
+    // What reading the project freed, given back: it serves on for long.
+    project::give_back_memory();
     host.listen_for_edits();
     let _watching = watch_layers(&p, &host)?;
     let stopping = Arc::downgrade(&host);
@@ -220,12 +263,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Host {
-    /// Answer edits sent on the editor's link while it holds the project; the rest is declined, for whoever asked to
-    /// take the project for it (borrowed from here).
+    /// Answer what is asked on the holder's link while it holds the project - edits, and reads as an editor would; what
+    /// needs a window is declined.
     fn listen_for_edits(self: &Arc<Self>) {
         let me: Weak<Host> = Arc::downgrade(self);
         let answer = move |request: mcp::Request| match (request, me.upgrade()) {
             (mcp::Request::Edit { op, layer }, Some(host)) => host.edit(&op, layer.as_deref()),
+            (request, Some(host)) if !request.uses_window() => host.read(&request),
             _ => mcp::Reply::Declined,
         };
         let mut state = lock(&self.state);
@@ -237,21 +281,69 @@ impl Host {
         }
     }
 
+    /// Answer a read while holding the project, from its index: the extensions loaded and the imports attached at the
+    /// first, kept until something changes.
+    fn read(&self, request: &mcp::Request) -> mcp::Reply {
+        let mut state = lock(&self.state);
+        let State { index, held, reading, .. } = &mut *state;
+        let (Some(index), Some(held)) = (index.as_mut(), held.as_ref()) else { return mcp::Reply::Declined };
+        if reading.is_none() {
+            let made = (|| {
+                let cache = Cache::open(&self.project, &held.lock)?;
+                let extensions = extensions::for_project(&self.project);
+                let _ = project::imports::Imports::open(&cache)?.attach(index, &extensions);
+                let store = project::graph::store::Store::open(&cache)?;
+                extensions.keep_in(store.clone());
+                anyhow::Ok(Reading { extensions, store, last: Instant::now() })
+            })();
+            match made {
+                Ok(made) => *reading = Some(made),
+                Err(e) => return mcp::Reply::Error(format!("the project cannot be read: {e:#}")),
+            }
+        }
+        let Some(reading) = reading.as_mut() else { return mcp::Reply::Declined };
+        reading.last = Instant::now();
+        let view = &mut mcp::View { project: &self.project, index, extensions: &reading.extensions, editor: None };
+        let reply = mcp::answer(view, request);
+        // Between requests, nothing draws frames: the extensions' readings give their memory back.
+        reading.extensions.release();
+        let _ = project::imports::sweep_if_due(&reading.store, index);
+        reply
+    }
+
     /// Make an edit while holding the project: a step of its history, taken in at once.
     fn edit(&self, op: &vfs::ops::Op, layer: Option<&str>) -> mcp::Reply {
         let mut state = lock(&self.state);
-        let State { index, held, .. } = &mut *state;
-        let Some(held) = held else { return mcp::Reply::failed("the host has lent the project".into()) };
+        let State { index, held, written, reading, .. } = &mut *state;
+        let (Some(index), Some(held)) = (index.as_mut(), held) else {
+            return mcp::Reply::failed("the host does not hold the project".into());
+        };
+        // What reads were answered from changes: made again at the next.
+        *reading = None;
         let made = (|| {
             let layer = match layer {
                 Some(layer) => layer.to_string(),
                 None => vfs::write::writable_layer(index).context("no layer of the project can be written")?,
             };
-            let (label, touched) = vfs::ops::apply(op, &self.project, index, &layer, &mut held.history)?;
+            let (label, touched) = {
+                let _span = tracing::info_span!("host edit apply").entered();
+                vfs::ops::apply(op, &self.project, index, &layer, &mut held.history)?
+            };
             let mut changed = touched.clone();
             changed.extend(held.history.take_written());
-            index.refresh(&self.project, &changed)?;
+            {
+                let _span = tracing::info_span!("host edit refresh").entered();
+                index.refresh(&self.project, &changed)?;
+            }
+            if written.len() > 10_000 {
+                written.clear();
+            }
+            for path in &changed {
+                written.insert(path.clone(), stamp(path));
+            }
+            let _span = tracing::info_span!("host served update").entered();
             self.served.update(index);
+            project::give_back_memory();
             anyhow::Ok((label, touched))
         })();
         match made {
@@ -266,10 +358,58 @@ impl Host {
     /// Take in what changed in the layers: the index refreshed, the tree served made of it.
     fn take_in(&self, changed: &[PathBuf]) {
         let mut state = lock(&self.state);
-        match state.index.refresh(&self.project, changed) {
-            Ok(_) => self.served.update(&state.index),
+        // What its own edits wrote, as they wrote it, it has taken in; written over since, it is forgotten.
+        let written = &mut state.written;
+        let changed: Vec<PathBuf> = changed
+            .iter()
+            .filter(|path| {
+                let taken = written.get(*path).is_some_and(|was| *was == stamp(path));
+                if !taken {
+                    written.remove(*path);
+                }
+                !taken
+            })
+            .cloned()
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let Some(index) = state.index.as_mut() else {
+            // Another holds the project and lists what is served: what is read of it here is kept current.
+            project::pack::reread_changed(&changed);
+            let records = std::ffi::OsStr::new(project::records::DIR);
+            if changed.iter().any(|p| p.components().any(|c| c.as_os_str() == records))
+                && let Err(e) = project::records::Set::open(&self.project)
+            {
+                eprintln!("its records: {e:#}");
+            }
+            return;
+        };
+        match index.refresh(&self.project, &changed) {
+            Ok(_) => {
+                self.served.update(index);
+                state.reading = None;
+                project::give_back_memory();
+            }
             Err(e) => eprintln!("taking in what changed: {e:#}"),
         }
+    }
+
+    /// What the holder lists as served: shown, while another holds the project.
+    fn show(&self, whole: bool, shown: Vec<(String, project::host::Shown)>, gone: &[String]) -> FromHost {
+        let mut state = lock(&self.state);
+        if state.index.is_some() {
+            return FromHost::Error { why: "the host holds the project: it lists what it serves itself".into() };
+        }
+        if whole {
+            state.listing.clear();
+        }
+        for path in gone {
+            state.listing.remove(path);
+        }
+        state.listing.extend(shown);
+        self.served.show(&state.listing);
+        FromHost::Done
     }
 
     /// Let go of the project for `who`: its link, history, record store and lock, in that order.
@@ -282,9 +422,17 @@ impl Host {
         let Held { link, history, lock } = held;
         drop(link);
         history.let_go();
-        state.index.let_go_of_store();
+        // Its index goes: the borrower holds the project's, and lists what is served from it. Until it does, what this
+        // one listed is served on.
+        if let Some(index) = state.index.take() {
+            state.listing = index.served();
+        }
+        state.reading = None;
         drop(lock);
         state.lent_to = Some(who.to_string());
+        drop(state);
+        // What its index held, given back.
+        project::give_back_memory();
         println!("lent to {who}");
         FromHost::Lent
     }
@@ -305,13 +453,19 @@ impl Host {
             let held = (|| {
                 let cache = Cache::open(&self.project, &taken)?;
                 let (history, _) = History::open(&cache)?;
-                state.index.keep_records(&cache)?;
-                anyhow::Ok(history)
+                let index = Index::open(&self.project, &cache)?;
+                anyhow::Ok((history, index))
             })();
             match held {
-                Ok(history) => state.held = Some(Held { link: None, history, lock: taken }),
+                Ok((history, index)) => {
+                    self.served.update(&index);
+                    state.index = Some(index);
+                    state.listing.clear();
+                    state.held = Some(Held { link: None, history, lock: taken });
+                }
                 Err(e) => return eprintln!("taking the project back: {e:#}"),
             }
+            project::give_back_memory();
         }
         println!("holding the project");
         self.listen_for_edits();
@@ -324,6 +478,7 @@ impl Host {
         while !self.stopping.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(200));
             self.take_back();
+            self.forget_reading();
             if self.leases.load(Ordering::Relaxed) > 0 {
                 waiting = false;
                 continue;
@@ -347,6 +502,16 @@ impl Host {
                     }
                 }
             }
+        }
+    }
+
+    /// What answering reads took, let go of once none was asked for a while.
+    fn forget_reading(&self) {
+        let mut state = lock(&self.state);
+        if state.reading.as_ref().is_some_and(|r| r.last.elapsed() > READING_KEPT) {
+            state.reading = None;
+            drop(state);
+            project::give_back_memory();
         }
     }
 
@@ -387,8 +552,8 @@ impl vfs::write::Owner for Host {
         }
         let request = mcp::Request::Edit { op, layer: None };
         match mcp::link::forward(&self.project.root, &request) {
-            Some(mcp::Reply::Edited { label, touched }) => {
-                self.take_in(&touched);
+            // What is served follows as the holder lists it.
+            Some(mcp::Reply::Edited { label, .. }) => {
                 println!("{label} (by whoever holds the project)");
                 Ok(())
             }
@@ -442,9 +607,13 @@ impl Drop for StopListening {
 fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
     let mut stream = BufReader::new(stream);
     let (mut leased, mut borrowing) = (false, false);
-    let mut line = String::new();
-    while matches!(stream.read_line(&mut line), Ok(n) if n > 0) {
-        let answer = match serde_json::from_str::<ToHost>(&line) {
+    loop {
+        let said = match project::wire::receive::<ToHost>(&mut stream) {
+            Ok(Some(said)) => Ok(said),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(e),
+            Ok(None) | Err(_) => break,
+        };
+        let answer = match said {
             Ok(ToHost::Keep { who }) => {
                 println!("kept by {who}");
                 if !std::mem::replace(&mut leased, true) {
@@ -466,6 +635,7 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
                 host.take_in(&paths);
                 FromHost::Done
             }
+            Ok(ToHost::Shown { whole, shown, gone }) => host.show(whole, shown, &gone),
             Ok(ToHost::Status) => host.status(),
             Ok(ToHost::Stop) => {
                 host.stopping.store(true, Ordering::Relaxed);
@@ -473,11 +643,9 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
             }
             Err(e) => FromHost::Error { why: format!("not something said to the host: {e}") },
         };
-        let Ok(text) = serde_json::to_string(&answer) else { break };
-        if stream.get_mut().write_all(format!("{text}\n").as_bytes()).is_err() {
+        if project::wire::send(stream.get_mut(), &answer).is_err() {
             break;
         }
-        line.clear();
     }
     if borrowing {
         println!("given back");

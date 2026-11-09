@@ -5,8 +5,8 @@
 //! serves on from what it reads of the layers, sending what programs write to whoever holds the project, until the
 //! borrower lets go and it takes the project back. The mount never goes away in between.
 //!
-//! What a process says to the host goes over a local socket - `.cache/host.sock`, a named pipe on Windows - one JSON
-//! message a line (`ToHost`, `FromHost`). A connection asking to keep it (`Keep`) or borrowing the project (`Lend`) is
+//! What a process says to the host goes over a local socket - `.cache/host.sock`, a named pipe on Windows - one CBOR
+//! message a frame (`ToHost`, `FromHost`, `wire`). A connection asking to keep it (`Keep`) or borrowing the project (`Lend`) is
 //! a lease while it stays open: the host stops a while after none is left, once no file is open in what it serves -
 //! what only looks at it keeps nothing - unless the machine says to keep it (`[filesystem] keep`).
 
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{Name, Stream};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,35 @@ pub const LOCK: &str = "host.lock";
 /// What a host started by another process writes of itself.
 pub const LOG: &str = "host.log";
 
+/// What is served of the project, by each path in the served folder (`Index::served`): what the holder sends the host,
+/// which serves it while it does not hold the project itself.
+pub type Listing = std::collections::BTreeMap<String, Shown>;
+
+/// A path of what is served.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "is", rename_all = "snake_case")]
+pub enum Shown {
+    Folder,
+    /// A node: a folder of its files, and the entries inside it.
+    Node,
+    /// A file: where a layer holds it, its length and when it changed (seconds and nanoseconds since the epoch);
+    /// whether it is a node's file (the folders its name makes are the node's, not entries).
+    File {
+        disk: std::path::PathBuf,
+        size: u64,
+        modified: (u64, u32),
+        of_files: bool,
+    },
+}
+
+/// What changed from one listing to another: what is new or other now, and what is gone.
+#[must_use]
+pub fn changes(before: &Listing, now: &Listing) -> (Vec<(String, Shown)>, Vec<String>) {
+    let shown = now.iter().filter(|(path, it)| before.get(*path) != Some(*it)).map(|(p, it)| (p.clone(), it.clone()));
+    let gone = before.keys().filter(|path| !now.contains_key(*path)).cloned();
+    (shown.collect(), gone.collect())
+}
+
 /// What a process says to the host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "say", rename_all = "snake_case")]
@@ -37,6 +66,8 @@ pub enum ToHost {
     Lend { who: String },
     /// These files changed - an edit made by whoever holds the project - for what is served to follow at once.
     Changed { paths: Vec<std::path::PathBuf> },
+    /// What is served, from whoever holds the project: the whole listing (`whole`), or what changed since the last.
+    Shown { whole: bool, shown: Vec<(String, Shown)>, gone: Vec<String> },
     /// What it is doing.
     Status,
     /// Stop serving, now.
@@ -146,32 +177,34 @@ impl Connection {
     /// # Errors
     /// The host is gone, or answered with what is not an answer.
     pub fn ask(&mut self, said: &ToHost) -> Result<FromHost> {
-        let line = serde_json::to_string(said)?;
-        self.stream.get_mut().write_all(format!("{line}\n").as_bytes())?;
-        let mut answer = String::new();
-        if self.stream.read_line(&mut answer)? == 0 {
-            bail!("the host closed the connection");
-        }
-        Ok(serde_json::from_str(&answer)?)
+        crate::wire::send(self.stream.get_mut(), said)?;
+        crate::wire::receive(&mut self.stream)?.context("the host closed the connection")
     }
 
     /// Wait for the host to close the connection (it stops).
     pub fn closed(mut self) {
-        let mut line = String::new();
-        while matches!(self.stream.read_line(&mut line), Ok(n) if n > 0) {
-            line.clear();
-        }
+        while matches!(crate::wire::receive::<FromHost>(&mut self.stream), Ok(Some(_))) {}
     }
 }
 
 /// A lease on the host: it serves while this is held.
 #[derive(Debug)]
 pub struct Lease {
-    _connection: Connection,
+    connection: Connection,
     /// Where it serves.
     pub at: String,
     /// What the host says of how it serves.
     pub note: Option<String>,
+}
+
+impl Lease {
+    /// Say something more on the lease's connection, and read the answer.
+    ///
+    /// # Errors
+    /// The host is gone.
+    pub fn tell(&mut self, said: &ToHost) -> Result<FromHost> {
+        self.connection.ask(said)
+    }
 }
 
 /// Borrow the project from the host holding it, for `who`: the host lets go of the lock, and takes it back once the
@@ -180,7 +213,7 @@ pub struct Lease {
 pub fn borrow(root: &Path, who: &str) -> Option<Lease> {
     let mut connection = Connection::connect(root)?;
     match connection.ask(&ToHost::Lend { who: who.to_string() }) {
-        Ok(FromHost::Lent) => Some(Lease { _connection: connection, at: String::new(), note: None }),
+        Ok(FromHost::Lent) => Some(Lease { connection, at: String::new(), note: None }),
         _ => None,
     }
 }
@@ -196,7 +229,7 @@ pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<L
         None => start(root, program, args)?,
     };
     match connection.ask(&ToHost::Keep { who: who.to_string() })? {
-        FromHost::Kept { at, note } => Ok(Lease { _connection: connection, at, note }),
+        FromHost::Kept { at, note } => Ok(Lease { connection, at, note }),
         FromHost::Error { why } => bail!(why),
         other => bail!("the host answered {other:?}"),
     }

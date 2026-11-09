@@ -101,6 +101,11 @@ fn about_ui(ui: &mut egui::Ui, ws: &Workspace, all: &[Present], p: &Present) {
                 row("Sandbox", "none".to_string());
             }
             match &p.origin {
+                // Held by a layer: kept whole as a tree, laid out where it runs from.
+                Origin::Project(path) if let Some(held) = project::records::held(path) => {
+                    row("Held by", held.layer.file_name().map_or_default(|n| n.to_string_lossy().into_owned()));
+                    row("Tree", held.tree.clone());
+                }
                 Origin::Project(path) | Origin::User(path) | Origin::Install(path) => {
                     row(if path.is_dir() { "Folder" } else { "Archive" }, path.display().to_string());
                 }
@@ -420,7 +425,7 @@ fn unsandboxed_ui(ui: &mut egui::Ui, ws: &Workspace, p: &Present, message: &mut 
 /// each opened as it is.
 fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
     // An archive's are read once it is added and unpacked.
-    let Some(folder) = p.origin.folder().filter(|folder| folder.is_dir()) else { return };
+    let Some(folder) = p.origin.folder().filter(|folder| project::pack::is_dir(folder)) else { return };
     let described = &p.described;
     let pages = [("Guides", described.docs.as_deref()), ("Installation", described.install.as_deref())];
     let pages: Vec<(&str, &str)> = pages.into_iter().filter_map(|(label, page)| Some((label, page?))).collect();
@@ -429,10 +434,12 @@ fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
     }
     let mut open = |ui: &mut egui::Ui, label: &str, page: &str| {
         let file = folder.join(page);
-        if ui.link(label).on_hover_text(file.display().to_string()).clicked()
-            && let Err(e) = crate::external::open_default(&file)
-        {
-            *message = Some(e);
+        if ui.link(label).on_hover_text(file.display().to_string()).clicked() {
+            // Handed to a program as a file: one a project holds, through the filesystem it is served as.
+            let opened = project::content::for_program(&file).map_err(|e| format!("{}: {e}", file.display()));
+            if let Err(e) = opened.and_then(|file| crate::external::open_default(&file)) {
+                *message = Some(e);
+            }
         }
     };
     theme::section(ui, "Documents", |ui| {

@@ -200,7 +200,7 @@ fn part_fields(
         return (sheet.within.clone(), fields, values);
     }
     let Some((group, name)) = id.split_once('/') else { return Default::default() };
-    let held = asset.settings().get(group).and_then(|table| table.get(name)).and_then(toml::Value::as_table);
+    let held = asset.settings_toml().get(group).and_then(|table| table.get(name)).and_then(toml::Value::as_table);
     let values =
         held.map_or_else(Vec::new, |table| table.iter().map(|(key, value)| (key.clone(), value.clone())).collect());
     (vec![group.to_string(), name.to_string()], vec![], values)
@@ -302,7 +302,7 @@ fn properties_ui(
         };
         // The settings as resolved: what the import derives in its place; then what the type declares with a default
         // and the node leaves out, shown at its default for it to be set from.
-        let settings = asset.settings();
+        let settings = asset.settings_toml();
         let defaults: Vec<(String, toml::Value)> = sheet
             .fields
             .iter()
@@ -508,7 +508,7 @@ fn property_sheet(
         }
         let editable = editable && !field.is_some_and(|f| f.read_only);
         // Left out, at its type's default: said so, beside it.
-        let set = !sheet.within.is_empty() || asset.settings().contains_key(key.as_str());
+        let set = !sheet.within.is_empty() || asset.settings_toml().contains_key(key.as_str());
         if !set {
             ui.label(RichText::new("default").small().color(theme::weak()))
                 .on_hover_text("The node leaves it out: this is what it is then. Setting it writes it.");
@@ -1504,8 +1504,8 @@ fn stack_ui(
     nav: &mut Option<String>,
     edit: &mut Option<EditRequest>,
 ) {
-    let Some(layers) = asset.fields().get("stack").and_then(toml::Value::as_array) else { return };
-    let import = project::graph::import_of(asset.fields());
+    let Some(layers) = asset.fields_toml().get("stack").and_then(toml::Value::as_array) else { return };
+    let import = project::graph::import_of(asset.fields_toml());
     let name = import.as_ref().map_or("", |i| i.op);
     let importer = ws.extensions.op(name);
     let fits: Vec<(String, String)> =
@@ -1694,7 +1694,7 @@ fn selected_ui(
 ) {
     let Some(inner) = ws.inner_of(&asset.path).map(str::to_string) else { return };
     let Some((at, op)) = layer_of_inner(&inner) else { return };
-    let Some(layer) = asset.fields().get("stack").and_then(toml::Value::as_array).and_then(|l| l.get(at)) else {
+    let Some(layer) = asset.fields_toml().get("stack").and_then(toml::Value::as_array).and_then(|l| l.get(at)) else {
         return;
     };
     let chosen = op.map_or(Some(layer), |id| layer.get("ops")?.get(id));
@@ -1702,7 +1702,8 @@ fn selected_ui(
     // An importer's settings are the stack's own, and a graph's are its boxes.
     let name = chosen.get("op").and_then(toml::Value::as_str).unwrap_or_default();
     if op.is_none()
-        && (name == project::graph::GRAPH || project::graph::import_of(asset.fields()).is_some_and(|i| i.op == name))
+        && (name == project::graph::GRAPH
+            || project::graph::import_of(asset.fields_toml()).is_some_and(|i| i.op == name))
     {
         return;
     }
@@ -1897,7 +1898,7 @@ fn add_items(
         }
         ui.separator();
         let taken: Vec<&str> = asset
-            .fields()
+            .fields_toml()
             .get("stack")
             .and_then(toml::Value::as_array)
             .into_iter()
@@ -2072,7 +2073,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
     if asset.files.is_empty() {
         return;
     }
-    let has_import = project::graph::import_of(asset.fields()).is_some();
+    let has_import = project::graph::import_of(asset.fields_toml()).is_some();
     theme::section(ui, "Bundle", |ui| {
         egui::Grid::new("bundle files").num_columns(4).spacing([14.0, 4.0]).min_row_height(ROW_HEIGHT).show(ui, |ui| {
             for f in &asset.files {
@@ -2110,7 +2111,7 @@ fn files_ui(ui: &mut egui::Ui, asset: &Asset, tools: &Tools, message: &mut Optio
                 ui.end_row();
             }
         });
-        if let Some(original) = asset.fields().get("original").and_then(toml::Value::as_table) {
+        if let Some(original) = asset.fields_toml().get("original").and_then(toml::Value::as_table) {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Original").small().color(theme::weak()));

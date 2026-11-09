@@ -25,7 +25,8 @@ const HEADER: &str = "pe2 pack 1";
 /// A file of a packed layer: its content's manifest, and when it was written.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    pub manifest: Manifest,
+    /// Shared with what reads it: a read takes no copy of its chunks' list.
+    pub manifest: Arc<Manifest>,
     pub modified: SystemTime,
 }
 
@@ -88,7 +89,7 @@ fn replay(text: &str) -> io::Result<(BTreeMap<String, Entry>, usize)> {
                 let size: u64 = size.parse().map_err(|_| bad("a length"))?;
                 let manifest = Manifest::new(size, (*sha1).to_string(), chunks.ok_or_else(|| bad("a chunk"))?);
                 let modified = time(modified).ok_or_else(|| bad("a time"))?;
-                entries.insert((*rel).to_string(), Entry { manifest, modified });
+                entries.insert((*rel).to_string(), Entry { manifest: Arc::new(manifest), modified });
             }
             ["del", rel] => {
                 entries.remove(*rel);
@@ -131,6 +132,22 @@ impl Pack {
         Ok(pack)
     }
 
+    /// Read its listing again, as another process wrote it: what this one holds of it is replaced.
+    ///
+    /// # Errors
+    /// Its listing cannot be read.
+    pub fn reread(&self) -> io::Result<()> {
+        let (entries, lines) = match std::fs::read_to_string(self.root.join(FILE)) {
+            Ok(text) => replay(&text)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
+            Err(e) => return Err(e),
+        };
+        let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.entries.write().unwrap_or_else(std::sync::PoisonError::into_inner) = entries;
+        journal.lines = lines;
+        Ok(())
+    }
+
     /// The pack holding a path, and the path within it: none where no open pack's folder holds it.
     #[must_use]
     pub fn of(path: &Path) -> Option<(Arc<Pack>, String)> {
@@ -149,6 +166,13 @@ impl Pack {
     #[must_use]
     pub fn get(&self, rel: &str) -> Option<Entry> {
         self.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(rel).cloned()
+    }
+
+    /// A file's length and time, without its manifest.
+    #[must_use]
+    pub fn stat(&self, rel: &str) -> Option<(u64, SystemTime)> {
+        let entries = self.entries.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.get(rel).map(|entry| (entry.manifest.size, entry.modified))
     }
 
     /// How many files it holds.
@@ -186,7 +210,7 @@ impl Pack {
     /// # Errors
     /// Its chunks or its line cannot be written.
     pub fn put(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
-        let entry = Entry { manifest: self.store.put(bytes)?, modified: SystemTime::now() };
+        let entry = Entry { manifest: Arc::new(self.store.put(bytes)?), modified: SystemTime::now() };
         self.append(&put_line(rel, &entry))?;
         self.entries.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rel.to_string(), entry);
         self.compact_if_due()
@@ -263,20 +287,35 @@ impl Pack {
     }
 }
 
+/// Read again the listings of the open packs among these paths (`Pack::reread`).
+pub fn reread_changed(paths: &[PathBuf]) {
+    for path in paths.iter().filter(|p| p.file_name().is_some_and(|n| n == FILE)) {
+        if let Some((pack, _)) = Pack::of(path)
+            && let Err(e) = pack.reread()
+        {
+            eprintln!("{}: {e}", path.display());
+        }
+    }
+}
+
 /// What is in a folder, on disk or in the packed layer holding it: each entry's name, its path and whether it is a
 /// folder - a file really there before one the pack holds alike.
 #[must_use]
 pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
     let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() || kind.is_file() {
-            out.push((entry.file_name().to_string_lossy().into_owned(), entry.path(), kind.is_dir()));
+            let name = entry.file_name().to_string_lossy().into_owned();
+            seen.insert(name.clone());
+            out.push((name, entry.path(), kind.is_dir()));
         }
     }
-    // A records layer's tree, as its records make it.
-    for (name, folder) in crate::records::Set::list(dir).into_iter().flatten() {
-        if !out.iter().any(|(n, ..)| *n == name) {
+    // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
+    let held = crate::records::held_at(dir).map(|(held, within)| held.list(&within));
+    for (name, folder) in held.into_iter().flatten().chain(crate::records::Set::list(dir).into_iter().flatten()) {
+        if seen.insert(name.clone()) {
             out.push((name.clone(), dir.join(&name), folder));
         }
     }
@@ -285,7 +324,7 @@ pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
         let rel =
             dir.strip_prefix(&pack.root).map_or_else(|_| String::new(), |r| r.to_string_lossy().replace('\\', "/"));
         for (name, folder) in pack.list(&rel) {
-            if !out.iter().any(|(n, ..)| *n == name) {
+            if seen.insert(name.clone()) {
                 out.push((name.clone(), dir.join(&name), folder));
             }
         }
@@ -296,17 +335,19 @@ pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
 /// Whether a path is a folder, on disk or in a packed layer.
 #[must_use]
 pub fn is_dir(path: &Path) -> bool {
-    path.is_dir()
-        || Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
+    Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
+        || crate::records::held_at(path).is_some_and(|(held, within)| held.is_folder(&within))
         || crate::records::Set::is_folder(path) == Some(true)
+        || path.is_dir()
 }
 
 /// Whether a path is a file, on disk or in a packed layer.
 #[must_use]
 pub fn is_file(path: &Path) -> bool {
-    path.is_file()
-        || Pack::of(path).is_some_and(|(pack, rel)| pack.get(&rel).is_some())
+    Pack::of(path).is_some_and(|(pack, rel)| pack.stat(&rel).is_some())
+        || crate::records::held_at(path).is_some_and(|(held, within)| held.file(&within).is_some())
         || crate::records::Set::is_file(path) == Some(true)
+        || path.is_file()
 }
 
 /// Set how a layer is stored in `project.toml` (`storage`): none for the default, its files as files.
