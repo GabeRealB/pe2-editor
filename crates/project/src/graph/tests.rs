@@ -1143,18 +1143,33 @@ fn a_config_read_for_what_it_says_holds_for_another_saying_the_same() {
     let mut engine = Engine::new(ops(), None);
     engine.config = Some(config_of("usa", "en"));
     let said = super::exec::Reads {
-        config: Some(super::exec::config_hash(engine.config.as_ref(), false)),
+        config: Some(super::exec::config_hash(engine.config.as_ref(), super::exec::ConfigPart::Said)),
         ..Default::default()
     };
     let whole = super::exec::Reads {
-        config: Some(super::exec::config_hash(engine.config.as_ref(), true)),
+        config: Some(super::exec::config_hash(engine.config.as_ref(), super::exec::ConfigPart::Whole)),
         ..Default::default()
     };
     engine.config = Some(config_of("usa_copy", "en"));
     assert!(engine.holds_config(&said), "the same said by another config");
     assert!(!engine.holds_config(&whole), "all of it read: its name too");
+    // The release alone read: the same where a property changes, not where the release does.
+    let release = super::exec::Reads {
+        config: Some(super::exec::config_hash(engine.config.as_ref(), super::exec::ConfigPart::Release)),
+        ..Default::default()
+    };
     engine.config = Some(config_of("usa", "fr"));
     assert!(!engine.holds_config(&said), "a property changed");
+    assert!(engine.holds_config(&release), "the release did not");
+    // Another config's values, which all of it holds (`known`).
+    let mut known = config_of("usa_copy", "en");
+    let whole_before = super::exec::Reads {
+        config: Some(super::exec::config_hash(Some(&known), super::exec::ConfigPart::Whole)),
+        ..Default::default()
+    };
+    known.known.push("language=fr".into());
+    engine.config = Some(known);
+    assert!(!engine.holds_config(&whole_before), "what every config says changed");
     engine.config = None;
     assert!(!engine.holds_config(&said), "no config");
 }
@@ -1439,4 +1454,47 @@ fn a_for_each_leaves_out_what_its_body_makes_nothing_of() {
         })
         .collect();
     assert_eq!(keys, ["a", "c"]);
+}
+
+#[test]
+fn a_branch_told_it_runs_and_then_not_taken_lets_go_of_what_it_takes_once() {
+    // Both branches run where the language is French; the merge takes the first, and lets go of the second, whose
+    // condition was taken already as it was told it runs.
+    let both = BRANCHED.replace("active = \"other\"", "active = \"french\"");
+    let (plan, problems) = Plan::of(&toml::from_str(&both).unwrap(), &ops(), &[]);
+    assert!(problems.is_empty(), "{problems:?}");
+    let node = Bundle::new(&both, &[("a.txt", "abc")]);
+    let mut engine = Engine::new(ops(), None);
+    engine.config = Some(config_of("fr", "fr"));
+    let world = Nodes(Vec::new(), engine.ops.clone());
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let (text, _) = plan.output("text").unwrap();
+    let (made, _) = evaluate(&plan, &engine.ops, &node, &[(text, None)], &Vec::new(), (None, Some(reach)));
+    let value = made.into_iter().next().unwrap().unwrap();
+    assert_eq!(String::from_utf8(data(&node, &value)).unwrap(), "ABC");
+}
+
+#[test]
+fn a_layer_written_not_active_is_not_made() {
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\nactive = false\n\n\
+                 [[stack]]\nop = \"output\"\nname = \"up\"\n";
+    let (plan, wrong) = Plan::of(&toml::from_str(stack).unwrap(), &ops(), &[]);
+    assert!(wrong.is_empty(), "{wrong:?}");
+    let node = Bundle::new(stack, &[("a.txt", "abc")]);
+    let (up, _) = plan.output("up").unwrap();
+    let (made, _) = evaluate(&plan, &ops(), &node, &[(up, None)], &Vec::new(), (None, None));
+    assert!(made[0].as_ref().is_err_and(|e| e.contains("not active")), "{made:?}");
+    let said = problems(&stack.replace("active = false", "active = 1"));
+    assert!(said.iter().any(|p| p.contains("`active` is 1")), "{said:?}");
+}
+
+#[test]
+fn what_a_node_using_an_operation_with_a_setting_unset_by_default_is_is_read_off_its_shape() {
+    let unset = CHOOSE.replace(", default = \"fr\"", "");
+    let ops = with_definitions(&[("uid://choose", &unset)]);
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"uid://choose\"\nlanguage = \"en\"\n";
+    let shape = super::shape(&toml::from_str(stack).unwrap());
+    let (plan, wrong) = Plan::of(&toml::from_str(&shape).unwrap(), &ops, &[]);
+    assert!(wrong.is_empty(), "{wrong:?}");
+    assert!(plan.result.is_some());
 }

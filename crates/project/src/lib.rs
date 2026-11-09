@@ -475,6 +475,12 @@ fn configs_of(
     (configs, properties, problems)
 }
 
+/// A value written as TOML alone (`fr` is none; `"fr"`, `2`, `["-O2"]` are): what a property is set to from text.
+#[must_use]
+pub fn toml_value(text: &str) -> Option<toml::Value> {
+    format!("v = {text}").parse::<toml::Table>().ok().and_then(|mut table| table.remove("v"))
+}
+
 /// The properties declared (those declared wrongly left out) and what is wrong with them and the configs' values.
 fn properties_of(declared: &toml::Table, configs: &[Config]) -> (Vec<Property>, Vec<PropertyProblem>) {
     let mut problems = Vec::new();

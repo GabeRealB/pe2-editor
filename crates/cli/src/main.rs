@@ -334,11 +334,7 @@ enum ConfigCommand {
 
 /// A value given on the command line: TOML where it reads as such, else text.
 fn toml_value(text: &str) -> toml::Value {
-    format!("v = {text}")
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|mut t| t.remove("v"))
-        .unwrap_or_else(|| toml::Value::String(text.to_owned()))
+    project::toml_value(text).unwrap_or_else(|| toml::Value::String(text.to_owned()))
 }
 
 /// Which project an edit is of, and which of its layers it goes to.
@@ -1333,7 +1329,6 @@ fn main() -> Result<()> {
     done
 }
 
-/// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
 /// `pe2-cli project config ...`: a config added, a property declared, set or left to its default, the configs listed.
 fn config_command(command: ConfigCommand) -> Result<()> {
     match command {
@@ -1386,6 +1381,7 @@ fn config_command(command: ConfigCommand) -> Result<()> {
     Ok(())
 }
 
+/// A project's setup edited - made, its layers, mounts and configs - or its generated layers' states said.
 fn setup_command(command: ProjectCommand) -> Result<()> {
     match command {
         ProjectCommand::New { directory } => {

@@ -2081,7 +2081,6 @@ pub fn listed(member: &str) -> &str {
     member.split_once('@').map_or(member, |(listed, _)| listed)
 }
 
-/// Whether a file's name is a pattern's: `*.png`, or the name itself.
 /// A template a project defines (`pe2.graph@template`): its `label`, the stack it makes (`makes`, its layers), the
 /// type of node that is (`node_type`), the files it takes (`files`) and whether it is offered (`offered`).
 fn project_template(uid: &str, fields: &toml::Table) -> std::result::Result<pe2_ext::TemplateDef, String> {
@@ -2104,6 +2103,7 @@ fn project_template(uid: &str, fields: &toml::Table) -> std::result::Result<pe2_
     })
 }
 
+/// Whether a file's name is a pattern's: `*.png`, or the name itself.
 fn name_matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_prefix('*') {
         Some(suffix) => name.ends_with(suffix),

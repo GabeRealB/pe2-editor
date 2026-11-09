@@ -2776,9 +2776,16 @@ fn property_editor(
             ui.checkbox(&mut on, "").changed().then_some(toml::Value::Boolean(on))
         }
         K::Integer => {
-            let mut n = value.and_then(toml::Value::as_integer).unwrap_or(0);
+            // The number as it is dragged or typed, kept while it is; set where it is let go of.
+            let stored = value.and_then(toml::Value::as_integer).unwrap_or(0);
+            let mut n = ui.data(|d| d.get_temp::<i64>(id)).unwrap_or(stored);
             let response = ui.add(egui::DragValue::new(&mut n));
-            (response.changed() && !response.dragged() || response.drag_stopped()).then_some(toml::Value::Integer(n))
+            if response.dragged() || response.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, n));
+                return None;
+            }
+            ui.data_mut(|d| d.remove::<i64>(id));
+            (n != stored).then_some(toml::Value::Integer(n))
         }
         kind => {
             // Text as it is edited, kept while it is; set where it is left.
@@ -2809,7 +2816,7 @@ fn property_editor(
                 K::Texts => Some(toml::Value::Array(
                     text.lines().filter(|l| !l.trim().is_empty()).map(|l| toml::Value::String(l.to_owned())).collect(),
                 )),
-                _ => format!("v = {text}").parse::<toml::Table>().ok().and_then(|mut t| t.remove("v")),
+                _ => project::toml_value(&text),
             }
         }
     }

@@ -1086,8 +1086,11 @@ pub fn wire_of(value: &Toml) -> Option<&Toml> {
 pub fn shape(fields: &Table) -> String {
     let kept = |layer: &Toml| {
         let held = layer.as_table().into_iter().flatten();
+        // An operation the project defines is laid in with its settings, which may have no default.
+        let defined = layer.get("op").and_then(Toml::as_str).is_some_and(|op| op.starts_with("uid://"));
         let kept = held.filter(|(key, value)| {
-            wire_of(value).is_some()
+            defined
+                || wire_of(value).is_some()
                 || matches!(key.as_str(), "op" | "id" | "name" | "file" | "type" | "result" | "ops" | "each" | "branch")
         });
         Toml::Table(kept.map(|(key, value)| (key.clone(), value.clone())).collect())
@@ -1404,6 +1407,23 @@ impl Lowering<'_> {
         self.plan.steps.len() - 1
     }
 
+    /// What a layer's or box's `active` written as a value comes to: a step making that boolean. Anything else written
+    /// there that is no wire is said.
+    fn constant_active(&mut self, written: Option<&Toml>, at: &str) -> Option<usize> {
+        match written? {
+            Toml::Boolean(set) => {
+                let setting = self.ops.get(SETTING).cloned()?;
+                let value = Table::from_iter([("value".to_string(), Toml::Boolean(*set))]);
+                Some(self.step(&setting, SETTING, value, Vec::new(), at))
+            }
+            Toml::Table(_) => None,
+            other => {
+                self.problem(at, &format!("its `{ACTIVE}` is {other}: a wire, true or false"));
+                None
+            }
+        }
+    }
+
     /// Say what a step takes to tell whether it runs: a boolean.
     fn activate(&mut self, step: usize, active: Option<usize>, at: &str) {
         let Some(active) = active else { return };
@@ -1480,7 +1500,7 @@ impl Lowering<'_> {
                             self.problem(&at, &format!("its `{ACTIVE}` takes one value"));
                             None
                         }
-                        None => None,
+                        None => self.constant_active(layer.get(ACTIVE), &at),
                     };
                     let (Some(def), None) = (def, &defined) else {
                         let defined = defined.unwrap_or_else(|| unreachable!("checked above"));
@@ -2044,7 +2064,7 @@ impl Lowering<'_> {
             return None;
         }
         let active = match ins.get(ports.len()).map(Vec::as_slice) {
-            None | Some([]) => None,
+            None | Some([]) => self.constant_active(op.get(ACTIVE), at),
             Some([id]) => {
                 let steps = self.source(id, placed, given, at);
                 let Some([step]) = steps.as_deref() else {
@@ -2058,7 +2078,7 @@ impl Lowering<'_> {
                 return None;
             }
         };
-        let settings = settings_of(op, &["op", "from", layers::POS]);
+        let settings = settings_of(op, &["op", "from", layers::POS, ACTIVE]);
         let Some(def) = def else {
             let defined = defined?;
             return self.inline(&defined, &settings, inputs, active, at);

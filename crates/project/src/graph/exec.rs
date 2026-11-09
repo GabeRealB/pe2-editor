@@ -135,24 +135,52 @@ pub struct Reads {
     pub config: Option<String>,
 }
 
-/// What reading the config being built is recorded as: the hash of all of it (`whole`: its name and folder too), or of
-/// what it says alone - its release, target and properties, which two configs can share; empty where none is built.
-#[must_use]
-pub fn config_hash(config: Option<&pe2_ext::data::BuildConfig>, whole: bool) -> String {
-    let Some(config) = config else { return String::new() };
-    let mut text = format!("{:?}\n{:?}\n{}", config.release, config.target, config.properties);
-    if whole {
-        text = format!("whole\n{}\n{}\n{text}", config.name, config.folder);
+/// What of the config being built was read: its release alone; what it says - its release, target and properties,
+/// which two configs can share; or all of it - its name, folder and what every config says (`known`) too. Each takes
+/// in those before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigPart {
+    Release,
+    Said,
+    Whole,
+}
+
+impl ConfigPart {
+    const ALL: [ConfigPart; 3] = [ConfigPart::Release, ConfigPart::Said, ConfigPart::Whole];
+
+    fn mark(self) -> &'static str {
+        match self {
+            ConfigPart::Release => "release:",
+            ConfigPart::Said => "said:",
+            ConfigPart::Whole => "all:",
+        }
     }
-    let hash = crate::extract::sha1_hex(text.as_bytes());
-    if whole { format!("{WHOLE}{hash}") } else { hash }
+
+    /// What a reading recorded is of.
+    fn of(read: &str) -> Option<ConfigPart> {
+        ConfigPart::ALL.into_iter().find(|part| read.starts_with(part.mark()))
+    }
+}
+
+/// What reading a part of the config being built is recorded as: its mark and the hash of that part - `none` where no
+/// config is built.
+#[must_use]
+pub fn config_hash(config: Option<&pe2_ext::data::BuildConfig>, part: ConfigPart) -> String {
+    let Some(config) = config else { return format!("{}none", part.mark()) };
+    let text = match part {
+        ConfigPart::Release => format!("{:?}", config.release),
+        ConfigPart::Said => format!("{:?}\n{:?}\n{}", config.release, config.target, config.properties),
+        ConfigPart::Whole => format!(
+            "{}\n{}\n{:?}\n{:?}\n{}\n{:?}",
+            config.name, config.folder, config.release, config.target, config.properties, config.known
+        ),
+    };
+    format!("{}{}", part.mark(), crate::extract::sha1_hex(text.as_bytes()))
 }
 
 /// What a `for_each`'s items are traced as made by.
 const FOR_EACH_MADE: &str = "for_each@1";
 
-/// What marks a reading of all of a config.
-const WHOLE: &str = "all:";
 
 impl Reads {
     /// Add what another read: an output made from a kept one read what that one did.
@@ -164,7 +192,9 @@ impl Reads {
             self.declaration.clone_from(&other.declaration);
         }
         // What read all of the config wins over what read what it says.
-        if other.config.is_some() && !self.config.as_ref().is_some_and(|c| c.starts_with(WHOLE)) {
+        // What read more of the config wins over what read less.
+        let part = |read: &Option<String>| read.as_deref().and_then(ConfigPart::of);
+        if part(&other.config) > part(&self.config) {
             self.config.clone_from(&other.config);
         }
     }
@@ -521,7 +551,7 @@ impl<'a> Call<'a> {
         if !apart {
             return name.to_string();
         }
-        let Some(release) = self.config().and_then(|config| config.release) else { return name.to_string() };
+        let Some(release) = self.release() else { return name.to_string() };
         let ours = format!("{release}/{name}");
         let held = node.file_sha1(&ours).is_some()
             || node.file_names().iter().any(|file| file.starts_with(&format!("{release}/{within}/")));
@@ -641,8 +671,7 @@ impl<'a> Call<'a> {
     #[must_use]
     pub fn config(&self) -> Option<pe2_ext::data::BuildConfig> {
         let config = self.reach?.engine.config.clone();
-        self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config =
-            Some(config_hash(config.as_ref(), true));
+        self.read_config(config.as_ref(), ConfigPart::Whole);
         config
     }
 
@@ -651,13 +680,24 @@ impl<'a> Call<'a> {
     #[must_use]
     pub fn config_said(&self) -> Option<(Option<String>, Option<String>, toml::Table)> {
         let config = self.reach?.engine.config.clone();
-        let mut reads = self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // What reads all of it keeps that.
-        if reads.config.is_none() {
-            reads.config = Some(config_hash(config.as_ref(), false));
-        }
-        drop(reads);
+        self.read_config(config.as_ref(), ConfigPart::Said);
         config.map(|c| (c.release, c.target, c.properties))
+    }
+
+    /// The release the config being built is of, recorded as read alone: what its properties are does not matter.
+    #[must_use]
+    pub fn release(&self) -> Option<String> {
+        let config = self.reach?.engine.config.clone();
+        self.read_config(config.as_ref(), ConfigPart::Release);
+        config.and_then(|c| c.release)
+    }
+
+    /// Record a part of the config read, where no more of it was.
+    fn read_config(&self, config: Option<&pe2_ext::data::BuildConfig>, part: ConfigPart) {
+        let mut reads = self.recorder.reads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reads.config.as_deref().and_then(ConfigPart::of).is_none_or(|read| read < part) {
+            reads.config = Some(config_hash(config, part));
+        }
     }
 
     /// Its node's settings, recorded as read (its declaration as a whole).
@@ -921,7 +961,6 @@ pub fn evaluate(
     let made = made
         .into_iter()
         .map(|m| match m {
-            Some(Err(e)) if is_absent(&e) => Err(Arc::from("it makes nothing: what makes it is not active")),
             Some(made) => made,
             None => Err("not made".into()),
         })
@@ -938,8 +977,8 @@ fn making_made(chain: &[String], work: impl FnOnce() -> Made) -> Made {
 }
 
 /// What a step that does not run makes, among the reasons nothing is made: it goes on to what takes from it, as a
-/// failure does, until a `merge` passes it by; an output it reaches says it is inactive.
-pub(crate) const ABSENT: &str = "\u{0}nothing is made: it is not active";
+/// failure does, until a `merge` passes it by - told from failures by being this, and read as it is wherever it is said.
+pub(crate) const ABSENT: &str = "nothing is made: what makes it is not active";
 
 /// Whether nothing was made for not being active, rather than for failing.
 #[must_use]
@@ -973,8 +1012,13 @@ impl Run<'_> {
     fn release(&mut self, plan: &Plan, s: usize) {
         self.left[s] -= 1;
         if self.left[s] == 0 && self.slots[s].take().is_none() && !self.known.contains_key(&s) {
-            for from in plan.steps[s].sources() {
+            let step = &plan.steps[s];
+            for &from in step.inputs.iter().flatten() {
                 self.release(plan, from);
+            }
+            // What says whether it runs was taken already where it was told.
+            if let Some(active) = step.active.filter(|_| !self.passed[s]) {
+                self.release(plan, active);
             }
         }
     }
@@ -1127,8 +1171,9 @@ impl Evaluation<'_> {
         false
     }
 
-    /// Before a step takes a value others take too, ask the others whether they run: one that does not lets go of it,
-    /// so that the value is moved to its last taker, not copied. Not where asking would reach a step being made.
+    /// Before a step takes a value others take too, tell the others whether they run, where what says so is made
+    /// already or is logic of the config alone (`settled_cheaply`) - asking reads no other node, and makes nothing of a
+    /// branch not taken - so that one that does not lets go of the value, and it is moved to its last taker, not copied.
     fn settle_takers(&self, from: usize, s: usize, run: &mut Run<'_>, parameter: Option<&str>, recorder: Recorder<'_>) {
         if run.left[from] <= 1 {
             return;
@@ -1139,13 +1184,30 @@ impl Evaluation<'_> {
             .filter(|&c| c != s && run.needed[c] && run.slots[c].is_none() && !run.making[c] && !run.passed[c])
             .collect();
         for c in others {
-            let Some(active) = self.plan.steps[c].active else { continue };
-            let reaches = self.plan.steps_reached(&[active], &run.known.keys().copied().collect());
-            if reaches.iter().enumerate().any(|(x, reached)| *reached && run.making[x]) {
+            if self.plan.steps[c].active.is_some_and(|active| self.settled_cheaply(active, run)) {
+                self.gate(c, run, parameter, recorder);
+            }
+        }
+    }
+
+    /// Whether a step's value is made, or is made of what is, by logic over the config and settings alone: what may
+    /// be asked before it is wanted. Not where it would reach a step being made.
+    fn settled_cheaply(&self, step: usize, run: &Run<'_>) -> bool {
+        const CHEAP: &[&str] =
+            &[super::CONFIG, super::EQUALS, super::ALL, super::ANY, super::INVERT, super::SETTING, super::CONSTANT];
+        let mut todo = vec![step];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(s) = todo.pop() {
+            if !seen.insert(s) || run.slots[s].is_some() || run.known.contains_key(&s) {
                 continue;
             }
-            self.gate(c, run, parameter, recorder);
+            let at = &self.plan.steps[s];
+            if run.making[s] || !CHEAP.contains(&at.op.as_str()) {
+                return false;
+            }
+            todo.extend(at.sources());
         }
+        true
     }
 
     /// A `for_each`: its body - an operation the project defines - laid out alone and run for each item it is given,
@@ -1731,7 +1793,7 @@ impl Engine {
     #[must_use]
     pub fn holds_config(&self, reads: &Reads) -> bool {
         reads.config.as_ref().is_none_or(|read| {
-            *read == config_hash(self.config.as_ref(), true) || *read == config_hash(self.config.as_ref(), false)
+            ConfigPart::of(read).is_some_and(|part| *read == config_hash(self.config.as_ref(), part))
         })
     }
 
@@ -1890,10 +1952,13 @@ impl Engine {
         };
         if let Some(active) = step.active {
             let runs = context.run_steps(&[active], parameter).pop().unwrap_or_else(|| Err("not made".into()));
-            match runs.map(|value| super::truth(&value)) {
-                Ok(Some(true)) => {}
-                Ok(_) => anyhow::bail!("{address} is not active"),
-                Err(e) => anyhow::bail!("{e}"),
+            match runs {
+                Ok(value) => match super::truth(&value) {
+                    Some(true) => {}
+                    Some(false) => anyhow::bail!("{address}: {ABSENT}"),
+                    None => anyhow::bail!("{address}: its `active` is given {}, no boolean", value.ty()),
+                },
+                Err(e) => anyhow::bail!("{address}: {e}"),
             }
         }
         let mut inputs = Vec::with_capacity(step.inputs.len());

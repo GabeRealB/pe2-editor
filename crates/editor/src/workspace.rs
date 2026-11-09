@@ -235,7 +235,7 @@ pub struct Workspace {
     /// The config in use.
     pub config: Option<project::Config>,
     /// The config the extensions were told, and which extensions were: told again once they are read again.
-    config_told: Option<(usize, Option<project::Config>)>,
+    config_told: Option<(usize, Option<pe2_ext::data::BuildConfig>, Vec<String>)>,
     /// How the last epoch ended.
     pub last_epoch: Option<crate::runner::Finished>,
     /// The name of an event being defined.
@@ -891,11 +891,13 @@ impl Workspace {
     /// The config in use: what events set off are for, and, told the extensions as it changes, what is made of the
     /// assets is made for (a file the releases have apart is read as its release has it).
     pub fn set_config(&mut self, config: Option<project::Config>) {
-        let told = (Arc::as_ptr(&self.extensions) as usize, config.clone());
+        // What extensions are told is the config as built: its properties over the project's defaults, and what every
+        // config says - changed by more than this config's own table.
+        let built = config.as_ref().map(|c| project::build::build_config(&self.project, c));
+        let disabled = config.as_ref().map_or_else(Vec::new, |c| c.disabled.clone());
+        let told = (Arc::as_ptr(&self.extensions) as usize, built, disabled);
         if self.config_told.as_ref() != Some(&told) {
-            let built = config.as_ref().map(|c| project::build::build_config(&self.project, c));
-            let disabled = config.as_ref().map_or(&[][..], |c| c.disabled.as_slice());
-            self.extensions.set_config(built, disabled);
+            self.extensions.set_config(told.1.clone(), &told.2);
             self.config_told = Some(told);
         }
         self.config = config;
