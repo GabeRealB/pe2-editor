@@ -497,6 +497,24 @@ pub struct Refreshed {
     pub project_file: bool,
     /// The stack was applied again: what changed was more than contents.
     pub restacked: bool,
+    /// The entries of the whole stack that changed or came to be, by their resolved paths, and those that are no
+    /// more: what is served of them is all that changed of what is served (`Index::serve_changed`).
+    pub touched: BTreeSet<String>,
+    pub gone: BTreeSet<String>,
+}
+
+impl Refreshed {
+    /// This, and what a later refresh changed.
+    pub fn and(&mut self, later: Refreshed) {
+        self.assets.extend(later.assets);
+        // What came back after it was gone is there; what went after it was touched is gone.
+        self.gone.retain(|path| !later.touched.contains(path));
+        self.touched.retain(|path| !later.gone.contains(path));
+        self.touched.extend(later.touched);
+        self.gone.extend(later.gone);
+        self.project_file |= later.project_file;
+        self.restacked |= later.restacked;
+    }
 }
 
 fn stamp(time: SystemTime) -> Stamp {
@@ -1237,42 +1255,143 @@ impl Index {
     /// the same name holds that place. Files as they are on disk, never an unsaved working copy.
     #[must_use]
     pub fn served(&self) -> crate::server::Listing {
-        use crate::server::Shown;
-        let stamp = |file: &Path| {
-            let (size, modified) =
-                self.file_stat(file).or_else(|| crate::content::stat(file).ok()).unwrap_or((0, UNIX_EPOCH));
-            let time = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-            (size, (time.as_secs(), time.subsec_nanos()))
-        };
+        let _span = tracing::info_span!("served: listing").entered();
         let mut listing = crate::server::Listing::new();
         for (path, node) in self.full.iter() {
-            match node.kind {
-                Kind::Folder => drop(listing.insert(path.clone(), Shown::Folder)),
-                Kind::File => {
-                    if let Some((_, disk, _)) = self.node_files(node).into_iter().next() {
-                        let (size, modified) = stamp(&disk);
-                        let source = crate::records::Set::source(&disk).unwrap_or_default();
-                        listing.insert(path.clone(), Shown::File { disk, size, modified, of_files: false, source });
-                    }
-                }
-                Kind::Asset => drop(listing.insert(asset_of(path).to_string(), Shown::Node)),
-            }
+            self.serve_entry(path, node, &mut |path, shown| drop(listing.insert(path, shown)));
         }
         for (path, node) in self.full.iter().filter(|(_, n)| n.kind == Kind::Asset) {
-            let name = asset_of(path);
-            for (file, disk, _) in self.node_files(node) {
-                let first = file.split('/').next().unwrap_or(&file);
-                let child = format!("{name}/{first}");
-                if self.full.contains_key(&child) || self.full.contains_key(&format!("{child}{BUNDLE_SUFFIX}")) {
-                    continue;
-                }
-                let (size, modified) = stamp(&disk);
-                let source = crate::records::Set::source(&disk).unwrap_or_default();
-                let shown = Shown::File { disk, size, modified, of_files: true, source };
-                listing.insert(format!("{name}/{file}"), shown);
-            }
+            self.serve_files(path, node, &mut |path, shown| drop(listing.insert(path, shown)));
         }
         listing
+    }
+
+    /// Which entries of the whole stack differ after the stack was applied again - changed, new, or with content in
+    /// what was rescanned - and which are no more: what is served may differ of those alone. A node an entry came
+    /// or went in is among them: its files show where no entry of the same name holds the place.
+    fn served_differences(&self, before: &BTreeMap<String, Node>, rescanned: &[PathBuf], refreshed: &mut Refreshed) {
+        let _span = tracing::info_span!("refresh: what is served differs").entered();
+        let within = |file: &Path| rescanned.iter().any(|r| file.starts_with(r) || r.starts_with(file));
+        for (path, node) in self.full.iter() {
+            let content = self.layers[node.content.0].place.disk(&node.content.1);
+            let through = node.files.iter().flat_map(|f| f.iter().map(|(_, file, _)| file));
+            if before.get(path) != Some(node) || std::iter::once(&content).chain(through).any(|file| within(file)) {
+                refreshed.touched.insert(path.clone());
+            }
+        }
+        refreshed.gone.extend(before.keys().filter(|path| !self.full.contains_key(*path)).cloned());
+        refreshed.touched.retain(|path| self.full.contains_key(path));
+        let around: Vec<String> = refreshed
+            .touched
+            .iter()
+            .chain(&refreshed.gone)
+            .filter(|path| before.contains_key(*path) != self.full.contains_key(*path))
+            .filter_map(|path| asset_of(path).rsplit_once('/').map(|(parent, _)| format!("{parent}{BUNDLE_SUFFIX}")))
+            .filter(|parent| self.full.contains_key(parent))
+            .collect();
+        refreshed.touched.extend(around);
+    }
+
+    /// Bring a listing of what is served (`served`) up to what a refresh changed - the entries it touched, those
+    /// that are gone - and say what of it differs now: what it costs follows what changed, not what the project
+    /// holds.
+    pub fn serve_changed(
+        &self,
+        listing: &mut crate::server::Listing,
+        refreshed: &Refreshed,
+    ) -> crate::server::Delta {
+        use crate::server::Shown;
+        let mut delta = crate::server::Delta::default();
+        // The files a node has in a listing: those in its folder that are its own, not those of a node inside it.
+        let files_of = |listing: &crate::server::Listing, name: &str| -> Vec<String> {
+            let prefix = format!("{name}/");
+            let inside = listing.range(prefix.clone()..).take_while(|(path, _)| path.starts_with(&prefix));
+            let own = |path: &str| {
+                let mut at = path;
+                while let Some((above, _)) = at.rsplit_once('/') {
+                    if matches!(listing.get(above), Some(Shown::Node)) {
+                        return above == name;
+                    }
+                    at = above;
+                }
+                false
+            };
+            let files = inside.filter(|(path, it)| matches!(it, Shown::File { of_files: true, .. }) && own(path));
+            files.map(|(path, _)| path.clone()).collect()
+        };
+        for path in &refreshed.gone {
+            let name = asset_of(path);
+            let mut going = files_of(listing, name);
+            going.push(name.to_string());
+            for path in going {
+                if listing.remove(&path).is_some() {
+                    delta.gone.insert(path);
+                }
+            }
+        }
+        for path in &refreshed.touched {
+            let Some(node) = self.full.get(path) else { continue };
+            let name = asset_of(path).to_string();
+            // What it had, to tell what of it differs: its own entry, and a node's files.
+            let mut had: BTreeMap<String, Shown> = BTreeMap::new();
+            let mut held = if node.kind == Kind::Asset { files_of(listing, &name) } else { Vec::new() };
+            held.push(name);
+            for path in held {
+                if let Some(it) = listing.remove(&path) {
+                    had.insert(path, it);
+                }
+            }
+            let mut put = |path: String, it: Shown| {
+                if had.remove(&path).as_ref() != Some(&it) {
+                    delta.gone.remove(&path);
+                    delta.shown.insert(path.clone(), it.clone());
+                }
+                listing.insert(path, it);
+            };
+            self.serve_entry(path, node, &mut put);
+            if node.kind == Kind::Asset {
+                self.serve_files(path, node, &mut put);
+            }
+            delta.gone.extend(had.into_keys().filter(|path| !listing.contains_key(path)));
+        }
+        delta
+    }
+
+    /// A file as it is served: where a layer holds it, its length, when it changed, and where its content lives.
+    fn serve_file(&self, disk: PathBuf, of_files: bool) -> crate::server::Shown {
+        let (size, modified) =
+            self.file_stat(&disk).or_else(|| crate::content::stat(&disk).ok()).unwrap_or((0, UNIX_EPOCH));
+        let time = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let source = crate::records::Set::source(&disk).unwrap_or_default();
+        let modified = (time.as_secs(), time.subsec_nanos());
+        crate::server::Shown::File { disk, size, modified, of_files, source }
+    }
+
+    /// An entry of the stack as it is served: a folder, a plain file, or a node - the folder of its name.
+    fn serve_entry(&self, path: &str, node: &Node, list: &mut impl FnMut(String, crate::server::Shown)) {
+        use crate::server::Shown;
+        match node.kind {
+            Kind::Folder => list(path.to_string(), Shown::Folder),
+            Kind::File => {
+                if let Some((_, disk, _)) = self.node_files(node).into_iter().next() {
+                    list(path.to_string(), self.serve_file(disk, false));
+                }
+            }
+            Kind::Asset => list(asset_of(path).to_string(), Shown::Node),
+        }
+    }
+
+    /// A node's files as they are served, in its folder - but where an entry of the same name holds that place.
+    fn serve_files(&self, path: &str, node: &Node, list: &mut impl FnMut(String, crate::server::Shown)) {
+        let name = asset_of(path);
+        for (file, disk, _) in self.node_files(node) {
+            let first = file.split('/').next().unwrap_or(&file);
+            let child = format!("{name}/{first}");
+            if self.full.contains_key(&child) || self.full.contains_key(&format!("{child}{BUNDLE_SUFFIX}")) {
+                continue;
+            }
+            list(format!("{name}/{file}"), self.serve_file(disk, true));
+        }
     }
 
     /// A file's length and time as the index read them; none for a file it has not read.
@@ -1312,16 +1431,22 @@ impl Index {
     /// as they were), their changesets made again - each changed where it says otherwise - and the entries whose records
     /// changed scanned again where they were and where they are, in their layer and, where any is placed otherwise, in
     /// the records layers above it, whose entries may be placed through it. Whether a changeset changed.
-    fn take_in_records(&mut self, project: &Project, wanted: &mut Vec<(usize, String)>) -> Result<bool> {
+    fn take_in_records(
+        &mut self,
+        project: &Project,
+        changed: &[PathBuf],
+        wanted: &mut Vec<(usize, String)>,
+    ) -> Result<bool> {
         let before = crate::records::Set::current(&project.root);
-        let now = crate::records::Set::open(project)?;
+        let now = crate::records::Set::open_after(project, changed)?;
         let differences = crate::records::Set::differences(before.as_deref(), &now);
         let (changed, placed) = (&differences.paths, differences.placed);
         // An override changed merges again as the stack is applied.
         let mut any = differences.overrides;
         let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            if !crate::records::is_records(&layer.place.root) {
+            // A layer whose records are as they were says of itself what it said.
+            if !crate::records::is_records(&layer.place.root) || differences.same.contains(&layer.place.root) {
                 continue;
             }
             let was = layer.changeset.clone();
@@ -1348,7 +1473,7 @@ impl Index {
         let mut changesets = false;
         let mut wanted: Vec<(usize, String)> = Vec::new();
         if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
-            changesets |= self.take_in_records(project, &mut wanted)?;
+            changesets |= self.take_in_records(project, changed, &mut wanted)?;
         }
         for path in changed {
             // `project.toml` is read again whole, records with their layers (above).
@@ -1429,7 +1554,9 @@ impl Index {
         let rescanned: Vec<PathBuf> = regions.iter().map(|(i, at)| self.layers[*i].place.disk(at)).collect();
         refreshed.restacked = true;
         let before = std::mem::take(&mut self.resolved);
-        self.apply_stack()?;
+        let whole_before = self.full.clone();
+        tracing::info_span!("index apply stack").in_scope(|| self.apply_stack())?;
+        self.served_differences(&whole_before, &rescanned, &mut refreshed);
         // An asset changed when its entry did, or when its content - or what a generated layer gives it - lies in what
         // was rescanned.
         for (path, node) in self.resolved.iter() {
@@ -1480,7 +1607,11 @@ impl Index {
                     paths.push(resolved.clone());
                 }
             }
+            // What is served of these may differ: the nodes, and the plain files, by where the stack resolves them.
+            let plain = scan.files.keys().filter_map(|path| self.winning.get(&(entries, path.clone())));
+            refreshed.touched.extend(plain.cloned());
         }
+        refreshed.touched.extend(paths.iter().cloned());
         self.assemble_assets(&paths);
         let assets: Vec<String> = paths.iter().map(|p| asset_of(p).to_string()).collect();
         let referring = |r: &Reference| (r.slot.clone(), r.uid.clone(), r.target.clone(), r.output.clone());

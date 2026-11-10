@@ -39,6 +39,8 @@ struct Held {
 struct State {
     /// Its index, while it holds the project.
     index: Option<Index>,
+    /// What is served of it, as last said to the server it feeds: brought up to each change, to say what differs.
+    listing: project::server::Listing,
     /// What answering reads takes, made at the first and kept while it holds the project and nothing changes.
     reading: Option<Reading>,
     /// What runs the epochs events set off, once one was signaled, and the extensions it runs them with: kept while
@@ -125,6 +127,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let inherited = held.as_ref().is_some_and(|h| h.lock.inherited());
     let state = State {
         index,
+        listing: project::server::Listing::new(),
         reading: None,
         runner: None,
         held,
@@ -321,7 +324,7 @@ impl Host {
     fn edits(&self, ops: &[vfs::ops::Op], layer: Option<&str>) -> Vec<mcp::Reply> {
         let failed = |why: String| ops.iter().map(|_| mcp::Reply::failed(why.clone())).collect();
         let mut state = lock(&self.state);
-        let State { index, held, written, reading, .. } = &mut *state;
+        let State { index, listing, held, written, reading, .. } = &mut *state;
         let (Some(index), Some(held)) = (index.as_mut(), held) else {
             return failed("the host does not hold the project".into());
         };
@@ -333,6 +336,8 @@ impl Host {
         // What the edits wrote that the index has not taken in yet, and all of it.
         let (mut pending, mut changed): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
         let mut replies = Vec::with_capacity(ops.len());
+        // What the refreshes of all of them changed, together.
+        let mut all = project::index::Refreshed::default();
         for op in ops {
             let mut apply = |index: &Index| {
                 let _span = tracing::info_span!("host edit apply").entered();
@@ -340,7 +345,11 @@ impl Host {
             };
             let mut made = apply(index);
             // What it could not be made over may be what the ones before it made: taken in, and tried once more.
-            if made.is_err() && !pending.is_empty() && index.refresh(&self.project, &pending).is_ok() {
+            if made.is_err()
+                && !pending.is_empty()
+                && let Ok(refreshed) = index.refresh(&self.project, &pending)
+            {
+                all.and(refreshed);
                 changed.append(&mut pending);
                 made = apply(index);
             }
@@ -362,8 +371,9 @@ impl Host {
             index.refresh(&self.project, &pending)
         };
         changed.append(&mut pending);
-        if let Err(e) = refreshed {
-            return failed(format!("{e:#}"));
+        match refreshed {
+            Ok(refreshed) => all.and(refreshed),
+            Err(e) => return failed(format!("{e:#}")),
         }
         if written.len() > 10_000 {
             written.clear();
@@ -371,8 +381,7 @@ impl Host {
         for path in &changed {
             written.insert(path.clone(), stamp(path));
         }
-        let _span = tracing::info_span!("host served update").entered();
-        self.feed(index, &changed);
+        self.feed(index, listing, &changed, &all);
         project::give_back_memory();
         replies
     }
@@ -397,11 +406,12 @@ impl Host {
         if changed.is_empty() {
             return;
         }
-        let Some(index) = state.index.as_mut() else { return };
+        let State { index, listing, reading, .. } = &mut *state;
+        let Some(index) = index.as_mut() else { return };
         match index.refresh(&self.project, &changed) {
-            Ok(_) => {
-                self.feed(index, &changed);
-                state.reading = None;
+            Ok(refreshed) => {
+                self.feed(index, listing, &changed, &refreshed);
+                *reading = None;
                 project::give_back_memory();
             }
             Err(e) => eprintln!("taking in what changed: {e:#}"),
@@ -427,28 +437,44 @@ impl Host {
 
     /// Feed the server it keeps what is served, from now on, where it holds the project: the whole of it first.
     fn feed_from_now(&self) {
-        let state = lock(&self.state);
-        if let Some(index) = state.index.as_ref() {
-            self.feed_whole(index);
+        let mut state = lock(&self.state);
+        let State { index, listing, .. } = &mut *state;
+        if let Some(index) = index.as_ref() {
+            self.feed_whole(index, listing);
         }
     }
 
-    /// Feed the server it keeps what is served, from now on: all `index` lists first.
-    fn feed_whole(&self, index: &Index) {
+    /// Feed the server it keeps what is served, from now on: all `index` lists first, kept as `listing` to tell
+    /// what differs after each change.
+    fn feed_whole(&self, index: &Index, listing: &mut project::server::Listing) {
         if lock(&self.server).is_none() {
             return;
         }
         let files = holder::files::Files::feed(&self.project, self.serve.clone().unwrap_or_default());
-        files.show(Arc::new(index.served()));
+        *listing = index.served();
+        files.show(Arc::new(listing.clone()));
         *lock(&self.files) = Some(files);
     }
 
     /// What is served follows what changed, where it feeds a server: told which files changed, for what it reads of
-    /// them to be read again, then listed what is served now - and waited for, so that who asked for a change finds
-    /// it in the folder once answered.
-    fn feed(&self, index: &Index, changed: &[PathBuf]) {
+    /// them to be read again, then what differs of what is served - of the entries the refresh touched and those
+    /// gone - and waited for, so that who asked for a change finds it in the folder once answered.
+    fn feed(
+        &self,
+        index: &Index,
+        listing: &mut project::server::Listing,
+        changed: &[PathBuf],
+        refreshed: &project::index::Refreshed,
+    ) {
+        let _span = tracing::info_span!("host served update").entered();
         if let Some(files) = lock(&self.files).as_ref() {
-            files.show_changed(changed.to_vec(), Arc::new(index.served()));
+            // `project.toml` changed: the layers themselves may have. All of it, listed again.
+            if refreshed.project_file {
+                *listing = index.served();
+                files.show_changed(changed.to_vec(), Arc::new(listing.clone()));
+            } else {
+                files.show_delta(changed.to_vec(), index.serve_changed(listing, refreshed));
+            }
         }
     }
 
@@ -535,6 +561,7 @@ impl Host {
         // Its index goes: the borrower holds the project's, and lists what is served from it. Until it does, what this
         // one listed is served on.
         state.index = None;
+        state.listing.clear();
         state.reading = None;
         state.runner = None;
         drop(held);
@@ -573,7 +600,7 @@ impl Host {
                     if let Err(e) = self.keep_server() {
                         eprintln!("its folder is not served: {e:#}");
                     }
-                    self.feed_whole(&index);
+                    self.feed_whole(&index, &mut state.listing);
                     state.index = Some(index);
                     state.held = Some(Held { link: None, history, lock: taken });
                 }

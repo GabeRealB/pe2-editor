@@ -88,6 +88,7 @@ fn text_of(path: &Path) -> String {
 /// # Errors
 /// It cannot be written.
 pub fn write(root: &Path, generation: u64, listing: &Listing) -> io::Result<()> {
+    let _span = tracing::info_span!("served: table written").entered();
     let mut text = Text::default();
     let mut entries = Vec::with_capacity(listing.len() * ENTRY);
     // Each entry's number by where a layer holds it, for those that are files.
@@ -305,6 +306,7 @@ impl Table {
     /// What it lists, as a listing of its own: every path copied out.
     #[must_use]
     pub fn listing(&self) -> Listing {
+        let _span = tracing::info_span!("served: listing of table").entered();
         let entries = self.entries().map(|entry| {
             let shown = match entry.is {
                 Is::Folder => Shown::Folder,

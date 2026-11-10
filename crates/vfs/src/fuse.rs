@@ -533,6 +533,10 @@ fn tell_kernel(
         // is looked for as often as before.
         let looked = std::time::Instant::now();
         while let Ok(ino) = stale.recv_timeout(std::time::Duration::from_millis(200).saturating_sub(looked.elapsed())) {
+            // Told the tree changed: looked at now.
+            if ino == 0 {
+                break;
+            }
             let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
         }
         let now = served.tree();
@@ -615,6 +619,11 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
     }
     config.n_threads = Some(4);
     let (stale, stales) = std::sync::mpsc::channel();
+    // The tree changed: what tells the kernel looks at once (no inode's number is 0).
+    let changed = std::sync::Mutex::new(stale.clone());
+    served.on_change(move || {
+        let _ = changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(0);
+    });
     let fuse = Fuse {
         served: served.clone(),
         writes,

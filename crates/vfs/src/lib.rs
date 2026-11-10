@@ -265,6 +265,78 @@ impl Tree {
         );
     }
 
+    /// Change the tree by what whoever holds the project lists as changed (`ToServer::Changes`): the paths gone
+    /// taken out with what is in them, the paths shown made or made anew - a file's time kept from going back, as
+    /// `keep_times` does for a tree made whole. What it costs follows what changed, not what the tree holds.
+    pub fn change(
+        &mut self,
+        shown: &[(String, project::server::Shown)],
+        gone: &[String],
+        inodes: &mut Inodes,
+        now: SystemTime,
+    ) {
+        use project::server::Shown;
+        for path in gone {
+            self.remove(path);
+        }
+        let time = |(secs, nanos): (u64, u32)| SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+        for (path, shown) in shown {
+            let was = self.at(path).map(|(_, node)| node.clone());
+            match shown {
+                Shown::Folder | Shown::Node => {
+                    if was.as_ref().is_some_and(|was| matches!(was.what, What::File(_))) {
+                        self.remove(path);
+                    }
+                    let ino = self.folder(path, inodes);
+                    if let Some(node) = self.nodes.get_mut(&ino) {
+                        node.asset = matches!(shown, Shown::Node);
+                    }
+                }
+                Shown::File { disk, size, modified, of_files, .. } => {
+                    let given = Given::Disk(disk.clone());
+                    let mut modified = time(*modified);
+                    match &was {
+                        Some(was) if matches!(was.what, What::Folder(_)) => self.remove(path),
+                        // A second on at least, where it changed and its time did not go on: what polls compares
+                        // whole seconds.
+                        Some(was) if modified <= was.modified => {
+                            let later = was.modified + std::time::Duration::from_secs(1);
+                            let other = was.what != What::File(given.clone()) || was.size != *size;
+                            modified = if other { now.max(later) } else { was.modified };
+                        }
+                        _ => {}
+                    }
+                    self.of_files = *of_files;
+                    self.file(path, given, *size, modified, inodes);
+                    self.of_files = false;
+                }
+            }
+        }
+    }
+
+    /// Take a path out of the tree, with what is in it.
+    fn remove(&mut self, path: &str) {
+        let Some((ino, node)) = self.at(path).map(|(ino, node)| (ino, node.parent)) else { return };
+        let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
+        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&node) {
+            children.remove(name);
+        }
+        let mut going = vec![ino];
+        while let Some(ino) = going.pop() {
+            if let Some(Node { what: What::Folder(children), .. }) = self.nodes.remove(&ino) {
+                going.extend(children.into_values());
+            }
+        }
+        // A folder a node's files made, left empty, is no entry of its own: it goes with the last of them.
+        let Some((above, _)) = path.rsplit_once('/') else { return };
+        let emptied = self.at(above).is_some_and(|(_, folder)| {
+            folder.of_files && !folder.asset && matches!(&folder.what, What::Folder(children) if children.is_empty())
+        });
+        if emptied {
+            self.remove(above);
+        }
+    }
+
     fn adopt(&mut self, parent: u64, name: &str, ino: u64) {
         if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&parent) {
             children.insert(name.to_string(), ino);
@@ -415,7 +487,13 @@ pub struct Served {
     open: Arc<std::sync::atomic::AtomicUsize>,
     /// What watches what is read of it, where something does (`access`).
     watcher: Arc<RwLock<Option<Watcher>>>,
+    /// What is woken when the tree changes: what tells of it - the kernel, what watches a mount, a folder brought in
+    /// step - does so at once, where it would else find out when it next looked.
+    wakers: Arc<Mutex<Vec<Waker>>>,
 }
+
+/// What is called when the tree served changes.
+type Waker = Box<dyn Fn() + Send + Sync>;
 
 /// A file open in what is served, for as long as this is held (`Served::opening`).
 pub struct Open(Arc<std::sync::atomic::AtomicUsize>);
@@ -446,14 +524,39 @@ impl Served {
         self.show(&index.served());
     }
 
+    /// Serve what changed of what is listed, as whoever holds the project says it (`Tree::change`): the tree served
+    /// until now with those paths gone, made or made anew.
+    pub fn change(&self, shown: &[(String, project::server::Shown)], gone: &[String]) {
+        let mut tree = (*self.tree()).clone();
+        {
+            let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tree.change(shown, gone, &mut inodes, SystemTime::now());
+        }
+        *self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(tree);
+        self.wake();
+    }
+
+    /// Call this whenever the tree served changes, from now on: for what tells others of it to do so at once.
+    pub fn on_change(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.wakers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Box::new(wake));
+    }
+
+    fn wake(&self) {
+        for wake in self.wakers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            wake();
+        }
+    }
+
     /// Serve what is listed (`Index::served`, as whoever holds the project sends it).
     pub fn show(&self, listing: &project::server::Listing) {
+        let _span = tracing::info_span!("served: tree built").entered();
         let mut tree = {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Tree::of_listing(listing, &mut inodes)
         };
         tree.keep_times(&self.tree(), SystemTime::now());
         *self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(tree);
+        self.wake();
     }
 
     /// Serve a tree of the files given (`Tree::of_files`).
@@ -534,7 +637,61 @@ impl Served {
 
 #[cfg(test)]
 mod tests {
-    use super::Inodes;
+    use super::{Inodes, Tree};
+    use project::server::{Delta, Listing, Shown, Source};
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    fn file(disk: &str, size: u64, of_files: bool) -> Shown {
+        let (disk, modified, source) = (PathBuf::from(disk), (1_700_000_000 + size, 0), Source::Disk);
+        Shown::File { disk, size, modified, of_files, source }
+    }
+
+    #[test]
+    fn a_tree_changed_by_what_differs_is_the_tree_of_what_is_listed_then() {
+        let before: Listing = [
+            ("a".to_string(), Shown::Folder),
+            ("a/n".to_string(), Shown::Node),
+            ("a/n/node.toml".to_string(), file("/l/a/n.node/node.toml", 3, true)),
+            ("a/n/glyphs/x.glif".to_string(), file("/l/a/n.node/glyphs/x.glif", 4, true)),
+            ("a/plain.txt".to_string(), file("/l/a/plain.txt", 5, false)),
+            ("b".to_string(), Shown::Folder),
+            ("b/old.txt".to_string(), file("/l/b/old.txt", 6, false)),
+        ]
+        .into();
+        let mut after = before.clone();
+        // A file's content changed, a node's file gone with the folder it made, a folder gone with what is in it, and
+        // new: a node with a file, a plain file, and a file where a folder was.
+        after.insert("a/plain.txt".into(), file("/l/a/plain.txt", 9, false));
+        after.remove("a/n/glyphs/x.glif");
+        after.remove("b");
+        after.remove("b/old.txt");
+        after.insert("b".into(), file("/l/b", 2, false));
+        after.insert("c".into(), Shown::Node);
+        after.insert("c/node.toml".into(), file("/l/c.node/node.toml", 7, true));
+        after.insert("d/e/new.txt".into(), file("/l/d/e/new.txt", 8, false));
+        after.insert("d".into(), Shown::Folder);
+        after.insert("d/e".into(), Shown::Folder);
+        let mut inodes = Inodes::default();
+        let mut tree = Tree::of_listing(&before, &mut inodes);
+        let delta = Delta::between(&before, &after);
+        let shown: Vec<(String, Shown)> = delta.shown.iter().map(|(path, it)| (path.clone(), it.clone())).collect();
+        let gone: Vec<String> = delta.gone.iter().cloned().collect();
+        tree.change(&shown, &gone, &mut inodes, SystemTime::now());
+        let whole = Tree::of_listing(&after, &mut inodes);
+        let paths = |tree: &Tree| {
+            let mut paths: Vec<(String, bool, u64)> =
+                tree.nodes.values().map(|node| (node.path.clone(), node.asset, node.size)).collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(paths(&tree), paths(&whole));
+        assert_eq!(tree.nodes, whole.nodes, "every node as a tree made whole has it");
+        // And the listing itself, changed by the same, is what is listed then.
+        let mut listing = before.clone();
+        delta.apply(&mut listing);
+        assert_eq!(listing, after);
+    }
 
     #[test]
     fn a_renamed_path_keeps_its_number_and_its_contents_theirs() {

@@ -235,6 +235,23 @@ impl Server {
         FromServer::Serving { at: state.at.clone(), note: state.note.clone() }
     }
 
+    /// What whoever feeds it says changed of what is served, since the table it named and the changes after it:
+    /// read by, and shown - the tree it serves changed by those paths, not made again.
+    fn change(&self, from: u64, shown: &[(String, project::server::Shown)], gone: &[String]) -> FromServer {
+        let state = lock(&self.state);
+        match &state.feeder {
+            Some((feeds, _)) if *feeds == from && state.mounted.is_some() => {}
+            Some((feeds, by)) if *feeds != from => return FromServer::Fed { by: by.clone() },
+            _ => return FromServer::Error { why: "it was named no table by this connection: all of it first".into() },
+        }
+        if self.stopping.load(Ordering::Relaxed) {
+            return FromServer::Stopping;
+        }
+        project::content::serve_changed(shown);
+        self.served.change(shown, gone);
+        FromServer::Serving { at: state.at.clone(), note: state.note.clone() }
+    }
+
     /// Serve the project's folder: what others left there retired, what is not the project's dealt with as asked,
     /// then mounted. What it holds while it serves, where that is, and what is to be known of how.
     fn mount(self: &Arc<Self>) -> Result<(Mounted, String, Option<String>)> {
@@ -553,6 +570,7 @@ fn connection(server: &Arc<Server>, id: u64, stream: interprocess::local_socket:
                 FromServer::Kept
             }
             Ok(ToServer::Table { generation }) => server.show((id, &who), generation),
+            Ok(ToServer::Changes { shown, gone }) => server.change(id, &shown, &gone),
             Ok(ToServer::Changed { paths }) => {
                 server.reread(&paths);
                 FromServer::Done

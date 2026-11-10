@@ -998,8 +998,15 @@ fn tell_changes(served: &Served, instance: usize, at: &Path, stop: &AtomicBool) 
     let full = |path: &str| wide(&format!("{}\\{}", at.display(), path.replace('/', "\\")));
     let folder = |tree: &Tree, ino: u64| i32::from(matches!(tree.node(ino).map(|n| &n.what), Some(What::Folder(_))));
     let mut last = served.tree();
+    // Woken when the tree changes, where it would else find out when it next looked.
+    let (wake, woken) = std::sync::mpsc::channel::<()>();
+    let wake = std::sync::Mutex::new(wake);
+    served.on_change(move || {
+        let _ = wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(());
+    });
     while !stop.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = woken.recv_timeout(std::time::Duration::from_millis(200));
+        while woken.try_recv().is_ok() {}
         let now = served.tree();
         if Arc::ptr_eq(&last, &now) {
             continue;

@@ -26,12 +26,20 @@ pub struct Files {
     shown: mpsc::Sender<Shown>,
 }
 
-/// What the thread sending what is served is given: the listing, the files of the layers that changed since the one
-/// before, and who waits for it to be served (told by this being dropped).
+/// What the thread sending what is served is given: what is served now, the files of the layers that changed since
+/// what it was given before, and who waits for it to be served (told by this being dropped).
 struct Shown {
-    listing: Arc<Listing>,
+    said: Said,
     changed: Vec<std::path::PathBuf>,
     served: Option<mpsc::Sender<()>>,
+}
+
+/// What is served now, as whoever holds the project says it.
+enum Said {
+    /// All of it.
+    Whole(Arc<Listing>),
+    /// What of it differs from what was said before.
+    Changed(project::server::Delta),
 }
 
 /// How long who made a change waits for the server to serve it.
@@ -101,16 +109,27 @@ impl Files {
 
     /// What is served now, as the index lists it: sent to the server, after what was sent before.
     pub fn show(&self, listing: Arc<Listing>) {
-        let _ = self.shown.send(Shown { listing, changed: Vec::new(), served: None });
+        let _ = self.shown.send(Shown { said: Said::Whole(listing), changed: Vec::new(), served: None });
     }
 
     /// What is served now, after these files of the layers changed: the server told of them first - what it reads of
     /// them is read again before what is listed is served - and, where it serves already, waited for to serve it, so
     /// that who made the change finds it in the folder.
     pub fn show_changed(&self, changed: Vec<std::path::PathBuf>, listing: Arc<Listing>) {
+        self.say(Said::Whole(listing), changed);
+    }
+
+    /// What differs of what is served from what was shown before, after these files of the layers changed
+    /// (`Index::serve_changed`): told and waited for as `show_changed` is, at what the change costs, not what the
+    /// project holds.
+    pub fn show_delta(&self, changed: Vec<std::path::PathBuf>, delta: project::server::Delta) {
+        self.say(Said::Changed(delta), changed);
+    }
+
+    fn say(&self, said: Said, changed: Vec<std::path::PathBuf>) {
         let (served, waited) = mpsc::channel();
         let wait = matches!(self.state(), State::Served(..));
-        let _ = self.shown.send(Shown { listing, changed, served: wait.then_some(served) });
+        let _ = self.shown.send(Shown { said, changed, served: wait.then_some(served) });
         if wait {
             let _ = waited.recv_timeout(PATIENCE);
         }
@@ -188,15 +207,19 @@ fn strays_in(project: &project::Project) -> usize {
     serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
 }
 
-/// Send what is served to the server as it changes: the newest listing each time, written as a table the server
-/// maps (`project::served`) and named to it. What the server is not kept for yet waits for it.
+/// Send what is served to the server as it changes: to a lease that has none of it yet, all of it - written as a
+/// table the server maps (`project::served`) and named to it; after that, what changed since (`ToServer::Changes`).
+/// What the server is not kept for yet waits for it.
 fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>) {
-    let mut pending: Option<Arc<Listing>> = None;
-    // The files that changed since what was sent last, and who waits for what is pending to be served: let go of -
+    use project::server::Delta;
+    // What is served now, as last said; the lease that has it, but for `unsent`; and what of it that lease has yet
+    // to be told - none where no lease has any of it.
+    let mut current: Option<Listing> = None;
+    let mut has: Option<Arc<Mutex<Lease>>> = None;
+    let mut unsent: Option<Delta> = None;
+    // The files that changed since what was sent last, and who waits for what is said to be served: let go of -
     // which tells them - once it is, or will not be.
     let (mut changed, mut waiting) = (Vec::new(), Vec::new());
-    // The lease the last listing went on, and that listing.
-    let mut sent: Option<(Arc<Mutex<Lease>>, Arc<Listing>)> = None;
     loop {
         let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(shown) => Some(shown),
@@ -204,7 +227,26 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         for shown in first.into_iter().chain(newest.try_iter()) {
-            pending = Some(shown.listing);
+            let delta = match (shown.said, &mut current) {
+                (Said::Whole(listing), Some(before)) => {
+                    let delta = Delta::between(before, &listing);
+                    *before = Arc::unwrap_or_clone(listing);
+                    delta
+                }
+                (Said::Whole(listing), None) => {
+                    current = Some(Arc::unwrap_or_clone(listing));
+                    Delta::default()
+                }
+                (Said::Changed(delta), Some(before)) => {
+                    delta.apply(before);
+                    delta
+                }
+                // Part of nothing: whoever holds the project says all of it first.
+                (Said::Changed(_), None) => Delta::default(),
+            };
+            if let Some(unsent) = &mut unsent {
+                unsent.then(delta);
+            }
             changed.extend(shown.changed);
             waiting.extend(shown.served);
         }
@@ -214,27 +256,32 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
             Kept::Leased(lease, _) => lease.clone(),
             _ => continue,
         };
-        // A new lease (the server started again) takes the whole listing, the last one's at least.
-        let same_lease = sent.as_ref().is_some_and(|(to, _)| Arc::ptr_eq(to, &lease));
-        let Some(listing) =
-            pending.take().or_else(|| (!same_lease).then(|| sent.as_ref().map(|(_, l)| l.clone())).flatten())
-        else {
-            continue;
-        };
-        // What is served as it was, on the lease that has it: nothing to say.
-        if sent.as_ref().is_some_and(|(_, before)| same_lease && **before == *listing) && changed.is_empty() {
+        let Some(listing) = &current else { continue };
+        // A new lease (the server started again) has none of it.
+        if !has.as_ref().is_some_and(|has| Arc::ptr_eq(has, &lease)) {
+            (has, unsent) = (None, None);
+        }
+        if unsent.as_ref().is_some_and(Delta::is_empty) && changed.is_empty() {
             continue;
         }
         // What changed in the layers first: what it reads of the files listed is read again before they are served.
         if !changed.is_empty() {
             let _ = lock(&lease).tell(&ToServer::Changed { paths: std::mem::take(&mut changed) });
         }
-        // The table of it, written for the server to map, then named.
         let root = &project.root;
-        let generation = project::served::next_generation(root);
-        let told = match project::served::write(root, generation, &listing) {
-            Ok(()) => lock(&lease).tell(&ToServer::Table { generation }),
-            Err(e) => Err(anyhow::Error::new(e).context("writing the table of what is served")),
+        let mut written = None;
+        let told = if let Some(delta) = &unsent {
+            let shown = delta.shown.iter().map(|(path, it)| (path.clone(), it.clone())).collect();
+            let _span = tracing::info_span!("served: server told what changed").entered();
+            lock(&lease).tell(&ToServer::Changes { shown, gone: delta.gone.iter().cloned().collect() })
+        } else {
+            // All of it: the table, written for the server to map, then named.
+            let generation = project::served::next_generation(root);
+            written = Some(generation);
+            match project::served::write(root, generation, listing) {
+                Ok(()) => lock(&lease).tell(&ToServer::Table { generation }),
+                Err(e) => Err(anyhow::Error::new(e).context("writing the table of what is served")),
+            }
         };
         let failed = match told {
             Ok(FromServer::Serving { at, note }) => {
@@ -243,15 +290,18 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                 {
                     *serving = Some((at, note));
                 }
-                sent = Some((lease, listing));
-                // The tables before it are nobody's any more.
-                project::served::remove_before(root, generation);
+                (has, unsent) = (Some(lease), Some(Delta::default()));
+                // The tables before the one it has are nobody's any more.
+                if let Some(generation) = written {
+                    project::served::remove_before(root, generation);
+                }
                 continue;
             }
-            // Whoever held the project before feeds it still, its connection yet to end: again in a moment, whole.
-            Ok(FromServer::Fed { .. }) => None,
             // It does not serve - over what is in the folder that is not the project's, most likely - or is gone.
-            Ok(FromServer::Error { why }) => Some(why),
+            Ok(FromServer::Error { why }) if written.is_some() => Some(why),
+            // Whoever held the project before feeds it still, its connection yet to end; or what changed was not
+            // taken, it having no table of this lease: all of it, in a moment.
+            Ok(FromServer::Fed { .. } | FromServer::Error { .. }) => None,
             Ok(other) => Some(format!("the server answered {other:?}")),
             Err(e) => Some(format!("the server serving it stopped ({e:#})")),
         };
@@ -261,7 +311,6 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                 *state = Kept::Failed(why, strays_in(project));
             }
         }
-        sent = None;
-        pending = Some(listing);
+        (has, unsent) = (None, None);
     }
 }

@@ -113,6 +113,9 @@ pub fn serve(
     let worker = Worker { served: served.clone(), owner, root: at.clone(), staging: staging.to_path_buf(), pending };
     let stopping = stopped.clone();
     let worker = std::thread::Builder::new().name("cloud".into()).spawn(move || worker.run(&stopping))?;
+    // Woken when the tree changes: the folder is brought in step at once, not when the worker next looks.
+    let waking = worker.thread().clone();
+    served.on_change(move || waking.unpark());
     Ok(Cloud { _connection: connection, stop: stopped, worker: Some(worker) })
 }
 

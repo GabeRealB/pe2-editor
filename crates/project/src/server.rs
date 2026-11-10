@@ -56,6 +56,50 @@ pub enum Source {
     Stored { sha1: String, store: std::path::PathBuf },
 }
 
+/// What changed of a listing: the paths shown anew or otherwise, and the paths gone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Delta {
+    pub shown: std::collections::BTreeMap<String, Shown>,
+    pub gone: std::collections::BTreeSet<String>,
+}
+
+impl Delta {
+    /// What changed from one listing to another.
+    #[must_use]
+    pub fn between(before: &Listing, now: &Listing) -> Delta {
+        let other = now.iter().filter(|(path, it)| before.get(*path) != Some(*it));
+        Delta {
+            shown: other.map(|(path, it)| (path.clone(), it.clone())).collect(),
+            gone: before.keys().filter(|path| !now.contains_key(*path)).cloned().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.shown.is_empty() && self.gone.is_empty()
+    }
+
+    /// This, then what changed after it: one change of both.
+    pub fn then(&mut self, later: Delta) {
+        for path in &later.gone {
+            self.shown.remove(path);
+        }
+        for path in later.shown.keys() {
+            self.gone.remove(path);
+        }
+        self.gone.extend(later.gone);
+        self.shown.extend(later.shown);
+    }
+
+    /// Make a listing what it is after this.
+    pub fn apply(&self, listing: &mut Listing) {
+        for path in &self.gone {
+            listing.remove(path);
+        }
+        listing.extend(self.shown.iter().map(|(path, it)| (path.clone(), it.clone())));
+    }
+}
+
 /// What a process says to the server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "say", rename_all = "snake_case")]
@@ -66,6 +110,10 @@ pub enum ToServer {
     /// the server to map. The first is what it starts serving with; who names one feeds it from then on, until its
     /// connection ends.
     Table { generation: u64 },
+    /// What changed of what is served since the table it was named, and the changes after it: the paths shown anew
+    /// or otherwise, with where their content lives, and the paths gone. From who feeds it alone. What an edit
+    /// costs to serve then follows what it changed.
+    Changes { shown: Vec<(String, Shown)>, gone: Vec<String> },
     /// These files changed in the layers - an edit made by whoever holds the project - for what is read of them to
     /// follow at once.
     Changed { paths: Vec<std::path::PathBuf> },

@@ -522,6 +522,8 @@ struct View {
     placed: std::collections::HashMap<String, String>,
     /// What each folder holds, by its path ("" the layer's top): each name, and whether it is a folder.
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
+    /// What is wrong with its records: those with no place.
+    problems: Vec<String>,
 }
 
 impl View {
@@ -553,6 +555,9 @@ pub struct Differences {
     pub placed: bool,
     /// Any of them is (or was) an override: what it merges is merged again.
     pub overrides: bool,
+    /// The layers (by folder) whose records are as they were, taken as read before: nothing of them is to be
+    /// derived again.
+    pub same: BTreeSet<PathBuf>,
 }
 
 /// A record read, with the stamp of its file: what a reading again finds unchanged it takes as it was.
@@ -571,7 +576,7 @@ type Read = BTreeMap<String, Held>;
 pub struct Set {
     root: PathBuf,
     store: crate::chunks::Store,
-    views: Vec<View>,
+    views: Vec<std::sync::Arc<View>>,
     /// Records whose place cannot be found, by what: their parent is nowhere below.
     pub problems: Vec<String>,
 }
@@ -668,13 +673,32 @@ impl Set {
     /// # Errors
     /// A records layer cannot be read, or is of a format this program does not know.
     pub fn open(project: &crate::Project) -> Result<std::sync::Arc<Set>> {
+        Set::opened(project, None)
+    }
+
+    /// Read a project's records layers again after these files changed, as `open` does - but a layer none of them is
+    /// a record of, with nothing changed below it, is taken as it was read before: its records neither looked at nor
+    /// placed again. What an edit costs then follows what it changed, not what the project holds.
+    ///
+    /// # Errors
+    /// As `open`.
+    pub fn open_after(project: &crate::Project, changed: &[PathBuf]) -> Result<std::sync::Arc<Set>> {
+        Set::opened(project, Some(changed))
+    }
+
+    fn opened(project: &crate::Project, changed: Option<&[PathBuf]>) -> Result<std::sync::Arc<Set>> {
         let _span = tracing::info_span!("records open").entered();
         // What was read of it before: a record whose file is as it was is not read again.
         let previous = Set::current(&project.root);
         let mut places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let (mut views, mut problems) = (Vec::new(), Vec::new());
+        let mut views: Vec<std::sync::Arc<View>> = Vec::new();
+        // Whether anything below the layer at hand may place its entries otherwise than before: all of it read anew,
+        // or a layer below changed.
+        let mut below_changed = changed.is_none();
+        let touched = |within: &Path| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
         for layer in &project.layers {
             if !is_records(&layer.path) {
+                below_changed |= changed.is_some_and(|paths| paths.contains(&layer.changeset));
                 let changeset = crate::changeset::Changeset::load(&layer.changeset).unwrap_or_default();
                 places.extend(changeset.entries);
                 for (uid, op) in changeset.ops {
@@ -685,15 +709,28 @@ impl Set {
                 }
                 continue;
             }
-            let settings = settings(&layer.path)?;
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
+            if let Some(before) = before.filter(|_| !below_changed && !touched(&layer.path.join(DIR))) {
+                // As it was read: what it places is there for the layers above, as it was.
+                for (uid, held) in &before.records {
+                    if held.record.name.is_some()
+                        && let Some(at) = before.placed.get(uid)
+                    {
+                        places.insert(uid.clone(), at.clone());
+                    }
+                }
+                views.push(before.clone());
+                continue;
+            }
+            below_changed = true;
+            let settings = settings(&layer.path)?;
             let records = read_records(&layer.path, before.map(|v| &v.records))?;
             let mut view = View { dir: layer.path.clone(), settings, ..View::default() };
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             for uid in records.keys() {
                 if place(uid, &records, &places, &mut located, 0).is_none() {
-                    problems.push(format!("{}: {uid} has no place: what it is in is nowhere below", layer.name));
+                    view.problems.push(format!("{}: {uid} has no place: what it is in is nowhere below", layer.name));
                 }
             }
             for (uid, Held { record, .. }) in &records {
@@ -737,8 +774,9 @@ impl Set {
             view.records = records;
             view.placed = located;
             view.list_children();
-            views.push(view);
+            views.push(std::sync::Arc::new(view));
         }
+        let problems = views.iter().flat_map(|view| view.problems.iter().cloned()).collect();
         let set = std::sync::Arc::new(Set {
             root: project.root.clone(),
             store: crate::chunks::Store::at(&project.root),
@@ -767,8 +805,14 @@ impl Set {
     pub fn differences(before: Option<&Set>, now: &Set) -> Differences {
         let mut out = Vec::new();
         let (mut placed, mut overrides) = (false, false);
+        let mut same = BTreeSet::new();
         for view in &now.views {
             let old = before.and_then(|b| b.views.iter().find(|v| v.dir == view.dir));
+            // Taken as it was read before: nothing of it differs.
+            if old.is_some_and(|old| std::sync::Arc::ptr_eq(old, view)) {
+                same.insert(view.dir.clone());
+                continue;
+            }
             let empty = BTreeMap::new();
             let old_records = old.map_or(&empty, |o| &o.records);
             let mut paths = BTreeSet::new();
@@ -808,7 +852,7 @@ impl Set {
         if let Some(before) = before {
             placed |= before.views.iter().any(|o| !now.views.iter().any(|v| v.dir == o.dir));
         }
-        Differences { paths: out, placed, overrides }
+        Differences { paths: out, placed, overrides, same }
     }
 
     /// The records layer a path is in, and the path within it.

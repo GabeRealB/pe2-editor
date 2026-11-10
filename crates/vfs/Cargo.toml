@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 project.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The WebDAV transport (`dav.rs`): its handler, served over HTTP/1 on a runtime of its own.

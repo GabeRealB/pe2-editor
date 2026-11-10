@@ -99,7 +99,27 @@ static TABLE: RwLock<Option<Arc<crate::served::Table>>> = RwLock::new(None);
 /// folder knows where each file's content lives from what whoever holds the project listed, and reads no records
 /// of its own. In place of the table it read by before.
 pub fn serve_from(table: Arc<crate::served::Table>) {
-    *TABLE.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(table);
+    let mut reading = TABLE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *CHANGED.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *reading = Some(table);
+}
+
+/// Where the files that changed since the table this process reads by live now, by where a layer holds each
+/// (`serve_changed`): asked before the table.
+static CHANGED: RwLock<Option<std::collections::HashMap<PathBuf, Changed>>> = RwLock::new(None);
+
+/// Where a file's content lives now, and when it changed.
+type Changed = (crate::server::Source, (u64, u32));
+
+/// Read these files as listed now, where they changed since the table this process reads by was written.
+pub fn serve_changed(shown: &[(String, crate::server::Shown)]) {
+    let mut changed = CHANGED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = changed.get_or_insert_default();
+    for (_, shown) in shown {
+        if let crate::server::Shown::File { disk, modified, source, .. } = shown {
+            changed.insert(disk.clone(), (source.clone(), *modified));
+        }
+    }
 }
 
 /// Records read for the text they hold, by their files as they were then: a few, read again where they changed.
@@ -133,21 +153,37 @@ fn record_text(record: &Path, name: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-/// A file's content as the table this process reads by says where it lives; none where it reads by none, or the
-/// table has the file where a layer holds it as it is.
+/// A file's content as what this process reads by says where it lives - what changed since its table, then the
+/// table; none where it reads by none, or the file is where a layer holds it, as it is.
 fn listed(path: &Path) -> Option<io::Result<Form>> {
     use crate::served::{From, Is};
-    let table = TABLE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
-    let Is::File { source, modified, .. } = table.held_at(&path.to_string_lossy())?.is else { return None };
+    use crate::server::Source;
+    let since = CHANGED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = since.as_ref().and_then(|changed| changed.get(path)).cloned();
+    drop(since);
+    let (source, modified) = if let Some(changed) = changed {
+        changed
+    } else {
+        let table = TABLE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
+        let Is::File { source, modified, .. } = table.held_at(&path.to_string_lossy())?.is else { return None };
+        let source = match source {
+            From::Disk => Source::Disk,
+            From::RecordText { record, name } => {
+                Source::RecordText { record: PathBuf::from(record), name: name.to_string() }
+            }
+            From::Stored { sha1, store } => Source::Stored { sha1: sha1.to_string(), store: PathBuf::from(store) },
+        };
+        (source, modified)
+    };
     let modified = std::time::UNIX_EPOCH + std::time::Duration::new(modified.0, modified.1);
     match source {
-        From::Disk => None,
-        From::RecordText { record, name } => {
-            Some(record_text(Path::new(record), name).map(|bytes| Form::Inline { bytes, modified }))
+        Source::Disk => None,
+        Source::RecordText { record, name } => {
+            Some(record_text(&record, &name).map(|bytes| Form::Inline { bytes, modified }))
         }
-        From::Stored { sha1, store } => {
-            let store = Store { dir: PathBuf::from(store) };
-            Some(stored_manifest(&store, sha1).map(|manifest| Form::Packed { manifest, store, modified }))
+        Source::Stored { sha1, store } => {
+            let store = Store { dir: store };
+            Some(stored_manifest(&store, &sha1).map(|manifest| Form::Packed { manifest, store, modified }))
         }
     }
 }

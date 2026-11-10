@@ -900,8 +900,19 @@ mod tests {
     }
 
     impl Open {
+        /// Take in what changed - and hold every edit tried here to it: what is served, brought up to the change
+        /// by what the refresh says differs, is what is served listed whole.
         fn refresh(&mut self, paths: &[PathBuf]) {
-            self.index.refresh(&self.project, paths).unwrap();
+            let mut listing = self.index.served();
+            let refreshed = self.index.refresh(&self.project, paths).unwrap();
+            if !refreshed.project_file {
+                let delta = self.index.serve_changed(&mut listing, &refreshed);
+                let whole = self.index.served();
+                assert_eq!(listing, whole, "what is served, kept by change, is what is served listed whole");
+                // And what it says differs is no more than does.
+                assert!(delta.shown.iter().all(|(path, it)| whole.get(path) == Some(it)));
+                assert!(delta.gone.iter().all(|path| !whole.contains_key(path)));
+            }
         }
 
         fn uid(&self, path: &str) -> String {

@@ -15,4 +15,5 @@ mcp.workspace = true
 notify.workspace = true
 pe2-ext.workspace = true
 project.workspace = true
+tracing.workspace = true
 vfs.workspace = true
