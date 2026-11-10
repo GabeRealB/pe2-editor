@@ -37,6 +37,62 @@ pub enum Request {
     /// the one edits go to - by whoever holds the project, as a step of its history: answered with the step's label.
     /// Never an agent's: no tool makes one.
     Edit { op: vfs::ops::Op, layer: Option<String> },
+    /// Several edits made together, each a step of its own: what programs wrote at once through the served folder.
+    /// Answered with each one's label, or why it was not made.
+    Edits { ops: Vec<vfs::ops::Op>, layer: Option<String> },
+    /// Who answers, and how it runs (`Holder`): what whoever asks compares with itself before relying on it.
+    Hello,
+    /// The tools of the project's extensions, as its holder has them loaded: those it holds among them, which a
+    /// program that only asks does not have.
+    Tools,
+}
+
+/// Who holds a project and answers what is asked of it: an editor, or a host with no window; the program it runs,
+/// as it was built when it started; and what it was started under - the user's data folder, and whether it trusts
+/// every extension. A host that differs in these from whoever asks would answer with other code, other settings or
+/// other trust than its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holder {
+    pub editor: bool,
+    pub pid: u32,
+    pub program: String,
+    pub built: Option<u64>,
+    pub data: Option<std::path::PathBuf>,
+    pub trusts_everything: bool,
+}
+
+impl Holder {
+    /// This process, as a holder: an editor or not.
+    #[must_use]
+    pub fn this(editor: bool) -> Holder {
+        let (program, built) = presence::started();
+        Holder {
+            editor,
+            pid: std::process::id(),
+            program,
+            built,
+            data: extensions::data_folder(),
+            trusts_everything: extensions::trust::trusts_everything(),
+        }
+    }
+
+    /// Why a host is not what this process would have started, where it is not: another program or build of it,
+    /// another data folder, another trust.
+    #[must_use]
+    pub fn differs(&self) -> Option<String> {
+        let mine = Holder::this(false);
+        let (my_program, now) = presence::this_program();
+        if !presence::same(std::path::Path::new(&self.program), std::path::Path::new(&my_program)) {
+            return Some(format!("it runs {}, not {my_program}", self.program));
+        }
+        if self.built != now {
+            return Some("its program was built again since it started".into());
+        }
+        if self.data != mine.data {
+            return Some("it was started with another data folder".into());
+        }
+        (self.trusts_everything != mine.trusts_everything).then(|| "it trusts extensions otherwise".into())
+    }
 }
 
 /// Its answer.
@@ -54,6 +110,13 @@ pub enum Reply {
     },
     /// Not answered by this holder (the host answers edits alone): whoever asked takes the project for it.
     Declined,
+    /// Edits made together: each one's label, or why it was not made, and every path they touched.
+    EditedEach {
+        made: Vec<Result<String, String>>,
+        touched: Vec<std::path::PathBuf>,
+    },
+    Hello(Holder),
+    Tools(Vec<rmcp::model::Tool>),
 }
 
 impl Reply {
@@ -69,7 +132,13 @@ impl Reply {
                 if result.is_error == Some(true) { Err(said) } else { Ok(said) }
             }
             Reply::Edited { label, .. } => Ok(label.clone()),
-            Reply::Read(_) | Reply::Declined => Err("it answered with something else".to_string()),
+            Reply::EditedEach { made, .. } => {
+                let labels: Result<Vec<String>, String> = made.iter().cloned().collect();
+                labels.map(|labels| labels.join("\n"))
+            }
+            Reply::Read(_) | Reply::Declined | Reply::Hello(_) | Reply::Tools(_) => {
+                Err("it answered with something else".to_string())
+            }
             Reply::Error(why) => Err(why.clone()),
         }
     }
@@ -137,6 +206,10 @@ pub fn answer(view: &mut View, request: &Request) -> Reply {
             Err(e) => Reply::Error(e),
         },
         Request::Signal { .. } => Reply::Error("events are signaled to an editor".to_string()),
-        Request::Edit { .. } => Reply::Error("an edit is made by whoever holds the project, with its history".into()),
+        Request::Edit { .. } | Request::Edits { .. } => {
+            Reply::Error("an edit is made by whoever holds the project, with its history".into())
+        }
+        Request::Hello => Reply::Hello(Holder::this(view.editor.is_some())),
+        Request::Tools => Reply::Tools(tools::of(view.extensions)),
     }
 }

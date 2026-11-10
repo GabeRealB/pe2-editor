@@ -92,6 +92,8 @@ struct Host {
 
 /// `pe2-cli project host`.
 pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
+    // What it says of itself (`mcp::Holder`) is of the program as it is now, not as it may be built again.
+    mcp::presence::note_start();
     let p = Project::load(directory)?;
     let (serving, address) = serving_of(&p, backend, address)?;
     project::cache::make(&p.root)?;
@@ -387,6 +389,9 @@ impl Host {
             host.answering.fetch_add(1, Ordering::Relaxed);
             let reply = match request {
                 mcp::Request::Edit { op, layer } => host.edit(&op, layer.as_deref()),
+                mcp::Request::Edits { ops, layer } => each(host.edits(&ops, layer.as_deref())),
+                // Said of itself, with nothing of the project read for it.
+                mcp::Request::Hello => mcp::Reply::Hello(mcp::Holder::this(false)),
                 request if !request.uses_window() => host.read(&request),
                 _ => mcp::Reply::Declined,
             };
@@ -699,30 +704,61 @@ impl vfs::write::Owner for Host {
         if lock(&self.state).held.is_some() {
             return self.edit(&op, None).told().map(drop);
         }
+        // Waited for as long as its holder's link lives: given up on while it is being made, it would be made again.
         let request = mcp::Request::Edit { op, layer: None };
-        match mcp::link::forward(&self.project.root, &request) {
+        match mcp::link::forward_patiently(&self.project.root, &request) {
             // What is served follows as the holder lists it.
             Some(mcp::Reply::Edited { label, .. }) => {
                 println!("{label} (by whoever holds the project)");
                 Ok(())
             }
             Some(reply) => Err(reply.told().err().unwrap_or_else(|| "it answered with something else".into())),
-            None => {
-                let holder = project::lock::holder(&self.project.root).unwrap_or_else(|| "another process".into());
-                Err(format!("the project is in use by {holder}, which takes no edits: write it again once it is done"))
-            }
+            None => Err(self.no_holder()),
         }
     }
 
     /// What programs wrote at once: made here together while the host holds the project, the index and the tree
-    /// served brought up to date once; else sent to whoever does, one by one.
+    /// served brought up to date once; else sent to whoever does, together too.
     fn changes(&self, changes: Vec<vfs::write::Change>) -> Vec<std::result::Result<(), String>> {
-        if lock(&self.state).held.is_none() {
-            return changes.into_iter().map(|change| self.change(change)).collect();
-        }
         let ops: Vec<vfs::ops::Op> = changes.into_iter().map(vfs::ops::Op::from).collect();
-        self.edits(&ops, None).into_iter().map(|reply| reply.told().map(drop)).collect()
+        if lock(&self.state).held.is_some() {
+            return self.edits(&ops, None).into_iter().map(|reply| reply.told().map(drop)).collect();
+        }
+        let count = ops.len();
+        let all = |why: String| (0..count).map(|_| Err(why.clone())).collect();
+        match mcp::link::forward_patiently(&self.project.root, &mcp::Request::Edits { ops, layer: None }) {
+            Some(mcp::Reply::EditedEach { made, .. }) if made.len() == count => {
+                for label in made.iter().flatten() {
+                    println!("{label} (by whoever holds the project)");
+                }
+                made.into_iter().map(|made| made.map(drop)).collect()
+            }
+            Some(reply) => all(reply.told().err().unwrap_or_else(|| "it answered with something else".into())),
+            None => all(self.no_holder()),
+        }
     }
+}
+
+impl Host {
+    /// Why an edit could not be sent to whoever holds the project: nothing listens for one.
+    fn no_holder(&self) -> String {
+        let holder = project::lock::holder(&self.project.root).unwrap_or_else(|| "another process".into());
+        format!("the project is in use by {holder}, which takes no edits: write it again once it is done")
+    }
+}
+
+/// Edits made together, as one answer: each one's label, or why it was not made, and all they touched.
+fn each(replies: Vec<mcp::Reply>) -> mcp::Reply {
+    let mut touched = Vec::new();
+    let made = replies.into_iter().map(|reply| match reply {
+        mcp::Reply::Edited { label, touched: paths } => {
+            touched.extend(paths);
+            Ok(label)
+        }
+        other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
+    });
+    let made = made.collect();
+    mcp::Reply::EditedEach { made, touched }
 }
 
 /// Listen for what processes say to the host, each connection on a thread of its own. Listening ends with what this

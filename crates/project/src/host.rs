@@ -300,6 +300,23 @@ pub fn ensure(root: &Path) -> bool {
     }
 }
 
+/// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.
+/// One something keeps - an editor it serves the folder for, `project serve` - is left.
+#[must_use]
+pub fn replace(root: &Path) -> bool {
+    let Some(mut host) = Connection::connect(root) else { return !running(root) };
+    if !matches!(host.ask(&ToHost::Status), Ok(FromHost::Status { leases: 0, .. })) {
+        return false;
+    }
+    let _ = host.ask(&ToHost::Stop);
+    drop(host);
+    let told = Instant::now();
+    while running(root) && told.elapsed() < STOPPING {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !running(root)
+}
+
 /// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
 /// where it lent the project, or something else holds it.
 #[must_use]

@@ -36,6 +36,24 @@ pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Opt
     }
 }
 
+/// Hand a request to the holder of the project in `root` and wait for its answer for as long as the link lives: for
+/// what must not be asked twice - an edit given up on while its holder is still making it would be made again. None
+/// where nothing listens, or the holder declines it.
+#[must_use]
+pub fn forward_patiently(root: &Path, request: &Request) -> Option<Reply> {
+    let mut stream = BufReader::new(Stream::connect(name(root).ok()?).ok()?);
+    let answered = (|| -> std::io::Result<Option<Reply>> {
+        project::wire::send(stream.get_mut(), request)?;
+        project::wire::receive(&mut stream)
+    })();
+    match answered {
+        Ok(Some(Reply::Declined)) => None,
+        Ok(Some(reply)) => Some(reply),
+        Ok(None) => Some(Reply::Error("the holder closed its link without answering".into())),
+        Err(e) => Some(Reply::Error(format!("the holder's link failed: {e}"))),
+    }
+}
+
 fn forward_to_holder(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
     let stream = Stream::connect(name(root).ok()?).ok()?;
     let request = request.clone();

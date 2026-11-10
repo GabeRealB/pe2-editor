@@ -45,6 +45,7 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
         let text = crate::presence::report(root).to_string();
         return Reply::Call(rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]));
     }
+    greet(root);
     if let Some(reply) = link::forward(root, request) {
         return reply;
     }
@@ -93,6 +94,18 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     if let Request::Edit { op, layer } = request {
         return edit_here(root, &lock, op, layer.as_deref());
     }
+    if let Request::Edits { ops, layer } = request {
+        let mut touched = Vec::new();
+        let made = ops.iter().map(|op| match edit_here(root, &lock, op, layer.as_deref()) {
+            Reply::Edited { label, touched: paths } => {
+                touched.extend(paths);
+                Ok(label)
+            }
+            other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
+        });
+        let made = made.collect();
+        return Reply::EditedEach { made, touched };
+    }
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
         let mut index = Index::open(&project, &cache)?;
@@ -114,6 +127,35 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
             reply
         }
         Err(e) => Reply::Error(format!("the project cannot be opened: {e:#}")),
+    }
+}
+
+/// Ask whoever holds the project who it is, once a process: a host that is not what this program would have started
+/// (another build of it, started with another data folder or another trust) would answer with other code or
+/// settings than its own. One nobody keeps is told to stop, and the one started next is this program's; one that is
+/// kept, or an editor, is only said to differ.
+fn greet(root: &Path) {
+    static GREETED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut greeted = GREETED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if greeted.iter().any(|known| known == root) {
+            return;
+        }
+        greeted.push(root.to_path_buf());
+    }
+    let Some(Reply::Hello(holder)) = link::forward(root, &Request::Hello) else { return };
+    if holder.editor {
+        let mine = crate::Holder::this(false);
+        if holder.data != mine.data {
+            eprintln!("note: the editor holding the project (process {}) runs with another data folder", holder.pid);
+        }
+        return;
+    }
+    let Some(why) = holder.differs() else { return };
+    if project::host::replace(root) {
+        eprintln!("note: the host holding the project (process {}) was stopped: {why}", holder.pid);
+    } else {
+        eprintln!("note: the host holding the project (process {}) answers, though {why}: it is kept", holder.pid);
     }
 }
 
@@ -147,13 +189,14 @@ fn edit_here(root: &Path, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -
 #[derive(Clone)]
 pub struct Server {
     root: PathBuf,
-    tools: Vec<Tool>,
+    /// The tools as last listed: every project's, until the project's holder said its own.
+    tools: std::sync::Arc<std::sync::Mutex<Vec<Tool>>>,
 }
 
 impl Server {
     #[must_use]
     pub fn new(root: PathBuf) -> Server {
-        Server { root, tools: crate::definitions() }
+        Server { root, tools: std::sync::Arc::new(std::sync::Mutex::new(crate::definitions())) }
     }
 
     async fn execute(&self, request: Request) -> Result<Reply, ErrorData> {
@@ -171,16 +214,23 @@ impl ServerHandler for Server {
             .with_instructions(INSTRUCTIONS)
     }
 
-    fn list_tools(
+    /// The server's own tools, then the extensions' as the project's holder has them: those the project holds
+    /// among them, which this program does not load. As every project has them where nothing answers.
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        std::future::ready(Ok(ListToolsResult::with_all_items(self.tools.clone())))
+    ) -> Result<ListToolsResult, ErrorData> {
+        if let Ok(Reply::Tools(theirs)) = self.execute(Request::Tools).await {
+            *self.tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = crate::tools::with(theirs);
+        }
+        let tools = self.tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.tools.iter().find(|t| t.name == name).cloned()
+        let tools = self.tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tools.iter().find(|t| t.name == name).cloned()
     }
 
     async fn call_tool(
@@ -191,10 +241,8 @@ impl ServerHandler for Server {
         let call = Request::Call { name: request.name.to_string(), arguments: request.arguments.unwrap_or_default() };
         match self.execute(call).await? {
             Reply::Call(result) => Ok(result.into()),
-            Reply::Read(_) | Reply::Edited { .. } | Reply::Declined => {
-                Err(ErrorData::internal_error("something else answered a call", None))
-            }
             Reply::Error(e) => Err(ErrorData::internal_error(e, None)),
+            _ => Err(ErrorData::internal_error("something else answered a call", None)),
         }
     }
 
@@ -216,10 +264,8 @@ impl ServerHandler for Server {
     ) -> Result<ReadResourceResponse, ErrorData> {
         match self.execute(Request::Read { uri: request.uri }).await? {
             Reply::Read(result) => Ok(result.into()),
-            Reply::Call(_) | Reply::Edited { .. } | Reply::Declined => {
-                Err(ErrorData::internal_error("something else answered a read", None))
-            }
             Reply::Error(e) => Err(ErrorData::resource_not_found(e, None)),
+            _ => Err(ErrorData::internal_error("something else answered a read", None)),
         }
     }
 }

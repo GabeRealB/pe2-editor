@@ -30,7 +30,12 @@ impl Tried {
 
     /// Run the program on the project: whether it succeeded, and what it said.
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let data = self.root.join("data");
+        self.run_with("data", args)
+    }
+
+    /// Run the program with a data folder of this name, of the project's own.
+    fn run_with(&self, data: &str, args: &[&str]) -> (bool, String) {
+        let data = self.root.join(data);
         let ran = Command::new(env!("CARGO_BIN_EXE_pe2-cli"))
             .args(args)
             .envs([("XDG_DATA_HOME", &data), ("APPDATA", &data), ("LOCALAPPDATA", &data)])
@@ -43,11 +48,16 @@ impl Tried {
 
     /// Run a command of `pe2-cli project` on the project.
     fn ask(&self, command: &[&str]) -> (bool, String) {
+        self.ask_with("data", command)
+    }
+
+    /// Run a command of `pe2-cli project` on the project, with a data folder of this name.
+    fn ask_with(&self, data: &str, command: &[&str]) -> (bool, String) {
         let project = self.project();
         let mut args = vec!["project"];
         args.extend(command);
         args.extend(["--project", project.to_str().unwrap()]);
-        self.run(&args)
+        self.run_with(data, &args)
     }
 
     /// The process hosting the project, where one does.
@@ -107,3 +117,22 @@ fn what_commands_ask_is_answered_by_one_host_started_for_it() {
     assert!(stopped, "{said}");
     assert!(within(Duration::from_secs(20), || !project::host::running(&tried.project())), "the host stops");
 }
+
+#[test]
+fn a_host_started_under_other_settings_is_replaced_by_who_asks_next() {
+    let tried = Tried::new("identity");
+    let from = written(&tried.root.join("from.txt"), "one");
+    let (made, said) = tried.ask(&["write", "a.txt", "--from", &from]);
+    assert!(made, "{said}");
+    let first = tried.host().expect("a host was started");
+    // Asked again as it was started: the same host answers.
+    let (made, said) = tried.ask(&["write", "b.txt", "--from", &from]);
+    assert!(made && tried.host() == Some(first), "{said}");
+    // Asked with another data folder - other settings, other trust: that host is stopped, and another answers.
+    std::fs::create_dir_all(tried.root.join("other")).unwrap();
+    let (made, said) = tried.ask_with("other", &["write", "c.txt", "--from", &from]);
+    assert!(made && said.contains("was stopped"), "{said}");
+    let second = tried.host().expect("another host was started");
+    assert_ne!(second, first, "a host of the asker's own");
+}
+

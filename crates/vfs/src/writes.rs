@@ -47,6 +47,10 @@ struct State {
     staged: HashMap<String, Staged>,
     /// Folders made in nodes, waiting for what is written in them.
     folders: BTreeSet<String>,
+    /// Folders the project was given a moment ago, and until when each is shown whatever the tree says: where another
+    /// process holds the project, the tree follows as that one lists it - a moment after the folder was made, and
+    /// what makes a folder writes in it next.
+    given: HashMap<String, Instant>,
     /// Paths hidden, and when their removal is applied (none: never, a backup's move awaiting the file's return).
     hidden: HashMap<String, Option<Instant>>,
     /// New files, and when they are applied.
@@ -131,7 +135,7 @@ impl Writes {
             let meta = std::fs::metadata(&staged.file).ok()?;
             return Some(Shown { folder: false, size: meta.len(), modified: meta.modified().ok()? });
         }
-        if state.folders.contains(path) {
+        if state.folders.contains(path) || (state.given.contains_key(path) && tree.at(path).is_none()) {
             return Some(Shown { folder: true, size: 0, modified: SystemTime::now() });
         }
         let (_, node) = tree.at(path)?;
@@ -146,7 +150,8 @@ impl Writes {
         !(state.staged.contains_key(path)
             || state.hidden.contains_key(path)
             || state.new.contains_key(path)
-            || state.folders.contains(path))
+            || state.folders.contains(path)
+            || state.given.contains_key(path))
     }
 
     /// A folder's children as shown: the tree's, less what is hidden, with what is staged in it.
@@ -164,7 +169,8 @@ impl Writes {
         let state = self.lock();
         let join = |name: &str| if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
         out.retain(|name, _| !state.hidden.contains_key(&join(name)));
-        for (staged, folder) in state.staged.keys().map(|p| (p, false)).chain(state.folders.iter().map(|p| (p, true))) {
+        let folders = state.folders.iter().chain(state.given.keys());
+        for (staged, folder) in state.staged.keys().map(|p| (p, false)).chain(folders.map(|p| (p, true))) {
             if parent(staged) == path {
                 out.insert(staged.rsplit('/').next().unwrap_or(staged).to_string(), folder);
             }
@@ -176,7 +182,8 @@ impl Writes {
     #[must_use]
     pub fn staged_in(&self, folder: &str) -> Vec<String> {
         let state = self.lock();
-        let staged = state.staged.keys().chain(state.folders.iter()).filter(|path| parent(path) == folder);
+        let made = state.folders.iter().chain(state.given.keys());
+        let staged = state.staged.keys().chain(made).filter(|path| parent(path) == folder);
         staged.map(|path| path.rsplit('/').next().unwrap_or(path).to_string()).collect()
     }
 
@@ -412,11 +419,13 @@ impl Writes {
         let mut state = self.lock();
         let staged = state.staged.remove(path);
         let folder = state.folders.remove(path);
+        // A folder the project was given, the tree not showing it yet: the project has it, as a file applied.
+        let given = state.given.remove(path).is_some();
         state.new.remove(path);
         if let Some(staged) = &staged {
             let _ = std::fs::remove_file(&staged.file);
         }
-        let applied = staged.as_ref().is_some_and(|s| s.applied.is_some());
+        let applied = given || staged.as_ref().is_some_and(|s| s.applied.is_some());
         if in_tree || applied {
             let due = Instant::now() + SETTLE;
             state.hidden.insert(path.to_string(), Some(due));
@@ -453,7 +462,12 @@ impl Writes {
             self.lock().folders.insert(path.to_string());
             return Ok(());
         }
-        self.apply(Change::Folder { path: path.to_string() })
+        self.apply(Change::Folder { path: path.to_string() })?;
+        // Shown from now on, whenever the tree comes to show it.
+        if self.served.tree().at(path).is_none() {
+            self.lock().given.insert(path.to_string(), Instant::now() + AWAITED);
+        }
+        Ok(())
     }
 
     /// Whether a new path is inside a node: its nearest folder shown is a node, one of a node's files, or one made in
@@ -468,6 +482,10 @@ impl Writes {
             }
             if let Some((_, node)) = tree.at(parent) {
                 return node.asset || node.of_files;
+            }
+            // A folder the project was given at once is a plain one, as it was when it was made.
+            if state.given.contains_key(parent) {
+                return false;
             }
             at = parent;
         }
@@ -608,6 +626,7 @@ impl Writes {
         let tree = self.served.tree();
         let mut state = self.lock();
         state.hidden.retain(|path, due| due.is_some() || tree.at(path).is_some());
+        state.given.retain(|path, until| tree.at(path).is_none() && *until > now);
         let open: BTreeSet<String> = state.handles.values().cloned().collect();
         state.staged.retain(|path, staged| {
             let Some(applied) = staged.applied.filter(|_| !staged.dirty && !open.contains(path)) else { return true };
@@ -745,6 +764,33 @@ mod tests {
         writes.finish();
         let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
         assert_eq!(given, ["Write late.txt from outside"]);
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_the_project_was_given_is_shown_before_the_tree_follows() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-given-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        // An owner that takes what it is given, the tree served following in its own time - as where another process
+        // holds the project, and lists what is served a moment later.
+        let owner = Arc::new(Told::default());
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        writes.make_folder("made").expect("made");
+        assert!(writes.shown("made").is_some_and(|shown| shown.folder), "there at once");
+        assert_eq!(writes.list("").keys().collect::<Vec<_>>(), ["made"]);
+        // What is written in it next finds it, and is the project's with it.
+        let handle = writes.create("made/a.txt").unwrap();
+        writes.write(handle, 0, b"x").unwrap();
+        writes.close(handle, true).unwrap();
+        writes.finish();
+        let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
+        assert_eq!(given, ["New made from outside", "Write a.txt from outside"]);
+        // Once the tree shows it, it is the tree's.
+        served.set_files(&BTreeMap::from([("made/a.txt".to_string(), Given::Bytes(Arc::from(&b"x"[..])))]));
+        writes.settle();
+        assert!(writes.settled("made"), "nothing shown over the tree any more");
         drop(writes);
         let _ = std::fs::remove_dir_all(&dir);
     }

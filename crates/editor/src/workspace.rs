@@ -1183,6 +1183,11 @@ impl Workspace {
             let _ = reply.send(answer);
             return;
         }
+        if let mcp::Request::Edits { ops, layer } = request {
+            let (made, touched) = self.apply_edits(ops, layer.as_deref());
+            let _ = reply.send(mcp::Reply::EditedEach { made, touched });
+            return;
+        }
         let selection = self.selected.clone();
         let variant = selection.as_deref().and_then(|s| self.variants_of(s).get(self.variant(s)).cloned());
         let editor = mcp::EditorState { selection, variant, show: None, performance: crate::perf::read() };
@@ -1784,11 +1789,61 @@ impl Workspace {
             None => self.editable_layer()?.name.clone(),
         };
         self.settle();
-        let (label, mut touched) =
-            vfs::ops::apply(op, &self.project, &self.index, &layer, &mut self.history).map_err(|e| format!("{e:#}"))?;
+        let (label, mut touched) = self.apply_op(op, &layer)?;
         touched.extend(self.history.written().iter().cloned());
         self.take_written();
         Ok((label, touched))
+    }
+
+    /// An edit made over the index as it is, as a step of the history: what it wrote is yet to be taken in.
+    fn apply_op(&mut self, op: &vfs::ops::Op, layer: &str) -> Result<(String, Vec<std::path::PathBuf>), String> {
+        vfs::ops::apply(op, &self.project, &self.index, layer, &mut self.history).map_err(|e| format!("{e:#}"))
+    }
+
+    /// Edits made together, each a step of its own, taken in once for all of them - what programs wrote at once
+    /// through the served folder: each one's label, or why it was not made, and every path they touched. One that
+    /// cannot be made over the index as it is may need what those before it made: they are taken in, and it is tried
+    /// once more.
+    pub fn apply_edits(
+        &mut self,
+        ops: &[vfs::ops::Op],
+        layer: Option<&str>,
+    ) -> (Vec<Result<String, String>>, Vec<std::path::PathBuf>) {
+        let plain = |op: &vfs::ops::Op| !matches!(op, vfs::ops::Op::Undo | vfs::ops::Op::Redo);
+        // What takes steps back, or names its layer, is made as one edit alone is.
+        if layer.is_some() || !ops.iter().all(plain) {
+            let mut touched = Vec::new();
+            let made = ops.iter().map(|op| {
+                let (label, paths) = self.apply_edit(op, layer)?;
+                touched.extend(paths);
+                Ok(label)
+            });
+            return (made.collect(), touched);
+        }
+        let layer = match self.editable_layer() {
+            Ok(layer) => layer.name.clone(),
+            Err(why) => return (ops.iter().map(|_| Err(why.clone())).collect(), Vec::new()),
+        };
+        self.settle();
+        let (mut touched, mut pending) = (Vec::new(), false);
+        let mut made = Vec::with_capacity(ops.len());
+        for op in ops {
+            let mut tried = self.apply_op(op, &layer);
+            if tried.is_err() && pending {
+                self.take_written();
+                self.settle();
+                pending = false;
+                tried = self.apply_op(op, &layer);
+            }
+            made.push(tried.map(|(label, paths)| {
+                touched.extend(paths);
+                pending = true;
+                label
+            }));
+        }
+        touched.extend(self.history.written().iter().cloned());
+        self.take_written();
+        (made, touched)
     }
 
     pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {

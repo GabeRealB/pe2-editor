@@ -205,7 +205,7 @@ pub fn report(root: &Path) -> serde_json::Value {
 }
 
 /// Whether two paths are one folder.
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -214,6 +214,12 @@ fn same(a: &Path, b: &Path) -> bool {
 
 /// This process's program's time as it started: what it is compared with, to know it was rebuilt since.
 static STARTED_BUILT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| this_program().1);
+
+/// This process's program, and its time as this process started (`note_start`).
+#[must_use]
+pub fn started() -> (String, Option<u64>) {
+    (this_program().0, *STARTED_BUILT)
+}
 
 /// Note this process's program's time now, as it starts: asked first later, it would be the rebuilt program's.
 pub fn note_start() {

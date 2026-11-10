@@ -166,13 +166,24 @@ fn extension_tool(tool: &pe2_ext::ToolDef) -> Tool {
     Tool::new(tool.name.local().to_string(), tool.description.clone(), schema).annotate(annotations)
 }
 
-/// Every tool: the server's own, then the extensions'.
+/// Every tool: the server's own, then the extensions' - those every project has, as this program has them.
 #[must_use]
 pub fn definitions() -> Vec<Tool> {
+    with(extensions::shared().tools().iter().map(extension_tool).collect())
+}
+
+/// Every tool, the extensions' being these: the server's own, then theirs.
+#[must_use]
+pub fn with(theirs: Vec<Tool>) -> Vec<Tool> {
     let mut tools = vec![editors()];
     tools.extend(own());
-    tools.extend(extensions::shared().tools().iter().map(extension_tool));
+    tools.extend(theirs);
     tools
+}
+
+/// The tools of a project's extensions, as loaded for it.
+pub(crate) fn of(extensions: &project::ext::Extensions) -> Vec<Tool> {
+    extensions.tools().iter().map(extension_tool).collect()
 }
 
 /// The tool listing the editors on this computer, which needs no project (`presence`).
