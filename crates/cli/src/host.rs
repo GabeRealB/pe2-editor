@@ -43,6 +43,9 @@ struct State {
     listing: project::host::Listing,
     /// What answering reads takes, made at the first and kept while it holds the project and nothing changes.
     reading: Option<Reading>,
+    /// What runs the epochs events set off, once one was signaled, and the extensions it runs them with: kept while
+    /// one runs whatever changes meanwhile - an edit does not end a build - and let go of with the project.
+    runner: Option<(holder::runner::Runner, std::sync::Arc<project::ext::Extensions>)>,
     held: Option<Held>,
     /// Who it lent the project to, while they have it.
     lent_to: Option<String>,
@@ -128,6 +131,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         index,
         listing: project::host::Listing::new(),
         reading: None,
+        runner: None,
         held,
         lent_to: None,
         written: std::collections::HashMap::new(),
@@ -396,6 +400,7 @@ impl Host {
             let reply = match request {
                 mcp::Request::Edit { op, layer } => host.edit(&op, layer.as_deref()),
                 mcp::Request::Edits { ops, layer } => each(host.edits(&ops, layer.as_deref())),
+                mcp::Request::Signal { events, config } => host.signal(events, config.as_deref()),
                 // Said of itself, with nothing of the project read for it.
                 mcp::Request::Hello => mcp::Reply::Hello(mcp::Holder::this(false)),
                 request if !request.uses_window() => host.read(&request),
@@ -418,8 +423,27 @@ impl Host {
     /// first, kept until something changes.
     fn read(&self, request: &mcp::Request) -> mcp::Reply {
         let mut state = lock(&self.state);
-        let State { index, held, reading, .. } = &mut *state;
-        let (Some(index), Some(held)) = (index.as_mut(), held.as_ref()) else { return mcp::Reply::Declined };
+        if let Err(declined) = self.ready(&mut state) {
+            return declined;
+        }
+        let State { index, reading, .. } = &mut *state;
+        let (Some(index), Some(reading)) = (index.as_mut(), reading.as_mut()) else { return mcp::Reply::Declined };
+        let view = &mut mcp::View { project: &self.project, index, extensions: &reading.extensions, editor: None };
+        let reply = mcp::answer(view, request);
+        // Between requests, nothing draws frames: the extensions' readings give their memory back.
+        reading.extensions.release();
+        let _ = project::imports::sweep_if_due(&reading.store, index);
+        reply
+    }
+
+    /// Have what answering takes: the extensions loaded and the imports attached to the index, made where they are not
+    /// (the first time, and after what changed the project).
+    ///
+    /// # Errors
+    /// It does not hold the project (declined), or the project cannot be read.
+    fn ready(&self, state: &mut State) -> std::result::Result<(), mcp::Reply> {
+        let State { index, held, reading, .. } = state;
+        let (Some(index), Some(held)) = (index.as_mut(), held.as_ref()) else { return Err(mcp::Reply::Declined) };
         if reading.is_none() {
             let made = (|| {
                 let cache = Cache::open(&self.project, &held.lock)?;
@@ -431,17 +455,52 @@ impl Host {
             })();
             match made {
                 Ok(made) => *reading = Some(made),
-                Err(e) => return mcp::Reply::Error(format!("the project cannot be read: {e:#}")),
+                Err(e) => return Err(mcp::Reply::Error(format!("the project cannot be read: {e:#}"))),
             }
         }
-        let Some(reading) = reading.as_mut() else { return mcp::Reply::Declined };
-        reading.last = Instant::now();
-        let view = &mut mcp::View { project: &self.project, index, extensions: &reading.extensions, editor: None };
-        let reply = mcp::answer(view, request);
-        // Between requests, nothing draws frames: the extensions' readings give their memory back.
-        reading.extensions.release();
-        let _ = project::imports::sweep_if_due(&reading.store, index);
-        reply
+        if let Some(reading) = reading.as_mut() {
+            reading.last = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Run what events set off while holding the project, as an editor does - one epoch, on the project as it is now,
+    /// off this thread and not under the host's own lock, so that it reads and edits on meanwhile - and say what came
+    /// of it once it has ended.
+    fn signal(&self, events: Vec<String>, config: Option<&str>) -> mcp::Reply {
+        let answered = {
+            let mut state = lock(&self.state);
+            if let Err(declined) = self.ready(&mut state) {
+                return declined;
+            }
+            let State { index, reading, runner, .. } = &mut *state;
+            let (Some(index), Some(reading)) = (index.as_ref(), reading.as_ref()) else { return mcp::Reply::Declined };
+            // What the project requires and lacks, said; what its extensions have yet to fetch, fetched.
+            if let Err(e) = crate::whole(&reading.extensions) {
+                return mcp::Reply::failed(format!("{e:#}"));
+            }
+            let chosen = self.project.configs.iter().find(|c| config.is_none_or(|name| c.name == name));
+            let Some(config) = chosen.cloned() else {
+                return mcp::Reply::failed("no such config in project.toml".into());
+            };
+            // Run with the extensions as they are now, unless an epoch runs: that one keeps what it started with.
+            let idle = runner.as_ref().is_none_or(|(runner, _)| !runner.busy());
+            if idle && !runner.as_ref().is_some_and(|(_, with)| Arc::ptr_eq(with, &reading.extensions)) {
+                let started = holder::runner::Runner::start(self.project.clone(), reading.extensions.clone());
+                *runner = Some((started, reading.extensions.clone()));
+            }
+            let Some((runner, _)) = runner.as_ref() else { return mcp::Reply::Declined };
+            let (reply, answered) = std::sync::mpsc::channel();
+            let index = Arc::new(index.clone());
+            runner.run(holder::runner::Job { roots: events, index, config, reply: Some(reply) });
+            answered
+        };
+        let reply = answered.recv();
+        // What it ended as is said to who asked: nothing here reads it again.
+        if let Some((runner, _)) = &lock(&self.state).runner {
+            drop(runner.poll());
+        }
+        reply.unwrap_or_else(|_| mcp::Reply::Error("the host let go of the project before it ended".into()))
     }
 
     /// Make an edit while holding the project: a step of its history, taken in at once.
@@ -573,6 +632,10 @@ impl Host {
     fn lend(&self, who: &str) -> FromHost {
         let mut state = lock(&self.state);
         let holder = || project::lock::holder(&self.project.root).unwrap_or_else(|| "nobody".into());
+        // Not while an epoch runs: who asks waits for it, as for any holder that is busy.
+        if state.runner.as_ref().is_some_and(|(runner, _)| runner.busy()) {
+            return FromHost::NotHolding { holder: format!("{WHO}, running {}", running(&state)) };
+        }
         let Some(held) = state.held.take_if(|held| !held.lock.inherited()) else {
             return FromHost::NotHolding { holder: holder() };
         };
@@ -585,6 +648,7 @@ impl Host {
             state.listing = index.served();
         }
         state.reading = None;
+        state.runner = None;
         drop(lock);
         state.lent_to = Some(who.to_string());
         drop(state);
@@ -670,7 +734,10 @@ impl Host {
         let mut state = lock(&self.state);
         if state.reading.as_ref().is_some_and(|r| r.last.elapsed() > READING_KEPT) {
             state.reading = None;
+            // What ran its epochs goes with it, once none runs.
+            let runner = state.runner.take_if(|(runner, _)| !runner.busy());
             drop(state);
+            drop(runner);
             project::give_back_memory();
         }
     }
@@ -751,6 +818,12 @@ impl Host {
         let holder = project::lock::holder(&self.project.root).unwrap_or_else(|| "another process".into());
         format!("the project is in use by {holder}, which takes no edits: write it again once it is done")
     }
+}
+
+/// The events the epoch running was signaled by, as said of a host that is busy.
+fn running(state: &State) -> String {
+    let events = state.runner.as_ref().map_or_default(|(runner, _)| runner.running());
+    if events.is_empty() { "an epoch".to_string() } else { events.join(", ") }
 }
 
 /// Edits made together, as one answer: each one's label, or why it was not made, and all they touched.

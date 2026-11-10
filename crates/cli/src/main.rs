@@ -2,6 +2,9 @@
 //! It dispatches on its subcommand (`pe2-cli project extract`) or, run under a tool's name (a link in the editor's
 //! own `bin/`), on that name (`project extract`).
 
+// The host holds what runs its epochs, whose types are Send through a deep chain: proving it needs a higher limit.
+#![recursion_limit = "256"]
+
 mod host;
 
 use anyhow::{Context, Result};
@@ -792,8 +795,6 @@ fn palette_to_png(input: &std::path::Path, output: &std::path::Path) -> Result<(
     write_png(output, palette.width.max(1), palette.rows.len().max(1), png::ColorType::Rgba, &rgba)
 }
 
-/// How long an editor is given to run an epoch.
-const EPOCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Run an epoch for each of these events, in turn, and say what came of them.
 /// The editor's program: beside this one, else as the system finds it.
@@ -891,10 +892,11 @@ fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()>
 
 fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Result<()> {
     let p = project::Project::load(project)?;
-    // An editor with the project open holds it: it runs them, and says what came of them.
+    // Whoever holds the project runs them, and says what came of them: an editor, or a host - started for it where
+    // nothing does.
     let events_named: Vec<String> = events.iter().map(ToString::to_string).collect();
     let request = mcp::Request::Signal { events: events_named, config: config.map(str::to_string) };
-    if let Some(reply) = mcp::link::forward_within(&p.root, &request, EPOCH_PATIENCE) {
+    if let Some(reply) = mcp::server::signal(&p.root, &request) {
         let said = reply.told().map_err(anyhow::Error::msg)?;
         if !said.is_empty() {
             println!("{said}");

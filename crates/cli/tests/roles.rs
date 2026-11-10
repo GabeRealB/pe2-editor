@@ -136,3 +136,23 @@ fn a_host_started_under_other_settings_is_replaced_by_who_asks_next() {
     assert_ne!(second, first, "a host of the asker's own");
 }
 
+#[test]
+fn what_events_set_off_is_run_by_the_host_which_lends_the_project_after() {
+    let tried = Tried::new("epochs");
+    let (configured, said) = tried.ask(&["config", "add", "test"]);
+    assert!(configured, "{said}");
+    let from = written(&tried.root.join("from.txt"), "one");
+    let (made, said) = tried.ask(&["write", "a.txt", "--from", &from]);
+    assert!(made, "{said}");
+    let host = tried.host().expect("a host was started");
+    // A build is the host's to run: the command asks it, and takes the project for nothing.
+    let (built, said) = tried.ask(&["build"]);
+    assert!(built, "{said}");
+    assert_eq!(tried.host(), Some(host), "the same host, which ran it");
+    // What works on the storage itself borrows the project, and the host takes it back.
+    let (collected, said) = tried.ask(&["store", "gc"]);
+    assert!(collected, "{said}");
+    let (made, said) = tried.ask(&["write", "b.txt", "--from", &from]);
+    assert!(made && tried.host() == Some(host), "{said}");
+}
+

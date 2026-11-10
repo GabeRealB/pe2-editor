@@ -130,6 +130,28 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     }
 }
 
+/// Signal events to whoever holds the project in `root` - a host started for it where nothing does - and wait for
+/// what came of them, however long the epochs take. None where nothing can hold it for this program (it works under
+/// another's lock, no host can be started) or the holder lent it: the events are then run by whoever asked.
+#[must_use]
+pub fn signal(root: &Path, request: &Request) -> Option<Reply> {
+    greet(root);
+    if let Some(reply) = link::forward_patiently(root, request) {
+        return Some(reply);
+    }
+    if !project::host::ensure(root) {
+        return None;
+    }
+    let asked = std::time::Instant::now();
+    while asked.elapsed() < HOST_STARTING && project::host::answers(root) {
+        if let Some(reply) = link::forward_patiently(root, request) {
+            return Some(reply);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
 /// Ask whoever holds the project who it is, once a process: a host that is not what this program would have started
 /// (another build of it, started with another data folder or another trust) would answer with other code or
 /// settings than its own. One nobody keeps is told to stop, and the one started next is this program's; one that is

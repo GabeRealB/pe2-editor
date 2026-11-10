@@ -350,10 +350,12 @@ pub fn start(root: &Path, program: &Path, args: &[String]) -> Result<Connection>
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x8;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // A console of its own, with no window: not its starter's, so it does not end with that one's terminal - and
+        // not none at all (`DETACHED_PROCESS`, beside which Windows ignores the other), or every console program it
+        // came to start would be given a terminal window of its own.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         keep_output_to_ourselves();
     }
     let mut child = command.spawn().with_context(|| format!("starting {}", program.display()))?;

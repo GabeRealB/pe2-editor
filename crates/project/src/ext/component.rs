@@ -792,12 +792,22 @@ impl unsandboxed::Host for State {
             }
             None => (super::unsandboxed::program(folder, &fetched, &tool), args),
         };
-        let spawned = std::process::Command::new(&program)
+        let mut command = std::process::Command::new(&program);
+        command
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
+            .stderr(std::process::Stdio::piped());
+        // Never a window of its own: what it reads and writes is piped. Started by a process that has no console - a
+        // host, an editor started from the desktop - Windows would open a terminal for each tool run otherwise, a
+        // build's hundreds of them.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let spawned = command.spawn();
         let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
