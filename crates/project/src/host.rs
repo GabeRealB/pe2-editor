@@ -213,6 +213,19 @@ pub fn ensure(root: &Path) -> bool {
     }
 }
 
+/// Have a host stand by for the project in `root`, which this process holds: the one running, or one started -
+/// `program` being `pe2-cli` - which holds nothing while this process has the project and takes it once let go, to
+/// keep its folder served and answer what is asked of it from then on.
+///
+/// # Errors
+/// None runs, and none could be started.
+pub fn stand_by(root: &Path, program: &Path) -> Result<()> {
+    if Connection::connect(root).is_some() {
+        return Ok(());
+    }
+    start(root, program, &["--backend".to_string(), "none".to_string()]).map(drop)
+}
+
 /// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.
 /// One something keeps - an editor it serves the folder for, `project serve` - is left.
 #[must_use]

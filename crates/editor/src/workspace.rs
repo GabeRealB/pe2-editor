@@ -562,6 +562,21 @@ pub struct Leaving {
     _files: Option<crate::files::Files>,
 }
 
+/// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
+/// one running, or `pe2-cli` beside the editor started as one. Where that is not there, none does.
+fn stand_by(root: &Path) {
+    let Ok(program) = std::env::current_exe().map(|exe| project::host::cli_beside(&exe)) else { return };
+    if !program.is_file() {
+        return;
+    }
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new().name("standby".into()).spawn(move || {
+        if let Err(e) = project::host::stand_by(&root, &program) {
+            eprintln!("no host stands by for {}: {e:#}", project::host::shown(&root));
+        }
+    });
+}
+
 /// An event asked for: the events, the config, and who waits for what became of it.
 type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
 
@@ -623,6 +638,11 @@ impl Workspace {
         // The server of its files, started where none runs, beside the opening: fed what is served once that is
         // listed.
         let files = crate::files::Files::keep(&project);
+        // A host stands by where its files are served: holding nothing while the editor has the project, it takes
+        // it once the editor lets go, and feeds the server from then on - closing the window ends no serving.
+        if files.is_some() {
+            stand_by(&project.root);
+        }
         // Agents reach it from now on: what they ask of the window is answered as it opens.
         let link = listen(&project.root, agents.0, agents.1);
         if link.is_ok() {
