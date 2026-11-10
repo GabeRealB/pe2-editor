@@ -517,6 +517,21 @@ impl Refreshed {
     }
 }
 
+/// Whether an entry's content - where its layer holds it, or the layer filling that one does - or a file its
+/// overrides made lies in what was scanned again: the regions, by layer and path there, and where those are on disk.
+fn in_rescanned(node: &Node, regions: &[(usize, String)], disks: &[PathBuf], filled: &[Option<usize>]) -> bool {
+    let within = |inner: &str, outer: &str| {
+        outer.is_empty() || inner.strip_prefix(outer).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    let (layer, at) = (node.content.0, node.content.1.as_str());
+    let of_content = |(scanned, region): &(usize, String)| {
+        (*scanned == layer || filled.get(layer).copied().flatten() == Some(*scanned))
+            && (within(at, region) || within(region, at))
+    };
+    let through = || node.files.iter().flat_map(|files| files.iter().map(|(_, file, _)| file));
+    regions.iter().any(of_content) || through().any(|file| disks.iter().any(|r| file.starts_with(r) || r.starts_with(file)))
+}
+
 fn stamp(time: SystemTime) -> Stamp {
     time.duration_since(UNIX_EPOCH).map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()))
 }
@@ -1266,16 +1281,52 @@ impl Index {
         listing
     }
 
+    /// What follows the stack applied again, by what differs from before: which assets changed - their entries, or
+    /// their content, in what was rescanned - assembled and linked again; and which entries of the whole stack
+    /// differ, for what is served (`served_differences`). Where no asset changed, the links stand as they were.
+    fn after_restack(
+        &mut self,
+        regions: &[(usize, String)],
+        (before, whole_before): (&BTreeMap<String, Node>, &BTreeMap<String, Node>),
+        unreadable: Vec<Problem>,
+        refreshed: &mut Refreshed,
+    ) {
+        let rescanned: Vec<PathBuf> = regions.iter().map(|(i, at)| self.layers[*i].place.disk(at)).collect();
+        // The layer filling each layer, where one does.
+        let filled: Vec<Option<usize>> = (0..self.layers.len()).map(|layer| self.filled_by(layer)).collect();
+        let touched = |node: &Node| in_rescanned(node, regions, &rescanned, &filled);
+        self.served_differences(whole_before, &touched, refreshed);
+        // An asset changed when its entry did, or when its content - or what a generated layer gives it - lies in what
+        // was rescanned.
+        for (path, node) in self.resolved.iter().filter(|(_, node)| node.kind == Kind::Asset) {
+            if before.get(path) != Some(node) || touched(node) {
+                refreshed.assets.insert(asset_of(path).to_string());
+            }
+        }
+        refreshed.assets.extend(
+            self.assets.keys().filter(|a| !self.resolved.contains_key(&format!("{a}{BUNDLE_SUFFIX}"))).cloned(),
+        );
+        let paths: Vec<String> = refreshed.assets.iter().map(|a| format!("{a}{BUNDLE_SUFFIX}")).collect();
+        self.assemble(&paths);
+        if refreshed.assets.is_empty() {
+            self.problems.extend(unreadable);
+        } else {
+            self.link();
+        }
+    }
+
     /// Which entries of the whole stack differ after the stack was applied again - changed, new, or with content in
     /// what was rescanned - and which are no more: what is served may differ of those alone. A node an entry came
     /// or went in is among them: its files show where no entry of the same name holds the place.
-    fn served_differences(&self, before: &BTreeMap<String, Node>, rescanned: &[PathBuf], refreshed: &mut Refreshed) {
+    fn served_differences(
+        &self,
+        before: &BTreeMap<String, Node>,
+        touched: &impl Fn(&Node) -> bool,
+        refreshed: &mut Refreshed,
+    ) {
         let _span = tracing::info_span!("refresh: what is served differs").entered();
-        let within = |file: &Path| rescanned.iter().any(|r| file.starts_with(r) || r.starts_with(file));
         for (path, node) in self.full.iter() {
-            let content = self.layers[node.content.0].place.disk(&node.content.1);
-            let through = node.files.iter().flat_map(|f| f.iter().map(|(_, file, _)| file));
-            if before.get(path) != Some(node) || std::iter::once(&content).chain(through).any(|file| within(file)) {
+            if before.get(path) != Some(node) || touched(node) {
                 refreshed.touched.insert(path.clone());
             }
         }
@@ -1551,32 +1602,13 @@ impl Index {
             self.refresh_contents(&regions, &before_references, &mut refreshed);
             return Ok(refreshed);
         }
-        let rescanned: Vec<PathBuf> = regions.iter().map(|(i, at)| self.layers[*i].place.disk(at)).collect();
         refreshed.restacked = true;
         let before = std::mem::take(&mut self.resolved);
         let whole_before = self.full.clone();
+        // What says an asset cannot be read is the link's to say; where no asset changed, it says what it said.
+        let unreadable = self.problems.iter().filter(|p| matches!(p, Problem::Unreadable { .. })).cloned().collect();
         tracing::info_span!("index apply stack").in_scope(|| self.apply_stack())?;
-        self.served_differences(&whole_before, &rescanned, &mut refreshed);
-        // An asset changed when its entry did, or when its content - or what a generated layer gives it - lies in what
-        // was rescanned.
-        for (path, node) in self.resolved.iter() {
-            let content = self.layers[node.content.0].place.disk(&node.content.1);
-            let filled = self.filled_by(node.content.0).map(|g| self.layers[g].place.disk(&node.content.1));
-            let through = node.files.iter().flat_map(|f| f.iter().map(|(_, file, _)| file));
-            let touched = std::iter::once(&content)
-                .chain(filled.as_ref())
-                .chain(through)
-                .any(|c| rescanned.iter().any(|r| c.starts_with(r) || r.starts_with(c)));
-            if node.kind == Kind::Asset && (before.get(path) != Some(node) || touched) {
-                refreshed.assets.insert(asset_of(path).to_string());
-            }
-        }
-        refreshed.assets.extend(
-            self.assets.keys().filter(|a| !self.resolved.contains_key(&format!("{a}{BUNDLE_SUFFIX}"))).cloned(),
-        );
-        let paths: Vec<String> = refreshed.assets.iter().map(|a| format!("{a}{BUNDLE_SUFFIX}")).collect();
-        self.assemble(&paths);
-        self.link();
+        self.after_restack(&regions, (&before, &whole_before), unreadable, &mut refreshed);
         Ok(refreshed)
     }
 
