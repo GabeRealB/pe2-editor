@@ -33,6 +33,8 @@ pub enum ToHost {
     Keep { who: String },
     /// Let go of the project for this connection's process, until the connection ends.
     Lend { who: String },
+    /// Whoever holds the project is about to let go of it: take it the moment this connection ends.
+    Leaving { who: String },
     /// What it is doing.
     Status,
     /// Stop, now.
@@ -52,6 +54,8 @@ pub enum FromHost {
     },
     /// The project's lock let go of: take it.
     Lent,
+    /// Heard: it takes the project once the connection ends.
+    Awaiting,
     /// It does not hold the project: who does, as the lock says.
     NotHolding {
         holder: String,
@@ -136,7 +140,7 @@ impl Connection {
     }
 }
 
-/// The project borrowed from the host: it takes it back once this is dropped.
+/// The project borrowed from the host, or about to be left to it: it takes it once this is dropped.
 #[derive(Debug)]
 pub struct Lease {
     _connection: Connection,
@@ -224,6 +228,18 @@ pub fn stand_by(root: &Path, program: &Path) -> Result<()> {
         return Ok(());
     }
     start(root, program, &["--backend".to_string(), "none".to_string()]).map(drop)
+}
+
+/// Tell the host standing by for the project in `root` that this process, which holds it, is about to let go of it:
+/// the host takes it the moment what this returns is dropped - which is to be after the project's lock - where it
+/// would else find it free when it next looked. None where no host listens.
+#[must_use]
+pub fn leaving(root: &Path, who: &str) -> Option<Lease> {
+    let mut connection = Connection::connect(root)?;
+    match connection.ask(&ToHost::Leaving { who: who.to_string() }) {
+        Ok(FromHost::Awaiting) => Some(Lease { _connection: connection }),
+        _ => None,
+    }
 }
 
 /// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.

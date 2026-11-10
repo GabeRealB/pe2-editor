@@ -123,7 +123,14 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         Err(e) => return Err(e.into()),
     };
     let inherited = held.as_ref().is_some_and(|h| h.lock.inherited());
-    let state = State { index, reading: None, runner: None, held, lent_to: None, written: std::collections::HashMap::new() };
+    let state = State {
+        index,
+        reading: None,
+        runner: None,
+        held,
+        lent_to: None,
+        written: std::collections::HashMap::new(),
+    };
     let host = Arc::new(Host {
         project: p.clone(),
         serve,
@@ -546,12 +553,14 @@ impl Host {
 
     /// Take the project back, where nobody holds it and nobody borrowed it.
     fn take_back(self: &Arc<Self>) {
+        let found;
         {
             let mut state = lock(&self.state);
             if state.held.is_some() || state.lent_to.is_some() {
                 return;
             }
             let Ok(taken) = Lock::try_take(&self.project.root, WHO) else { return };
+            found = Instant::now();
             let held = (|| {
                 let cache = Cache::open(&self.project, &taken)?;
                 let (history, _) = History::open(&cache)?;
@@ -572,8 +581,8 @@ impl Host {
             }
             project::give_back_memory();
         }
-        println!("holding the project");
         self.listen_for_edits();
+        println!("holding the project, {:.2}s after finding it free", found.elapsed().as_secs_f64());
     }
 
     /// Hold on until stopped, or until - while it holds the project - nothing keeps it and nothing was asked of it for
@@ -697,7 +706,7 @@ fn each(replies: Vec<mcp::Reply>) -> mcp::Reply {
 /// connection.
 fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
     let mut stream = BufReader::new(stream);
-    let (mut leased, mut borrowing) = (false, false);
+    let (mut leased, mut borrowing, mut leaving) = (false, false, None::<Instant>);
     loop {
         let said = match project::wire::receive::<ToHost>(&mut stream) {
             Ok(Some(said)) => Ok(said),
@@ -722,6 +731,11 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
                 }
                 answer
             }
+            Ok(ToHost::Leaving { who }) => {
+                println!("{who} is letting go of the project");
+                leaving = Some(Instant::now());
+                FromHost::Awaiting
+            }
             Ok(ToHost::Status) => host.status(),
             Ok(ToHost::Stop) => {
                 host.stopping.store(true, Ordering::Relaxed);
@@ -736,6 +750,13 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
     if borrowing {
         println!("given back");
         host.returned();
+    }
+    // Let go of this moment, by who said so with its connection: taken now, not when next looked for.
+    if let Some(said) = leaving {
+        println!("let go of {:.2}s after saying so", said.elapsed().as_secs_f64());
+    }
+    if borrowing || leaving.is_some() {
+        host.take_back();
     }
     if leased {
         host.leased(false);

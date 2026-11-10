@@ -375,8 +375,12 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     folder.write("c.txt", "three");
     assert!(within(Duration::from_secs(20), || stand_in.made("New c.txt")), "the holder makes the edit");
     assert_eq!(folder.read("c.txt").as_deref(), Some("three"));
-    // Let go of, the project is the host's again: it feeds the server what is served now, the other's edit in it.
+    // Let go of - said first, as an editor closing says it - the project is the host's again without it looking for
+    // it: it feeds the server what is served now, the other's edit in it.
+    let handing = project::host::leaving(&tried.project(), "a stand-in").expect("the host hears it");
     drop(stand_in);
+    drop(handing);
+    assert!(tried.host_said("a stand-in is letting go of the project"));
     let back = || {
         tried.holder().as_deref() == Some("the host") && tried.server().is_some_and(|(_, by)| by.as_deref() == Some("pe2-cli"))
     };

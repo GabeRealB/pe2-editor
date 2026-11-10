@@ -214,6 +214,8 @@ pub struct Workspace {
     pub watch_error: Option<String>,
     /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
     pub files: Option<crate::files::Files>,
+    /// The host standing by told that the editor is letting go of the project: it takes it the moment this goes.
+    handing: Option<project::host::Lease>,
     /// The watcher being started, off the window's thread.
     watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
     /// The generated layers as their plans say they are.
@@ -560,6 +562,8 @@ pub struct Leaving {
     _lock: Lock,
     /// The server kept: let go of once the project is, for whoever holds it next to feed.
     _files: Option<crate::files::Files>,
+    /// The host standing by, told: it takes the project the moment this goes, after the lock.
+    _handing: Option<project::host::Lease>,
 }
 
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
@@ -775,6 +779,7 @@ impl Workspace {
             cache_dir,
             watch: None,
             files,
+            handing: None,
             watch_starting: None,
             plans: crate::plans::Plans::default(),
             fill: crate::fill::Fill::default(),
@@ -954,14 +959,30 @@ impl Workspace {
 
     /// Leave the project. What takes a moment to finish - what the worker is on, an epoch, letting go of the index - is
     /// handed back, to finish away from the window.
-    pub fn leave(self) -> Leaving {
+    pub fn leave(mut self) -> Leaving {
+        self.leaving();
         // The extensions outlive a project in what is loaded: what it was asked should not.
         self.extensions.serve_requests(None);
         // Closed cleanly, its session goes - unless documents are unsaved still: the next opening offers them back.
         if self.history.documents().is_empty() {
             self.history.close();
         }
-        Leaving { _takein: self.takein, _runner: self.runner, _index: self.index, _lock: self.lock, _files: self.files }
+        Leaving {
+            _takein: self.takein,
+            _runner: self.runner,
+            _index: self.index,
+            _lock: self.lock,
+            _files: self.files,
+            _handing: self.handing,
+        }
+    }
+
+    /// The project is about to be let go of: the host standing by is told, once, and takes it the moment the editor
+    /// has let go, without looking for it.
+    fn leaving(&mut self) {
+        if self.handing.is_none() && self.files.is_some() {
+            self.handing = project::host::leaving(&self.project.root, "pe2-editor");
+        }
     }
 
     /// Have the worker read until what is returned goes.
