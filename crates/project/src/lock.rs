@@ -36,7 +36,7 @@ pub struct Lock {
 }
 
 /// Whether a parent process holds the project in `root` for this one.
-fn inherited(root: &Path) -> bool {
+pub(crate) fn inherited(root: &Path) -> bool {
     let held = std::env::var_os(HELD).map(PathBuf::from);
     held.is_some_and(|h| std::fs::canonicalize(h).ok() == std::fs::canonicalize(root).ok())
 }

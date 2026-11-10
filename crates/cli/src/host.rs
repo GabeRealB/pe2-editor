@@ -25,6 +25,9 @@ use project::lock::{Lock, LockError};
 const WHO: &str = "pe2-cli project host";
 /// How long after nobody keeps it it stops (once no file is open): a project opened again soon finds it serving.
 const GRACE: Duration = Duration::from_secs(30);
+/// How long after the last thing asked of it on the holder's link it stops, where nothing else keeps it: what is asked
+/// next - an agent's next read, the next command - finds the project open.
+const IDLE: Duration = Duration::from_mins(2);
 
 /// What the host has while it holds the project; let go of in this order.
 struct Held {
@@ -82,6 +85,9 @@ struct Host {
     inherited: bool,
     /// Whether anyone has kept it yet.
     kept: AtomicBool,
+    /// What is being answered on the holder's link this moment, and when something was last asked there.
+    answering: AtomicUsize,
+    asked: Mutex<Instant>,
 }
 
 /// `pe2-cli project host`.
@@ -135,6 +141,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         stopping: AtomicBool::new(false),
         inherited,
         kept: AtomicBool::new(false),
+        answering: AtomicUsize::new(0),
+        asked: Mutex::new(Instant::now()),
     });
     // What reading the project freed, given back: it serves on for long.
     project::give_back_memory();
@@ -146,22 +154,56 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
             host.stopping.store(true, Ordering::Relaxed);
         }
     })?;
+    // Held while it serves: dropped, it no longer does. None where it only holds the project, for what is asked of it.
+    let mounted = serving.map(|serving| mount(&p, &host, serving, address, strays)).transpose()?;
+    if mounted.is_none() {
+        println!("{} held, and served nowhere", project::host::shown(&p.root));
+    }
+    // Listened to once it serves: who keeps it is told where.
+    let _talking = talk(&host)?;
+    std::thread::scope(|scope| {
+        if let Some((serving, _, record)) = mounted.as_ref().filter(|(serving, ..)| serving.keeps()) {
+            scope.spawn(|| keep_within(&host, *serving, record));
+        }
+        host.keep_going();
+        // Stopping, whyever: what is said to it from now on finds it so.
+        host.stopping.store(true, Ordering::Relaxed);
+    });
+    if let Some((_, mount, record)) = mounted {
+        record.save();
+        drop(mount);
+    }
+    println!("stopped");
+    Ok(())
+}
+
+/// What a host serving a folder holds while it does: the backend, its mount, and what is read there.
+type Mounted = (&'static dyn vfs::backend::Backend, Box<dyn vfs::backend::Mount>, Arc<vfs::access::Access>);
+
+/// Serve the project's folder by a backend: what others left there retired, what is not the project's dealt with
+/// as asked, then mounted.
+fn mount(
+    p: &Project,
+    host: &Arc<Host>,
+    serving: &'static dyn vfs::backend::Backend,
+    address: Option<std::net::SocketAddr>,
+    strays: Strays,
+) -> Result<Mounted> {
     let staging = p.root.join(project::cache::DIR).join(project::cache::STAGING);
     let owner: Arc<dyn vfs::write::Owner> = host.clone();
     if serving.can().folder {
         // What another backend left there of its own serving is no stray: it goes first.
-        vfs::backend::hand_over(serving, &p.filesystem.at, &served_name(&p));
-        clear_strays(&p, serving, strays, owner.as_ref(), &staging)?;
+        vfs::backend::hand_over(serving, &p.filesystem.at, &served_name(p));
+        clear_strays(p, serving, strays, owner.as_ref(), &staging)?;
     }
     let job = vfs::backend::Job {
         served: &host.served,
         owner: Some(owner),
         at: &p.filesystem.at,
         staging: &staging,
-        name: &served_name(&p),
+        name: &served_name(p),
         address,
     };
-    // Held while it serves: dropped, it no longer does.
     let mount = serving
         .mount(&job)
         .with_context(|| format!("serving {} by `{}`", project::host::shown(&p.root), serving.name()))?;
@@ -174,21 +216,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     );
     *lock(&host.at) = at;
     *lock(&host.note) = mount.note();
-    let record = remembered(&host, serving.keeps());
-    // Listened to once it serves: who keeps it is told where.
-    let _talking = talk(&host)?;
-    std::thread::scope(|scope| {
-        if serving.keeps() {
-            scope.spawn(|| keep_within(&host, serving, &record));
-        }
-        host.keep_going();
-        // Stopping, whyever: what is said to it from now on finds it so.
-        host.stopping.store(true, Ordering::Relaxed);
-    });
-    record.save();
-    drop(mount);
-    println!("stopped");
-    Ok(())
+    Ok((serving, mount, remembered(host, serving.keeps())))
 }
 
 /// What is read of the folder served, remembered from one serving to the next: what a backend that keeps what is read
@@ -311,19 +339,20 @@ pub fn files(count: usize) -> String {
 
 /// What serves a project's folder, written through, and the address it does at where it serves at one: as asked, then
 /// as the project says (`project.local.toml`), then the machine - else the backend best suited here. A project or
-/// machine saying `none` is only not served by itself: asked to be, it is, by the best suited.
+/// machine saying `none` is only not served by itself: asked to be, it is, by the best suited. Asked to be served by
+/// `none`, it is served nowhere: the host only holds it.
 fn serving_of(
     p: &Project,
     asked: Option<&str>,
     address: Option<&str>,
-) -> Result<(&'static dyn vfs::backend::Backend, Option<std::net::SocketAddr>)> {
+) -> Result<(Option<&'static dyn vfs::backend::Backend>, Option<std::net::SocketAddr>)> {
     use vfs::backend::{Can, Setting, choose, setting, why_none};
     let machine = extensions::filesystem_defaults();
     let said = |says: &Option<String>| says.clone().filter(|says| says != "none");
     let (project, machine) = (said(&p.filesystem.serve), said(&machine.serve));
     let setting = setting(&[asked, project.as_deref(), machine.as_deref()]);
     if setting == Setting::None {
-        bail!("asked to serve {} by nothing", project::host::shown(&p.root));
+        return Ok((None, None));
     }
     let at = &p.filesystem.at;
     // A folder programs work in: any of it, any number of times.
@@ -333,7 +362,7 @@ fn serving_of(
     };
     let address = address.or(p.filesystem.address.as_deref());
     let address = address.map(|a| a.parse().with_context(|| format!("`{a}`: no address"))).transpose()?;
-    Ok((backend, address))
+    Ok((Some(backend), address))
 }
 
 /// The project held: its index, over the cache's store, and a history of its own.
@@ -352,10 +381,18 @@ impl Host {
     /// needs a window is declined.
     fn listen_for_edits(self: &Arc<Self>) {
         let me: Weak<Host> = Arc::downgrade(self);
-        let answer = move |request: mcp::Request| match (request, me.upgrade()) {
-            (mcp::Request::Edit { op, layer }, Some(host)) => host.edit(&op, layer.as_deref()),
-            (request, Some(host)) if !request.uses_window() => host.read(&request),
-            _ => mcp::Reply::Declined,
+        let answer = move |request: mcp::Request| {
+            let Some(host) = me.upgrade() else { return mcp::Reply::Declined };
+            // Asked, and answering: it stays for both, and a while after.
+            host.answering.fetch_add(1, Ordering::Relaxed);
+            let reply = match request {
+                mcp::Request::Edit { op, layer } => host.edit(&op, layer.as_deref()),
+                request if !request.uses_window() => host.read(&request),
+                _ => mcp::Reply::Declined,
+            };
+            *lock(&host.asked) = Instant::now();
+            host.answering.fetch_sub(1, Ordering::Relaxed);
+            reply
         };
         let mut state = lock(&self.state);
         if let Some(held) = &mut state.held {
@@ -599,9 +636,12 @@ impl Host {
             if self.project.filesystem.keep || lock(&self.quiet_since).elapsed() < GRACE {
                 continue;
             }
+            if self.answering.load(Ordering::Relaxed) > 0 || lock(&self.asked).elapsed() < IDLE {
+                continue;
+            }
             match self.served.open_files() {
                 0 => {
-                    println!("nobody has kept it for {}s, and no file is open in it", GRACE.as_secs());
+                    println!("nobody keeps it, nothing was asked of it for a while, and no file is open in it");
                     break;
                 }
                 open => {

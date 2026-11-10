@@ -1330,6 +1330,10 @@ fn main() -> Result<()> {
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
     vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(PathBuf::from));
+    // What is asked of a project nothing holds is answered by a host, started as this program.
+    if let Ok(program) = std::env::current_exe() {
+        project::host::start_hosts_with(program);
+    }
     let profile = cli.profile.then(std::time::Instant::now);
     // What the command line asks is a command: its work weighed as one, over the host's own.
     let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
@@ -1759,23 +1763,17 @@ fn serve_project(
         }
         return Ok(());
     }
-    let found = Connection::connect(&p.root);
-    let started = found.is_none();
-    let mut host = if let Some(host) = found {
-        if backend.is_some() || address.is_some() {
-            eprintln!("a host serves it already, as it does: --backend and --address are for one started");
+    let mut args = Vec::new();
+    for (flag, value) in [("--backend", backend), ("--address", address)] {
+        if let Some(value) = value {
+            args.extend([flag.to_string(), value.to_string()]);
         }
-        host
-    } else {
-        let mut args = Vec::new();
-        for (flag, value) in [("--backend", backend), ("--address", address)] {
-            if let Some(value) = value {
-                args.extend([flag.to_string(), value.to_string()]);
-            }
-        }
-        args.extend(host::Strays::args(strays));
-        project::host::start(&p.root, &std::env::current_exe()?, &args)?
-    };
+    }
+    args.extend(host::Strays::args(strays));
+    let (mut host, started) = project::host::serving(&p.root, &std::env::current_exe()?, &args)?;
+    if !started && (backend.is_some() || address.is_some()) {
+        eprintln!("a host serves it already, as it does: --backend and --address are for one started");
+    }
     let FromHost::Kept { at, note } = host.ask(&ToHost::Keep { who: "pe2-cli project serve".into() })? else {
         anyhow::bail!("the host would not keep serving");
     };

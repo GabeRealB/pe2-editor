@@ -224,15 +224,88 @@ pub fn borrow(root: &Path, who: &str) -> Option<Lease> {
 /// # Errors
 /// No host could be started, or it would not keep serving.
 pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<Lease> {
-    let mut connection = match Connection::connect(root) {
-        Some(connection) => connection,
-        None => start(root, program, args)?,
-    };
+    let (mut connection, _) = serving(root, program, args)?;
     match connection.ask(&ToHost::Keep { who: who.to_string() })? {
         FromHost::Kept { at, note } => Ok(Lease { connection, at, note }),
         FromHost::Error { why } => bail!(why),
         other => bail!("the host answered {other:?}"),
     }
+}
+
+/// How long a host told to stop is waited for to be gone.
+const STOPPING: Duration = Duration::from_secs(30);
+
+/// Whether a host runs for the project in `root`: one has its host lock.
+#[must_use]
+pub fn running(root: &Path) -> bool {
+    let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(DIR).join(LOCK)) else { return false };
+    let free = lock.try_lock().is_ok();
+    if free {
+        let _ = lock.unlock();
+    }
+    !free
+}
+
+/// A connection to a host serving the project's folder, and whether it was started for this: the one running, or one
+/// started where none runs - `program` being `pe2-cli`, given `args` after `project host`. A host that only holds the
+/// project, started to answer what commands ask (`ensure`), serves nowhere: it is told to stop, and one that serves
+/// started in its place.
+///
+/// # Errors
+/// No host could be started.
+pub fn serving(root: &Path, program: &Path, args: &[String]) -> Result<(Connection, bool)> {
+    if let Some(mut host) = Connection::connect(root) {
+        match host.ask(&ToHost::Status) {
+            Ok(FromHost::Status { at, .. }) if at.is_empty() => {
+                let _ = host.ask(&ToHost::Stop);
+                drop(host);
+                let told = Instant::now();
+                while running(root) && told.elapsed() < STOPPING {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            _ => return Ok((host, false)),
+        }
+    }
+    Ok((start(root, program, args)?, true))
+}
+
+/// The program a host is started as, where this one starts hosts for what is asked of a project (`ensure`).
+static STARTER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Start hosts as this program (`pe2-cli`) from now on, where something is asked of a project nothing holds.
+pub fn start_hosts_with(program: std::path::PathBuf) {
+    let _ = STARTER.set(program);
+}
+
+/// Have a host run for the project in `root`, to hold it and answer what is asked of it: started where none runs,
+/// serving its folder nowhere. Whether one runs. None is started by a program that was not told what a host is
+/// started as (`start_hosts_with`), nor by one working under another's lock - which then does the work itself.
+#[must_use]
+pub fn ensure(root: &Path) -> bool {
+    let Some(program) = STARTER.get() else { return false };
+    if crate::lock::inherited(root) {
+        return false;
+    }
+    if Connection::connect(root).is_some() {
+        return true;
+    }
+    match start(root, program, &["--backend".to_string(), "none".to_string()]) {
+        Ok(_) => true,
+        Err(e) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("no host could be started for {}: {e:#}; the work is done here", shown(root)));
+            false
+        }
+    }
+}
+
+/// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
+/// where it lent the project, or something else holds it.
+#[must_use]
+pub fn answers(root: &Path) -> bool {
+    let status = Connection::connect(root).and_then(|mut host| host.ask(&ToHost::Status).ok());
+    matches!(status, Some(FromHost::Status { holder, .. }) if holder == "the host" || holder == "nobody")
 }
 
 /// How long a host started is waited for to listen, while it runs (one that ends says why at once): long enough for
@@ -264,6 +337,7 @@ pub fn start(root: &Path, program: &Path, args: &[String]) -> Result<Connection>
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        keep_output_to_ourselves();
     }
     let mut child = command.spawn().with_context(|| format!("starting {}", program.display()))?;
     let started = Instant::now();
@@ -283,6 +357,24 @@ pub fn start(root: &Path, program: &Path, args: &[String]) -> Result<Connection>
             bail!("the host did not listen within {}s", STARTING.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Keep what this process reads and writes - its standard input, output and error - from the processes it starts
+/// from now on, but those given them. Windows hands a process started every handle of its starter that may be
+/// inherited, whatever it is given as its own: a host started by a command would hold on to what the command writes
+/// to, and whoever reads that - a script, a test, a terminal's pipe - would wait for the host to end.
+#[cfg(windows)]
+fn keep_output_to_ourselves() {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    let ours = [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()];
+    for handle in ours.into_iter().filter(|handle| !handle.is_null()) {
+        // SAFETY: a handle of this process, open for as long as it runs; only whether it is inherited changes.
+        unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0) };
     }
 }
 

@@ -20,6 +20,9 @@ use crate::{Reply, Request, View, answer, link};
 
 /// How long a request waits for an editor opening the project to listen.
 const EDITOR_STARTING: Duration = Duration::from_secs(10);
+/// How long a host that holds the project, or is about to, is asked before the work is done here instead: one started
+/// a moment ago listens once it has read the project.
+const HOST_STARTING: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long a request waits for another brief holder of the project (another agent's request) to let go.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -62,6 +65,18 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     // The window is the editor's alone: asked of none, it is no reason to take the project.
     if request.uses_window() {
         return Reply::Error("no editor has the project open".to_string());
+    }
+    // Nothing holds it: a host does, from now on - started where none runs - and answers this and what is asked next
+    // with the project open, where each would open it anew here. Where it lent the project, or none can be started,
+    // the work is done here, under the lock.
+    if project::host::ensure(root) {
+        let asked = std::time::Instant::now();
+        while asked.elapsed() < HOST_STARTING && project::host::answers(root) {
+            if let Some(reply) = link::forward(root, request) {
+                return reply;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     let lock = match Lock::acquire_within(root, "pe2-cli mcp", PATIENCE) {
         Ok(lock) if lock.unprotected().is_some() => {
