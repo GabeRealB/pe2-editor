@@ -3044,6 +3044,7 @@ pub fn load_unsandboxed(name: &str, bytes: &[u8], origin: Origin, unsandboxed: U
 }
 
 fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<Loadable> {
+    anyhow::ensure!(!super::forbidden(), "{name}: this process loads no extension (it only serves files)");
     let _span = tracing::info_span!("component loaded", name = %name).entered();
     let trust = unsandboxed.as_ref().map(|u| u.trust.clone());
     let build = trust.clone().unwrap_or_else(|| crate::extract::sha1_hex(bytes));

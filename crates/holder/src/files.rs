@@ -1,49 +1,55 @@
 //! The project served as a filesystem while something holds it, at its `assets` folder, by the backend this machine
-//! says (`project.local.toml`, `[filesystem] serve`) - by the host (`pe2-cli project host`, `project::host`), which the
-//! holder starts where none runs and keeps while it has the project, and which serves on after it, while anything uses
-//! what it serves. Opening the project borrows it from the host (`Lock::try_acquire`), so what programs write through
-//! the folder reaches the holder on its link as edits (`mcp::Request::Edit`, `Edits`) - the editor applies them between
-//! frames as steps of the session's log (`Workspace::apply_edit`); the program waits for it, as an agent waits for its
+//! says (`project.local.toml`, `[filesystem] serve`) - by the server (`pe2-cli project server`, `project::server`),
+//! which the holder starts where none runs, keeps while it has the project and feeds: the holder has the project's
+//! only index, and the server serves what the holder lists of it (`Index::served`), sent on the server's lease after
+//! each refresh - whole at first, then what changed - by a thread of its own, so that the holder never waits on the
+//! server. It serves from the first listing on. What programs write through the folder reaches the holder on its
+//! link as edits (`mcp::Request::Edit`, `Edits`): the editor applies them between frames as steps of the session's
+//! log (`Workspace::apply_edit`), a host as steps of its history; the program waits for it, as an agent waits for its
 //! request.
 //!
-//! The holder has the project's only index: the host keeps none while it does, and serves what the holder lists of it
-//! (`Index::served`), sent on the host's lease after each refresh - whole at first, then what changed - by a thread of
-//! its own, so that the holder never waits on the host.
-//!
-//! The host does not serve over files in the folder that are not the project's (`vfs::strays`): the user chooses to set
-//! them aside or take them in, and the host is started again to.
+//! The server does not serve over files in the folder that are not the project's (`vfs::strays`): the user chooses to
+//! set them aside or take them in, and the server is started again to.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use project::host::{Listing, ToHost};
+use project::server::{FromServer, Lease, Listing, ToServer};
 
-/// The host kept serving the project, or why it is not.
+/// The server kept serving the project and fed what is served, or why it is not.
 pub struct Files {
     project: project::Project,
+    /// What a server started for it is started with, besides what is done with strays.
+    args: Vec<String>,
     state: Arc<Mutex<Kept>>,
     /// What is served, the newest, for the thread sending it.
-    shown: mpsc::Sender<Arc<Listing>>,
+    shown: mpsc::Sender<Shown>,
 }
+
+/// What the thread sending what is served is given: the listing, the files of the layers that changed since the one
+/// before, and who waits for it to be served (told by this being dropped).
+struct Shown {
+    listing: Arc<Listing>,
+    changed: Vec<std::path::PathBuf>,
+    served: Option<mpsc::Sender<()>>,
+}
+
+/// How long who made a change waits for the server to serve it.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 enum Kept {
     Starting,
-    /// Where it serves and what it says of how; the lease, which the thread sending what is served writes on.
-    Served(String, Option<String>, Arc<Mutex<project::host::Lease>>),
+    /// The lease, which the thread sending what is served writes on; where it serves and what it says of how, once it
+    /// took what is served.
+    Leased(Arc<Mutex<Lease>>, Option<(String, Option<String>)>),
     /// Why not, and how many files in the folder are not the project's (none where that is not why).
     Failed(String, usize),
-}
-
-impl From<project::host::Lease> for Kept {
-    fn from(lease: project::host::Lease) -> Kept {
-        Kept::Served(lease.at.clone(), lease.note.clone(), Arc::new(Mutex::new(lease)))
-    }
 }
 
 /// How serving goes.
 pub enum State {
     Starting,
-    /// Where, and what the host says of how it serves.
+    /// Where, and what the server says of how it serves.
     Served(String, Option<String>),
     Failed {
         why: String,
@@ -58,59 +64,86 @@ pub enum Strays {
     TakeIn,
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Files {
-    /// Keep the host serving the project, started where none runs, off the caller's thread: none where this machine
-    /// serves nothing and no host serves it already. After the project is taken: the host starts beside the editor's
-    /// own opening rather than before it, reading the project without its store (as cheap as with it), and takes it
-    /// once the editor lets go of it.
+    /// Keep the server serving the project, started where none runs, off the caller's thread, and feed it: none where
+    /// this machine serves nothing and no server serves it already. After the project is taken: what is served is
+    /// the holder's to list.
     #[must_use]
     pub fn keep(project: &project::Project) -> Option<Files> {
-        let root = &project.root;
         let machine = extensions::filesystem_defaults().serve;
         let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
-        if says == vfs::backend::Setting::None && project::host::Connection::connect(root).is_none() {
+        if says == vfs::backend::Setting::None && !project::server::running(&project.root) {
             return None;
         }
-        let state = Arc::new(Mutex::new(Kept::Starting));
-        let (kept_project, kept_state) = (project.clone(), state.clone());
-        std::thread::spawn(move || {
-            let kept = kept(&kept_project, None);
-            *kept_state.lock().unwrap_or_else(PoisonError::into_inner) = kept;
-        });
-        let (shown, newest) = mpsc::channel();
-        let sending = state.clone();
-        let _ = std::thread::Builder::new().name("served".into()).spawn(move || send_shown(&sending, &newest));
-        Some(Files { project: project.clone(), state, shown })
+        Some(Files::feed(project, Vec::new()))
     }
 
-    /// What is served now, as the index lists it: sent to the host, after what was sent before.
+    /// Keep the server serving the project - one started with `args` (after `project server`) where none runs - off
+    /// the caller's thread, and feed it what is shown from now on.
+    #[must_use]
+    pub fn feed(project: &project::Project, args: Vec<String>) -> Files {
+        let state = Arc::new(Mutex::new(Kept::Starting));
+        let (kept_project, kept_state, kept_args) = (project.clone(), state.clone(), args.clone());
+        std::thread::spawn(move || {
+            let kept = kept(&kept_project, &kept_args);
+            *lock(&kept_state) = kept;
+        });
+        let (shown, newest) = mpsc::channel();
+        let (sending, sent_of) = (state.clone(), project.clone());
+        let send = move || send_shown(&sent_of, &sending, &newest);
+        let _ = std::thread::Builder::new().name("served".into()).spawn(send);
+        Files { project: project.clone(), args, state, shown }
+    }
+
+    /// What is served now, as the index lists it: sent to the server, after what was sent before.
     pub fn show(&self, listing: Arc<Listing>) {
-        let _ = self.shown.send(listing);
+        let _ = self.shown.send(Shown { listing, changed: Vec::new(), served: None });
+    }
+
+    /// What is served now, after these files of the layers changed: the server told of them first - what it reads of
+    /// them is read again before what is listed is served - and, where it serves already, waited for to serve it, so
+    /// that who made the change finds it in the folder.
+    pub fn show_changed(&self, changed: Vec<std::path::PathBuf>, listing: Arc<Listing>) {
+        let (served, waited) = mpsc::channel();
+        let wait = matches!(self.state(), State::Served(..));
+        let _ = self.shown.send(Shown { listing, changed, served: wait.then_some(served) });
+        if wait {
+            let _ = waited.recv_timeout(PATIENCE);
+        }
     }
 
     #[must_use]
     pub fn state(&self) -> State {
-        match &*self.state.lock().unwrap_or_else(PoisonError::into_inner) {
-            Kept::Starting => State::Starting,
-            Kept::Served(at, note, _) => State::Served(at.clone(), note.clone()),
+        match &*lock(&self.state) {
+            Kept::Starting | Kept::Leased(_, None) => State::Starting,
+            Kept::Leased(_, Some((at, note))) => State::Served(at.clone(), note.clone()),
             Kept::Failed(why, strays) => State::Failed { why: why.clone(), strays: *strays },
         }
     }
 
-    /// Start the host again, doing this with the files that are not the project's: off the caller's thread, which is
-    /// woken by `done` once it is.
+    /// Start the server again, doing this with the files that are not the project's: off the caller's thread, which
+    /// is woken by `done` once it is kept. What is served is sent to it again, whole.
     pub fn resolve(&self, strays: Strays, done: impl FnOnce() + Send + 'static) {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = Kept::Starting;
+        *lock(&self.state) = Kept::Starting;
         let (project, state) = (self.project.clone(), self.state.clone());
+        let mut args = self.args.clone();
+        args.extend(match strays {
+            Strays::SetAside => ["--strays".to_string(), "set-aside".to_string()],
+            Strays::TakeIn => ["--strays".to_string(), "take-in".to_string()],
+        });
         std::thread::spawn(move || {
-            let kept = kept(&project, Some(strays));
-            *state.lock().unwrap_or_else(PoisonError::into_inner) = kept;
+            let kept = kept(&project, &args);
+            *lock(&state) = kept;
             done();
         });
     }
 }
 
-/// This program, as it names itself to the host it keeps.
+/// This program, as it names itself to the server it keeps.
 fn who() -> &'static str {
     static WHO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     WHO.get_or_init(|| {
@@ -120,55 +153,68 @@ fn who() -> &'static str {
     })
 }
 
-/// The host kept, started where none runs - told what to do with what is not the project's, where told - or why not.
-fn kept(project: &project::Project, strays: Option<Strays>) -> Kept {
-    let args: Vec<String> = match strays {
-        None => vec![],
-        Some(Strays::SetAside) => vec!["--strays".into(), "set-aside".into()],
-        Some(Strays::TakeIn) => vec!["--strays".into(), "take-in".into()],
+/// `pe2-cli`, which the server is: this program where it is that, else the one beside it.
+fn cli() -> anyhow::Result<std::path::PathBuf> {
+    let program = std::env::current_exe()?;
+    let name = program.file_stem().map(|n| n.to_string_lossy().into_owned());
+    let cli = if name.as_deref() == Some("pe2-cli") { program } else { project::host::cli_beside(&program) };
+    if !cli.is_file() {
+        anyhow::bail!("{} is not there: the server serving the files is `pe2-cli`", cli.display());
+    }
+    Ok(cli)
+}
+
+/// The server kept, started with `args` where none runs, or why not.
+fn kept(project: &project::Project, args: &[String]) -> Kept {
+    // The one running, whatever program this is; one started is `pe2-cli`.
+    let kept = match project::server::keep_running(&project.root, who()) {
+        Some(lease) => Ok(lease),
+        None => cli().and_then(|program| project::server::keep(&project.root, who(), &program, args)),
     };
-    let program = std::env::current_exe().map(|exe| project::host::cli_beside(&exe));
-    let kept = program.map_err(anyhow::Error::from).and_then(|program| {
-        if !program.is_file() {
-            anyhow::bail!("{} is not there: the host serving the files is `pe2-cli`", program.display());
-        }
-        project::host::keep(&project.root, who(), &program, &args)
-    });
     match kept {
-        Ok(lease) => lease.into(),
-        Err(e) => {
-            // What its folder holds that is not the project's, where what serves it serves at one: why, most likely.
-            let machine = extensions::filesystem_defaults().serve;
-            let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
-            let at = &project.filesystem.at;
-            let how = project::content::Use::general();
-            let serving = vfs::backend::choose(&says, vfs::backend::Can::WRITTEN, at, &how, false).ok().flatten();
-            let strays = serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len());
-            Kept::Failed(format!("{e:#}"), strays)
-        }
+        Ok(lease) => Kept::Leased(Arc::new(Mutex::new(lease)), None),
+        Err(e) => Kept::Failed(format!("{e:#}"), strays_in(project)),
     }
 }
 
-/// Send what is served to the host as it changes: the newest listing each time, whole to a lease that has none yet,
-/// else what changed since the last it took. What the host is not keeping yet waits for it.
-fn send_shown(state: &Mutex<Kept>, newest: &mpsc::Receiver<Arc<Listing>>) {
+/// How many files the project's folder holds that are not the project's, where what serves it serves at one: why it
+/// is not served, most likely.
+fn strays_in(project: &project::Project) -> usize {
+    let machine = extensions::filesystem_defaults().serve;
+    let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
+    let at = &project.filesystem.at;
+    let how = project::content::Use::general();
+    let serving = vfs::backend::choose(&says, vfs::backend::Can::WRITTEN, at, &how, false).ok().flatten();
+    serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
+}
+
+/// Send what is served to the server as it changes: the newest listing each time, whole to a lease that has none
+/// yet, else what changed since the last it took. What the server is not kept for yet waits for it.
+fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>) {
     let mut pending: Option<Arc<Listing>> = None;
+    // The files that changed since what was sent last, and who waits for what is pending to be served: let go of -
+    // which tells them - once it is, or will not be.
+    let (mut changed, mut waiting) = (Vec::new(), Vec::new());
     // The lease the last listing went on, and that listing.
-    let mut sent: Option<(Arc<Mutex<project::host::Lease>>, Arc<Listing>)> = None;
+    let mut sent: Option<(Arc<Mutex<Lease>>, Arc<Listing>)> = None;
     loop {
-        match newest.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(listing) => pending = Some(listing),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(shown) => Some(shown),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        for shown in first.into_iter().chain(newest.try_iter()) {
+            pending = Some(shown.listing);
+            changed.extend(shown.changed);
+            waiting.extend(shown.served);
         }
-        while let Ok(listing) = newest.try_recv() {
-            pending = Some(listing);
-        }
-        let lease = match &*state.lock().unwrap_or_else(PoisonError::into_inner) {
-            Kept::Served(_, _, lease) => lease.clone(),
+        // Whoever waits is told when this pass ends, however it does.
+        let _told = std::mem::take(&mut waiting);
+        let lease = match &*lock(state) {
+            Kept::Leased(lease, _) => lease.clone(),
             _ => continue,
         };
-        // A new lease (the host started again) takes the whole listing, the last one's at least.
+        // A new lease (the server started again) takes the whole listing, the last one's at least.
         let same_lease = sent.as_ref().is_some_and(|(to, _)| Arc::ptr_eq(to, &lease));
         let Some(listing) =
             pending.take().or_else(|| (!same_lease).then(|| sent.as_ref().map(|(_, l)| l.clone())).flatten())
@@ -177,25 +223,47 @@ fn send_shown(state: &Mutex<Kept>, newest: &mpsc::Receiver<Arc<Listing>>) {
         };
         let said = match sent.as_ref().filter(|_| same_lease) {
             Some((_, before)) => {
-                let (shown, gone) = project::host::changes(before, &listing);
-                if shown.is_empty() && gone.is_empty() {
+                let (shown, gone) = project::server::changes(before, &listing);
+                if shown.is_empty() && gone.is_empty() && changed.is_empty() {
                     continue;
                 }
-                ToHost::Shown { whole: false, shown, gone }
+                ToServer::Shown { whole: false, shown, gone }
             }
-            None => ToHost::Shown {
+            None => ToServer::Shown {
                 whole: true,
                 shown: listing.iter().map(|(p, s)| (p.clone(), s.clone())).collect(),
                 gone: vec![],
             },
         };
-        let told = lease.lock().unwrap_or_else(PoisonError::into_inner).tell(&said);
-        if let Ok(project::host::FromHost::Done) = told {
-            sent = Some((lease, listing));
-        } else {
-            // Holding the project itself, or gone: the whole listing again, once it takes it.
-            sent = None;
-            pending = Some(listing);
+        // What changed in the layers first: what it reads of the files listed is read again before they are served.
+        if !changed.is_empty() {
+            let _ = lock(&lease).tell(&ToServer::Changed { paths: std::mem::take(&mut changed) });
         }
+        let told = lock(&lease).tell(&said);
+        let failed = match told {
+            Ok(FromServer::Serving { at, note }) => {
+                if let Kept::Leased(now, serving) = &mut *lock(state)
+                    && Arc::ptr_eq(now, &lease)
+                {
+                    *serving = Some((at, note));
+                }
+                sent = Some((lease, listing));
+                continue;
+            }
+            // Whoever held the project before feeds it still, its connection yet to end: again in a moment, whole.
+            Ok(FromServer::Fed { .. }) => None,
+            // It does not serve - over what is in the folder that is not the project's, most likely - or is gone.
+            Ok(FromServer::Error { why }) => Some(why),
+            Ok(other) => Some(format!("the server answered {other:?}")),
+            Err(e) => Some(format!("the server serving it stopped ({e:#})")),
+        };
+        if let Some(why) = failed {
+            let mut state = lock(state);
+            if matches!(&*state, Kept::Leased(now, _) if Arc::ptr_eq(now, &lease)) {
+                *state = Kept::Failed(why, strays_in(project));
+            }
+        }
+        sent = None;
+        pending = Some(listing);
     }
 }

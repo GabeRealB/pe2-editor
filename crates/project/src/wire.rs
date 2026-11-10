@@ -60,7 +60,6 @@ mod tests {
         let said = [
             ToHost::Keep { who: "a test".into() },
             ToHost::Lend { who: "a test".into() },
-            ToHost::Changed { paths: vec!["/a/b".into()] },
             ToHost::Status,
             ToHost::Stop,
         ];

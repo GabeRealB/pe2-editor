@@ -1,76 +1,41 @@
-//! The host: the process serving a project as a filesystem (`pe2-cli project host`), which keeps serving it for as long
-//! as anyone wants it - an editor, a `project serve`, a program still using what is served - whoever holds the project
-//! meanwhile. It holds the project itself while nothing else does; a process taking the project lock while the host
-//! holds it borrows it (`Lock::try_acquire`): the host lets go of the lock, its history and the cache's record store, and
-//! serves on from what it reads of the layers, sending what programs write to whoever holds the project, until the
-//! borrower lets go and it takes the project back. The mount never goes away in between.
+//! The host: the process holding a project while no editor does (`pe2-cli project host`) - its lock, its index and a
+//! history of its own - which answers what is asked of the project on the holder's link (`mcp::link`): the edits the
+//! command line and agents make, what programs write through the folder served, the reads, the builds. One is
+//! started by whoever asks something of a project nothing holds (`ensure`), and by `pe2-cli project serve`; it stops a
+//! while after nothing was asked of it and nothing keeps it. Where it serves the project's folder it keeps the server
+//! doing so (`server`) and feeds it what is served, as an editor does.
+//!
+//! A process taking the project lock while the host holds it borrows it (`Lock::try_acquire`): the host lets go of
+//! the lock, its history, its index and its link, and no longer feeds the server - whoever holds the project does -
+//! until the borrower lets go and it takes the project back.
 //!
 //! What a process says to the host goes over a local socket - `.cache/host.sock`, a named pipe on Windows - one CBOR
-//! message a frame (`ToHost`, `FromHost`, `wire`). A connection asking to keep it (`Keep`) or borrowing the project (`Lend`) is
-//! a lease while it stays open: the host stops a while after none is left, once no file is open in what it serves -
-//! what only looks at it keeps nothing - unless the machine says to keep it (`[filesystem] keep`).
+//! message a frame (`ToHost`, `FromHost`, `wire`). A connection asking to keep the folder served (`Keep`) or borrowing
+//! the project (`Lend`) is a lease while it stays open.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use interprocess::local_socket::Name;
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{Name, Stream};
 use serde::{Deserialize, Serialize};
-use std::io::BufReader;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::cache::DIR;
+use crate::role::{Link, Role};
 
-/// The host's socket, in the cache (Unix).
-pub const SOCKET: &str = "host.sock";
-/// The file a host locks for as long as it runs: one host a project.
-pub const LOCK: &str = "host.lock";
-/// What a host started by another process writes of itself.
-pub const LOG: &str = "host.log";
-
-/// What is served of the project, by each path in the served folder (`Index::served`): what the holder sends the host,
-/// which serves it while it does not hold the project itself.
-pub type Listing = std::collections::BTreeMap<String, Shown>;
-
-/// A path of what is served.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "is", rename_all = "snake_case")]
-pub enum Shown {
-    Folder,
-    /// A node: a folder of its files, and the entries inside it.
-    Node,
-    /// A file: where a layer holds it, its length and when it changed (seconds and nanoseconds since the epoch);
-    /// whether it is a node's file (the folders its name makes are the node's, not entries).
-    File {
-        disk: std::path::PathBuf,
-        size: u64,
-        modified: (u64, u32),
-        of_files: bool,
-    },
-}
-
-/// What changed from one listing to another: what is new or other now, and what is gone.
-#[must_use]
-pub fn changes(before: &Listing, now: &Listing) -> (Vec<(String, Shown)>, Vec<String>) {
-    let shown = now.iter().filter(|(path, it)| before.get(*path) != Some(*it)).map(|(p, it)| (p.clone(), it.clone()));
-    let gone = before.keys().filter(|path| !now.contains_key(*path)).cloned();
-    (shown.collect(), gone.collect())
-}
+/// The host, as a process of a project.
+pub static ROLE: Role = Role { command: "host", socket: "host.sock", pipe: "pe2-host", lock: "host.lock", log: "host.log" };
 
 /// What a process says to the host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "say", rename_all = "snake_case")]
 pub enum ToHost {
-    /// Keep serving while this connection lasts.
+    /// Keep the project's folder served while this connection lasts.
     Keep { who: String },
     /// Let go of the project for this connection's process, until the connection ends.
     Lend { who: String },
-    /// These files changed - an edit made by whoever holds the project - for what is served to follow at once.
-    Changed { paths: Vec<std::path::PathBuf> },
-    /// What is served, from whoever holds the project: the whole listing (`whole`), or what changed since the last.
-    Shown { whole: bool, shown: Vec<(String, Shown)>, gone: Vec<String> },
     /// What it is doing.
     Status,
-    /// Stop serving, now.
+    /// Stop, now.
     Stop,
 }
 
@@ -78,10 +43,10 @@ pub enum ToHost {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "say", rename_all = "snake_case")]
 pub enum FromHost {
-    /// Serving, where (a folder, an address), for as long as the connection lasts.
+    /// The folder is served, where (a folder, an address), for as long as the connection lasts.
     Kept {
         at: String,
-        /// What who keeps it should know of how it serves (Windows programs cannot reach a mount, say).
+        /// What who keeps it should know of how it is served (Windows programs cannot reach a mount, say).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
@@ -93,15 +58,13 @@ pub enum FromHost {
     },
     Status {
         pid: u32,
-        at: String,
+        /// Whether it keeps the project's folder served.
+        #[serde(default)]
+        serves: bool,
         holder: String,
         leases: usize,
-        /// How many files are open in what it serves.
-        open: usize,
     },
     Stopping,
-    /// What was said is done.
-    Done,
     Error {
         why: String,
     },
@@ -130,7 +93,7 @@ pub fn local_name(root: &Path, file: &str, prefix: &str) -> std::io::Result<Name
     {
         use interprocess::local_socket::GenericFilePath;
         // `sun_path`: 108 bytes on Linux, 104 on macOS, its terminating zero among them.
-        let path = root.join(DIR).join(file);
+        let path = root.join(crate::cache::DIR).join(file);
         let path = if path.as_os_str().len() < 100 {
             path
         } else {
@@ -146,30 +109,17 @@ pub fn local_name(root: &Path, file: &str, prefix: &str) -> std::io::Result<Name
     }
 }
 
-/// The host's socket for the project in `root`.
-///
-/// # Errors
-/// The name cannot be made.
-pub fn name(root: &Path) -> std::io::Result<Name<'static>> {
-    local_name(root, SOCKET, "pe2-host")
-}
-
 /// A connection to the host.
+#[derive(Debug)]
 pub struct Connection {
-    stream: BufReader<Stream>,
-}
-
-impl std::fmt::Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("host connection")
-    }
+    link: Link,
 }
 
 impl Connection {
-    /// Connect to the host serving the project in `root`; none where none does.
+    /// Connect to the host of the project in `root`; none where none listens.
     #[must_use]
     pub fn connect(root: &Path) -> Option<Connection> {
-        Stream::connect(name(root).ok()?).ok().map(|stream| Connection { stream: BufReader::new(stream) })
+        ROLE.connect(root).map(|link| Connection { link })
     }
 
     /// Say something to the host, and read its answer.
@@ -177,34 +127,19 @@ impl Connection {
     /// # Errors
     /// The host is gone, or answered with what is not an answer.
     pub fn ask(&mut self, said: &ToHost) -> Result<FromHost> {
-        crate::wire::send(self.stream.get_mut(), said)?;
-        crate::wire::receive(&mut self.stream)?.context("the host closed the connection")
+        self.link.ask(said).context("the host")
     }
 
     /// Wait for the host to close the connection (it stops).
-    pub fn closed(mut self) {
-        while matches!(crate::wire::receive::<FromHost>(&mut self.stream), Ok(Some(_))) {}
+    pub fn closed(self) {
+        self.link.closed();
     }
 }
 
-/// A lease on the host: it serves while this is held.
+/// The project borrowed from the host: it takes it back once this is dropped.
 #[derive(Debug)]
 pub struct Lease {
-    connection: Connection,
-    /// Where it serves.
-    pub at: String,
-    /// What the host says of how it serves.
-    pub note: Option<String>,
-}
-
-impl Lease {
-    /// Say something more on the lease's connection, and read the answer.
-    ///
-    /// # Errors
-    /// The host is gone.
-    pub fn tell(&mut self, said: &ToHost) -> Result<FromHost> {
-        self.connection.ask(said)
-    }
+    _connection: Connection,
 }
 
 /// Borrow the project from the host holding it, for `who`: the host lets go of the lock, and takes it back once the
@@ -213,56 +148,34 @@ impl Lease {
 pub fn borrow(root: &Path, who: &str) -> Option<Lease> {
     let mut connection = Connection::connect(root)?;
     match connection.ask(&ToHost::Lend { who: who.to_string() }) {
-        Ok(FromHost::Lent) => Some(Lease { connection, at: String::new(), note: None }),
+        Ok(FromHost::Lent) => Some(Lease { _connection: connection }),
         _ => None,
-    }
-}
-
-/// Keep the host serving the project in `root` for `who`, starting one where none runs - `program` being `pe2-cli`,
-/// given `args` after `project host` - and waiting for it to listen.
-///
-/// # Errors
-/// No host could be started, or it would not keep serving.
-pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<Lease> {
-    let (mut connection, _) = serving(root, program, args)?;
-    match connection.ask(&ToHost::Keep { who: who.to_string() })? {
-        FromHost::Kept { at, note } => Ok(Lease { connection, at, note }),
-        FromHost::Error { why } => bail!(why),
-        other => bail!("the host answered {other:?}"),
     }
 }
 
 /// How long a host told to stop is waited for to be gone.
 const STOPPING: Duration = Duration::from_secs(30);
 
-/// Whether a host runs for the project in `root`: one has its host lock.
+/// Whether a host runs for the project in `root`.
 #[must_use]
 pub fn running(root: &Path) -> bool {
-    let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(DIR).join(LOCK)) else { return false };
-    let free = lock.try_lock().is_ok();
-    if free {
-        let _ = lock.unlock();
-    }
-    !free
+    ROLE.running(root)
 }
 
-/// A connection to a host serving the project's folder, and whether it was started for this: the one running, or one
-/// started where none runs - `program` being `pe2-cli`, given `args` after `project host`. A host that only holds the
-/// project, started to answer what commands ask (`ensure`), serves nowhere: it is told to stop, and one that serves
-/// started in its place.
+/// A connection to a host keeping the project's folder served, and whether it was started for this: the one running,
+/// or one started where none runs - `program` being `pe2-cli`, given `args` after `project host`. A host that only
+/// holds the project, started to answer what commands ask (`ensure`), serves nowhere: it is told to stop, and one
+/// that serves started in its place.
 ///
 /// # Errors
 /// No host could be started.
 pub fn serving(root: &Path, program: &Path, args: &[String]) -> Result<(Connection, bool)> {
     if let Some(mut host) = Connection::connect(root) {
         match host.ask(&ToHost::Status) {
-            Ok(FromHost::Status { at, .. }) if at.is_empty() => {
+            Ok(FromHost::Status { serves: false, .. }) => {
                 let _ = host.ask(&ToHost::Stop);
                 drop(host);
-                let told = Instant::now();
-                while running(root) && told.elapsed() < STOPPING {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                let _ = ROLE.gone_within(root, STOPPING);
             }
             _ => return Ok((host, false)),
         }
@@ -310,11 +223,7 @@ pub fn replace(root: &Path) -> bool {
     }
     let _ = host.ask(&ToHost::Stop);
     drop(host);
-    let told = Instant::now();
-    while running(root) && told.elapsed() < STOPPING {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    !running(root)
+    ROLE.gone_within(root, STOPPING)
 }
 
 /// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
@@ -325,83 +234,13 @@ pub fn answers(root: &Path) -> bool {
     matches!(status, Some(FromHost::Status { holder, .. }) if holder == "the host" || holder == "nobody")
 }
 
-/// How long a host started is waited for to listen, while it runs (one that ends says why at once): long enough for
-/// it to index the project and, where another backend served its folder before, to retire what that one left there -
-/// some tens of seconds for a project listed whole.
-const STARTING: Duration = Duration::from_secs(120);
-
-/// Start a host for the project in `root`, on its own - not ended with this process, nor with its terminal - and connect
-/// to it once it listens. What it says goes to its log in the cache.
+/// Start a host for the project in `root`, on its own - not ended with this process, nor with its terminal - and
+/// connect to it once it listens. What it says goes to its log in the cache.
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.
 pub fn start(root: &Path, program: &Path, args: &[String]) -> Result<Connection> {
-    crate::cache::make(root)?;
-    let log = std::fs::File::create(root.join(DIR).join(LOG))?;
-    let mut command = std::process::Command::new(program);
-    command.args(["project", "host", "--project"]).arg(root).args(args);
-    command.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // A group of its own: a Ctrl-C in the terminal that started it is not its.
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // A console of its own, with no window: not its starter's, so it does not end with that one's terminal - and
-        // not none at all (`DETACHED_PROCESS`, beside which Windows ignores the other), or every console program it
-        // came to start would be given a terminal window of its own.
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        keep_output_to_ourselves();
-    }
-    let mut child = command.spawn().with_context(|| format!("starting {}", program.display()))?;
-    let started = Instant::now();
-    loop {
-        if let Some(connection) = Connection::connect(root) {
-            return Ok(connection);
-        }
-        // Ended at once: another host won the race to serve, or it failed - its log says.
-        if let Some(status) = child.try_wait()? {
-            if let Some(connection) = Connection::connect(root) {
-                return Ok(connection);
-            }
-            let said = std::fs::read_to_string(root.join(DIR).join(LOG)).unwrap_or_default();
-            bail!("the host ended ({status}): {}", said.trim());
-        }
-        if started.elapsed() > STARTING {
-            bail!("the host did not listen within {}s", STARTING.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Keep what this process reads and writes - its standard input, output and error - from the processes it starts
-/// from now on, but those given them. Windows hands a process started every handle of its starter that may be
-/// inherited, whatever it is given as its own: a host started by a command would hold on to what the command writes
-/// to, and whoever reads that - a script, a test, a terminal's pipe - would wait for the host to end.
-#[cfg(windows)]
-fn keep_output_to_ourselves() {
-    use std::os::windows::io::AsRawHandle;
-    unsafe extern "system" {
-        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
-    }
-    const HANDLE_FLAG_INHERIT: u32 = 1;
-    let ours = [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()];
-    for handle in ours.into_iter().filter(|handle| !handle.is_null()) {
-        // SAFETY: a handle of this process, open for as long as it runs; only whether it is inherited changes.
-        unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0) };
-    }
-}
-
-/// Tell the host serving the project in `root`, where one does, that these files changed.
-pub fn changed(root: &Path, paths: Vec<std::path::PathBuf>) {
-    if let Some(mut host) = Connection::connect(root) {
-        let _ = host.ask(&ToHost::Changed { paths });
-    }
+    ROLE.start(root, program, args).map(|link| Connection { link })
 }
 
 /// A path as a person reads it: on Windows, without the verbatim prefix a canonical path has (`\\?\D:\...`).

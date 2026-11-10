@@ -152,10 +152,10 @@ impl Tree {
         Tree::of_listing(&index.served(), inodes)
     }
 
-    /// The tree of what is served, as listed (`project::host::Listing`): its entries first, then the nodes' files.
+    /// The tree of what is served, as listed (`project::server::Listing`): its entries first, then the nodes' files.
     #[must_use]
-    pub fn of_listing(listing: &project::host::Listing, inodes: &mut Inodes) -> Tree {
-        use project::host::Shown;
+    pub fn of_listing(listing: &project::server::Listing, inodes: &mut Inodes) -> Tree {
+        use project::server::Shown;
         let mut tree = Tree::default();
         tree.nodes.insert(
             ROOT,
@@ -447,7 +447,7 @@ impl Served {
     }
 
     /// Serve what is listed (`Index::served`, as whoever holds the project sends it).
-    pub fn show(&self, listing: &project::host::Listing) {
+    pub fn show(&self, listing: &project::server::Listing) {
         let mut tree = {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Tree::of_listing(listing, &mut inodes)

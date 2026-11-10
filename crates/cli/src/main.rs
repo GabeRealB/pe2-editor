@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 mod host;
+mod server;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -531,7 +532,7 @@ enum ProjectCommand {
         #[command(flatten)]
         at: EditAt,
     },
-    /// Take back the last step of whoever holds the project (an editor, or the host serving it)
+    /// Take back the last step of whoever holds the project (an editor, or a host)
     Undo {
         #[command(flatten)]
         at: EditAt,
@@ -569,7 +570,7 @@ enum ProjectCommand {
         /// No longer have the project's folder registered with the system (a sync root, on Windows), and serve nothing
         #[arg(long)]
         forget: bool,
-        /// Stop the host serving it, whoever keeps it
+        /// Stop what serves it, and the host holding it, whoever keeps them
         #[arg(long)]
         stop: bool,
         /// Where its folder holds files that are not the project's, move them beside it (`assets.set-aside`)
@@ -586,7 +587,8 @@ enum ProjectCommand {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
-    /// Serve a project as a filesystem, holding it while nothing else does: what `serve` and the editor start, and keep
+    /// Hold a project while no editor does, answering what is asked of it, and keep its folder served (unless
+    /// `--backend none`): what commands, agents and `serve` start, and keep
     #[command(hide = true)]
     Host {
         #[arg(long, default_value = ".")]
@@ -596,7 +598,20 @@ enum ProjectCommand {
         #[arg(long)]
         address: Option<String>,
         #[arg(long, value_enum, default_value = "refuse")]
-        strays: host::Strays,
+        strays: server::Strays,
+    },
+    /// Serve a project as a filesystem, what whoever holds it lists of it, and nothing else: what a host and the
+    /// editor start, and keep
+    #[command(hide = true)]
+    Server {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        address: Option<String>,
+        #[arg(long, value_enum, default_value = "refuse")]
+        strays: server::Strays,
     },
     /// How a project's generated layers are, by their plans: none, empty, filled, or not as the plan says now - known
     /// without the discs and without reading what was made
@@ -896,7 +911,7 @@ fn signal(project: &Path, config: Option<&str>, events: &[&str]) -> anyhow::Resu
     // nothing does.
     let events_named: Vec<String> = events.iter().map(ToString::to_string).collect();
     let request = mcp::Request::Signal { events: events_named, config: config.map(str::to_string) };
-    if let Some(reply) = mcp::server::signal(&p.root, &request) {
+    if let Some(reply) = mcp::server::ask_holder(&p.root, &request) {
         let said = reply.told().map_err(anyhow::Error::msg)?;
         if !said.is_empty() {
             println!("{said}");
@@ -1529,9 +1544,9 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
         ProjectCommand::Problems { project } => return problems(project),
         ProjectCommand::Serve { project, backend, address, forget, stop, set_aside, take_in } => {
             let strays = match (set_aside, take_in) {
-                (true, _) => host::Strays::SetAside,
-                (_, true) => host::Strays::TakeIn,
-                _ => host::Strays::Refuse,
+                (true, _) => server::Strays::SetAside,
+                (_, true) => server::Strays::TakeIn,
+                _ => server::Strays::Refuse,
             };
             return if *forget {
                 forget_served(project)
@@ -1542,6 +1557,9 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
         ProjectCommand::Backends { project } => return backends(project),
         ProjectCommand::Host { project, backend, address, strays } => {
             return host::run(project, backend.as_deref(), address.as_deref(), *strays);
+        }
+        ProjectCommand::Server { project, backend, address, strays } => {
+            return server::run(project, backend.as_deref(), address.as_deref(), *strays);
         }
         _ => {}
     }
@@ -1602,10 +1620,6 @@ fn edit(op: &vfs::ops::Op, at: &EditAt) -> Result<()> {
     let root = project::Project::load(&at.project)?.root;
     let request = mcp::Request::Edit { op: op.clone(), layer: at.layer.clone() };
     let reply = mcp::server::execute(&root, &request);
-    // Made by whoever holds the project: what is served follows at once, not when the host's watch sees it.
-    if let mcp::Reply::Edited { touched, .. } = &reply {
-        project::host::changed(&root, touched.clone());
-    }
     println!("{}", reply.told().map_err(anyhow::Error::msg)?);
     Ok(())
 }
@@ -1744,24 +1758,29 @@ fn store(command: &StoreCommand) -> Result<()> {
     Ok(())
 }
 
-/// `pe2-cli project serve`: the host keeps serving the project while this runs - started where none runs - or, with
-/// `--stop`, stops.
+/// `pe2-cli project serve`: a host keeps the project's folder served while this runs - started where none runs,
+/// and starting the server that serves it - or, with `--stop`, both stop.
 fn serve_project(
     project: &Path,
     backend: Option<&str>,
     address: Option<&str>,
     stop: bool,
-    strays: host::Strays,
+    strays: server::Strays,
 ) -> Result<()> {
     use project::host::{Connection, FromHost, ToHost};
     let p = project::Project::load(project)?;
     if stop {
-        match Connection::connect(&p.root) {
-            Some(mut host) => {
-                host.ask(&ToHost::Stop)?;
-                println!("the host serving {} stops", project::host::shown(&p.root));
-            }
-            None => println!("nothing serves {}", project::host::shown(&p.root)),
+        // The server first, and waited for: what programs wrote a moment ago it gives the project as it ends, and
+        // whoever holds the project is there to take it.
+        let server = project::server::stop(&p.root);
+        if server && !project::server::ROLE.gone_within(&p.root, std::time::Duration::from_secs(60)) {
+            eprintln!("what serves {} has not stopped yet", project::host::shown(&p.root));
+        }
+        let host = Connection::connect(&p.root).is_some_and(|mut host| host.ask(&ToHost::Stop).is_ok());
+        match (host, server) {
+            (_, true) => println!("what serves {} stops", project::host::shown(&p.root)),
+            (true, false) => println!("the host holding {} stops; nothing served it", project::host::shown(&p.root)),
+            (false, false) => println!("nothing serves {}", project::host::shown(&p.root)),
         }
         return Ok(());
     }
@@ -1771,15 +1790,17 @@ fn serve_project(
             args.extend([flag.to_string(), value.to_string()]);
         }
     }
-    args.extend(host::Strays::args(strays));
+    args.extend(server::Strays::args(strays));
     let (mut host, started) = project::host::serving(&p.root, &std::env::current_exe()?, &args)?;
     if !started && (backend.is_some() || address.is_some()) {
-        eprintln!("a host serves it already, as it does: --backend and --address are for one started");
+        eprintln!("a host keeps it served already, as it is: --backend and --address are for one started");
     }
-    let FromHost::Kept { at, note } = host.ask(&ToHost::Keep { who: "pe2-cli project serve".into() })? else {
-        anyhow::bail!("the host would not keep serving");
+    let (at, note) = match host.ask(&ToHost::Keep { who: "pe2-cli project serve".into() })? {
+        FromHost::Kept { at, note } => (at, note),
+        FromHost::Error { why } => anyhow::bail!(why),
+        other => anyhow::bail!("the host would not keep it served: it answered {other:?}"),
     };
-    let how = if started { "a host started for it" } else { "by the host serving it already" };
+    let how = if started { "a host started for it" } else { "kept so by the host running already" };
     println!("{} served at {at}, {how}: Ctrl-C lets go of it", project::host::shown(&p.root));
     if let Some(note) = note {
         println!("note: {note}");
@@ -1797,9 +1818,12 @@ fn serve_project(
     if stopped.recv().unwrap_or(true) {
         println!("the host stopped");
     } else if p.filesystem.keep {
-        println!("let go: the host serves on, as this machine says (`[filesystem] keep`)");
+        println!("let go: it is served on, as this machine says (`[filesystem] keep`)");
     } else {
-        println!("let go: unless something else keeps it, the host stops in 30s, once no file is open in it");
+        println!(
+            "let go: unless something else keeps it, the host stops once nothing was asked of it for two minutes and \
+             no file is open in what is served, and what serves it after it"
+        );
     }
     Ok(())
 }
@@ -1808,7 +1832,7 @@ fn serve_project(
 fn forget_served(project: &Path) -> Result<()> {
     let p = project::Project::load(project)?;
     for backend in vfs::backend::all() {
-        backend.forget(&p.filesystem.at, &host::served_name(&p)).with_context(|| format!("`{}`", backend.name()))?;
+        backend.forget(&p.filesystem.at, &server::served_name(&p)).with_context(|| format!("`{}`", backend.name()))?;
     }
     println!("{} is registered with nothing", project::host::shown(&p.filesystem.at));
     Ok(())

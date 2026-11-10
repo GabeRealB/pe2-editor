@@ -2343,9 +2343,9 @@ impl Editor {
                     }
                     ui.label(RichText::new(format!("files at {at}")).small().color(theme::weak())).on_hover_text(
                         "The project's merged layers as a folder any program can read and write, each change a step \
-                         of the history (project.local.toml, [filesystem] serve). Its host stops 30 s after nothing \
-                         keeps it - the editor, `pe2-cli project serve` - once no file is open in it, unless \
-                         [filesystem] keep says to serve on.",
+                         of the history (project.local.toml, [filesystem] serve). What serves it stops 30 s after \
+                         nothing keeps it - the editor, a host kept by `pe2-cli project serve` - once no file is \
+                         open in it.",
                     );
                 }
                 // Right to left: the choices, then what they are for.

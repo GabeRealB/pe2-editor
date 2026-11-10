@@ -388,11 +388,15 @@ impl Writes {
         let mut state = self.lock();
         for ((path, _), applied) in given.into_iter().zip(applied) {
             state.applying.remove(&path);
-            if applied.is_ok()
-                && let Some(staged) = state.staged.get_mut(&path)
-            {
-                staged.dirty = false;
-                staged.applied = Some(SystemTime::now());
+            match applied {
+                Ok(()) => {
+                    if let Some(staged) = state.staged.get_mut(&path) {
+                        staged.dirty = false;
+                        staged.applied = Some(SystemTime::now());
+                    }
+                }
+                // It stays as written, shown in the folder and not the project's: said, since nothing else tells.
+                Err(why) => eprintln!("{path}: written, and not taken into the project: {why}"),
             }
         }
     }

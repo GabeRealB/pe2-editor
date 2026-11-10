@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn what_is_served_is_the_whole_stack_whatever_the_view_hides() {
-        use crate::host::Shown;
+        use crate::server::Shown;
         let root = project("served");
         let mut o = open(&root);
         let paths = super::create(

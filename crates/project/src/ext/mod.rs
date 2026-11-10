@@ -433,6 +433,22 @@ fn requirement(text: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Whether this process loads no extension (`forbid`).
+static FORBIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Load no extension in this process, from now on: loading one fails, by its name. What only serves a project's files
+/// says so at its start - so that it may load what a process running an extension's code must not be one with, and
+/// a backend may say it mounts only there (`forbidden`).
+pub fn forbid() {
+    FORBIDDEN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this process loads no extension.
+#[must_use]
+pub fn forbidden() -> bool {
+    FORBIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Extensions {
     /// Load `extensions`, built-ins (`builtin`) or a project's own.
     #[must_use]

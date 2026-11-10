@@ -7,7 +7,7 @@
 //! process finding its project named there works under its parent's lock instead of waiting for it
 //! (`tools/project_lock.py` takes the same lock for the Python tools).
 //!
-//! A project the host serving it holds (`host.rs`) is borrowed from it: the host lets go of the lock when asked, and
+//! A project a host holds (`host.rs`) is borrowed from it: the host lets go of the lock when asked, and
 //! takes it back when the borrower lets go - the lease is held with the lock, and ends after it.
 //!
 //! Some file systems cannot lock a file at all - a WSL folder opened from Windows (`\\wsl.localhost\...`, whose 9P
@@ -138,7 +138,7 @@ impl Lock {
         self.unprotected.as_deref()
     }
 
-    /// Lock the project in `root` for `who` - borrowed from the host serving it, where it holds it - or say who holds
+    /// Lock the project in `root` for `who` - borrowed from the host, where one holds it - or say who holds
     /// it.
     ///
     /// # Errors

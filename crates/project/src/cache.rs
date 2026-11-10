@@ -3,8 +3,8 @@
 //! of time only. It ignores itself (its own `.gitignore`, so no tracked file has to name it), and its `version` names
 //! the schema and the tools that wrote it: a cache written by others is wiped on opening - all but what whoever opens
 //! the cache holds: the project lock (`lock.rs`) and the socket agents reach its editor by (`SOCKET`) - and what the
-//! host serving the project has while it lends it (`host.rs`: its socket, lock and log, and what is written through
-//! what it serves).
+//! project's other processes have while it is opened: a host that lent it (`host.rs`) and the server serving its
+//! folder (`server.rs`), each its socket, lock and log, and what is written through what is served.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -38,10 +38,11 @@ impl Cache {
         let current = std::fs::read_to_string(dir.join("version")).ok();
         if current.as_deref() != Some(version.as_str()) && dir.exists() {
             // Everything but what the process opening the cache holds - the project lock, and its agents' socket - and
-            // the host's.
+            // what a host and the server serving its folder have there.
             for entry in std::fs::read_dir(&dir).with_context(|| format!("{}", dir.display()))? {
                 let entry = entry?;
-                let kept = |n: &str| n.starts_with("lock") || n.starts_with("host.") || n == SOCKET || n == STAGING;
+                let running = |n: &str| n.starts_with("host.") || n.starts_with("server.");
+                let kept = |n: &str| n.starts_with("lock") || running(n) || n == SOCKET || n == STAGING;
                 if entry.file_name().to_str().is_some_and(kept) {
                     continue;
                 }

@@ -130,11 +130,12 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     }
 }
 
-/// Signal events to whoever holds the project in `root` - a host started for it where nothing does - and wait for
-/// what came of them, however long the epochs take. None where nothing can hold it for this program (it works under
-/// another's lock, no host can be started) or the holder lent it: the events are then run by whoever asked.
+/// Ask something of whoever holds the project in `root` - a host started for it where nothing does - and wait for
+/// the answer for as long as the holder's link lives: for what takes long (the epochs events set off) and for what
+/// must not be asked twice (an edit). None where nothing can hold it for this program (it works under another's lock,
+/// no host can be started) or the holder lent it: whoever asked then does the work itself, or says it is not done.
 #[must_use]
-pub fn signal(root: &Path, request: &Request) -> Option<Reply> {
+pub fn ask_holder(root: &Path, request: &Request) -> Option<Reply> {
     greet(root);
     if let Some(reply) = link::forward_patiently(root, request) {
         return Some(reply);

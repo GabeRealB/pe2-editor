@@ -70,8 +70,8 @@ pub struct Snapshot {
     pub said: Option<String>,
     /// What went wrong taking a change in.
     pub error: Option<String>,
-    /// What is served of the project now, where anything changed: for its host (`Files::show`).
-    pub served: Option<Arc<project::host::Listing>>,
+    /// What is served of the project now, where anything changed: for the server (`Files::show`).
+    pub served: Option<Arc<project::server::Listing>>,
 }
 
 /// The worker, as the UI holds it.

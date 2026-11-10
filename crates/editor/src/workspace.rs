@@ -494,7 +494,7 @@ pub struct Opened {
     tree: Arc<Node>,
     /// Agents' link to it, listening since its lock was taken; or why agents cannot reach it.
     link: std::result::Result<mcp::link::Listener, String>,
-    /// The host serving its files, kept from before its lock was taken.
+    /// The server of its files, kept and fed what is served.
     files: Option<crate::files::Files>,
 }
 
@@ -558,7 +558,7 @@ pub struct Leaving {
     _runner: crate::runner::Runner,
     _index: Arc<Index>,
     _lock: Lock,
-    /// The host kept: let go of once the project is, for it to take the project back.
+    /// The server kept: let go of once the project is, for whoever holds it next to feed.
     _files: Option<crate::files::Files>,
 }
 
@@ -620,8 +620,8 @@ impl Workspace {
             }
             locked => locked?,
         };
-        // The host serving its files, started where none runs, beside the opening: it takes the project once the
-        // editor lets go of it.
+        // The server of its files, started where none runs, beside the opening: fed what is served once that is
+        // listed.
         let files = crate::files::Files::keep(&project);
         // Agents reach it from now on: what they ask of the window is answered as it opens.
         let link = listen(&project.root, agents.0, agents.1);
@@ -634,7 +634,7 @@ impl Workspace {
         let (history, recovered) = History::open(&cache)?;
         let history = history.journaled();
         let index = Index::open_reporting(&project, &cache, report)?;
-        // What is served of it, listed for its host, which keeps no index of its own while the editor holds it.
+        // What is served of it, listed for the server, which has no index: it serves from this first listing on.
         if let Some(files) = &files {
             files.show(Arc::new(index.served()));
         }

@@ -1236,15 +1236,15 @@ impl Index {
     /// file and node by its path (a node's without `.node`), then each node's files in its folder, but where an entry of
     /// the same name holds that place. Files as they are on disk, never an unsaved working copy.
     #[must_use]
-    pub fn served(&self) -> crate::host::Listing {
-        use crate::host::Shown;
+    pub fn served(&self) -> crate::server::Listing {
+        use crate::server::Shown;
         let stamp = |file: &Path| {
             let (size, modified) =
                 self.file_stat(file).or_else(|| crate::content::stat(file).ok()).unwrap_or((0, UNIX_EPOCH));
             let time = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
             (size, (time.as_secs(), time.subsec_nanos()))
         };
-        let mut listing = crate::host::Listing::new();
+        let mut listing = crate::server::Listing::new();
         for (path, node) in self.full.iter() {
             match node.kind {
                 Kind::Folder => drop(listing.insert(path.clone(), Shown::Folder)),
