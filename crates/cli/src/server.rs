@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use project::Project;
 use project::server::{FromServer, Listing, ROLE, Shown, ToServer};
+use vfs::write::Refusal;
 
 /// How long after nobody keeps it it stops (once no file is open): whoever holds the project next finds it serving.
 const GRACE: Duration = Duration::from_secs(30);
@@ -382,28 +383,59 @@ impl Server {
     }
 
     /// Ask something of whoever holds the project - an editor, a host - waiting for the answer for as long as the
-    /// link lives; where nothing holds it, of a host started to. None where what holds it takes no edits.
-    fn ask(&self, request: &mcp::Request) -> Option<mcp::Reply> {
+    /// link lives; where nothing holds it, of a host started to.
+    fn ask(&self, request: &mcp::Request) -> Asked {
         let root = &self.project.root;
         if let Some(reply) = mcp::link::forward_patiently(root, request) {
-            return Some(reply);
+            return Asked::Answered(reply);
         }
-        // Held by what answers nothing (an extraction, a tool): no host started beside it would hold it either.
-        if project::lock::holder(root).is_some() && !project::host::answers(root) {
-            return None;
+        if let Err(later) = self.ready() {
+            return Asked::Later(later);
         }
-        mcp::server::ask_holder(root, request)
+        match mcp::server::ask_holder(root, request) {
+            Some(reply) => Asked::Answered(reply),
+            // Taken meanwhile by what answers nothing, or no host could be started to hold it.
+            None => match self.ready() {
+                Err(later) => Asked::Later(later),
+                Ok(()) => Asked::Nobody,
+            },
+        }
     }
 
-    /// Why an edit could not be sent to whoever holds the project: nothing listens for one.
-    fn no_holder(&self) -> String {
-        match project::lock::holder(&self.project.root) {
-            Some(holder) => {
-                format!("the project is in use by {holder}, which takes no edits: write it again once it is done")
-            }
-            None => "nothing holds the project, and no host could be started to: it is not written".into(),
+    /// Whether whoever holds the project takes edits: one that listens on the holder's link does, and where nothing
+    /// holds the project a host is started to. Not what holds it and answers nothing - an extraction, a tool, an
+    /// editor or a host still opening: no host started beside it would hold the project either.
+    fn ready(&self) -> std::result::Result<(), Refusal> {
+        let root = &self.project.root;
+        if mcp::link::listens(root) {
+            return Ok(());
+        }
+        match project::lock::holder(root) {
+            Some(holder) => Err(Refusal::Later(format!(
+                "the project is in use by {holder}, which takes no edits now: it is taken in once it does, or is done"
+            ))),
+            None => Ok(()),
         }
     }
+}
+
+/// What came of asking whoever holds the project.
+enum Asked {
+    Answered(mcp::Reply),
+    /// What holds the project takes no edits now: why.
+    Later(Refusal),
+    /// Nothing holds it, and no host could be started to.
+    Nobody,
+}
+
+/// Why an edit was not made, where nothing holds the project to make it.
+fn nobody() -> Refusal {
+    Refusal::Never("nothing holds the project, and no host could be started to: it is not written".into())
+}
+
+/// What an answer that is no edit made says.
+fn refused(reply: &mcp::Reply) -> Refusal {
+    Refusal::Never(reply.told().err().unwrap_or_else(|| "it answered with something else".into()))
 }
 
 /// How often what a backend keeps of the folder is brought within its budget.
@@ -412,36 +444,54 @@ const COLLECTING: Duration = Duration::from_mins(10);
 impl vfs::write::Owner for Server {
     /// What a program wrote: sent to whoever holds the project, which makes it an edit; what is served follows as
     /// that one lists it.
-    fn change(&self, change: vfs::write::Change) -> std::result::Result<(), String> {
+    fn change(&self, change: vfs::write::Change) -> std::result::Result<(), Refusal> {
         let request = mcp::Request::Edit { op: vfs::ops::Op::from(change), layer: None };
         match self.ask(&request) {
-            Some(mcp::Reply::Edited { label, .. }) => {
+            Asked::Answered(mcp::Reply::Edited { label, .. }) => {
                 println!("{label}");
                 Ok(())
             }
-            Some(reply) => Err(reply.told().err().unwrap_or_else(|| "it answered with something else".into())),
-            None => Err(self.no_holder()),
+            Asked::Answered(reply) => Err(refused(&reply)),
+            Asked::Later(later) => Err(later),
+            Asked::Nobody => Err(nobody()),
         }
     }
 
     /// What programs wrote at once: sent together, for the holder to bring what follows up to date once.
-    fn changes(&self, changes: Vec<vfs::write::Change>) -> Vec<std::result::Result<(), String>> {
+    fn changes(&self, changes: Vec<vfs::write::Change>) -> Vec<std::result::Result<(), Refusal>> {
         let ops: Vec<vfs::ops::Op> = changes.into_iter().map(vfs::ops::Op::from).collect();
         // Nothing to ask: a holder is not started for it.
         if ops.is_empty() {
             return Vec::new();
         }
         let count = ops.len();
-        let all = |why: String| (0..count).map(|_| Err(why.clone())).collect();
+        let all = |why: Refusal| (0..count).map(|_| Err(why.clone())).collect();
         match self.ask(&mcp::Request::Edits { ops, layer: None }) {
-            Some(mcp::Reply::EditedEach { made, .. }) if made.len() == count => {
+            Asked::Answered(mcp::Reply::EditedEach { made, .. }) if made.len() == count => {
                 for label in made.iter().flatten() {
                     println!("{label}");
                 }
-                made.into_iter().map(|made| made.map(drop)).collect()
+                made.into_iter().map(|made| made.map(drop).map_err(Refusal::Never)).collect()
             }
-            Some(reply) => all(reply.told().err().unwrap_or_else(|| "it answered with something else".into())),
-            None => all(self.no_holder()),
+            Asked::Answered(reply) => all(refused(&reply)),
+            Asked::Later(later) => all(later),
+            Asked::Nobody => all(nobody()),
+        }
+    }
+
+    fn ready(&self) -> std::result::Result<(), Refusal> {
+        Server::ready(self)
+    }
+
+    /// What was written and nobody took by the time serving ends: set aside beside the folder, by its path there,
+    /// as what is not the project's is - the staging is emptied when the folder is next served.
+    fn left(&self, path: &str, staged: &Path) {
+        let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let aside = self.project.root.join(project::SET_ASIDE).join(seconds.to_string()).join(path);
+        let kept = aside.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(staged, &aside));
+        match kept {
+            Ok(_) => println!("{path}: not taken into the project, and set aside in {}", project::host::shown(&aside)),
+            Err(e) => eprintln!("{path}: not taken into the project, and lost: {e}"),
         }
     }
 }

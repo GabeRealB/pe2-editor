@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::write::{Change, Owner, is_junk};
+use crate::write::{Change, Owner, Refusal, is_junk};
 use crate::{Served, What};
 
 /// How long a new file or a removal waits for what follows it before it is applied.
@@ -63,8 +63,16 @@ struct State {
     /// Paths removed while the project had them and the tree did not show them yet, and when to stop waiting for it to:
     /// their removal is applied once it does.
     awaited: HashMap<String, Instant>,
+    /// Paths whose change nobody took yet (`Refusal::Later`): asked again, and said once.
+    waiting: BTreeSet<String>,
     next: u64,
 }
+
+/// How long after nobody took a change it is asked again.
+const AGAIN: Duration = Duration::from_secs(1);
+/// How long a change a program waits for - a rename, a folder made - is asked again and again while nobody takes
+/// one, before the program is told the project is in use.
+const PATIENCE: Duration = Duration::from_secs(3);
 
 /// What a path is, as the filesystem shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,15 +362,34 @@ impl Writes {
             }
         };
         self.lock().applying.insert(path.to_string());
-        let applied = self.apply(Change::Write { path: path.to_string(), staged: file });
+        let applied = self.owner.change(Change::Write { path: path.to_string(), staged: file });
         let mut state = self.lock();
         state.applying.remove(path);
-        applied?;
-        if let Some(staged) = state.staged.get_mut(path) {
-            staged.dirty = false;
-            staged.applied = Some(SystemTime::now());
+        match applied {
+            Ok(()) => {
+                state.waiting.remove(path);
+                if let Some(staged) = state.staged.get_mut(path) {
+                    staged.dirty = false;
+                    staged.applied = Some(SystemTime::now());
+                }
+                Ok(())
+            }
+            // Nobody takes it now: it is kept as written, shown, and given when it settles next - the program is
+            // not told it failed, since it has not.
+            Err(Refusal::Later(why)) => {
+                Self::waits(&mut state, path, &why);
+                Ok(())
+            }
+            Err(Refusal::Never(why)) => Err(io::Error::other(why)),
         }
-        Ok(())
+    }
+
+    /// A path's change nobody took: asked again in a moment, and said the first time.
+    fn waits(state: &mut State, path: &str, why: &str) {
+        state.new.insert(path.to_string(), Instant::now() + AGAIN);
+        if state.waiting.insert(path.to_string()) {
+            eprintln!("{path}: written, and kept until it can be taken into the project: {why}");
+        }
     }
 
     /// Give the project the new files that have settled, together (`Owner::changes`): what `apply_written` does for
@@ -390,13 +417,15 @@ impl Writes {
             state.applying.remove(&path);
             match applied {
                 Ok(()) => {
+                    state.waiting.remove(&path);
                     if let Some(staged) = state.staged.get_mut(&path) {
                         staged.dirty = false;
                         staged.applied = Some(SystemTime::now());
                     }
                 }
+                Err(Refusal::Later(why)) => Self::waits(&mut state, &path, &why),
                 // It stays as written, shown in the folder and not the project's: said, since nothing else tells.
-                Err(why) => eprintln!("{path}: written, and not taken into the project: {why}"),
+                Err(Refusal::Never(why)) => eprintln!("{path}: written, and not taken into the project: {why}"),
             }
         }
     }
@@ -409,8 +438,18 @@ impl Writes {
         }
     }
 
-    fn apply(&self, change: Change) -> io::Result<()> {
-        self.owner.change(change).map_err(io::Error::other)
+    /// Apply a change a program waits for: asked again for a while where nobody takes one now, then refused as the
+    /// project being in use.
+    fn apply(&self, change: &Change) -> io::Result<()> {
+        let asked = Instant::now();
+        loop {
+            match self.owner.change(change.clone()) {
+                Ok(()) => return Ok(()),
+                Err(Refusal::Later(_)) if asked.elapsed() < PATIENCE => std::thread::sleep(Duration::from_millis(100)),
+                Err(Refusal::Later(why)) => return Err(io::Error::new(io::ErrorKind::ResourceBusy, why)),
+                Err(Refusal::Never(why)) => return Err(io::Error::other(why)),
+            }
+        }
     }
 
     /// Remove a file or an empty folder: hidden now, removed when it settles. What is staged alone goes at once.
@@ -466,7 +505,7 @@ impl Writes {
             self.lock().folders.insert(path.to_string());
             return Ok(());
         }
-        self.apply(Change::Folder { path: path.to_string() })?;
+        self.apply(&Change::Folder { path: path.to_string() })?;
         // Shown from now on, whenever the tree comes to show it.
         if self.served.tree().at(path).is_none() {
             self.lock().given.insert(path.to_string(), Instant::now() + AWAITED);
@@ -507,6 +546,37 @@ impl Writes {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         self.applied(from);
+        // One the project has, with content of it staged - written and not taken yet, or taken a moment ago - is
+        // renamed in the project, and what was written goes on to its new name: moved as what is only staged is, it
+        // would stay in the project under its old name too.
+        let held = self.served.tree().at(from).is_some() && self.lock().staged.contains_key(from);
+        if held && !is_junk(to) && self.served.tree().at(to).is_some() {
+            // Onto another the project has: that one takes what was written, and this one is removed.
+            let mut state = self.lock();
+            state.new.remove(from);
+            state.waiting.remove(from);
+            if let Some(staged) = state.staged.remove(from) {
+                state.staged.insert(to.to_string(), Staged { dirty: true, ..staged });
+                state.new.insert(to.to_string(), Instant::now() + SETTLE);
+            }
+            state.hidden.remove(to);
+            state.hidden.insert(from.to_string(), Some(Instant::now() + SETTLE));
+            return Ok(());
+        }
+        if held && !is_junk(to) {
+            self.apply(&Change::Rename { from: from.to_string(), to: to.to_string() })?;
+            self.served.rename(from, to);
+            let mut state = self.lock();
+            state.new.remove(from);
+            state.waiting.remove(from);
+            if let Some(staged) = state.staged.remove(from) {
+                if staged.dirty {
+                    state.new.insert(to.to_string(), Instant::now() + SETTLE);
+                }
+                state.staged.insert(to.to_string(), staged);
+            }
+            return Ok(());
+        }
         // The kernel keeps the renamed node's number for its new name.
         self.served.rename(from, to);
         let staged = {
@@ -539,7 +609,7 @@ impl Writes {
             state.hidden.insert(from.to_string(), Some(Instant::now() + SETTLE * 5));
             return Ok(());
         }
-        self.apply(Change::Rename { from: from.to_string(), to: to.to_string() })
+        self.apply(&Change::Rename { from: from.to_string(), to: to.to_string() })
     }
 
     /// Apply what waits to settle, now: what serving does as it ends, so that what a program did a moment before is
@@ -556,6 +626,15 @@ impl Writes {
             }
         }
         self.settle();
+        // What nobody took by now is its owner's to keep: the staging is emptied when the folder is next served.
+        let left: Vec<(String, PathBuf)> = {
+            let state = self.lock();
+            let unapplied = state.staged.iter().filter(|(path, staged)| staged.dirty && !is_junk(path));
+            unapplied.map(|(path, staged)| (path.clone(), staged.file.clone())).collect()
+        };
+        for (path, staged) in left {
+            self.owner.left(&path, &staged);
+        }
     }
 
     /// Apply what has settled - new files, removals - and let go of what the tree served now shows.
@@ -619,11 +698,20 @@ impl Writes {
         for (path, removed) in removing.into_iter().zip(self.owner.changes(asked)) {
             let mut state = self.lock();
             state.awaited.remove(&path);
-            if removed.is_ok() {
-                state.hidden.insert(path, None);
-            } else {
+            match removed {
+                Ok(()) => {
+                    state.waiting.remove(&path);
+                    state.hidden.insert(path, None);
+                }
+                // Nobody takes it now: it stays hidden, and is asked again.
+                Err(Refusal::Later(why)) => {
+                    if state.waiting.insert(path.clone()) {
+                        eprintln!("{path}: removed, which waits until the project can be told: {why}");
+                    }
+                    state.hidden.insert(path, Some(Instant::now() + AGAIN));
+                }
                 // Refused: it is shown again.
-                state.hidden.remove(&path);
+                Err(Refusal::Never(_)) => drop(state.hidden.remove(&path)),
             }
         }
         // What the tree has now needs no showing over it.
@@ -666,7 +754,7 @@ impl Writes {
 mod tests {
     use super::Writes;
     use crate::Served;
-    use crate::write::{Change, Owner};
+    use crate::write::{Change, Owner, Refusal};
     use project::content::Given;
     use std::collections::BTreeMap;
     use std::sync::mpsc::{Receiver, Sender, channel};
@@ -684,12 +772,12 @@ mod tests {
     }
 
     impl Owner for Slow {
-        fn change(&self, change: Change) -> Result<(), String> {
+        fn change(&self, change: Change) -> Result<(), Refusal> {
             match &change {
                 Change::Write { path, staged } => {
                     let _ = self.started.lock().unwrap().send(());
                     let _ = self.go_on.lock().unwrap().recv();
-                    let bytes = std::fs::read(staged).map_err(|e| e.to_string())?;
+                    let bytes = std::fs::read(staged).map_err(|e| Refusal::Never(e.to_string()))?;
                     let mut files = self.files.lock().unwrap();
                     files.insert(path.clone(), Given::Bytes(Arc::from(bytes)));
                     self.served.set_files(&files);
@@ -713,15 +801,80 @@ mod tests {
     }
 
     impl Owner for Told {
-        fn change(&self, change: Change) -> Result<(), String> {
+        fn change(&self, change: Change) -> Result<(), Refusal> {
             self.batches.lock().unwrap().push(vec![change.label()]);
             Ok(())
         }
 
-        fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), String>> {
+        fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), Refusal>> {
             self.batches.lock().unwrap().push(changes.iter().map(Change::label).collect());
             changes.iter().map(|_| Ok(())).collect()
         }
+    }
+
+    /// A project nobody takes changes for until it is `open`: what it was given then, and what was left with it.
+    #[derive(Default)]
+    struct Busy {
+        open: std::sync::atomic::AtomicBool,
+        given: Mutex<Vec<String>>,
+        left: Mutex<Vec<String>>,
+    }
+
+    impl Owner for Busy {
+        fn change(&self, change: Change) -> Result<(), Refusal> {
+            if !self.open.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Refusal::Later("a tool has it".into()));
+            }
+            self.given.lock().unwrap().push(change.label());
+            Ok(())
+        }
+
+        fn left(&self, path: &str, _staged: &std::path::Path) {
+            self.left.lock().unwrap().push(path.to_string());
+        }
+    }
+
+    #[test]
+    fn what_nobody_takes_yet_is_kept_and_given_once_someone_does() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-later-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let owner = Arc::new(Busy::default());
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let handle = writes.create("kept.txt").unwrap();
+        writes.write(handle, 0, b"x").unwrap();
+        writes.close(handle, true).unwrap();
+        // Tried, and not taken: it is shown as written, and nothing was given.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(writes.shown("kept.txt").is_some(), "shown as written while it waits");
+        assert!(owner.given.lock().unwrap().is_empty());
+        // Someone takes changes again: it is given without being written again.
+        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
+        let given = || !owner.given.lock().unwrap().is_empty();
+        let asked = Instant::now();
+        while !given() && asked.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(given(), "given once someone takes it");
+        assert!(owner.left.lock().unwrap().is_empty());
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_nobody_took_by_the_end_is_left_with_the_owner() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-left-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let owner = Arc::new(Busy::default());
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let handle = writes.create("late.txt").unwrap();
+        writes.write(handle, 0, b"x").unwrap();
+        writes.close(handle, true).unwrap();
+        writes.finish();
+        assert_eq!(*owner.left.lock().unwrap(), ["late.txt"]);
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

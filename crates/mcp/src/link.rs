@@ -20,6 +20,12 @@ fn name(root: &Path) -> std::io::Result<Name<'static>> {
     project::host::local_name(root, project::cache::SOCKET, "pe2-editor")
 }
 
+/// Whether anything listens on the holder's link of the project in `root`: an editor or a host that answers.
+#[must_use]
+pub fn listens(root: &Path) -> bool {
+    name(root).ok().and_then(|name| Stream::connect(name).ok()).is_some()
+}
+
 /// Hand a request to the editor serving the project in `root`; none when no editor is.
 #[must_use]
 pub fn forward(root: &Path, request: &Request) -> Option<Reply> {

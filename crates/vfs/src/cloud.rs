@@ -409,7 +409,17 @@ impl Worker {
     /// Apply what has settled - or `all` that waits, settled or not: removals first - what is in a folder removed
     /// going with it - then changed files.
     fn settle(&self, all: bool) {
+        // While nobody takes changes - a tool has the project - what waits goes on waiting, as it is in the folder:
+        // given once someone does (asked only where something is due). As serving ends it is tried all the same, and
+        // what is not taken stays a file there.
         let due = |at: &Instant| all || at.elapsed() >= SETTLE;
+        let any = {
+            let pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.removed.values().chain(pending.changed.values()).any(&due)
+        };
+        if !any || (!all && self.owner.as_ref().is_some_and(|owner| owner.ready().is_err())) {
+            return;
+        }
         let (mut removed, changed, waiting) = {
             let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let removed: Vec<String> =
@@ -500,7 +510,7 @@ impl Worker {
             std::fs::copy(path, &staged)?;
             Change::Write { path: tree_path, staged }
         };
-        owner.change(change).map_err(io::Error::other)?;
+        owner.change(change).map_err(|why| io::Error::other(why.to_string()))?;
         mark_in_sync(path, state.is_some(), meta.is_dir())
     }
 

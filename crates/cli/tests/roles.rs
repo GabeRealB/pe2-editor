@@ -407,3 +407,23 @@ fn what_is_written_while_nothing_holds_the_project_starts_a_host() {
     assert_ne!(tried.host(), Some(host), "another host");
     assert_eq!(folder.read("e.txt").as_deref(), Some("five"));
 }
+
+#[test]
+fn what_is_written_while_a_tool_has_the_project_is_taken_in_once_it_is_done() {
+    let tried = Tried::new("busy");
+    let folder = tried.serve();
+    // A tool takes the project, as an extraction does: it answers no edits.
+    let tool = project::lock::Lock::acquire_within(&tried.project(), "a tool", Duration::from_secs(20)).unwrap();
+    assert_eq!(tried.holder().as_deref(), Some("a tool"));
+    // What a program writes meanwhile is kept, shown as written, and is nobody's step yet.
+    folder.write("meanwhile.txt", "kept");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(folder.read("meanwhile.txt").as_deref(), Some("kept"), "shown as written");
+    assert!(!tried.host_said("New meanwhile.txt"));
+    // The tool done, the host has the project again, and what was kept is its step.
+    drop(tool);
+    assert!(within(Duration::from_secs(30), || tried.host_said("New meanwhile.txt")), "taken in once it is done");
+    assert_eq!(folder.read("meanwhile.txt").as_deref(), Some("kept"));
+    let (undone, said) = tried.ask(&["undo"]);
+    assert!(undone && said.contains("meanwhile.txt"), "{said}");
+}

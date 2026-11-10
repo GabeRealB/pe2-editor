@@ -53,20 +53,64 @@ impl Change {
     }
 }
 
+/// Why a change was not made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// It cannot be made: why, for the program to be told it failed.
+    Never(String),
+    /// Nobody takes changes this moment - what holds the project does not (a tool at work on it, an editor still
+    /// opening): why. Asked again later, it is made: what was written is kept for it.
+    Later(String),
+}
+
+impl Refusal {
+    /// Whether the change is to be asked again.
+    #[must_use]
+    pub fn later(&self) -> bool {
+        matches!(self, Refusal::Later(_))
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Refusal::Never(why) | Refusal::Later(why)) = self;
+        f.write_str(why)
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Refusal {
+        Refusal::Never(why)
+    }
+}
+
 /// What applies the changes a filesystem's programs make: whoever holds the project.
 pub trait Owner: Send + Sync {
     /// Apply a change; once this returns, the tree served shows it, or will on its next update.
     ///
     /// # Errors
-    /// The change cannot be made: why, for the program to be told it failed.
-    fn change(&self, change: Change) -> Result<(), String>;
+    /// The change cannot be made (`Refusal::Never`: why, for the program to be told it failed), or nobody takes one
+    /// now (`Later`).
+    fn change(&self, change: Change) -> Result<(), Refusal>;
 
     /// Apply several changes that do not depend on each other, in order: how each went. One that can applies them
     /// together - a step of the history each, what follows from them (its index, the tree served) brought up to date
     /// once for all - which is what makes many files written at once land in the time of a few.
-    fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), String>> {
+    fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), Refusal>> {
         changes.into_iter().map(|change| self.change(change)).collect()
     }
+
+    /// Whether a change would be taken this moment, asked without giving one.
+    ///
+    /// # Errors
+    /// Nobody takes one now: why.
+    fn ready(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
+    /// What a program wrote at this path, staged in this file, was not given to the project by the time serving
+    /// ends: the owner's to keep, where it can - the staging is emptied when the folder is next served.
+    fn left(&self, _path: &str, _staged: &std::path::Path) {}
 }
 
 /// Files programs make for themselves beside what they edit - swap files, backups, lock files - which stay in the
