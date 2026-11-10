@@ -209,8 +209,11 @@ impl Filesystem for Fuse {
                 return reply.error(errno(&e));
             }
             self.let_go(u64::from(ino));
-            // Truncated with no file open: applied now, as nothing else will close it.
+            // Truncated with no file open: applied now, as nothing else will close it. Opened to be written anew, a
+            // file is truncated so too, with its handle not said: what closes it applies what it comes to hold -
+            // applied here as well, every save was two steps of the history, the first an empty file.
             if fh.is_none()
+                && !writes.is_open(&path)
                 && let Ok(handle) = writes.open(&path, false)
                 && let Err(e) = writes.close(handle, true)
             {

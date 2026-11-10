@@ -337,6 +337,12 @@ impl Writes {
         OpenOptions::new().write(true).open(file)?.set_len(len)
     }
 
+    /// Whether a program has the file at a path open to write.
+    #[must_use]
+    pub fn is_open(&self, path: &str) -> bool {
+        self.lock().handles.values().any(|open| open == path)
+    }
+
     /// A handle let go of, or a file synced: what it wrote applied, where the project has the file.
     ///
     /// # Errors
