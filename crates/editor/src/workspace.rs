@@ -807,7 +807,8 @@ impl Workspace {
             self.outputs.wake_by(move |after| ctx.request_repaint_after(after));
         }
         self.takein.wake(ctx);
-        self.runner.wake(ctx);
+        let window = ctx.clone();
+        self.runner.wake(move || window.request_repaint());
         self.plans.update(&self.project, &self.extensions, ctx);
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);

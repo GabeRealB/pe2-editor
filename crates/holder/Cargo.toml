@@ -1,0 +1,18 @@
+[package]
+name = "holder"
+description = "What a process holding a project does, with a window or without: feed what serves it, run its epochs, watch its layers"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+extensions.workspace = true
+mcp.workspace = true
+notify.workspace = true
+pe2-ext.workspace = true
+project.workspace = true
+vfs.workspace = true

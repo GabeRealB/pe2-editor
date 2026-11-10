@@ -35,7 +35,7 @@ mod ext_ui;
 mod extensions_pane;
 mod external;
 mod fetcher;
-mod files;
+use holder::files;
 mod fill;
 mod gpu_stats;
 mod gpu_view;
@@ -51,7 +51,7 @@ mod pictures;
 mod plans;
 mod player;
 mod pointer_gate;
-mod runner;
+use holder::runner;
 #[cfg(any(test, feature = "tests"))]
 #[allow(clippy::missing_panics_doc, reason = "what fails in a test panics")]
 pub mod scenario;

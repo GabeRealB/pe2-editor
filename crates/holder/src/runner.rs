@@ -1,10 +1,10 @@
-//! The epoch worker: what events set off, off the UI thread. Each job is an epoch on the project as last taken in, one at a time, in the order asked, so a clean and the build
-//! after it stay two: only batches of files waiting behind each other are one, as they mean the same. It wakes the window when one ends.
+//! The epoch worker: what events set off, off the holder's own thread. Each job is an epoch on the project as last
+//! taken in, one at a time, in the order asked, so a clean and the build after it stay two: only batches of files
+//! waiting behind each other are one, as they mean the same. It wakes its holder when one ends (`Runner::wake`).
 //!
 //! It runs the generated layers' plans too (`extract`): the work graph is theirs alone while they run, so an extraction
 //! waits for the epoch running to end, and what is asked after it waits for it.
 
-use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged};
 use project::events::Report;
 use project::ext::Extensions;
@@ -53,6 +53,7 @@ pub struct Finished {
 
 impl Finished {
     /// What to say of it, where someone asked for it.
+    #[must_use]
     pub fn said(&self) -> Option<String> {
         let asked = |event: &str| self.roots.iter().any(|root| root == event);
         let what = if asked(Build::NAME) {
@@ -70,6 +71,7 @@ impl Finished {
     }
 
     /// Whether it left something to be told.
+    #[must_use]
     pub fn is_wrong(&self) -> bool {
         !(self.problems.is_empty() && self.report.failed.is_empty() && self.report.stale.is_empty())
     }
@@ -85,9 +87,12 @@ pub struct Runner {
     waiting: Arc<AtomicUsize>,
     /// The events the epoch running was signaled by, while one runs.
     running: Arc<std::sync::Mutex<Vec<String>>>,
-    ctx: Arc<OnceLock<egui::Context>>,
+    wake: Arc<OnceLock<Wake>>,
     thread: Option<JoinHandle<()>>,
 }
+
+/// What is called when an epoch, or an extraction, ends: the holder woken - its window drawn again, where it has one.
+type Wake = Box<dyn Fn() + Send + Sync>;
 
 /// Whether a job can be run as part of the next: they say the same thing of the same config.
 fn same(job: &Job, next: &Job) -> bool {
@@ -108,6 +113,7 @@ fn text(report: &Report) -> mcp::Reply {
 }
 
 impl Runner {
+    #[must_use]
     pub fn start(project: Project, extensions: Arc<Extensions>) -> Runner {
         Runner::after(None, project, extensions)
     }
@@ -126,8 +132,8 @@ impl Runner {
         let cancel = Arc::new(AtomicBool::new(false));
         let waiting = Arc::new(AtomicUsize::new(0));
         let running: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-        let ctx: Arc<OnceLock<egui::Context>> = Arc::default();
-        let (stop, left, wake, now) = (cancel.clone(), waiting.clone(), ctx.clone(), running.clone());
+        let woken: Arc<OnceLock<Wake>> = Arc::default();
+        let (stop, left, wake, now) = (cancel.clone(), waiting.clone(), woken.clone(), running.clone());
         let thread = std::thread::Builder::new()
             .name("epochs".into())
             .spawn(move || {
@@ -140,8 +146,8 @@ impl Runner {
                         None => return,
                         Some(Work::Extract(extraction)) => {
                             extract(&project, &extensions, &extraction);
-                            if let Some(ctx) = wake.get() {
-                                ctx.request_repaint();
+                            if let Some(wake) = wake.get() {
+                                wake();
                             }
                             continue;
                         }
@@ -192,18 +198,18 @@ impl Runner {
                     if done.send(ended).is_err() {
                         return;
                     }
-                    if let Some(ctx) = wake.get() {
-                        ctx.request_repaint();
+                    if let Some(wake) = wake.get() {
+                        wake();
                     }
                 }
             })
             .ok();
-        Runner { jobs: Some(jobs), finished, cancel, waiting, running, ctx, thread }
+        Runner { jobs: Some(jobs), finished, cancel, waiting, running, wake: woken, thread }
     }
 
-    /// The window to wake when an epoch ends.
-    pub fn wake(&self, ctx: &egui::Context) {
-        let _ = self.ctx.set(ctx.clone());
+    /// What to call when an epoch ends: set once.
+    pub fn wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.wake.set(Box::new(wake));
     }
 
     pub fn run(&self, job: Job) {
@@ -221,15 +227,18 @@ impl Runner {
     }
 
     /// The epochs that ended since the last poll.
+    #[must_use]
     pub fn poll(&self) -> Vec<Finished> {
         self.finished.try_iter().collect()
     }
 
+    #[must_use]
     pub fn busy(&self) -> bool {
         self.waiting.load(Ordering::Relaxed) > 0
     }
 
     /// The events the epoch running was signaled by; none between epochs.
+    #[must_use]
     pub fn running(&self) -> Vec<String> {
         self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }

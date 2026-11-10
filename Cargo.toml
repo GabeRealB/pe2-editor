@@ -15,6 +15,7 @@ members = [
     "crates/project",
     "crates/webgpu",
     "crates/mcp",
+    "crates/holder",
     "crates/cli",
     "crates/editor",
     "xtask",
@@ -89,6 +90,7 @@ pe2-packages = { path = "extensions/packages" }
 pe2-str = { path = "extensions/str" }
 pe2-sounds = { path = "extensions/sounds" }
 mcp = { path = "crates/mcp" }
+holder = { path = "crates/holder" }
 # The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"

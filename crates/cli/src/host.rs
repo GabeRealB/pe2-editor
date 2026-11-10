@@ -149,7 +149,13 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     // What reading the project freed, given back: it serves on for long.
     project::give_back_memory();
     host.listen_for_edits();
-    let _watching = watch_layers(&p, &host)?;
+    // What changes in its layers by other means than the filesystem served, taken in a batch at a time.
+    let watched = Arc::downgrade(&host);
+    let _watching = holder::watch::layers(&p, move |batch| {
+        let Some(host) = watched.upgrade() else { return false };
+        host.take_in(batch);
+        true
+    })?;
     let stopping = Arc::downgrade(&host);
     ctrlc::set_handler(move || {
         if let Some(host) = stopping.upgrade() {
@@ -862,60 +868,3 @@ pub fn served_name(p: &Project) -> String {
     format!("pe2:{}", p.root.file_name().and_then(|n| n.to_str()).unwrap_or("project"))
 }
 
-/// Watch a project's layers - each layer's and mount's folder, and the folders of its changesets and `project.toml` -
-/// for what changes by other means than the filesystem served, taken in a batch at a time (`Host::take_in`). Not the
-/// project's: its cache, what its builds write, its unmanaged mounts (the discs), the temporary files of atomic writes.
-/// Watching ends with what this returns.
-fn watch_layers(p: &Project, host: &Arc<Host>) -> Result<notify::RecommendedWatcher> {
-    use notify::Watcher as _;
-    let mut ignore = vec![p.root.join(project::cache::DIR), p.root.join("build"), p.filesystem.at.clone()];
-    ignore.extend(p.unmanaged.iter().map(|m| m.path.clone()));
-    let (seen, changes) = std::sync::mpsc::channel::<PathBuf>();
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        // What is read is no change: the filesystem served reads the layers all the time.
-        let Ok(event) = event.map_err(drop) else { return };
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        for path in event.paths {
-            let _ = seen.send(path);
-        }
-    })?;
-    for layer in &p.layers {
-        if layer.path.is_dir() {
-            watcher.watch(&layer.path, notify::RecursiveMode::Recursive)?;
-        }
-    }
-    let mut folders: Vec<PathBuf> =
-        p.layers.iter().filter_map(|l| l.changeset.parent().map(Path::to_path_buf)).collect();
-    folders.push(p.root.clone());
-    folders.sort();
-    folders.dedup();
-    for folder in folders {
-        if folder.is_dir() {
-            watcher.watch(&folder, notify::RecursiveMode::NonRecursive)?;
-        }
-    }
-    let host = Arc::downgrade(host);
-    std::thread::Builder::new().name("watch".into()).spawn(move || {
-        let atomic = |path: &Path| {
-            path.extension().is_some_and(|e| e == "tmp")
-                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
-        };
-        // A batch: what arrives until a moment passes with nothing more.
-        while let Ok(first) = changes.recv() {
-            let mut batch = vec![first];
-            while let Ok(more) = changes.recv_timeout(Duration::from_millis(300)) {
-                batch.push(more);
-            }
-            batch.retain(|path| !atomic(path) && !ignore.iter().any(|i| path.starts_with(i)));
-            batch.sort();
-            batch.dedup();
-            let Some(host) = host.upgrade() else { break };
-            if !batch.is_empty() {
-                host.take_in(&batch);
-            }
-        }
-    })?;
-    Ok(watcher)
-}

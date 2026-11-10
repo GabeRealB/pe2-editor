@@ -18,6 +18,7 @@ pe2-ext.workspace = true
 codecs.workspace = true
 project.workspace = true
 mcp.workspace = true
+holder.workspace = true
 extensions.workspace = true
 png.workspace = true
 anyhow.workspace = true

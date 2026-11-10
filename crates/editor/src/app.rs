@@ -2356,14 +2356,16 @@ impl Editor {
                         .on_hover_text("Write them into the project, as edits through the folder are, and serve it")
                         .clicked()
                     {
-                        files.resolve(crate::files::Strays::TakeIn, ui.ctx());
+                        let window = ui.ctx().clone();
+                        files.resolve(crate::files::Strays::TakeIn, move || window.request_repaint());
                     }
                     if ui
                         .small_button("Set aside")
                         .on_hover_text(format!("Move them beside it, to {aside}, and serve it"))
                         .clicked()
                     {
-                        files.resolve(crate::files::Strays::SetAside, ui.ctx());
+                        let window = ui.ctx().clone();
+                        files.resolve(crate::files::Strays::SetAside, move || window.request_repaint());
                     }
                     let (count, are) =
                         if strays == 1 { ("1 file".to_string(), "is") } else { (format!("{strays} files"), "are") };

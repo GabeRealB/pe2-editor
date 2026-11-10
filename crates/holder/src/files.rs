@@ -1,18 +1,18 @@
-//! The project served as a filesystem while the editor has it open, at its `assets` folder, by the backend this machine
+//! The project served as a filesystem while something holds it, at its `assets` folder, by the backend this machine
 //! says (`project.local.toml`, `[filesystem] serve`) - by the host (`pe2-cli project host`, `project::host`), which the
-//! editor starts where none runs and keeps while it has the project, and which serves on after it, while anything uses
+//! holder starts where none runs and keeps while it has the project, and which serves on after it, while anything uses
 //! what it serves. Opening the project borrows it from the host (`Lock::try_acquire`), so what programs write through
-//! the folder reaches the editor on its link as edits (`mcp::Request::Edit`), applied between frames as steps of the
-//! session's log (`Workspace::apply_edit`); the program waits for it, as an agent waits for its request.
+//! the folder reaches the holder on its link as edits (`mcp::Request::Edit`, `Edits`) - the editor applies them between
+//! frames as steps of the session's log (`Workspace::apply_edit`); the program waits for it, as an agent waits for its
+//! request.
 //!
-//! The editor holds the project's only index: the host keeps none while it does, and serves what the editor lists of it
+//! The holder has the project's only index: the host keeps none while it does, and serves what the holder lists of it
 //! (`Index::served`), sent on the host's lease after each refresh - whole at first, then what changed - by a thread of
-//! its own, so that the window never waits on the host.
+//! its own, so that the holder never waits on the host.
 //!
 //! The host does not serve over files in the folder that are not the project's (`vfs::strays`): the user chooses to set
 //! them aside or take them in, and the host is started again to.
 
-use eframe::egui;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -59,7 +59,7 @@ pub enum Strays {
 }
 
 impl Files {
-    /// Keep the host serving the project, started where none runs, off the window's thread: none where this machine
+    /// Keep the host serving the project, started where none runs, off the caller's thread: none where this machine
     /// serves nothing and no host serves it already. After the project is taken: the host starts beside the editor's
     /// own opening rather than before it, reading the project without its store (as cheap as with it), and takes it
     /// once the editor lets go of it.
@@ -97,16 +97,27 @@ impl Files {
         }
     }
 
-    /// Start the host again, doing this with the files that are not the project's: off the window's thread.
-    pub fn resolve(&self, strays: Strays, ctx: &egui::Context) {
+    /// Start the host again, doing this with the files that are not the project's: off the caller's thread, which is
+    /// woken by `done` once it is.
+    pub fn resolve(&self, strays: Strays, done: impl FnOnce() + Send + 'static) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = Kept::Starting;
-        let (project, state, ctx) = (self.project.clone(), self.state.clone(), ctx.clone());
+        let (project, state) = (self.project.clone(), self.state.clone());
         std::thread::spawn(move || {
             let kept = kept(&project, Some(strays));
             *state.lock().unwrap_or_else(PoisonError::into_inner) = kept;
-            ctx.request_repaint();
+            done();
         });
     }
+}
+
+/// This program, as it names itself to the host it keeps.
+fn who() -> &'static str {
+    static WHO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WHO.get_or_init(|| {
+        let program = std::env::current_exe().ok();
+        let name = program.as_deref().and_then(|p| p.file_stem()).map(|n| n.to_string_lossy().into_owned());
+        name.unwrap_or_else(|| "a holder".into())
+    })
 }
 
 /// The host kept, started where none runs - told what to do with what is not the project's, where told - or why not.
@@ -121,7 +132,7 @@ fn kept(project: &project::Project, strays: Option<Strays>) -> Kept {
         if !program.is_file() {
             anyhow::bail!("{} is not there: the host serving the files is `pe2-cli`", program.display());
         }
-        project::host::keep(&project.root, "pe2-editor", &program, &args)
+        project::host::keep(&project.root, who(), &program, &args)
     });
     match kept {
         Ok(lease) => lease.into(),

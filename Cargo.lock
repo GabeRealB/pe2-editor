@@ -1030,6 +1030,7 @@ dependencies = [
  "codecs",
  "ctrlc",
  "extensions",
+ "holder",
  "interprocess",
  "mcp",
  "notify",
@@ -1720,6 +1721,7 @@ dependencies = [
  "egui_kittest",
  "egui_tiles",
  "extensions",
+ "holder",
  "mcp",
  "notify",
  "pe2-ext",
@@ -2754,6 +2756,19 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "holder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "extensions",
+ "mcp",
+ "notify",
+ "pe2-ext",
+ "project",
+ "vfs",
+]
 
 [[package]]
 name = "home"
