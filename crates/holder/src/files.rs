@@ -1,9 +1,9 @@
 //! The project served as a filesystem while something holds it, at its `assets` folder, by the backend this machine
 //! says (`project.local.toml`, `[filesystem] serve`) - by the server (`pe2-cli project server`, `project::server`),
 //! which the holder starts where none runs, keeps while it has the project and feeds: the holder has the project's
-//! only index, and the server serves what the holder lists of it (`Index::served`), sent on the server's lease after
-//! each refresh - whole at first, then what changed - by a thread of its own, so that the holder never waits on the
-//! server. It serves from the first listing on. What programs write through the folder reaches the holder on its
+//! only index, and the server serves what the holder lists of it (`Index::served`), written after each refresh as a
+//! table both map into memory (`project::served`) and named on the server's lease - by a thread of its own, so that
+//! the holder never waits on the server. It serves from the first listing on. What programs write through the folder reaches the holder on its
 //! link as edits (`mcp::Request::Edit`, `Edits`): the editor applies them between frames as steps of the session's
 //! log (`Workspace::apply_edit`), a host as steps of its history; the program waits for it, as an agent waits for its
 //! request.
@@ -188,8 +188,8 @@ fn strays_in(project: &project::Project) -> usize {
     serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
 }
 
-/// Send what is served to the server as it changes: the newest listing each time, whole to a lease that has none
-/// yet, else what changed since the last it took. What the server is not kept for yet waits for it.
+/// Send what is served to the server as it changes: the newest listing each time, written as a table the server
+/// maps (`project::served`) and named to it. What the server is not kept for yet waits for it.
 fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>) {
     let mut pending: Option<Arc<Listing>> = None;
     // The files that changed since what was sent last, and who waits for what is pending to be served: let go of -
@@ -221,25 +221,21 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
         else {
             continue;
         };
-        let said = match sent.as_ref().filter(|_| same_lease) {
-            Some((_, before)) => {
-                let (shown, gone) = project::server::changes(before, &listing);
-                if shown.is_empty() && gone.is_empty() && changed.is_empty() {
-                    continue;
-                }
-                ToServer::Shown { whole: false, shown, gone }
-            }
-            None => ToServer::Shown {
-                whole: true,
-                shown: listing.iter().map(|(p, s)| (p.clone(), s.clone())).collect(),
-                gone: vec![],
-            },
-        };
+        // What is served as it was, on the lease that has it: nothing to say.
+        if sent.as_ref().is_some_and(|(_, before)| same_lease && **before == *listing) && changed.is_empty() {
+            continue;
+        }
         // What changed in the layers first: what it reads of the files listed is read again before they are served.
         if !changed.is_empty() {
             let _ = lock(&lease).tell(&ToServer::Changed { paths: std::mem::take(&mut changed) });
         }
-        let told = lock(&lease).tell(&said);
+        // The table of it, written for the server to map, then named.
+        let root = &project.root;
+        let generation = project::served::next_generation(root);
+        let told = match project::served::write(root, generation, &listing) {
+            Ok(()) => lock(&lease).tell(&ToServer::Table { generation }),
+            Err(e) => Err(anyhow::Error::new(e).context("writing the table of what is served")),
+        };
         let failed = match told {
             Ok(FromServer::Serving { at, note }) => {
                 if let Kept::Leased(now, serving) = &mut *lock(state)
@@ -248,6 +244,8 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                     *serving = Some((at, note));
                 }
                 sent = Some((lease, listing));
+                // The tables before it are nobody's any more.
+                project::served::remove_before(root, generation);
                 continue;
             }
             // Whoever held the project before feeds it still, its connection yet to end: again in a moment, whole.

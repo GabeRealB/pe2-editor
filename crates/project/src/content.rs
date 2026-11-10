@@ -92,6 +92,66 @@ fn held(path: &Path) -> Option<Form> {
     })
 }
 
+/// The table of what is served that this process reads files by (`serve_from`), where it does.
+static TABLE: RwLock<Option<Arc<crate::served::Table>>> = RwLock::new(None);
+
+/// Read the files a project's records hold by this table from now on, in this process: what serves a project's
+/// folder knows where each file's content lives from what whoever holds the project listed, and reads no records
+/// of its own. In place of the table it read by before.
+pub fn serve_from(table: Arc<crate::served::Table>) {
+    *TABLE.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(table);
+}
+
+/// Records read for the text they hold, by their files as they were then: a few, read again where they changed.
+static RECORDS: std::sync::Mutex<Vec<(PathBuf, std::time::SystemTime, Arc<crate::records::Record>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How many records are remembered for their text.
+const RECORDS_HELD: usize = 256;
+
+/// The text a record holds for one of its files, read from the record's own file.
+fn record_text(record: &Path, name: &str) -> io::Result<Vec<u8>> {
+    let written = std::fs::metadata(record)?.modified()?;
+    let mut held = RECORDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let known = held.iter().position(|(path, at, _)| path == record && *at == written);
+    let parsed = if let Some(at) = known {
+        held[at].2.clone()
+    } else {
+        let parsed = crate::records::Record::parse(&std::fs::read_to_string(record)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e:#}", record.display())))?;
+        let parsed = Arc::new(parsed);
+        held.retain(|(path, _, _)| path != record);
+        if held.len() >= RECORDS_HELD {
+            held.remove(0);
+        }
+        held.push((record.to_path_buf(), written, parsed.clone()));
+        parsed
+    };
+    match parsed.files.get(name).and_then(|file| file.content.as_ref()) {
+        Some(crate::records::Content::Text(text)) => Ok(text.clone().into_bytes()),
+        _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: no text of `{name}`", record.display()))),
+    }
+}
+
+/// A file's content as the table this process reads by says where it lives; none where it reads by none, or the
+/// table has the file where a layer holds it as it is.
+fn listed(path: &Path) -> Option<io::Result<Form>> {
+    use crate::served::{From, Is};
+    let table = TABLE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
+    let Is::File { source, modified, .. } = table.held_at(&path.to_string_lossy())?.is else { return None };
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::new(modified.0, modified.1);
+    match source {
+        From::Disk => None,
+        From::RecordText { record, name } => {
+            Some(record_text(Path::new(record), name).map(|bytes| Form::Inline { bytes, modified }))
+        }
+        From::Stored { sha1, store } => {
+            let store = Store { dir: PathBuf::from(store) };
+            Some(stored_manifest(&store, sha1).map(|manifest| Form::Packed { manifest, store, modified }))
+        }
+    }
+}
+
 /// Where a path's content is: what is known without the disk first - a packed layer's listing, a records layer's
 /// records, by the path's prefix - then the file, then its manifest.
 fn form(path: &Path) -> io::Result<Form> {
@@ -102,6 +162,9 @@ fn form(path: &Path) -> io::Result<Form> {
     }
     if let Some(form) = held(path) {
         return Ok(form);
+    }
+    if let Some(form) = listed(path) {
+        return form;
     }
     if let Some((content, modified, store)) = crate::records::Set::file(path) {
         return Ok(match content {

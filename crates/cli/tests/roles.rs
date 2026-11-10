@@ -345,7 +345,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     assert_eq!(folder.read("b.txt"), None, "taken back, it is gone from the folder");
     // One feeder at a time: what another process lists while the host feeds it is not taken.
     let mut other = project::server::ROLE.connect(&tried.project()).expect("the server listens");
-    let listed: FromServer = other.ask(&ToServer::Shown { whole: true, shown: vec![], gone: vec![] }).unwrap();
+    let listed: FromServer = other.ask(&ToServer::Table { generation: 1 }).unwrap();
     assert_eq!(listed, FromServer::Fed { by: "pe2-cli".into() });
     assert_eq!(folder.read("notes/a.txt").as_deref(), Some("one"));
     // Stopped, both are gone.

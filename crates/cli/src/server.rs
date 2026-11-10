@@ -1,7 +1,8 @@
 //! `pe2-cli project server`: the process serving a project as a filesystem (`project::server`), and doing nothing
-//! else. It has no index and loads no extension: whoever holds the project - an editor, a host - lists what is served
-//! and sends it, whole at first and then what changed, and it serves each file from where a layer holds it. It starts
-//! serving with the first whole listing; the connection that sent it feeds it until it ends. What programs write
+//! else. It has no index, reads no records and loads no extension: whoever holds the project - an editor, a host -
+//! lists what is served into a table both map into memory (`project::served`) and names it, and it serves each file
+//! from where the table says its content lives. It starts serving with the first table; the connection that named it
+//! feeds it until it ends. What programs write
 //! through what it serves it sends to whoever holds the project as edits, a host started to hold it where nothing
 //! does. It is started by whoever wants the folder served - a host, the editor - and stops a while after nobody keeps
 //! it, once no file is open in what it serves: what only looks at the folder (a watcher, a file browser) keeps
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use project::Project;
-use project::server::{FromServer, Listing, ROLE, Shown, ToServer};
+use project::server::{FromServer, ROLE, ToServer};
 use vfs::write::Refusal;
 
 /// How long after nobody keeps it it stops (once no file is open): whoever holds the project next finds it serving.
@@ -43,8 +44,8 @@ type Stamp = (std::time::SystemTime, u64);
 
 #[derive(Default)]
 struct State {
-    /// What it serves, as its feeder last listed it.
-    listing: Listing,
+    /// What it serves: the table its feeder last named, mapped.
+    table: Option<Arc<project::served::Table>>,
     /// The connection feeding it, and whose it is.
     feeder: Option<(u64, String)>,
     /// What it holds while it serves, from the first listing on.
@@ -69,10 +70,6 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let p = Project::load(directory)?;
     let (serving, address) = serving_of(&p, backend, address)?;
     let _one = ROLE.claim(&p.root)?;
-    // What is read of the project's files, its layers give - its records read here, and again as they change.
-    if let Err(e) = project::records::Set::open(&p) {
-        eprintln!("its records: {e:#}");
-    }
     let server = Arc::new(Server {
         project: p.clone(),
         served: vfs::Served::default(),
@@ -178,7 +175,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Server {
     /// Read again what these files of the layers are to what is read of the project, where they changed since it
-    /// last did: its packs' listings, its records.
+    /// last did: its packs' listings. What its records hold it reads by the table it is named, not by them.
     fn reread(&self, changed: &[std::path::PathBuf]) {
         let stamp = |path: &Path| {
             let meta = std::fs::metadata(path).ok()?;
@@ -196,39 +193,26 @@ impl Server {
             changed.iter().filter(other).cloned().collect()
         };
         project::pack::reread_changed(&changed);
-        let records = std::ffi::OsStr::new(project::records::DIR);
-        if changed.iter().any(|path| path.components().any(|c| c.as_os_str() == records))
-            && let Err(e) = project::records::Set::open(&self.project)
-        {
-            eprintln!("its records: {e:#}");
-        }
     }
 
-    /// What whoever holds the project lists as served, from the connection `from`: shown - and served, from the first
-    /// whole listing on. Not taken from a second connection while one feeds it.
-    fn show(
-        self: &Arc<Self>,
-        (from, who): (u64, &str),
-        whole: bool,
-        shown: Vec<(String, Shown)>,
-        gone: &[String],
-    ) -> FromServer {
+    /// What whoever holds the project lists as served, from the connection `from`: the table of this generation,
+    /// mapped and shown - and served, from the first on. Not taken from a second connection while one feeds it.
+    fn show(self: &Arc<Self>, (from, who): (u64, &str), generation: u64) -> FromServer {
         let mut state = lock(&self.state);
-        match &state.feeder {
-            Some((feeds, by)) if *feeds != from => return FromServer::Fed { by: by.clone() },
-            // What changed, of a listing it was never given: the whole one first.
-            None if !whole => return FromServer::Error { why: "nothing feeds it: the whole listing first".into() },
-            _ => {}
+        if let Some((feeds, by)) = &state.feeder
+            && *feeds != from
+        {
+            return FromServer::Fed { by: by.clone() };
         }
+        let table = match project::served::Table::map(&self.project.root, generation) {
+            Ok(table) => Arc::new(table),
+            Err(e) => return FromServer::Error { why: format!("the table of generation {generation}: {e}") },
+        };
         state.feeder = Some((from, who.to_string()));
-        if whole {
-            state.listing.clear();
-        }
-        for path in gone {
-            state.listing.remove(path);
-        }
-        state.listing.extend(shown);
-        self.served.show(&state.listing);
+        // Read by it before it is shown: what it lists is read where it says.
+        project::content::serve_from(table.clone());
+        self.served.show(&table.listing());
+        state.table = Some(table);
         if state.mounted.is_none() {
             // Stopping, it serves no more: what it is listed now - what it gave the project as it ended, taken in -
             // is not mounted again.
@@ -568,7 +552,7 @@ fn connection(server: &Arc<Server>, id: u64, stream: interprocess::local_socket:
                 }
                 FromServer::Kept
             }
-            Ok(ToServer::Shown { whole, shown, gone }) => server.show((id, &who), whole, shown, &gone),
+            Ok(ToServer::Table { generation }) => server.show((id, &who), generation),
             Ok(ToServer::Changed { paths }) => {
                 server.reread(&paths);
                 FromServer::Done

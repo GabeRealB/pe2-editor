@@ -1,10 +1,10 @@
 //! The server: the process serving a project as a filesystem (`pe2-cli project server`), and nothing else. It reads no
-//! index and loads no extension: whoever holds the project - an editor, a host (`host`) - lists what is served
-//! (`Index::served`) and sends it here, whole at first and then what changed, and the server serves each file from
-//! where a layer holds it. What programs write through what it serves it sends to whoever holds the project, on the
+//! index, no records, and loads no extension: whoever holds the project - an editor, a host (`host`) - lists what is
+//! served (`Index::served`) into a table both map into memory (`served`), each path with where its content lives,
+//! and names it here; the server serves each file from where the table says it is. What programs write through what it serves it sends to whoever holds the project, on the
 //! holder's link, as edits; where nothing holds it, a host is started to.
 //!
-//! It serves from the first whole listing it is given - until then its folder is as it was - and that connection
+//! It serves from the first table it is named - until then its folder is as it was - and that connection
 //! feeds it until it ends: one feeder at a time, as one process holds the project at a time. A connection asking to
 //! keep it (`Keep`) is a lease while it stays open: the server stops a while after none is left, once no file is open
 //! in what it serves - what only looks at the folder keeps nothing.
@@ -37,15 +37,23 @@ pub enum Shown {
         size: u64,
         modified: (u64, u32),
         of_files: bool,
+        /// Where its content lives, for the server to read it knowing nothing else of the project.
+        #[serde(default)]
+        source: Source,
     },
 }
 
-/// What changed from one listing to another: what is new or other now, and what is gone.
-#[must_use]
-pub fn changes(before: &Listing, now: &Listing) -> (Vec<(String, Shown)>, Vec<String>) {
-    let shown = now.iter().filter(|(path, it)| before.get(*path) != Some(*it)).map(|(p, it)| (p.clone(), it.clone()));
-    let gone = before.keys().filter(|path| !now.contains_key(*path)).cloned();
-    (shown.collect(), gone.collect())
+/// Where a served file's content lives.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "in", rename_all = "snake_case")]
+pub enum Source {
+    /// Where a layer holds it, as a file or the manifest of one (chunked, or in a packed layer's listing).
+    #[default]
+    Disk,
+    /// Text a record holds: the record's file, and the file's name in it.
+    RecordText { record: std::path::PathBuf, name: String },
+    /// Kept in a store for a record, by its SHA-1.
+    Stored { sha1: String, store: std::path::PathBuf },
 }
 
 /// What a process says to the server.
@@ -54,10 +62,10 @@ pub fn changes(before: &Listing, now: &Listing) -> (Vec<(String, Shown)>, Vec<St
 pub enum ToServer {
     /// Keep serving while this connection lasts.
     Keep { who: String },
-    /// What is served, from whoever holds the project: the whole listing (`whole`), or what changed since the last.
-    /// The first whole one is what it starts serving with; who sends one feeds it from then on, until its connection
-    /// ends.
-    Shown { whole: bool, shown: Vec<(String, Shown)>, gone: Vec<String> },
+    /// What is served, from whoever holds the project: the table of this generation, which it wrote (`served`) for
+    /// the server to map. The first is what it starts serving with; who names one feeds it from then on, until its
+    /// connection ends.
+    Table { generation: u64 },
     /// These files changed in the layers - an edit made by whoever holds the project - for what is read of them to
     /// follow at once.
     Changed { paths: Vec<std::path::PathBuf> },

@@ -24,6 +24,7 @@ pub mod profile;
 pub mod records;
 pub mod role;
 pub mod schedule;
+pub mod served;
 pub mod server;
 pub mod setup;
 pub mod stack;

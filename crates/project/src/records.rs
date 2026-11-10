@@ -834,6 +834,21 @@ impl Set {
         Some((held.record.files.get(name)?.content.clone()?, held.modified, set.store.clone()))
     }
 
+    /// Where the content of a file of a records layer lives, for what serves it to read it without the records: the
+    /// record holding its text, or the store keeping it.
+    #[must_use]
+    pub fn source(path: &Path) -> Option<crate::server::Source> {
+        use crate::server::Source;
+        let (set, i, rel) = Set::view_of(path)?;
+        let view = &set.views[i];
+        let (uid, name) = view.files.get(&rel)?;
+        let held = view.records.get(uid)?;
+        Some(match held.record.files.get(name)?.content.as_ref()? {
+            Content::Text(_) => Source::RecordText { record: path_of(&view.dir, uid), name: name.clone() },
+            Content::Stored { sha1, .. } => Source::Stored { sha1: sha1.clone(), store: set.store.dir.clone() },
+        })
+    }
+
     /// A file of a records layer's length and when its record was written, without its content.
     #[must_use]
     pub fn stat(path: &Path) -> Option<(u64, std::time::SystemTime)> {

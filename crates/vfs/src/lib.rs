@@ -180,7 +180,7 @@ impl Tree {
                         node.asset = true;
                     }
                 }
-                Shown::File { disk, size, modified, of_files: false } => {
+                Shown::File { disk, size, modified, of_files: false, .. } => {
                     tree.file(path, Given::Disk(disk.clone()), *size, time(*modified), inodes);
                 }
                 Shown::File { of_files: true, .. } => {}
@@ -188,7 +188,7 @@ impl Tree {
         }
         // Then each node's files in its folder: the folders their names make are the node's, not entries.
         for (path, shown) in listing {
-            if let Shown::File { disk, size, modified, of_files: true } = shown {
+            if let Shown::File { disk, size, modified, of_files: true, .. } = shown {
                 tree.of_files = true;
                 tree.file(path, Given::Disk(disk.clone()), *size, time(*modified), inodes);
                 tree.of_files = false;

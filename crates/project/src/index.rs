@@ -1251,7 +1251,8 @@ impl Index {
                 Kind::File => {
                     if let Some((_, disk, _)) = self.node_files(node).into_iter().next() {
                         let (size, modified) = stamp(&disk);
-                        listing.insert(path.clone(), Shown::File { disk, size, modified, of_files: false });
+                        let source = crate::records::Set::source(&disk).unwrap_or_default();
+                        listing.insert(path.clone(), Shown::File { disk, size, modified, of_files: false, source });
                     }
                 }
                 Kind::Asset => drop(listing.insert(asset_of(path).to_string(), Shown::Node)),
@@ -1266,7 +1267,9 @@ impl Index {
                     continue;
                 }
                 let (size, modified) = stamp(&disk);
-                listing.insert(format!("{name}/{file}"), Shown::File { disk, size, modified, of_files: true });
+                let source = crate::records::Set::source(&disk).unwrap_or_default();
+                let shown = Shown::File { disk, size, modified, of_files: true, source };
+                listing.insert(format!("{name}/{file}"), shown);
             }
         }
         listing
