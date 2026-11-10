@@ -396,7 +396,7 @@ pub fn kept(project: &Project) -> Kept {
 
 /// What this machine says serves projects as filesystems where a project does not: `[filesystem]` in the editor's
 /// `settings.toml` - `serve`, what serves a project's folder, and `scopes`, what serves the files programs are given,
-/// each `auto`, `none` or a backend's name; and the budgets `copies` and `kept`.
+/// each `auto`, `none` or a backend's name; the budgets `copies` and `kept`; and `cache`, where what is kept apart is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FilesystemDefaults {
     pub serve: Option<String>,
@@ -405,6 +405,8 @@ pub struct FilesystemDefaults {
     /// folder: budgets of bytes (`16 MiB`).
     pub copies: Option<String>,
     pub kept: Option<String>,
+    /// Where what a backend keeps apart from the folder it serves is kept: a folder.
+    pub cache: Option<String>,
 }
 
 /// What this machine says serves projects (`FilesystemDefaults`); nothing where the settings say nothing, or cannot be
@@ -422,6 +424,7 @@ pub fn filesystem_defaults() -> FilesystemDefaults {
             scopes: said("scopes"),
             copies: said("copies"),
             kept: said("kept"),
+            cache: said("cache"),
         })
     };
     read().unwrap_or_default()

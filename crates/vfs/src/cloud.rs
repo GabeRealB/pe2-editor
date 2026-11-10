@@ -575,7 +575,7 @@ impl crate::backend::Backend for AsBackend {
     fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
         let read_only = job.owner.is_none();
         let cloud = serve(job.served, job.owner.clone(), job.at, job.staging, job.name)?;
-        Ok(Box::new(Kept { _cloud: cloud, root: plain(job.at), read_only }))
+        Ok(Box::new(Kept { _cloud: cloud, root: plain(job.at), shown: plain(job.at), read_only }))
     }
 
     fn clear(&self, at: &Path, name: &str) {
@@ -588,7 +588,10 @@ impl crate::backend::Backend for AsBackend {
         // Told apart while Windows still knows the folder as a sync root - what is in sync is what it left, and can be
         // read again; anything else was put or changed there - then no longer one, which takes with it the placeholders
         // never read. Each file is opened to be asked: some seconds for a project listed whole, once, as another
-        // backend takes over.
+        // backend takes over. A folder that leads elsewhere holds nothing of this one's: it is kept apart (`Apart`).
+        if crate::backend::joined(at) {
+            return;
+        }
         let mut left = Vec::new();
         placeholders_in_sync(at, &mut left);
         let _ = forget(at, name);
@@ -631,6 +634,193 @@ impl crate::backend::Backend for AsBackend {
     }
 }
 
+/// The Cloud Files API serving a folder whose content it keeps apart: the sync root is a folder of its own, where such
+/// things are kept on this machine (`backend::apart_for`: an NTFS volume), and the folder served is a junction to it.
+/// What a project on a volume the API cannot serve - `ReFS` - is served by all the same; and a choice of its own where
+/// it can, for a project's folder that is to hold nothing of what was read.
+struct Apart;
+
+/// The Cloud Files API keeping apart what it serves, among Windows' backends.
+pub const APART: &dyn crate::backend::Backend = &Apart;
+
+/// Beside a tree kept apart, what says whose it is: the folder it is served at, then the name it is served by.
+const WHOSE: &str = "project";
+/// The tree kept apart, in the folder that is its own.
+const TREE: &str = "tree";
+
+/// The folder of what is kept apart of a folder served: its own, by the place of the one served.
+fn apart(at: &Path) -> Option<PathBuf> {
+    let place = project::extract::sha1_hex(plain(at).to_string_lossy().to_lowercase().as_bytes());
+    Some(crate::backend::apart_for(at)?.join(&place[..16]))
+}
+
+/// Whether two paths name one folder, as Windows compares them.
+fn same(a: &Path, b: &Path) -> bool {
+    let written = |path: &Path| plain(path).to_string_lossy().trim_end_matches('\\').to_lowercase();
+    written(a) == written(b)
+}
+
+/// The tree a folder leads to, where that is the one kept apart for it.
+fn apart_tree(at: &Path) -> Option<PathBuf> {
+    let (to, tree) = (crate::backend::joined_to(at)?, apart(at)?.join(TREE));
+    same(&to, &tree).then_some(tree)
+}
+
+/// Whether a folder holds a file, anywhere in it.
+fn holds_files(dir: &Path) -> bool {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    entries.into_iter().any(|entry| {
+        let folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        !folder || holds_files(&entry.path())
+    })
+}
+
+/// Make a folder the junction to its tree kept apart. One that leads elsewhere is made again - another project's
+/// tree, where this project is a copy of that one; a folder of its own has to hold no file.
+fn link(at: &Path, tree: &Path) -> io::Result<()> {
+    if crate::backend::joined_to(at).is_some_and(|to| same(&to, tree)) {
+        return Ok(());
+    }
+    crate::backend::unjoin(at);
+    if at.exists() {
+        if holds_files(at) {
+            return Err(io::Error::other(format!("{} holds files: it cannot lead elsewhere", at.display())));
+        }
+        std::fs::remove_dir_all(at)?;
+    }
+    crate::backend::join_to(at, tree)
+}
+
+/// Let go of the trees kept apart, beside this one, whose folder no longer leads to them: a project removed, moved,
+/// or served otherwise since.
+fn sweep_apart(all: &Path, but: &Path) {
+    for entry in std::fs::read_dir(all).into_iter().flatten().flatten() {
+        let kept = entry.path();
+        let Ok(whose) = std::fs::read_to_string(kept.join(WHOSE)) else { continue };
+        let mut said = whose.lines();
+        let (Some(at), Some(name)) = (said.next(), said.next()) else { continue };
+        let tree = kept.join(TREE);
+        if same(&kept, but) || crate::backend::joined_to(Path::new(at)).is_some_and(|to| same(&to, &tree)) {
+            continue;
+        }
+        let _ = forget(&tree, name);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+}
+
+/// Move what a folder holds into another, folder by folder: a move where it can be one, else a copy (another volume).
+fn move_into(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
+        let (path, into) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if std::fs::create_dir_all(&into).is_ok() {
+                move_into(&path, &into);
+            }
+        } else if std::fs::rename(&path, &into).is_err() && std::fs::copy(&path, &into).is_ok() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+impl crate::backend::Backend for Apart {
+    fn name(&self) -> &'static str {
+        "cloud-cache"
+    }
+
+    fn label(&self) -> &'static str {
+        "Cloud Files, kept apart"
+    }
+
+    fn can(&self) -> crate::backend::Can {
+        crate::backend::Can { write: true, folder: true }
+    }
+
+    fn keeps(&self) -> bool {
+        true
+    }
+
+    fn prepares(&self) -> bool {
+        true
+    }
+
+    fn available(&self, at: &Path) -> Result<(), String> {
+        let Some(kept) = apart(at) else {
+            return Err("where to keep it apart is not known: `[filesystem] cache` says".into());
+        };
+        let filesystem = crate::backend::volume_filesystem;
+        if let Some(theirs) = filesystem(&kept).filter(|name| !name.eq_ignore_ascii_case("NTFS")) {
+            return Err(format!(
+                "the Cloud Files API serves on NTFS volumes, and it would be kept apart at {}, on {theirs}",
+                kept.display()
+            ));
+        }
+        match filesystem(at) {
+            Some(ours) if !["NTFS", "ReFS"].iter().any(|known| ours.eq_ignore_ascii_case(known)) => {
+                Err(format!("a folder on {ours} cannot lead to one elsewhere"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
+        let at = plain(job.at);
+        let kept = apart(&at).ok_or_else(|| io::Error::other("where to keep it apart is not known"))?;
+        let tree = kept.join(TREE);
+        std::fs::create_dir_all(&tree)?;
+        if let Some(all) = kept.parent() {
+            sweep_apart(all, &kept);
+        }
+        link(&at, &tree)?;
+        // Said once the folder leads to it: one that says so and is led to by nothing is swept.
+        std::fs::write(kept.join(WHOSE), format!("{}\n{}\n", at.display(), job.name))?;
+        let read_only = job.owner.is_none();
+        let cloud = serve(job.served, job.owner.clone(), &tree, job.staging, job.name)?;
+        Ok(Box::new(Kept { _cloud: cloud, root: tree, shown: at, read_only }))
+    }
+
+    fn clear(&self, at: &Path, name: &str) {
+        let Some(kept) = apart(at) else { return };
+        let tree = kept.join(TREE);
+        // Unregistered first, or Windows keeps what was not read of it from being removed.
+        let _ = forget(&tree, name);
+        let _ = std::fs::remove_dir_all(&kept);
+        if crate::backend::joined_to(at).is_some_and(|to| same(&to, &tree)) {
+            let _ = std::fs::remove_dir(at);
+        }
+    }
+
+    fn retire(&self, at: &Path, name: &str) {
+        let Some(tree) = apart_tree(at) else { return };
+        // As the API serving in place retires: what is in sync is what it left, and goes; anything else was put or
+        // changed there, and stays - in the folder itself, which is one of its own again.
+        let mut left = Vec::new();
+        placeholders_in_sync(&tree, &mut left);
+        let _ = forget(&tree, name);
+        for path in left.iter().rev() {
+            let _ = if path.is_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
+        }
+        crate::backend::unjoin(at);
+        move_into(&tree, at);
+        // Gone with what it kept, unless something of it could not be moved.
+        if let Some(kept) = tree.parent().filter(|_| !holds_files(&tree)) {
+            let _ = std::fs::remove_dir_all(kept);
+        }
+    }
+
+    fn collect(&self, at: &Path, record: &crate::access::Access, budget: u64) {
+        // By the folder served: what is opened through it is in the tree kept apart.
+        AsBackend.collect(at, record, budget);
+    }
+
+    fn forget(&self, at: &Path, name: &str) -> io::Result<()> {
+        apart(at).map_or(Ok(()), |kept| forget(&kept.join(TREE), name))
+    }
+
+    fn left_as_served(&self, file: &Path) -> bool {
+        in_sync(file)
+    }
+}
+
 /// What a folder holds that serving left there as it was - the files that are placeholders in sync - and every folder
 /// in it, each before what is in it: a folder holds nothing of its own, and goes where nothing is kept in it.
 fn placeholders_in_sync(dir: &Path, found: &mut Vec<PathBuf>) {
@@ -645,16 +835,18 @@ fn placeholders_in_sync(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// A folder served through the Cloud Files API, as a mount.
+/// A folder served through the Cloud Files API, as a mount: where its placeholders are, and where it is shown - the
+/// same folder, but where it is kept apart.
 struct Kept {
     _cloud: Cloud,
     root: PathBuf,
+    shown: PathBuf,
     read_only: bool,
 }
 
 impl crate::backend::Mount for Kept {
     fn shown(&self) -> String {
-        project::host::shown(&self.root)
+        project::host::shown(&self.shown)
     }
 
     fn placed(&self, served: &Served, path: &str) {

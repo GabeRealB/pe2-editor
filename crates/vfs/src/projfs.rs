@@ -148,6 +148,31 @@ impl Drop for Projected {
     }
 }
 
+/// The volumes found to let its filter attach to nothing of theirs, by trying (`serve`): not tried again, and said
+/// of them by `available`.
+static REFUSING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Why such a volume serves nothing through it.
+const REFUSED: &str = "this is a developer volume (a Dev Drive), which lets the Projected File System's filter attach \
+                       only where an administrator allows it (`fsutil devdrv setfiltersallowed PrjFlt`)";
+
+/// Why a folder could not be virtualized - and, where its volume lets the filter attach to nothing, that it does:
+/// which only trying tells, what a volume allows being an administrator's to ask.
+fn not_virtualized(at: &Path, why: HRESULT) -> io::Error {
+    /// "The file system minifilter cannot attach to the developer volume."
+    const NO_FILTER: u32 = 0x8007_01DE;
+    if why.0.cast_unsigned() != NO_FILTER {
+        return io::Error::other(format!("{}: not virtualized ({why:?})", at.display()));
+    }
+    if let Some(volume) = crate::backend::volume_of(at) {
+        let mut refusing = REFUSING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !refusing.contains(&volume) {
+            refusing.push(volume);
+        }
+    }
+    io::Error::other(format!("{}: {REFUSED}", at.display()))
+}
+
 /// Serve a tree at a folder, made empty for it here, through the Projected File System; what is not there yet looked
 /// up in the tree as it is then.
 ///
@@ -162,7 +187,7 @@ pub fn serve(served: &Served, at: &Path) -> io::Result<Projected> {
     // SAFETY: a folder's path, no target, no version, an instance id: as documented.
     let marked = unsafe { (api.mark)(PCWSTR(root.as_ptr()), PCWSTR::null(), std::ptr::null(), &raw const instance) };
     if marked.is_err() {
-        return Err(io::Error::other(format!("{}: not virtualized ({marked:?})", at.display())));
+        return Err(not_virtualized(at, marked));
     }
     let provider = std::sync::Arc::new(Provider { served: served.clone(), listings: Mutex::default() });
     let callbacks = PRJ_CALLBACKS {
@@ -197,7 +222,7 @@ pub fn serve(served: &Served, at: &Path) -> io::Result<Projected> {
     if started.is_err() {
         // SAFETY: the provider made above, which nothing calls into.
         drop(unsafe { std::sync::Arc::from_raw(raw) });
-        return Err(io::Error::other(format!("{}: not virtualized ({started:?})", at.display())));
+        return Err(not_virtualized(at, started));
     }
     Ok(Projected { context, provider: raw, at: at.to_path_buf() })
 }
@@ -411,6 +436,11 @@ impl crate::backend::Backend for AsBackend {
         if api().is_none() {
             return Err("the Projected File System is not turned on (the Windows feature `Client-ProjFS`)".into());
         }
+        let refusing = REFUSING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if crate::backend::volume_of(at).is_some_and(|volume| refusing.contains(&volume)) {
+            return Err(REFUSED.into());
+        }
+        drop(refusing);
         match crate::backend::volume_filesystem(at) {
             Some(filesystem) if !["NTFS", "ReFS"].iter().any(|known| filesystem.eq_ignore_ascii_case(known)) => {
                 Err(format!("the Projected File System serves on NTFS and ReFS volumes, and this one is {filesystem}"))

@@ -849,22 +849,9 @@ impl Drop for Mounted {
                 (api.close)(self.instance);
             }
         }
-        unjoin(&self.at);
+        crate::backend::unjoin(&self.at);
         // SAFETY: the provider `mount` made, given back once nothing calls into it.
         drop(unsafe { Arc::from_raw(self.provider) });
-    }
-}
-
-/// Make a folder Dokany mounted on a plain, empty one again. Mounting on a folder makes it a junction to the volume
-/// served, which the library leaves there once the volume is gone - as does a process that ended while it served: a
-/// folder nothing can open or list.
-fn unjoin(at: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    let joined = std::fs::symlink_metadata(at).is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
-    // Removed as the junction it is - what it led to is not touched - and made again.
-    if joined && std::fs::remove_dir(at).is_ok() {
-        let _ = std::fs::create_dir(at);
     }
 }
 
@@ -904,7 +891,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "Dokany is not installed"))?;
     let at = crate::backend::plain(at);
     // What a process that ended while it served there left of it, first.
-    unjoin(&at);
+    crate::backend::unjoin(&at);
     std::fs::create_dir_all(&at)?;
     let read_only = writes.is_none();
     let provider = Arc::new(Provider {
@@ -1085,12 +1072,15 @@ impl Backend for AsBackend {
             // SAFETY: a path ended by a zero.
             unsafe { (api.remove_mount_point)(PCWSTR(mount_point.as_ptr())) };
         }
-        unjoin(&at);
+        crate::backend::unjoin(&at);
     }
 
     fn retire(&self, at: &Path, name: &str) {
-        // Nothing of it is on disk but the folder itself, mounted on.
-        self.clear(at, name);
+        // Nothing of it is on disk but the folder itself, mounted on: a junction to a volume that is gone. One that
+        // leads to a folder is another backend's, kept apart, and stays.
+        if crate::backend::joined_to(at).is_none_or(|to| !to.exists()) {
+            self.clear(at, name);
+        }
     }
 }
 

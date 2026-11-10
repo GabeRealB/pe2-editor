@@ -289,6 +289,7 @@ struct FilesystemFile {
     keep: Option<bool>,
     copies: Option<String>,
     kept: Option<String>,
+    cache: Option<String>,
 }
 
 /// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
@@ -317,6 +318,8 @@ pub struct Filesystem {
     pub copies: Option<String>,
     /// How much a backend that keeps what is read may keep of the project's folder (`[filesystem] kept`, as `2 GiB`).
     pub kept: Option<String>,
+    /// Where a backend that keeps the folder's content apart from it keeps it (`[filesystem] cache`, a folder).
+    pub cache: Option<String>,
 }
 
 impl Filesystem {
@@ -329,6 +332,7 @@ impl Filesystem {
             keep: file.keep.unwrap_or(false),
             copies: file.copies,
             kept: file.kept,
+            cache: file.cache,
         }
     }
 }

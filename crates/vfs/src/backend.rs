@@ -236,7 +236,13 @@ pub fn all() -> &'static [&'static dyn Backend] {
     }
     #[cfg(windows)]
     {
-        &[crate::dokan::BACKEND, crate::projfs::BACKEND, crate::cloud::BACKEND, crate::dav::BACKEND]
+        &[
+            crate::dokan::BACKEND,
+            crate::projfs::BACKEND,
+            crate::cloud::BACKEND,
+            crate::cloud::APART,
+            crate::dav::BACKEND,
+        ]
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -332,6 +338,28 @@ fn choose_among<'a>(
     }
 }
 
+/// What says where this machine keeps apart what a backend keeps of a folder elsewhere than in it (`keep_apart_by`).
+static APART: std::sync::OnceLock<Box<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Ask this, from now on, where the machine keeps such things apart (its settings' `[filesystem] cache`): given by
+/// the program, which is what reads the machine's settings, once.
+pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + Sync + 'static) {
+    let _ = APART.set(Box::new(machine));
+}
+
+/// Where what is kept apart of a folder served is: as its project says (`[filesystem] cache` of the
+/// `project.local.toml` beside the folder), else the machine, else the user's local data on Windows
+/// (`%LOCALAPPDATA%\pe2-editor\served`: this machine's, not what roams with the user). None where nothing says and
+/// the system has no such place.
+#[must_use]
+pub fn apart_for(at: &Path) -> Option<std::path::PathBuf> {
+    let project = at.parent().and_then(|root| project::local_filesystem(root).cache);
+    let machine = || APART.get().and_then(|machine| machine());
+    let default = || Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("pe2-editor").join("served"));
+    project.map(std::path::PathBuf::from).or_else(machine).or_else(|| if cfg!(windows) { default() } else { None })
+}
+
 /// Make a folder ready for a backend to serve at: every other backend of this system that serves at folders retires
 /// what it left there (`Backend::retire`), so that serving by one after another finds no leftovers of the other's to
 /// take for files that are not the project's.
@@ -365,22 +393,108 @@ pub(crate) fn plain(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// Whether a folder is a junction: a link to a folder elsewhere, not one of its own.
+#[cfg(windows)]
+pub(crate) fn joined(at: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(at).is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// Where a junction leads, plainly written; none where the folder is none.
+#[cfg(windows)]
+pub(crate) fn joined_to(at: &Path) -> Option<std::path::PathBuf> {
+    if !joined(at) {
+        return None;
+    }
+    let to = std::fs::read_link(at).ok()?;
+    let text = to.to_string_lossy();
+    Some(plain(Path::new(text.strip_prefix(r"\??\").unwrap_or(&text))))
+}
+
+/// Make a folder a plain one again where it is a junction: removed as the junction it is - what it led to is not
+/// touched - and made again.
+#[cfg(windows)]
+pub(crate) fn unjoin(at: &Path) {
+    if joined(at) && std::fs::remove_dir(at).is_ok() {
+        let _ = std::fs::create_dir(at);
+    }
+}
+
+/// Make a folder a junction to another: whatever opens a path through it is in the other. The folder is made where
+/// it is not there; it has to be empty.
+///
+/// # Errors
+/// The folder cannot be made or opened, or Windows refuses the junction (a volume that takes none, a folder that
+/// holds something).
+#[cfg(windows)]
+pub(crate) fn join_to(at: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::System::IO::DeviceIoControl;
+    const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::create_dir_all(at)?;
+    // The name Windows follows (`\??\C:\...`) and the one it shows (`C:\...`), each ended by a zero.
+    let shown: Vec<u16> = plain(to).as_os_str().encode_wide().collect();
+    let followed: Vec<u16> = r"\??\".encode_utf16().chain(shown.iter().copied()).collect();
+    let long = || io::Error::other("too long a path for a junction");
+    let bytes = |units: &[u16]| u16::try_from(units.len() * 2).map_err(|_| long());
+    let (followed_len, shown_len) = (bytes(&followed)?, bytes(&shown)?);
+    let names_len = followed_len.checked_add(shown_len).and_then(|len| len.checked_add(4 + 8)).ok_or_else(long)?;
+    // A mount point's reparse data: its tag, the length of what follows the header, then where each name is in the
+    // names that end it.
+    let mut data: Vec<u8> = Vec::with_capacity(8 + usize::from(names_len));
+    data.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for field in [names_len, 0, 0, followed_len, followed_len + 2, shown_len] {
+        data.extend(field.to_le_bytes());
+    }
+    for unit in followed.iter().chain(&[0]).chain(&shown).chain(&[0]) {
+        data.extend(unit.to_le_bytes());
+    }
+    let folder = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(at)?;
+    let handle = windows::Win32::Foundation::HANDLE(folder.as_raw_handle());
+    let len = u32::try_from(data.len()).map_err(|_| long())?;
+    // SAFETY: an open folder's handle, and a buffer of the length given with it; nothing is asked back.
+    unsafe { DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, Some(data.as_ptr().cast()), len, None, 0, None, None) }
+        .map_err(io::Error::other)
+}
+
 /// The filesystem of the volume a path is on (`NTFS`, `ReFS`), where Windows says: the path need not be there yet.
 #[cfg(windows)]
 pub(crate) fn volume_filesystem(at: &Path) -> Option<String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
-    let at = std::path::absolute(at).ok()?;
-    let there = at.ancestors().find(|a| a.exists())?;
-    let path: Vec<u16> = there.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let (mut root, mut name) = ([0u16; 262], [0u16; 64]);
-    // SAFETY: a path ended by a zero, and buffers of the lengths given with them.
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+    let root: Vec<u16> = volume_of(at)?.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut name = [0u16; 64];
+    // SAFETY: a path ended by a zero, and a buffer of the length given with it.
     unsafe {
-        GetVolumePathNameW(windows_core::PCWSTR(path.as_ptr()), &mut root).ok()?;
         GetVolumeInformationW(windows_core::PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut name)).ok()?;
     }
     let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
     Some(String::from_utf16_lossy(&name[..len]))
+}
+
+/// The volume a path is on, as Windows names its root (`E:\`); the path need not be there yet.
+#[cfg(windows)]
+pub(crate) fn volume_of(at: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let at = std::path::absolute(at).ok()?;
+    // The volume the folder itself is on: a junction is asked of the folder it is in, or Windows answers for the
+    // volume it leads to.
+    let there = at.ancestors().find(|a| a.exists() && !joined(a))?;
+    let path: Vec<u16> = there.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut root = [0u16; 262];
+    // SAFETY: a path ended by a zero, and a buffer of the length given with it.
+    unsafe { GetVolumePathNameW(windows_core::PCWSTR(path.as_ptr()), &mut root).ok()? };
+    let len = root.iter().position(|c| *c == 0).unwrap_or(root.len());
+    Some(String::from_utf16_lossy(&root[..len]))
 }
 
 /// Let go, at once, of every mount this process made that would outlast it: as it is about to end without dropping them.
@@ -466,6 +580,27 @@ mod tests {
         // None suited: nothing serves.
         let none: [&dyn Backend; 2] = [&off, &wire];
         assert!(choose_among(&none, &Setting::Auto, Can::BY_PATH, at, &how, false).unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_leads_to_another_and_is_one_of_its_own_again() {
+        let root = std::env::temp_dir().join(format!("pe2-junction-{}", std::process::id()));
+        let (at, to) = (root.join("at"), root.join("to"));
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("there.txt"), "there").unwrap();
+        assert!(!super::joined(&at) && super::joined_to(&at).is_none());
+        super::join_to(&at, &to).expect("joined");
+        assert_eq!(super::joined_to(&at).as_deref(), Some(super::plain(&to).as_path()));
+        // What is opened through it is in the other; what is written through it too.
+        assert_eq!(std::fs::read_to_string(at.join("there.txt")).unwrap(), "there");
+        std::fs::write(at.join("new.txt"), "new").unwrap();
+        assert_eq!(std::fs::read_to_string(to.join("new.txt")).unwrap(), "new");
+        // One of its own again, empty: what it led to is as it was.
+        super::unjoin(&at);
+        assert!(!super::joined(&at) && std::fs::read_dir(&at).unwrap().next().is_none());
+        assert!(to.join("there.txt").exists() && to.join("new.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -197,6 +197,7 @@ pub fn run() -> Result {
         let machine = extensions::filesystem_defaults();
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
+    vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(PathBuf::from));
     // Ended by a signal, the editor drops nothing: what it mounted would be left with no one serving it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = ctrlc::set_handler(|| {

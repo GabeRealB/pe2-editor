@@ -1329,6 +1329,7 @@ fn main() -> Result<()> {
         let machine = extensions::filesystem_defaults();
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
+    vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(PathBuf::from));
     let profile = cli.profile.then(std::time::Instant::now);
     // What the command line asks is a command: its work weighed as one, over the host's own.
     let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
