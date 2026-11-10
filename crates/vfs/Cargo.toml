@@ -1,6 +1,6 @@
 [package]
 name = "vfs"
-description = "A project's merged layers as a filesystem: one tree, served over FUSE or WebDAV, and scoped views of it"
+description = "A project's merged layers as a filesystem: one tree, served by the backend suited to the job, and scoped views of it"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
@@ -28,5 +28,13 @@ libc = "0.2"
 # The Cloud Files transport (`cloud.rs`): placeholders Windows fills as they are read, nothing to install.
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.7"
+# The Projected File System (`projfs.rs`), where Windows has it turned on, and Dokany (`dokan.rs`), where it is
+# installed: Windows' types, each library loaded when used.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
+] }
+libloading = "0.8"
 nt-time = "0.15"
 windows-core = "0.62"

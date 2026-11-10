@@ -698,6 +698,22 @@ fn download_from(setup: &Setup, url: &str, to: &Path, progress: Progress, cancel
     Ok(got)
 }
 
+/// How the files of an extension's folder are read (its patches): plainly, unless what holds the extension says
+/// otherwise - a project's held extension, a tree read through its store (`read_folder_files_with`).
+static READER: std::sync::OnceLock<FolderReader> = std::sync::OnceLock::new();
+
+/// What reads a file of an extension's folder.
+pub type FolderReader = fn(&Path) -> std::io::Result<Vec<u8>>;
+
+/// Read the files of extensions' folders with this, from now on: what holds extensions where no disk does.
+pub fn read_folder_files_with(reader: FolderReader) {
+    let _ = READER.set(reader);
+}
+
+fn read_folder_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    READER.get().map_or_else(|| std::fs::read(path), |read| read(path))
+}
+
 /// An entry's patches applied to what it took, each checked against its hash first.
 fn patch_all(setup: &Setup, folder: Option<&Path>, into: &Path) -> Result<()> {
     for patch in &setup.patches {
@@ -705,7 +721,7 @@ fn patch_all(setup: &Setup, folder: Option<&Path>, into: &Path) -> Result<()> {
             format!("{}: its patches are in the extension's folder, which it has none of", setup.name)
         })?;
         let file = folder.join(&patch.file);
-        let bytes = std::fs::read(&file).with_context(|| file.display().to_string())?;
+        let bytes = read_folder_file(&file).with_context(|| file.display().to_string())?;
         let got = hex(&Sha256::digest(&bytes));
         ensure!(
             got.eq_ignore_ascii_case(&patch.sha256),

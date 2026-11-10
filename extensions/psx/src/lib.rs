@@ -326,9 +326,24 @@ fn package_name(call: &Call) -> Result<String> {
         .ok_or_else(|| anyhow!("it is told no package's name"))
 }
 
-/// A package's name, in the gathered tree written out.
-fn name_in(tree: &Path) -> Result<String> {
-    fs::read_to_string(tree.join("package")).map_err(|_| anyhow!("the tree names no package"))
+/// A file of the gathered tree, as text: read from the value, not where it is served - what this extension reads
+/// itself it has, and a served folder is for the tools (on Windows its placeholders are no files to the sandbox's
+/// filesystem).
+fn text_in(call: &Call, sources: &Typed, name: &str) -> Result<String> {
+    let file = sources.files.iter().find(|file| file.name == name).ok_or_else(|| anyhow!("the tree has no {name}"))?;
+    Ok(String::from_utf8_lossy(&call.read(file)?).into_owned())
+}
+
+/// A package's name, in the gathered tree.
+fn name_in(call: &Call, sources: &Typed) -> Result<String> {
+    text_in(call, sources, "package").map_err(|_| anyhow!("the tree names no package"))
+}
+
+/// The one file of a folder of the gathered tree (a property of a package's), where the tree is served.
+fn only_in(sources: &Typed, tree: &Path, folder: &str) -> Result<PathBuf> {
+    let inside = format!("{folder}/");
+    let file = sources.files.iter().find(|file| file.name.starts_with(&inside));
+    file.map(|file| tree.join(&file.name)).ok_or_else(|| anyhow!("{folder} is empty"))
 }
 
 /// The file an image is written to: its package's name as the release names its files, the path's steps joined by `_` (`aya/mist`:
@@ -347,23 +362,26 @@ fn expand(call: &mut Call) -> Result<Typed> {
     let sources = call.take::<SourceTree>(0)?;
     let scratch = PathBuf::from(format!("{}.expand", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+    let made = with_tree(call, &sources, &path, |tree| {
         let mut made = vec![];
         for (_, unit) in
-            units_of(&fs::read_to_string(tree.join("units"))?).iter().filter(|(_, unit)| !is_assembly(unit))
+            units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit))
         {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
-            args.extend(searched(&tree));
-            args.extend([format!("-I{}", text(&tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
+            args.extend(searched(call, &sources, tree));
+            args.extend([format!("-I{}", text(tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
             run(PREPROCESSOR, &args)?;
-            let said = replaced(&fs::read(&expanded)?, text(&tree).as_bytes(), TREE.as_bytes());
+            let mut said = fs::read(&expanded)?;
+            for form in forms(tree) {
+                said = replaced(&said, form.as_bytes(), TREE.as_bytes());
+            }
             made.push(File::new(&expanded_name(unit), said));
         }
         Ok(made)
     });
     let _ = fs::remove_dir_all(&scratch);
-    Ok(Typed::new(SourceTree::NAME, in_project(made, &scratch, &path)?))
+    Ok(Typed::new(SourceTree::NAME, made?))
 }
 
 /// These bytes with one run of them put for another.
@@ -391,7 +409,8 @@ fn object(call: &mut Call) -> Result<Typed> {
     let core = call.take::<SourceTree>(1)?;
     let scratch = PathBuf::from(format!("{}.object", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &core, &scratch).and_then(|tree| {
+    // A compiler's core tree: little of it read, once.
+    let made = call.serve(&core.files, &pe2_ext::Use::once()).and_then(|tree| {
         let source = expanded.files.first().ok_or_else(|| anyhow!("{unit} was not expanded"))?;
         let at = scratch.join("unit.i");
         fs::write(&at, call.read(source)?)?;
@@ -424,7 +443,7 @@ fn assemble(call: &mut Call) -> Result<Typed> {
     let sources = call.take::<SourceTree>(0)?;
     let scratch = PathBuf::from(format!("{}.assemble", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+    let made = with_tree(call, &sources, &path, |tree| {
         let object = scratch.join("unit.o");
         let mut args: Vec<String> = ASSEMBLER.iter().map(ToString::to_string).collect();
         args.extend(["-o".to_string(), text(&object), text(&tree.join(&unit))]);
@@ -432,7 +451,7 @@ fn assemble(call: &mut Call) -> Result<Typed> {
         call.keep(&text(&object), &object_name(&package_name(call)?, &unit))
     });
     let _ = fs::remove_dir_all(&scratch);
-    Ok(Typed::new(Object::NAME, vec![in_project(made, &scratch, &path)?]))
+    Ok(Typed::new(Object::NAME, vec![made?]))
 }
 
 /// The package's objects: its units', and its prebuilt ones (`target/psx/<package>/objects/<visibility>/<place>`) by their place in
@@ -461,18 +480,11 @@ fn collect(call: &mut Call) -> Result<Typed> {
     Ok(Typed { settings, ..Typed::new(Objects::NAME, files) })
 }
 
-/// Objects on disk under `objects/`, each by its name, as a link script names them.
-fn write_objects(call: &Call, objects: &[File], scratch: &Path) -> Result<Vec<PathBuf>> {
-    let mut written = vec![];
-    for file in objects {
-        let at = scratch.join("objects").join(&file.name);
-        if let Some(parent) = at.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&at, call.read(file)?)?;
-        written.push(at);
-    }
-    Ok(written)
+/// Objects served for the linker, each by its name, as a link script names them: their paths.
+fn served_objects(call: &Call, objects: &[File]) -> Result<Vec<PathBuf>> {
+    // A linker reads every object it is given, once, whole.
+    let at = call.serve(objects, &pe2_ext::Use::default())?;
+    Ok(objects.iter().map(|file| at.join(&file.name)).collect())
 }
 
 /// What the gathered tree says the image links besides its own objects (its file `linked`, as text): its dependencies
@@ -482,9 +494,8 @@ fn linked_in(listed: &str, kind: &str) -> Vec<String> {
 }
 
 /// The package's own link script, from the gathered tree.
-fn script_of(tree: &Path, name: &str) -> Result<PathBuf> {
-    only_file(&tree.join("target").join(TARGET).join(name).join("link_script"))
-        .map_err(|_| anyhow!("{name} has no link_script"))
+fn script_of(sources: &Typed, tree: &Path, name: &str) -> Result<PathBuf> {
+    only_in(sources, tree, &format!("target/{TARGET}/{name}/link_script")).map_err(|_| anyhow!("{name} has no link_script"))
 }
 
 /// What an image exports: its layout alone, its references left open - a jump to 0 does not reach, which ld says and goes
@@ -495,15 +506,15 @@ fn symbols(call: &mut Call) -> Result<Typed> {
     let objects = call.take::<Objects>(1)?;
     let scratch = PathBuf::from(format!("{}.symbols", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| {
-        let name = name_in(&tree)?;
-        let objects = write_objects(call, &objects.files, &scratch)?;
+    let made = with_tree(call, &sources, &path, |tree| {
+        let name = name_in(call, &sources)?;
+        let objects = served_objects(call, &objects.files)?;
         let layout = scratch.join("layout.elf");
         let mut args: Vec<String> =
             ["-EL", "-nostdlib", "--no-check-sections", "--unresolved-symbols=ignore-all", "--noinhibit-exec"]
                 .map(ToString::to_string)
                 .to_vec();
-        args.extend(["-T".to_string(), text(&script_of(&tree, &name)?), "-o".to_string(), text(&layout)]);
+        args.extend(["-T".to_string(), text(&script_of(&sources, tree, &name)?), "-o".to_string(), text(&layout)]);
         args.extend(objects.iter().map(|object| text(object)));
         output("mips-linux-gnu-ld", &args)?;
         let listed = output("mips-linux-gnu-nm", &["-g".to_string(), "--defined-only".to_string(), text(&layout)])?;
@@ -521,7 +532,7 @@ fn symbols(call: &mut Call) -> Result<Typed> {
         call.keep(&text(&at), "symbols.ld")
     });
     let _ = fs::remove_dir_all(&scratch);
-    Ok(Typed::new(Symbols::NAME, vec![in_project(made, &scratch, &path)?]))
+    Ok(Typed::new(Symbols::NAME, vec![made?]))
 }
 
 /// The image: the package's objects and its dependencies', by its script at its slot, against what the libraries publish
@@ -551,8 +562,8 @@ fn link_image(call: &mut Call) -> Result<Typed> {
     let own = call.take::<Objects>(1)?;
     let scratch = PathBuf::from(format!("{}.link", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| {
-        let name = name_in(&tree)?;
+    let made = with_tree(call, &sources, &path, |tree| {
+        let name = name_in(call, &sources)?;
         let mut files = own.files.clone();
         for (dependency, objects) in dependencies.iter().zip(objects_read) {
             let pe2_ext::Data::Typed(objects) = objects.clone() else {
@@ -569,22 +580,27 @@ fn link_image(call: &mut Call) -> Result<Typed> {
                 .collect();
             files.extend(objects.files.into_iter().filter(|file| public.contains(&file.name.as_str())));
         }
-        let objects = write_objects(call, &files, &scratch)?;
+        let objects = served_objects(call, &files)?;
         let mut published = vec![];
-        if let Ok(packages) = fs::read_dir(tree.join("target").join(TARGET)) {
-            for package in packages {
-                if let Ok(file) = only_file(&package?.path().join("symbols")) {
-                    published.push(file);
-                }
+        // What each package of the tree publishes: its one file under `symbols/`.
+        let mut publishing = std::collections::BTreeMap::new();
+        let target = format!("target/{TARGET}/");
+        for file in &sources.files {
+            let Some((package, rest)) = file.name.strip_prefix(&target).and_then(|rest| rest.split_once('/')) else {
+                continue;
+            };
+            if rest.starts_with("symbols/") {
+                publishing.entry(package.to_string()).or_insert_with(|| tree.join(&file.name));
             }
         }
+        published.extend(publishing.into_values());
         for (at, (bound, symbols)) in bound.iter().zip(symbols_read).enumerate() {
             let pe2_ext::Data::Typed(symbols) = symbols else { bail!("{bound}: what it publishes is no file") };
             let written = scratch.join(format!("bound_{at}.ld"));
             fs::write(&written, call.read(symbols.file()?)?)?;
             published.push(written);
         }
-        let image = link(&script_of(&tree, &name)?, &published, &objects, &scratch, &name)?;
+        let image = link(&script_of(&sources, tree, &name)?, &published, &objects, &scratch, &name)?;
         if pe2_ext::targeted(&fields, Some(TARGET)).get("executable").and_then(Value::as_bool) != Some(true) {
             return Ok((image, format!("{}.pe2pkg", file_name(&name))));
         }
@@ -599,22 +615,40 @@ fn link_image(call: &mut Call) -> Result<Typed> {
         Ok(Typed { notes: notes.clone(), ..Typed::new(Package::NAME, vec![kept]) })
     });
     let _ = fs::remove_dir_all(&scratch);
-    // What a tool said of the tree it was given is said of the files they are.
-    in_project(result, &scratch, &path)
+    result
+}
+
+/// What was gathered, served for the tools to read (`Call::serve`: nothing written where the host serves it), and
+/// what is done with it - what a tool says of the tree said of the files they are.
+fn with_tree<T>(call: &Call, sources: &Typed, path: &str, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    // A tool reads its unit and the headers that includes, once.
+    let tree = call.serve(&sources.files, &pe2_ext::Use::once())?;
+    in_project(work(&tree), &tree, path)
 }
 
 /// What a tool said of the tree it was given, said of the files they are.
-fn in_project<T>(result: Result<T>, scratch: &Path, path: &str) -> Result<T> {
-    let tree = scratch.join("tree").display().to_string();
+fn in_project<T>(result: Result<T>, tree: &Path, path: &str) -> Result<T> {
     result.map_err(|e| {
-        anyhow!(
-            "{}",
-            format!("{e:#}")
+        let mut said = format!("{e:#}");
+        for tree in forms(tree) {
+            said = said
                 .replace(&format!("{tree}/self/"), &format!("{path}/"))
                 .replace(&format!("{tree}/dep/"), "packages/")
-                .replace(&format!("{tree}/"), "")
-        )
+                .replace(&format!("{tree}/"), "");
+        }
+        anyhow!("{said}")
     })
+}
+
+/// A folder's path as this extension names it, and as the programs it runs do: on Windows the same but for the
+/// drive, a root of its own here (`/D:/a`) and not to them (`D:/a`).
+fn forms(folder: &Path) -> Vec<String> {
+    let own = text(folder);
+    let theirs = match own.as_bytes() {
+        [b'/', letter, b':', b'/', ..] if letter.is_ascii_alphabetic() => Some(own[1..].to_string()),
+        _ => None,
+    };
+    std::iter::once(own).chain(theirs).collect()
 }
 
 /// What the units come to with their includes and the options expanded and the other `PE2_*` macros left as they are written, for
@@ -623,18 +657,19 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
     let mut sources = call.take::<SourceTree>(0)?;
     let scratch = PathBuf::from(format!("{}.first", call.temp()?));
     fs::create_dir_all(&scratch)?;
-    let made = write_out(call, &sources, &scratch).and_then(|tree| {
+    let path = call.host.path().to_string();
+    let made = with_tree(call, &sources, &path, |tree| {
         let mut made = vec![];
         for (_, unit) in
-            units_of(&fs::read_to_string(tree.join("units"))?).iter().filter(|(_, unit)| !is_assembly(unit))
+            units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit))
         {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
-            args.extend(searched(&tree));
+            args.extend(searched(call, &sources, tree));
             args.extend([
                 "-P".to_string(),
                 "-DPE2_FIRST_PASS".to_string(),
-                format!("-I{}", text(&tree)),
+                format!("-I{}", text(tree)),
                 "-o".to_string(),
                 text(&expanded),
                 text(&tree.join(unit)),
@@ -645,13 +680,12 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
         Ok(made)
     });
     let _ = fs::remove_dir_all(&scratch);
-    let path = call.host.path().to_string();
     let unset = sources
         .settings
         .get("unset")
         .and_then(Value::as_array)
         .map_or_else(Vec::new, |names| names.iter().filter_map(Value::as_str).collect());
-    sources.files.extend(in_project(made, &scratch, &path).map_err(|e| no_value(e, &unset))?);
+    sources.files.extend(made.map_err(|e| no_value(e, &unset))?);
     Ok(sources)
 }
 
@@ -672,8 +706,8 @@ fn no_value(error: pe2_ext::Error, unset: &[&str]) -> pe2_ext::Error {
 
 /// The folders a gathered tree's includes are found in, as the preprocessor is told them, in their order: a package's own for what
 /// it includes in quotes (`-iquote`), its dependencies' for what in angle brackets.
-fn searched(tree: &Path) -> Vec<String> {
-    let listed = fs::read_to_string(tree.join("includes")).unwrap_or_default();
+fn searched(call: &Call, sources: &Typed, tree: &Path) -> Vec<String> {
+    let listed = text_in(call, sources, "includes").unwrap_or_default();
     let mut args = vec![];
     for line in listed.lines() {
         match line.split_once(' ') {
@@ -685,24 +719,6 @@ fn searched(tree: &Path) -> Vec<String> {
     args
 }
 
-/// What was gathered, on disk for the tools to read.
-fn write_out(call: &Call, sources: &Typed, scratch: &Path) -> Result<PathBuf> {
-    let tree = scratch.join("tree");
-    for file in &sources.files {
-        let to = tree.join(&file.name);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(to, call.read(file)?)?;
-    }
-    Ok(tree)
-}
-
-/// The one file a property of a package is in.
-fn only_file(folder: &Path) -> Result<PathBuf> {
-    let found = fs::read_dir(folder)?.next().ok_or_else(|| anyhow!("{} is empty", folder.display()))??;
-    Ok(found.path())
-}
 
 fn text(path: &Path) -> String {
     path.display().to_string()

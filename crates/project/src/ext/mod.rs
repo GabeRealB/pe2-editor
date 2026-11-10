@@ -11,7 +11,44 @@
 pub mod component;
 pub mod folder;
 pub mod requests;
-pub use pe2_setup as setup;
+/// What extensions fetch (`pe2_setup`), an extension's own files - its patches - read where they are: a held one's
+/// through the project's store (`content::read`), its folder being on no disk.
+pub mod setup {
+    pub use pe2_setup::*;
+
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    /// `pe2_setup::fetch`, what the extension's folder holds read through the project's content.
+    ///
+    /// # Errors
+    /// As `pe2_setup::fetch`.
+    pub fn fetch(
+        setup: &Setup,
+        store: &Path,
+        folder: Option<&Path>,
+        progress: Progress,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        pe2_setup::read_folder_files_with(crate::content::read);
+        pe2_setup::fetch(setup, store, folder, progress, cancel)
+    }
+
+    /// `pe2_setup::hashes`, what the extension's folder holds read through the project's content.
+    ///
+    /// # Errors
+    /// As `pe2_setup::hashes`.
+    pub fn hashes(
+        setup: &Setup,
+        scratch: &Path,
+        folder: Option<&Path>,
+        progress: Progress,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        pe2_setup::read_folder_files_with(crate::content::read);
+        pe2_setup::hashes(setup, scratch, folder, progress, cancel)
+    }
+}
 pub mod unsandboxed;
 
 use anyhow::{Context, Result};
@@ -2522,6 +2559,10 @@ impl pe2_ext::CallHost for Hosted<'_> {
 
     fn keep(&self, path: &str, name: &str) -> Result<pe2_ext::File> {
         self.call.keep(std::path::Path::new(path), name)
+    }
+
+    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Result<String> {
+        self.call.serve(files, how).map(|at| at.display().to_string())
     }
 
     fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {

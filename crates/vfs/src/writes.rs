@@ -30,6 +30,9 @@ use crate::{Served, What};
 /// How long a new file or a removal waits for what follows it before it is applied.
 pub const SETTLE: Duration = Duration::from_millis(1000);
 
+/// How long the removal of a file the project was just given waits for the tree to show it, before it is given up.
+const AWAITED: Duration = Duration::from_secs(30);
+
 /// A file staged: where its content is, whether it was written since it was last applied, whether the project has it,
 /// and when it was applied.
 #[derive(Debug)]
@@ -50,6 +53,12 @@ struct State {
     new: HashMap<String, Instant>,
     /// Open files by handle: their path.
     handles: HashMap<u64, String>,
+    /// Paths whose content the owner is applying this moment: the project's any moment now, whatever is asked of them
+    /// meanwhile - which waits for it (`applied`).
+    applying: BTreeSet<String>,
+    /// Paths removed while the project had them and the tree did not show them yet, and when to stop waiting for it to:
+    /// their removal is applied once it does.
+    awaited: HashMap<String, Instant>,
     next: u64,
 }
 
@@ -68,6 +77,8 @@ pub struct Writes {
     owner: Arc<dyn Owner>,
     dir: PathBuf,
     state: Arc<Mutex<State>>,
+    /// Held by what applies what has settled: one at a time, so that nothing is given to the project twice.
+    settling: Arc<Mutex<()>>,
 }
 
 fn parent(path: &str) -> &str {
@@ -83,15 +94,22 @@ impl Writes {
     pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &Path) -> io::Result<Writes> {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir)?;
-        let writes = Writes { served: served.clone(), owner, dir: dir.to_path_buf(), state: Arc::default() };
+        let writes = Writes {
+            served: served.clone(),
+            owner,
+            dir: dir.to_path_buf(),
+            state: Arc::default(),
+            settling: Arc::default(),
+        };
         // What has settled is applied off the filesystem's threads, for as long as the writes are kept.
         let (served, owner, dir, weak) =
             (writes.served.clone(), Arc::downgrade(&writes.owner), writes.dir.clone(), Arc::downgrade(&writes.state));
+        let settling = writes.settling.clone();
         let _ = std::thread::Builder::new().name("filesystem writes".into()).spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(200));
                 let (Some(state), Some(owner)) = (weak.upgrade(), owner.upgrade()) else { return };
-                Writes { served: served.clone(), owner, dir: dir.clone(), state }.settle();
+                Writes { served: served.clone(), owner, dir: dir.clone(), state, settling: settling.clone() }.settle();
             }
         });
         Ok(writes)
@@ -120,6 +138,17 @@ impl Writes {
         Some(Shown { folder: matches!(node.what, What::Folder(_)), size: node.size, modified: node.modified })
     }
 
+    /// Whether a path is the tree's alone: nothing staged over it, hidden or waiting. What it is then changes only as
+    /// the tree does, which is told to whatever caches it.
+    #[must_use]
+    pub fn settled(&self, path: &str) -> bool {
+        let state = self.lock();
+        !(state.staged.contains_key(path)
+            || state.hidden.contains_key(path)
+            || state.new.contains_key(path)
+            || state.folders.contains(path))
+    }
+
     /// A folder's children as shown: the tree's, less what is hidden, with what is staged in it.
     #[must_use]
     pub fn list(&self, path: &str) -> BTreeMap<String, bool> {
@@ -143,6 +172,14 @@ impl Writes {
         out
     }
 
+    /// The names written or made in a folder since the tree was told: few, whatever the folder holds.
+    #[must_use]
+    pub fn staged_in(&self, folder: &str) -> Vec<String> {
+        let state = self.lock();
+        let staged = state.staged.keys().chain(state.folders.iter()).filter(|path| parent(path) == folder);
+        staged.map(|path| path.rsplit('/').next().unwrap_or(path).to_string()).collect()
+    }
+
     /// Up to `len` bytes of a file from `offset`: staged, or the tree's.
     ///
     /// # Errors
@@ -159,6 +196,29 @@ impl Writes {
         let tree = self.served.tree();
         let (ino, _) = tree.at(path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         tree.read(ino, offset, len)
+    }
+
+    /// Bytes of a file from `offset` read into a buffer, as many as it takes or the file has: staged, or the tree's.
+    ///
+    /// # Errors
+    /// It is not there, or cannot be read.
+    pub fn read_into(&self, path: &str, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        let staged = self.lock().staged.get(path).map(|s| s.file.clone());
+        if let Some(file) = staged {
+            let mut opened = File::open(file)?;
+            opened.seek(SeekFrom::Start(offset))?;
+            let mut read = 0;
+            while read < buffer.len() {
+                match opened.read(&mut buffer[read..])? {
+                    0 => break,
+                    count => read += count,
+                }
+            }
+            return Ok(read);
+        }
+        let tree = self.served.tree();
+        let (ino, _) = tree.at(path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        tree.read_into(ino, offset, buffer)
     }
 
     /// A staging file of a path: its content now - the tree's, unless `empty` - copied in where it is not staged yet.
@@ -286,12 +346,56 @@ impl Writes {
                 _ => return Ok(()),
             }
         };
-        self.apply(Change::Write { path: path.to_string(), staged: file })?;
-        if let Some(staged) = self.lock().staged.get_mut(path) {
+        self.lock().applying.insert(path.to_string());
+        let applied = self.apply(Change::Write { path: path.to_string(), staged: file });
+        let mut state = self.lock();
+        state.applying.remove(path);
+        applied?;
+        if let Some(staged) = state.staged.get_mut(path) {
             staged.dirty = false;
             staged.applied = Some(SystemTime::now());
         }
         Ok(())
+    }
+
+    /// Give the project the new files that have settled, together (`Owner::changes`): what `apply_written` does for
+    /// one, for all that were written and are no junk.
+    fn apply_new(&self, paths: &[String]) {
+        let mut given = Vec::new();
+        {
+            let mut state = self.lock();
+            for path in paths {
+                state.new.remove(path);
+                let Some(staged) = state.staged.get(path).filter(|staged| staged.dirty && !is_junk(path)) else {
+                    continue;
+                };
+                given.push((path.clone(), staged.file.clone()));
+                state.applying.insert(path.clone());
+            }
+        }
+        if given.is_empty() {
+            return;
+        }
+        let asked = given.iter().map(|(path, file)| Change::Write { path: path.clone(), staged: file.clone() });
+        let applied = self.owner.changes(asked.collect());
+        let mut state = self.lock();
+        for ((path, _), applied) in given.into_iter().zip(applied) {
+            state.applying.remove(&path);
+            if applied.is_ok()
+                && let Some(staged) = state.staged.get_mut(&path)
+            {
+                staged.dirty = false;
+                staged.applied = Some(SystemTime::now());
+            }
+        }
+    }
+
+    /// Wait until the owner is done applying a path's content, where it is this moment: what is asked of the path next
+    /// - its removal, its renaming - is then asked of a file the project has, not of one it is about to be given.
+    fn applied(&self, path: &str) {
+        while self.lock().applying.contains(path) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     fn apply(&self, change: Change) -> io::Result<()> {
@@ -303,6 +407,7 @@ impl Writes {
     /// # Errors
     /// It is not there.
     pub fn remove(&self, path: &str) -> io::Result<()> {
+        self.applied(path);
         let in_tree = self.served.tree().at(path).is_some();
         let mut state = self.lock();
         let staged = state.staged.remove(path);
@@ -313,20 +418,36 @@ impl Writes {
         }
         let applied = staged.as_ref().is_some_and(|s| s.applied.is_some());
         if in_tree || applied {
-            state.hidden.insert(path.to_string(), Some(Instant::now() + SETTLE));
+            let due = Instant::now() + SETTLE;
+            state.hidden.insert(path.to_string(), Some(due));
+            // The project has it, and the tree may not show it yet: its removal waits for the tree to.
+            if !in_tree {
+                state.awaited.insert(path.to_string(), due + AWAITED);
+            }
         } else if staged.is_none() && !folder {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
         Ok(())
     }
 
-    /// Make a folder: in a folder, at once; in a node, waiting for what is written in it.
+    /// Make a folder: in a folder, at once; in a node, waiting for what is written in it; where one was removed a
+    /// moment ago, by keeping that one.
     ///
     /// # Errors
     /// Its name is refused, or the owner could not apply it.
     pub fn make_folder(&self, path: &str) -> io::Result<()> {
         if crate::write::refused(path) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // Made where one was removed a moment ago, its removal not applied yet: it is not removed after all. What was
+        // removed from it stays removed.
+        {
+            let mut state = self.lock();
+            if matches!(state.hidden.get(path), Some(Some(_))) && self.served.tree().at(path).is_some() {
+                state.hidden.remove(path);
+                state.awaited.remove(path);
+                return Ok(());
+            }
         }
         if self.in_node(path) || is_junk(path) {
             self.lock().folders.insert(path.to_string());
@@ -363,6 +484,7 @@ impl Writes {
         if crate::write::refused(to) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        self.applied(from);
         // The kernel keeps the renamed node's number for its new name.
         self.served.rename(from, to);
         let staged = {
@@ -398,8 +520,27 @@ impl Writes {
         self.apply(Change::Rename { from: from.to_string(), to: to.to_string() })
     }
 
+    /// Apply what waits to settle, now: what serving does as it ends, so that what a program did a moment before is
+    /// the project's too. A file still open is left, as is what waits for more than time.
+    pub fn finish(&self) {
+        {
+            let mut state = self.lock();
+            let now = Instant::now();
+            for due in state.new.values_mut() {
+                *due = now;
+            }
+            for due in state.hidden.values_mut().flatten() {
+                *due = now;
+            }
+        }
+        self.settle();
+    }
+
     /// Apply what has settled - new files, removals - and let go of what the tree served now shows.
     pub fn settle(&self) {
+        // One at a time: what settles is found and given under it, by the thread that does so as it goes and by
+        // what gives all of it as serving ends.
+        let _settling = self.settling.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let due_new: Vec<String> = {
             let state = self.lock();
@@ -409,12 +550,10 @@ impl Writes {
         // Declarations first: what is written beside one waits for its folder to be a node.
         let mut due_new = due_new;
         due_new.sort_by_key(|p| (!p.ends_with(&format!("/{}", project::index::NODE_FILE)), p.clone()));
-        for path in due_new {
-            if self.waits_for_its_node(&path) {
-                continue;
-            }
-            self.lock().new.remove(&path);
-            let _ = self.apply_written(&path);
+        due_new.retain(|path| !self.waits_for_its_node(path));
+        // Given to the project together: each waits for nothing the others make.
+        self.apply_new(&due_new);
+        for path in &due_new {
             // A folder waiting in a node is settled by what was written in it.
             let mut state = self.lock();
             let mut at = path.as_str();
@@ -427,6 +566,7 @@ impl Writes {
             let state = self.lock();
             state.hidden.iter().filter(|(_, due)| due.is_some_and(|d| d <= now)).map(|(p, _)| p.clone()).collect()
         };
+        let mut removing = Vec::new();
         for path in due_removals {
             // What is in a folder being removed goes with it.
             let covered = {
@@ -439,15 +579,30 @@ impl Writes {
                 }
                 covered
             };
-            if !covered
-                && self.served.tree().at(&path).is_some()
-                && self.apply(Change::Remove { path: path.clone() }).is_err()
-            {
-                // Refused: it is shown again.
-                self.lock().hidden.remove(&path);
+            let in_tree = self.served.tree().at(&path).is_some();
+            if !covered && !in_tree && self.lock().awaited.get(&path).is_some_and(|until| *until > now) {
+                // The project was given it a moment ago, and the tree does not show it yet: removed once it does.
                 continue;
             }
-            self.lock().hidden.insert(path, None);
+            if !covered && in_tree {
+                removing.push(path);
+                continue;
+            }
+            let mut state = self.lock();
+            state.awaited.remove(&path);
+            state.hidden.insert(path, None);
+        }
+        // Removed from the project together.
+        let asked = removing.iter().map(|path| Change::Remove { path: path.clone() }).collect();
+        for (path, removed) in removing.into_iter().zip(self.owner.changes(asked)) {
+            let mut state = self.lock();
+            state.awaited.remove(&path);
+            if removed.is_ok() {
+                state.hidden.insert(path, None);
+            } else {
+                // Refused: it is shown again.
+                state.hidden.remove(&path);
+            }
         }
         // What the tree has now needs no showing over it.
         let tree = self.served.tree();
@@ -481,5 +636,194 @@ impl Writes {
     #[must_use]
     pub fn served(&self) -> &Served {
         &self.served
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Writes;
+    use crate::Served;
+    use crate::write::{Change, Owner};
+    use project::content::Given;
+    use std::collections::BTreeMap;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A project of files held in memory, which takes its time to be given one: it says when it starts to, and goes on
+    /// when told.
+    struct Slow {
+        served: Served,
+        files: Mutex<BTreeMap<String, Given>>,
+        started: Mutex<Sender<()>>,
+        go_on: Mutex<Receiver<()>>,
+        changes: Mutex<Vec<String>>,
+    }
+
+    impl Owner for Slow {
+        fn change(&self, change: Change) -> Result<(), String> {
+            match &change {
+                Change::Write { path, staged } => {
+                    let _ = self.started.lock().unwrap().send(());
+                    let _ = self.go_on.lock().unwrap().recv();
+                    let bytes = std::fs::read(staged).map_err(|e| e.to_string())?;
+                    let mut files = self.files.lock().unwrap();
+                    files.insert(path.clone(), Given::Bytes(Arc::from(bytes)));
+                    self.served.set_files(&files);
+                }
+                Change::Remove { path } => {
+                    let mut files = self.files.lock().unwrap();
+                    files.remove(path);
+                    self.served.set_files(&files);
+                }
+                _ => {}
+            }
+            self.changes.lock().unwrap().push(change.label());
+            Ok(())
+        }
+    }
+
+    /// A project that only says what it was given, and how many at a time.
+    #[derive(Default)]
+    struct Told {
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Owner for Told {
+        fn change(&self, change: Change) -> Result<(), String> {
+            self.batches.lock().unwrap().push(vec![change.label()]);
+            Ok(())
+        }
+
+        fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), String>> {
+            self.batches.lock().unwrap().push(changes.iter().map(Change::label).collect());
+            changes.iter().map(|_| Ok(())).collect()
+        }
+    }
+
+    #[test]
+    fn new_files_that_have_settled_are_given_to_the_project_together() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-many-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let owner = Arc::new(Told::default());
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let handle = writes.create(name).unwrap();
+            writes.write(handle, 0, b"x").unwrap();
+            writes.close(handle, true).unwrap();
+        }
+        // All that waits is given at once - as when it has settled by the same moment, which a machine doing other
+        // things does not promise of three files made one after another.
+        writes.finish();
+        let batches = owner.batches.lock().unwrap().clone();
+        let writes_given: Vec<&Vec<String>> = batches.iter().filter(|batch| !batch.is_empty()).collect();
+        assert_eq!(
+            writes_given,
+            [&vec![
+                "Write a.txt from outside".to_string(),
+                "Write b.txt from outside".to_string(),
+                "Write c.txt from outside".to_string()
+            ]],
+            "one batch of the three"
+        );
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_waits_to_settle_is_given_to_the_project_as_serving_ends() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-finish-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let owner = Arc::new(Told::default());
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let handle = writes.create("late.txt").unwrap();
+        writes.write(handle, 0, b"x").unwrap();
+        writes.close(handle, true).unwrap();
+        // At once, long before it would have settled.
+        writes.finish();
+        let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
+        assert_eq!(given, ["Write late.txt from outside"]);
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_made_where_one_was_just_removed_is_kept() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-folder-{}", std::process::id()));
+        let served = Served::default();
+        let files = BTreeMap::from([("kept/a.txt".to_string(), Given::Bytes(Arc::from(&b"a"[..])))]);
+        served.set_files(&files);
+        let (started, _starts) = channel();
+        let (_goes_on, go_on) = channel();
+        let owner = Arc::new(Slow {
+            served: served.clone(),
+            files: Mutex::new(files),
+            started: Mutex::new(started),
+            go_on: Mutex::new(go_on),
+            changes: Mutex::default(),
+        });
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        // Emptied and removed, then made again before the removal has settled: as a program replacing a folder does.
+        writes.remove("kept/a.txt").unwrap();
+        writes.remove("kept").unwrap();
+        assert!(writes.shown("kept").is_none(), "hidden at once");
+        writes.make_folder("kept").expect("made again");
+        assert!(writes.shown("kept").is_some_and(|shown| shown.folder), "shown again");
+        assert!(writes.list("kept").is_empty(), "without what was removed from it");
+        // Once the removal has settled - however long that takes a machine doing other things - and then for as long
+        // as the folder's own would have taken to follow it.
+        let waited = std::time::Instant::now();
+        while owner.changes.lock().unwrap().is_empty() && waited.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(super::SETTLE + Duration::from_millis(600));
+        let changes = owner.changes.lock().unwrap().clone();
+        assert_eq!(changes, ["Remove a.txt from outside"], "only its file is removed from the project");
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_removed_while_the_project_is_given_it_is_removed_from_the_project() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let (started, starts) = channel();
+        let (goes_on, go_on) = channel();
+        let owner = Arc::new(Slow {
+            served: served.clone(),
+            files: Mutex::default(),
+            started: Mutex::new(started),
+            go_on: Mutex::new(go_on),
+            changes: Mutex::default(),
+        });
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        // A new file, written and let go of: given to the project once it has settled.
+        let handle = writes.create("a.txt").unwrap();
+        writes.write(handle, 0, b"written").unwrap();
+        writes.close(handle, true).unwrap();
+        starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file");
+        // Removed at that moment: the removal waits for the project to have it, rather than taking the file for one
+        // only staged - which would leave it in the project.
+        let removing = {
+            let writes = writes.clone();
+            std::thread::spawn(move || writes.remove("a.txt"))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!removing.is_finished(), "the removal waits for the file to be the project's");
+        goes_on.send(()).unwrap();
+        removing.join().unwrap().expect("removed");
+        assert!(writes.shown("a.txt").is_none(), "hidden at once");
+        let asked = Instant::now();
+        let removed = || owner.changes.lock().unwrap().iter().any(|c| c == "Remove a.txt from outside");
+        while !removed() && asked.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(removed(), "removed from the project: {:?}", owner.changes.lock().unwrap());
+        assert!(served.tree().at("a.txt").is_none() && writes.shown("a.txt").is_none(), "and gone");
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

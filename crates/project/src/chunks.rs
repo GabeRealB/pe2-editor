@@ -124,10 +124,23 @@ impl Manifest {
     /// A chunk is missing from the store, or cannot be read.
     pub fn read_range(&self, store: &Store, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let end = offset.saturating_add(len as u64).min(self.size);
-        let mut out = Vec::with_capacity(usize::try_from(end.saturating_sub(offset)).unwrap_or(0));
+        let mut out = vec![0; usize::try_from(end.saturating_sub(offset)).unwrap_or(0)];
+        let read = self.read_range_into(store, offset, &mut out)?;
+        out.truncate(read);
+        Ok(out)
+    }
+
+    /// Bytes from `offset` read into a buffer, from the store, as many as it takes or the content has: how many.
+    /// Only the chunks they are in are read.
+    ///
+    /// # Errors
+    /// A chunk is missing from the store, or cannot be read.
+    pub fn read_range_into(&self, store: &Store, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let end = offset.saturating_add(into.len() as u64).min(self.size);
         if offset >= end {
-            return Ok(out);
+            return Ok(0);
         }
+        let mut read = 0;
         let first = self.starts.partition_point(|start| *start <= offset).saturating_sub(1);
         for (i, (hash, size)) in self.chunks.iter().enumerate().skip(first) {
             let start = self.starts[i];
@@ -140,9 +153,10 @@ impl Manifest {
             }
             let from = usize::try_from(offset.saturating_sub(start)).unwrap_or(0);
             let to = usize::try_from((end - start).min(*size)).unwrap_or(chunk.len());
-            out.extend_from_slice(&chunk[from..to]);
+            into[read..read + (to - from)].copy_from_slice(&chunk[from..to]);
+            read += to - from;
         }
-        Ok(out)
+        Ok(read)
     }
 }
 

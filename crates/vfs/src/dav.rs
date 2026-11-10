@@ -439,3 +439,45 @@ pub fn serve(served: &Served, writes: Option<Writes>, addr: SocketAddr) -> std::
     let thread = std::thread::Builder::new().name("webdav".into()).spawn(move || runtime.block_on(accept))?;
     Ok(DavServer { addr, stop: Some(stop), thread: Some(thread) })
 }
+
+/// WebDAV as a backend: the tree served at an address, which the system's own client mounts.
+struct AsBackend;
+
+/// WebDAV, among every system's backends.
+pub const BACKEND: &dyn crate::backend::Backend = &AsBackend;
+
+/// The address WebDAV serves at where nothing names one.
+pub const ADDRESS: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4918);
+
+impl crate::backend::Backend for AsBackend {
+    fn name(&self) -> &'static str {
+        "webdav"
+    }
+
+    fn label(&self) -> &'static str {
+        "WebDAV"
+    }
+
+    fn can(&self) -> crate::backend::Can {
+        crate::backend::Can { write: true, folder: false }
+    }
+
+    fn available(&self, _at: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn mount(&self, job: &crate::backend::Job) -> std::io::Result<Box<dyn crate::backend::Mount>> {
+        let writes = match &job.owner {
+            Some(owner) => Some(Writes::new(job.served, owner.clone(), job.staging)?),
+            None => None,
+        };
+        let server = serve(job.served, writes.clone(), job.address.unwrap_or(ADDRESS))?;
+        Ok(crate::backend::Finishing::of(server, writes))
+    }
+}
+
+impl crate::backend::Mount for DavServer {
+    fn shown(&self) -> String {
+        format!("http://{}/", self.addr)
+    }
+}

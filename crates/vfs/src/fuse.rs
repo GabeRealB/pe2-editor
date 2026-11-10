@@ -15,14 +15,25 @@ use fuser::{
 use crate::writes::{Shown, Writes};
 use crate::{ROOT, Served, What};
 
-/// How long the kernel may keep what it was told of a node: short, as a take-in may change it.
-const TTL: Duration = Duration::from_secs(1);
+/// How long the kernel may keep what it was told of a node the tree alone says: long - what changes in the tree is
+/// told to it as it does (`tell_kernel`), so that until then it asks nothing again.
+const KEPT: Duration = Duration::from_secs(3600);
+/// How long it may keep what it was told of a node something is staged over: short, as what is staged changes with
+/// every write and is applied in its own time.
+const STAGED: Duration = Duration::from_secs(1);
 
 struct Fuse {
     served: Served,
     writes: Option<Writes>,
     uid: u32,
     gid: u32,
+    /// Files open for reading, by inode number, how many times: what a write to one has to be told to the kernel for.
+    readers: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+    /// Inode numbers whose content the kernel is to let go of, taken by what tells it (`tell_kernel`): never told
+    /// from within a request, which the kernel may be waiting on.
+    stale: std::sync::Mutex<std::sync::mpsc::Sender<u64>>,
+    /// Whether the kernel opens folders without asking (`init`): it then keeps their listings too.
+    folders_unasked: bool,
 }
 
 fn errno(e: &std::io::Error) -> Errno {
@@ -85,9 +96,31 @@ impl Fuse {
         }
     }
 
+    /// What an entry of no node says: its number, none.
+    fn nothing(&self) -> FileAttr {
+        let never = SystemTime::UNIX_EPOCH;
+        FileAttr {
+            ino: INodeNo(0),
+            size: 0,
+            blocks: 0,
+            atime: never,
+            mtime: never,
+            ctime: never,
+            crtime: never,
+            kind: FileType::RegularFile,
+            perm: 0,
+            nlink: 0,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
     fn entry(&self, path: &str, reply: ReplyEntry) {
         match self.shown(path) {
-            Some(shown) => reply.entry(&TTL, &self.attr(path, &shown), Generation(0)),
+            Some(shown) => reply.entry(&self.lifetime(path), &self.attr(path, &shown), Generation(0)),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -95,19 +128,55 @@ impl Fuse {
     fn writes(&self) -> Result<&Writes, Errno> {
         self.writes.as_ref().ok_or(Errno::EROFS)
     }
+
+    /// Whether a path is the tree's alone, nothing staged over it: what the kernel may keep, of its attributes and of
+    /// its content, until the tree changes.
+    fn settled(&self, path: &str) -> bool {
+        self.writes.as_ref().is_none_or(|writes| writes.settled(path))
+    }
+
+    fn lifetime(&self, path: &str) -> Duration {
+        if self.settled(path) { KEPT } else { STAGED }
+    }
+
+    /// Have the kernel let go of what it keeps of a file's content, soon: it is about to be, or was, written.
+    fn let_go(&self, ino: u64) {
+        let _ = self.stale.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(ino);
+    }
 }
 
 impl Filesystem for Fuse {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // A folder opened and let go of without a request each, where the kernel can: it then keeps what a folder
+        // lists until told the folder changed (`tell_kernel`), as it keeps a file's content.
+        self.folders_unasked = config.add_capabilities(fuser::InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
+        // A folder listed with what each entry is, where the kernel asks so (`readdirplus`).
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS | fuser::InitFlags::FUSE_READDIRPLUS_AUTO);
+        Ok(())
+    }
+
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.folders_unasked {
+            // Not answered, once: the kernel no longer asks.
+            return reply.error(Errno::ENOSYS);
+        }
+        reply.opened(FileHandle(0), FopenFlags::empty());
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.child(parent, name) {
-            Some(path) => self.entry(&path, reply),
-            None => reply.error(Errno::ENOENT),
+        let Some(path) = self.child(parent, name) else { return reply.error(Errno::ENOENT) };
+        match self.shown(&path) {
+            Some(shown) => reply.entry(&self.lifetime(&path), &self.attr(&path, &shown), Generation(0)),
+            // Not there - which the kernel keeps too, as an entry of no node: a compiler looking for a header along
+            // its paths asks for far more names that are not there than that are, again for every unit. A name that
+            // comes to be is told to it (`tell_kernel`), or is its own doing, through the mount.
+            None => reply.entry(&self.lifetime(&path), &self.nothing(), Generation(0)),
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.path(ino).and_then(|path| Some((self.shown(&path)?, path))) {
-            Some((shown, path)) => reply.attr(&TTL, &self.attr(&path, &shown)),
+            Some((shown, path)) => reply.attr(&self.lifetime(&path), &self.attr(&path, &shown)),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -139,6 +208,7 @@ impl Filesystem for Fuse {
             if let Err(e) = writes.truncate(&path, size) {
                 return reply.error(errno(&e));
             }
+            self.let_go(u64::from(ino));
             // Truncated with no file open: applied now, as nothing else will close it.
             if fh.is_none()
                 && let Ok(handle) = writes.open(&path, false)
@@ -148,7 +218,7 @@ impl Filesystem for Fuse {
             }
         }
         match self.shown(&path) {
-            Some(shown) => reply.attr(&TTL, &self.attr(&path, &shown)),
+            Some(shown) => reply.attr(&self.lifetime(&path), &self.attr(&path, &shown)),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -210,12 +280,19 @@ impl Filesystem for Fuse {
         // Open until released: what serving waits for before it stops.
         if flags.acc_mode() == OpenAccMode::O_RDONLY {
             self.served.opened();
-            return reply.opened(FileHandle(0), FopenFlags::empty());
+            self.served.seen(&path, crate::Seen::Read);
+            *self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(u64::from(ino)).or_default() += 1;
+            // What the tree alone says the kernel may keep, across opens too: read again, it is not asked for. What
+            // is staged is read here each time.
+            let kept = if self.settled(&path) { FopenFlags::FOPEN_KEEP_CACHE } else { FopenFlags::FOPEN_DIRECT_IO };
+            return reply.opened(FileHandle(0), kept);
         }
         let truncate = flags.0 & libc::O_TRUNC != 0;
         match self.writes().map(|w| w.open(&path, truncate)) {
             Ok(Ok(handle)) => {
                 self.served.opened();
+                // What the kernel keeps of it is what it was: let go of, as it is about to be written.
+                self.let_go(u64::from(ino));
                 reply.opened(FileHandle(handle), FopenFlags::FOPEN_DIRECT_IO);
             }
             Ok(Err(e)) => reply.error(errno(&e)),
@@ -240,7 +317,7 @@ impl Filesystem for Fuse {
                 Some(shown) => {
                     self.served.opened();
                     reply.created(
-                        &TTL,
+                        &STAGED,
                         &self.attr(&path, &shown),
                         Generation(0),
                         FileHandle(handle),
@@ -265,21 +342,31 @@ impl Filesystem for Fuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let read = match (&self.writes, self.path(ino)) {
-            (Some(writes), Some(path)) => writes.read(&path, offset, size as usize),
-            (None, _) => self.served.tree().read(u64::from(ino), offset, size as usize),
-            (Some(_), None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-        };
-        match read {
-            Ok(bytes) => reply.data(&bytes),
-            Err(e) => reply.error(errno(&e)),
+        thread_local! {
+            /// What a read is answered from: kept by each of the mount's threads, so that none is made for a read.
+            static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        READ.with_borrow_mut(|buffer| {
+            if buffer.len() < size as usize {
+                buffer.resize(size as usize, 0);
+            }
+            let asked = &mut buffer[..size as usize];
+            let read = match (&self.writes, self.path(ino)) {
+                (Some(writes), Some(path)) => writes.read_into(&path, offset, asked),
+                (None, _) => self.served.tree().read_into(u64::from(ino), offset, asked),
+                (Some(_), None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            };
+            match read {
+                Ok(read) => reply.data(&buffer[..read]),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -289,7 +376,14 @@ impl Filesystem for Fuse {
         reply: ReplyWrite,
     ) {
         match self.writes().map(|w| w.write(u64::from(fh), offset, data)) {
-            Ok(Ok(n)) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
+            Ok(Ok(n)) => {
+                // Read by another meanwhile, through what the kernel kept of it: let go of again.
+                let read = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&u64::from(ino));
+                if read {
+                    self.let_go(u64::from(ino));
+                }
+                reply.written(u32::try_from(n).unwrap_or(u32::MAX));
+            }
             Ok(Err(e)) => reply.error(errno(&e)),
             Err(e) => reply.error(e),
         }
@@ -305,7 +399,7 @@ impl Filesystem for Fuse {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -313,6 +407,15 @@ impl Filesystem for Fuse {
         reply: ReplyEmpty,
     ) {
         self.served.released();
+        if u64::from(fh) == 0 {
+            let mut readers = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(count) = readers.get_mut(&u64::from(ino)) {
+                *count -= 1;
+                if *count == 0 {
+                    readers.remove(&u64::from(ino));
+                }
+            }
+        }
         match self.writes.as_ref().filter(|_| u64::from(fh) != 0).map(|w| w.close(u64::from(fh), true)) {
             Some(Err(e)) => reply.error(errno(&e)),
             _ => reply.ok(),
@@ -321,35 +424,72 @@ impl Filesystem for Fuse {
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         let Some(path) = self.path(ino) else { return reply.error(Errno::ENOENT) };
+        let Some(listed) = self.listed(ino, &path) else { return reply.error(Errno::ENOTDIR) };
+        for (at, (child, folder, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
+            let kind = if folder { FileType::Directory } else { FileType::RegularFile };
+            if reply.add(INodeNo(child), (at + 1) as u64, kind, &name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    /// A folder listed with what each entry is, so that the kernel need not ask of each after: what lists and looks
+    /// at every file (a search, a file browser, a backup) asks once a folder, not once a file.
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
+    ) {
+        let Some(path) = self.path(ino) else { return reply.error(Errno::ENOENT) };
+        let Some(listed) = self.listed(ino, &path) else { return reply.error(Errno::ENOTDIR) };
+        for (at, (child, _, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
+            // The folder itself and the one it is in are no entries of it to look up: told by their numbers alone.
+            let of = match name.as_str() {
+                "." => path.clone(),
+                ".." => path.rsplit_once('/').map_or_else(String::new, |(parent, _)| parent.to_string()),
+                name => join(&path, name),
+            };
+            let Some(shown) = self.shown(&of) else { continue };
+            let mut attr = self.attr(&of, &shown);
+            attr.ino = INodeNo(child);
+            if reply.add(INodeNo(child), (at + 1) as u64, &name, &self.lifetime(&of), &attr, Generation(0)) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+}
+
+impl Fuse {
+    /// What a folder lists - itself, the folder it is in, then its entries as shown - each by its inode number and
+    /// whether it is a folder; none where it is no folder.
+    fn listed(&self, ino: INodeNo, path: &str) -> Option<Vec<(u64, bool, String)>> {
         let children: Vec<(String, bool)> = if let Some(writes) = &self.writes {
-            writes.list(&path).into_iter().collect()
+            writes.list(path).into_iter().collect()
         } else {
             let tree = self.served.tree();
-            match tree.at(&path).map(|(_, n)| &n.what) {
+            match tree.at(path).map(|(_, n)| &n.what) {
                 Some(What::Folder(children)) => children
                     .iter()
                     .map(|(name, child)| {
                         (name.clone(), matches!(tree.node(*child).map(|n| &n.what), Some(What::Folder(_))))
                     })
                     .collect(),
-                _ => return reply.error(Errno::ENOTDIR),
+                _ => return None,
             }
         };
         let parent =
             if u64::from(ino) == ROOT { ROOT } else { self.served.ino(path.rsplit_once('/').map_or("", |(p, _)| p)) };
-        let listed =
-            [(u64::from(ino), FileType::Directory, ".".to_string()), (parent, FileType::Directory, "..".to_string())]
-                .into_iter()
-                .chain(children.into_iter().map(|(name, folder)| {
-                    let kind = if folder { FileType::Directory } else { FileType::RegularFile };
-                    (self.served.ino(&join(&path, &name)), kind, name)
-                }));
-        for (at, (child, kind, name)) in listed.enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
-            if reply.add(INodeNo(child), (at + 1) as u64, kind, &name) {
-                break;
-            }
-        }
-        reply.ok();
+        let own = [(u64::from(ino), true, ".".to_string()), (parent, true, "..".to_string())];
+        Some(
+            own.into_iter()
+                .chain(children.into_iter().map(|(name, folder)| (self.served.ino(&join(path, &name)), folder, name)))
+                .collect(),
+        )
     }
 }
 
@@ -372,7 +512,13 @@ impl Drop for Mounted {
 /// new no longer known missing. What watches the mount (an editor's inotify) hears only of what passes through it, so
 /// each file changed, and the folder of each node gone or new, is touched through the mount (its time set: `ATTRIB`),
 /// for the watcher to look again. Until `stop`.
-fn tell_kernel(served: &Served, notifier: &fuser::Notifier, at: &Path, stop: &std::sync::atomic::AtomicBool) {
+fn tell_kernel(
+    served: &Served,
+    notifier: &fuser::Notifier,
+    at: &Path,
+    stale: &std::sync::mpsc::Receiver<u64>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
     let touch = |path: &str, time: SystemTime| {
         if let Ok(file) = std::fs::File::open(at.join(path)) {
             let _ = file.set_modified(time);
@@ -380,7 +526,12 @@ fn tell_kernel(served: &Served, notifier: &fuser::Notifier, at: &Path, stop: &st
     };
     let mut last = served.tree();
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // What is written through the mount, the kernel lets go of what it kept of at once; what changed in the tree
+        // is looked for as often as before.
+        let looked = std::time::Instant::now();
+        while let Ok(ino) = stale.recv_timeout(std::time::Duration::from_millis(200).saturating_sub(looked.elapsed())) {
+            let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+        }
         let now = served.tree();
         if std::sync::Arc::ptr_eq(&last, &now) {
             continue;
@@ -403,6 +554,10 @@ fn tell_kernel(served: &Served, notifier: &fuser::Notifier, at: &Path, stop: &st
         }
         for node in changes.changed.iter().filter_map(|ino| now.node(*ino)) {
             touch(&node.path, node.modified);
+        }
+        for folder in &folders {
+            // What the kernel keeps of what the folder lists: let go of, whether or not it knew the name.
+            let _ = notifier.inval_inode(INodeNo(*folder), 0, 0);
         }
         for folder in folders.iter().filter_map(|ino| now.node(*ino)) {
             touch(&folder.path, SystemTime::now());
@@ -456,13 +611,22 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
         config.acl = fuser::SessionACL::RootAndOwner;
     }
     config.n_threads = Some(4);
-    let fuse = Fuse { served: served.clone(), writes, uid, gid };
+    let (stale, stales) = std::sync::mpsc::channel();
+    let fuse = Fuse {
+        served: served.clone(),
+        writes,
+        uid,
+        gid,
+        readers: std::sync::Mutex::default(),
+        stale: std::sync::Mutex::new(stale),
+        folders_unasked: false,
+    };
     let session = fuser::spawn_mount(fuse, at, &config)?;
     let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (notifier, stop, watched, root) = (session.notifier(), told.clone(), served.clone(), at.to_path_buf());
     std::thread::Builder::new()
         .name("fuse-notify".into())
-        .spawn(move || tell_kernel(&watched, &notifier, &root, &stop))?;
+        .spawn(move || tell_kernel(&watched, &notifier, &root, &stales, &stop))?;
     MOUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(at.to_path_buf());
     Ok(Mounted { _session: session, at: at.to_path_buf(), told })
 }
@@ -493,5 +657,60 @@ fn users_may_allow_others() -> bool {
 pub fn clear_stale(at: &Path) {
     if std::fs::metadata(at).is_err_and(|e| e.raw_os_error() == Some(libc::ENOTCONN)) {
         unmount(at);
+    }
+}
+
+/// FUSE as a backend: the tree mounted at a folder, written through where it has an owner.
+struct AsBackend;
+
+/// FUSE, among this system's backends.
+pub const BACKEND: &dyn crate::backend::Backend = &AsBackend;
+
+impl crate::backend::Backend for AsBackend {
+    fn name(&self) -> &'static str {
+        "fuse"
+    }
+
+    fn label(&self) -> &'static str {
+        "FUSE"
+    }
+
+    fn can(&self) -> crate::backend::Can {
+        crate::backend::Can { write: true, folder: true }
+    }
+
+    fn available(&self, _at: &Path) -> Result<(), String> {
+        // macOS has no device to look for: a mount that fails says why.
+        if cfg!(target_os = "linux") && !Path::new("/dev/fuse").exists() {
+            return Err("there is no FUSE here (/dev/fuse)".into());
+        }
+        Ok(())
+    }
+
+    fn mount(&self, job: &crate::backend::Job) -> std::io::Result<Box<dyn crate::backend::Mount>> {
+        std::fs::create_dir_all(job.at)?;
+        let writes = match &job.owner {
+            Some(owner) => Some(Writes::new(job.served, owner.clone(), job.staging)?),
+            None => None,
+        };
+        Ok(crate::backend::Finishing::of(mount(job.served, writes.clone(), job.at, job.name)?, writes))
+    }
+
+    fn clear(&self, at: &Path, _name: &str) {
+        clear_stale(at);
+    }
+
+    fn retire(&self, at: &Path, _name: &str) {
+        clear_stale(at);
+    }
+}
+
+impl crate::backend::Mount for Mounted {
+    fn shown(&self) -> String {
+        project::host::shown(&self.at)
+    }
+
+    fn note(&self) -> Option<String> {
+        windows_cannot_reach()
     }
 }

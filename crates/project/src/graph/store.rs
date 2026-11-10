@@ -249,6 +249,19 @@ impl Store {
         Ok(Blob { sha1, size: bytes.len() as u64 })
     }
 
+    /// The project whose cache holds it (`<project>/.cache/store`), where it is one's.
+    #[must_use]
+    pub fn project(&self) -> Option<&std::path::Path> {
+        let cache = self.dir.parent()?;
+        (cache.file_name()? == crate::cache::DIR).then(|| cache.parent()).flatten()
+    }
+
+    /// Where what is written for the while is kept (`spill`).
+    #[must_use]
+    pub fn tmp(&self) -> PathBuf {
+        self.dir.join("tmp")
+    }
+
     /// A file to write a content too large to hold into: `tmp/` in the store, adopted as a blob once written.
     ///
     /// # Errors

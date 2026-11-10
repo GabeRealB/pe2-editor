@@ -394,6 +394,39 @@ pub fn kept(project: &Project) -> Kept {
     kept
 }
 
+/// What this machine says serves projects as filesystems where a project does not: `[filesystem]` in the editor's
+/// `settings.toml` - `serve`, what serves a project's folder, and `scopes`, what serves the files programs are given,
+/// each `auto`, `none` or a backend's name; and the budgets `copies` and `kept`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilesystemDefaults {
+    pub serve: Option<String>,
+    pub scopes: Option<String>,
+    /// How much laying files out for a program may write, and how much may be kept of what was read of a project's
+    /// folder: budgets of bytes (`16 MiB`).
+    pub copies: Option<String>,
+    pub kept: Option<String>,
+}
+
+/// What this machine says serves projects (`FilesystemDefaults`); nothing where the settings say nothing, or cannot be
+/// read.
+#[must_use]
+pub fn filesystem_defaults() -> FilesystemDefaults {
+    let read = || {
+        let text = std::fs::read_to_string(data_folder()?.join("settings.toml")).ok()?;
+        let Some(Value::Table(filesystem)) = toml::from_str::<Table>(&text).ok()?.remove("filesystem") else {
+            return None;
+        };
+        let said = |key: &str| filesystem.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(FilesystemDefaults {
+            serve: said("serve"),
+            scopes: said("scopes"),
+            copies: said("copies"),
+            kept: said("kept"),
+        })
+    };
+    read().unwrap_or_default()
+}
+
 /// The user's settings of extensions: `[extensions."<id>"]` in the editor's `settings.toml`, beside its other ones.
 #[must_use]
 pub fn user_settings() -> BTreeMap<String, Table> {

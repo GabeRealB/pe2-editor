@@ -235,8 +235,10 @@ pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<L
     }
 }
 
-/// How long a host started is waited for.
-const STARTING: Duration = Duration::from_secs(30);
+/// How long a host started is waited for to listen, while it runs (one that ends says why at once): long enough for
+/// it to index the project and, where another backend served its folder before, to retire what that one left there -
+/// some tens of seconds for a project listed whole.
+const STARTING: Duration = Duration::from_secs(120);
 
 /// Start a host for the project in `root`, on its own - not ended with this process, nor with its terminal - and connect
 /// to it once it listens. What it says goes to its log in the cache.

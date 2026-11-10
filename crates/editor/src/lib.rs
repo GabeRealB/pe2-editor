@@ -193,11 +193,14 @@ pub type Result = eframe::Result;
 pub fn run() -> Result {
     project::profile::install();
     // A large file a layer holds as chunks is given to a program in a scoped filesystem, mounted when first needed.
-    let _scopes = vfs::scoped::Scopes::install();
+    let _scopes = vfs::scoped::Scopes::install(|| {
+        let machine = extensions::filesystem_defaults();
+        vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
+    });
     // Ended by a signal, the editor drops nothing: what it mounted would be left with no one serving it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = ctrlc::set_handler(|| {
-        vfs::fuse::unmount_all();
+        vfs::backend::unmount_all();
         std::process::exit(130);
     });
     project::ext::component::link_gpu(pe2_webgpu::add_to_linker);

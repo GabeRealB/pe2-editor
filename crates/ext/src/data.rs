@@ -220,6 +220,33 @@ pub struct File {
     pub content: Content,
 }
 
+/// How files served to a program (`Call::serve`) will be used, as far as whoever asks knows: what the host chooses
+/// how to serve them by, where they are not simply laid out - nothing kept of what is read once, what is read often
+/// kept. As it is by default: read once, whole. How many of the files are read is not asked: what is not read costs
+/// nothing either way, laid out by link or served when asked for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Use {
+    /// Each file read is read again and again, not once: a folder a program works in.
+    pub often: bool,
+    /// Ranges of large files are read, not files whole - a player seeking in a movie: nothing is kept of them,
+    /// however often they are read, since keeping a range keeps the file.
+    pub ranges: bool,
+}
+
+impl Use {
+    /// A use nothing is known of: any of it, any number of times.
+    #[must_use]
+    pub fn general() -> Use {
+        Use { often: true, ..Use::default() }
+    }
+
+    /// What is read of it read once, whole: a compiler's sources.
+    #[must_use]
+    pub fn once() -> Use {
+        Use::default()
+    }
+}
+
 impl File {
     /// A file made now, its bytes inline.
     #[must_use]
@@ -521,6 +548,15 @@ pub trait CallHost {
         let _ = content;
         None
     }
+    /// A read-only folder holding these files by their names, for an unsandboxed extension's operation to point a
+    /// program at, until its run is done.
+    ///
+    /// # Errors
+    /// The host serves no folders here, or a file's content cannot be found.
+    fn serve(&self, files: &[File], how: &Use) -> Result<String> {
+        let _ = (files, how);
+        bail!("{}: no folder is served here", self.path())
+    }
 }
 
 /// A node as a reference names it.
@@ -666,6 +702,16 @@ impl Call<'_> {
     /// The host has none to give.
     pub fn temp(&self) -> Result<String> {
         self.host.temp()
+    }
+
+    /// A read-only folder holding these files by their names (a name's folders made), for a program of this extension
+    /// to read, until the run is done: each served where its content is, nothing written where the host can - which
+    /// chooses how by `how` they will be used.
+    ///
+    /// # Errors
+    /// The host serves no folders here, or a file's content cannot be found.
+    pub fn serve(&self, files: &[File], how: &Use) -> Result<std::path::PathBuf> {
+        self.host.serve(files, how).map(std::path::PathBuf::from)
     }
 
     /// A file a program of this extension made kept as a content, named `name`.

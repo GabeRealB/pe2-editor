@@ -829,6 +829,10 @@ impl crate::data::CallHost for Replaying<'_> {
     fn path_of(&self, content: &crate::Content) -> Option<String> {
         self.inner.path_of(content)
     }
+
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<String> {
+        self.inner.serve(files, how)
+    }
 }
 
 #[cfg(test)]

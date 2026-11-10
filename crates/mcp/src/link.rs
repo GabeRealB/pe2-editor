@@ -97,9 +97,11 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake the accepting thread, which then ends.
+        // Wake the accepting thread, which then ends - from a thread of its own: where that one has ended already (a
+        // request reached it since it was told to stop), nobody answers the name any more, and on Windows connecting
+        // to it then waits for as long as a connection of it is still open, which would be this never returning.
         if let Ok(name) = name(&self.root) {
-            let _ = Stream::connect(name);
+            std::thread::spawn(move || drop(Stream::connect(name)));
         }
         // Gone once it has stopped answering, for whoever holds the project next to answer - unless the name was taken
         // over meanwhile, and the wake reached the newer listener: then it is left, no longer reached.

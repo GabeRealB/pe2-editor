@@ -8,6 +8,7 @@
 //! project's own files (`project.toml`, changesets), and temporary files. The history keeps what is on disk as it is - a
 //! manifest, not the chunks it names - so undo restores a large file by its manifest.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -163,6 +164,37 @@ pub fn read_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         }
         Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
             manifest.read_range(&store, offset, len)
+        }
+    }
+}
+
+/// Bytes of a file's content from `offset` read into a buffer, as many as it takes or the content has: how many. What
+/// serves content to programs reads it so, into where it is asked for, with nothing made on the way.
+///
+/// # Errors
+/// It cannot be opened or read.
+pub fn read_range_into(path: &Path, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+    match form(path)? {
+        Form::Plain(path) | Form::Object { path, .. } => {
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut read = 0;
+            while read < into.len() {
+                match file.read(&mut into[read..])? {
+                    0 => break,
+                    count => read += count,
+                }
+            }
+            Ok(read)
+        }
+        Form::Inline { bytes, .. } => {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+            let read = (bytes.len() - start).min(into.len());
+            into[..read].copy_from_slice(&bytes[start..start + read]);
+            Ok(read)
+        }
+        Form::Chunked { manifest, store, .. } | Form::Packed { manifest, store, .. } => {
+            manifest.read_range_into(&store, offset, into)
         }
     }
 }
@@ -339,6 +371,129 @@ pub fn expose_with(
     Exposing(id)
 }
 
+/// A file of a folder served to a program (`serve_folder`): a content where it is - a store's blob, a layer's file,
+/// chunked or not, read through `read_range` - or bytes held in memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Given {
+    Disk(PathBuf),
+    Bytes(Arc<[u8]>),
+}
+
+/// A folder served to a program, until this is dropped: where it is.
+pub struct Folder {
+    pub at: PathBuf,
+    _held: Box<dyn Send + Sync>,
+}
+
+impl Folder {
+    /// A folder at a place, served until `held` is dropped.
+    #[must_use]
+    pub fn new(at: PathBuf, held: Box<dyn Send + Sync>) -> Folder {
+        Folder { at, _held: held }
+    }
+}
+
+/// How what is served to a program will be used (`pe2_ext::Use`): what it is served by is chosen by it.
+pub use pe2_ext::Use;
+
+/// What serves folders to programs (a scoped filesystem, `vfs::scoped`): given the project they are of, where there is
+/// one, the files by their paths in the folder, and how they will be used. One that finds laying them out the better
+/// way for that use serves none, and they are laid out.
+type FolderServer = Arc<dyn Fn(Option<&Path>, &BTreeMap<String, Given>, &Use) -> io::Result<Folder> + Send + Sync>;
+
+static FOLDER_SERVERS: RwLock<Vec<(u64, FolderServer)>> = RwLock::new(Vec::new());
+
+/// A folder server's registration: it serves until this is dropped.
+pub struct ServingFolders(u64);
+
+impl Drop for ServingFolders {
+    fn drop(&mut self) {
+        FOLDER_SERVERS.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(id, _)| *id != self.0);
+    }
+}
+
+/// Have `server` serve folders to programs (`serve_folder`) for as long as what this returns is held; the latest
+/// registered serves.
+pub fn serve_folders_with(
+    server: impl Fn(Option<&Path>, &BTreeMap<String, Given>, &Use) -> io::Result<Folder> + Send + Sync + 'static,
+) -> ServingFolders {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FOLDER_SERVERS.write().unwrap_or_else(std::sync::PoisonError::into_inner).push((id, Arc::new(server)));
+    ServingFolders(id)
+}
+
+/// A read-only folder holding these files by their paths in it (folders made of their parents), for a program to read,
+/// until what this returns is dropped: served where they are by a folder server (`serve_folders_with`), else laid out
+/// in `fallback` - each whole file on disk linked, the rest written - and removed whole once dropped.
+///
+/// # Errors
+/// Nothing serves it, and it cannot be laid out.
+pub fn serve_folder(
+    project: Option<&Path>,
+    files: &BTreeMap<String, Given>,
+    how: &Use,
+    fallback: &Path,
+) -> io::Result<Folder> {
+    let server = FOLDER_SERVERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).last().map(|(_, s)| Arc::clone(s));
+    if let Some(served) = server.and_then(|serve| serve(project, files, how).ok()) {
+        return Ok(served);
+    }
+    laid_out(files, fallback)
+}
+
+/// What laying these files out on disk would write, in bytes: what is held in memory, and what no layer holds as one
+/// file to link. What is linked costs nothing, so a tree of whole files is laid out for next to nothing whatever its
+/// size - which is what decides between laying files out and serving them where they are (`vfs::backend::choose`).
+#[must_use]
+pub fn written_to_lay_out(files: &BTreeMap<String, Given>) -> u64 {
+    files
+        .values()
+        .map(|given| match given {
+            Given::Bytes(bytes) => bytes.len() as u64,
+            Given::Disk(disk) => match form(disk) {
+                Ok(Form::Plain(_) | Form::Object { .. }) => 0,
+                _ => len(disk).unwrap_or(0),
+            },
+        })
+        .sum()
+}
+
+/// A folder of these files laid out on disk, removed whole once what this returns is dropped.
+fn laid_out(files: &BTreeMap<String, Given>, under: &Path) -> io::Result<Folder> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let at = under.join(format!("served-{}-{n}", std::process::id()));
+    let removed = Removed(at.clone());
+    for (name, given) in files {
+        let to = at.join(name);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match given {
+            Given::Bytes(bytes) => std::fs::write(&to, bytes)?,
+            // A whole file linked where it is, else its content written.
+            Given::Disk(disk) => {
+                let whole = matches!(form(disk)?, Form::Plain(_) | Form::Object { .. });
+                if !(whole && std::fs::hard_link(disk, &to).is_ok()) {
+                    std::fs::write(&to, read(disk)?)?;
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(&at)?;
+    Ok(Folder::new(at, Box::new(removed)))
+}
+
+/// A folder removed whole once this is dropped.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A path a program can open for a content, as a file: the file itself where a layer holds it whole; for a chunked one,
 /// where an exposer serves it (`expose_with`), else a copy assembled in the cache (`materialize`).
 ///
@@ -442,5 +597,37 @@ mod tests {
         remove(&path).expect("removed");
         assert!(!exists(&path));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod serving {
+    use super::Given;
+
+    #[test]
+    fn a_folder_nothing_serves_is_laid_out_and_removed_once_let_go_of() {
+        let dir = std::env::temp_dir().join(format!("pe2-laid-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let whole = dir.join("whole.o");
+        std::fs::write(&whole, b"object").unwrap();
+        let files = std::collections::BTreeMap::from([
+            ("objects/a.o".to_string(), Given::Disk(whole.clone())),
+            ("units".to_string(), Given::Bytes(std::sync::Arc::from(&b"a.c"[..]))),
+        ]);
+        let folder = super::laid_out(&files, &dir.join("tmp")).unwrap();
+        assert_eq!(std::fs::read(folder.at.join("objects/a.o")).unwrap(), b"object");
+        assert_eq!(std::fs::read(folder.at.join("units")).unwrap(), b"a.c");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let linked = std::fs::metadata(folder.at.join("objects/a.o")).unwrap().ino();
+            assert_eq!(linked, std::fs::metadata(&whole).unwrap().ino(), "a whole file linked, not copied");
+        }
+        let at = folder.at.clone();
+        drop(folder);
+        assert!(!at.exists());
+        assert!(whole.is_file(), "what it was linked to stays");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

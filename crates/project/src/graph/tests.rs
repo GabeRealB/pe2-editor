@@ -159,6 +159,16 @@ fn ops() -> Ops {
         bytes.make_ascii_uppercase();
         Ok(file(bytes))
     }));
+    ops.add(OpDef::new("t.served", "Served and read back", "1").input(port("in", file_type())).makes(file_type(), |call| {
+        let input = call.take(0)?.take();
+        let Value::Typed(typed) = input else { anyhow::bail!("not a file") };
+        let mut files = typed.files.clone();
+        files.push(File::new("dir/extra.txt", b"!".to_vec()));
+        let folder = call.serve(&files, &crate::content::Use::default())?;
+        let mut read = std::fs::read(folder.join(&files[0].name))?;
+        read.extend(std::fs::read(folder.join("dir/extra.txt"))?);
+        Ok(file(read))
+    }));
     ops.add(OpDef::new("t.split", "Texts as files", "1").makes(Type::List(Box::new(file_type())), |call| {
         let texts = call.settings().get("texts").and_then(toml::Value::as_array).cloned().unwrap_or_default();
         Ok(Value::List(texts.iter().filter_map(toml::Value::as_str).map(|t| file(t.as_bytes().to_vec())).collect()))
@@ -1497,4 +1507,21 @@ fn what_a_node_using_an_operation_with_a_setting_unset_by_default_is_is_read_off
     let (plan, wrong) = Plan::of(&toml::from_str(&shape).unwrap(), &ops, &[]);
     assert!(wrong.is_empty(), "{wrong:?}");
     assert!(plan.result.is_some());
+}
+
+#[test]
+fn an_operation_is_served_a_folder_of_its_files_for_its_run() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-served-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.served\"\n\n[[stack]]\nop = \"output\"\nname = \"read\"\n";
+    let (plan, wrong) = Plan::of(&toml::from_str(stack).unwrap(), &ops(), &[]);
+    assert!(wrong.is_empty(), "{wrong:?}");
+    let node = Bundle::new(stack, &[("a.txt", "abc")]);
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let given = engine.output(&plan, &node, "read", true).unwrap();
+    assert_eq!(data(&node, &given.value.unwrap()), b"abc!");
+    let tmp = dir.join("tmp");
+    let left = std::fs::read_dir(&tmp).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("served-")).count());
+    assert_eq!(left.unwrap_or(0), 0, "the folder is gone once the run is done");
+    let _ = std::fs::remove_dir_all(&dir);
 }

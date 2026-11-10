@@ -264,8 +264,7 @@ struct MountFile {
 
 /// `project.local.toml`: what of a project is this machine's - where its unmanaged mounts are (`[mounts] <at> =
 /// "<path>"`), the links it wants to what builds deploy (`[build.links]`), and how it serves the project as a
-/// filesystem (`[filesystem] serve = "fuse" | "webdav" | "none"`, `address` for WebDAV). It is kept out of the
-/// project's history and of version control.
+/// filesystem (`[filesystem]`). It is kept out of the project's history and of version control.
 #[derive(Default, Deserialize)]
 struct LocalFile {
     #[serde(default)]
@@ -276,14 +275,20 @@ struct LocalFile {
     filesystem: FilesystemFile,
 }
 
-/// `[filesystem]` of `project.local.toml`: how this machine serves the project's merged layers as a filesystem while
-/// it is open - in the editor, or with `pe2-cli project serve`.
+/// `[filesystem]` of `project.local.toml`: what serves the project's merged layers at its folder while it is open -
+/// in the editor, or with `pe2-cli project serve` - and what serves the files programs are given (`scopes`): each
+/// `auto`, `none` or a backend's name; `address` where the backend serves at one, whether its host serves on with
+/// nobody keeping it (`keep`), and two budgets of bytes: what laying files out for a program may write (`copies`)
+/// and what may be kept of what was read of the folder (`kept`).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FilesystemFile {
     serve: Option<String>,
+    scopes: Option<String>,
     address: Option<String>,
     keep: Option<bool>,
+    copies: Option<String>,
+    kept: Option<String>,
 }
 
 /// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
@@ -292,62 +297,47 @@ pub const SERVED: &str = "assets";
 /// time: the only copy of it, so not in the cache.
 pub const SET_ASIDE: &str = "assets.set-aside";
 
-/// The address WebDAV serves a project at where `project.local.toml` names none.
-pub const WEBDAV_ADDRESS: &str = "127.0.0.1:4918";
-const WEBDAV_PORT: u16 = 4918;
-
-/// How a project is served as a filesystem.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Serving {
-    /// Mounted at its folder (`SERVED`), on Linux and macOS.
-    Fuse,
-    /// Over WebDAV at an address, which the system's own client mounts (Windows, Finder, davfs2).
-    WebDav(std::net::SocketAddr),
-    /// Placeholders Windows fills as they are read, at its folder (the Cloud Files API, `vfs::cloud`): on Windows,
-    /// with nothing to install.
-    Cloud,
-    /// Not served.
-    None,
-}
-
-impl Serving {
-    /// What serves where nothing says: FUSE where it is, the Cloud Files API on Windows, WebDAV elsewhere.
-    #[must_use]
-    pub fn default_here() -> Serving {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
-            Serving::Fuse
-        } else if cfg!(windows) {
-            Serving::Cloud
-        } else {
-            Serving::WebDav(std::net::SocketAddr::from(([127, 0, 0, 1], WEBDAV_PORT)))
-        }
-    }
-
-    /// A backend by name (`fuse`, `webdav`, `none`), WebDAV's at an address.
-    ///
-    /// # Errors
-    /// The name is none of those, or the address is no address.
-    pub fn named(name: &str, address: Option<&str>) -> Result<Serving> {
-        Ok(match name {
-            "fuse" => Serving::Fuse,
-            "cloud" => Serving::Cloud,
-            "webdav" => Serving::WebDav(
-                address.unwrap_or(WEBDAV_ADDRESS).parse().with_context(|| format!("{address:?}: no address"))?,
-            ),
-            "none" => Serving::None,
-            other => bail!("`serve = \"{other}\"`: a filesystem is served by fuse, cloud, webdav or none"),
-        })
-    }
-}
-
-/// How this machine serves a project as a filesystem, and the folder it is at.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// How this machine serves a project as a filesystem, as far as the project says (`project.local.toml`): what serves
+/// is chosen where it is served (`vfs::backend`), which knows the backends - a name is not judged here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filesystem {
+    /// The folder it is served at.
     pub at: PathBuf,
-    pub serving: Serving,
+    /// What serves it there (`[filesystem] serve`), where the project says.
+    pub serve: Option<String>,
+    /// What serves the files programs are given (`[filesystem] scopes`), where the project says.
+    pub scopes: Option<String>,
+    /// The address it is served at, by a backend serving at one (`[filesystem] address`).
+    pub address: Option<String>,
     /// Whether its host serves on with nobody keeping it, until stopped (`[filesystem] keep`): for a folder that is
     /// always there, while the machine runs, once anything has started serving it.
     pub keep: bool,
+    /// How much laying files out for a program may write (`[filesystem] copies`, as `16 MiB`): up to that it is
+    /// given copies, beyond it they are served where they are.
+    pub copies: Option<String>,
+    /// How much a backend that keeps what is read may keep of the project's folder (`[filesystem] kept`, as `2 GiB`).
+    pub kept: Option<String>,
+}
+
+impl Filesystem {
+    fn of(root: &Path, file: FilesystemFile) -> Filesystem {
+        Filesystem {
+            at: root.join(SERVED),
+            serve: file.serve,
+            scopes: file.scopes,
+            address: file.address,
+            keep: file.keep.unwrap_or(false),
+            copies: file.copies,
+            kept: file.kept,
+        }
+    }
+}
+
+/// How this machine serves the project at a folder, read from its `project.local.toml` alone: for what serves a
+/// project's files without loading it. One that cannot be read says nothing.
+#[must_use]
+pub fn local_filesystem(root: &Path) -> Filesystem {
+    Filesystem::of(root, read_local(root).map_or_default(|local| local.filesystem))
 }
 
 fn read_local(root: &Path) -> Result<LocalFile> {
@@ -694,12 +684,7 @@ impl Project {
             })
             .collect();
         let links = local.build.links;
-        let serving = match &local.filesystem.serve {
-            Some(name) => Serving::named(name, local.filesystem.address.as_deref())
-                .with_context(|| root.join(LOCAL).display().to_string())?,
-            None => Serving::default_here(),
-        };
-        let filesystem = Filesystem { at: root.join(SERVED), serving, keep: local.filesystem.keep.unwrap_or(false) };
+        let filesystem = Filesystem::of(&root, local.filesystem);
         let (configs, properties, property_problems) = configs_of(file.config, &file.property);
         Ok(Project {
             root,

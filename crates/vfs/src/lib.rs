@@ -1,26 +1,32 @@
 //! A project's merged layers as a filesystem: the tree the index resolves - every node a folder of its name holding its
 //! files and the entries inside it (a node and its folder of children are one, `edit::paired`), every folder and plain
 //! file where it is - as one tree any program can read, whatever layer each file comes from. Names are the asset
-//! browser's: a node's has no `.node`. Transports serve it (`fuse`, on Linux and macOS; `dav`, everywhere); a tree is made of an index snapshot (`Tree::of`), and
-//! what serves it takes a newer one without being mounted again (`Served::update`). Where FUSE is not, WebDAV serves the
-//! same tree (`dav`). Inode numbers follow paths across
-//! snapshots, so a program holding a file keeps it as the project changes beneath it.
+//! browser's: a node's has no `.node`. Backends serve it - `fuse` on Linux and macOS, `dokan`, `projfs` and `cloud` on Windows,
+//! `dav` everywhere - each chosen for the jobs it does whole (`backend`); a tree is made of an index snapshot
+//! (`Tree::of`), and what serves it takes a newer one without being mounted again (`Served::update`). Inode numbers
+//! follow paths across snapshots, so a program holding a file keeps it as the project changes beneath it.
 //!
 //! Content is read through `project::content`, as the layers store it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
+use project::content::Given;
 use project::index::Index;
 
+pub mod access;
+pub mod backend;
 #[cfg(windows)]
 pub mod cloud;
 pub mod dav;
+#[cfg(windows)]
+pub mod dokan;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fuse;
 pub mod ops;
+#[cfg(windows)]
+pub mod projfs;
 pub mod scoped;
 pub mod strays;
 pub mod write;
@@ -34,8 +40,8 @@ pub const ROOT: u64 = 1;
 pub enum What {
     /// A folder, its children by name.
     Folder(BTreeMap<String, u64>),
-    /// A file, its content where a layer stores it.
-    File(PathBuf),
+    /// A file, its content where a layer stores it, or held in memory (`Given`).
+    File(Given),
 }
 
 /// A node of the tree: its path from the root, its parent, what it is, its length and when it last changed.
@@ -95,6 +101,19 @@ impl Inodes {
     #[must_use]
     pub fn path(&self, ino: u64) -> Option<&str> {
         self.by_ino.get(&ino).map(String::as_str)
+    }
+
+    /// A folder's number and those of what is inside it let go of, for what is served no more: new paths there are
+    /// numbered anew.
+    pub fn forget(&mut self, folder: &str) {
+        let inside = format!("{folder}/");
+        let gone: Vec<String> =
+            self.by_path.keys().filter(|path| *path == folder || path.starts_with(&inside)).cloned().collect();
+        for path in gone {
+            if let Some(ino) = self.by_path.remove(&path) {
+                self.by_ino.remove(&ino);
+            }
+        }
     }
 
     /// A path renamed: its number, and those of what is inside it, go with it - as the kernel keeps them - and what
@@ -162,7 +181,7 @@ impl Tree {
                     }
                 }
                 Shown::File { disk, size, modified, of_files: false } => {
-                    tree.file(path, disk.clone(), *size, time(*modified), inodes);
+                    tree.file(path, Given::Disk(disk.clone()), *size, time(*modified), inodes);
                 }
                 Shown::File { of_files: true, .. } => {}
             }
@@ -171,7 +190,7 @@ impl Tree {
         for (path, shown) in listing {
             if let Shown::File { disk, size, modified, of_files: true } = shown {
                 tree.of_files = true;
-                tree.file(path, disk.clone(), *size, time(*modified), inodes);
+                tree.file(path, Given::Disk(disk.clone()), *size, time(*modified), inodes);
                 tree.of_files = false;
             }
         }
@@ -180,7 +199,7 @@ impl Tree {
 
     /// A tree of the files given, by their paths in it, each read where a layer stores it.
     #[must_use]
-    pub fn of_files(files: &BTreeMap<String, PathBuf>, inodes: &mut Inodes) -> Tree {
+    pub fn of_files(files: &BTreeMap<String, Given>, inodes: &mut Inodes) -> Tree {
         let mut tree = Tree::default();
         let root = Node {
             path: String::new(),
@@ -192,9 +211,12 @@ impl Tree {
             of_files: false,
         };
         tree.nodes.insert(ROOT, root);
-        for (path, disk) in files {
-            let (size, modified) = project::content::stat(disk).unwrap_or((0, SystemTime::UNIX_EPOCH));
-            tree.file(path, disk.clone(), size, modified, inodes);
+        for (path, given) in files {
+            let (size, modified) = match given {
+                Given::Disk(disk) => project::content::stat(disk).unwrap_or((0, SystemTime::UNIX_EPOCH)),
+                Given::Bytes(bytes) => (bytes.len() as u64, SystemTime::UNIX_EPOCH),
+            };
+            tree.file(path, given.clone(), size, modified, inodes);
         }
         tree
     }
@@ -224,7 +246,7 @@ impl Tree {
         ino
     }
 
-    fn file(&mut self, path: &str, disk: PathBuf, size: u64, modified: SystemTime, inodes: &mut Inodes) {
+    fn file(&mut self, path: &str, content: Given, size: u64, modified: SystemTime, inodes: &mut Inodes) {
         let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
         let parent = self.folder(parent_path, inodes);
         let ino = inodes.of(path);
@@ -234,7 +256,7 @@ impl Tree {
             Node {
                 path: path.to_string(),
                 parent,
-                what: What::File(disk),
+                what: What::File(content),
                 size,
                 modified,
                 asset: false,
@@ -326,13 +348,36 @@ impl Tree {
         self.nodes.is_empty()
     }
 
+    /// Bytes of a file's content from `offset` read into a buffer, as many as it takes or the file has: how many. What
+    /// a backend answers a read with, into the buffer it is given to fill.
+    ///
+    /// # Errors
+    /// It is no file of the tree, or it cannot be read.
+    pub fn read_into(&self, ino: u64, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.nodes.get(&ino).map(|n| &n.what) {
+            Some(What::File(Given::Disk(disk))) => project::content::read_range_into(disk, offset, buffer),
+            Some(What::File(Given::Bytes(bytes))) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+                let read = (bytes.len() - start).min(buffer.len());
+                buffer[..read].copy_from_slice(&bytes[start..start + read]);
+                Ok(read)
+            }
+            Some(What::Folder(_)) => Err(std::io::Error::from(std::io::ErrorKind::IsADirectory)),
+            None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }
+    }
+
     /// Up to `len` bytes of a file's content from `offset`.
     ///
     /// # Errors
     /// It is no file of the tree, or it cannot be read.
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         match self.nodes.get(&ino).map(|n| &n.what) {
-            Some(What::File(disk)) => project::content::read_range(disk, offset, len),
+            Some(What::File(Given::Disk(disk))) => project::content::read_range(disk, offset, len),
+            Some(What::File(Given::Bytes(bytes))) => {
+                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+                Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+            }
             Some(What::Folder(_)) => Err(std::io::Error::from(std::io::ErrorKind::IsADirectory)),
             None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
         }
@@ -347,6 +392,20 @@ pub struct Changes {
     pub new: Vec<(u64, String)>,
 }
 
+/// What a backend saw of a file it serves, told to whoever watches what is served (`Served::watch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// A program opened it to read.
+    Read,
+    /// It was read, and this much of it is now kept on disk.
+    Kept(u64),
+    /// What was kept of it on disk no longer is.
+    Dropped,
+}
+
+/// What is told what backends see of the files served, each by its path in the tree.
+type Watcher = Arc<dyn Fn(&str, Seen) + Send + Sync>;
+
 /// A tree being served: the newest one, swapped in as the project changes, and the inode numbers kept across them.
 #[derive(Clone, Default)]
 pub struct Served {
@@ -354,6 +413,8 @@ pub struct Served {
     inodes: Arc<Mutex<Inodes>>,
     /// How many files programs have open in it now: what serving waits for before it stops.
     open: Arc<std::sync::atomic::AtomicUsize>,
+    /// What watches what is read of it, where something does (`access`).
+    watcher: Arc<RwLock<Option<Watcher>>>,
 }
 
 /// A file open in what is served, for as long as this is held (`Served::opening`).
@@ -396,7 +457,7 @@ impl Served {
     }
 
     /// Serve a tree of the files given (`Tree::of_files`).
-    pub fn set_files(&self, files: &BTreeMap<String, PathBuf>) {
+    pub fn set_files(&self, files: &BTreeMap<String, Given>) {
         let tree = {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Tree::of_files(files, &mut inodes)
@@ -408,6 +469,11 @@ impl Served {
     #[must_use]
     pub fn ino(&self, path: &str) -> u64 {
         self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).of(path)
+    }
+
+    /// The inode numbers of a folder and what was in it let go of: what is served no more (`Inodes::forget`).
+    pub fn forget(&self, folder: &str) {
+        self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).forget(folder);
     }
 
     /// A path renamed: its inode number goes with it (`Inodes::rename`).
@@ -425,6 +491,19 @@ impl Served {
     #[must_use]
     pub fn tree(&self) -> Arc<Tree> {
         self.tree.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Have what backends see of the files served told to a watcher, from now on.
+    pub fn watch(&self, watcher: impl Fn(&str, Seen) + Send + Sync + 'static) {
+        *self.watcher.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(watcher));
+    }
+
+    /// A backend saw something of a file it serves: told to what watches.
+    pub fn seen(&self, path: &str, seen: Seen) {
+        let watcher = self.watcher.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if let Some(watcher) = watcher {
+            watcher(path, seen);
+        }
     }
 
     /// A file opened by a program, until it is released (`released`): one being read or written, not one looked at.

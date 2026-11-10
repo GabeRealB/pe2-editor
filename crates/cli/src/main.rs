@@ -556,14 +556,14 @@ enum ProjectCommand {
         /// The project's directory
         #[arg(long, default_value = ".")]
         project: PathBuf,
-        /// How to serve it - `fuse` (mounted at `assets`), or `webdav` (for the system's own client to mount) - in
-        /// place of what `project.local.toml` says (`[filesystem] serve`)
+        /// What serves it - a backend's name (`project backends` lists them), or `auto` for the best suited - in
+        /// place of what `project.local.toml` (`[filesystem] serve`) and then this machine's settings say
         #[arg(long)]
         backend: Option<String>,
         /// WebDAV's address (`127.0.0.1:4918`; port 0 for any), in place of `[filesystem] address`
         #[arg(long)]
         address: Option<String>,
-        /// On Windows, unregister the project's folder as a sync root, and serve nothing
+        /// No longer have the project's folder registered with the system (a sync root, on Windows), and serve nothing
         #[arg(long)]
         forget: bool,
         /// Stop the host serving it, whoever keeps it
@@ -575,6 +575,13 @@ enum ProjectCommand {
         /// Where its folder holds files that are not the project's, write them into the project
         #[arg(long)]
         take_in: bool,
+    },
+    /// What can serve a project as a filesystem here - each backend, what it can do, whether it is available and why
+    /// not - and what serves its folder and the files programs are given, as the project and this machine say
+    Backends {
+        /// The project's directory
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
     },
     /// Serve a project as a filesystem, holding it while nothing else does: what `serve` and the editor start, and keep
     #[command(hide = true)]
@@ -1318,7 +1325,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
     project::profile::install();
     // A large file a layer holds as chunks is given to a program in a scoped filesystem, mounted when first needed.
-    let _scopes = vfs::scoped::Scopes::install();
+    let _scopes = vfs::scoped::Scopes::install(|| {
+        let machine = extensions::filesystem_defaults();
+        vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
+    });
     let profile = cli.profile.then(std::time::Instant::now);
     // What the command line asks is a command: its work weighed as one, over the host's own.
     let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
@@ -1522,6 +1532,7 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
                 serve_project(project, backend.as_deref(), address.as_deref(), *stop, strays)
             };
         }
+        ProjectCommand::Backends { project } => return backends(project),
         ProjectCommand::Host { project, backend, address, strays } => {
             return host::run(project, backend.as_deref(), address.as_deref(), *strays);
         }
@@ -1792,16 +1803,83 @@ fn serve_project(
     Ok(())
 }
 
-/// Unregister a project's folder as a sync root (Windows).
+/// No longer know a project's folder where a backend registers it with the system (a sync root, on Windows).
 fn forget_served(project: &Path) -> Result<()> {
     let p = project::Project::load(project)?;
-    #[cfg(windows)]
-    {
-        vfs::cloud::forget(&host::served_name(&p))?;
-        println!("{} is no longer a sync root", project::host::shown(&p.filesystem.at));
+    for backend in vfs::backend::all() {
+        backend.forget(&p.filesystem.at, &host::served_name(&p)).with_context(|| format!("`{}`", backend.name()))?;
     }
-    #[cfg(not(windows))]
-    println!("{}: only Windows registers a project's folder", project::host::shown(&p.root));
+    println!("{} is registered with nothing", project::host::shown(&p.filesystem.at));
+    Ok(())
+}
+
+/// `pe2-cli project backends`: what can serve a project here - each backend, what it can do and whether it is
+/// available - and what serves its folder and its scopes as the project and this machine say.
+fn backends(project: &Path) -> Result<()> {
+    use project::content::Use;
+    use vfs::backend::{Can, choose, setting};
+    let p = project::Project::load(project)?;
+    let machine = extensions::filesystem_defaults();
+    let at = &p.filesystem.at;
+    for backend in vfs::backend::all() {
+        let can = backend.can();
+        let what = match (can.write, can.folder) {
+            (true, true) => "a folder, written through",
+            (false, true) => "a folder, read-only",
+            (true, false) => "an address, written through",
+            (false, false) => "an address, read-only",
+        };
+        let here = match backend.available(at) {
+            Ok(()) => "available".to_string(),
+            Err(why) => format!("not available: {why}"),
+        };
+        println!("{:<8} {what:<28} {here}", backend.name());
+    }
+    let scope = vfs::scoped::Scopes::at(&p.root);
+    let copies =
+        vfs::backend::budget(&[p.filesystem.copies.as_deref(), machine.copies.as_deref()], vfs::backend::COPIES);
+    let kept = vfs::backend::budget(&[p.filesystem.kept.as_deref(), machine.kept.as_deref()], vfs::backend::KEPT);
+    // What programs are given is laid out where that writes little, else served by how it will be used.
+    let jobs = [
+        ("the project's folder", "serve", &p.filesystem.serve, &machine.serve, Can::WRITTEN, at.clone(), Use::general()),
+        (
+            "what programs are given, where laying it out would write more than that: read once",
+            "scopes",
+            &p.filesystem.scopes,
+            &machine.scopes,
+            Can::BY_PATH,
+            scope.clone(),
+            Use::once(),
+        ),
+        (
+            "and read again and again",
+            "scopes",
+            &p.filesystem.scopes,
+            &machine.scopes,
+            Can::BY_PATH,
+            scope,
+            Use::general(),
+        ),
+    ];
+    println!(
+        "laid out for a program: what writes up to {} MiB; kept of what was read of the folder: up to {} MiB",
+        copies >> 20,
+        kept >> 20
+    );
+    for (job, key, project_says, machine_says, needs, at, how) in jobs {
+        let (says, who) = match (project_says, machine_says) {
+            (Some(says), _) => (says.as_str(), format!("`{key} = \"{says}\"` in {}", project::LOCAL)),
+            (None, Some(says)) => (says.as_str(), format!("`{key} = \"{says}\"` in this machine's settings")),
+            (None, None) => ("auto", "nothing says otherwise".to_string()),
+        };
+        let chosen = match choose(&setting(&[Some(says)]), needs, &at, &how, false) {
+            Ok(Some(backend)) => format!("`{}`", backend.name()),
+            Ok(None) if needs == Can::BY_PATH => "copies".to_string(),
+            Ok(None) => "nothing".to_string(),
+            Err(why) => format!("nothing: {why}"),
+        };
+        println!("{job}: {chosen} ({who})");
+    }
     Ok(())
 }
 

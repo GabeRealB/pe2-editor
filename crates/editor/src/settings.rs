@@ -159,6 +159,31 @@ pub struct Agents {
     pub drive: bool,
 }
 
+/// What serves projects as filesystems on this machine, where a project's own `project.local.toml` does not say
+/// (`[filesystem]`, which `pe2-cli` reads too): each a backend's name, `none`, or nothing for the best suited.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Filesystem {
+    /// What serves a project's folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve: Option<String>,
+    /// What serves the files programs are given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    /// How much laying files out for a program may write (`16 MiB`): up to that it is given copies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copies: Option<String>,
+    /// How much may be kept of what was read of a project's folder (`2 GiB`), by a backend that keeps what is read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
+}
+
+impl Filesystem {
+    fn says_nothing(&self) -> bool {
+        self.serve.is_none() && self.scopes.is_none() && self.copies.is_none() && self.kept.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
@@ -171,6 +196,9 @@ pub struct EditorSettings {
     pub performance_overlay: bool,
     /// Changes made outside the editor.
     pub changes: Changes,
+    /// What serves projects as filesystems.
+    #[serde(skip_serializing_if = "Filesystem::says_nothing")]
+    pub filesystem: Filesystem,
     /// What runs a command, by its id, where it is not what it comes with.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,

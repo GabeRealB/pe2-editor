@@ -87,7 +87,7 @@ struct Host {
 /// `pe2-cli project host`.
 pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
     let p = Project::load(directory)?;
-    let serving = serving_of(&p, backend, address)?;
+    let (serving, address) = serving_of(&p, backend, address)?;
     project::cache::make(&p.root)?;
     // One host a project: a second one started in a race ends here, and its starter finds the first.
     let one = std::fs::OpenOptions::new()
@@ -148,24 +148,86 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     })?;
     let staging = p.root.join(project::cache::DIR).join(project::cache::STAGING);
     let owner: Arc<dyn vfs::write::Owner> = host.clone();
-    if matches!(serving, project::Serving::Fuse | project::Serving::Cloud) {
-        clear_strays(&p, strays, owner.as_ref(), &staging)?;
+    if serving.can().folder {
+        // What another backend left there of its own serving is no stray: it goes first.
+        vfs::backend::hand_over(serving, &p.filesystem.at, &served_name(&p));
+        clear_strays(&p, serving, strays, owner.as_ref(), &staging)?;
     }
-    let (serving, at) = serve(&host.served, owner, &staging, serving, &p)?;
-    println!("{} served at {at} ({} entries)", project::host::shown(&p.root), host.served.tree().len());
+    let job = vfs::backend::Job {
+        served: &host.served,
+        owner: Some(owner),
+        at: &p.filesystem.at,
+        staging: &staging,
+        name: &served_name(&p),
+        address,
+    };
+    // Held while it serves: dropped, it no longer does.
+    let mount = serving
+        .mount(&job)
+        .with_context(|| format!("serving {} by `{}`", project::host::shown(&p.root), serving.name()))?;
+    let at = mount.shown();
+    println!(
+        "{} served at {at} by `{}` ({} entries)",
+        project::host::shown(&p.root),
+        serving.name(),
+        host.served.tree().len()
+    );
     *lock(&host.at) = at;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if host.project.filesystem.serving == project::Serving::Fuse || backend == Some("fuse") {
-        *lock(&host.note) = vfs::fuse::windows_cannot_reach();
-    }
+    *lock(&host.note) = mount.note();
+    let record = remembered(&host, serving.keeps());
     // Listened to once it serves: who keeps it is told where.
     let _talking = talk(&host)?;
-    host.keep_going();
-    // Stopping, whyever: what is said to it from now on finds it so.
-    host.stopping.store(true, Ordering::Relaxed);
-    drop(serving);
+    std::thread::scope(|scope| {
+        if serving.keeps() {
+            scope.spawn(|| keep_within(&host, serving, &record));
+        }
+        host.keep_going();
+        // Stopping, whyever: what is said to it from now on finds it so.
+        host.stopping.store(true, Ordering::Relaxed);
+    });
+    record.save();
+    drop(mount);
     println!("stopped");
     Ok(())
+}
+
+/// What is read of the folder served, remembered from one serving to the next: what a backend that keeps what is read
+/// lets go of last.
+fn remembered(host: &Host, keeps: bool) -> Arc<vfs::access::Access> {
+    let record = Arc::new(vfs::access::Access::of(&host.project.root, "the project's folder"));
+    if !keeps {
+        // Whatever kept what was read before has handed the folder over, and with it let go of what it kept.
+        record.nothing_kept();
+    }
+    let noted = Arc::clone(&record);
+    host.served.watch(move |path, seen| match seen {
+        vfs::Seen::Read => noted.read(path),
+        vfs::Seen::Kept(bytes) => noted.kept(path, bytes),
+        vfs::Seen::Dropped => noted.dropped(path),
+    });
+    record
+}
+
+/// How often what a backend keeps of the folder is brought within its budget.
+const COLLECTING: Duration = Duration::from_mins(10);
+
+/// For a backend that keeps what is read, while the host serves: what it keeps of the folder brought within its
+/// budget (`[filesystem] kept`) - now, every ten minutes, and as serving ends.
+fn keep_within(host: &Host, serving: &dyn vfs::backend::Backend, record: &vfs::access::Access) {
+    let machine = extensions::filesystem_defaults();
+    let says = &host.project.filesystem;
+    let kept = vfs::backend::budget(&[says.kept.as_deref(), machine.kept.as_deref()], vfs::backend::KEPT);
+    serving.collect(&says.at, record, kept);
+    let mut collected = Instant::now();
+    while !host.stopping.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(500));
+        if collected.elapsed() >= COLLECTING {
+            serving.collect(&says.at, record, kept);
+            record.save();
+            collected = Instant::now();
+        }
+    }
+    serving.collect(&says.at, record, kept);
 }
 
 /// What is done with what the folder a project is served at holds that is not the project's (`vfs::strays`).
@@ -191,9 +253,15 @@ impl Strays {
 }
 
 /// Leave the folder a project is served at holding nothing that is not the project's, as `strays` says.
-fn clear_strays(p: &Project, strays: Strays, owner: &dyn vfs::write::Owner, staging: &Path) -> Result<()> {
+fn clear_strays(
+    p: &Project,
+    serving: &dyn vfs::backend::Backend,
+    strays: Strays,
+    owner: &dyn vfs::write::Owner,
+    staging: &Path,
+) -> Result<()> {
     let at = &p.filesystem.at;
-    let found = vfs::strays::strays(at);
+    let found = vfs::strays::strays(at, serving);
     if found.is_empty() {
         return Ok(());
     }
@@ -241,14 +309,31 @@ pub fn files(count: usize) -> String {
     if count == 1 { "1 file".into() } else { format!("{count} files") }
 }
 
-/// How a project is served: as asked, or as this machine says.
-fn serving_of(p: &Project, backend: Option<&str>, address: Option<&str>) -> Result<project::Serving> {
-    Ok(match (backend, p.filesystem.serving) {
-        (Some(name), _) => project::Serving::named(name, address)?,
-        (None, project::Serving::WebDav(_)) if address.is_some() => project::Serving::named("webdav", address)?,
-        (None, project::Serving::None) => project::Serving::default_here(),
-        (None, serving) => serving,
-    })
+/// What serves a project's folder, written through, and the address it does at where it serves at one: as asked, then
+/// as the project says (`project.local.toml`), then the machine - else the backend best suited here. A project or
+/// machine saying `none` is only not served by itself: asked to be, it is, by the best suited.
+fn serving_of(
+    p: &Project,
+    asked: Option<&str>,
+    address: Option<&str>,
+) -> Result<(&'static dyn vfs::backend::Backend, Option<std::net::SocketAddr>)> {
+    use vfs::backend::{Can, Setting, choose, setting, why_none};
+    let machine = extensions::filesystem_defaults();
+    let said = |says: &Option<String>| says.clone().filter(|says| says != "none");
+    let (project, machine) = (said(&p.filesystem.serve), said(&machine.serve));
+    let setting = setting(&[asked, project.as_deref(), machine.as_deref()]);
+    if setting == Setting::None {
+        bail!("asked to serve {} by nothing", project::host::shown(&p.root));
+    }
+    let at = &p.filesystem.at;
+    // A folder programs work in: any of it, any number of times.
+    let how = project::content::Use::general();
+    let Some(backend) = choose(&setting, Can::WRITTEN, at, &how, false).map_err(anyhow::Error::msg)? else {
+        bail!("nothing serves {} here ({})", project::host::shown(&p.root), why_none(Can::WRITTEN, at));
+    };
+    let address = address.or(p.filesystem.address.as_deref());
+    let address = address.map(|a| a.parse().with_context(|| format!("`{a}`: no address"))).transpose()?;
+    Ok((backend, address))
 }
 
 /// The project held: its index, over the cache's store, and a history of its own.
@@ -313,46 +398,70 @@ impl Host {
 
     /// Make an edit while holding the project: a step of its history, taken in at once.
     fn edit(&self, op: &vfs::ops::Op, layer: Option<&str>) -> mcp::Reply {
+        let made = self.edits(std::slice::from_ref(op), layer).pop();
+        made.unwrap_or_else(|| mcp::Reply::failed("nothing was asked".into()))
+    }
+
+    /// Make edits while holding the project, in order: each a step of its history, and what follows from them - the
+    /// index, the tree served - brought up to date once for all of them, which is most of what one edit takes. How
+    /// each went.
+    fn edits(&self, ops: &[vfs::ops::Op], layer: Option<&str>) -> Vec<mcp::Reply> {
+        let failed = |why: String| ops.iter().map(|_| mcp::Reply::failed(why.clone())).collect();
         let mut state = lock(&self.state);
         let State { index, held, written, reading, .. } = &mut *state;
         let (Some(index), Some(held)) = (index.as_mut(), held) else {
-            return mcp::Reply::failed("the host does not hold the project".into());
+            return failed("the host does not hold the project".into());
         };
         // What reads were answered from changes: made again at the next.
         *reading = None;
-        let made = (|| {
-            let layer = match layer {
-                Some(layer) => layer.to_string(),
-                None => vfs::write::writable_layer(index).context("no layer of the project can be written")?,
-            };
-            let (label, touched) = {
+        let Some(layer) = layer.map(str::to_string).or_else(|| vfs::write::writable_layer(index)) else {
+            return failed("no layer of the project can be written".into());
+        };
+        // What the edits wrote that the index has not taken in yet, and all of it.
+        let (mut pending, mut changed): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+        let mut replies = Vec::with_capacity(ops.len());
+        for op in ops {
+            let mut apply = |index: &Index| {
                 let _span = tracing::info_span!("host edit apply").entered();
-                vfs::ops::apply(op, &self.project, index, &layer, &mut held.history)?
+                vfs::ops::apply(op, &self.project, index, &layer, &mut held.history)
             };
-            let mut changed = touched.clone();
-            changed.extend(held.history.take_written());
-            {
-                let _span = tracing::info_span!("host edit refresh").entered();
-                index.refresh(&self.project, &changed)?;
+            let mut made = apply(index);
+            // What it could not be made over may be what the ones before it made: taken in, and tried once more.
+            if made.is_err() && !pending.is_empty() && index.refresh(&self.project, &pending).is_ok() {
+                changed.append(&mut pending);
+                made = apply(index);
             }
-            if written.len() > 10_000 {
-                written.clear();
-            }
-            for path in &changed {
-                written.insert(path.clone(), stamp(path));
-            }
-            let _span = tracing::info_span!("host served update").entered();
-            self.served.update(index);
-            project::give_back_memory();
-            anyhow::Ok((label, touched))
-        })();
-        match made {
-            Ok((label, touched)) => {
-                println!("{label}");
-                mcp::Reply::Edited { label, touched }
-            }
-            Err(e) => mcp::Reply::failed(format!("{e:#}")),
+            replies.push(match made {
+                Ok((label, touched)) => {
+                    pending.extend(touched.iter().cloned());
+                    pending.extend(held.history.take_written());
+                    println!("{label}");
+                    mcp::Reply::Edited { label, touched }
+                }
+                Err(e) => mcp::Reply::failed(format!("{e:#}")),
+            });
         }
+        if pending.is_empty() && changed.is_empty() {
+            return replies;
+        }
+        let refreshed = {
+            let _span = tracing::info_span!("host edit refresh").entered();
+            index.refresh(&self.project, &pending)
+        };
+        changed.append(&mut pending);
+        if let Err(e) = refreshed {
+            return failed(format!("{e:#}"));
+        }
+        if written.len() > 10_000 {
+            written.clear();
+        }
+        for path in &changed {
+            written.insert(path.clone(), stamp(path));
+        }
+        let _span = tracing::info_span!("host served update").entered();
+        self.served.update(index);
+        project::give_back_memory();
+        replies
     }
 
     /// Take in what changed in the layers: the index refreshed, the tree served made of it.
@@ -564,6 +673,16 @@ impl vfs::write::Owner for Host {
             }
         }
     }
+
+    /// What programs wrote at once: made here together while the host holds the project, the index and the tree
+    /// served brought up to date once; else sent to whoever does, one by one.
+    fn changes(&self, changes: Vec<vfs::write::Change>) -> Vec<std::result::Result<(), String>> {
+        if lock(&self.state).held.is_none() {
+            return changes.into_iter().map(|change| self.change(change)).collect();
+        }
+        let ops: Vec<vfs::ops::Op> = changes.into_iter().map(vfs::ops::Op::from).collect();
+        self.edits(&ops, None).into_iter().map(|reply| reply.told().map(drop)).collect()
+    }
 }
 
 /// Listen for what processes say to the host, each connection on a thread of its own. Listening ends with what this
@@ -593,13 +712,18 @@ struct StopListening {
 
 impl Drop for StopListening {
     fn drop(&mut self) {
-        // Woken, it finds the host stopping (or gone) and lets go of the name.
-        if let Ok(name) = project::host::name(&self.root) {
-            let _ = interprocess::local_socket::Stream::connect(name);
+        let Some(thread) = self.thread.take() else { return };
+        // Woken, it finds the host stopping (or gone) and lets go of the name. Where it has left already - whoever
+        // spoke to a host that was stopping woke it - nobody answers the name any more, and on Windows connecting to
+        // it then waits for as long as a connection of it is still open, a keeper's: so never on this thread, which
+        // would be the host never stopping.
+        if !thread.is_finished()
+            && let Ok(name) = project::host::name(&self.root)
+        {
+            let wake = move || drop(interprocess::local_socket::Stream::connect(name));
+            let _ = std::thread::Builder::new().name("host wake".into()).spawn(wake);
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let _ = thread.join();
     }
 }
 
@@ -657,49 +781,6 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
 }
 
 /// What serves the tree, for as long as it is held: dropped, it stops.
-#[expect(dead_code, reason = "held for its drop")]
-enum Serving {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    Mounted(vfs::fuse::Mounted),
-    Dav(vfs::dav::DavServer),
-    #[cfg(windows)]
-    Cloud(Box<vfs::cloud::Cloud>),
-}
-
-/// Serve the tree by a backend, what programs write applied by `owner`: what serves it, and where.
-fn serve(
-    served: &vfs::Served,
-    owner: Arc<dyn vfs::write::Owner>,
-    staging: &Path,
-    serving: project::Serving,
-    p: &Project,
-) -> Result<(Serving, String)> {
-    let at = &p.filesystem.at;
-    match serving {
-        project::Serving::WebDav(addr) => {
-            let writes = vfs::writes::Writes::new(served, owner, staging)?;
-            let dav = vfs::dav::serve(served, Some(writes), addr).with_context(|| format!("serving at {addr}"))?;
-            let at = format!("http://{}/", dav.addr);
-            Ok((Serving::Dav(dav), at))
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        project::Serving::Fuse => {
-            std::fs::create_dir_all(at).with_context(|| at.display().to_string())?;
-            let writes = vfs::writes::Writes::new(served, owner, staging)?;
-            let mounted = vfs::fuse::mount(served, Some(writes), at, &served_name(p))
-                .with_context(|| format!("mounting at {}", at.display()))?;
-            Ok((Serving::Mounted(mounted), project::host::shown(at)))
-        }
-        #[cfg(windows)]
-        project::Serving::Cloud => {
-            let cloud = vfs::cloud::serve(served, Some(owner), at, staging, &served_name(p))
-                .with_context(|| format!("serving at {}", at.display()))?;
-            Ok((Serving::Cloud(Box::new(cloud)), project::host::shown(at)))
-        }
-        _ => bail!("{serving:?} cannot serve here: FUSE on Linux and macOS, `cloud` on Windows, or `webdav`"),
-    }
-}
-
 /// The name a project is served by: its folder's.
 pub fn served_name(p: &Project) -> String {
     format!("pe2:{}", p.root.file_name().and_then(|n| n.to_str()).unwrap_or("project"))

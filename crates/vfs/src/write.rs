@@ -60,6 +60,13 @@ pub trait Owner: Send + Sync {
     /// # Errors
     /// The change cannot be made: why, for the program to be told it failed.
     fn change(&self, change: Change) -> Result<(), String>;
+
+    /// Apply several changes that do not depend on each other, in order: how each went. One that can applies them
+    /// together - a step of the history each, what follows from them (its index, the tree served) brought up to date
+    /// once for all - which is what makes many files written at once land in the time of a few.
+    fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), String>> {
+        changes.into_iter().map(|change| self.change(change)).collect()
+    }
 }
 
 /// Files programs make for themselves beside what they edit - swap files, backups, lock files - which stay in the

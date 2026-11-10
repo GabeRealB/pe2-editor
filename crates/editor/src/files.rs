@@ -66,7 +66,9 @@ impl Files {
     #[must_use]
     pub fn keep(project: &project::Project) -> Option<Files> {
         let root = &project.root;
-        if project.filesystem.serving == project::Serving::None && project::host::Connection::connect(root).is_none() {
+        let machine = extensions::filesystem_defaults().serve;
+        let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
+        if says == vfs::backend::Setting::None && project::host::Connection::connect(root).is_none() {
             return None;
         }
         let state = Arc::new(Mutex::new(Kept::Starting));
@@ -124,8 +126,13 @@ fn kept(project: &project::Project, strays: Option<Strays>) -> Kept {
     match kept {
         Ok(lease) => lease.into(),
         Err(e) => {
-            let folder = matches!(project.filesystem.serving, project::Serving::Fuse | project::Serving::Cloud);
-            let strays = if folder { vfs::strays::strays(&project.filesystem.at).len() } else { 0 };
+            // What its folder holds that is not the project's, where what serves it serves at one: why, most likely.
+            let machine = extensions::filesystem_defaults().serve;
+            let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
+            let at = &project.filesystem.at;
+            let how = project::content::Use::general();
+            let serving = vfs::backend::choose(&says, vfs::backend::Can::WRITTEN, at, &how, false).ok().flatten();
+            let strays = serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len());
             Kept::Failed(format!("{e:#}"), strays)
         }
     }

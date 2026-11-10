@@ -421,7 +421,7 @@ impl host::HostAsset for State {
     }
 
     fn place(&mut self, asset: Resource<LentAsset>, path: String) -> wasmtime::Result<Option<String>> {
-        Ok(self.lent(&asset)?.place(&path))
+        Ok(self.lent(&asset)?.place(&path).map(|at| guest_path(&at)))
     }
 
     fn node_named(
@@ -455,7 +455,7 @@ impl host::HostAsset for State {
             name: c.name,
             release: c.release,
             target: c.target,
-            folder: c.folder,
+            folder: guest_path(&c.folder),
             known: c.known,
             properties: c.properties.to_string(),
         }))
@@ -481,6 +481,7 @@ impl host::HostAsset for State {
             .lent(&asset)?
             .temp()
             .unwrap_or_else(|| Err(anyhow!("lent for no operation's run")))
+            .map(|at| guest_path(&at))
             .map_err(|e| format!("{e:#}")))
     }
 
@@ -493,6 +494,7 @@ impl host::HostAsset for State {
         if self.unsandboxed.is_none() {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         }
+        let path = host_path(&path);
         let kept = self.lent(&asset)?.keep(&path, &name).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
         Ok(kept.map(file_to_wit).map_err(|e| format!("{e:#}")))
     }
@@ -501,7 +503,23 @@ impl host::HostAsset for State {
         if self.unsandboxed.is_none() {
             return Ok(None);
         }
-        Ok(self.lent(&asset)?.path_of(&name))
+        Ok(self.lent(&asset)?.path_of(&name).map(|at| guest_path(&at)))
+    }
+
+    fn serve(
+        &mut self,
+        asset: Resource<LentAsset>,
+        files: Vec<types::File>,
+        how: types::ServeUse,
+    ) -> wasmtime::Result<Result<String, String>> {
+        if self.unsandboxed.is_none() {
+            return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
+        }
+        let files: Vec<pe2_ext::File> = files.into_iter().map(file_from_wit).collect();
+        let how = pe2_ext::Use { often: how.often, ranges: how.ranges };
+        let served =
+            self.lent(&asset)?.serve(&files, &how).unwrap_or_else(|| Err(anyhow!("lent for no operation's run")));
+        Ok(served.map(|at| guest_path(&at)).map_err(|e| format!("{e:#}")))
     }
 
     fn drop(&mut self, asset: Resource<LentAsset>) -> wasmtime::Result<()> {
@@ -763,6 +781,8 @@ impl unsandboxed::Host for State {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         };
         let (folder, fetched) = (unsandboxed.folder.as_deref(), unsandboxed.fetched());
+        // Paths in its filesystem's form, as the program reads them.
+        let args: Vec<String> = args.iter().map(|arg| host_arg(arg)).collect();
         // A name it launches is another program with arguments of its own, before those passed.
         let (program, args) = match unsandboxed.launch.iter().find(|launch| launch.name == tool) {
             Some(launch) => {
@@ -1551,7 +1571,17 @@ impl Shared {
         if self.unsandboxed.is_some() {
             // It sees the system as a program does.
             wasi.inherit_env().inherit_network().allow_blocking_current_thread(true);
-            wasi.preopened_dir("/", "/", wasmtime_wasi::FsPerms::ReadWrite)?;
+            if cfg!(windows) {
+                // Each drive a root of its own (`/D:`): what the host's paths are told as (`guest_path`).
+                for letter in 'A'..='Z' {
+                    let root = format!("{letter}:\\");
+                    if Path::new(&root).is_dir() {
+                        wasi.preopened_dir(&root, format!("/{letter}:"), wasmtime_wasi::FsPerms::ReadWrite)?;
+                    }
+                }
+            } else {
+                wasi.preopened_dir("/", "/", wasmtime_wasi::FsPerms::ReadWrite)?;
+            }
         } else {
             wasi.wall_clock(Still).monotonic_clock(Still);
         }
@@ -2458,6 +2488,82 @@ impl Source for Node<'_> {
     fn path_of(&self, name: &str) -> Option<String> {
         self.host.path_of(&Node::content(name))
     }
+
+    fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Option<Result<String>> {
+        Some(self.host.serve(files, how))
+    }
+}
+
+/// A host path as an unsandboxed extension's filesystem names it: on Windows each drive is a root of its own
+/// (`drive_form`), elsewhere it is as it is.
+fn guest_path(path: &str) -> String {
+    if cfg!(windows) { drive_form(path) } else { path.to_string() }
+}
+
+/// A path an unsandboxed extension names, as the host names it (`host_form` on Windows).
+fn host_path(path: &str) -> String {
+    if cfg!(windows) { host_form(path) } else { path.to_string() }
+}
+
+/// A program's argument as the program reads it (`arg_host_form` on Windows).
+fn host_arg(arg: &str) -> String {
+    if cfg!(windows) { arg_host_form(arg) } else { arg.to_string() }
+}
+
+/// A Windows path with its drive a root: `D:\a\b` (or `\\?\D:\a\b`) is `/D:/a/b`; what has no drive, as it is.
+fn drive_form(path: &str) -> String {
+    let plain = path.strip_prefix(r"\\?\").unwrap_or(path);
+    match plain.as_bytes() {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
+            format!("/{}:{}", char::from(*letter).to_ascii_uppercase(), plain[2..].replace('\\', "/"))
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// A path with its drive a root as Windows names it: `/D:/a/b` is `D:/a/b`.
+fn host_form(path: &str) -> String {
+    match path.as_bytes() {
+        [b'/', letter, b':', rest @ ..] if letter.is_ascii_alphabetic() && rest.first().is_none_or(|c| *c == b'/') => {
+            path[1..].to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// Each path in an argument with its drive a root as Windows names it: `-I/D:/a` is `-ID:/a`.
+fn arg_host_form(arg: &str) -> String {
+    let bytes = arg.as_bytes();
+    let mut out = String::with_capacity(arg.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let drive = bytes[at] == b'/'
+            && bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(at + 2) == Some(&b':')
+            && bytes.get(at + 3).is_none_or(|c| *c == b'/');
+        if drive {
+            at += 1;
+            continue;
+        }
+        let ch = arg[at..].chars().next().unwrap_or_default();
+        out.push(ch);
+        at += ch.len_utf8();
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn a_windows_path_has_its_drive_a_root_in_an_extensions_filesystem_and_back() {
+    assert_eq!(drive_form(r"D:\pe2\project\tmp"), "/D:/pe2/project/tmp");
+    assert_eq!(drive_form(r"\\?\d:\pe2"), "/D:/pe2");
+    assert_eq!(drive_form("relative/path"), "relative/path");
+    assert_eq!(host_form("/D:/pe2/project"), "D:/pe2/project");
+    assert_eq!(host_form("/D:"), "D:");
+    assert_eq!(host_form("/Data/x"), "/Data/x");
+    assert_eq!(arg_host_form("-I/D:/pe2/tree/self"), "-ID:/pe2/tree/self");
+    assert_eq!(arg_host_form("--x=/C:/a,/D:/b"), "--x=C:/a,D:/b");
+    assert_eq!(arg_host_form("/usr/bin/a:b"), "/usr/bin/a:b");
 }
 
 /// What an operation said before it runs, as the contract carried it.

@@ -397,6 +397,8 @@ pub struct Call<'a> {
     needs: Option<&'a Needs>,
     /// The paths it handed a program to write (`temp`): what is not kept of them is removed when it is done.
     temps: Mutex<Vec<std::path::PathBuf>>,
+    /// The folders it had served to programs (`serve`): served until it is done.
+    served: Mutex<Vec<crate::content::Folder>>,
 }
 
 impl Drop for Call<'_> {
@@ -729,6 +731,36 @@ impl<'a> Call<'a> {
         let path = self.store.context("no store to keep it in")?.spill()?.1;
         self.temps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.clone());
         Ok(path)
+    }
+
+    /// A read-only folder holding these files by their names, for a program to read, until the run is done: each where
+    /// it is - a stored one where its content is, one held in memory from there - nothing written where a folder server
+    /// serves it (`content::serve_folder`), which chooses how by `how` they will be used.
+    ///
+    /// # Errors
+    /// A file's content cannot be found, or the folder cannot be served.
+    pub fn serve(&self, files: &[File], how: &crate::content::Use) -> Result<std::path::PathBuf> {
+        use crate::content::Given;
+        let mut given = std::collections::BTreeMap::new();
+        for file in files {
+            // Where its content is; one with no place on disk (a node holding it otherwise), read and held.
+            let content = match &file.content {
+                super::Content::Inline(bytes) => Given::Bytes(Arc::from(bytes.as_slice())),
+                super::Content::Stored { sha1, .. } => match self.content_path(sha1) {
+                    Some(disk) => Given::Disk(disk),
+                    None => Given::Bytes(Arc::from(
+                        self.read(&file.content).with_context(|| format!("{}: its content is nowhere", file.name))?,
+                    )),
+                },
+            };
+            given.insert(file.name.clone(), content);
+        }
+        let project = self.store.and_then(Store::project);
+        let fallback = self.store.map_or_else(std::env::temp_dir, Store::tmp);
+        let folder = crate::content::serve_folder(project, &given, how, &fallback)?;
+        let at = folder.at.clone();
+        self.served.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(folder);
+        Ok(at)
     }
 
     /// A file made kept as a content: moved to its blob, named `name`.
@@ -1349,6 +1381,7 @@ impl Evaluation<'_> {
                 others,
                 needs: None,
                 temps: Mutex::default(),
+            served: Mutex::default(),
             };
             return match tracing::info_span!("stream", of = %step.op).in_scope(|| start(&mut call)) {
                 Ok(producer) => {
@@ -1401,6 +1434,7 @@ impl Evaluation<'_> {
             others,
             needs: held,
             temps: Mutex::default(),
+            served: Mutex::default(),
         };
         // In steps, a chain: what its first step's run leaves - its instance - goes on to the next.
         let Some(given) = given else {
@@ -1467,6 +1501,7 @@ impl Evaluation<'_> {
                 others: self.others,
                 needs: Some(&needs),
                 temps: Mutex::default(),
+            served: Mutex::default(),
             };
             value = tracing::info_span!("op", of = %op).in_scope(|| run(&mut call))?;
         }
@@ -1573,6 +1608,7 @@ impl Evaluation<'_> {
             others: self.others,
             needs: Some(needs),
             temps: Mutex::default(),
+            served: Mutex::default(),
         };
         let prepared = tracing::info_span!("prepare", of = %step.op).in_scope(|| prepare(&mut call))?;
         self.make_needs(&prepared.needs, needs);
@@ -1979,10 +2015,15 @@ impl Engine {
             others: &others,
             needs: None,
             temps: Mutex::default(),
+            served: Mutex::default(),
         };
         let producer = start(&mut call).with_context(|| format!("{}: {address} could not be opened", node.path()));
         // What a stream's producer may go on writing outlives the call that opened it: left to the store's sweep.
         call.temps.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        // And the folders it had served: still served while it reads them.
+        std::mem::take(call.served.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .into_iter()
+            .for_each(std::mem::forget);
         drop(call);
         let producer = producer?;
         let reads = reads.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2026,6 +2067,7 @@ impl Engine {
             others,
             needs: None,
             temps: Mutex::default(),
+            served: Mutex::default(),
         };
         tracing::info_span!("op", of = %op).in_scope(|| run(&mut call))
     }

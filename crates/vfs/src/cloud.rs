@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use cloud_filter::error::{CResult, CloudErrorKind};
 use cloud_filter::filter::{Request, StateWatchEvent, SyncFilter, info, ticket};
 use cloud_filter::metadata::Metadata;
-use cloud_filter::placeholder::{ConvertOptions, Placeholder, UpdateOptions};
+use cloud_filter::placeholder::{ConvertOptions, Placeholder, PlaceholderInfo, UpdateOptions};
 use cloud_filter::placeholder_create_info::PlaceholderCreateInfo;
 use cloud_filter::root::{
     Connection, HydrationType, PopulationType, SecurityId, Session, SyncRootId, SyncRootIdBuilder, SyncRootInfo,
@@ -33,6 +33,7 @@ mod windows_error {
     pub type Error = windows_core::Error;
 }
 
+use crate::backend::plain;
 use crate::write::{Change, Owner, is_junk};
 use crate::{Node, Served, Tree, What};
 
@@ -50,17 +51,27 @@ const PROVIDER: &str = "pe2";
 pub struct Cloud {
     _connection: Connection<Filter>,
     stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Cloud {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Waited for: it gives the project what still waits to settle, while the folder is still connected.
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
     }
 }
 
-/// A sync root's id: this provider's, the user's, the project's (by its name).
-fn id_of(name: &str) -> io::Result<SyncRootId> {
-    let account: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+/// A sync root's id: this provider's, the user's, and the folder's - its name as served, for a person to know it by,
+/// and what tells its place from every other: two projects in folders of one name (`project`, mostly) are two sync
+/// roots, and letting go of one's leaves the other's.
+fn id_of(name: &str, at: &Path) -> io::Result<SyncRootId> {
+    let place = project::extract::sha1_hex(plain(at).to_string_lossy().to_lowercase().as_bytes());
+    let named = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' });
+    let account: String = named.chain("_".chars()).chain(place.chars().take(12)).collect();
     let user = SecurityId::current_user().map_err(|e| io::Error::other(format!("the user: {e}")))?;
     Ok(SyncRootIdBuilder::new(PROVIDER).user_security_id(user).account_name(account).build())
 }
@@ -82,7 +93,7 @@ pub fn serve(
     std::fs::create_dir_all(at)?;
     std::fs::create_dir_all(staging)?;
     let step = |what: &'static str| move |e: windows_error::Error| io::Error::other(format!("{what}: {e}"));
-    let id = id_of(name)?;
+    let id = id_of(name, at)?;
     if !id.is_registered().map_err(step("asking whether it is registered"))? {
         let info = SyncRootInfo::default()
             .with_display_name(format!("Parasite Eve II project {name}"))
@@ -101,28 +112,56 @@ pub fn serve(
     let stopped = Arc::new(AtomicBool::new(false));
     let worker = Worker { served: served.clone(), owner, root: at.clone(), staging: staging.to_path_buf(), pending };
     let stopping = stopped.clone();
-    std::thread::Builder::new().name("cloud".into()).spawn(move || worker.run(&stopping))?;
-    Ok(Cloud { _connection: connection, stop: stopped })
+    let worker = std::thread::Builder::new().name("cloud".into()).spawn(move || worker.run(&stopping))?;
+    Ok(Cloud { _connection: connection, stop: stopped, worker: Some(worker) })
 }
 
-/// Unregister a project's folder: it is no longer a sync root, and what was not read of it cannot be.
+/// Make the placeholders of what is at a path of the tree, all under it and the folders leading to it, where Windows
+/// has not: what a program opens by its path finds it, before anything lists the folders it is in - which is when
+/// Windows asks for them (`fetch_placeholders`).
+pub fn place(served: &Served, root: &Path, at: &str, read_only: bool) {
+    let tree = served.tree();
+    let mut dir = plain(root);
+    let mut walked = String::new();
+    for step in at.split('/').filter(|step| !step.is_empty()) {
+        walked = if walked.is_empty() { step.to_string() } else { format!("{walked}/{step}") };
+        let Some((_, node)) = tree.at(&walked) else { return };
+        let next = dir.join(step);
+        if std::fs::symlink_metadata(&next).is_err() {
+            let _ = placeholder(step, node, read_only).create(&dir);
+        }
+        dir = next;
+    }
+    fill(&tree, &dir, &walked, read_only);
+}
+
+/// The placeholders of all under a folder of the tree, where they are not.
+fn fill(tree: &Tree, dir: &Path, at: &str, read_only: bool) {
+    let Some((_, Node { what: What::Folder(children), .. })) = tree.at(at) else { return };
+    for (name, ino) in children {
+        let Some(node) = tree.node(*ino) else { continue };
+        let path = dir.join(name);
+        if std::fs::symlink_metadata(&path).is_err() {
+            let _ = placeholder(name, node, read_only).create(dir);
+        }
+        if matches!(node.what, What::Folder(_)) {
+            let inside = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
+            fill(tree, &path, &inside, read_only);
+        }
+    }
+}
+
+/// Unregister a folder: it is no longer a sync root, and what was not read of it cannot be. One that is not
+/// registered is none to forget - asked of Windows as it is unregistered, which whether one is registered
+/// (`is_registered`) does not always say.
 ///
 /// # Errors
 /// It cannot be unregistered.
-pub fn forget(name: &str) -> io::Result<()> {
-    let id = id_of(name)?;
-    if id.is_registered()? {
-        id.unregister()?;
-    }
-    Ok(())
-}
-
-/// A path without the verbatim prefix canonicalizing gives it (`\\?\D:\x` as `D:\x`), where it has a drive.
-fn plain(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
-        _ => path.to_path_buf(),
+pub fn forget(at: &Path, name: &str) -> io::Result<()> {
+    const NOT_FOUND: i32 = 0x8007_0490_u32.cast_signed();
+    match id_of(name, at)?.unregister() {
+        Err(e) if e.code().0 != NOT_FOUND => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -144,18 +183,24 @@ fn time(at: SystemTime) -> FileTime {
     FileTime::try_from(at).unwrap_or(FileTime::NT_TIME_EPOCH)
 }
 
-/// A node's metadata as Windows keeps it on its placeholder.
-fn metadata(node: &Node) -> Metadata {
+/// A node's metadata as Windows keeps it on its placeholder: a file's read-only where nothing applies what programs
+/// change.
+fn metadata(node: &Node, read_only: bool) -> Metadata {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
     let at = time(node.modified);
-    let base = if matches!(node.what, What::Folder(_)) { Metadata::directory() } else { Metadata::file() };
+    let folder = matches!(node.what, What::Folder(_));
+    let base = if folder { Metadata::directory() } else { Metadata::file() };
+    let base = if read_only && !folder { base.attributes(FILE_ATTRIBUTE_READONLY) } else { base };
     base.size(node.size).created(at).written(at).changed(at).accessed(at)
 }
 
 /// A node's placeholder in its folder, by its name: its metadata, its path in the tree as its identity (which Windows
 /// requires of a file), in sync.
-fn placeholder(name: &str, node: &Node) -> PlaceholderCreateInfo {
-    let made =
-        PlaceholderCreateInfo::new(name).metadata(metadata(node)).blob(node.path.as_bytes().to_vec()).mark_in_sync();
+fn placeholder(name: &str, node: &Node, read_only: bool) -> PlaceholderCreateInfo {
+    let made = PlaceholderCreateInfo::new(name)
+        .metadata(metadata(node, read_only))
+        .blob(node.path.as_bytes().to_vec())
+        .mark_in_sync();
     if matches!(node.what, What::Folder(_)) { made } else { made.has_no_children() }
 }
 
@@ -180,15 +225,19 @@ impl SyncFilter for Filter {
         let tree = self.served.tree();
         let (node, _) = tree.at(&path).ok_or(CloudErrorKind::NotInSync)?;
         let range = info.required_file_range();
+        // Read, and kept from now on as far as it was asked for.
+        self.served.seen(&path, crate::Seen::Kept(range.end));
         let mut at = range.start;
+        // One piece's room, filled again for each.
+        let mut piece = vec![0u8; usize::try_from((range.end - at).min(PIECE)).unwrap_or(1 << 20)];
         while at < range.end {
             let len = usize::try_from((range.end - at).min(PIECE)).unwrap_or(1 << 20);
-            let bytes = tree.read(node, at, len).map_err(|_| CloudErrorKind::Unsuccessful)?;
-            if bytes.is_empty() {
+            let read = tree.read_into(node, at, &mut piece[..len]).map_err(|_| CloudErrorKind::Unsuccessful)?;
+            if read == 0 {
                 break;
             }
-            ticket.write_at(&bytes, at).map_err(|_| CloudErrorKind::Unsuccessful)?;
-            at += bytes.len() as u64;
+            ticket.write_at(&piece[..read], at).map_err(|_| CloudErrorKind::Unsuccessful)?;
+            at += read as u64;
         }
         Ok(())
     }
@@ -204,8 +253,9 @@ impl SyncFilter for Filter {
         let Some((_, Node { what: What::Folder(children), .. })) = tree.at(&path) else {
             return Ok(());
         };
+        let read_only = self.owner.is_none();
         let mut made: Vec<PlaceholderCreateInfo> =
-            children.iter().filter_map(|(name, ino)| Some(placeholder(name, tree.node(*ino)?))).collect();
+            children.iter().filter_map(|(name, ino)| Some(placeholder(name, tree.node(*ino)?, read_only))).collect();
         // One there already (made here meanwhile) is no failure of the rest.
         let _ = ticket.pass_with_placeholders(&mut made);
         Ok(())
@@ -255,28 +305,53 @@ impl SyncFilter for Filter {
     }
 }
 
+/// Opening a file so, Windows does not read its content back in where it is not on disk.
+const FILE_FLAG_OPEN_NO_RECALL: u32 = 0x0010_0000;
+/// A folder is opened so.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// What is opened here is shared with whoever else has it open.
+const SHARE_ALL: u32 = 0x7;
+
 /// A file or folder opened to change its placeholder: a plain handle that may write (a folder's with backup semantics,
-/// as Windows opens one).
+/// as Windows opens one), which reads nothing in.
 fn writable(path: &Path, folder: bool) -> io::Result<Placeholder> {
     use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const SHARE_ALL: u32 = 0x7;
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).share_mode(SHARE_ALL);
-    if folder {
-        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    }
+    let flags = if folder { FILE_FLAG_BACKUP_SEMANTICS } else { 0 };
+    options.read(true).write(true).share_mode(SHARE_ALL).custom_flags(flags | FILE_FLAG_OPEN_NO_RECALL);
     Ok(Placeholder::from(options.open(path)?))
 }
 
-/// Mark what is on disk in sync with the project: a placeholder updated, anything else made one.
+/// A file or folder opened to be asked what it is as a placeholder, and for nothing else: for its attributes alone.
+/// Opened as the Cloud Files API opens one (`CfOpenFileWithOplock`), Windows fetches a file whole whose content was
+/// let go of, so walking a folder to ask would read back in all a collector freed.
+fn asked(path: &Path) -> io::Result<Placeholder> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL);
+    Ok(Placeholder::from(options.open(path)?))
+}
+
+/// A file's or folder's state as a placeholder; none where it is a plain one. Asked of the file itself, opened: how
+/// a folder lists it does not say, since Windows shows placeholders to other programs as plain files.
+///
+/// # Errors
+/// It cannot be opened or asked: which says nothing of its state.
+fn state(path: &Path) -> io::Result<Option<PlaceholderInfo>> {
+    asked(path)?.info().map_err(io::Error::other)
+}
+
 /// Whether a file is a placeholder in sync: one serving made and nothing changed since.
 #[must_use]
 pub fn in_sync(path: &Path) -> bool {
-    let state = Placeholder::open(path).ok().and_then(|p| p.info().ok().flatten());
-    state.as_ref().is_some_and(cloud_filter::placeholder::PlaceholderInfo::is_in_sync)
+    state(path).ok().flatten().is_some_and(|state| state.is_in_sync())
 }
 
+/// Mark what is on disk in sync with the project: a placeholder updated, anything else made one.
 fn mark_in_sync(path: &Path, placeholder: bool, folder: bool) -> io::Result<()> {
     let mut opened = writable(path, folder)?;
     if placeholder {
@@ -300,48 +375,63 @@ impl Worker {
     fn run(&self, stop: &AtomicBool) {
         let mut last = self.served.tree();
         // What was left of an earlier serving, brought in step: the tree may have changed while nothing served it.
-        Self::sync(&last, &self.root, "");
+        self.sync(&last, &self.root, "");
         while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(250));
-            self.settle();
+            // Woken sooner by what stops it.
+            std::thread::park_timeout(Duration::from_millis(250));
+            self.settle(false);
             let now = self.served.tree();
             if !Arc::ptr_eq(&last, &now) {
-                Self::sync(&now, &self.root, "");
+                self.sync(&now, &self.root, "");
                 last = now;
             }
         }
+        // As serving ends, what a program did a moment before is the project's too.
+        self.settle(true);
     }
 
-    /// Apply what has settled: removals first - what is in a folder removed going with it - then changed files.
-    fn settle(&self) {
-        let due = |at: &Instant| at.elapsed() >= SETTLE;
-        let (removed, changed) = {
+    /// Apply what has settled - or `all` that waits, settled or not: removals first - what is in a folder removed
+    /// going with it - then changed files.
+    fn settle(&self, all: bool) {
+        let due = |at: &Instant| all || at.elapsed() >= SETTLE;
+        let (mut removed, changed, waiting) = {
             let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let removed: Vec<String> =
                 pending.removed.iter().filter(|(_, at)| due(at)).map(|(p, _)| p.clone()).collect();
             let changed: Vec<PathBuf> =
                 pending.changed.iter().filter(|(_, at)| due(at)).map(|(p, _)| p.clone()).collect();
-            let all = pending.removed.keys().cloned().collect::<Vec<_>>();
             for path in &removed {
                 pending.removed.remove(path);
             }
             for path in &changed {
                 pending.changed.remove(path);
             }
-            // A removal inside one still waiting goes with it.
-            let covered = |path: &str| all.iter().any(|other| path.starts_with(&format!("{other}/")));
-            (removed.into_iter().filter(|p| !covered(p)).collect::<Vec<_>>(), changed)
+            (removed, changed, pending.removed.keys().cloned().collect::<Vec<_>>())
         };
         let Some(owner) = &self.owner else { return };
-        for path in removed {
-            if self.served.tree().at(&path).is_some()
-                && let Err(why) = owner.change(Change::Remove { path })
-            {
+        // What changed and is no longer there was removed. Windows tells of the removal of a placeholder alone
+        // (`deleted`): what a program made a moment ago, and the project was given before it was one, goes without.
+        let (gone, mut changed): (Vec<PathBuf>, Vec<PathBuf>) =
+            changed.into_iter().partition(|path| std::fs::symlink_metadata(path).is_err());
+        removed.extend(gone.iter().filter_map(|path| rel(&self.root, path)).filter(|path| !path.is_empty()));
+        removed.sort();
+        removed.dedup();
+        // A removal inside one made with it, or still waiting, goes with that one.
+        let inside = |path: &str, other: &String| path.starts_with(&format!("{other}/"));
+        let covered = |path: &str| removed.iter().chain(&waiting).any(|other| inside(path, other));
+        let tree = self.served.tree();
+        let asked: Vec<Change> = removed
+            .iter()
+            .filter(|path| !covered(path) && tree.at(path).is_some())
+            .map(|path| Change::Remove { path: path.clone() })
+            .collect();
+        if !asked.is_empty() {
+            // Removed from the project together.
+            for why in owner.changes(asked).into_iter().filter_map(Result::err) {
                 eprintln!("{why}");
             }
         }
         // Declarations first; a file beside a new one waits for the tree to show its folder a node, so it is its file.
-        let mut changed = changed;
         changed.sort_by_key(|p| p.file_name().is_none_or(|n| n != project::index::NODE_FILE));
         for path in changed {
             if self.waits_for_its_node(&path) {
@@ -374,9 +464,13 @@ impl Worker {
     fn take_in(&self, owner: &dyn Owner, path: &Path) -> io::Result<()> {
         let Some(tree_path) = rel(&self.root, path).filter(|p| !p.is_empty() && !is_junk(p)) else { return Ok(()) };
         let Ok(meta) = std::fs::metadata(path) else { return Ok(()) };
-        // Any file opens as one; only a placeholder has a placeholder's state.
-        let state = Placeholder::open(path).ok().and_then(|p| p.info().ok().flatten());
-        if state.as_ref().is_some_and(cloud_filter::placeholder::PlaceholderInfo::is_in_sync) {
+        // Only a placeholder has a placeholder's state. Where it cannot be asked, nothing is known of the file - it
+        // is not taken for changed, which would read it whole and write it to the project: asked again shortly.
+        let Ok(state) = state(path) else {
+            self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).changed.insert(path.into(), Instant::now());
+            return Ok(());
+        };
+        if state.as_ref().is_some_and(PlaceholderInfo::is_in_sync) {
             return Ok(());
         }
         let change = if meta.is_dir() {
@@ -398,7 +492,8 @@ impl Worker {
     /// read again; one no longer in the tree removed; a folder recursed into, and given placeholders of the nodes new
     /// in it where Windows filled it already (one it has not is filled when read, as the tree is then). What changed
     /// here, and is not applied yet, is left as it is.
-    fn sync(tree: &Tree, dir: &Path, at: &str) {
+    fn sync(&self, tree: &Tree, dir: &Path, at: &str) {
+        let read_only = self.owner.is_none();
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let mut here: Vec<String> = Vec::new();
         for entry in entries.flatten() {
@@ -406,8 +501,7 @@ impl Worker {
             let path_in_tree = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
             let path = entry.path();
             here.push(name);
-            let in_sync =
-                Placeholder::open(&path).ok().and_then(|p| p.info().ok().flatten()).is_some_and(|i| i.is_in_sync());
+            let in_sync = in_sync(&path);
             let Some((_, node)) = tree.at(&path_in_tree) else {
                 if in_sync {
                     let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
@@ -415,27 +509,155 @@ impl Worker {
                 continue;
             };
             if matches!(node.what, What::Folder(_)) {
-                Self::sync(tree, &path, &path_in_tree);
+                self.sync(tree, &path, &path_in_tree);
                 continue;
             }
             let stale = std::fs::metadata(&path).is_ok_and(|m| m.len() != node.size);
             if in_sync && stale {
-                let options = UpdateOptions::default().metadata(metadata(node)).dehydrate().mark_in_sync();
+                let options =
+                    UpdateOptions::default().metadata(metadata(node, read_only)).dehydrate().mark_in_sync();
                 if let Ok(mut placeholder) = writable(&path, false) {
                     let _ = placeholder.update(options, None);
                 }
             }
         }
         // A folder filled shows what is new in it - filled empty too: a project's top, served before it held anything.
-        let state = Placeholder::open(dir).ok().and_then(|p| p.state().ok().flatten());
+        let state = asked(dir).ok().and_then(|folder| folder.state().ok().flatten());
         let filled = state.map_or(!here.is_empty(), |state| !state.partial());
         if let Some((_, Node { what: What::Folder(children), .. })) = tree.at(at)
             && filled
         {
             for (name, ino) in children.iter().filter(|(name, _)| !here.contains(name)) {
                 let Some(node) = tree.node(*ino) else { continue };
-                let _ = placeholder(name, node).create(dir);
+                let _ = placeholder(name, node, read_only).create(dir);
             }
         }
+    }
+}
+
+/// The Cloud Files API as a backend: the tree as placeholders at a folder of an NTFS volume, registered as a sync
+/// root, written through where it has an owner.
+struct AsBackend;
+
+/// The Cloud Files API, among Windows' backends.
+pub const BACKEND: &dyn crate::backend::Backend = &AsBackend;
+
+impl crate::backend::Backend for AsBackend {
+    fn name(&self) -> &'static str {
+        "cloud"
+    }
+
+    fn label(&self) -> &'static str {
+        "Cloud Files"
+    }
+
+    fn can(&self) -> crate::backend::Can {
+        crate::backend::Can { write: true, folder: true }
+    }
+
+    fn keeps(&self) -> bool {
+        true
+    }
+
+    fn prepares(&self) -> bool {
+        true
+    }
+
+    fn available(&self, at: &Path) -> Result<(), String> {
+        match crate::backend::volume_filesystem(at) {
+            Some(filesystem) if !filesystem.eq_ignore_ascii_case("NTFS") => {
+                Err(format!("the Cloud Files API serves on NTFS volumes, and this one is {filesystem}"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
+        let read_only = job.owner.is_none();
+        let cloud = serve(job.served, job.owner.clone(), job.at, job.staging, job.name)?;
+        Ok(Box::new(Kept { _cloud: cloud, root: plain(job.at), read_only }))
+    }
+
+    fn clear(&self, at: &Path, name: &str) {
+        // Unregistered first, or Windows keeps what was not read of it from being removed.
+        let _ = forget(at, name);
+        let _ = std::fs::remove_dir_all(at);
+    }
+
+    fn retire(&self, at: &Path, name: &str) {
+        // Told apart while Windows still knows the folder as a sync root - what is in sync is what it left, and can be
+        // read again; anything else was put or changed there - then no longer one, which takes with it the placeholders
+        // never read. Each file is opened to be asked: some seconds for a project listed whole, once, as another
+        // backend takes over.
+        let mut left = Vec::new();
+        placeholders_in_sync(at, &mut left);
+        let _ = forget(at, name);
+        for path in left.iter().rev() {
+            // Deepest first: a folder goes once what it held has, and stays where something was kept in it.
+            let _ = if path.is_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
+        }
+    }
+
+    fn collect(&self, at: &Path, record: &crate::access::Access, budget: u64) {
+        let root = plain(at);
+        let mut kept = record.kept_in_all();
+        for (path, bytes) in record.oldest() {
+            if kept <= budget {
+                break;
+            }
+            let file = root.join(&path);
+            // Only what is as serving left it: what was changed there is someone's work, and stays.
+            if in_sync(&file) {
+                let let_go = writable(&file, false).is_ok_and(|mut placeholder| {
+                    placeholder.update(UpdateOptions::default().dehydrate().mark_in_sync(), None).is_ok()
+                });
+                // In use, or refused: still kept, and asked again the next time.
+                if !let_go {
+                    continue;
+                }
+            }
+            // Let go of, changed since or gone: none of it counts as kept any more.
+            record.dropped(&path);
+            kept = kept.saturating_sub(bytes);
+        }
+    }
+
+    fn forget(&self, at: &Path, name: &str) -> io::Result<()> {
+        forget(at, name)
+    }
+
+    fn left_as_served(&self, file: &Path) -> bool {
+        in_sync(file)
+    }
+}
+
+/// What a folder holds that serving left there as it was - the files that are placeholders in sync - and every folder
+/// in it, each before what is in it: a folder holds nothing of its own, and goes where nothing is kept in it.
+fn placeholders_in_sync(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.push(path.clone());
+            placeholders_in_sync(&path, found);
+        } else if in_sync(&path) {
+            found.push(path);
+        }
+    }
+}
+
+/// A folder served through the Cloud Files API, as a mount.
+struct Kept {
+    _cloud: Cloud,
+    root: PathBuf,
+    read_only: bool,
+}
+
+impl crate::backend::Mount for Kept {
+    fn shown(&self) -> String {
+        project::host::shown(&self.root)
+    }
+
+    fn placed(&self, served: &Served, path: &str) {
+        place(served, &self.root, path, self.read_only);
     }
 }

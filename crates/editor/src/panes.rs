@@ -2376,6 +2376,95 @@ impl SettingsPage {
 
 /// The editor's settings (global, per user) and the open project's (its `project.toml`): categories on the left, the
 /// chosen one's form on the right.
+/// What serves projects as filesystems on this machine: the project's folder, and the files programs are given - each
+/// the best suited, a backend that can do it (one not available here said why), or nothing.
+fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, project: Option<&std::path::Path>) {
+    use vfs::backend::{Can, Setting, all, choose};
+    // Whether a backend is available is asked of a folder: the project's, or any where none is open.
+    let anywhere = std::env::temp_dir();
+    let at = project.unwrap_or(&anywhere);
+    let row = |ui: &mut egui::Ui, label: &str, says: &mut Option<String>, needs: Can, nothing: &str| {
+        ui.label(label);
+        // The project's folder is worked in; what programs are given is, mostly, a build's sources: read once.
+        let how = if needs.write { project::content::Use::general() } else { project::content::Use::once() };
+        let best = choose(&Setting::Auto, needs, at, &how, false).ok().flatten();
+        let auto = if needs.write {
+            format!("Best suited ({})", best.map_or("nothing here", |b| b.label()))
+        } else {
+            format!("Best suited (copies of what is small, else {})", best.map_or("copies", |b| b.label()))
+        };
+        let named = |name: &str| all().iter().find(|b| b.name() == name).map_or(name, |b| b.label()).to_string();
+        let (shown, refused) = match says.as_deref() {
+            None | Some("auto") => (auto.clone(), None),
+            Some("none") => (nothing.to_string(), None),
+            Some(name) => (named(name), choose(&Setting::Named(name.to_string()), needs, at, &how, false).err()),
+        };
+        let warn = ui.visuals().warn_fg_color;
+        let shown = if refused.is_some() { RichText::new(shown).color(warn) } else { RichText::new(shown) };
+        let combo = egui::ComboBox::from_id_salt(("served by", label)).selected_text(shown).width(250.0);
+        let chosen = combo.show_ui(ui, |ui| {
+            if ui.selectable_label(matches!(says.as_deref(), None | Some("auto")), &auto).clicked() {
+                *says = None;
+            }
+            for backend in all().iter().filter(|b| b.can().does(needs)) {
+                let is = says.as_deref() == Some(backend.name());
+                let offered = egui::Button::selectable(is, backend.label());
+                match backend.available(at) {
+                    Ok(()) => {
+                        if ui.add(offered).clicked() {
+                            *says = Some(backend.name().to_string());
+                        }
+                    }
+                    Err(why) => {
+                        ui.add_enabled(false, offered).on_disabled_hover_text(format!("Not available here: {why}"));
+                    }
+                }
+            }
+            if ui.selectable_label(says.as_deref() == Some("none"), nothing).clicked() {
+                *says = Some("none".to_string());
+            }
+        });
+        if let Some(why) = refused {
+            chosen.response.on_hover_text(why);
+        }
+        ui.end_row();
+    };
+    // A budget of bytes, written as `16 MiB`: empty is the default, said beside it; what is no size is said so.
+    let budget = |ui: &mut egui::Ui, label: &str, says: &mut Option<String>, default: u64| {
+        ui.label(label);
+        ui.horizontal(|ui| {
+            let mut text = says.clone().unwrap_or_default();
+            let hint = if default >= 1 << 30 { format!("{} GiB", default >> 30) } else { format!("{} MiB", default >> 20) };
+            let edited = ui.add(egui::TextEdit::singleline(&mut text).hint_text(hint).desired_width(90.0));
+            if edited.changed() {
+                *says = Some(text.trim().to_string()).filter(|text| !text.is_empty());
+            }
+            if says.as_deref().is_some_and(|text| vfs::access::bytes(text).is_none()) {
+                ui.label(RichText::new("a size, as 16 MiB or 2 GiB").small().color(ui.visuals().warn_fg_color));
+            }
+        });
+        ui.end_row();
+    };
+    theme::section(ui, "Projects as filesystems", |ui| {
+        egui::Grid::new("served by").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+            row(ui, "A project's folder", &mut says.serve, Can::WRITTEN, "Nothing");
+            row(ui, "Files given to programs", &mut says.scopes, Can::BY_PATH, "Nothing: copies");
+            budget(ui, "Copies written up to", &mut says.copies, vfs::backend::COPIES);
+            budget(ui, "Kept of a folder up to", &mut says.kept, vfs::backend::KEPT);
+        });
+        ui.label(
+            RichText::new(
+                "A program is given copies of what writes little to lay out, and is served the rest where it is. A \
+                 backend that keeps what is read lets go of what was read longest ago beyond what it may keep. A \
+                 project says otherwise in its project.local.toml ([filesystem]); a change holds from when a \
+                 project is next served.",
+            )
+            .small()
+            .color(theme::weak()),
+        );
+    });
+}
+
 fn settings_ui(
     ui: &mut egui::Ui,
     settings: &mut EditorSettings,
@@ -2417,8 +2506,10 @@ fn settings_ui(
                         });
                     }
                     (SettingsPage::Tools, _) => tools_ui(ui, &mut settings.tools),
-                    (SettingsPage::Files, _) => {
+                    (SettingsPage::Files, ws) => {
                         use crate::settings::TakeIn;
+                        let at = ws.map(|ws| ws.project.filesystem.at.clone());
+                        served_by_ui(ui, &mut settings.filesystem, at.as_deref());
                         theme::section(ui, "Changes other programs make", |ui| {
                             let take_in = &mut settings.changes.take_in;
                             ui.radio_value(take_in, TakeIn::OnFocus, "Take them in when the editor regains focus");

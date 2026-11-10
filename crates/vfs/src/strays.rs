@@ -1,47 +1,39 @@
 //! What the folder a project is served at holds that is not the project's, before it is served there: files written in
-//! it while nothing served it - a program left open on it after the host stopped, a file put there by hand - and, on
-//! Windows, a file read on an earlier run and changed while nothing served it (a placeholder no longer in sync). A mount
-//! would hide them, and Windows' placeholders would serve them beside the project's, or in place of them: so the host
-//! does not serve over them, unless told to set them aside (`set_aside`) or take them in as edits (`take_in`).
+//! it while nothing served it - a program left open on it after the host stopped, a file put there by hand - and, where
+//! the backend keeps what was read on disk, a file read on an earlier run and changed while nothing served it (a
+//! placeholder no longer in sync). A mount would hide them, and placeholders would serve them beside the project's, or
+//! in place of them: so the host does not serve over them, unless told to set them aside (`set_aside`) or take them in
+//! as edits (`take_in`).
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::backend::Backend;
 use crate::write::{Change, Owner, is_junk, refused};
 
-/// What the folder at `at` holds that is not the project's: its files, by their path in it, `/`-separated. Folders are
-/// none: a folder holds nothing of its own.
+/// What the folder at `at` holds that is not the project's, before a backend serves it there: its files, by their path
+/// in it, `/`-separated, but those the backend left there as it served them. Folders are none: a folder holds nothing
+/// of its own.
 #[must_use]
-pub fn strays(at: &Path) -> Vec<String> {
+pub fn strays(at: &Path, backend: &dyn Backend) -> Vec<String> {
     let mut found = Vec::new();
-    walk(at, "", &mut found);
+    walk(at, "", backend, &mut found);
     found.sort();
     found
 }
 
-fn walk(dir: &Path, at: &str, found: &mut Vec<String>) {
+fn walk(dir: &Path, at: &str, backend: &dyn Backend, found: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = if at.is_empty() { name } else { format!("{at}/{name}") };
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() {
-            walk(&entry.path(), &path, found);
-        } else if !served_before(&entry.path()) {
+            walk(&entry.path(), &path, backend, found);
+        } else if !backend.left_as_served(&entry.path()) {
             found.push(path);
         }
     }
-}
-
-/// Whether a file is what serving put there and left as it was: a placeholder in sync (Windows).
-#[cfg(windows)]
-fn served_before(path: &Path) -> bool {
-    crate::cloud::in_sync(path)
-}
-
-#[cfg(not(windows))]
-fn served_before(_path: &Path) -> bool {
-    false
 }
 
 /// Move what is not the project's out of the folder at `at`, keeping its paths, into `to`; folders left empty go.
@@ -121,11 +113,12 @@ mod tests {
         std::fs::create_dir_all(at.join("empty")).unwrap();
         std::fs::write(at.join("stray.txt"), "s").unwrap();
         std::fs::write(at.join("notes/deep/c.md"), "c").unwrap();
-        let found = strays(&at);
+        let backend = crate::dav::BACKEND;
+        let found = strays(&at, backend);
         assert_eq!(found, ["notes/deep/c.md", "stray.txt"]);
         set_aside(&at, &found, &aside).unwrap();
         assert_eq!(std::fs::read_to_string(aside.join("notes/deep/c.md")).unwrap(), "c");
-        assert_eq!(strays(&at), Vec::<String>::new());
+        assert_eq!(strays(&at, backend), Vec::<String>::new());
         assert!(!at.join("notes").exists(), "a folder emptied goes");
         assert!(at.join("empty").exists(), "one that was empty is no stray's");
         std::fs::remove_dir_all(&root).unwrap();

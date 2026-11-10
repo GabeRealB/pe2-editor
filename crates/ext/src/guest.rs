@@ -250,6 +250,12 @@ impl Source for Lent<'_> {
     fn path_of(&self, name: &str) -> Option<String> {
         self.resource().path_of(name)
     }
+
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<crate::Result<String>> {
+        let files: Vec<types::File> = files.iter().cloned().map(file_to_wit).collect();
+        let how = types::ServeUse { often: how.often, ranges: how.ranges };
+        Some(self.resource().serve(&files, how).map_err(crate::Error::msg))
+    }
 }
 
 /// A file being made through the host's writer: appended to there, finished into the file the host made.
@@ -1265,6 +1271,10 @@ impl CallHost for NodeHost<'_> {
             Content::Inline(_) => None,
             Content::Stored { sha1, .. } => Source::path_of(self.0, sha1),
         }
+    }
+
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> crate::Result<String> {
+        Source::serve(self.0, files, how).ok_or_else(|| crate::anyhow!("the host serves no folders for this call"))?
     }
 }
 

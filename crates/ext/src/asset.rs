@@ -79,6 +79,10 @@ pub trait Source {
         let _ = name;
         None
     }
+    fn serve(&self, files: &[crate::File], how: &crate::Use) -> Option<Result<String>> {
+        let _ = (files, how);
+        None
+    }
 }
 
 /// An asset, lent for one call: what an extension keeps of it, it copies. Its type is a qualified name

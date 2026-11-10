@@ -123,6 +123,13 @@ interface types {
         content: content,
     }
 
+    /// How files served to a program will be used, as far as whoever asks knows: each read often rather than once,
+    /// in ranges rather than whole.
+    record serve-use {
+        often: bool,
+        ranges: bool,
+    }
+
     /// Audio: interleaved 16-bit samples.
     record pcm {
         rate: u32,
@@ -201,7 +208,7 @@ interface host {
         properties: string,
     }
 
-    use types.{image, rect, style, icon, file, value};
+    use types.{image, rect, style, icon, file, serve-use, value};
 
     /// An asset, lent for a call: one the host passes, or one a query of the project returns.
     resource asset {
@@ -227,6 +234,11 @@ interface host {
         keep: func(path: string, name: string) -> result<file, string>;
         /// For an unsandboxed extension's operation: where a content is on disk, to point a program at it.
         path-of: func(name: string) -> option<string>;
+        /// For an unsandboxed extension's operation: a read-only folder holding these files by their names (a name's
+        /// folders made), for a program to read, until the operation's run is done; its path. Each is served where its
+        /// content is, nothing written where the host has a filesystem to serve it with - chosen by how they will be
+        /// used.
+        serve: func(files: list<file>, how: serve-use) -> result<string, string>;
         /// For an operation's run: the plain files under a folder of the project, each by its path, as the stack resolves it. What is
         /// made is made again when the list changes.
         entries: func(folder: string) -> result<list<string>, string>;
