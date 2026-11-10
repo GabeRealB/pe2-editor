@@ -554,16 +554,37 @@ fn listen(
     .map_err(|e| format!("agents cannot reach the editor: {e}"))
 }
 
-/// What a project being left has yet to finish. Dropped in this order: what writes first, the lock on all it writes last.
+/// What a project being left has yet to finish. Let go of in this order: what writes first, the lock on all it writes
+/// last - and only then what merely takes time: the index's memory, which nobody waits for.
 pub struct Leaving {
-    _takein: crate::takein::TakeIn,
-    _runner: crate::runner::Runner,
-    _index: Arc<Index>,
-    _lock: Lock,
+    takein: Option<crate::takein::TakeIn>,
+    runner: Option<crate::runner::Runner>,
+    index: Option<Arc<Index>>,
+    lock: Option<Lock>,
     /// The server kept: let go of once the project is, for whoever holds it next to feed.
-    _files: Option<crate::files::Files>,
+    files: Option<crate::files::Files>,
     /// The host standing by, told: it takes the project the moment this goes, after the lock.
-    _handing: Option<project::host::Lease>,
+    handing: Option<project::host::Lease>,
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        // What may still write: the worker finishes the job it is on, an epoch running is given up.
+        self.takein = None;
+        self.runner = None;
+        // The index writes through its store alone: closed, the project is whoever takes it next's, while the index
+        // itself is freed after - some tenths of a second for a large project, which a host standing by would wait.
+        // Where something else still has the index, it goes first, as it did.
+        let mut index = self.index.take();
+        match index.as_mut().and_then(Arc::get_mut) {
+            Some(index) => index.let_go_of_store(),
+            None => index = None,
+        }
+        self.lock = None;
+        self.files = None;
+        self.handing = None;
+        drop(index);
+    }
 }
 
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
@@ -968,12 +989,12 @@ impl Workspace {
             self.history.close();
         }
         Leaving {
-            _takein: self.takein,
-            _runner: self.runner,
-            _index: self.index,
-            _lock: self.lock,
-            _files: self.files,
-            _handing: self.handing,
+            takein: Some(self.takein),
+            runner: Some(self.runner),
+            index: Some(self.index),
+            lock: Some(self.lock),
+            files: self.files,
+            handing: self.handing,
         }
     }
 
