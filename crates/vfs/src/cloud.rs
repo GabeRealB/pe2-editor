@@ -172,6 +172,22 @@ struct Pending {
     removed: HashMap<String, Instant>,
 }
 
+/// Remove what serving left at a path the tree no longer has: a file in sync, a folder's files in sync and the
+/// folder once it is empty. What a program put there since - in no state, or changed - stays, a stray of its own.
+fn remove_in_sync(path: &Path) {
+    if !path.is_dir() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        let inner = entry.path();
+        if inner.is_dir() || in_sync(&inner) {
+            remove_in_sync(&inner);
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
+
 /// A path of the tree for a path in the folder: its steps joined by `/`.
 fn rel(root: &Path, path: &Path) -> Option<String> {
     let inside = path.strip_prefix(root).ok()?;
@@ -488,6 +504,15 @@ impl Worker {
         mark_in_sync(path, state.is_some(), meta.is_dir())
     }
 
+    /// Whether something changed here at a path - or in it, or above it - that the project has yet to be told: a
+    /// file written or renamed, a removal waiting to settle.
+    fn waits(&self, path: &Path, path_in_tree: &str) -> bool {
+        let pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let within = |inner: &str, outer: &str| inner == outer || inner.starts_with(&format!("{outer}/"));
+        pending.changed.keys().any(|changed| changed.starts_with(path) || path.starts_with(changed))
+            || pending.removed.keys().any(|removed| within(path_in_tree, removed) || within(removed, path_in_tree))
+    }
+
     /// Bring what is on disk under a folder in step with the tree: a file in sync whose node changed emptied, to be
     /// read again; one no longer in the tree removed; a folder recursed into, and given placeholders of the nodes new
     /// in it where Windows filled it already (one it has not is filled when read, as the tree is then). What changed
@@ -503,8 +528,11 @@ impl Worker {
             here.push(name);
             let in_sync = in_sync(&path);
             let Some((_, node)) = tree.at(&path_in_tree) else {
-                if in_sync {
-                    let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                // What the tree no longer has goes - but not what a program changed here a moment ago and the
+                // project has yet to be told: renamed, a file or a folder keeps the state it had, and the tree has
+                // it under its new name only once the renaming is applied.
+                if in_sync && !self.waits(&path, &path_in_tree) {
+                    remove_in_sync(&path);
                 }
                 continue;
             };
@@ -529,6 +557,12 @@ impl Worker {
         {
             for (name, ino) in children.iter().filter(|(name, _)| !here.contains(name)) {
                 let Some(node) = tree.node(*ino) else { continue };
+                // What a program removed or renamed away here a moment ago is not put back: the tree has it until
+                // the project is told.
+                let path_in_tree = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
+                if self.waits(&dir.join(name), &path_in_tree) {
+                    continue;
+                }
                 let _ = placeholder(name, node, read_only).create(dir);
             }
         }
