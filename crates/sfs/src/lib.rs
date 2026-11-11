@@ -20,6 +20,7 @@
 //! It knows nothing of what a project is: it is given a folder to keep its state in.
 
 pub mod content;
+pub mod fs;
 pub mod header;
 pub mod log;
 pub mod ops;

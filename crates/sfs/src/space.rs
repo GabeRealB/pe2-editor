@@ -47,7 +47,7 @@ const CHUNK: usize = 1024 * PAGE;
 /// The most chunks a space maps: 16 GiB.
 const CHUNKS: usize = 4096;
 /// How many trees a space has roots for.
-pub const ROOTS: usize = 8;
+pub const ROOTS: usize = 16;
 /// How many processes have one space attached at a time.
 const READERS: usize = 64;
 /// How long the list of free pages is, in bytes: a count, then a page's number and the generation that freed it for
