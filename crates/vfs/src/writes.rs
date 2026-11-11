@@ -1460,91 +1460,220 @@ mod tests {
     use super::Writes;
     use crate::Served;
     use crate::write::{Change, Owner, Refusal};
-    use project::content::Given;
-    use std::collections::BTreeMap;
+    use project::server::{Delta, Listing, Shown as Listed, Source};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// A project of files held in memory, which takes its time to be given one: it says when it starts to, and goes on
-    /// when told.
-    struct Slow {
-        served: Served,
-        files: Mutex<BTreeMap<String, Given>>,
-        started: Mutex<Sender<()>>,
-        go_on: Mutex<Receiver<()>>,
-        changes: Mutex<Vec<String>>,
+    /// How the stand-in for whoever holds a project takes what it is given.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Takes {
+        All,
+        /// Nobody takes anything now: a tool has the project.
+        Nothing,
+        /// Nothing is taken, ever.
+        Never,
+        /// What is asked in an order - folders, renames, removals - and nothing written yet.
+        Ordered,
     }
 
-    impl Owner for Slow {
-        fn change(&self, change: Change) -> Result<(), Refusal> {
-            match &change {
-                Change::Write { path, staged } => {
-                    let _ = self.started.lock().unwrap().send(());
-                    let _ = self.go_on.lock().unwrap().recv();
-                    let bytes = staged.read().map_err(|e| Refusal::Never(e.to_string()))?;
-                    let mut files = self.files.lock().unwrap();
-                    files.insert(path.clone(), Given::Bytes(Arc::from(bytes)));
-                    self.served.set_files(&files);
-                }
-                Change::Remove { path } => {
-                    let mut files = self.files.lock().unwrap();
-                    files.remove(path);
-                    self.served.set_files(&files);
-                }
-                _ => {}
-            }
-            self.changes.lock().unwrap().push(change.label());
-            Ok(())
+    /// A project of files, held as whoever holds one does: what it takes of what programs did it makes its own,
+    /// and says in a shared space of the test's own - which the tree served is a view of - before it answers.
+    struct Holder {
+        space: Arc<sfs::Space>,
+        served: Served,
+        /// Where its files' content is.
+        files: PathBuf,
+        listing: Mutex<Listing>,
+        takes: Mutex<Takes>,
+        /// Where it says that it starts to take a written file, and waits to be told to go on.
+        gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+        /// What it took, as it was given together; and what was left with it as serving ended.
+        batches: Mutex<Vec<Vec<String>>>,
+        left: Mutex<Vec<String>>,
+        made: AtomicU64,
+    }
+
+    fn above(listing: &mut Listing, path: &str) {
+        for (at, _) in path.match_indices('/') {
+            listing.entry(path[..at].to_string()).or_insert(Listed::Folder);
         }
     }
 
-    /// A project that only says what it was given, and how many at a time.
-    #[derive(Default)]
-    struct Told {
-        batches: Mutex<Vec<Vec<String>>>,
+    impl Holder {
+        /// A project of these files, each with its text, over the folder `dir` a test keeps its writes in.
+        fn new(dir: &Path, files: &[(&str, &str)], takes: Takes) -> Arc<Holder> {
+            let at = PathBuf::from(format!("{}-files", dir.display()));
+            let _ = std::fs::remove_dir_all(&at);
+            std::fs::create_dir_all(&at).unwrap();
+            let space = Arc::new(sfs::Space::private().unwrap());
+            let holder = Holder {
+                served: Served::shared(space.clone(), None),
+                space,
+                files: at,
+                listing: Mutex::default(),
+                takes: Mutex::new(takes),
+                gate: Mutex::default(),
+                batches: Mutex::default(),
+                left: Mutex::default(),
+                made: AtomicU64::new(0),
+            };
+            {
+                let mut listing = holder.listing.lock().unwrap();
+                for (path, text) in files {
+                    above(&mut listing, path);
+                    listing.insert((*path).to_string(), holder.file(text.as_bytes()));
+                }
+                project::shared::say_whole(&holder.space, &listing).unwrap();
+            }
+            Arc::new(holder)
+        }
+
+        /// As `new`, taking a written file only once told to go on: it says when it starts to.
+        fn gated(dir: &Path, files: &[(&str, &str)]) -> (Arc<Holder>, Receiver<()>, Sender<()>) {
+            let holder = Holder::new(dir, files, Takes::All);
+            let (started, starts) = channel();
+            let (goes_on, go_on) = channel();
+            *holder.gate.lock().unwrap() = Some((started, go_on));
+            (holder, starts, goes_on)
+        }
+
+        fn file(&self, bytes: &[u8]) -> Listed {
+            let disk = self.files.join(self.made.fetch_add(1, Ordering::Relaxed).to_string());
+            std::fs::write(&disk, bytes).unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+            let modified = (now.as_secs(), now.subsec_nanos());
+            Listed::File { disk, size: bytes.len() as u64, modified, of_files: false, source: Source::Disk }
+        }
+
+        fn take(&self, takes: Takes) {
+            *self.takes.lock().unwrap() = takes;
+        }
+
+        /// What it took so far, in the order it did.
+        fn given(&self) -> Vec<String> {
+            self.batches.lock().unwrap().iter().flatten().cloned().collect()
+        }
+
+        fn has(&self, path: &str) -> bool {
+            self.listing.lock().unwrap().contains_key(path)
+        }
+
+        fn made_of(&self, listing: &mut Listing, change: &Change) -> Result<(), Refusal> {
+            let under = |listing: &Listing, path: &str| -> Vec<String> {
+                let inside = format!("{path}/");
+                listing.keys().filter(|at| *at == path || at.starts_with(&inside)).cloned().collect()
+            };
+            let none = |path: &str| Refusal::Never(format!("{path}: nothing is there"));
+            match change {
+                Change::Write { path, staged } => {
+                    let bytes = staged.read().map_err(|e| Refusal::Never(e.to_string()))?;
+                    above(listing, path);
+                    listing.insert(path.clone(), self.file(&bytes));
+                }
+                Change::Folder { path } => {
+                    if listing.contains_key(path) {
+                        return Err(Refusal::Never(format!("{path} is there already")));
+                    }
+                    above(listing, path);
+                    listing.insert(path.clone(), Listed::Folder);
+                }
+                Change::Remove { path } => {
+                    let gone = under(listing, path);
+                    if gone.is_empty() {
+                        return Err(none(path));
+                    }
+                    for path in gone {
+                        listing.remove(&path);
+                    }
+                }
+                Change::Rename { from, to } => {
+                    let moved = under(listing, from);
+                    if moved.is_empty() {
+                        return Err(none(from));
+                    }
+                    for path in under(listing, to) {
+                        listing.remove(&path);
+                    }
+                    above(listing, to);
+                    for path in moved {
+                        if let Some(it) = listing.remove(&path) {
+                            listing.insert(format!("{to}{}", &path[from.len()..]), it);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Take what programs did, as it takes things now: each made the project's, what is served said - where
+        /// the tree served reads it - and those that tell of the tree told, before any of it is answered.
+        fn taken(&self, changes: &[Change]) -> Vec<Result<(), Refusal>> {
+            let takes = *self.takes.lock().unwrap();
+            let all = |why: Refusal| changes.iter().map(|_| Err(why.clone())).collect();
+            match takes {
+                Takes::Nothing => return all(Refusal::Later("a tool has it".into())),
+                Takes::Never => return all(Refusal::Never("not here".into())),
+                Takes::All | Takes::Ordered => {}
+            }
+            let mut listing = self.listing.lock().unwrap();
+            let before = listing.clone();
+            let mut took = Vec::new();
+            let mut became = Vec::with_capacity(changes.len());
+            for change in changes {
+                if matches!(change, Change::Write { .. }) {
+                    if takes == Takes::Ordered {
+                        became.push(Err(Refusal::Later("not yet".into())));
+                        continue;
+                    }
+                    if let Some((started, go_on)) = &*self.gate.lock().unwrap() {
+                        let _ = started.send(());
+                        let _ = go_on.recv();
+                    }
+                }
+                let made = self.made_of(&mut listing, change);
+                if made.is_ok() {
+                    took.push(change.label());
+                }
+                became.push(made);
+            }
+            let delta = Delta::between(&before, &listing);
+            if !delta.is_empty() {
+                project::shared::say(&self.space, &delta).unwrap();
+                self.served.told(crate::Changes::of(&before, &delta, &listing));
+            }
+            self.batches.lock().unwrap().push(took);
+            became
+        }
     }
 
-    impl Owner for Told {
+    impl Owner for Holder {
         fn change(&self, change: Change) -> Result<(), Refusal> {
-            self.batches.lock().unwrap().push(vec![change.label()]);
-            Ok(())
+            self.taken(std::slice::from_ref(&change)).pop().unwrap_or(Ok(()))
         }
 
         fn changes(&self, changes: Vec<Change>) -> Vec<Result<(), Refusal>> {
-            self.batches.lock().unwrap().push(changes.iter().map(Change::label).collect());
-            changes.iter().map(|_| Ok(())).collect()
-        }
-    }
-
-    /// A project nobody takes changes for until it is `open`: what it was given then, and what was left with it.
-    #[derive(Default)]
-    struct Busy {
-        open: std::sync::atomic::AtomicBool,
-        given: Mutex<Vec<String>>,
-        left: Mutex<Vec<String>>,
-    }
-
-    impl Owner for Busy {
-        fn change(&self, change: Change) -> Result<(), Refusal> {
-            if !self.open.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(Refusal::Later("a tool has it".into()));
-            }
-            self.given.lock().unwrap().push(change.label());
-            Ok(())
+            self.taken(&changes)
         }
 
-        fn left(&self, path: &str, _staged: &std::path::Path) {
+        fn left(&self, path: &str, _staged: &Path) {
             self.left.lock().unwrap().push(path.to_string());
         }
+    }
+
+    /// Done with a test's folders: its writes' and its project's files'.
+    fn done(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(format!("{}-files", dir.display()));
     }
 
     #[test]
     fn what_nobody_takes_yet_is_kept_and_given_once_someone_does() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-later-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &[], Takes::Nothing);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let handle = writes.create("kept.txt").unwrap();
         writes.write(handle, 0, b"x").unwrap();
@@ -1552,10 +1681,10 @@ mod tests {
         // Tried, and not taken: it is shown as written, and nothing was given.
         std::thread::sleep(Duration::from_millis(2500));
         assert!(writes.shown("kept.txt").is_some(), "shown as written while it waits");
-        assert!(owner.given.lock().unwrap().is_empty());
+        assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
         // Someone takes changes again: it is given without being written again.
-        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
-        let given = || !owner.given.lock().unwrap().is_empty();
+        owner.take(Takes::All);
+        let given = || !owner.given().is_empty();
         let asked = Instant::now();
         while !given() && asked.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(50));
@@ -1563,16 +1692,15 @@ mod tests {
         assert!(given(), "given once someone takes it");
         assert!(owner.left.lock().unwrap().is_empty());
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn the_log_is_let_go_of_behind_what_is_written_whatever_waits() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-log-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
         // Nobody takes anything: what is written waits, for as long as this runs.
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &[], Takes::Nothing);
+        let served = owner.served.clone();
         let log = sfs::log::Config { segment: 64 << 10, budget: 1 << 20 };
         let writes = Writes::with(&served, owner, &dir, log, super::Pace::default()).unwrap();
         let waits = writes.create("waits.txt").unwrap();
@@ -1592,7 +1720,7 @@ mod tests {
         let segments = std::fs::read_dir(dir.join("sfs").join("log")).unwrap().count();
         assert!(segments <= 8, "the log keeps what is read from, not all that was written: {segments} segments");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     /// How long the library itself takes for what programs do, with no backend before it.
@@ -1600,9 +1728,9 @@ mod tests {
     #[ignore = "a measurement"]
     fn bench_writes() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-bench-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let writes = Writes::new(&served, Arc::new(Told::default()), &dir).unwrap();
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
+        let writes = Writes::new(&served, owner, &dir).unwrap();
         let said = |what: &str, mut took: Vec<Duration>| {
             took.sort_unstable();
             let at = |part: usize| took[took.len() * part / 100].as_secs_f64() * 1e6;
@@ -1647,60 +1775,44 @@ mod tests {
         writes.close(handle, true).unwrap();
         said("a file removed", timed(&mut |n| writes.remove(&format!("new{n}.bin")).unwrap(), 2000));
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     /// New files given only long after they were last changed: for what is to happen before they are.
     const UNHURRIED: super::Pace = super::Pace { least: Duration::from_secs(20), most: Duration::from_secs(20) };
 
-    fn slow(served: &Served, files: BTreeMap<String, Given>) -> (Arc<Slow>, Receiver<()>, Sender<()>) {
-        let (started, starts) = channel();
-        let (goes_on, go_on) = channel();
-        let owner = Slow {
-            served: served.clone(),
-            files: Mutex::new(files),
-            started: Mutex::new(started),
-            go_on: Mutex::new(go_on),
-            changes: Mutex::default(),
-        };
-        (Arc::new(owner), starts, goes_on)
-    }
-
     #[test]
     fn a_save_returns_at_once_and_is_the_projects_a_moment_later() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-save-{}", std::process::id()));
-        let served = Served::default();
-        let files = BTreeMap::from([("saved.txt".to_string(), Given::Bytes(Arc::from(&b"before"[..])))]);
-        served.set_files(&files);
-        let (owner, starts, goes_on) = slow(&served, files);
+        let (owner, starts, goes_on) = Holder::gated(&dir, &[("saved.txt", "before")]);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let handle = writes.open("saved.txt", true).unwrap();
         writes.write(handle, 0, b"after").unwrap();
         // Let go of: it returns while the project has not taken it - which here waits to be told to go on.
         writes.close(handle, true).unwrap();
         starts.recv_timeout(Duration::from_secs(5)).expect("the project is being given the file, off this thread");
-        assert!(owner.changes.lock().unwrap().is_empty(), "not the project's yet");
+        assert!(owner.given().is_empty(), "not the project's yet");
         assert_eq!(writes.read("saved.txt", 0, 16).unwrap(), b"after", "read as written meanwhile");
         goes_on.send(()).unwrap();
         let asked = Instant::now();
-        let saved = || owner.changes.lock().unwrap().iter().any(|c| c == "Write saved.txt from outside");
+        let saved = || owner.given().iter().any(|c| c == "Write saved.txt from outside");
         while !saved() && asked.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(saved(), "the project's a moment later");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_new_file_is_the_projects_once_its_burst_of_changes_has_ended() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-burst-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
         let pace = super::Pace { least: Duration::from_millis(400), most: Duration::from_secs(2) };
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), pace).unwrap();
-        let given = || owner.batches.lock().unwrap().iter().flatten().count();
+        let given = || owner.given().len();
         // Written again and again, let go of in between: one burst, for as long as it goes on.
         for round in 0..25u64 {
             let handle = if round == 0 { writes.create("log.txt") } else { writes.open("log.txt", false) }.unwrap();
@@ -1716,16 +1828,15 @@ mod tests {
         }
         assert_eq!(given(), 1, "given once its burst has ended");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_folder_is_made_at_once_whoever_takes_it_when() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-mkdir-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
         // Nobody takes anything yet.
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &[], Takes::Nothing);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let asked = Instant::now();
         writes.make_folder("made").expect("made, whatever the project is doing");
@@ -1733,25 +1844,24 @@ mod tests {
         assert!(asked.elapsed() < Duration::from_secs(1), "without waiting for the project");
         assert!(writes.shown("made/inside").is_some_and(|shown| shown.folder), "shown at once");
         std::thread::sleep(Duration::from_millis(300));
-        assert!(owner.given.lock().unwrap().is_empty());
+        assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
         // Someone takes changes again: given in the order they were made.
-        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
-        let given = || owner.given.lock().unwrap().clone();
+        owner.take(Takes::All);
+        let given = || owner.given();
         let waited = Instant::now();
         while given().len() < 2 && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(given(), ["New made from outside", "New inside from outside"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn what_is_written_in_a_folder_goes_with_it_when_it_is_renamed() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-moved-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
         writes.make_folder("a").unwrap();
         let handle = writes.create("a/x.txt").unwrap();
@@ -1763,27 +1873,18 @@ mod tests {
         assert_eq!(writes.read("b/x.txt", 0, 4).unwrap(), b"x", "read where its folder is now");
         assert_eq!(writes.list("b").keys().collect::<Vec<_>>(), ["x.txt"]);
         writes.finish();
-        let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
+        let given = owner.given();
         assert_eq!(given, ["New a from outside", "Rename a to b from outside", "Write x.txt from outside"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A project that takes nothing, ever.
-    struct Refusing;
-
-    impl Owner for Refusing {
-        fn change(&self, _change: Change) -> Result<(), Refusal> {
-            Err(Refusal::Never("not here".into()))
-        }
+        done(&dir);
     }
 
     #[test]
     fn what_the_project_refuses_late_is_said_at_the_next_sync_or_close() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-late-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let writes = Writes::new(&served, Arc::new(Refusing), &dir).unwrap();
+        let owner = Holder::new(&dir, &[], Takes::Never);
+        let served = owner.served.clone();
+        let writes = Writes::new(&served, owner, &dir).unwrap();
         // Written and closed: answered at once, before the project is asked.
         let handle = writes.create("a.txt").unwrap();
         writes.write(handle, 0, b"one").unwrap();
@@ -1815,16 +1916,15 @@ mod tests {
         writes.close(third, true).unwrap();
         assert_eq!(writes.read("a.txt", 0, 16).unwrap(), b"one!", "as written, whatever the project took");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_rename_is_shown_at_once_and_the_project_told_in_its_turn() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-rename-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::from([("old/in/a.txt".to_string(), Given::Bytes(Arc::from(&b"a"[..])))]));
         // Nobody takes anything yet.
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &[("old/in/a.txt", "a")], Takes::Nothing);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let number = served.ino("old/in/a.txt");
         writes.rename("old", "new").expect("renamed, whatever the project is doing");
@@ -1837,34 +1937,31 @@ mod tests {
         writes.write(handle, 0, b"after").unwrap();
         writes.close(handle, true).unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(owner.given.lock().unwrap().is_empty());
+        assert_eq!(owner.given(), [] as [String; 0], "nothing was given");
         // Someone takes changes again: the rename first, then what was written where it led.
-        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
-        let given = || owner.given.lock().unwrap().clone();
+        owner.take(Takes::All);
+        let given = || owner.given();
         let waited = Instant::now();
         while given().len() < 2 && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(given(), ["Rename old to new from outside", "Write a.txt from outside"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_file_moved_onto_one_that_is_there_gives_it_its_content_and_goes() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-onto-{}", std::process::id()));
-        let served = Served::default();
-        let files = [("a.txt", "one"), ("b.txt", "two"), ("d.txt", "four")];
-        served.set_files(&files.iter().map(|(path, text)| ((*path).to_string(), Given::Bytes(Arc::from(text.as_bytes())))).collect());
-        let owner = Arc::new(Busy::default());
-        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
+        let owner = Holder::new(&dir, &[("a.txt", "one"), ("b.txt", "two"), ("d.txt", "four")], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let given = |many: usize| {
             let waited = Instant::now();
-            while owner.given.lock().unwrap().len() < many && waited.elapsed() < Duration::from_secs(10) {
+            while owner.given().len() < many && waited.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let mut given = std::mem::take(&mut *owner.given.lock().unwrap());
+            let mut given: Vec<String> = owner.batches.lock().unwrap().drain(..).flatten().collect();
             given.sort();
             given
         };
@@ -1884,15 +1981,15 @@ mod tests {
         let given = given(2);
         assert_eq!(given, ["Remove d.txt from outside", "Write c.txt from outside"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_rename_the_project_refuses_is_put_back() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-back-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::from([("old/a.txt".to_string(), Given::Bytes(Arc::from(&b"a"[..])))]));
-        let writes = Writes::new(&served, Arc::new(Refusing), &dir).unwrap();
+        let owner = Holder::new(&dir, &[("old/a.txt", "a")], Takes::Never);
+        let served = owner.served.clone();
+        let writes = Writes::new(&served, owner, &dir).unwrap();
         writes.rename("old", "new").expect("shown renamed, until the project says otherwise");
         let back = || writes.shown("old/a.txt").is_some() && writes.shown("new").is_none();
         let waited = Instant::now();
@@ -1901,23 +1998,19 @@ mod tests {
         }
         assert!(back(), "where it was, as the project has it");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn files(of: &[(&str, &str)]) -> BTreeMap<String, Given> {
-        of.iter().map(|(path, text)| ((*path).to_string(), Given::Bytes(Arc::from(text.as_bytes())))).collect()
+        done(&dir);
     }
 
     #[test]
     fn what_was_in_transit_is_taken_up_by_a_serving_that_starts_again() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-again-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let project = files(&[("kept.txt", "before"), ("gone.txt", "g"), ("old/x.txt", "x"), ("part.txt", "0123456789")]);
+        done(&dir);
+        let project = [("kept.txt", "before"), ("gone.txt", "g"), ("old/x.txt", "x"), ("part.txt", "0123456789")];
         {
-            let served = Served::default();
-            served.set_files(&project);
             // Nobody takes anything, for as long as this serving lasts.
-            let writes = Writes::new(&served, Arc::new(Busy::default()), &dir).unwrap();
+            let owner = Holder::new(&dir, &project, Takes::Nothing);
+            let served = owner.served.clone();
+            let writes = Writes::new(&served, owner, &dir).unwrap();
             writes.make_folder("made").unwrap();
             let handle = writes.create("made/a.txt").unwrap();
             writes.write(handle, 0, b"one").unwrap();
@@ -1938,9 +2031,8 @@ mod tests {
             writes.close(handle, true).unwrap();
             // It ends with no word of it: its process gone.
         }
-        let served = Served::default();
-        served.set_files(&project);
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &project, Takes::Nothing);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // Shown as it was left.
         assert!(writes.shown("made").is_some_and(|shown| shown.folder));
@@ -1951,8 +2043,8 @@ mod tests {
         assert_eq!(writes.read("new/x.txt", 0, 4).unwrap(), b"x");
         assert!(writes.shown("made/.a.txt.swp").is_none());
         // And given once someone takes it: what was asked in an order first, in that order.
-        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
-        let given = || owner.given.lock().unwrap().clone();
+        owner.take(Takes::All);
+        let given = || owner.given();
         let waited = Instant::now();
         while given().len() < 6 && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
@@ -1972,33 +2064,16 @@ mod tests {
             ]
         );
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A project that takes what is asked in an order - folders, renames - and nothing written yet.
-    #[derive(Default)]
-    struct Ordered {
-        given: Mutex<Vec<String>>,
-    }
-
-    impl Owner for Ordered {
-        fn change(&self, change: Change) -> Result<(), Refusal> {
-            if matches!(change, Change::Write { .. }) {
-                return Err(Refusal::Later("not yet".into()));
-            }
-            self.given.lock().unwrap().push(change.label());
-            Ok(())
-        }
+        done(&dir);
     }
 
     #[test]
     fn what_was_written_in_a_folder_the_project_has_renamed_is_taken_up_where_it_is() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-where-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
         {
-            let served = Served::default();
-            served.set_files(&files(&[("old/x.txt", "x")]));
-            let owner = Arc::new(Ordered::default());
+            let owner = Holder::new(&dir, &[("old/x.txt", "x")], Takes::Ordered);
+            let served = owner.served.clone();
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
             let handle = writes.create("old/written.txt").unwrap();
             writes.write(handle, 0, b"w").unwrap();
@@ -2006,36 +2081,34 @@ mod tests {
             writes.rename("old", "new").unwrap();
             // The project has the rename, and not what was written: there it ends.
             let waited = Instant::now();
-            while owner.given.lock().unwrap().is_empty() && waited.elapsed() < Duration::from_secs(10) {
+            while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(*owner.given.lock().unwrap(), ["Rename old to new from outside"]);
+            assert_eq!(owner.given(), ["Rename old to new from outside"]);
         }
         // The tree as the project has it: renamed.
-        let served = Served::default();
-        served.set_files(&files(&[("new/x.txt", "x")]));
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[("new/x.txt", "x")], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         assert_eq!(writes.read("new/written.txt", 0, 4).unwrap(), b"w", "where its folder is now");
         assert!(writes.shown("old").is_none() && writes.shown("old/written.txt").is_none());
-        let given = || owner.batches.lock().unwrap().iter().flatten().cloned().collect::<Vec<_>>();
+        let given = || owner.given();
         let waited = Instant::now();
         while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(given(), ["Write written.txt from outside"], "the rename is not asked again");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn what_the_project_took_is_not_given_again() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-took-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
         {
-            let served = Served::default();
-            served.set_files(&BTreeMap::new());
-            let owner = Arc::new(Told::default());
+            let owner = Holder::new(&dir, &[], Takes::All);
+            let served = owner.served.clone();
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
             writes.make_folder("made").unwrap();
             let handle = writes.create("made/a.txt").unwrap();
@@ -2044,7 +2117,7 @@ mod tests {
             let handle = writes.create("late.txt").unwrap();
             writes.write(handle, 0, b"first").unwrap();
             writes.close(handle, true).unwrap();
-            let given = || owner.batches.lock().unwrap().iter().flatten().count();
+            let given = || owner.given().len();
             let waited = Instant::now();
             while given() < 3 && waited.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(10));
@@ -2055,12 +2128,11 @@ mod tests {
             writes.write(handle, 5, b" and more").unwrap();
         }
         // The tree as whoever holds the project has it by now.
-        let served = Served::default();
-        served.set_files(&files(&[("made/a.txt", "one"), ("late.txt", "first")]));
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[("made/a.txt", "one"), ("late.txt", "first")], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         assert_eq!(writes.read("late.txt", 0, 32).unwrap(), b"first and more");
-        let given = || owner.batches.lock().unwrap().iter().flatten().cloned().collect::<Vec<_>>();
+        let given = || owner.given();
         let waited = Instant::now();
         while given().is_empty() && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
@@ -2069,17 +2141,16 @@ mod tests {
         assert_eq!(given(), ["Write late.txt from outside"], "only what the project had not taken");
         assert!(writes.settled("made/a.txt"), "what it had is the tree's alone");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_serving_that_ended_leaves_nothing_to_take_up() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-ended-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
+        done(&dir);
+        let owner = Holder::new(&dir, &[], Takes::Nothing);
+        let served = owner.served.clone();
         {
-            let owner = Arc::new(Busy::default());
             let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
             let handle = writes.create("left.txt").unwrap();
             writes.write(handle, 0, b"x").unwrap();
@@ -2087,21 +2158,20 @@ mod tests {
             writes.finish();
             assert_eq!(*owner.left.lock().unwrap(), ["left.txt"], "its owner's to keep, as serving ends");
         }
-        let owner = Arc::new(Told::default());
+        owner.take(Takes::All);
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         assert!(writes.shown("left.txt").is_none(), "not taken up again: it was set aside");
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(owner.batches.lock().unwrap().iter().flatten().count(), 0, "and nothing is given");
+        assert_eq!(owner.given().len(), 0, "and nothing is given");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn what_nobody_took_by_the_end_is_left_with_the_owner() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-left-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Busy::default());
+        let owner = Holder::new(&dir, &[], Takes::Nothing);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         let handle = writes.create("late.txt").unwrap();
         writes.write(handle, 0, b"x").unwrap();
@@ -2109,15 +2179,14 @@ mod tests {
         writes.finish();
         assert_eq!(*owner.left.lock().unwrap(), ["late.txt"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn new_files_that_have_settled_are_given_to_the_project_together() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-many-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
         // Paced so that nothing is given before it is asked for here.
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
         for name in ["a.txt", "b.txt", "c.txt"] {
@@ -2140,35 +2209,33 @@ mod tests {
             "one batch of the three"
         );
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn what_waits_to_settle_is_given_to_the_project_as_serving_ends() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-finish-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
         let handle = writes.create("late.txt").unwrap();
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         // At once, long before it would have settled.
         writes.finish();
-        let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
+        let given = owner.given();
         assert_eq!(given, ["Write late.txt from outside"]);
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_folder_the_project_was_given_is_shown_before_the_tree_follows() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-given-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
         // An owner that takes what it is given, the tree served following in its own time - as where another process
         // holds the project, and lists what is served a moment later.
-        let owner = Arc::new(Told::default());
+        let owner = Holder::new(&dir, &[], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         writes.make_folder("made").expect("made");
         assert!(writes.shown("made").is_some_and(|shown| shown.folder), "there at once");
@@ -2178,31 +2245,21 @@ mod tests {
         writes.write(handle, 0, b"x").unwrap();
         writes.close(handle, true).unwrap();
         writes.finish();
-        let given: Vec<String> = owner.batches.lock().unwrap().iter().flatten().cloned().collect();
+        let given = owner.given();
         assert_eq!(given, ["New made from outside", "Write a.txt from outside"]);
-        // Once the tree shows it, it is the tree's.
-        served.set_files(&BTreeMap::from([("made/a.txt".to_string(), Given::Bytes(Arc::from(&b"x"[..])))]));
+        // The tree shows it by then, and it is the tree's.
+        assert!(owner.has("made/a.txt"));
         writes.settle();
         assert!(writes.settled("made"), "nothing shown over the tree any more");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_folder_made_where_one_was_just_removed_is_kept() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-folder-{}", std::process::id()));
-        let served = Served::default();
-        let files = BTreeMap::from([("kept/a.txt".to_string(), Given::Bytes(Arc::from(&b"a"[..])))]);
-        served.set_files(&files);
-        let (started, _starts) = channel();
-        let (_goes_on, go_on) = channel();
-        let owner = Arc::new(Slow {
-            served: served.clone(),
-            files: Mutex::new(files),
-            started: Mutex::new(started),
-            go_on: Mutex::new(go_on),
-            changes: Mutex::default(),
-        });
+        let owner = Holder::new(&dir, &[("kept/a.txt", "a")], Takes::All);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // Emptied and removed, then made again before the removal has settled: as a program replacing a folder does.
         writes.remove("kept/a.txt").unwrap();
@@ -2214,30 +2271,21 @@ mod tests {
         // Once the removal has settled - however long that takes a machine doing other things - and then for as long
         // as the folder's own would have taken to follow it.
         let waited = std::time::Instant::now();
-        while owner.changes.lock().unwrap().is_empty() && waited.elapsed() < Duration::from_secs(20) {
+        while owner.given().is_empty() && waited.elapsed() < Duration::from_secs(20) {
             std::thread::sleep(Duration::from_millis(50));
         }
         std::thread::sleep(super::Pace::default().most + Duration::from_millis(600));
-        let changes = owner.changes.lock().unwrap().clone();
+        let changes = owner.given();
         assert_eq!(changes, ["Remove a.txt from outside"], "only its file is removed from the project");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 
     #[test]
     fn a_file_removed_while_the_project_is_given_it_is_removed_from_the_project() {
         let dir = std::env::temp_dir().join(format!("pe2-writes-{}", std::process::id()));
-        let served = Served::default();
-        served.set_files(&BTreeMap::new());
-        let (started, starts) = channel();
-        let (goes_on, go_on) = channel();
-        let owner = Arc::new(Slow {
-            served: served.clone(),
-            files: Mutex::default(),
-            started: Mutex::new(started),
-            go_on: Mutex::new(go_on),
-            changes: Mutex::default(),
-        });
+        let (owner, starts, goes_on) = Holder::gated(&dir, &[]);
+        let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
         // A new file, written and let go of: given to the project once it has settled.
         let handle = writes.create("a.txt").unwrap();
@@ -2256,13 +2304,13 @@ mod tests {
         removing.join().unwrap().expect("removed");
         assert!(writes.shown("a.txt").is_none(), "hidden at once");
         let asked = Instant::now();
-        let removed = || owner.changes.lock().unwrap().iter().any(|c| c == "Remove a.txt from outside");
+        let removed = || owner.given().iter().any(|c| c == "Remove a.txt from outside");
         while !removed() && asked.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(removed(), "removed from the project: {:?}", owner.changes.lock().unwrap());
+        assert!(removed(), "removed from the project: {:?}", owner.given());
         assert!(served.tree().at("a.txt").is_none() && writes.shown("a.txt").is_none(), "and gone");
         drop(writes);
-        let _ = std::fs::remove_dir_all(&dir);
+        done(&dir);
     }
 }
