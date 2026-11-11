@@ -6,6 +6,8 @@
 //! - `log`: a write-ahead log that holds every operation in transit, with its bytes. Any process appends; all read
 //!   it where it is mapped. A position in it is the sequence number of everything.
 //! - `content`: a file in transit, as the ranges of the log its bytes are in.
+//! - `ops`: what was done through the served folder and what became of it, as records: what a process that
+//!   starts again takes up.
 //! - `header`: one page of positions every process reads without asking another - how far the log goes, how far
 //!   the project has it, how far that is on disk.
 //!
@@ -14,7 +16,9 @@
 pub mod content;
 pub mod header;
 pub mod log;
+pub mod ops;
 
 pub use content::Content;
 pub use header::Header;
 pub use log::{Log, Record};
+pub use ops::Op;

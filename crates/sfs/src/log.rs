@@ -394,6 +394,14 @@ impl Log {
         }
     }
 
+    /// Where what the log still holds begins: where the project has it up to, or where its first segment does
+    /// where the ones before are gone. A record is there, or the log's end.
+    #[must_use]
+    pub fn begins(&self) -> u64 {
+        let lowest = self.segments().first().map_or(0, |number| number * self.config.segment);
+        self.header.applied().max(lowest).min(self.header.tail())
+    }
+
     /// The record at a position, or the first after it where that is the rest of a segment; none at the log's end.
     ///
     /// # Errors
