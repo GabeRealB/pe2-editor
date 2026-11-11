@@ -167,15 +167,18 @@ impl<'a, 'h> Out<'a, 'h> {
 
     /// Write the layer's list: its changeset, or its records as the changeset and the files written make them.
     fn changeset(&mut self, changeset: &Changeset) -> Result<()> {
+        // A changeset is read as the file it is, as a record is: never kept as chunks, however much it lists.
         let Some(written) = &self.records else {
-            return self.tx.write(&self.layer.changeset, changeset.render().as_bytes());
+            return self.tx.write_stored(&self.layer.changeset, changeset.render().as_bytes());
         };
         let old = tracing::info_span!("edit: the layer's records copied")
             .in_scope(|| crate::records::Set::records_of(&self.layer.path).unwrap_or_default());
         let (new, gone) = tracing::info_span!("edit: the layer's records made")
             .in_scope(|| crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written))?;
+        // As it is, whatever its length: a record is read as a record, never kept as chunks as a layer's long
+        // files are - which one holding a long text was, and was then not found again.
         for (uid, record) in &new {
-            self.tx.write(&crate::records::path_of(&self.layer.path, uid), record.render().as_bytes())?;
+            self.tx.write_stored(&crate::records::path_of(&self.layer.path, uid), record.render().as_bytes())?;
         }
         for uid in &gone {
             self.tx.remove(&crate::records::path_of(&self.layer.path, uid))?;
@@ -545,7 +548,7 @@ fn uid_at(index: &Index, real: &str) -> Option<String> {
 
 /// The real path an entry resolves at now, by its uid.
 fn real_of(index: &Index, uid: &str) -> Option<String> {
-    index.entries.iter().find(|(_, e)| e.uid == uid).map(|(path, _)| path.clone())
+    index.real_path(uid).map(str::to_string)
 }
 
 /// Delete an entry from a layer's view, with the entry paired with it (`paired`): one the layer makes leaves it; one
@@ -1162,6 +1165,81 @@ mod tests {
         assert!(refreshed.restacked);
         assert!(o.index.assets.contains_key("h/won") && !o.index.assets.contains_key("h/one"));
         assert!(o.index.assets.contains_key("h/two"));
+    }
+
+    #[test]
+    fn nodes_that_come_and_go_leave_the_links_as_a_fresh_reading_makes_them() {
+        let root = project("links");
+        std::fs::write(root.join(".layers/base/g/a.node/node.toml"), "uid = \"uid://a\"\nstack = [{ op = \"t.image\" }]\n")
+            .unwrap();
+        crate::records::mark(&root.join(".layers/top"), &crate::records::Settings::default()).unwrap();
+        let mut o = open(&root);
+        let node = |text: &str| format!("stack = [{{ op = \"t.file\" }}]\n{text}");
+        let make = |o: &mut Open, uid: &str, path: &str, text: &str| {
+            let made = super::create(&o.project, &o.index, "top", uid, path, (&node(text), &[]), &mut o.history);
+            // Each held to an index opened afresh: its links, what names what, what each layer needs of another.
+            o.refresh(&made.unwrap());
+        };
+        // One that refers below, and to a uid nothing has yet.
+        make(&mut o, "uid://one", "h/one", "below = \"uid://a\"\nlater = \"uid://two\"\n");
+        assert_eq!(o.index.referenced_by["g/a"].len(), 1);
+        assert_eq!(o.index.dangling.len(), 1);
+        // The one it named comes: no longer dangling. One nothing names, referring to both.
+        make(&mut o, "uid://two", "h/two", "");
+        assert!(o.index.dangling.is_empty() && o.index.referenced_by.contains_key("h/two"));
+        make(&mut o, "uid://three", "h/deep/three", "a = \"uid://one\"\nb = \"uid://two\"\nc = \"uid://a\"\n");
+        assert_eq!(o.index.referenced_by["g/a"].len(), 2);
+        // Renamed, written again with other references, and gone - one nothing refers to, then one that is.
+        let paths = super::rename(&o.project, &o.index, "top", "uid://three", "h/deep/third", &mut o.history).unwrap();
+        o.refresh(&paths);
+        let again = node("a = \"uid://one\"\nnowhere = \"uid://none\"\n");
+        let paths = super::write_file(
+            &o.project,
+            &o.index,
+            "top",
+            "uid://three",
+            "node.toml",
+            again.as_bytes(),
+            "Edit".into(),
+            None,
+            &mut o.history,
+        );
+        o.refresh(&paths.unwrap());
+        assert_eq!((o.index.referenced_by["g/a"].len(), o.index.dangling.len()), (1, 1));
+        for uid in ["uid://three", "uid://two", "uid://one"] {
+            let paths = super::delete(&o.project, &o.index, "top", uid, &mut o.history).unwrap();
+            o.refresh(&paths);
+        }
+        assert!(!o.index.referenced_by.contains_key("g/a") && o.index.dangling.is_empty());
+        // And each of those taken back, in turn.
+        while let Ok(step) = o.history.undo(&o.index, None, false) {
+            let paths = step.paths();
+            o.refresh(&paths);
+        }
+        assert!(!o.index.assets.contains_key("h/one"));
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_long_text_in_a_records_layer_is_read_back() {
+        let root = project("long");
+        crate::records::mark(&root.join(".layers/top"), &crate::records::Settings::default()).unwrap();
+        let mut o = open(&root);
+        // Text is kept in its record whatever its length: here longer than what a layer keeps as chunks.
+        let long = "a line of a long text\n".repeat(60_000);
+        assert!(long.len() > crate::chunks::THRESHOLD);
+        let paths = super::create_file(&o.project, &o.index, "top", "long.txt", long.as_bytes(), &mut o.history).unwrap();
+        o.refresh(&paths);
+        let entry = o.index.entries.get("long.txt").expect("the file is an entry of the project");
+        assert_eq!(crate::content::read(&entry.disk).unwrap(), long.as_bytes());
+        // And by a reading afresh, as the next process to take the project reads it.
+        drop(o);
+        let o = open(&root);
+        let entry = o.index.entries.get("long.txt").expect("read again, it is there");
+        assert_eq!(crate::content::read(&entry.disk).unwrap().len(), long.len());
+        drop(o);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

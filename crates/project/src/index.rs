@@ -1159,6 +1159,11 @@ pub struct Index {
     /// one merges again. An entry a layer makes by itself reads none, so applying the stack for such alone
     /// (`restack_entries`) leaves it as it is.
     merge_inputs: Arc<HashSet<PathBuf>>,
+    /// Where each entry is, by its uid: its real path.
+    placed: Arc<HashMap<String, String>>,
+    /// How many references name each uid, whatever they resolve to: a uid none names can come or go without any
+    /// other asset's links changing.
+    named: Arc<HashMap<String, usize>>,
     /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
     working: Arc<HashMap<String, Working>>,
     /// What the layers below each layer resolve (`below_layer`), as asked since the stack was last applied: made anew,
@@ -1203,6 +1208,14 @@ impl Index {
     /// A layer cannot be read.
     pub fn without_store(project: &Project) -> Result<Index> {
         Index::over(None, project, &|_, _, _| {})
+    }
+
+    /// Write to the cache's store what the index read and has not written there yet, where that has waited a
+    /// moment: asked by whoever holds the index while nothing is asked of it.
+    pub fn tick(&self) {
+        if let Some(store) = &self.store {
+            let _ = store.tick();
+        }
     }
 
     /// Stop keeping the records in the cache's store, and close it, for another process to open: what is read from now
@@ -1278,6 +1291,8 @@ impl Index {
             hashes: Arc::default(),
             winning: Arc::default(),
             merge_inputs: Arc::default(),
+            placed: Arc::default(),
+            named: Arc::default(),
             working: Arc::default(),
             beneath: Arc::default(),
             full: Arc::default(),
@@ -1778,9 +1793,6 @@ impl Index {
         let came_at: HashSet<&str> = came.iter().map(|(_, path)| path.as_str()).collect();
         let gone_at: HashSet<&str> = gone.iter().map(|(_, path)| path.as_str()).collect();
         let layer = &self.layers[at];
-        // The references that named a uid nothing had, or have one that goes: what a layer needs of another is
-        // counted again.
-        let named = self.dangling.iter().any(|reference| uids.contains(reference.uid.as_str()));
         let (name, writable) = (layer.name.clone(), layer.writable);
         let disk = |path: &str| self.layers[at].place.disk(path);
         let entries: Vec<Entry> = came
@@ -1805,14 +1817,17 @@ impl Index {
             let full = Arc::make_mut(&mut self.full);
             let listed = Arc::make_mut(&mut self.entries);
             let winning = Arc::make_mut(&mut self.winning);
+            let placed = Arc::make_mut(&mut self.placed);
             let hashes = &mut Arc::make_mut(&mut self.hashes)[at];
-            for (_, path) in gone {
+            for (uid, path) in gone {
+                placed.remove(uid);
                 full.remove(path);
                 listed.remove(path);
                 winning.remove(&(at, path.clone()));
                 hashes.remove(path);
             }
             for (((uid, path), kind), entry) in came.iter().zip(kinds).zip(entries) {
+                placed.insert(uid.clone(), path.clone());
                 full.insert(path.clone(), Node::created(*kind, uid, at, path));
                 listed.insert(path.clone(), entry);
                 winning.insert((at, path.clone()), path.clone());
@@ -1837,19 +1852,63 @@ impl Index {
             .filter(|parent| self.full.contains_key(parent))
             .collect();
         refreshed.touched.extend(around);
-        // What the entries that stay hold changed with them, as where contents alone change.
-        self.refresh_contents(regions, before_references, refreshed);
-        // An asset come or gone: the assets are those of the stack again, and linked as a whole - a uid is another's
-        // to name from now on, or no more.
-        let bundles: Vec<String> =
-            paths.iter().filter(|path| path.ends_with(BUNDLE_SUFFIX)).map(|path| (*path).to_string()).collect();
-        if !bundles.is_empty() {
-            self.assemble_assets(&bundles);
-            refreshed.assets.extend(bundles.iter().map(|path| asset_of(path).to_string()));
-            self.link();
+        // The assets come and gone: each known by its uid from now on, or no more. Where nothing names their uids
+        // and nothing refers to one that goes, the other assets' links stand, and so does what the layers need of
+        // each other but for these; else all are linked, and counted, again.
+        let asset = |(uid, path): &(String, String)| path.ends_with(BUNDLE_SUFFIX).then(|| (uid.clone(), asset_of(path).to_string()));
+        let went: Vec<(String, String)> = gone.iter().filter_map(asset).collect();
+        let come: Vec<(String, String)> = came.iter().filter_map(asset).collect();
+        let others_refer = |asset: &str| self.referenced_by.get(asset).is_some_and(|refs| refs.iter().any(|r| r.from != asset));
+        let whole = uids.iter().any(|uid| self.named.contains_key(*uid))
+            || self.layers.iter().any(|l| uids.iter().any(|uid| l.changeset.ops.contains_key(*uid)))
+            || come.iter().any(|(_, asset)| self.dangling.iter().any(|r| r.target == *asset))
+            || went.iter().any(|(_, asset)| others_refer(asset));
+        {
+            let by_uid = Arc::make_mut(&mut self.by_uid);
+            for (uid, asset) in &went {
+                if by_uid.get(uid) == Some(asset) {
+                    by_uid.remove(uid);
+                }
+            }
+            by_uid.extend(come.iter().cloned());
         }
-        if named || !bundles.is_empty() {
+        let left: Vec<String> = gone.iter().map(|(_, path)| path).filter(|path| !came_at.contains(path.as_str())).cloned().collect();
+        self.assemble_assets(&left);
+        let left: Vec<String> = went.iter().map(|(_, asset)| asset.clone()).filter(|a| !self.assets.contains_key(a)).collect();
+        if !whole {
+            for asset in &left {
+                let was: Vec<String> = before_references.get(asset).into_iter().flatten().map(|r| r.uid.clone()).collect();
+                self.recount(at, &was, &[]);
+            }
+            self.relink(&left, before_references);
+        }
+        refreshed.assets.extend(left);
+        // What the entries that are there hold - those come, and those that stay - assembled and linked, as where
+        // contents alone change.
+        self.refresh_contents(regions, before_references, refreshed);
+        if whole {
+            self.link();
             self.dependencies = self.dependencies();
+        }
+    }
+
+    /// Count what a layer needs of the others for an asset of its own whose references named `was` and name `now`:
+    /// each uid another layer makes is one reference to that layer, more or less.
+    fn recount(&mut self, layer: usize, was: &[String], now: &[String]) {
+        let creator = |uid: &String| self.layers.iter().position(|l| l.changeset.entries.contains_key(uid));
+        let less: Vec<usize> = was.iter().filter_map(creator).filter(|other| *other != layer).collect();
+        let more: Vec<usize> = now.iter().filter_map(creator).filter(|other| *other != layer).collect();
+        let needs = &mut self.dependencies[layer];
+        for other in more {
+            needs.entry(other).or_insert((0, 0)).1 += 1;
+        }
+        for other in less {
+            if let Some(count) = needs.get_mut(&other) {
+                count.1 = count.1.saturating_sub(1);
+                if *count == (0, 0) {
+                    needs.remove(&other);
+                }
+            }
         }
     }
 
@@ -1894,7 +1953,20 @@ impl Index {
         });
         self.relink(&assets, before);
         if references_changed {
-            self.dependencies = self.dependencies();
+            // Each asset's own layer needs what its references name now, where it needed what they named: counted
+            // for those, where every asset's layer can be told; else for all, as the stack applied does.
+            let layers: Option<Vec<usize>> = paths.iter().map(|path| self.resolved.get(path).map(|n| n.content.0)).collect();
+            let plain = |layer: &usize| self.entries_of(*layer) == *layer && self.filled_by(*layer).is_none();
+            match layers.filter(|layers| layers.iter().all(plain)) {
+                Some(layers) => {
+                    for (asset, layer) in assets.iter().zip(layers) {
+                        let was: Vec<String> = before.get(asset).into_iter().flatten().map(|r| r.uid.clone()).collect();
+                        let now: Vec<String> = self.references_from(asset).into_iter().map(|r| r.uid).collect();
+                        self.recount(layer, &was, &now);
+                    }
+                }
+                None => self.dependencies = self.dependencies(),
+            }
         }
         refreshed.assets.extend(assets);
     }
@@ -2395,7 +2467,16 @@ impl Index {
         let mut winning: Vec<_> = index.winning.iter().collect();
         winning.sort();
         let _ = writeln!(out, "winning {winning:?}");
+        let placed: std::collections::BTreeMap<_, _> = index.placed.iter().collect();
+        let named: std::collections::BTreeMap<_, _> = index.named.iter().collect();
+        let _ = writeln!(out, "placed {placed:?}\nnamed {named:?}");
         out
+    }
+
+    /// The real path an entry resolves at, by its uid.
+    #[must_use]
+    pub fn real_path(&self, uid: &str) -> Option<&str> {
+        self.placed.get(uid).map(String::as_str)
     }
 
     /// A layer's changeset as the index read it.
@@ -2883,6 +2964,7 @@ impl Index {
 
     /// The entries, from the resolved stack.
     fn assemble_entries(&mut self) {
+        self.placed = Arc::new(self.resolved.iter().map(|(path, node)| (node.uid.clone(), path.clone())).collect());
         self.entries = Arc::new(
             self.resolved
                 .iter()
@@ -3052,6 +3134,7 @@ impl Index {
             }
         }
         let (mut referenced_by, mut dangling) = (HashMap::<String, Vec<Reference>>::new(), Vec::new());
+        let mut named = HashMap::<String, usize>::new();
         for asset in self.assets.values() {
             let declaration = asset
                 .files
@@ -3062,6 +3145,7 @@ impl Index {
             {
                 let output = (!output.is_empty()).then_some(output);
                 let reference = Reference { from: asset.path.clone(), slot, uid, target, output };
+                *named.entry(reference.uid.clone()).or_default() += 1;
                 // The uid decides; the path is the fallback.
                 match self
                     .by_uid
@@ -3075,6 +3159,7 @@ impl Index {
         }
         self.referenced_by = Arc::new(referenced_by);
         self.dangling = dangling;
+        self.named = Arc::new(named);
     }
 
     /// Link again what these assets declare, which declared `before` (by asset): their unreadable declarations, and
@@ -3092,6 +3177,15 @@ impl Index {
             index.by_uid.get(&r.uid).cloned().or_else(|| index.assets.contains_key(&r.target).then(|| r.target.clone()))
         };
         for (from, references) in before.iter().filter(|(a, _)| changed.contains(a.as_str())) {
+            let named = Arc::make_mut(&mut self.named);
+            for reference in references {
+                if let Some(count) = named.get_mut(&reference.uid) {
+                    *count -= 1;
+                    if *count == 0 {
+                        named.remove(&reference.uid);
+                    }
+                }
+            }
             let targets: Vec<String> = references.iter().filter_map(|r| resolved(self, r)).collect();
             for target in targets {
                 let referenced_by = Arc::make_mut(&mut self.referenced_by);
@@ -3110,6 +3204,7 @@ impl Index {
             let mut placed: HashMap<String, usize> = HashMap::new();
             let mut dangling_at = self.dangling.partition_point(|r| r.from < *from);
             for reference in self.references_from(from) {
+                *Arc::make_mut(&mut self.named).entry(reference.uid.clone()).or_default() += 1;
                 if let Some(target) = resolved(self, &reference) {
                     let list = Arc::make_mut(&mut self.referenced_by).entry(target.clone()).or_default();
                     // After the references of the assets before it, then each of its own after the last.

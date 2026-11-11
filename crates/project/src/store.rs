@@ -59,8 +59,10 @@ pub struct Store {
 /// What waits to be written: each file's record, or (none) that it is gone; and since when the first of them waits.
 type Later = (HashMap<PathBuf, Option<Record>>, Option<std::time::Instant>);
 
-/// How long what is to be written may wait for more (`Store::write_later`).
+/// How long what is to be written waits for more before whoever holds the store, asked while it has nothing else
+/// to do (`Store::tick`), writes it; and how long at most, where nobody asks.
 const LATER: std::time::Duration = std::time::Duration::from_secs(2);
+const AT_MOST: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Drop for Store {
     fn drop(&mut self) {
@@ -188,7 +190,20 @@ impl Store {
             later.0.extend(records.into_iter().map(|(path, record)| (path.to_path_buf(), Some(record.clone()))));
             later.0.extend(gone.into_iter().map(|path| (path.to_path_buf(), None)));
             let since = *later.1.get_or_insert_with(std::time::Instant::now);
-            !later.0.is_empty() && since.elapsed() > LATER
+            !later.0.is_empty() && since.elapsed() > AT_MOST
+        };
+        if due { self.flush() } else { Ok(()) }
+    }
+
+    /// Write what has waited a moment (`write_later`): asked by whoever holds the store between the things it does,
+    /// so that the writing is on the path of none of them.
+    ///
+    /// # Errors
+    /// The database cannot be written.
+    pub fn tick(&self) -> Result<()> {
+        let due = {
+            let later = self.later.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            later.1.is_some_and(|since| since.elapsed() > LATER)
         };
         if due { self.flush() } else { Ok(()) }
     }

@@ -628,6 +628,10 @@ impl Host {
             self.forget_reading();
             if looked.elapsed() > Duration::from_secs(1) {
                 looked = Instant::now();
+                // What its index read is written to the cache's store here, between edits, not in one.
+                if let Some(index) = &lock(&self.state).index {
+                    index.tick();
+                }
                 // Started to keep the folder served, it stops where that is stopped.
                 if self.server_gone() && self.serve.is_some() {
                     break;

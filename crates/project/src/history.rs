@@ -26,7 +26,9 @@
 //! once), a folder deleted moved whole into `.cache/history/trash/`. A working copy's files are kept there too.
 //!
 //! The log lasts the session. Where it is journaled (`journaled`, as the editor's is), it is written as it changes
-//! (`.cache/history/session.json`), and a clean close (`close`) wipes it all; one a crash left behind is found on the
+//! (`.cache/history/session.jsonl`): a step made, or joined to the one before it, is appended with the documents it
+//! edited - the session written whole only where it changed otherwise (an undo, a save), and when what was appended
+//! has grown long. A clean close (`close`) wipes it all; one a crash left behind is found on the
 //! next opening (`left`) and taken up again (`resume`) or let go (`discard_left`).
 //!
 //! Only the holder of the project lock writes (`lock.rs`).
@@ -42,7 +44,9 @@ use crate::extract::sha1_hex;
 use crate::index::{Index, Working, WorkingFile};
 
 const DIR: &str = "history";
-const SESSION: &str = "session.json";
+const SESSION: &str = "session.jsonl";
+/// How long the session's file may grow by what is appended before it is written whole again.
+const SESSION_LONG: u64 = 4 << 20;
 /// How many steps a session keeps.
 const STEPS: usize = 500;
 /// How close in time edits of one kind (`Transaction::merging`) must follow each other to make one step.
@@ -233,6 +237,9 @@ pub struct History {
     left: Option<Session>,
     /// Whether the session is written as it changes.
     journaled: bool,
+    /// What the session's file holds, where it was written whole and appended to since: how many steps done and
+    /// undone, and how long it is. None where the next writing is of the whole.
+    appended: std::cell::Cell<Option<(usize, usize, u64)>>,
     /// Who makes the steps begun now.
     author: String,
     trashed: usize,
@@ -259,6 +266,7 @@ impl History {
             documents: BTreeMap::new(),
             left: None,
             journaled: false,
+            appended: std::cell::Cell::new(None),
             author: "user".into(),
             trashed: 0,
             written: vec![],
@@ -267,7 +275,7 @@ impl History {
         let recovered = cache.recovered.clone();
         let left = std::fs::read_to_string(dir.join(SESSION))
             .ok()
-            .and_then(|text| serde_json::from_str::<Session>(&text).ok())
+            .and_then(|text| Session::read(&text))
             .filter(|left| !left.done.is_empty() || !left.undone.is_empty() || !left.documents.is_empty());
         if left.is_some() {
             // What it kept stays, for what it left to be taken up; the trash goes on numbering after it.
@@ -349,7 +357,7 @@ impl History {
         if let Some(step) = self.done.last_mut() {
             step.selection = selection;
         }
-        self.journal();
+        self.journal_last(&[]);
     }
 
     /// The paths its steps wrote since they were last taken, made, undone or redone.
@@ -908,14 +916,50 @@ impl History {
         })
     }
 
-    /// The session written, where it is journaled: what a crash would leave.
+    /// The session written whole, where it is journaled: what a crash would leave.
     fn journal(&self) {
         if !self.journaled {
             return;
         }
         let session = SessionRef { done: &self.done, undone: &self.undone, documents: &self.documents };
-        if let Ok(text) = serde_json::to_string(&session) {
-            let _ = write_atomic(&self.dir.join(SESSION), text.as_bytes());
+        self.appended.set(None);
+        if let Ok(mut text) = serde_json::to_string(&Journaled::Whole(session)) {
+            text.push('\n');
+            if write_atomic(&self.dir.join(SESSION), text.as_bytes()).is_ok() {
+                self.appended.set(Some((self.done.len(), self.undone.len(), text.len() as u64)));
+            }
+        }
+    }
+
+    /// The session written after its last step was made, or changed - joined by another, given a selection - with
+    /// these documents edited: appended to what its file holds, as the steps from the last it held on, the steps
+    /// undone where their number changed, and those documents. Written whole where its file does not hold it yet, or
+    /// has grown long.
+    fn journal_last(&self, documents: &[String]) {
+        if !self.journaled {
+            return;
+        }
+        let Some((done, undone, long)) = self.appended.get().filter(|(done, _, long)| *done <= self.done.len() && *long < SESSION_LONG) else {
+            return self.journal();
+        };
+        // The last step it held may be the one joined: from that one on.
+        let from = done.saturating_sub(1);
+        let since = Journaled::Since {
+            from,
+            done: &self.done[from..],
+            undone: (undone != self.undone.len()).then_some(self.undone.as_slice()),
+            documents: documents.iter().map(|uid| (uid.as_str(), self.documents.get(uid))).collect(),
+        };
+        let appended = serde_json::to_string(&since).ok().and_then(|mut text| {
+            use std::io::Write as _;
+            text.push('\n');
+            let mut file = std::fs::OpenOptions::new().append(true).open(self.dir.join(SESSION)).ok()?;
+            file.write_all(text.as_bytes()).ok()?;
+            Some(text.len() as u64)
+        });
+        match appended {
+            Some(more) => self.appended.set(Some((self.done.len(), self.undone.len(), long + more))),
+            None => self.journal(),
         }
     }
 
@@ -972,6 +1016,8 @@ impl History {
         if step.undoable() {
             self.undone.retain(|undone| !undone.overtaken_by(&step));
         }
+        // The documents it edited: written with it.
+        let edited: Vec<String> = step.edits.iter().map(|edit| edit.uid.clone()).collect();
         if let (Some(last), Some((key, _))) = (self.done.last_mut(), &step.merge)
             && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < MERGE_WITHIN)
         {
@@ -996,14 +1042,16 @@ impl History {
                 }
             }
             last.merge = step.merge;
-            self.journal();
+            self.journal_last(&edited);
             return;
         }
         self.done.push(step);
         if self.done.len() > STEPS {
+            // The oldest goes: every step is at another place, and the session is written whole.
             self.done.remove(0);
+            return self.journal();
         }
-        self.journal();
+        self.journal_last(&edited);
     }
 }
 
@@ -1013,6 +1061,57 @@ struct SessionRef<'a> {
     done: &'a [Step],
     undone: &'a [Step],
     documents: &'a BTreeMap<String, Document>,
+}
+
+/// A line of the session's file: the session whole, or what changed of it since the line before - its steps done
+/// from one on, its steps undone where they changed, and documents (none: no longer one).
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Journaled<'a> {
+    Whole(SessionRef<'a>),
+    Since {
+        from: usize,
+        done: &'a [Step],
+        undone: Option<&'a [Step]>,
+        documents: BTreeMap<&'a str, Option<&'a Document>>,
+    },
+}
+
+/// A line of the session's file, read.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournaledLine {
+    Whole(Session),
+    Since { from: usize, done: Vec<Step>, undone: Option<Vec<Step>>, documents: BTreeMap<String, Option<Document>> },
+}
+
+impl Session {
+    /// The session a file of lines holds (`Journaled`): the last written whole, with what was appended since - up
+    /// to a line that is not whole, which a process ended writing. None where it holds no session.
+    fn read(text: &str) -> Option<Session> {
+        let mut session = None;
+        for line in text.lines() {
+            match serde_json::from_str::<JournaledLine>(line) {
+                Ok(JournaledLine::Whole(whole)) => session = Some(whole),
+                Ok(JournaledLine::Since { from, done, undone, documents }) => {
+                    let session: &mut Session = session.as_mut()?;
+                    session.done.truncate(from);
+                    session.done.extend(done);
+                    if let Some(undone) = undone {
+                        session.undone = undone;
+                    }
+                    for (uid, document) in documents {
+                        match document {
+                            Some(document) => drop(session.documents.insert(uid, document)),
+                            None => drop(session.documents.remove(&uid)),
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        session
+    }
 }
 
 /// A modification being made: its changes are gathered, no file touched, and made together when it is committed
@@ -1665,6 +1764,43 @@ mod tests {
         assert_eq!(history.done().len(), steps + 1);
         history.undo(&index, None, false).unwrap();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 3"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_journaled_session_is_appended_to_and_read_back_as_it_was() {
+        let root = documents_project("appended");
+        let index = index(&root);
+        let session = root.join(".cache/history/session.jsonl");
+        {
+            let (history, _) = history(&root);
+            let mut history = history.journaled();
+            for (n, text) in ["x = 1", "x = 2", "x = 3", "x = 4"].iter().enumerate() {
+                history.edit(&index, "uid://a", "a", "node.toml", text.as_bytes(), format!("Edit {n}"), None).unwrap();
+            }
+            history.note_selection(Some("uid://a".into()));
+            // Appended to, not written again: a line the session whole, then one for each step and the note.
+            let lines = std::fs::read_to_string(&session).unwrap().lines().count();
+            assert_eq!(lines, 5, "the whole once, and what changed since");
+            // One taken back: its shape changed, and it is written whole.
+            history.undo(&index, Some("uid://a"), false).unwrap();
+            assert_eq!(std::fs::read_to_string(&session).unwrap().lines().count(), 1);
+            history.edit(&index, "uid://a", "a", "node.toml", b"x = 5", "Edit again".into(), None).unwrap();
+            // A crash: never closed - and its last line cut short.
+            drop(history);
+            let mut text = std::fs::read_to_string(&session).unwrap();
+            text.push_str("{\"since\":{\"from\":9,\"done\":[");
+            std::fs::write(&session, text).unwrap();
+        }
+        let (history, _) = self::history(&root);
+        let mut history = history.journaled();
+        let left = history.left().unwrap();
+        let labels: Vec<&str> = left.done.iter().map(|step| step.label.as_str()).collect();
+        assert_eq!(labels, ["Edit 0", "Edit 1", "Edit 2", "Edit again"]);
+        assert!(left.undone.is_empty(), "what was undone, overtaken by the edit after it");
+        history.resume();
+        assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 5"));
+        history.close();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
