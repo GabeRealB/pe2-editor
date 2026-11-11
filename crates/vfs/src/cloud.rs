@@ -131,7 +131,7 @@ pub fn place(served: &Served, root: &Path, at: &str, read_only: bool) {
         let Some((_, node)) = tree.at(&walked) else { return };
         let next = dir.join(step);
         if std::fs::symlink_metadata(&next).is_err() {
-            let _ = placeholder(step, node, read_only).create(&dir);
+            let _ = placeholder(step, &node, read_only).create(&dir);
         }
         dir = next;
     }
@@ -140,9 +140,8 @@ pub fn place(served: &Served, root: &Path, at: &str, read_only: bool) {
 
 /// The placeholders of all under a folder of the tree, where they are not.
 fn fill(tree: &Tree, dir: &Path, at: &str, read_only: bool) {
-    let Some((_, Node { what: What::Folder(children), .. })) = tree.at(at) else { return };
-    for (name, ino) in children {
-        let Some(node) = tree.node(*ino) else { continue };
+    let Some(children) = tree.entries(at) else { return };
+    for (name, _, node) in &children {
         let path = dir.join(name);
         if std::fs::symlink_metadata(&path).is_err() {
             let _ = placeholder(name, node, read_only).create(dir);
@@ -269,12 +268,12 @@ impl SyncFilter for Filter {
     ) -> CResult<()> {
         let path = rel(&self.root, &request.path()).ok_or(CloudErrorKind::InvalidRequest)?;
         let tree = self.served.tree();
-        let Some((_, Node { what: What::Folder(children), .. })) = tree.at(&path) else {
+        let Some(children) = tree.entries(&path) else {
             return Ok(());
         };
         let read_only = self.owner.is_none();
         let mut made: Vec<PlaceholderCreateInfo> =
-            children.iter().filter_map(|(name, ino)| Some(placeholder(name, tree.node(*ino)?, read_only))).collect();
+            children.iter().map(|(name, _, node)| placeholder(name, node, read_only)).collect();
         // One there already (made here meanwhile) is no failure of the rest.
         let _ = ticket.pass_with_placeholders(&mut made);
         Ok(())
@@ -556,7 +555,7 @@ impl Worker {
             let stale = std::fs::metadata(&path).is_ok_and(|m| m.len() != node.size);
             if in_sync && stale {
                 let options =
-                    UpdateOptions::default().metadata(metadata(node, read_only)).dehydrate().mark_in_sync();
+                    UpdateOptions::default().metadata(metadata(&node, read_only)).dehydrate().mark_in_sync();
                 if let Ok(mut placeholder) = writable(&path, false) {
                     let _ = placeholder.update(options, None);
                 }
@@ -565,11 +564,8 @@ impl Worker {
         // A folder filled shows what is new in it - filled empty too: a project's top, served before it held anything.
         let state = asked(dir).ok().and_then(|folder| folder.state().ok().flatten());
         let filled = state.map_or(!here.is_empty(), |state| !state.partial());
-        if let Some((_, Node { what: What::Folder(children), .. })) = tree.at(at)
-            && filled
-        {
-            for (name, ino) in children.iter().filter(|(name, _)| !here.contains(name)) {
-                let Some(node) = tree.node(*ino) else { continue };
+        if filled && let Some(children) = tree.entries(at) {
+            for (name, _, node) in children.iter().filter(|(name, _, _)| !here.contains(name)) {
                 // What a program removed or renamed away here a moment ago is not put back: the tree has it until
                 // the project is told.
                 let path_in_tree = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };

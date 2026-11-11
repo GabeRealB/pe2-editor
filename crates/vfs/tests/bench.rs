@@ -288,14 +288,11 @@ fn tree() {
     let mut files: Vec<(String, u64)> = Vec::new();
     let mut folders = vec![String::new()];
     while let Some(folder) = folders.pop() {
-        let Some((_, node)) = tree.at(&folder) else { continue };
-        let vfs::What::Folder(children) = &node.what else { continue };
-        for (name, ino) in children {
-            let path = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
-            match tree.node(*ino).map(|node| (&node.what, node.size)) {
-                Some((vfs::What::Folder(_), _)) => folders.push(path),
-                Some((vfs::What::File(_), size)) => files.push((path, size)),
-                None => {}
+        for (name, _, node) in tree.entries(&folder).unwrap_or_default() {
+            let path = if folder.is_empty() { name } else { format!("{folder}/{name}") };
+            match &node.what {
+                vfs::What::Folder(_) => folders.push(path),
+                vfs::What::File(_) => files.push((path, node.size)),
             }
         }
     }

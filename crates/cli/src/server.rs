@@ -78,7 +78,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let shared = project::shared::space(&p.root).context("the space the project's processes share")?;
     let server = Arc::new(Server {
         project: p.clone(),
-        served: vfs::Served::default(),
+        // The tree it serves is the shared filesystem itself, read as it is asked: nothing of it is kept here.
+        served: vfs::Served::shared(shared.clone()),
         shared,
         serving,
         address,
@@ -202,9 +203,10 @@ impl Server {
         project::pack::reread_changed(&changed);
     }
 
-    /// Read what is served where whoever holds the project says it, in the shared filesystem: what the commits
-    /// since it last read did, or - the first time, and where those are no longer kept - all of it. The tree it
-    /// serves is changed by those paths, and its files read where they are said to live.
+    /// Take in what whoever holds the project said is served, in the shared filesystem - which is the tree it
+    /// serves, so nothing of that is changed here: what the commits since it last read did (the first time, and
+    /// where those are no longer kept, all of it against what it had) is what its files are read by, and what those
+    /// that tell of the tree - the kernel, what watches a mount - are told.
     fn follow(&self, state: &mut State) -> Result<()> {
         use project::server::Delta;
         let read = self.shared.read()?;
@@ -216,28 +218,26 @@ impl Server {
             Some(seen) => project::shared::changed(&read, seen, &state.listing)?,
             None => None,
         };
+        let before = std::mem::take(&mut state.listing);
         let delta = if let Some(delta) = by_change {
+            state.listing = before.clone();
             delta.apply_under(&mut state.listing);
             delta
         } else {
-            let listing = project::shared::listed(&read)?;
-            let delta = Delta::between(&state.listing, &listing);
-            let first = state.seen.is_none();
-            state.listing = listing;
-            if first {
-                project::content::serve_whole(&state.listing);
-                self.served.show(&state.listing);
-                state.seen = Some(generation);
-                return Ok(());
-            }
-            delta
+            state.listing = project::shared::listed(&read)?;
+            Delta::between(&before, &state.listing)
         };
-        state.seen = Some(generation);
+        drop(read);
+        if state.seen.replace(generation).is_none() {
+            // The first: all its files are read by this, and nobody was shown anything yet.
+            project::content::serve_whole(&state.listing);
+            return Ok(());
+        }
         if !delta.is_empty() {
+            let changes = vfs::Changes::of(&before, &delta, &state.listing);
             let shown: Vec<_> = delta.shown.into_iter().collect();
-            let gone: Vec<String> = delta.gone.into_iter().collect();
             project::content::serve_changed(&shown);
-            self.served.change(&shown, &gone);
+            self.served.told(changes);
         }
         Ok(())
     }

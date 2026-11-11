@@ -210,7 +210,8 @@ struct Provider {
 /// for - is answered by it, where listing the folder each time took longer the more it holds.
 #[derive(Default)]
 struct Folded {
-    of: Option<Arc<Tree>>,
+    /// The tree its names are of, and how many changes that had seen.
+    of: Option<(Arc<Tree>, u64)>,
     folders: HashMap<String, Arc<HashMap<String, String>>>,
 }
 
@@ -243,11 +244,7 @@ impl Provider {
         if let Some(writes) = &self.writes {
             return Some(writes.list(path));
         }
-        let tree = self.served.tree();
-        let (_, node) = tree.at(path)?;
-        let What::Folder(children) = &node.what else { return None };
-        let folder = |ino: &u64| matches!(tree.node(*ino).map(|n| &n.what), Some(What::Folder(_)));
-        Some(children.iter().map(|(name, ino)| (name.clone(), folder(ino))).collect())
+        self.served.tree().children(path)
     }
 
     /// A path as the tree names it, for one as Windows gives it (`\a\b`): its names matched as Windows matches them
@@ -275,23 +272,21 @@ impl Provider {
     /// named so.
     fn by_case(&self, folder: &str, name: &str) -> Option<String> {
         let lower = name.to_lowercase();
-        let tree = self.served.tree();
+        // As the tree was when its changes were as many: a view of the shared filesystem is one tree, whatever
+        // changes in it.
+        let (tree, changes) = (self.served.tree(), self.served.changes_from_now());
         let names = {
             let mut kept = self.folded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !kept.of.as_ref().is_some_and(|of| Arc::ptr_eq(of, &tree)) {
-                *kept = Folded { of: Some(tree.clone()), folders: HashMap::new() };
+            if !kept.of.as_ref().is_some_and(|(of, at)| Arc::ptr_eq(of, &tree) && *at == changes) {
+                *kept = Folded { of: Some((tree.clone(), changes)), folders: HashMap::new() };
             }
             if let Some(names) = kept.folders.get(folder) {
                 names.clone()
             } else {
                 let mut names = HashMap::new();
-                if let Some((_, node)) = tree.at(folder)
-                    && let What::Folder(children) = &node.what
-                {
-                    // Of two that differ in case alone, the first as the folder lists them.
-                    for name in children.keys() {
-                        names.entry(name.to_lowercase()).or_insert_with(|| name.clone());
-                    }
+                // Of two that differ in case alone, the first as the folder lists them.
+                for name in tree.children(folder).unwrap_or_default().into_keys() {
+                    names.entry(name.to_lowercase()).or_insert(name);
                 }
                 let names = Arc::new(names);
                 kept.folders.insert(folder.to_string(), names.clone());
@@ -996,8 +991,7 @@ fn tell_changes(served: &Served, instance: usize, at: &Path, stop: &AtomicBool) 
     let Some(api) = api() else { return };
     let instance = instance as Instance;
     let full = |path: &str| wide(&format!("{}\\{}", at.display(), path.replace('/', "\\")));
-    let folder = |tree: &Tree, ino: u64| i32::from(matches!(tree.node(ino).map(|n| &n.what), Some(What::Folder(_))));
-    let mut last = served.tree();
+    let mut from = served.changes_from_now();
     // Woken when the tree changes, where it would else find out when it next looked.
     let (wake, woken) = std::sync::mpsc::channel::<()>();
     let wake = std::sync::Mutex::new(wake);
@@ -1007,31 +1001,20 @@ fn tell_changes(served: &Served, instance: usize, at: &Path, stop: &AtomicBool) 
     while !stop.load(Ordering::Relaxed) {
         let _ = woken.recv_timeout(std::time::Duration::from_millis(200));
         while woken.try_recv().is_ok() {}
-        let now = served.tree();
-        if Arc::ptr_eq(&last, &now) {
-            continue;
-        }
-        let changes = Tree::changes(&last, &now);
+        // More than is kept to tell of: what watches finds out as it next looks.
+        let Some(changes) = served.changes_since(&mut from) else { continue };
         // SAFETY: the filesystem `mount` made, which lives until this thread is joined, and paths ended by zeros.
         unsafe {
-            for node in changes.changed.iter().filter_map(|ino| now.node(*ino)) {
-                (api.notify_update)(instance, PCWSTR(full(&node.path).as_ptr()));
+            for path in &changes.changed {
+                (api.notify_update)(instance, PCWSTR(full(path).as_ptr()));
             }
-            for (parent, ino, name) in &changes.gone {
-                if let Some(parent) = last.node(*parent) {
-                    let path = full(&join(&parent.path, name));
-                    (api.notify_delete)(instance, PCWSTR(path.as_ptr()), folder(&last, *ino));
-                }
+            for (path, folder) in &changes.gone {
+                (api.notify_delete)(instance, PCWSTR(full(path).as_ptr()), i32::from(*folder));
             }
-            for (parent, name) in &changes.new {
-                if let Some(parent) = now.node(*parent) {
-                    let path = join(&parent.path, name);
-                    let is_folder = now.at(&path).map_or(0, |(ino, _)| folder(&now, ino));
-                    (api.notify_create)(instance, PCWSTR(full(&path).as_ptr()), is_folder);
-                }
+            for (path, folder) in &changes.new {
+                (api.notify_create)(instance, PCWSTR(full(path).as_ptr()), i32::from(*folder));
             }
         }
-        last = now;
     }
 }
 

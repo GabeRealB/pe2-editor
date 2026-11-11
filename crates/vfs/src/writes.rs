@@ -562,14 +562,7 @@ impl Writes {
     #[must_use]
     pub fn list(&self, path: &str) -> BTreeMap<String, bool> {
         let tree = self.served.tree();
-        let mut out: BTreeMap<String, bool> = BTreeMap::new();
-        if let Some((_, node)) = tree.at(path)
-            && let What::Folder(children) = &node.what
-        {
-            for (name, ino) in children {
-                out.insert(name.clone(), matches!(tree.node(*ino).map(|n| &n.what), Some(What::Folder(_))));
-            }
-        }
+        let mut out: BTreeMap<String, bool> = tree.children(path).unwrap_or_default();
         let state = self.lock();
         let join = |name: &str| if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
         out.retain(|name, _| !state.hidden.contains_key(&join(name)));

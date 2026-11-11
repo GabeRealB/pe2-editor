@@ -284,7 +284,7 @@ impl DavFileSystem for Dav {
             if !matches!(node.what, What::File(_)) {
                 return Err(FsError::Forbidden);
             }
-            let meta = Meta::of(node);
+            let meta = Meta::of(&node);
             let open = self.served.opening();
             let file: Box<dyn DavFile> = Box::new(Opened { tree: tree.clone(), ino, meta, at: 0, _open: open });
             Ok(file)
@@ -312,14 +312,13 @@ impl DavFileSystem for Dav {
                 return Ok(stream);
             }
             let tree = self.served.tree();
-            let node = tree.node(find(&tree, path)?).ok_or(FsError::NotFound)?;
-            let What::Folder(children) = &node.what else { return Err(FsError::Forbidden) };
+            find(&tree, path)?;
+            let Some(children) = tree.entries(&rel(path)?) else { return Err(FsError::Forbidden) };
             let entries: Vec<FsResult<Box<dyn DavDirEntry>>> = children
-                .iter()
-                .filter_map(|(name, child)| {
-                    let meta = Meta::of(tree.node(*child)?);
-                    let entry: Box<dyn DavDirEntry> = Box::new(Entry { name: name.clone(), meta });
-                    Some(Ok(entry))
+                .into_iter()
+                .map(|(name, _, node)| {
+                    let entry: Box<dyn DavDirEntry> = Box::new(Entry { name, meta: Meta::of(&node) });
+                    Ok(entry)
                 })
                 .collect();
             let stream: FsStream<Box<dyn DavDirEntry>> = Box::pin(futures_util::stream::iter(entries));
@@ -336,7 +335,7 @@ impl DavFileSystem for Dav {
             }
             let tree = self.served.tree();
             let node = tree.node(find(&tree, path)?).ok_or(FsError::NotFound)?;
-            let meta: Box<dyn DavMetaData> = Box::new(Meta::of(node));
+            let meta: Box<dyn DavMetaData> = Box::new(Meta::of(&node));
             Ok(meta)
         })
     }

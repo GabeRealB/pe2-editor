@@ -251,18 +251,18 @@ fn provider<'a>(data: *const PRJ_CALLBACK_DATA) -> Option<(&'a PRJ_CALLBACK_DATA
 
 /// A node by the path Windows names it by (relative, `\`-separated), its names matched as Windows matches them where
 /// they are not the same.
-fn node_at(tree: &Tree, path: &str) -> Option<(u64, Node)> {
-    let mut ino = crate::ROOT;
+fn node_at(tree: &Tree, path: &str) -> Option<(u64, std::sync::Arc<Node>)> {
+    let mut walked = String::new();
     for step in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
-        ino = match tree.lookup(ino, step) {
-            Some(found) => found,
-            None => match &tree.node(ino)?.what {
-                What::Folder(children) => *children.iter().find(|(name, _)| name.eq_ignore_ascii_case(step))?.1,
-                What::File(_) => return None,
-            },
+        let join = |name: &str| if walked.is_empty() { name.to_string() } else { format!("{walked}/{name}") };
+        let exact = join(step);
+        walked = if tree.at(&exact).is_some() {
+            exact
+        } else {
+            join(tree.children(&walked)?.keys().find(|name| name.eq_ignore_ascii_case(step))?)
         };
     }
-    Some((ino, tree.node(ino)?.clone()))
+    tree.at(&walked)
 }
 
 /// A node as Windows is told it: a file read-only.
@@ -301,12 +301,10 @@ unsafe extern "system" fn start_listing(data: *const PRJ_CALLBACK_DATA, id: *con
     let Some(id) = (unsafe { id.as_ref() }) else { return NOT_FOUND };
     let tree = provider.served.tree();
     // A folder still on disk that the tree no longer has holds nothing more than what is on disk.
-    let children = match node_at(&tree, &text_of(data.FilePathName)) {
-        Some((_, Node { what: What::Folder(children), .. })) => children,
-        _ => std::collections::BTreeMap::new(),
-    };
+    let folder = node_at(&tree, &text_of(data.FilePathName));
+    let children = folder.and_then(|(_, folder)| tree.entries(&folder.path)).unwrap_or_default();
     let mut entries: Vec<(Vec<u16>, PRJ_FILE_BASIC_INFO)> =
-        children.iter().filter_map(|(name, ino)| Some((wide(name), basic(tree.node(*ino)?)))).collect();
+        children.iter().map(|(name, _, node)| (wide(name), basic(node))).collect();
     // In Windows' order of names, which is how it is listed.
     // SAFETY: two strings ended by zeros.
     entries.sort_by(|a, b| unsafe { (api.compare)(PCWSTR(a.0.as_ptr()), PCWSTR(b.0.as_ptr())) }.cmp(&0));

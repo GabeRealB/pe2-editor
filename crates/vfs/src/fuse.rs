@@ -476,16 +476,7 @@ impl Fuse {
         let children: Vec<(String, bool)> = if let Some(writes) = &self.writes {
             writes.list(path).into_iter().collect()
         } else {
-            let tree = self.served.tree();
-            match tree.at(path).map(|(_, n)| &n.what) {
-                Some(What::Folder(children)) => children
-                    .iter()
-                    .map(|(name, child)| {
-                        (name.clone(), matches!(tree.node(*child).map(|n| &n.what), Some(What::Folder(_))))
-                    })
-                    .collect(),
-                _ => return None,
-            }
+            self.served.tree().children(path)?.into_iter().collect()
         };
         let parent =
             if u64::from(ino) == ROOT { ROOT } else { self.served.ino(path.rsplit_once('/').map_or("", |(p, _)| p)) };
@@ -529,7 +520,9 @@ fn tell_kernel(
             let _ = file.set_modified(time);
         }
     };
-    let mut last = served.tree();
+    let mut from = served.changes_from_now();
+    let parent_of = |path: &str| path.rsplit_once('/').map_or("", |(parent, _)| parent).to_string();
+    let name_of = |path: &str| path.rsplit_once('/').map_or(path, |(_, name)| name).to_string();
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         // What is written through the mount, the kernel lets go of what it kept of at once; what changed in the tree
         // is looked for as often as before.
@@ -541,37 +534,65 @@ fn tell_kernel(
             }
             let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
         }
-        let now = served.tree();
-        if std::sync::Arc::ptr_eq(&last, &now) {
+        // What the kernel did itself (a program's write through the mount) it knows: what it is told again it ignores.
+        let Some(changes) = served.changes_since(&mut from) else {
+            eprintln!("more changed of what is served than is kept to tell of: the kernel may show some of it as it was for a while");
+            continue;
+        };
+        if changes.is_empty() {
             continue;
         }
-        // What the kernel did itself (a program's write through the mount) it knows: what it is told again it ignores.
-        let changes = crate::Tree::changes(&last, &now);
+        let tree = served.tree();
+        // The kernel knows a path by the number it was given for it: what it never asked of it keeps nothing of.
         let mut folders = std::collections::BTreeSet::new();
-        for ino in &changes.changed {
-            let _ = notifier.inval_inode(INodeNo(*ino), 0, 0);
-        }
-        for (parent, ino, name) in &changes.gone {
-            if notifier.delete(INodeNo(*parent), INodeNo(*ino), OsStr::new(name)).is_err() {
-                let _ = notifier.inval_entry(INodeNo(*parent), OsStr::new(name));
+        for path in &changes.changed {
+            if let Some(ino) = served.known(path) {
+                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
             }
-            folders.insert(*parent);
         }
-        for (parent, name) in &changes.new {
-            let _ = notifier.inval_entry(INodeNo(*parent), OsStr::new(name));
-            folders.insert(*parent);
+        for (path, _) in &changes.gone {
+            // It, and each folder above it that went with it - one a node's files made, gone with the last of them.
+            let mut gone = path.clone();
+            loop {
+                let above = parent_of(&gone);
+                let number = |path: &str| changes.numbers.get(path).copied().or_else(|| served.known(path));
+                if let Some(parent) = number(&above) {
+                    let told = number(&gone).map(|ino| notifier.delete(INodeNo(parent), INodeNo(ino), OsStr::new(&name_of(&gone))));
+                    if told.is_none_or(|told| told.is_err()) {
+                        let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name_of(&gone)));
+                    }
+                    folders.insert(above.clone());
+                }
+                if above.is_empty() || tree.at(&above).is_some() {
+                    break;
+                }
+                gone = above;
+            }
         }
-        for node in changes.changed.iter().filter_map(|ino| now.node(*ino)) {
-            touch(&node.path, node.modified);
+        for (path, _) in &changes.new {
+            // The name the kernel may have asked for and not found: this one, or that of the first folder above it
+            // that it does not know - made with it.
+            let mut new = path.clone();
+            while !new.is_empty() && served.known(&parent_of(&new)).is_none() {
+                new = parent_of(&new);
+            }
+            if let Some(parent) = served.known(&parent_of(&new)).filter(|_| !new.is_empty()) {
+                let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name_of(&new)));
+                folders.insert(parent_of(&new));
+            }
+        }
+        for (path, node) in changes.changed.iter().filter_map(|path| Some((path, tree.at(path)?.1))) {
+            touch(path, node.modified);
         }
         for folder in &folders {
             // What the kernel keeps of what the folder lists: let go of, whether or not it knew the name.
-            let _ = notifier.inval_inode(INodeNo(*folder), 0, 0);
+            if let Some(ino) = changes.numbers.get(folder).copied().or_else(|| served.known(folder)) {
+                let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
+            }
+            if tree.at(folder).is_some() {
+                touch(folder, SystemTime::now());
+            }
         }
-        for folder in folders.iter().filter_map(|ino| now.node(*ino)) {
-            touch(&folder.path, SystemTime::now());
-        }
-        last = now;
     }
 }
 
