@@ -1,11 +1,12 @@
 //! The server: the process serving a project as a filesystem (`pe2-cli project server`), and nothing else. It reads no
-//! index, no records, and loads no extension: whoever holds the project - an editor, a host (`host`) - lists what is
-//! served (`Index::served`) into a table both map into memory (`served`), each path with where its content lives,
-//! and names it here; the server serves each file from where the table says it is. What programs write through what it serves it sends to whoever holds the project, on the
-//! holder's link, as edits; where nothing holds it, a host is started to.
+//! index, no records, and loads no extension: whoever holds the project - an editor, a host (`host`) - says what is
+//! served (`Index::served`) in the filesystem the project's processes share (`shared`), each path with where its
+//! content lives, and says here that it did (`ToServer::Shown`); the server reads there what changed since it
+//! last read, and serves each file from where it is said to be. What programs write through what it serves it
+//! sends to whoever holds the project, on the holder's link, as edits; where nothing holds it, a host is started to.
 //!
-//! It serves from the first table it is named - until then its folder is as it was - and that connection
-//! feeds it until it ends: one feeder at a time, as one process holds the project at a time. A connection asking to
+//! It serves from the first time it is told what is served - until then its folder is as it was - and that
+//! connection feeds it until it ends: one feeder at a time, as one process holds the project at a time. A connection asking to
 //! keep it (`Keep`) is a lease while it stays open: the server stops a while after none is left, once no file is open
 //! in what it serves - what only looks at the folder keeps nothing.
 
@@ -19,8 +20,8 @@ use crate::role::{Link, Role};
 pub static ROLE: Role =
     Role { command: "server", socket: "server.sock", pipe: "pe2-server", lock: "server.lock", log: "server.log" };
 
-/// What is served of the project, by each path in the served folder (`Index::served`): what the holder sends the
-/// server.
+/// What is served of the project, by each path in the served folder (`Index::served`): what the holder says in
+/// the shared filesystem, and the server reads there.
 pub type Listing = std::collections::BTreeMap<String, Shown>;
 
 /// A path of what is served.
@@ -91,6 +92,21 @@ impl Delta {
         self.shown.extend(later.shown);
     }
 
+    /// Make a listing what it is after this, where a path gone goes with all that is under it and what is shown
+    /// comes after - as the tree served takes it (`shared::changed` says a change so).
+    pub fn apply_under(&self, listing: &mut Listing) {
+        for path in &self.gone {
+            let inside = format!("{path}/");
+            let under: Vec<String> =
+                listing.range(inside.clone()..).take_while(|(under, _)| under.starts_with(&inside)).map(|(under, _)| under.clone()).collect();
+            for under in under {
+                listing.remove(&under);
+            }
+            listing.remove(path);
+        }
+        listing.extend(self.shown.iter().map(|(path, it)| (path.clone(), it.clone())));
+    }
+
     /// Make a listing what it is after this.
     pub fn apply(&self, listing: &mut Listing) {
         for path in &self.gone {
@@ -106,14 +122,10 @@ impl Delta {
 pub enum ToServer {
     /// Keep serving while this connection lasts.
     Keep { who: String },
-    /// What is served, from whoever holds the project: the table of this generation, which it wrote (`served`) for
-    /// the server to map. The first is what it starts serving with; who names one feeds it from then on, until its
-    /// connection ends.
-    Table { generation: u64 },
-    /// What changed of what is served since the table it was named, and the changes after it: the paths shown anew
-    /// or otherwise, with where their content lives, and the paths gone. From who feeds it alone. What an edit
-    /// costs to serve then follows what it changed.
-    Changes { shown: Vec<(String, Shown)>, gone: Vec<String> },
+    /// What is served is said in the shared filesystem (`shared`), all of it or what changed since this was last
+    /// said, by whoever holds the project: read it there. The first is what it starts serving with; who says so
+    /// feeds it from then on, until its connection ends.
+    Shown,
     /// These files changed in the layers - an edit made by whoever holds the project - for what is read of them to
     /// follow at once.
     Changed { paths: Vec<std::path::PathBuf> },

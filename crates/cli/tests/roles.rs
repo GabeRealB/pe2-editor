@@ -362,7 +362,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     drop(shared);
     // One feeder at a time: what another process lists while the host feeds it is not taken.
     let mut other = project::server::ROLE.connect(&tried.project()).expect("the server listens");
-    let listed: FromServer = other.ask(&ToServer::Table { generation: 1 }).unwrap();
+    let listed: FromServer = other.ask(&ToServer::Shown).unwrap();
     assert_eq!(listed, FromServer::Fed { by: "pe2-cli".into() });
     assert_eq!(folder.read("notes/a.txt").as_deref(), Some("one"));
     // Stopped, both are gone.

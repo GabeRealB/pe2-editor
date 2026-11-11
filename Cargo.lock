@@ -1038,6 +1038,7 @@ dependencies = [
  "png",
  "project",
  "serde_json",
+ "sfs",
  "toml 0.8.23",
  "tracing",
  "vfs",
@@ -2767,7 +2768,6 @@ dependencies = [
  "notify",
  "pe2-ext",
  "project",
- "sfs",
  "tracing",
  "vfs",
 ]

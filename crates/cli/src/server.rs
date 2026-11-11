@@ -1,8 +1,8 @@
 //! `pe2-cli project server`: the process serving a project as a filesystem (`project::server`), and doing nothing
 //! else. It has no index, reads no records and loads no extension: whoever holds the project - an editor, a host -
-//! lists what is served into a table both map into memory (`project::served`) and names it, and it serves each file
-//! from where the table says its content lives. It starts serving with the first table; the connection that named it
-//! feeds it until it ends. What programs write
+//! says what is served in the filesystem the project's processes share (`project::shared`) and tells it that it
+//! did; it reads there what changed since it last read, and serves each file from where it is said to live. It
+//! starts serving the first time it is told; the connection that told it feeds it until it ends. What programs write
 //! through what it serves it sends to whoever holds the project as edits, a host started to hold it where nothing
 //! does. It is started by whoever wants the folder served - a host, the editor - and stops a while after nobody keeps
 //! it, once no file is open in what it serves: what only looks at the folder (a watcher, a file browser) keeps
@@ -25,6 +25,9 @@ const GRACE: Duration = Duration::from_secs(30);
 struct Server {
     project: Project,
     served: vfs::Served,
+    /// The space the project's processes share, attached for as long as it serves: what is served is said there
+    /// by whoever holds the project (`project::shared`).
+    shared: Arc<sfs::Space>,
     /// What it serves by, at which address where it serves at one, and what it does with what is not the project's.
     serving: &'static dyn vfs::backend::Backend,
     address: Option<std::net::SocketAddr>,
@@ -44,8 +47,10 @@ type Stamp = (std::time::SystemTime, u64);
 
 #[derive(Default)]
 struct State {
-    /// What it serves: the table its feeder last named, mapped.
-    table: Option<Arc<project::served::Table>>,
+    /// What it serves, as it last read it in the shared filesystem, and the commit it read it at - none before
+    /// the first.
+    listing: project::server::Listing,
+    seen: Option<u64>,
     /// The connection feeding it, and whose it is.
     feeder: Option<(u64, String)>,
     /// What it holds while it serves, from the first listing on.
@@ -70,9 +75,11 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let p = Project::load(directory)?;
     let (serving, address) = serving_of(&p, backend, address)?;
     let _one = ROLE.claim(&p.root)?;
+    let shared = project::shared::space(&p.root).context("the space the project's processes share")?;
     let server = Arc::new(Server {
         project: p.clone(),
         served: vfs::Served::default(),
+        shared,
         serving,
         address,
         strays,
@@ -175,7 +182,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Server {
     /// Read again what these files of the layers are to what is read of the project, where they changed since it
-    /// last did: its packs' listings. What its records hold it reads by the table it is named, not by them.
+    /// last did: its packs' listings. What its records hold it reads by what is said to be served, not by them.
     fn reread(&self, changed: &[std::path::PathBuf]) {
         let stamp = |path: &Path| {
             let meta = std::fs::metadata(path).ok()?;
@@ -195,24 +202,64 @@ impl Server {
         project::pack::reread_changed(&changed);
     }
 
-    /// What whoever holds the project lists as served, from the connection `from`: the table of this generation,
-    /// mapped and shown - and served, from the first on. Not taken from a second connection while one feeds it.
-    fn show(self: &Arc<Self>, (from, who): (u64, &str), generation: u64) -> FromServer {
+    /// Read what is served where whoever holds the project says it, in the shared filesystem: what the commits
+    /// since it last read did, or - the first time, and where those are no longer kept - all of it. The tree it
+    /// serves is changed by those paths, and its files read where they are said to live.
+    fn follow(&self, state: &mut State) -> Result<()> {
+        use project::server::Delta;
+        let read = self.shared.read()?;
+        let generation = read.commit().generation;
+        if state.seen == Some(generation) {
+            return Ok(());
+        }
+        let by_change = match state.seen {
+            Some(seen) => project::shared::changed(&read, seen, &state.listing)?,
+            None => None,
+        };
+        let delta = if let Some(delta) = by_change {
+            delta.apply_under(&mut state.listing);
+            delta
+        } else {
+            let listing = project::shared::listed(&read)?;
+            let delta = Delta::between(&state.listing, &listing);
+            let first = state.seen.is_none();
+            state.listing = listing;
+            if first {
+                project::content::serve_whole(&state.listing);
+                self.served.show(&state.listing);
+                state.seen = Some(generation);
+                return Ok(());
+            }
+            delta
+        };
+        state.seen = Some(generation);
+        if !delta.is_empty() {
+            let shown: Vec<_> = delta.shown.into_iter().collect();
+            let gone: Vec<String> = delta.gone.into_iter().collect();
+            project::content::serve_changed(&shown);
+            self.served.change(&shown, &gone);
+        }
+        Ok(())
+    }
+
+    /// Whoever holds the project says, on the connection `from`, that it said what is served: read, and served -
+    /// from the first time on. Not taken from a second connection while one feeds it.
+    fn show(self: &Arc<Self>, (from, who): (u64, &str)) -> FromServer {
         let mut state = lock(&self.state);
         if let Some((feeds, by)) = &state.feeder
             && *feeds != from
         {
             return FromServer::Fed { by: by.clone() };
         }
-        let table = match project::served::Table::map(&self.project.root, generation) {
-            Ok(table) => Arc::new(table),
-            Err(e) => return FromServer::Error { why: format!("the table of generation {generation}: {e}") },
-        };
+        if self.stopping.load(Ordering::Relaxed) && state.mounted.is_some() {
+            return FromServer::Stopping;
+        }
+        if let Err(e) = self.follow(&mut state) {
+            // What it cannot read it does not serve: said to who asked, and to its log.
+            println!("what is served could not be read in the shared filesystem: {e:#}");
+            return FromServer::Error { why: format!("what is served could not be read in the shared filesystem: {e:#}") };
+        }
         state.feeder = Some((from, who.to_string()));
-        // Read by it before it is shown: what it lists is read where it says.
-        project::content::serve_from(table.clone());
-        self.served.show(&table.listing());
-        state.table = Some(table);
         if state.mounted.is_none() {
             // Stopping, it serves no more: what it is listed now - what it gave the project as it ended, taken in -
             // is not mounted again.
@@ -232,23 +279,6 @@ impl Server {
                 }
             }
         }
-        FromServer::Serving { at: state.at.clone(), note: state.note.clone() }
-    }
-
-    /// What whoever feeds it says changed of what is served, since the table it named and the changes after it:
-    /// read by, and shown - the tree it serves changed by those paths, not made again.
-    fn change(&self, from: u64, shown: &[(String, project::server::Shown)], gone: &[String]) -> FromServer {
-        let state = lock(&self.state);
-        match &state.feeder {
-            Some((feeds, _)) if *feeds == from && state.mounted.is_some() => {}
-            Some((feeds, by)) if *feeds != from => return FromServer::Fed { by: by.clone() },
-            _ => return FromServer::Error { why: "it was named no table by this connection: all of it first".into() },
-        }
-        if self.stopping.load(Ordering::Relaxed) {
-            return FromServer::Stopping;
-        }
-        project::content::serve_changed(shown);
-        self.served.change(shown, gone);
         FromServer::Serving { at: state.at.clone(), note: state.note.clone() }
     }
 
@@ -570,8 +600,7 @@ fn connection(server: &Arc<Server>, id: u64, stream: interprocess::local_socket:
                 }
                 FromServer::Kept
             }
-            Ok(ToServer::Table { generation }) => server.show((id, &who), generation),
-            Ok(ToServer::Changes { shown, gone }) => server.change(id, &shown, &gone),
+            Ok(ToServer::Shown) => server.show((id, &who)),
             Ok(ToServer::Changed { paths }) => {
                 server.reread(&paths);
                 FromServer::Done

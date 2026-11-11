@@ -1,9 +1,10 @@
 //! The project served as a filesystem while something holds it, at its `assets` folder, by the backend this machine
 //! says (`project.local.toml`, `[filesystem] serve`) - by the server (`pe2-cli project server`, `project::server`),
 //! which the holder starts where none runs, keeps while it has the project and feeds: the holder has the project's
-//! only index, and the server serves what the holder lists of it (`Index::served`), written after each refresh as a
-//! table both map into memory (`project::served`) and named on the server's lease - by a thread of its own, so that
-//! the holder never waits on the server. It serves from the first listing on. What programs write through the folder reaches the holder on its
+//! only index, and the server serves what the holder lists of it (`Index::served`), said after each refresh in the
+//! filesystem the project's processes share (`project::shared`) - all of it the first time, then what changed -
+//! and the server told on its lease that it was said, by a thread of its own, so that the holder never waits on
+//! the server. It serves from the first listing on. What programs write through the folder reaches the holder on its
 //! link as edits (`mcp::Request::Edit`, `Edits`): the editor applies them between frames as steps of the session's
 //! log (`Workspace::apply_edit`), a host as steps of its history; the program waits for it, as an agent waits for its
 //! request.
@@ -40,20 +41,6 @@ enum Said {
     Whole(Arc<Listing>),
     /// What of it differs from what was said before.
     Changed(project::server::Delta),
-}
-
-impl Said {
-    /// The shared space what is served is said in, after something was asked of it: none once that failed, which
-    /// is said - nothing serves from it yet.
-    fn shared<E: std::fmt::Display>(asked: Result<Option<Arc<sfs::Space>>, E>) -> Option<Arc<sfs::Space>> {
-        match asked {
-            Ok(space) => space,
-            Err(e) => {
-                eprintln!("what is served is not said in the shared filesystem: {e}");
-                None
-            }
-        }
-    }
 }
 
 /// How long who made a change waits for the server to serve it.
@@ -221,22 +208,22 @@ fn strays_in(project: &project::Project) -> usize {
     serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
 }
 
-/// Send what is served to the server as it changes: to a lease that has none of it yet, all of it - written as a
-/// table the server maps (`project::served`) and named to it; after that, what changed since (`ToServer::Changes`).
-/// What the server is not kept for yet waits for it.
+/// Say what is served as it changes, and tell the server that it was said: in the filesystem the project's
+/// processes share (`project::shared`), all of it the first time - by what differs from what that holds, which is
+/// little where a holder before this one said it - and after that what changed; the server reads it there. What
+/// the server is not kept for yet waits for it.
 fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>) {
     use project::server::Delta;
-    // What is served now, as last said; the lease that has it, but for `unsent`; and what of it that lease has yet
-    // to be told - none where no lease has any of it.
+    let shared = project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
+    // What is served now, as last said; the lease that was told of all of it; and why it could not be said, once
+    // it could not.
     let mut current: Option<Listing> = None;
-    let mut has: Option<Arc<Mutex<Lease>>> = None;
-    let mut unsent: Option<Delta> = None;
-    // The files that changed since what was sent last, and who waits for what is said to be served: let go of -
-    // which tells them - once it is, or will not be.
+    let mut told: Option<Arc<Mutex<Lease>>> = None;
+    let mut untold = false;
+    let mut unsaid: Option<String> = shared.as_ref().err().cloned();
+    // The files that changed since the server was last told, and who waits for what is said to be served: let go
+    // of - which tells them - once it is, or will not be.
     let (mut changed, mut waiting) = (Vec::new(), Vec::new());
-    // What is served, said in the filesystem the project's processes share as well (`project::shared`); no more
-    // once that cannot take it, which is said.
-    let mut shared = Said::shared(project::shared::space(&project.root).map(Some));
     loop {
         let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(shown) => Some(shown),
@@ -244,33 +231,29 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         for shown in first.into_iter().chain(newest.try_iter()) {
-            let delta = match (shown.said, &mut current) {
-                (Said::Whole(listing), Some(before)) => {
+            let said = match (shown.said, &mut current, &shared) {
+                (Said::Whole(listing), Some(before), Ok(space)) => {
                     let delta = Delta::between(before, &listing);
                     *before = Arc::unwrap_or_clone(listing);
-                    delta
+                    if delta.is_empty() { Ok(()) } else { project::shared::say(space, &delta) }
                 }
-                (Said::Whole(listing), None) => {
+                (Said::Whole(listing), None, Ok(space)) => {
                     let _span = tracing::info_span!("served: said whole in the shared filesystem").entered();
-                    let said = shared.as_deref().map(|space| project::shared::say_whole(space, &listing));
-                    shared = Said::shared(said.transpose().map(|said| said.and(shared)));
+                    let said = project::shared::say_whole(space, &listing);
                     current = Some(Arc::unwrap_or_clone(listing));
-                    Delta::default()
+                    said
                 }
-                (Said::Changed(delta), Some(before)) => {
+                (Said::Changed(delta), Some(before), Ok(space)) => {
                     delta.apply(before);
-                    delta
+                    project::shared::say(space, &delta)
                 }
                 // Part of nothing: whoever holds the project says all of it first.
-                (Said::Changed(_), None) => Delta::default(),
+                (Said::Changed(_), None, _) | (_, _, Err(_)) => Ok(()),
             };
-            if !delta.is_empty() {
-                let said = shared.as_deref().map(|space| project::shared::say(space, &delta));
-                shared = Said::shared(said.transpose().map(|said| said.and(shared)));
+            if let Err(e) = said {
+                unsaid.get_or_insert(format!("what is served could not be said in the shared filesystem: {e}"));
             }
-            if let Some(unsent) = &mut unsent {
-                unsent.then(delta);
-            }
+            untold = true;
             changed.extend(shown.changed);
             waiting.extend(shown.served);
         }
@@ -280,52 +263,46 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
             Kept::Leased(lease, _) => lease.clone(),
             _ => continue,
         };
-        let Some(listing) = &current else { continue };
-        // A new lease (the server started again) has none of it.
-        if !has.as_ref().is_some_and(|has| Arc::ptr_eq(has, &lease)) {
-            (has, unsent) = (None, None);
+        if let Some(why) = &unsaid {
+            // Nothing is served that could not be said: the server reads it nowhere else.
+            let mut state = lock(state);
+            if matches!(&*state, Kept::Leased(now, _) if Arc::ptr_eq(now, &lease)) {
+                *state = Kept::Failed(why.clone(), 0);
+            }
+            continue;
         }
-        if unsent.as_ref().is_some_and(Delta::is_empty) && changed.is_empty() {
+        if current.is_none() {
+            continue;
+        }
+        // A new lease (the server started again) was told nothing.
+        if !told.as_ref().is_some_and(|told| Arc::ptr_eq(told, &lease)) {
+            (told, untold) = (None, true);
+        }
+        if !untold && changed.is_empty() {
             continue;
         }
         // What changed in the layers first: what it reads of the files listed is read again before they are served.
         if !changed.is_empty() {
             let _ = lock(&lease).tell(&ToServer::Changed { paths: std::mem::take(&mut changed) });
         }
-        let root = &project.root;
-        let mut written = None;
-        let told = if let Some(delta) = &unsent {
-            let shown = delta.shown.iter().map(|(path, it)| (path.clone(), it.clone())).collect();
-            let _span = tracing::info_span!("served: server told what changed").entered();
-            lock(&lease).tell(&ToServer::Changes { shown, gone: delta.gone.iter().cloned().collect() })
-        } else {
-            // All of it: the table, written for the server to map, then named.
-            let generation = project::served::next_generation(root);
-            written = Some(generation);
-            match project::served::write(root, generation, listing) {
-                Ok(()) => lock(&lease).tell(&ToServer::Table { generation }),
-                Err(e) => Err(anyhow::Error::new(e).context("writing the table of what is served")),
-            }
+        let answered = {
+            let _span = tracing::info_span!("served: server told it was said").entered();
+            lock(&lease).tell(&ToServer::Shown)
         };
-        let failed = match told {
+        let failed = match answered {
             Ok(FromServer::Serving { at, note }) => {
                 if let Kept::Leased(now, serving) = &mut *lock(state)
                     && Arc::ptr_eq(now, &lease)
                 {
                     *serving = Some((at, note));
                 }
-                (has, unsent) = (Some(lease), Some(Delta::default()));
-                // The tables before the one it has are nobody's any more.
-                if let Some(generation) = written {
-                    project::served::remove_before(root, generation);
-                }
+                (told, untold) = (Some(lease), false);
                 continue;
             }
+            // Whoever held the project before feeds it still, its connection yet to end: told again in a moment.
+            Ok(FromServer::Fed { .. }) => None,
             // It does not serve - over what is in the folder that is not the project's, most likely - or is gone.
-            Ok(FromServer::Error { why }) if written.is_some() => Some(why),
-            // Whoever held the project before feeds it still, its connection yet to end; or what changed was not
-            // taken, it having no table of this lease: all of it, in a moment.
-            Ok(FromServer::Fed { .. } | FromServer::Error { .. }) => None,
+            Ok(FromServer::Error { why }) => Some(why),
             Ok(other) => Some(format!("the server answered {other:?}")),
             Err(e) => Some(format!("the server serving it stopped ({e:#})")),
         };
@@ -335,6 +312,6 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                 *state = Kept::Failed(why, strays_in(project));
             }
         }
-        (has, unsent) = (None, None);
+        (told, untold) = (None, true);
     }
 }

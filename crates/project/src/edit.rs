@@ -896,6 +896,8 @@ mod tests {
         history: History,
         /// What is served, as the processes of a project share it: told every change, and held to the listing.
         shared: sfs::Space,
+        /// What the server would serve: what it read there at a commit, brought on by what the commits since did.
+        follows: (u64, crate::server::Listing),
         _lock: Lock,
     }
 
@@ -910,7 +912,11 @@ mod tests {
         let mut txn = shared.write().unwrap();
         crate::shared::show_whole(&mut txn, &index.served(), 0).unwrap();
         txn.commit().unwrap();
-        Open { project, index, history, shared, _lock: lock }
+        let follows = {
+            let read = shared.read().unwrap();
+            (read.commit().generation, crate::shared::listed(&read).unwrap())
+        };
+        Open { project, index, history, shared, follows, _lock: lock }
     }
 
     /// A listing with no times in it: the shared filesystem keeps a file's time from going back.
@@ -947,6 +953,16 @@ mod tests {
                 let said = crate::shared::listed(&self.shared.read().unwrap()).unwrap();
                 assert_eq!(untimed(said), untimed(whole), "what the shared filesystem says is served");
             }
+            // And who follows it by what its commits did - as the server does - has what it lists whole.
+            let read = self.shared.read().unwrap();
+            let (seen, mut follows) = std::mem::take(&mut self.follows);
+            match crate::shared::changed(&read, seen, &follows).unwrap() {
+                Some(delta) => delta.apply_under(&mut follows),
+                None => follows = crate::shared::listed(&read).unwrap(),
+            }
+            assert_eq!(follows, crate::shared::listed(&read).unwrap(), "what is served, followed by change");
+            self.follows = (read.commit().generation, follows);
+            drop(read);
             // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
             // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and
             // writes that, which one indexed already never does.

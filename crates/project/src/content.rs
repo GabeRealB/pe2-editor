@@ -92,32 +92,39 @@ fn held(path: &Path) -> Option<Form> {
     })
 }
 
-/// The table of what is served that this process reads files by (`serve_from`), where it does.
-static TABLE: RwLock<Option<Arc<crate::served::Table>>> = RwLock::new(None);
+/// Where the files this process serves live, by where a layer holds each - those that are not files there, but a
+/// record's text or kept in a store (`serve_whole`, `serve_changed`): none where this process serves nothing.
+static SERVED: RwLock<Option<std::collections::HashMap<PathBuf, Lives>>> = RwLock::new(None);
 
-/// Read the files a project's records hold by this table from now on, in this process: what serves a project's
-/// folder knows where each file's content lives from what whoever holds the project listed, and reads no records
-/// of its own. In place of the table it read by before.
-pub fn serve_from(table: Arc<crate::served::Table>) {
-    let mut reading = TABLE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    *CHANGED.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *reading = Some(table);
+/// Where a file's content lives, and when it changed.
+type Lives = (crate::server::Source, (u64, u32));
+
+/// Read the files a project's records hold as this listing says from now on, in this process: what serves a
+/// project's folder knows where each file's content lives from what whoever holds the project says is served, and
+/// reads no records of its own. In place of what it read by before.
+pub fn serve_whole(listing: &crate::server::Listing) {
+    let mut lives = std::collections::HashMap::new();
+    for shown in listing.values() {
+        if let crate::server::Shown::File { disk, modified, source, .. } = shown
+            && *source != crate::server::Source::Disk
+        {
+            lives.insert(disk.clone(), (source.clone(), *modified));
+        }
+    }
+    *SERVED.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lives);
 }
 
-/// Where the files that changed since the table this process reads by live now, by where a layer holds each
-/// (`serve_changed`): asked before the table.
-static CHANGED: RwLock<Option<std::collections::HashMap<PathBuf, Changed>>> = RwLock::new(None);
-
-/// Where a file's content lives now, and when it changed.
-type Changed = (crate::server::Source, (u64, u32));
-
-/// Read these files as listed now, where they changed since the table this process reads by was written.
+/// Read these files as listed now, where they changed since what this process reads by was said.
 pub fn serve_changed(shown: &[(String, crate::server::Shown)]) {
-    let mut changed = CHANGED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let changed = changed.get_or_insert_default();
+    let mut lives = SERVED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lives = lives.get_or_insert_default();
     for (_, shown) in shown {
         if let crate::server::Shown::File { disk, modified, source, .. } = shown {
-            changed.insert(disk.clone(), (source.clone(), *modified));
+            if *source == crate::server::Source::Disk {
+                lives.remove(disk);
+            } else {
+                lives.insert(disk.clone(), (source.clone(), *modified));
+            }
         }
     }
 }
@@ -153,28 +160,13 @@ fn record_text(record: &Path, name: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-/// A file's content as what this process reads by says where it lives - what changed since its table, then the
-/// table; none where it reads by none, or the file is where a layer holds it, as it is.
+/// A file's content as what this process serves by says where it lives; none where it serves by nothing, or the
+/// file is where a layer holds it, as it is.
 fn listed(path: &Path) -> Option<io::Result<Form>> {
-    use crate::served::{From, Is};
     use crate::server::Source;
-    let since = CHANGED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let changed = since.as_ref().and_then(|changed| changed.get(path)).cloned();
-    drop(since);
-    let (source, modified) = if let Some(changed) = changed {
-        changed
-    } else {
-        let table = TABLE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
-        let Is::File { source, modified, .. } = table.held_at(&path.to_string_lossy())?.is else { return None };
-        let source = match source {
-            From::Disk => Source::Disk,
-            From::RecordText { record, name } => {
-                Source::RecordText { record: PathBuf::from(record), name: name.to_string() }
-            }
-            From::Stored { sha1, store } => Source::Stored { sha1: sha1.to_string(), store: PathBuf::from(store) },
-        };
-        (source, modified)
-    };
+    let lives = SERVED.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (source, modified) = lives.as_ref()?.get(path).cloned()?;
+    drop(lives);
     let modified = std::time::UNIX_EPOCH + std::time::Duration::new(modified.0, modified.1);
     match source {
         Source::Disk => None,

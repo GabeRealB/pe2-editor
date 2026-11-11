@@ -267,7 +267,7 @@ impl Tree {
         );
     }
 
-    /// Change the tree by what whoever holds the project lists as changed (`ToServer::Changes`): the paths gone
+    /// Change the tree by what whoever holds the project says changed (`project::shared::changed`): the paths gone
     /// taken out with what is in them, the paths shown made or made anew - a file's time kept from going back, as
     /// `keep_times` does for a tree made whole. What it costs follows what changed, not what the tree holds.
     pub fn change(

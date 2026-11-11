@@ -17,6 +17,7 @@ tracing.workspace = true
 pe2-ext.workspace = true
 codecs.workspace = true
 project.workspace = true
+sfs.workspace = true
 mcp.workspace = true
 holder.workspace = true
 extensions.workspace = true

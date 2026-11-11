@@ -1,8 +1,8 @@
 //! What is served of a project, kept in the filesystem its processes share (`sfs::fs::SERVED`): whoever holds the
 //! project says there what it serves - all of it where the shared space holds none of it (`show_whole`), and after
 //! an edit what the edit changed (`show`, of `Index::serve_changed`) - for whoever serves the folder to read with
-//! no word from the holder. Nothing reads it there yet: the server is still told by the holder what it serves
-//! (`server::ToServer`), and this is said beside that.
+//! no word from the holder but that it did (`server::ToServer::Shown`): the server reads what changed since it
+//! last read (`changed`), or all of it (`listed`).
 //!
 //! A listing's path is a folder or a file of that filesystem. A project node is a folder that says so (`NODE`);
 //! a folder a node's files made, no entry of its own, says that (`OF_FILES`) and goes with the last of what is in
@@ -273,6 +273,21 @@ pub fn show_whole(txn: &mut Txn<'_>, listing: &Listing, now: u64) -> Result<()> 
     show(txn, &Delta::between(&held, listing), now)
 }
 
+/// What a node of the shared filesystem is to a listing: an entry, or - a folder a node's files made - none.
+fn entry(node: &Node) -> Option<Shown> {
+    if node.folder {
+        return match node.flags {
+            flags if flags & NODE != 0 => Some(Shown::Node),
+            flags if flags & OF_FILES != 0 => None,
+            _ => Some(Shown::Folder),
+        };
+    }
+    let Bytes::Derived(said) = &node.bytes else { return None };
+    let (disk, source) = placed(said)?;
+    let modified = (node.modified / 1_000_000_000, u32::try_from(node.modified % 1_000_000_000).unwrap_or(0));
+    Some(Shown::File { disk, size: node.len, modified, of_files: node.flags & OF_FILES != 0, source })
+}
+
 /// What the shared filesystem says is served, as a listing: each folder that is an entry, each node, each file
 /// with where its content lives - its time as the filesystem has it, which never goes back.
 ///
@@ -280,7 +295,13 @@ pub fn show_whole(txn: &mut Txn<'_>, listing: &Listing, now: u64) -> Result<()> 
 /// The shared space is damaged.
 pub fn listed(pages: &impl Pages) -> Result<Listing> {
     let mut listing = Listing::new();
-    let mut folders = vec![(ROOT, String::new())];
+    under(pages, ROOT, "", &mut |path, shown| drop(listing.insert(path, shown)))?;
+    Ok(listing)
+}
+
+/// Each entry under a folder of the shared filesystem, by its path.
+fn under(pages: &impl Pages, folder: u64, path: &str, each: &mut dyn FnMut(String, Shown)) -> Result<()> {
+    let mut folders = vec![(folder, path.to_owned())];
     while let Some((number, path)) = folders.pop() {
         let mut inside = Vec::new();
         fs::list(pages, SERVED, number, None, &mut |name, number| {
@@ -290,22 +311,92 @@ pub fn listed(pages: &impl Pages) -> Result<Listing> {
         for (name, number) in inside {
             let Some(node) = fs::node(pages, SERVED, number)? else { continue };
             let path = if path.is_empty() { name } else { format!("{path}/{name}") };
+            if let Some(shown) = entry(&node) {
+                each(path.clone(), shown);
+            }
             if node.folder {
-                if node.flags & NODE != 0 {
-                    listing.insert(path.clone(), Shown::Node);
-                } else if node.flags & OF_FILES == 0 {
-                    listing.insert(path.clone(), Shown::Folder);
-                }
                 folders.push((number, path));
-            } else if let Bytes::Derived(said) = &node.bytes
-                && let Some((disk, source)) = placed(said)
-            {
-                let modified = (node.modified / 1_000_000_000, u32::try_from(node.modified % 1_000_000_000).unwrap_or(0));
-                listing.insert(path, Shown::File { disk, size: node.len, modified, of_files: node.flags & OF_FILES != 0, source });
             }
         }
     }
-    Ok(listing)
+    Ok(())
+}
+
+/// What differs of what is served from a listing of it read at an earlier commit, by what the commits after that
+/// one did (`fs::changes`): what it costs follows what changed. None where those changes are no longer kept - who
+/// asks lists it whole (`listed`).
+///
+/// # Errors
+/// The shared space is damaged.
+pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Option<Delta>> {
+    let mut since = Vec::new();
+    if !fs::changes(pages, SERVED, after, &mut |_, change| {
+        since.push(change);
+        true
+    })? {
+        return Ok(None);
+    }
+    let mut delta = Delta::default();
+    let join = |folder: &str, name: &str| if folder.is_empty() { name.to_owned() } else { format!("{folder}/{name}") };
+    // A path is listed no more, with what the listing - and what was shown since - has under it.
+    let gone = |delta: &mut Delta, path: &str| {
+        let inside = format!("{path}/");
+        let listed = listing.range(inside.clone()..).take_while(|(under, _)| under.starts_with(&inside));
+        delta.gone.extend(listed.map(|(under, _)| under.clone()));
+        delta.gone.insert(path.to_owned());
+        delta.shown.retain(|shown, _| shown != path && !shown.starts_with(&inside));
+    };
+    for change in since {
+        let now = match change.what {
+            fs::What::Gone => None,
+            fs::What::Made | fs::What::Changed | fs::What::Moved { .. } => fs::node(pages, SERVED, change.number)?,
+        };
+        if let fs::What::Moved { from, was } = &change.what
+            && let Some(folder) = fs::path(pages, SERVED, *from)?
+        {
+            gone(&mut delta, &join(&folder, was));
+        }
+        // Where it is now - or, gone, was: what is gone with the folder it was in is said by that folder's going.
+        let Some(folder) = fs::path(pages, SERVED, now.as_ref().map_or(change.parent, |node| node.parent))? else { continue };
+        let Some(node) = now else {
+            gone(&mut delta, &join(&folder, &change.name));
+            continue;
+        };
+        let path = join(&folder, &node.name);
+        match entry(&node) {
+            Some(shown) => {
+                delta.gone.remove(&path);
+                if matches!(change.what, fs::What::Moved { .. }) && node.folder {
+                    under(pages, change.number, &path, &mut |path, shown| {
+                        delta.gone.remove(&path);
+                        delta.shown.insert(path, shown);
+                    })?;
+                }
+                delta.shown.insert(path, shown);
+            }
+            // An entry no more, but there for the files still in it: those are shown as they are, after it went.
+            None if listing.contains_key(&path) || delta.shown.contains_key(&path) => {
+                gone(&mut delta, &path);
+                under(pages, change.number, &path, &mut |path, shown| {
+                    delta.gone.remove(&path);
+                    delta.shown.insert(path, shown);
+                })?;
+            }
+            None => {}
+        }
+    }
+    // What is as the listing has it already is no change - but where it, or a folder above it, went first.
+    let went = |path: &str| {
+        let mut at = Some(path);
+        std::iter::from_fn(|| {
+            let now = at?;
+            at = now.rsplit_once('/').map(|(above, _)| above);
+            Some(now)
+        })
+        .any(|path| delta.gone.contains(path))
+    };
+    delta.shown.retain(|path, shown| went(path) || listing.get(path) != Some(&*shown));
+    Ok(Some(delta))
 }
 
 #[cfg(test)]
@@ -332,10 +423,25 @@ mod tests {
         ])
     }
 
+    /// Say what differs between two listings - and hold who follows by change to it: a listing read before,
+    /// brought on by what the commits since did, is what is listed whole.
     fn told(space: &Space, before: &Listing, now: &Listing, at: u64) {
+        let (seen, mut follows) = {
+            let read = space.read().unwrap();
+            (read.commit().generation, listed(&read).unwrap())
+        };
         let mut txn = space.write().unwrap();
         show(&mut txn, &Delta::between(before, now), at).unwrap();
         txn.commit().unwrap();
+        let read = space.read().unwrap();
+        let delta = changed(&read, seen, &follows).unwrap().expect("the changes are kept");
+        // As the server's tree takes it: what is gone goes with what is under it, then what is shown is put.
+        for path in &delta.gone {
+            let inside = format!("{path}/");
+            follows.retain(|under, _| under != path && !under.starts_with(&inside));
+        }
+        follows.extend(delta.shown.clone());
+        assert_eq!(follows, listed(&read).unwrap(), "followed by change: {delta:?}");
     }
 
     #[test]
