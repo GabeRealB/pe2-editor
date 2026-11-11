@@ -2767,6 +2767,7 @@ dependencies = [
  "notify",
  "pe2-ext",
  "project",
+ "sfs",
  "tracing",
  "vfs",
 ]

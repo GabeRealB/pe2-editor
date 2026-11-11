@@ -27,6 +27,7 @@ pub mod schedule;
 pub mod served;
 pub mod server;
 pub mod setup;
+pub mod shared;
 pub mod stack;
 pub mod storage;
 pub mod store;

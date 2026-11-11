@@ -894,6 +894,8 @@ mod tests {
         project: Project,
         index: Index,
         history: History,
+        /// What is served, as the processes of a project share it: told every change, and held to the listing.
+        shared: sfs::Space,
         _lock: Lock,
     }
 
@@ -903,7 +905,22 @@ mod tests {
         let cache = Cache::open(&project, &lock).unwrap();
         let index = Index::open(&project, &cache).unwrap();
         let (history, _) = History::open(&cache).unwrap();
-        Open { project, index, history, _lock: lock }
+        // What it serves, said whole in a shared filesystem of this test's own.
+        let shared = sfs::Space::private().unwrap();
+        let mut txn = shared.write().unwrap();
+        crate::shared::show_whole(&mut txn, &index.served(), 0).unwrap();
+        txn.commit().unwrap();
+        Open { project, index, history, shared, _lock: lock }
+    }
+
+    /// A listing with no times in it: the shared filesystem keeps a file's time from going back.
+    fn untimed(mut listing: crate::server::Listing) -> crate::server::Listing {
+        for shown in listing.values_mut() {
+            if let crate::server::Shown::File { modified, .. } = shown {
+                *modified = (0, 0);
+            }
+        }
+        listing
     }
 
     impl Open {
@@ -912,13 +929,23 @@ mod tests {
         fn refresh(&mut self, paths: &[PathBuf]) {
             let mut listing = self.index.served();
             let refreshed = self.index.refresh(&self.project, paths).unwrap();
-            if !refreshed.project_file {
+            if refreshed.project_file {
+                let mut txn = self.shared.write().unwrap();
+                crate::shared::show_whole(&mut txn, &self.index.served(), 0).unwrap();
+                txn.commit().unwrap();
+            } else {
                 let delta = self.index.serve_changed(&mut listing, &refreshed);
                 let whole = self.index.served();
                 assert_eq!(listing, whole, "what is served, kept by change, is what is served listed whole");
                 // And what it says differs is no more than does.
                 assert!(delta.shown.iter().all(|(path, it)| whole.get(path) == Some(it)));
                 assert!(delta.gone.iter().all(|path| !whole.contains_key(path)));
+                // And the shared filesystem, told the same change, says what is served listed whole.
+                let mut txn = self.shared.write().unwrap();
+                crate::shared::show(&mut txn, &delta, 0).unwrap();
+                txn.commit().unwrap();
+                let said = crate::shared::listed(&self.shared.read().unwrap()).unwrap();
+                assert_eq!(untimed(said), untimed(whole), "what the shared filesystem says is served");
             }
             // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
             // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and

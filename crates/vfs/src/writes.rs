@@ -252,10 +252,11 @@ impl Writes {
         log: sfs::log::Config,
         pace: Pace,
     ) -> io::Result<Writes> {
-        // Emptied, but the log: whoever holds the project may have it open, and nothing of it is read again - what
-        // it held for an earlier serving is let go of.
         std::fs::create_dir_all(dir)?;
-        for entry in std::fs::read_dir(dir)?.flatten().filter(|entry| entry.file_name() != LOG) {
+        // Emptied of what a serving before this one staged - but the log and the space the project's processes
+        // share, which whoever holds the project may have open.
+        let shared = |name: &std::ffi::OsStr| name == LOG || name == project::shared::SPACE;
+        for entry in std::fs::read_dir(dir)?.flatten().filter(|entry| !shared(&entry.file_name())) {
             let path = entry.path();
             let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         }

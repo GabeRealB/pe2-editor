@@ -2,14 +2,14 @@
 //!
 //! - `names`: a folder's number and a name, to the number of what has that name there - a lookup one descent, a
 //!   listing one range, a folder renamed one key, whatever is inside it. And the same with the name folded, to
-//!   the name as it is written: what a system that ignores case looks names up through.
+//!   the names written so there, each with its number: what a system that ignores case looks names up through.
 //! - `nodes`: a number to what has it - a folder or a file, its length, when it changed, a version that goes up
 //!   with every change of its bytes, flags its consumers give meaning to, the folder it is in and its name there,
 //!   and where its bytes are: in the node itself, a file on disk, ranges of the log, or what its consumer derives
 //!   them from. Numbers are given once and never again: they are what a system knows a file by.
 //! - `changes`: what each commit made, changed, moved and took away, with who did it - what tells a kernel, a
-//!   watcher or a holder what to look at again without comparing trees. Kept to a length: who has read up to
-//!   before what it still holds takes the tree whole (`changes` says so).
+//!   watcher or a holder what to look at again without comparing trees. Kept to a length - and of one commit,
+//!   to half of it: who has read up to before what it still holds takes the tree whole (`changes` says so).
 //!
 //! Several such filesystems share a space, each in trees of its own (`Trees`).
 
@@ -286,14 +286,25 @@ pub fn lookup(pages: &impl Pages, trees: Trees, folder: u64, name: &str) -> Resu
     }
 }
 
-/// What a folder has under a name whatever its case: the name as it is written, and its number.
+/// The names a folder has that fold to one, each with its number, as the folded tree's value holds them.
+fn folded_names(pages: &impl Pages, value: &[u8]) -> Result<Vec<(String, u64)>> {
+    let mut value = Reader(value);
+    let mut names = Vec::new();
+    while !value.0.is_empty() {
+        let read = (|| Some((value.text()?, value.u64()?)))();
+        names.push(read.ok_or_else(|| pages.damaged("the names of a filesystem that fold to one are not whole".into()))?);
+    }
+    Ok(names)
+}
+
+/// What a folder has under a name whatever its case: the name as it is written, and its number - the first of
+/// them, where several differ by case alone.
 ///
 /// # Errors
 /// The space is damaged.
 pub fn lookup_folded(pages: &impl Pages, trees: Trees, folder: u64, name: &str) -> Result<Option<(String, u64)>> {
-    let Some(written) = tree::get(pages, trees.folded, &name_key(folder, &folded(name)))? else { return Ok(None) };
-    let written = String::from_utf8(written).map_err(|_| pages.damaged("a folded name leads to none".into()))?;
-    Ok(lookup(pages, trees, folder, &written)?.map(|number| (written, number)))
+    let Some(value) = tree::get(pages, trees.folded, &name_key(folder, &folded(name)))? else { return Ok(None) };
+    Ok(folded_names(pages, &value)?.into_iter().next())
 }
 
 /// What has a number; none where nothing does.
@@ -385,10 +396,16 @@ fn note(txn: &mut Txn<'_>, trees: Trees, kept: &mut Kept, change: &Change) -> Re
         kept.generation = txn.generation();
         kept.noted = 0;
     }
+    kept.noted += 1;
+    if u64::from(kept.noted) > KEPT / 2 {
+        // One commit that changes this much is not followed change by change: who is before it takes the tree
+        // whole.
+        kept.floor = kept.generation;
+        return Ok(());
+    }
     let mut key = kept.generation.to_be_bytes().to_vec();
     key.extend_from_slice(&kept.noted.to_be_bytes());
     tree::put(txn, trees.changes, &key, &change.written())?;
-    kept.noted += 1;
     kept.changes += 1;
     if kept.changes > KEPT {
         // The oldest half goes, whole generations of it: who had read up to before them takes the tree whole.
@@ -411,7 +428,7 @@ fn note(txn: &mut Txn<'_>, trees: Trees, kept: &mut Kept, change: &Change) -> Re
             kept.changes -= 1;
         }
         if let Some(generation) = oldest.last().and_then(|key| key.first_chunk::<8>()) {
-            kept.floor = u64::from_be_bytes(*generation);
+            kept.floor = kept.floor.max(u64::from_be_bytes(*generation));
         }
     }
     Ok(())
@@ -445,35 +462,42 @@ fn put_node(txn: &mut Txn<'_>, trees: Trees, number: u64, node: &Node) -> Result
     tree::put(txn, trees.nodes, &number.to_be_bytes(), &node.written())
 }
 
+/// Say, or say no more (`number` none), that a folder has a name, among the names there that fold to the same.
+fn fold_name(txn: &mut Txn<'_>, trees: Trees, folder: u64, name: &str, number: Option<u64>) -> Result<()> {
+    let key = name_key(folder, &folded(name));
+    let mut names = match tree::get(txn, trees.folded, &key)? {
+        Some(value) => folded_names(txn, &value)?,
+        None => Vec::new(),
+    };
+    names.retain(|(written, _)| written != name);
+    if let Some(number) = number {
+        names.push((name.to_owned(), number));
+    }
+    if names.is_empty() {
+        tree::remove(txn, trees.folded, &key)?;
+        return Ok(());
+    }
+    let mut value = Vec::new();
+    for (written, number) in &names {
+        text(&mut value, written.as_bytes());
+        value.extend_from_slice(&number.to_le_bytes());
+    }
+    tree::put(txn, trees.folded, &key, &value)
+}
+
 fn put_name(txn: &mut Txn<'_>, trees: Trees, folder: u64, name: &str, number: u64) -> Result<()> {
     tree::put(txn, trees.names, &name_key(folder, name), &number.to_be_bytes())?;
-    tree::put(txn, trees.folded, &name_key(folder, &folded(name)), name.as_bytes())
+    fold_name(txn, trees, folder, name, Some(number))
 }
 
 fn take_name(txn: &mut Txn<'_>, trees: Trees, folder: u64, name: &str) -> Result<()> {
     tree::remove(txn, trees.names, &name_key(folder, name))?;
-    let fold = folded(name);
-    let key = name_key(folder, &fold);
-    if tree::get(txn, trees.folded, &key)?.is_some_and(|written| written == name.as_bytes()) {
-        // Another name there may fold to the same: it is what that leads to now.
-        let mut other = None;
-        list(txn, trees, folder, None, &mut |written, _| {
-            if folded(written) == fold {
-                other = Some(written.to_owned());
-            }
-            other.is_none()
-        })?;
-        match other {
-            Some(other) => tree::put(txn, trees.folded, &key, other.as_bytes())?,
-            None => drop(tree::remove(txn, trees.folded, &key)?),
-        }
-    }
-    Ok(())
+    fold_name(txn, trees, folder, name, None)
 }
 
 /// A folder to put something into under a name: there, a folder, and with nothing of that name.
 fn free_in(txn: &Txn<'_>, trees: Trees, folder: u64, name: &str) -> Result<()> {
-    if name.is_empty() || name.contains('/') || name.len() > tree::KEY - 8 {
+    if name.is_empty() || name.contains(['/', '\0']) || name.len() > tree::KEY - 8 {
         return Err(invalid("no name a filesystem holds"));
     }
     if !node(txn, trees, folder)?.is_some_and(|node| node.folder) {
@@ -756,6 +780,35 @@ mod tests {
         })
         .unwrap());
         assert_eq!(all, 5);
+    }
+
+    #[test]
+    fn a_commit_that_changes_very_much_is_not_followed_change_by_change() {
+        let space = Space::private().unwrap();
+        let mut txn = space.write().unwrap();
+        let first = make(&mut txn, SERVED, &folder(ROOT, "first"), 1).unwrap();
+        txn.commit().unwrap();
+        let before = space.read().unwrap().commit().generation;
+        let mut txn = space.write().unwrap();
+        for n in 0..6000 {
+            make(&mut txn, SERVED, &file(first, &format!("{n}"), b""), 1).unwrap();
+        }
+        txn.commit().unwrap();
+        let after = space.read().unwrap().commit().generation;
+        let mut txn = space.write().unwrap();
+        make(&mut txn, SERVED, &folder(ROOT, "later"), 1).unwrap();
+        txn.commit().unwrap();
+        let read = space.read().unwrap();
+        let mut count = 0;
+        // Before it: the tree whole. After it: what came after.
+        assert!(!changes(&read, SERVED, before, &mut |_, _| true).unwrap());
+        assert!(changes(&read, SERVED, after, &mut |_, _| {
+            count += 1;
+            true
+        })
+        .unwrap());
+        assert_eq!(count, 1);
+        assert!(Kept::of(&read, SERVED).unwrap().changes <= KEPT / 2 + 2);
     }
 
     #[test]

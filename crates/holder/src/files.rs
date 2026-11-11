@@ -42,6 +42,20 @@ enum Said {
     Changed(project::server::Delta),
 }
 
+impl Said {
+    /// The shared space what is served is said in, after something was asked of it: none once that failed, which
+    /// is said - nothing serves from it yet.
+    fn shared<E: std::fmt::Display>(asked: Result<Option<Arc<sfs::Space>>, E>) -> Option<Arc<sfs::Space>> {
+        match asked {
+            Ok(space) => space,
+            Err(e) => {
+                eprintln!("what is served is not said in the shared filesystem: {e}");
+                None
+            }
+        }
+    }
+}
+
 /// How long who made a change waits for the server to serve it.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -220,6 +234,9 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
     // The files that changed since what was sent last, and who waits for what is said to be served: let go of -
     // which tells them - once it is, or will not be.
     let (mut changed, mut waiting) = (Vec::new(), Vec::new());
+    // What is served, said in the filesystem the project's processes share as well (`project::shared`); no more
+    // once that cannot take it, which is said.
+    let mut shared = Said::shared(project::shared::space(&project.root).map(Some));
     loop {
         let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(shown) => Some(shown),
@@ -234,6 +251,9 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                     delta
                 }
                 (Said::Whole(listing), None) => {
+                    let _span = tracing::info_span!("served: said whole in the shared filesystem").entered();
+                    let said = shared.as_deref().map(|space| project::shared::say_whole(space, &listing));
+                    shared = Said::shared(said.transpose().map(|said| said.and(shared)));
                     current = Some(Arc::unwrap_or_clone(listing));
                     Delta::default()
                 }
@@ -244,6 +264,10 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
                 // Part of nothing: whoever holds the project says all of it first.
                 (Said::Changed(_), None) => Delta::default(),
             };
+            if !delta.is_empty() {
+                let said = shared.as_deref().map(|space| project::shared::say(space, &delta));
+                shared = Said::shared(said.transpose().map(|said| said.and(shared)));
+            }
             if let Some(unsent) = &mut unsent {
                 unsent.then(delta);
             }

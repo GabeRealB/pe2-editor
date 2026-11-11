@@ -354,6 +354,12 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     let (undone, said) = tried.ask(&["undo"]);
     assert!(undone && said.contains("b.txt"), "{said}");
     assert_eq!(folder.read("b.txt"), None, "taken back, it is gone from the folder");
+    // And the filesystem the project's processes share says the same of what is served, to whoever attaches.
+    let shared = project::shared::space(&tried.project()).expect("the shared space");
+    let said = project::shared::listed(&shared.read().expect("read")).expect("listed");
+    assert!(matches!(said.get("notes/a.txt"), Some(project::server::Shown::File { size: 3, .. })), "{:?}\n{:?}", said.keys(), tried.said());
+    assert!(matches!(said.get("notes"), Some(project::server::Shown::Folder)) && !said.contains_key("b.txt"));
+    drop(shared);
     // One feeder at a time: what another process lists while the host feeds it is not taken.
     let mut other = project::server::ROLE.connect(&tried.project()).expect("the server listens");
     let listed: FromServer = other.ask(&ToServer::Table { generation: 1 }).unwrap();
