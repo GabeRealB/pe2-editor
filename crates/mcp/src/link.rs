@@ -42,42 +42,72 @@ pub fn forward_within(root: &Path, request: &Request, patience: Duration) -> Opt
     }
 }
 
+/// How long a link that closed without answering is asked again: its holder stopping, the link is gone in a moment.
+const LEAVING: Duration = Duration::from_secs(2);
+
+/// Asked of a link: answered, or closed with no answer - by a holder that was stopping, and took the connection as
+/// its last act. Such a one has done nothing of what was asked.
+enum Asked {
+    Answered(Reply),
+    Closed,
+    Failed(String),
+}
+
+/// Ask a link again while it closes without answering, a short while: none once nothing listens there any more -
+/// whoever asked goes on as where nothing holds the project - an error where it goes on closing.
+fn until_answered(root: &Path, whose: &str, mut ask: impl FnMut() -> Option<Asked>) -> Option<Reply> {
+    let asked = std::time::Instant::now();
+    loop {
+        match ask()? {
+            Asked::Answered(Reply::Declined) => return None,
+            Asked::Answered(reply) => return Some(reply),
+            Asked::Failed(why) => return Some(Reply::Error(why)),
+            Asked::Closed if asked.elapsed() < LEAVING => std::thread::sleep(Duration::from_millis(20)),
+            Asked::Closed if !listens(root) => return None,
+            Asked::Closed => return Some(Reply::Error(format!("{whose} closed its link without answering"))),
+        }
+    }
+}
+
 /// Hand a request to the holder of the project in `root` and wait for its answer for as long as the link lives: for
 /// what must not be asked twice - an edit given up on while its holder is still making it would be made again. None
 /// where nothing listens, or the holder declines it.
 #[must_use]
 pub fn forward_patiently(root: &Path, request: &Request) -> Option<Reply> {
-    let mut stream = BufReader::new(Stream::connect(name(root).ok()?).ok()?);
-    let answered = (|| -> std::io::Result<Option<Reply>> {
-        project::wire::send(stream.get_mut(), request)?;
-        project::wire::receive(&mut stream)
-    })();
-    match answered {
-        Ok(Some(Reply::Declined)) => None,
-        Ok(Some(reply)) => Some(reply),
-        Ok(None) => Some(Reply::Error("the holder closed its link without answering".into())),
-        Err(e) => Some(Reply::Error(format!("the holder's link failed: {e}"))),
-    }
+    until_answered(root, "the holder", || {
+        let mut stream = BufReader::new(Stream::connect(name(root).ok()?).ok()?);
+        let answered = (|| -> std::io::Result<Option<Reply>> {
+            project::wire::send(stream.get_mut(), request)?;
+            project::wire::receive(&mut stream)
+        })();
+        Some(match answered {
+            Ok(Some(reply)) => Asked::Answered(reply),
+            Ok(None) => Asked::Closed,
+            Err(e) => Asked::Failed(format!("the holder's link failed: {e}")),
+        })
+    })
 }
 
 fn forward_to_holder(root: &Path, request: &Request, patience: Duration) -> Option<Reply> {
-    let stream = Stream::connect(name(root).ok()?).ok()?;
-    let request = request.clone();
-    // Read on a thread of its own, so an editor that does not answer is given up on.
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stream = BufReader::new(stream);
-        let result = (|| -> std::io::Result<Option<Reply>> {
-            project::wire::send(stream.get_mut(), &request)?;
-            project::wire::receive(&mut stream)
-        })();
-        let _ = send.send(result);
-    });
-    Some(match receive.recv_timeout(patience) {
-        Ok(Ok(Some(reply))) => reply,
-        Ok(Ok(None)) => Reply::Error("the editor closed its link without answering".into()),
-        Ok(Err(e)) => Reply::Error(format!("the editor's link failed: {e}")),
-        Err(_) => Reply::Error("the editor did not answer in time (is it minimized?)".into()),
+    until_answered(root, "the editor", || {
+        let stream = Stream::connect(name(root).ok()?).ok()?;
+        let request = request.clone();
+        // Read on a thread of its own, so an editor that does not answer is given up on.
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stream = BufReader::new(stream);
+            let result = (|| -> std::io::Result<Option<Reply>> {
+                project::wire::send(stream.get_mut(), &request)?;
+                project::wire::receive(&mut stream)
+            })();
+            let _ = send.send(result);
+        });
+        Some(match receive.recv_timeout(patience) {
+            Ok(Ok(Some(reply))) => Asked::Answered(reply),
+            Ok(Ok(None)) => Asked::Closed,
+            Ok(Err(e)) => Asked::Failed(format!("the editor's link failed: {e}")),
+            Err(_) => Asked::Failed("the editor did not answer in time (is it minimized?)".into()),
+        })
     })
 }
 

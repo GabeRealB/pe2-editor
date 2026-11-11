@@ -87,6 +87,14 @@ impl Tried {
         }
     }
 
+    /// What the server and the host said, in their logs.
+    fn said(&self) -> (String, String) {
+        let log = |role: &project::role::Role| {
+            std::fs::read_to_string(self.project().join(project::cache::DIR).join(role.log)).unwrap_or_default()
+        };
+        (log(&project::server::ROLE), log(&project::host::ROLE))
+    }
+
     /// Whether the host said this of what it did, in its log.
     fn host_said(&self, what: &str) -> bool {
         let log = self.project().join(project::cache::DIR).join(project::host::ROLE.log);
@@ -408,7 +416,8 @@ fn what_is_written_while_nothing_holds_the_project_starts_a_host() {
     assert!(tried.server().is_some(), "the server serves on for a while");
     // What a program writes now has a host started to hold the project, which feeds the server from then on.
     folder.write("e.txt", "five");
-    assert!(within(Duration::from_secs(30), || tried.host_said("New e.txt")), "a host is started, and makes it");
+    let made = within(Duration::from_secs(30), || tried.host_said("New e.txt"));
+    assert!(made, "a host is started, and makes it; the server said:\n{}\nthe host said:\n{}", tried.said().0, tried.said().1);
     assert_ne!(tried.host(), Some(host), "another host");
     assert_eq!(folder.read("e.txt").as_deref(), Some("five"));
 }

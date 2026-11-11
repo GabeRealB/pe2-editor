@@ -429,9 +429,10 @@ enum Asked {
     Nobody,
 }
 
-/// Why an edit was not made, where nothing holds the project to make it.
+/// Why an edit was not made, where nothing holds the project to make it: not now - a host that could not be
+/// started this moment, as where the one before it is still letting go, is started the next time it is asked.
 fn nobody() -> Refusal {
-    Refusal::Never("nothing holds the project, and no host could be started to: it is not written".into())
+    Refusal::Later("nothing holds the project, and no host could be started to this moment".into())
 }
 
 /// What an answer that is no edit made says.
