@@ -953,6 +953,20 @@ impl Writes {
         self.applied(from);
         let _ordered = self.ordered();
         let replaying = self.replaying.load(std::sync::atomic::Ordering::Relaxed) != NOT;
+        // A file the project has, moved onto a file that is there - the project's, or written and not the
+        // project's yet: that one takes its content and it is removed, as where content of it is staged. Staged
+        // first, then, as the project has it - and before the rename is said, so that the log has it in that order.
+        let onto_a_file = {
+            let tree = self.served.tree();
+            let file = |path: &str| tree.at(path).is_some_and(|(_, node)| matches!(node.what, crate::What::File(_)));
+            let folder = tree.at(to).is_some_and(|(_, node)| matches!(node.what, crate::What::Folder(_)));
+            let state = self.lock();
+            let there = file(to) || (!folder && state.staged.contains_key(to));
+            file(from) && there && !state.staged.contains_key(from)
+        };
+        if onto_a_file && !replaying && !is_junk(from) && !is_junk(to) && from != to {
+            self.stage(from, false)?;
+        }
         // Said of what the log knows of: what was never the project's to have is found again by nothing.
         let said = if is_junk(from) {
             0
@@ -963,8 +977,10 @@ impl Writes {
         // renamed in the project, and what was written goes on to its new name: moved as what is only staged is, it
         // would stay in the project under its old name too.
         let held = self.served.tree().at(from).is_some() && self.lock().staged.contains_key(from);
-        if held && !is_junk(to) && self.served.tree().at(to).is_some() {
-            // Onto another the project has: that one takes what was written, and this one is removed.
+        let onto = self.served.tree().at(to).is_some() || self.lock().staged.contains_key(to);
+        if held && !is_junk(to) && onto {
+            // Onto another the project has, or one written there that it is yet to have: that one takes what
+            // was written, and this one is removed.
             let mut state = self.lock();
             state.new.remove(from);
             state.touched.remove(from);
@@ -1770,6 +1786,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(given(), ["Rename old to new from outside", "Write a.txt from outside"]);
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_moved_onto_one_that_is_there_gives_it_its_content_and_goes() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-onto-{}", std::process::id()));
+        let served = Served::default();
+        let files = [("a.txt", "one"), ("b.txt", "two"), ("d.txt", "four")];
+        served.set_files(&files.iter().map(|(path, text)| ((*path).to_string(), Given::Bytes(Arc::from(text.as_bytes())))).collect());
+        let owner = Arc::new(Busy::default());
+        owner.open.store(true, std::sync::atomic::Ordering::Relaxed);
+        let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
+        let given = |many: usize| {
+            let waited = Instant::now();
+            while owner.given.lock().unwrap().len() < many && waited.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let mut given = std::mem::take(&mut *owner.given.lock().unwrap());
+            given.sort();
+            given
+        };
+        // Both the project's, nothing of either staged: no rename the project would refuse - the one there takes
+        // the content, the one moved is removed.
+        writes.rename("a.txt", "b.txt").expect("moved onto it");
+        assert_eq!(writes.read("b.txt", 0, 8).unwrap(), b"one");
+        assert!(writes.shown("a.txt").is_none(), "no longer where it was");
+        assert_eq!(given(2), ["Remove a.txt from outside", "Write b.txt from outside"]);
+        // Onto one written there that the project is yet to have: the same, and what was written there is not given.
+        let handle = writes.open("c.txt", true).unwrap();
+        writes.write(handle, 0, b"written, never the project's").unwrap();
+        writes.rename("d.txt", "c.txt").expect("moved onto it");
+        assert_eq!(writes.read("c.txt", 0, 8).unwrap(), b"four");
+        assert!(writes.shown("d.txt").is_none());
+        writes.close(handle, true).unwrap();
+        let given = given(2);
+        assert_eq!(given, ["Remove d.txt from outside", "Write c.txt from outside"]);
         drop(writes);
         let _ = std::fs::remove_dir_all(&dir);
     }
