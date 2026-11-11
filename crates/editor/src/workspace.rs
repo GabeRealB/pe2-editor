@@ -1326,6 +1326,8 @@ impl Workspace {
     /// Take in what the history wrote since this was last asked - the editor's own changes - remembering each path's
     /// stamp to know the watcher's report of it again; returns the job's ticket.
     fn take_written(&mut self) -> Option<u64> {
+        // What its steps wrote is had on disk where that is due - a few seconds after, between frames.
+        self.history.tick();
         let written = self.history.take_written();
         if written.is_empty() {
             return None;

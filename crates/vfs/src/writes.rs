@@ -478,9 +478,10 @@ impl Writes {
             let told = state.queued.iter().map(|(at, _)| *at).chain(state.removals.values().copied()).min();
             needed = needed.min(told.unwrap_or(needed));
         }
-        self.log.header().set_applied(needed);
-        self.log.header().set_durable(needed);
-        self.log.let_go();
+        // From there the log is needed for what is in transit; what whoever holds the project needs of it, that one
+        // says (`Header::storage`).
+        self.log.header().set_transit(Some(needed));
+        self.log.keep();
     }
 
     /// What a staged file holds this moment, said by where it is in the log for the owner to read it there - the
@@ -1114,9 +1115,9 @@ impl Writes {
         }
         // Ended with nothing in transit that is not its owner's now: what the log holds is nobody's to take up.
         let _ordered = self.ordered();
-        if let Ok(ended) = self.record(&sfs::Op::Ended) {
-            self.log.header().set_applied(ended);
-            self.log.header().set_durable(ended);
+        if self.record(&sfs::Op::Ended).is_ok() {
+            self.log.header().set_transit(None);
+            self.log.keep();
         }
     }
 
@@ -1135,7 +1136,15 @@ impl Writes {
             found.map(|(path, _)| path.clone())
         };
         let mut taken_up = 0usize;
-        for record in self.log.records(self.log.begins()) {
+        // Nothing in transit, nothing to take up - but said from here on, on disk, before anything is: a header a
+        // loss of power leaves saying nothing would have what was synced since never taken up.
+        let header = self.log.header();
+        let Some(begins) = header.transit() else {
+            header.set_transit(Some(header.tail()));
+            let _ = header.flush();
+            return;
+        };
+        for record in self.log.records(self.log.from(begins)) {
             let Ok(record) = record else { break };
             if let Some((file, offset, at, len, wrote)) = sfs::content::data(&record) {
                 let Some(content) = files.get(&file) else { continue };

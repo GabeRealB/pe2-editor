@@ -16,10 +16,11 @@ const SIZE: usize = 4096;
 mod at {
     pub const MAGIC: usize = 0;
     pub const TAIL: usize = 8;
-    pub const APPLIED: usize = 16;
     pub const DURABLE: usize = 24;
     pub const HOLDER: usize = 32;
     pub const SEGMENT: usize = 40;
+    pub const STORAGE: usize = 48;
+    pub const TRANSIT: usize = 56;
 }
 
 /// The page, mapped: shared with every process that maps the same file.
@@ -31,7 +32,8 @@ pub struct Header {
 
 impl std::fmt::Debug for Header {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "header (tail {}, applied {}, durable {})", self.tail(), self.applied(), self.durable())
+        let (tail, durable) = (self.tail(), self.durable());
+        write!(f, "header (tail {tail}, kept from {durable}, in transit {:?}, storage {:?})", self.transit(), self.storage())
     }
 }
 
@@ -91,24 +93,27 @@ impl Header {
         self.u64_at(at::TAIL).store(position, Ordering::Release);
     }
 
-    /// How far the project has what the log holds.
+    /// From where the log holds what is in transit through the served folder - what a serving that starts takes up
+    /// (`ops`). None where nothing is: the serving before ended with all of it given, or there was none.
     #[must_use]
-    pub fn applied(&self) -> u64 {
-        self.u64_at(at::APPLIED).load(Ordering::Acquire)
+    pub fn transit(&self) -> Option<u64> {
+        self.u64_at(at::TRANSIT).load(Ordering::Acquire).checked_sub(1)
     }
 
-    /// The project has the log up to here: only ever said further on.
-    pub fn set_applied(&self, position: u64) {
-        self.u64_at(at::APPLIED).fetch_max(position, Ordering::AcqRel);
+    /// The log is needed from here for what is in transit, or (none) for none of it. Said - and had on disk
+    /// (`flush`) - as a serving begins, further on as what it holds is given.
+    pub fn set_transit(&self, from: Option<u64>) {
+        self.u64_at(at::TRANSIT).store(from.map_or(0, |from| from + 1), Ordering::Release);
     }
 
-    /// How far what the project has is on disk: the log before it is no longer needed.
+    /// From where the log is kept: what is before it nobody needs - neither what is in transit (`transit`) nor what
+    /// was written to the project's files (`storage`).
     #[must_use]
     pub fn durable(&self) -> u64 {
         self.u64_at(at::DURABLE).load(Ordering::Acquire)
     }
 
-    /// What the project has is on disk up to here: only ever said further on.
+    /// The log is kept from here: only ever said further on.
     pub fn set_durable(&self, position: u64) {
         self.u64_at(at::DURABLE).fetch_max(position, Ordering::AcqRel);
     }
@@ -120,6 +125,27 @@ impl Header {
             Ok(_) => size,
             Err(set) => set,
         }
+    }
+
+    /// From where the log holds what whoever holds the project wrote to its files and may not have on disk yet:
+    /// sets of changes that are to be written again where they were not. None where all of it is on disk.
+    #[must_use]
+    pub fn storage(&self) -> Option<u64> {
+        self.u64_at(at::STORAGE).load(Ordering::Acquire).checked_sub(1)
+    }
+
+    /// The log is needed from here for what was written to the project's files, or (none) for none of it. Said
+    /// before the first set of changes is appended, and had on disk (`flush`): who lets go of the log reads it.
+    pub fn set_storage(&self, from: Option<u64>) {
+        self.u64_at(at::STORAGE).store(from.map_or(0, |from| from + 1), Ordering::Release);
+    }
+
+    /// Have the header on disk as it is.
+    ///
+    /// # Errors
+    /// It cannot be flushed.
+    pub fn flush(&self) -> io::Result<()> {
+        self.map.flush()
     }
 
     /// The process holding the project, where one said so; 0 where none.

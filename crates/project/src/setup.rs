@@ -52,11 +52,11 @@ pub fn add_generated(project: &Project, name: &str, fills: &str, history: &mut H
     tx.commit().map(drop)
 }
 
-/// Have the project's `.gitignore` leave out a path, where it does not already (a transaction's writes are made as
-/// they come, so a second entry reads the first).
+/// Have the project's `.gitignore` leave out a path, where it does not already (read as the transaction's writes so
+/// far leave it, so a second entry reads the first).
 fn ignored(tx: &mut crate::history::Transaction<'_>, root: &Path, entry: &str) -> Result<()> {
     let file = root.join(".gitignore");
-    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let text = tx.read(&file)?.and_then(|bytes| String::from_utf8(bytes).ok()).unwrap_or_default();
     if text.lines().any(|line| line.trim() == entry) {
         return Ok(());
     }

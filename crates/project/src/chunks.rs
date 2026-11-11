@@ -44,6 +44,28 @@ use std::time::{Duration, SystemTime};
 
 /// Files this long or longer are stored as chunks.
 pub const THRESHOLD: usize = 1 << 20;
+
+/// What this process wrote into stores and has not had on disk yet - as many as are worth telling apart.
+static WRITTEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// How many of them are kept: a process that fills a layer from the discs writes far more, and takes none of them up.
+const KEPT: usize = 4096;
+
+/// A file was written into a store.
+fn written(path: &Path) {
+    let mut written = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if written.len() < KEPT {
+        written.push(path.to_path_buf());
+    }
+}
+
+/// Have on disk what this process wrote into stores since it last did: before a record that names any of it is
+/// said in the log, so that what the log brings back names nothing a loss of power took (`storage::Storage::say`).
+pub fn sync_written() {
+    let written = std::mem::take(&mut *WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    for path in written {
+        crate::storage::sync_file(&path);
+    }
+}
 /// The name a manifest adds to its file's.
 pub const SUFFIX: &str = ".chunks";
 /// The store, among a project's layers.
@@ -256,6 +278,7 @@ impl Store {
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, manifest.render())?;
         std::fs::rename(&temporary, &path)?;
+        written(&path);
         Ok(sha1)
     }
 
@@ -299,7 +322,9 @@ impl Store {
         std::fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, bytes)?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        written(path);
+        Ok(())
     }
 
     /// Keep bytes as one whole object, by their SHA-1 (given).
@@ -449,6 +474,7 @@ impl Store {
                 let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
                 std::fs::File::create(&temporary)?.write_all(chunk)?;
                 std::fs::rename(&temporary, &path)?;
+                written(&path);
             }
             chunks.push((hash, cut.length as u64));
         }

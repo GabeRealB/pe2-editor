@@ -144,7 +144,8 @@ impl<'a, 'h> Out<'a, 'h> {
         {
             return bytes.is_some();
         }
-        holds(path)
+        // A tree layer's files are as the step's changes so far leave them: none of them is on disk yet.
+        self.tx.pending(path).unwrap_or_else(|| holds(&self.tx.on_disk(path)))
     }
 
     /// Done with the layer: what was written of a records layer's files must be in its records, or it would be lost.

@@ -28,6 +28,7 @@ pub mod served;
 pub mod server;
 pub mod setup;
 pub mod stack;
+pub mod storage;
 pub mod store;
 pub mod switches;
 pub mod uid;

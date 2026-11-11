@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 ciborium = "0.2"
 memmap2 = "0.9"
+sfs.workspace = true
 pe2-value.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

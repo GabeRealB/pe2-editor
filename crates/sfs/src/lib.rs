@@ -8,6 +8,8 @@
 //! - `content`: a file in transit, as the ranges of the log its bytes are in.
 //! - `ops`: what was done through the served folder and what became of it, as records: what a process that
 //!   starts again takes up.
+//! - `storage`: what whoever holds the project writes to its files, said whole before any file is touched, and
+//!   written again from the log where it may not have been.
 //! - `header`: one page of positions every process reads without asking another - how far the log goes, how far
 //!   the project has it, how far that is on disk.
 //!
@@ -17,8 +19,10 @@ pub mod content;
 pub mod header;
 pub mod log;
 pub mod ops;
+pub mod storage;
 
 pub use content::Content;
 pub use header::Header;
 pub use log::{Log, Record};
 pub use ops::Op;
+pub use storage::Stored;

@@ -394,12 +394,22 @@ impl Log {
         }
     }
 
-    /// Where what the log still holds begins: where the project has it up to, or where its first segment does
-    /// where the ones before are gone. A record is there, or the log's end.
+    /// Let go of the log before what anyone says it needs it from - what is in transit through the served folder,
+    /// what was written to the project's files and may not be on disk - or before where it ends, where nobody
+    /// needs any of it: how many segments went. Asked by either, whenever what it needs moves on.
+    pub fn keep(&self) -> usize {
+        let header = &self.header;
+        let tail = header.tail();
+        header.set_durable(header.transit().unwrap_or(tail).min(header.storage().unwrap_or(tail)).min(tail));
+        self.let_go()
+    }
+
+    /// A position records are read from, at a position or after it: the position itself, or where the first segment
+    /// there still is begins, where the ones before are gone.
     #[must_use]
-    pub fn begins(&self) -> u64 {
+    pub fn from(&self, position: u64) -> u64 {
         let lowest = self.segments().first().map_or(0, |number| number * self.config.segment);
-        self.header.applied().max(lowest).min(self.header.tail())
+        position.max(lowest).min(self.header.tail())
     }
 
     /// The record at a position, or the first after it where that is the rest of a segment; none at the log's end.
@@ -598,9 +608,13 @@ mod tests {
         assert_eq!(full.kind(), std::io::ErrorKind::StorageFull);
         // A checkpoint: the project has all of it on disk. The segments before go, and there is room again.
         let end = log.read(last).unwrap().unwrap().next;
-        log.header().set_applied(end);
-        log.header().set_durable(end);
-        assert_eq!(log.let_go(), 2, "the two segments it filled, wholly before it");
+        // Someone still needs it from its beginning: none of it goes.
+        log.header().set_transit(Some(0));
+        assert_eq!(log.keep(), 0);
+        assert!(log.append(1, &[&body]).is_err(), "and it is as full as it was");
+        // Nobody needs any of it: the segments wholly before its end go.
+        log.header().set_transit(None);
+        assert_eq!(log.keep(), 2, "the two segments it filled, wholly before it");
         let again = log.append(1, &[&body]).unwrap();
         assert!(again >= end);
         assert_eq!(log.records(end).count(), 1);

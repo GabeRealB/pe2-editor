@@ -24,6 +24,9 @@ const SCHEMA: u32 = 2;
 #[derive(Clone)]
 pub struct Cache {
     pub dir: PathBuf,
+    /// What was written again from the log as the cache was opened (`storage::redo`), where anything was: changes
+    /// whoever held the project before had said whole and may not have had in its files.
+    pub recovered: Option<String>,
 }
 
 impl Cache {
@@ -55,7 +58,9 @@ impl Cache {
         if current.as_deref() != Some(version.as_str()) {
             write_atomic(&dir.join("version"), version.as_bytes())?;
         }
-        Ok(Cache { dir })
+        // Before anything reads the project's files: they are as the log says they are to be.
+        let recovered = crate::storage::redo(&project.root)?;
+        Ok(Cache { dir, recovered })
     }
 
     /// A file of the cache.
