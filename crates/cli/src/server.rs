@@ -76,6 +76,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let (serving, address) = serving_of(&p, backend, address)?;
     let _one = ROLE.claim(&p.root)?;
     let shared = project::shared::space(&p.root).context("the space the project's processes share")?;
+    // What a serving before this one said due it says again itself - from the log, or as it finds the folder.
+    vfs::due::clear(&shared).context("what is due, where the project's processes share it")?;
     // What is read of its files is kept in a ring of pages, in memory every process of the project can name.
     let pages = {
         let machine = extensions::filesystem_defaults();
@@ -478,50 +480,81 @@ fn nobody() -> Refusal {
     Refusal::Later("nothing holds the project, and no host could be started to this moment".into())
 }
 
-/// What an answer that is no edit made says.
-fn refused(reply: &mcp::Reply) -> Refusal {
-    Refusal::Never(reply.told().err().unwrap_or_else(|| "it answered with something else".into()))
-}
-
 /// How often what a backend keeps of the folder is brought within its budget.
 const COLLECTING: Duration = Duration::from_mins(10);
 
+/// How many times whoever holds the project is asked to look at what is due before what it left there is taken
+/// back, to be said again later.
+const ASKED_TO_LOOK: usize = 3;
+
 impl vfs::write::Owner for Server {
-    /// What a program wrote: sent to whoever holds the project, which makes it an edit; what is served follows as
-    /// that one lists it.
+    /// What a program did: said due, as `changes`.
     fn change(&self, change: vfs::write::Change) -> std::result::Result<(), Refusal> {
-        let request = mcp::Request::Edit { op: vfs::ops::Op::from(change), layer: None };
-        match self.ask(&request) {
-            Asked::Answered(mcp::Reply::Edited { label, .. }) => {
-                println!("{label}");
-                Ok(())
-            }
-            Asked::Answered(reply) => Err(refused(&reply)),
-            Asked::Later(later) => Err(later),
-            Asked::Nobody => Err(nobody()),
-        }
+        self.changes(vec![change]).pop().unwrap_or(Ok(()))
     }
 
-    /// What programs wrote at once: sent together, for the holder to bring what follows up to date once.
+    /// What programs did: said due where the project's processes share it (`vfs::due`), in this order, and
+    /// whoever holds the project asked to look - a host started where nothing holds it. It takes them from there,
+    /// makes each an edit, and says what became of each in the commit that says what is served after them: read
+    /// here once it answers. What nobody took - nothing holds the project that takes edits now - is taken back,
+    /// and said again later.
     fn changes(&self, changes: Vec<vfs::write::Change>) -> Vec<std::result::Result<(), Refusal>> {
         let ops: Vec<vfs::ops::Op> = changes.into_iter().map(vfs::ops::Op::from).collect();
         // Nothing to ask: a holder is not started for it.
         if ops.is_empty() {
             return Vec::new();
         }
-        let count = ops.len();
-        let all = |why: Refusal| (0..count).map(|_| Err(why.clone())).collect();
-        match self.ask(&mcp::Request::Edits { ops, layer: None }) {
-            Asked::Answered(mcp::Reply::EditedEach { made, .. }) if made.len() == count => {
-                for label in made.iter().flatten() {
-                    println!("{label}");
-                }
-                made.into_iter().map(|made| made.map(drop).map_err(Refusal::Never)).collect()
+        let numbers = match vfs::due::put(&self.shared, &ops) {
+            Ok(numbers) => numbers,
+            Err(e) => {
+                let why = Refusal::Later(format!("it could not be said due: {e}"));
+                return ops.iter().map(|_| Err(why.clone())).collect();
             }
-            Asked::Answered(reply) => all(refused(&reply)),
-            Asked::Later(later) => all(later),
-            Asked::Nobody => all(nobody()),
+        };
+        let mut became: Vec<Option<vfs::due::Answer>> = vec![None; numbers.len()];
+        let mut why = Refusal::Later("whoever holds the project did not say what became of it".into());
+        for asked in 1..=ASKED_TO_LOOK {
+            let nobody_took = match self.ask(&mcp::Request::Due) {
+                Asked::Answered(mcp::Reply::Taken { .. }) => None,
+                // It holds the project and takes nothing now - a host that lent it, an editor still opening.
+                Asked::Answered(reply) => Some(Refusal::Later(match reply.told() {
+                    Err(why) => why,
+                    Ok(said) => said,
+                })),
+                Asked::Later(later) => Some(later),
+                Asked::Nobody => Some(nobody()),
+            };
+            // What is answered by now; what is not, where nobody took it or nobody will be asked again, is taken
+            // back - one taken this moment after all is answered to nobody, and so already when it is said again.
+            let last = nobody_took.is_some() || asked == ASKED_TO_LOOK;
+            let open: Vec<usize> = (0..numbers.len()).filter(|at| became[*at].is_none()).collect();
+            let asked_of: Vec<u64> = open.iter().map(|at| numbers[*at]).collect();
+            match vfs::due::settle(&self.shared, &asked_of, last) {
+                Ok(answers) => {
+                    for (at, answer) in open.into_iter().zip(answers) {
+                        became[at] = answer;
+                    }
+                }
+                Err(e) => why = Refusal::Later(format!("what became of it could not be read: {e}")),
+            }
+            if let Some(nobody_took) = nobody_took {
+                why = nobody_took;
+            }
+            if last || became.iter().all(Option::is_some) {
+                break;
+            }
+            // Taken, and what became of it not said yet: a moment for it to be.
+            std::thread::sleep(Duration::from_millis(50));
         }
+        let told = |answer: Option<vfs::due::Answer>| match answer {
+            Some(Ok(label)) => {
+                println!("{label}");
+                Ok(())
+            }
+            Some(Err(refused)) => Err(Refusal::Never(refused)),
+            None => Err(why.clone()),
+        };
+        became.into_iter().map(told).collect()
     }
 
     fn ready(&self) -> std::result::Result<(), Refusal> {

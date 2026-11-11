@@ -215,6 +215,34 @@ fn place<'a>(index: &'a Index, path: &str) -> Place<'a> {
     Place::New
 }
 
+/// Whether something is at a path of the tree: an entry, or a file of the node it is in - or files under it there.
+fn there(index: &Index, path: &str) -> bool {
+    match place(index, path) {
+        Place::Entry(..) => true,
+        Place::File(real, _, file) => {
+            let asset = index.assets.get(real.strip_suffix(BUNDLE_SUFFIX).unwrap_or(real));
+            let inside = format!("{file}/");
+            asset.is_some_and(|a| a.on_disk().files.iter().any(|f| f.name == file || f.name.starts_with(&inside)))
+        }
+        Place::New => false,
+    }
+}
+
+/// Whether what a change asks is so already: a folder that is there, a thing moved to where it is asked to be and
+/// gone from where it was, a thing gone. What something due is when it is taken a second time - by whoever holds
+/// the project after one that made it and ended before saying so, or said due again by a serving after one that
+/// ended: made again it would be refused, and whoever serves would show it undone. Never a written file, which is
+/// written again as well as once.
+#[must_use]
+pub fn so_already(index: &Index, change: &Change) -> bool {
+    match change {
+        Change::Folder { path } => matches!(place(index, path), Place::Entry(_, entry) if entry.kind != Kind::File),
+        Change::Rename { from, to } => !there(index, from) && there(index, to),
+        Change::Remove { path } => !there(index, path),
+        Change::Write { .. } => false,
+    }
+}
+
 /// Whether a path of the tree is a node, or inside one: what a folder made there waits on.
 #[must_use]
 pub fn in_node(index: &Index, path: &str) -> bool {

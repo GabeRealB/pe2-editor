@@ -73,8 +73,18 @@ pub fn say_whole(space: &sfs::Space, listing: &Listing) -> Result<()> {
 /// # Errors
 /// As `show`.
 pub fn say(space: &sfs::Space, delta: &Delta) -> Result<()> {
+    say_with(space, delta, &mut |_| Ok(()))
+}
+
+/// As `say`, with what else its commit says: what whoever says it has to say of the same moment - what became of
+/// what was due (`vfs::due`), which is so the moment the folder shows it.
+///
+/// # Errors
+/// As `show`, and what `also` could not do.
+pub fn say_with(space: &sfs::Space, delta: &Delta, also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
     let mut txn = space.write()?;
     show(&mut txn, delta, now())?;
+    also(&mut txn)?;
     txn.commit()
 }
 

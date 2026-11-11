@@ -46,3 +46,34 @@ fn an_edit_from_outside_is_a_step_in_a_records_layer_and_undone() {
     });
     assert!(records(&mut editor).is_empty(), "{:?}", records(&mut editor));
 }
+
+#[test]
+fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
+    let mut editor = Scenario::open(Fixture::notes_under_records());
+    let root = editor.workspace().project.root.clone();
+    let space = project::shared::space(&root).expect("the shared space");
+    // What a serving would say due: a folder, one in it, and a removal of what is not there - so already.
+    let folder = |path: &str| vfs::ops::Op::Folder { path: path.into() };
+    let ops = [folder("made"), folder("made/inside"), vfs::ops::Op::Remove { path: "never".into() }];
+    let numbers = vfs::due::put(&space, &ops).expect("said due");
+    let (reply, answered) = std::sync::mpsc::channel();
+    editor.workspace().take_due(&reply);
+    editor.until("who asked to look to be answered", |_| answered.try_recv().is_ok_and(|reply| matches!(reply, mcp::Reply::Taken { count: 3 })));
+    // Answered once it is taken in, and said where it was due: nothing is due, each has its answer.
+    assert!(editor.workspace().index.entries.contains_key("made/inside"));
+    assert!(!vfs::due::any(&space.read().unwrap()));
+    let became = vfs::due::settle(&space, &numbers, false).expect("read");
+    assert!(matches!(&became[..], [Some(Ok(_)), Some(Ok(_)), Some(Ok(so))] if so.contains("already")), "{became:?}");
+    let said = records(&mut editor);
+    assert_eq!(said.len(), 2, "a step each, and none for what was so already: {said:?} {became:?}");
+    // Said due again - by a serving after one that ended: so already, and no edit made of it.
+    let again = vfs::due::put(&space, &ops[..1]).expect("said due");
+    editor.workspace().take_due(&reply);
+    editor.until("the second look to be answered", |_| answered.try_recv().is_ok());
+    let became = vfs::due::settle(&space, &again, false).expect("read");
+    assert!(matches!(&became[..], [Some(Ok(so))] if so.contains("already")), "{became:?}");
+    assert_eq!(records(&mut editor).len(), 2);
+    // And with nothing due, asked to look, it says so at once.
+    editor.workspace().take_due(&reply);
+    assert!(matches!(answered.try_recv(), Ok(mcp::Reply::Taken { count: 0 })));
+}

@@ -93,6 +93,9 @@ struct Host {
     /// What is being answered on the holder's link this moment, and when something was last asked there.
     answering: AtomicUsize,
     asked: Mutex<Instant>,
+    /// What was due and taken, by its number, until it is due no more: taken once, however often it is asked to
+    /// look while what became of it is being said.
+    due_taken: Mutex<std::collections::HashSet<u64>>,
 }
 
 /// `pe2-cli project host`: hold the project in `directory`, and keep its folder served by `backend` (at `address`,
@@ -146,6 +149,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         inherited,
         kept: AtomicBool::new(false),
         answering: AtomicUsize::new(0),
+        due_taken: Mutex::default(),
         asked: Mutex::new(Instant::now()),
     });
     // What reading the project freed, given back: it holds on for long.
@@ -213,7 +217,7 @@ impl Host {
             host.answering.fetch_add(1, Ordering::Relaxed);
             let reply = match request {
                 mcp::Request::Edit { op, layer } => host.edit(&op, layer.as_deref()),
-                mcp::Request::Edits { ops, layer } => each(host.edits(&ops, layer.as_deref())),
+                mcp::Request::Due => host.take_due(),
                 mcp::Request::Signal { events, config } => host.signal(events, config.as_deref()),
                 // Said of itself, with nothing of the project read for it.
                 mcp::Request::Hello => mcp::Reply::Hello(mcp::Holder::this(false)),
@@ -323,27 +327,100 @@ impl Host {
         made.unwrap_or_else(|| mcp::Reply::failed("nothing was asked".into()))
     }
 
+    /// Take what is due where the project's processes share it (`vfs::due`) - what programs did through the served
+    /// folder - and make edits of it, in its order; what became of each is said there in the commit that says what
+    /// is served after them. Declined while it does not hold the project: what is due stays so.
+    fn take_due(&self) -> mcp::Reply {
+        let root = &self.project.root;
+        let due = project::shared::space(root).and_then(|space| vfs::due::due(&space.read()?));
+        let due = match due {
+            Ok(due) => due,
+            Err(e) => return mcp::Reply::Error(format!("what is due could not be read: {e}")),
+        };
+        let due: Vec<(u64, vfs::ops::Op)> = {
+            let mut taken = lock(&self.due_taken);
+            taken.retain(|number| due.iter().any(|(due, _)| due == number));
+            due.into_iter().filter(|(number, _)| !taken.contains(number)).collect()
+        };
+        if due.is_empty() {
+            return mcp::Reply::Taken { count: 0 };
+        }
+        let (numbers, ops): (Vec<u64>, Vec<vfs::ops::Op>) = due.into_iter().unzip();
+        match self.edits_answering(&ops, None, Some(&numbers)) {
+            Some(made) => {
+                lock(&self.due_taken).extend(numbers);
+                mcp::Reply::Taken { count: made.len() }
+            }
+            None => mcp::Reply::Declined,
+        }
+    }
+
+    /// Say what became of what was due with nothing of what is served changed for it: through what feeds the
+    /// server, after all it was given to say before, or in the shared filesystem itself where nothing feeds one.
+    fn answer_due(&self, answers: Vec<(u64, vfs::due::Answer)>) {
+        if answers.is_empty() {
+            return;
+        }
+        if let Some(files) = lock(&self.files).as_ref() {
+            return files.show_changed_answering(Vec::new(), None, answers);
+        }
+        let said = project::shared::space(&self.project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
+        if let Err(e) = said {
+            eprintln!("what became of what was due could not be said: {e}");
+        }
+    }
+
     /// Make edits while holding the project, in order: each a step of its history, and what follows from them - the
     /// index, what is served - brought up to date once for all of them, which is most of what one edit takes. How
     /// each went.
     fn edits(&self, ops: &[vfs::ops::Op], layer: Option<&str>) -> Vec<mcp::Reply> {
-        let failed = |why: String| ops.iter().map(|_| mcp::Reply::failed(why.clone())).collect();
+        let failed = || ops.iter().map(|_| mcp::Reply::failed("the host does not hold the project".into())).collect();
+        self.edits_answering(ops, layer, None).unwrap_or_else(failed)
+    }
+
+    /// As `edits`; where they are what was due, by these numbers, what became of each is said where it was due,
+    /// with what is served after them - and one that is so already (`Op::so_already`: taken a second time) is
+    /// made no edit of. None where the host does not hold the project: nothing was made, and nothing said.
+    fn edits_answering(&self, ops: &[vfs::ops::Op], layer: Option<&str>, due: Option<&[u64]>) -> Option<Vec<mcp::Reply>> {
+        let failed = |why: String| ops.iter().map(|_| mcp::Reply::failed(why.clone())).collect::<Vec<_>>();
+        // What became of each, for where it was due.
+        let answers = |replies: &[mcp::Reply]| -> Vec<(u64, vfs::due::Answer)> {
+            let became = replies.iter().map(|reply| match reply {
+                mcp::Reply::Edited { label, .. } => Ok(label.clone()),
+                other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
+            });
+            due.map_or_else(Vec::new, |due| due.iter().copied().zip(became).collect())
+        };
         let mut state = lock(&self.state);
         let State { index, listing, held, written, reading, .. } = &mut *state;
-        let (Some(index), Some(held)) = (index.as_mut(), held) else {
-            return failed("the host does not hold the project".into());
-        };
+        let (Some(index), Some(held)) = (index.as_mut(), held) else { return None };
         // What reads were answered from changes: made again at the next.
         *reading = None;
         let Some(layer) = layer.map(str::to_string).or_else(|| vfs::write::writable_layer(index)) else {
-            return failed("no layer of the project can be written".into());
+            let replies = failed("no layer of the project can be written".into());
+            let answers = answers(&replies);
+            drop(state);
+            self.answer_due(answers);
+            return Some(replies);
         };
         // What the edits wrote that the index has not taken in yet, and all of it.
         let (mut pending, mut changed): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
         let mut replies = Vec::with_capacity(ops.len());
         // What the refreshes of all of them changed, together.
         let mut all = project::index::Refreshed::default();
+        // The paths the edits made and not taken in yet named: one that names a path at, in or above one of them
+        // is made over the project as they left it.
+        let mut earlier: Vec<String> = Vec::new();
         for op in ops {
+            if !pending.is_empty()
+                && op.follows(&earlier)
+                && let Ok(refreshed) = index.refresh(&self.project, &pending)
+            {
+                all.and(refreshed);
+                changed.append(&mut pending);
+                earlier.clear();
+            }
+            earlier.extend(op.paths().into_iter().map(str::to_string));
             let mut apply = |index: &Index| {
                 let _span = tracing::info_span!("host edit apply").entered();
                 vfs::ops::apply(op, &self.project, index, &layer, &mut held.history)
@@ -358,6 +435,11 @@ impl Host {
                 changed.append(&mut pending);
                 made = apply(index);
             }
+            // Due, not made, and so already - taken before, by a holder that ended before it said so, or said due
+            // again by a serving after one that ended: it is as asked, and said so.
+            if due.is_some() && made.is_err() && op.so_already(index) {
+                made = Ok(("it is so already".to_string(), Vec::new()));
+            }
             replies.push(match made {
                 Ok((label, touched)) => {
                     pending.extend(touched.iter().cloned());
@@ -369,7 +451,10 @@ impl Host {
             });
         }
         if pending.is_empty() && changed.is_empty() {
-            return replies;
+            let answers = answers(&replies);
+            drop(state);
+            self.answer_due(answers);
+            return Some(replies);
         }
         let refreshed = {
             let _span = tracing::info_span!("host edit refresh").entered();
@@ -378,7 +463,13 @@ impl Host {
         changed.append(&mut pending);
         match refreshed {
             Ok(refreshed) => all.and(refreshed),
-            Err(e) => return failed(format!("{e:#}")),
+            Err(e) => {
+                let replies = failed(format!("{e:#}"));
+                let answers = answers(&replies);
+                drop(state);
+                self.answer_due(answers);
+                return Some(replies);
+            }
         }
         // Answered once the project's files have what was asked: whoever reads them next by other means - a
         // command after this one, a tool - finds them so. All that was asked together is had on disk together,
@@ -390,9 +481,9 @@ impl Host {
         for path in &changed {
             written.insert(path.clone(), stamp(path));
         }
-        self.feed(index, listing, &changed, &all);
+        self.feed(index, listing, &changed, &all, answers(&replies));
         project::give_back_memory();
-        replies
+        Some(replies)
     }
 
     /// Take in what changed in the layers while it holds the project: the index refreshed, what is served listed
@@ -419,7 +510,7 @@ impl Host {
         let Some(index) = index.as_mut() else { return };
         match index.refresh(&self.project, &changed) {
             Ok(refreshed) => {
-                self.feed(index, listing, &changed, &refreshed);
+                self.feed(index, listing, &changed, &refreshed, Vec::new());
                 *reading = None;
                 project::give_back_memory();
             }
@@ -467,23 +558,31 @@ impl Host {
 
     /// What is served follows what changed, where it feeds a server: told which files changed, for what it reads of
     /// them to be read again, then what differs of what is served - of the entries the refresh touched and those
-    /// gone - and waited for, so that who asked for a change finds it in the folder once answered.
+    /// gone - and waited for, so that who asked for a change finds it in the folder once answered. What became of
+    /// what was due (`answers`) is said in the same commit.
     fn feed(
         &self,
         index: &Index,
         listing: &mut project::server::Listing,
         changed: &[PathBuf],
         refreshed: &project::index::Refreshed,
+        answers: Vec<(u64, vfs::due::Answer)>,
     ) {
         let _span = tracing::info_span!("host served update").entered();
         if let Some(files) = lock(&self.files).as_ref() {
             // `project.toml` changed: the layers themselves may have. All of it, listed again.
             if refreshed.project_file {
                 *listing = index.served();
-                files.show_changed(changed.to_vec(), Arc::new(listing.clone()));
+                files.show_changed_answering(changed.to_vec(), Some(Arc::new(listing.clone())), answers);
             } else {
-                files.show_delta(changed.to_vec(), index.serve_changed(listing, refreshed));
+                files.show_delta_answering(changed.to_vec(), index.serve_changed(listing, refreshed), answers);
             }
+            return;
+        }
+        // Nothing feeds a server: said where it was due, by itself.
+        let said = project::shared::space(&self.project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
+        if let Err(e) = said {
+            eprintln!("what became of what was due could not be said: {e}");
         }
     }
 
@@ -731,20 +830,6 @@ impl Host {
 fn running(state: &State) -> String {
     let events = state.runner.as_ref().map_or_default(|(runner, _)| runner.running());
     if events.is_empty() { "an epoch".to_string() } else { events.join(", ") }
-}
-
-/// Edits made together, as one answer: each one's label, or why it was not made, and all they touched.
-fn each(replies: Vec<mcp::Reply>) -> mcp::Reply {
-    let mut touched = Vec::new();
-    let made = replies.into_iter().map(|reply| match reply {
-        mcp::Reply::Edited { label, touched: paths } => {
-            touched.extend(paths);
-            Ok(label)
-        }
-        other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
-    });
-    let made = made.collect();
-    mcp::Reply::EditedEach { made, touched }
 }
 
 /// One process talking to the host: a lease while it keeps the folder served or borrows the project, ended with the

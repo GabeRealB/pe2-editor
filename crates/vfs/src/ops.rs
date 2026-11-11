@@ -96,6 +96,44 @@ impl Op {
             _ => return None,
         })
     }
+
+    /// The paths of the tree it names.
+    #[must_use]
+    pub fn paths(&self) -> Vec<&str> {
+        match self {
+            Op::Rename { from, to } => vec![from, to],
+            Op::Write { path, .. }
+            | Op::Folder { path }
+            | Op::Remove { path }
+            | Op::Override { path }
+            | Op::Drop { path }
+            | Op::KeepMine { path }
+            | Op::TakeBase { path }
+            | Op::Forget { path, .. }
+            | Op::Adopt { path, .. }
+            | Op::RemoveUnlisted { path, .. } => vec![path],
+            Op::Undo | Op::Redo => Vec::new(),
+        }
+    }
+
+    /// Whether it names a path at, in or above one of these: what one of several edits made together is to those
+    /// before it whose paths these are, when it has to be made over the project as they left it - a folder in
+    /// one they made, a file moved that they wrote - where edits that have nothing to do with each other are
+    /// made over the project as it was and taken in once.
+    #[must_use]
+    pub fn follows(&self, earlier: &[String]) -> bool {
+        let within = |inner: &str, outer: &str| {
+            inner.strip_prefix(outer).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        };
+        let paths = self.paths();
+        earlier.iter().any(|before| paths.iter().any(|path| within(path, before) || within(before, path)))
+    }
+
+    /// Whether what it asks, as a program asks it through the folder, is so already (`write::so_already`).
+    #[must_use]
+    pub fn so_already(&self, index: &Index) -> bool {
+        self.as_change().is_some_and(|change| crate::write::so_already(index, &change))
+    }
 }
 
 /// The uid of the entry at a path of the tree: a node's (`x` for `x.node`), a folder's or a file's.

@@ -21,6 +21,7 @@ pub mod backend;
 #[cfg(windows)]
 pub mod cloud;
 pub mod dav;
+pub mod due;
 #[cfg(windows)]
 pub mod dokan;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

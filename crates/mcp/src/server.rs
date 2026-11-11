@@ -94,17 +94,9 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
     if let Request::Edit { op, layer } = request {
         return edit_here(root, &lock, op, layer.as_deref());
     }
-    if let Request::Edits { ops, layer } = request {
-        let mut touched = Vec::new();
-        let made = ops.iter().map(|op| match edit_here(root, &lock, op, layer.as_deref()) {
-            Reply::Edited { label, touched: paths } => {
-                touched.extend(paths);
-                Ok(label)
-            }
-            other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
-        });
-        let made = made.collect();
-        return Reply::EditedEach { made, touched };
+    // What is due is taken by who holds the project to stay, and says what is served: not by a command.
+    if matches!(request, Request::Due) {
+        return Reply::Declined;
     }
     let opened = Project::load(root).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;

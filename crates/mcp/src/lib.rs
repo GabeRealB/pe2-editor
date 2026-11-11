@@ -37,9 +37,10 @@ pub enum Request {
     /// the one edits go to - by whoever holds the project, as a step of its history: answered with the step's label.
     /// Never an agent's: no tool makes one.
     Edit { op: vfs::ops::Op, layer: Option<String> },
-    /// Several edits made together, each a step of its own: what programs wrote at once through the served folder.
-    /// Answered with each one's label, or why it was not made.
-    Edits { ops: Vec<vfs::ops::Op>, layer: Option<String> },
+    /// Something was done through the served folder and is due to be the project's: said where the project's
+    /// processes share it (`vfs::due`), for whoever holds the project to take from there and make edits of, each
+    /// a step of its own. Answered once what became of each is said there, with what is served after them.
+    Due,
     /// Who answers, and how it runs (`Holder`): what whoever asks compares with itself before relying on it.
     Hello,
     /// The tools of the project's extensions, as its holder has them loaded: those it holds among them, which a
@@ -110,11 +111,8 @@ pub enum Reply {
     },
     /// Not answered by this holder (the host answers edits alone): whoever asked takes the project for it.
     Declined,
-    /// Edits made together: each one's label, or why it was not made, and every path they touched.
-    EditedEach {
-        made: Vec<Result<String, String>>,
-        touched: Vec<std::path::PathBuf>,
-    },
+    /// What was due was taken (`Request::Due`), this many things, and what became of each said where it was due.
+    Taken { count: usize },
     Hello(Holder),
     Tools(Vec<rmcp::model::Tool>),
 }
@@ -132,11 +130,7 @@ impl Reply {
                 if result.is_error == Some(true) { Err(said) } else { Ok(said) }
             }
             Reply::Edited { label, .. } => Ok(label.clone()),
-            Reply::EditedEach { made, .. } => {
-                let labels: Result<Vec<String>, String> = made.iter().cloned().collect();
-                labels.map(|labels| labels.join("\n"))
-            }
-            Reply::Read(_) | Reply::Declined | Reply::Hello(_) | Reply::Tools(_) => {
+            Reply::Read(_) | Reply::Declined | Reply::Hello(_) | Reply::Tools(_) | Reply::Taken { .. } => {
                 Err("it answered with something else".to_string())
             }
             Reply::Error(why) => Err(why.clone()),
@@ -206,7 +200,7 @@ pub fn answer(view: &mut View, request: &Request) -> Reply {
             Err(e) => Reply::Error(e),
         },
         Request::Signal { .. } => Reply::Error("events are signaled to an editor".to_string()),
-        Request::Edit { .. } | Request::Edits { .. } => {
+        Request::Edit { .. } | Request::Due => {
             Reply::Error("an edit is made by whoever holds the project, with its history".into())
         }
         Request::Hello => Reply::Hello(Holder::this(view.editor.is_some())),

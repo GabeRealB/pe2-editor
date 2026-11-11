@@ -208,10 +208,15 @@ impl StandIn {
         let held = Arc::new(Mutex::new((index, history)));
         let made = Arc::new(Mutex::new(Vec::new()));
         let (holding, feeding, noting) = (held.clone(), files.clone(), made.clone());
+        let space = project::shared::space(root).unwrap();
         let answer = move |request: mcp::Request| {
-            let ops = match request {
-                mcp::Request::Edit { op, .. } => vec![op],
-                mcp::Request::Edits { ops, .. } => ops,
+            // What is due is taken where it is said; a command's edit comes as it is.
+            let (numbers, ops) = match request {
+                mcp::Request::Edit { op, .. } => (None, vec![op]),
+                mcp::Request::Due => {
+                    let (numbers, ops): (Vec<u64>, Vec<_>) = vfs::due::due(&space.read().unwrap()).unwrap().into_iter().unzip();
+                    (Some(numbers), ops)
+                }
                 _ => return mcp::Reply::Declined,
             };
             let mut held = holding.lock().unwrap();
@@ -233,8 +238,19 @@ impl StandIn {
                     }
                 });
             }
+            let served = Some(Arc::new(index.served()));
+            if let Some(numbers) = numbers {
+                let count = numbers.len();
+                let answers = numbers.into_iter().zip(labels).collect();
+                feeding.show_changed_answering(changed, served, answers);
+                return mcp::Reply::Taken { count };
+            }
             feeding.show_changed(changed.clone(), Arc::new(index.served()));
-            mcp::Reply::EditedEach { made: labels, touched: changed }
+            match labels.pop() {
+                Some(Ok(label)) => mcp::Reply::Edited { label, touched: changed },
+                Some(Err(why)) => mcp::Reply::failed(why),
+                None => mcp::Reply::Declined,
+            }
         };
         let link = mcp::link::Listener::start(root, answer).unwrap();
         StandIn { _link: link, files, made, _held: held, _lock: lock }

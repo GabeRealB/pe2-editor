@@ -260,6 +260,11 @@ pub struct Workspace {
     selection_after: Option<(u64, String)>,
     /// Agents' requests waiting for the take-in of what was pending when they came, by its ticket.
     agents_waiting: Vec<(u64, mcp::Request, mpsc::Sender<mcp::Reply>)>,
+    /// What was due and made edits of (`take_due`), waiting for the take-in of what they wrote, by its ticket:
+    /// what became of each, said with what is served after them, and who asked to look, answered then.
+    due_waiting: Vec<DueWaiting>,
+    /// What was due and taken, by its number, until it is due no more: taken once.
+    due_taken: std::collections::HashSet<u64>,
     /// What the snapshots taken in since the app last asked did.
     outcome: Update,
     /// Why agents cannot reach the editor.
@@ -604,6 +609,9 @@ fn stand_by(root: &Path) {
 
 /// An event asked for: the events, the config, and who waits for what became of it.
 type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
+/// What was due and made edits of, waiting for a take-in: its ticket, what became of each thing by its number,
+/// and who asked to look.
+type DueWaiting = (u64, Vec<(u64, vfs::due::Answer)>, mpsc::Sender<mcp::Reply>);
 
 /// What is made of a project's `project.toml` and its files, and made again when either changes.
 pub struct Loaded {
@@ -822,6 +830,8 @@ impl Workspace {
             external: (0, 0),
             selection_after: None,
             agents_waiting: Vec::new(),
+            due_waiting: Vec::new(),
+            due_taken: std::collections::HashSet::new(),
             outcome: Update::Nothing,
             tree,
             editable: HashSet::new(),
@@ -1248,9 +1258,8 @@ impl Workspace {
             let _ = reply.send(answer);
             return;
         }
-        if let mcp::Request::Edits { ops, layer } = request {
-            let (made, touched) = self.apply_edits(ops, layer.as_deref());
-            let _ = reply.send(mcp::Reply::EditedEach { made, touched });
+        if matches!(request, mcp::Request::Due) {
+            self.take_due(reply);
             return;
         }
         let selection = self.selected.clone();
@@ -1403,8 +1412,11 @@ impl Workspace {
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
             }
-            if let (Some(files), Some(served)) = (&self.files, snapshot.served) {
-                files.show(served);
+            // What became of what was due, whose edits this take-in covers, is said with what is served after it.
+            let (answers, then) = self.due_covered(snapshot.ticket);
+            match (&self.files, snapshot.served) {
+                (Some(files), Some(served)) => files.show_answering(served, answers, then),
+                (files, _) => Self::answer_due(&self.project, files.as_ref(), answers, then),
             }
             if let Some(pictures) = &mut self.textures.pictures {
                 if snapshot.all {
@@ -1865,6 +1877,92 @@ impl Workspace {
         vfs::ops::apply(op, &self.project, &self.index, layer, &mut self.history).map_err(|e| format!("{e:#}"))
     }
 
+    /// Take what is due where the project's processes share it (`vfs::due`) - what programs did through the served
+    /// folder - and make edits of it, in its order. What became of each is said there with what is served after
+    /// the take-in of what they wrote, and who asked to look answered then.
+    pub(crate) fn take_due(&mut self, reply: &mpsc::Sender<mcp::Reply>) {
+        let due = project::shared::space(&self.project.root).and_then(|space| vfs::due::due(&space.read()?));
+        let due = match due {
+            Ok(due) => due,
+            Err(e) => {
+                let _ = reply.send(mcp::Reply::Error(format!("what is due could not be read: {e}")));
+                return;
+            }
+        };
+        self.due_taken.retain(|number| due.iter().any(|(due, _)| due == number));
+        let (numbers, ops): (Vec<u64>, Vec<vfs::ops::Op>) =
+            due.into_iter().filter(|(number, _)| !self.due_taken.contains(number)).unzip();
+        if ops.is_empty() {
+            let _ = reply.send(mcp::Reply::Taken { count: 0 });
+            return;
+        }
+        let (mut made, _) = self.apply_edits(&ops, None);
+        // One not made that is so already was taken before, and said due again: it is as asked. Told of the index
+        // with what the others wrote taken in.
+        if made.iter().any(Result::is_err) {
+            self.settle();
+            for (made, op) in made.iter_mut().zip(&ops) {
+                if made.is_err() && op.so_already(&self.index) {
+                    *made = Ok("it is so already".to_string());
+                }
+            }
+        }
+        let answers: Vec<(u64, vfs::due::Answer)> = numbers.iter().copied().zip(made).collect();
+        self.due_taken.extend(numbers);
+        let ticket = self.takein.issued();
+        self.due_waiting.push((ticket, answers, reply.clone()));
+        // Taken in already - nothing was written, or it was waited for: said now, what is served being as it is.
+        if self.takein.covers(ticket) {
+            let (answers, then) = self.due_covered(ticket);
+            Self::answer_due(&self.project, self.files.as_ref(), answers, then);
+        }
+    }
+
+    /// What became of what was due whose edits the take-ins up to `ticket` cover, and the answering of who asked
+    /// to look, to be done once it is said.
+    fn due_covered(&mut self, ticket: u64) -> (Vec<(u64, vfs::due::Answer)>, Option<holder::files::Then>) {
+        let (covered, waiting): (Vec<DueWaiting>, Vec<DueWaiting>) =
+            std::mem::take(&mut self.due_waiting).into_iter().partition(|(asked, ..)| *asked <= ticket);
+        self.due_waiting = waiting;
+        if covered.is_empty() {
+            return (Vec::new(), None);
+        }
+        let (mut answers, mut asked) = (Vec::new(), Vec::new());
+        for (_, became, reply) in covered {
+            asked.push((reply, became.len()));
+            answers.extend(became);
+        }
+        let then = move || {
+            for (reply, count) in asked {
+                let _ = reply.send(mcp::Reply::Taken { count });
+            }
+        };
+        (answers, Some(Box::new(then)))
+    }
+
+    /// Say what became of what was due with what is served as it is: through what feeds the server, after all it
+    /// was given to say before, or in the shared filesystem itself where nothing feeds one.
+    fn answer_due(
+        project: &Project,
+        files: Option<&holder::files::Files>,
+        answers: Vec<(u64, vfs::due::Answer)>,
+        then: Option<holder::files::Then>,
+    ) {
+        if answers.is_empty() && then.is_none() {
+            return;
+        }
+        if let Some(files) = files {
+            return files.answer(answers, then);
+        }
+        let said = project::shared::space(&project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
+        if let Err(e) = said {
+            eprintln!("what became of what was due could not be said: {e}");
+        }
+        if let Some(then) = then {
+            then();
+        }
+    }
+
     /// Edits made together, each a step of its own, taken in once for all of them - what programs wrote at once
     /// through the served folder: each one's label, or why it was not made, and every path they touched. One that
     /// cannot be made over the index as it is may need what those before it made: they are taken in, and it is tried
@@ -1892,7 +1990,17 @@ impl Workspace {
         self.settle();
         let (mut touched, mut pending) = (Vec::new(), false);
         let mut made = Vec::with_capacity(ops.len());
+        // The paths the edits made and not taken in yet named: one that names a path at, in or above one of them
+        // is made over the project as they left it.
+        let mut earlier: Vec<String> = Vec::new();
         for op in ops {
+            if pending && op.follows(&earlier) {
+                self.take_written();
+                self.settle();
+                pending = false;
+                earlier.clear();
+            }
+            earlier.extend(op.paths().into_iter().map(str::to_string));
             let mut tried = self.apply_op(op, &layer);
             if tried.is_err() && pending {
                 self.take_written();
