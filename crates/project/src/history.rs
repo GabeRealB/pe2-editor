@@ -908,13 +908,6 @@ impl History {
         })
     }
 
-    /// Have on disk what its steps wrote, where that is due: asked by who holds the project while nothing else is.
-    pub fn tick(&mut self) {
-        if let Some(storage) = &mut self.storage {
-            storage.tick();
-        }
-    }
-
     /// The session written, where it is journaled: what a crash would leave.
     fn journal(&self) {
         if !self.journaled {

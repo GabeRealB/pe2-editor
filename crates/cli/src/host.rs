@@ -628,10 +628,6 @@ impl Host {
             self.forget_reading();
             if looked.elapsed() > Duration::from_secs(1) {
                 looked = Instant::now();
-                // What its steps wrote is had on disk where that is due: the log is then needed for it no longer.
-                if let Some(held) = &mut lock(&self.state).held {
-                    held.history.tick();
-                }
                 // Started to keep the folder served, it stops where that is stopped.
                 if self.server_gone() && self.serve.is_some() {
                     break;

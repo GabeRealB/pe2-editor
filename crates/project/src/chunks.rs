@@ -58,10 +58,16 @@ fn written(path: &Path) {
     }
 }
 
-/// Have on disk what this process wrote into stores since it last did: before a record that names any of it is
-/// said in the log, so that what the log brings back names nothing a loss of power took (`storage::Storage::say`).
-pub fn sync_written() {
-    let written = std::mem::take(&mut *WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+/// Have on disk what this process wrote into the stores of the project in `root` since it last did: before a
+/// record that names any of it is said in the log, so that what the log brings back names nothing a loss of power
+/// took (`storage::Storage::say`). What it wrote for another project is that one's to have on disk.
+pub fn sync_written(root: &Path) {
+    let written: Vec<PathBuf> = {
+        let mut all = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (ours, others) = std::mem::take(&mut *all).into_iter().partition(|path| path.starts_with(root));
+        *all = others;
+        ours
+    };
     for path in written {
         crate::storage::sync_file(&path);
     }

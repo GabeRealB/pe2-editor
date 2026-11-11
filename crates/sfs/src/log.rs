@@ -46,7 +46,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { segment: 64 << 20, budget: 4 << 30 }
+        // Small enough that a project with little in transit keeps little: a segment takes its whole length of
+        // the disk where a file's length is not sparse by itself.
+        Config { segment: 8 << 20, budget: 4 << 30 }
     }
 }
 
@@ -322,6 +324,9 @@ impl Log {
             let path = self.segment_path(number);
             let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
             if file.metadata()?.len() < self.config.segment {
+                // Of its whole length from the start, for who maps it. Not sparse: where that has to be asked for,
+                // what is read of such a file through a mapping right after it was written is read a hundred
+                // times slower (measured: 4.1 s where it took 26 ms).
                 file.set_len(self.config.segment)?;
             }
             // Those long behind are let go of: a process appends to one or two at a time.
@@ -680,6 +685,18 @@ mod tests {
             let at = |part: usize| took[took.len() * part / 100].as_secs_f64() * 1e6;
             println!("BENCH append of {size} bytes: median {:.1} us, 99th {:.1} us", at(50), at(99));
         }
+        // What having the log on disk takes, after a small record: what a set of changes waits for.
+        let mut took: Vec<std::time::Duration> = (0..200)
+            .map(|_| {
+                log.append(1, &[&[5u8; 256]]).unwrap();
+                let started = std::time::Instant::now();
+                log.flush(log.header().tail()).unwrap();
+                started.elapsed()
+            })
+            .collect();
+        took.sort_unstable();
+        let at = |part: usize| took[took.len() * part / 100].as_secs_f64() * 1e3;
+        println!("BENCH flush after 256 bytes: median {:.2} ms, 90th {:.2} ms, 99th {:.2} ms", at(50), at(90), at(99));
         let started = std::time::Instant::now();
         let count = log.records(0).count();
         println!("BENCH {count} records read in {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
