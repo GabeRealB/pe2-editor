@@ -7,6 +7,7 @@ members = [
     "crates/codecs",
     "crates/typeface",
     "crates/vfs",
+    "crates/sfs",
     "crates/value",
     "crates/ext",
     "crates/ext-macros",

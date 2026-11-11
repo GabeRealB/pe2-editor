@@ -5702,6 +5702,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sfs"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "memmap2",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

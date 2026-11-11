@@ -1,0 +1,13 @@
+[package]
+name = "sfs"
+description = "The filesystem a project's processes share: a write-ahead log that holds every operation in transit with its bytes, and the state they all map"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+memmap2 = "0.9"
+crc32fast = "1"
