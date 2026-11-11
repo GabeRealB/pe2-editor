@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 project.workspace = true
+sfs.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true

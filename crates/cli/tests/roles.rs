@@ -219,7 +219,10 @@ impl StandIn {
                         noting.lock().unwrap().push(label.clone());
                         Ok(label)
                     }
-                    Err(e) => Err(format!("{e:#}")),
+                    Err(e) => {
+                        eprintln!("the stand-in could not make an edit: {e:#}");
+                        Err(format!("{e:#}"))
+                    }
                 });
             }
             feeding.show_changed(changed.clone(), Arc::new(index.served()));
@@ -369,7 +372,9 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     assert_eq!(tried.holder().as_deref(), Some("a stand-in"));
     let fed_by_it = || tried.server().is_some_and(|(_, by)| by.is_some_and(|by| by != "pe2-cli"));
     assert!(within(Duration::from_secs(20), fed_by_it), "whoever holds the project feeds the server");
-    assert!(matches!(stand_in.files.state(), holder::files::State::Served(..)));
+    // The server says who feeds it a moment before that one has its answer.
+    let knows = || matches!(stand_in.files.state(), holder::files::State::Served(..));
+    assert!(within(Duration::from_secs(20), knows), "and knows it is served");
     assert_eq!(folder.read("a.txt").as_deref(), Some("one"), "served on");
     // What a program writes now is made by who holds the project.
     folder.write("c.txt", "three");

@@ -42,6 +42,8 @@ fn errno(e: &std::io::Error) -> Errno {
         std::io::ErrorKind::AlreadyExists => Errno::EEXIST,
         std::io::ErrorKind::PermissionDenied => Errno::EACCES,
         std::io::ErrorKind::InvalidInput => Errno::EINVAL,
+        std::io::ErrorKind::StorageFull => Errno::ENOSPC,
+        std::io::ErrorKind::ResourceBusy => Errno::EBUSY,
         _ => Errno::EIO,
     }
 }

@@ -22,7 +22,7 @@ pub enum Op {
     /// Write a file - of a node, or a plain one - with what a file holds; a `node.toml` in a folder makes it a node.
     Write {
         path: String,
-        from: PathBuf,
+        from: crate::write::Written,
     },
     /// Make a folder.
     Folder {

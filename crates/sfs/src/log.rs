@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use crate::Header;
 
@@ -27,7 +27,7 @@ pub const DIR: &str = "log";
 const ATTACHED: &str = "attached";
 
 /// A record's head: its body's length, its kind, its own position, a checksum of all three and the body.
-const HEAD: u64 = 24;
+pub(crate) const HEAD: u64 = 24;
 const HEAD_BYTES: usize = 24;
 /// The kind of what is no record: a segment's untouched rest reads as zeros.
 const NOTHING: u8 = 0;
@@ -156,6 +156,8 @@ impl Log {
     /// Its folder, header or segments cannot be made, opened or read.
     pub fn open(dir: &Path, config: Config) -> io::Result<Log> {
         let header = Header::open(dir)?;
+        // Laid out as it was made: every process reads the segments at the same size.
+        let config = Config { segment: header.segment_or(config.segment), ..config };
         std::fs::create_dir_all(dir.join(DIR))?;
         let attached =
             std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(ATTACHED))?;
@@ -189,6 +191,31 @@ impl Log {
         checked?;
         *lock(&log.flushed) = log.header.durable();
         Ok(log)
+    }
+
+    /// The log kept in `dir`, one for all of this process that ask for it while any of it has it: opened as `open`
+    /// does where nothing here has it.
+    ///
+    /// # Errors
+    /// As `open`.
+    pub fn shared(dir: &Path, config: Config) -> io::Result<Arc<Log>> {
+        static OPEN: Mutex<Vec<(PathBuf, Weak<Log>)>> = Mutex::new(Vec::new());
+        std::fs::create_dir_all(dir)?;
+        let dir = dir.canonicalize()?;
+        let mut open = lock(&OPEN);
+        open.retain(|(_, log)| log.strong_count() > 0);
+        if let Some(log) = open.iter().find(|(at, _)| *at == dir).and_then(|(_, log)| log.upgrade()) {
+            return Ok(log);
+        }
+        let log = Arc::new(Log::open(&dir, config)?);
+        open.push((dir, Arc::downgrade(&log)));
+        Ok(log)
+    }
+
+    /// The folder it is kept in.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The header this log shares with every process that has it open.
@@ -317,6 +344,10 @@ impl Log {
         // read does not change under the mapping. It is never made shorter while it is there.
         let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
         let mut maps = self.maps.write().unwrap_or_else(PoisonError::into_inner);
+        // Those wholly before what the project has on disk are let go of: whoever lets go of the log can then
+        // remove them, on a system that keeps a mapped file.
+        let keep_from = self.header.durable() / self.config.segment;
+        maps.retain(|mapped, _| *mapped >= keep_from);
         Ok(maps.entry(number).or_insert(map).clone())
     }
 

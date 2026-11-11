@@ -1,6 +1,7 @@
-//! Writing through the filesystem: what programs write is staged (`staging`, a folder of the project's cache) and shown
-//! over the tree served, so a program reads back what it wrote at once; the owner applies it to the project as programs
-//! finish with it (`write::Change`).
+//! Writing through the filesystem: what programs write is appended to the log the project's processes share
+//! (`sfs::Log`) - its bytes there, found again by the ranges each file keeps of it (`sfs::Content`) - and shown over
+//! the tree served, so a program reads back what it wrote at once, from memory; the owner applies it to the project
+//! as programs finish with it (`write::Change`).
 //!
 //! - A file the project has is applied when the program closes it (or syncs it) having written it.
 //! - A file the project does not have is applied a moment after the program last touched it (`SETTLE`): one written
@@ -18,14 +19,16 @@
 //! What is staged and applied stays shown over the tree until the tree served has it (its length and time).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::write::{Change, Owner, Refusal, is_junk};
+use crate::write::{Change, Owner, Refusal, Written, is_junk};
 use crate::{Served, What};
+
+/// The folder of the log, in the writes' own.
+pub const LOG: &str = "sfs";
 
 /// How long a new file or a removal waits for what follows it before it is applied.
 pub const SETTLE: Duration = Duration::from_millis(1000);
@@ -33,13 +36,21 @@ pub const SETTLE: Duration = Duration::from_millis(1000);
 /// How long the removal of a file the project was just given waits for the tree to show it, before it is given up.
 const AWAITED: Duration = Duration::from_secs(30);
 
-/// A file staged: where its content is, whether it was written since it was last applied, whether the project has it,
-/// and when it was applied.
+/// A file staged: its content - in the log, or in memory where it is junk - whether it was written since it was
+/// last applied, and when it was applied.
 #[derive(Debug)]
 struct Staged {
-    file: PathBuf,
+    content: Arc<RwLock<sfs::Content>>,
     dirty: bool,
     applied: Option<SystemTime>,
+}
+
+fn reading(content: &RwLock<sfs::Content>) -> std::sync::RwLockReadGuard<'_, sfs::Content> {
+    content.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn writing(content: &RwLock<sfs::Content>) -> std::sync::RwLockWriteGuard<'_, sfs::Content> {
+    content.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Default, Debug)]
@@ -74,6 +85,28 @@ const AGAIN: Duration = Duration::from_secs(1);
 /// one, before the program is told the project is in use.
 const PATIENCE: Duration = Duration::from_secs(3);
 
+/// What the owner was given of a staged file, for as long as it reads it: the log kept from where it is, or the
+/// file it was written out to.
+struct Given {
+    pins: Arc<Mutex<Vec<u64>>>,
+    pin: Option<u64>,
+    file: Option<PathBuf>,
+}
+
+impl Drop for Given {
+    fn drop(&mut self) {
+        if let Some(pin) = self.pin {
+            let mut pins = self.pins.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(at) = pins.iter().position(|pinned| *pinned == pin) {
+                pins.swap_remove(at);
+            }
+        }
+        if let Some(file) = &self.file {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
 /// What a path is, as the filesystem shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shown {
@@ -87,7 +120,15 @@ pub struct Shown {
 pub struct Writes {
     served: Served,
     owner: Arc<dyn Owner>,
+    /// Where a file is written out for who takes it whole, for as long as that takes.
     dir: PathBuf,
+    /// The log what is written goes to.
+    log: Arc<sfs::Log>,
+    /// Every content there is, for as long as anything has it - staged, or being read or given this moment: the log
+    /// is kept from the first position any of them reads from.
+    contents: Arc<Mutex<Vec<Weak<RwLock<sfs::Content>>>>>,
+    /// Positions of the log kept for what the owner was given and is reading this moment.
+    pins: Arc<Mutex<Vec<u64>>>,
     state: Arc<Mutex<State>>,
     /// Held by what applies what has settled: one at a time, so that nothing is given to the project twice.
     settling: Arc<Mutex<()>>,
@@ -98,33 +139,132 @@ fn parent(path: &str) -> &str {
 }
 
 impl Writes {
-    /// Writes staged in `dir` (emptied first), applied by `owner`; a thread applies what has settled, for as long as
-    /// any clone of them lives.
+    /// Writes kept in `dir` (emptied first: a log of its own, and what is written out for the owner), applied by
+    /// `owner`; a thread applies what has settled, for as long as any clone of them lives.
     ///
     /// # Errors
-    /// The staging folder cannot be made.
+    /// The folder or its log cannot be made.
     pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &Path) -> io::Result<Writes> {
-        let _ = std::fs::remove_dir_all(dir);
+        Writes::with_log(served, owner, dir, sfs::log::Config::default())
+    }
+
+    /// As `new`, the log laid out as said.
+    ///
+    /// # Errors
+    /// The folder or its log cannot be made.
+    pub fn with_log(served: &Served, owner: Arc<dyn Owner>, dir: &Path, log: sfs::log::Config) -> io::Result<Writes> {
+        // Emptied, but the log: whoever holds the project may have it open, and nothing of it is read again - what
+        // it held for an earlier serving is let go of.
         std::fs::create_dir_all(dir)?;
+        for entry in std::fs::read_dir(dir)?.flatten().filter(|entry| entry.file_name() != LOG) {
+            let path = entry.path();
+            let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        }
+        let log = sfs::Log::shared(&dir.join(LOG), log)?;
+        let ended = log.header().tail();
+        log.header().set_applied(ended);
+        log.header().set_durable(ended);
+        log.let_go();
         let writes = Writes {
             served: served.clone(),
             owner,
             dir: dir.to_path_buf(),
+            log,
+            contents: Arc::default(),
+            pins: Arc::default(),
             state: Arc::default(),
             settling: Arc::default(),
         };
         // What has settled is applied off the filesystem's threads, for as long as the writes are kept.
         let (served, owner, dir, weak) =
             (writes.served.clone(), Arc::downgrade(&writes.owner), writes.dir.clone(), Arc::downgrade(&writes.state));
-        let settling = writes.settling.clone();
+        let (settling, log, contents) = (writes.settling.clone(), writes.log.clone(), writes.contents.clone());
+        let pins = writes.pins.clone();
         let _ = std::thread::Builder::new().name("filesystem writes".into()).spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(200));
                 let (Some(state), Some(owner)) = (weak.upgrade(), owner.upgrade()) else { return };
-                Writes { served: served.clone(), owner, dir: dir.clone(), state, settling: settling.clone() }.settle();
+                let (served, dir, log, settling) = (served.clone(), dir.clone(), log.clone(), settling.clone());
+                let (contents, pins) = (contents.clone(), pins.clone());
+                Writes { served, owner, dir, log, contents, pins, state, settling }.settle();
             }
         });
         Ok(writes)
+    }
+
+    /// A content with nothing in it yet: in the log, or in memory where it will never be the project's.
+    fn content(&self, junk: bool) -> Arc<RwLock<sfs::Content>> {
+        let id = {
+            let mut state = self.lock();
+            state.next += 1;
+            state.next
+        };
+        let content = if junk { sfs::Content::in_memory(id) } else { sfs::Content::logged(id) };
+        let content = Arc::new(RwLock::new(content));
+        self.contents.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(&content));
+        content
+    }
+
+    /// Let go of the log before what any content still reads from. One that waits long while much is written after
+    /// it is moved forward, so that it alone does not keep all of that.
+    fn let_go_of_log(&self, written: u64) {
+        let live: Vec<Arc<RwLock<sfs::Content>>> = {
+            let mut contents = self.contents.lock().unwrap_or_else(PoisonError::into_inner);
+            contents.retain(|content| content.strong_count() > 0);
+            contents.iter().filter_map(Weak::upgrade).collect()
+        };
+        let far = self.log.config().budget / 4;
+        let mut needed = written;
+        for content in live {
+            let Some(mut first) = reading(&content).first() else { continue };
+            if first + far < written {
+                let mut content = writing(&content);
+                if content.moved_forward(&self.log).is_ok() {
+                    first = content.first().unwrap_or(written);
+                }
+            }
+            needed = needed.min(first);
+        }
+        let pinned = self.pins.lock().unwrap_or_else(PoisonError::into_inner).iter().copied().min();
+        needed = needed.min(pinned.unwrap_or(needed));
+        self.log.header().set_applied(needed);
+        self.log.header().set_durable(needed);
+        self.log.let_go();
+    }
+
+    /// What a staged file holds this moment, said by where it is in the log for the owner to read it there - the
+    /// log kept for it until what this returns with it is dropped. Written out to a file where it is not in the
+    /// log.
+    fn given(&self, content: &RwLock<sfs::Content>) -> io::Result<(Written, Given)> {
+        let (len, ranges, first) = {
+            let content = reading(content);
+            (content.len(), content.ranges(), content.first())
+        };
+        let Some(ranges) = ranges else {
+            let file = self.written_out(content)?;
+            return Ok((Written::File(file.clone()), Given { pins: self.pins.clone(), pin: None, file: Some(file) }));
+        };
+        // Pinned before the log could be let go of past it: the content is still held by who asked.
+        if let Some(first) = first {
+            self.pins.lock().unwrap_or_else(PoisonError::into_inner).push(first);
+        }
+        let written = Written::Logged { log: self.log.dir().to_path_buf(), len, ranges };
+        Ok((written, Given { pins: self.pins.clone(), pin: first, file: None }))
+    }
+
+    /// A staged file's content written out to a file of its own, for who takes it whole: its path, to be removed
+    /// once taken.
+    fn written_out(&self, content: &RwLock<sfs::Content>) -> io::Result<PathBuf> {
+        let number = {
+            let mut state = self.lock();
+            state.next += 1;
+            state.next
+        };
+        let path = self.dir.join(format!("{number}"));
+        let mut out = io::BufWriter::new(std::fs::File::create(&path)?);
+        reading(content).write_to(&self.log, &mut out)?;
+        io::Write::flush(&mut out)?;
+        Ok(path)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -140,8 +280,8 @@ impl Writes {
             return None;
         }
         if let Some(staged) = state.staged.get(path) {
-            let meta = std::fs::metadata(&staged.file).ok()?;
-            return Some(Shown { folder: false, size: meta.len(), modified: meta.modified().ok()? });
+            let content = reading(&staged.content);
+            return Some(Shown { folder: false, size: content.len(), modified: content.modified() });
         }
         if state.folders.contains(path) || (state.given.contains_key(path) && tree.at(path).is_none()) {
             return Some(Shown { folder: true, size: 0, modified: SystemTime::now() });
@@ -200,12 +340,11 @@ impl Writes {
     /// # Errors
     /// It is not there, or cannot be read.
     pub fn read(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let staged = self.lock().staged.get(path).map(|s| s.file.clone());
-        if let Some(file) = staged {
-            let mut opened = File::open(file)?;
-            opened.seek(SeekFrom::Start(offset))?;
-            let mut out = Vec::new();
-            opened.take(len as u64).read_to_end(&mut out)?;
+        let staged = self.lock().staged.get(path).map(|s| s.content.clone());
+        if let Some(content) = staged {
+            let mut out = vec![0u8; len];
+            let read = reading(&content).read_into(&self.log, offset, &mut out)?;
+            out.truncate(read);
             return Ok(out);
         }
         let tree = self.served.tree();
@@ -218,53 +357,40 @@ impl Writes {
     /// # Errors
     /// It is not there, or cannot be read.
     pub fn read_into(&self, path: &str, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        let staged = self.lock().staged.get(path).map(|s| s.file.clone());
-        if let Some(file) = staged {
-            let mut opened = File::open(file)?;
-            opened.seek(SeekFrom::Start(offset))?;
-            let mut read = 0;
-            while read < buffer.len() {
-                match opened.read(&mut buffer[read..])? {
-                    0 => break,
-                    count => read += count,
-                }
-            }
-            return Ok(read);
+        let staged = self.lock().staged.get(path).map(|s| s.content.clone());
+        if let Some(content) = staged {
+            return reading(&content).read_into(&self.log, offset, buffer);
         }
         let tree = self.served.tree();
         let (ino, _) = tree.at(path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         tree.read_into(ino, offset, buffer)
     }
 
-    /// A staging file of a path: its content now - the tree's, unless `empty` - copied in where it is not staged yet.
+    /// A path staged: its content now - the tree's, unless `empty` - brought into the log where it is not staged
+    /// yet, so that what is written to it next is written over the file as it was then. What will never be the
+    /// project's is kept in memory instead.
     fn stage(&self, path: &str, empty: bool) -> io::Result<()> {
-        if self.lock().staged.contains_key(path) {
+        let staged = self.lock().staged.get(path).map(|s| s.content.clone());
+        if let Some(content) = staged {
             if empty {
-                let file = self.lock().staged.get(path).map(|s| s.file.clone());
-                if let Some(file) = file {
-                    File::create(file)?;
-                }
+                writing(&content).truncate(0);
             }
             return Ok(());
         }
-        let file = {
-            let mut state = self.lock();
-            state.next += 1;
-            self.dir.join(format!("{}", state.next))
-        };
-        let mut out = File::create(&file)?;
+        let content = self.content(is_junk(path));
         if !empty && let Some((ino, node)) = self.served.tree().at(path) {
             let (tree, mut at) = (self.served.tree(), 0u64);
+            let mut filled = writing(&content);
             while at < node.size {
-                let bytes = tree.read(ino, at, 1 << 22)?;
+                let bytes = tree.read(ino, at, 1 << 20)?;
                 if bytes.is_empty() {
                     break;
                 }
-                out.write_all(&bytes)?;
+                filled.write(&self.log, at, &bytes)?;
                 at += bytes.len() as u64;
             }
         }
-        self.lock().staged.insert(path.to_string(), Staged { file, dirty: false, applied: None });
+        self.lock().staged.insert(path.to_string(), Staged { content, dirty: false, applied: None });
         Ok(())
     }
 
@@ -306,7 +432,7 @@ impl Writes {
     /// # Errors
     /// The handle is not open, or the staging file cannot be written.
     pub fn write(&self, handle: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
-        let file = {
+        let content = {
             let mut state = self.lock();
             let path = state.handles.get(&handle).cloned().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             if let Some(due) = state.new.get_mut(&path) {
@@ -314,11 +440,11 @@ impl Writes {
             }
             let staged = state.staged.get_mut(&path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             staged.dirty = true;
-            staged.file.clone()
+            staged.content.clone()
         };
-        let mut opened = OpenOptions::new().write(true).open(file)?;
-        opened.seek(SeekFrom::Start(offset))?;
-        opened.write_all(data)?;
+        // The log first, then the file's ranges: both under the file's own lock, so that two writes to one file
+        // are in the file in the order they are in the log.
+        writing(&content).write(&self.log, offset, data)?;
         Ok(data.len())
     }
 
@@ -328,13 +454,14 @@ impl Writes {
     /// It cannot be staged.
     pub fn truncate(&self, path: &str, len: u64) -> io::Result<()> {
         self.stage(path, false)?;
-        let file = {
+        let content = {
             let mut state = self.lock();
             let staged = state.staged.get_mut(path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             staged.dirty = true;
-            staged.file.clone()
+            staged.content.clone()
         };
-        OpenOptions::new().write(true).open(file)?.set_len(len)
+        writing(&content).truncate(len);
+        Ok(())
     }
 
     /// Whether a program has the file at a path open to write.
@@ -360,15 +487,17 @@ impl Writes {
 
     /// Apply a staged file's content, where it was written and is no junk.
     fn apply_written(&self, path: &str) -> io::Result<()> {
-        let file = {
+        let content = {
             let state = self.lock();
             match state.staged.get(path) {
-                Some(staged) if staged.dirty && !is_junk(path) => staged.file.clone(),
+                Some(staged) if staged.dirty && !is_junk(path) => staged.content.clone(),
                 _ => return Ok(()),
             }
         };
+        let (written, given) = self.given(&content)?;
         self.lock().applying.insert(path.to_string());
-        let applied = self.owner.change(Change::Write { path: path.to_string(), staged: file });
+        let applied = self.owner.change(Change::Write { path: path.to_string(), staged: written });
+        drop(given);
         let mut state = self.lock();
         state.applying.remove(path);
         match applied {
@@ -409,15 +538,27 @@ impl Writes {
                 let Some(staged) = state.staged.get(path).filter(|staged| staged.dirty && !is_junk(path)) else {
                     continue;
                 };
-                given.push((path.clone(), staged.file.clone()));
+                given.push((path.clone(), staged.content.clone()));
                 state.applying.insert(path.clone());
             }
         }
         if given.is_empty() {
             return;
         }
-        let asked = given.iter().map(|(path, file)| Change::Write { path: path.clone(), staged: file.clone() });
-        let applied = self.owner.changes(asked.collect());
+        // Each said by where it is; one that cannot be is not given, and stays as it is.
+        let said: Vec<io::Result<(Written, Given)>> = given.iter().map(|(_, content)| self.given(content)).collect();
+        let asked = given.iter().zip(&said).filter_map(|((path, _), said)| {
+            Some(Change::Write { path: path.clone(), staged: said.as_ref().ok()?.0.clone() })
+        });
+        let mut answers = self.owner.changes(asked.collect()).into_iter();
+        let applied: Vec<Result<(), Refusal>> = said
+            .iter()
+            .map(|said| match said {
+                Ok(_) => answers.next().unwrap_or_else(|| Err(Refusal::Never("it was not answered".into()))),
+                Err(e) => Err(Refusal::Later(format!("it could not be read: {e}"))),
+            })
+            .collect();
+        drop(said);
         let mut state = self.lock();
         for ((path, _), applied) in given.into_iter().zip(applied) {
             state.applying.remove(&path);
@@ -471,9 +612,6 @@ impl Writes {
         // A folder the project was given, the tree not showing it yet: the project has it, as a file applied.
         let given = state.given.remove(path).is_some();
         state.new.remove(path);
-        if let Some(staged) = &staged {
-            let _ = std::fs::remove_file(&staged.file);
-        }
         let applied = given || staged.as_ref().is_some_and(|s| s.applied.is_some());
         if in_tree || applied {
             let due = Instant::now() + SETTLE;
@@ -596,7 +734,10 @@ impl Writes {
                 state.hidden.remove(to).is_some()
             } || self.served.tree().at(to).is_some();
             staged.dirty = true;
+            // What comes to be the project's is in the log; what will never be, in memory.
+            let kept = writing(&staged.content).held_in_log(&self.log, !is_junk(to));
             self.lock().staged.insert(to.to_string(), staged);
+            kept?;
             if is_junk(to) {
                 return Ok(());
             }
@@ -610,7 +751,10 @@ impl Writes {
             self.stage(from, false)?;
             let mut state = self.lock();
             if let Some(copy) = state.staged.remove(from) {
+                // A backup is nobody's to give: out of the log.
+                let kept = writing(&copy.content).held_in_log(&self.log, false);
                 state.staged.insert(to.to_string(), Staged { dirty: false, ..copy });
+                kept?;
             }
             state.hidden.insert(from.to_string(), Some(Instant::now() + SETTLE * 5));
             return Ok(());
@@ -633,13 +777,16 @@ impl Writes {
         }
         self.settle();
         // What nobody took by now is its owner's to keep: the staging is emptied when the folder is next served.
-        let left: Vec<(String, PathBuf)> = {
+        let left: Vec<(String, Arc<RwLock<sfs::Content>>)> = {
             let state = self.lock();
             let unapplied = state.staged.iter().filter(|(path, staged)| staged.dirty && !is_junk(path));
-            unapplied.map(|(path, staged)| (path.clone(), staged.file.clone())).collect()
+            unapplied.map(|(path, staged)| (path.clone(), staged.content.clone())).collect()
         };
-        for (path, staged) in left {
-            self.owner.left(&path, &staged);
+        for (path, content) in left {
+            if let Ok(file) = self.written_out(&content) {
+                self.owner.left(&path, &file);
+                let _ = std::fs::remove_file(file);
+            }
         }
     }
 
@@ -649,6 +796,8 @@ impl Writes {
         // what gives all of it as serving ends.
         let _settling = self.settling.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
+        // Where the log ends before anything is looked at: what is staged from now on is past it.
+        let written = self.log.header().tail();
         let due_new: Vec<String> = {
             let state = self.lock();
             let open: BTreeSet<&String> = state.handles.values().collect();
@@ -729,14 +878,12 @@ impl Writes {
         state.staged.retain(|path, staged| {
             let Some(applied) = staged.applied.filter(|_| !staged.dirty && !open.contains(path)) else { return true };
             let shown = tree.at(path).is_some_and(|(_, node)| {
-                let len = std::fs::metadata(&staged.file).map(|m| m.len()).ok();
-                Some(node.size) == len && node.modified + Duration::from_secs(2) >= applied
+                node.size == reading(&staged.content).len() && node.modified + Duration::from_secs(2) >= applied
             });
-            if shown {
-                let _ = std::fs::remove_file(&staged.file);
-            }
             !shown
         });
+        drop(state);
+        self.let_go_of_log(written);
     }
 
     /// Whether a new file waits for the `node.toml` beside it to make its folder a node.
@@ -783,7 +930,7 @@ mod tests {
                 Change::Write { path, staged } => {
                     let _ = self.started.lock().unwrap().send(());
                     let _ = self.go_on.lock().unwrap().recv();
-                    let bytes = std::fs::read(staged).map_err(|e| Refusal::Never(e.to_string()))?;
+                    let bytes = staged.read().map_err(|e| Refusal::Never(e.to_string()))?;
                     let mut files = self.files.lock().unwrap();
                     files.insert(path.clone(), Given::Bytes(Arc::from(bytes)));
                     self.served.set_files(&files);
@@ -863,6 +1010,90 @@ mod tests {
         }
         assert!(given(), "given once someone takes it");
         assert!(owner.left.lock().unwrap().is_empty());
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_log_is_let_go_of_behind_what_is_written_whatever_waits() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-log-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        // Nobody takes anything: what is written waits, for as long as this runs.
+        let owner = Arc::new(Busy::default());
+        let log = sfs::log::Config { segment: 64 << 10, budget: 1 << 20 };
+        let writes = Writes::with_log(&served, owner, &dir, log).unwrap();
+        let waits = writes.create("waits.txt").unwrap();
+        writes.write(waits, 0, b"written first, and kept").unwrap();
+        writes.close(waits, true).unwrap();
+        // Four times what the log may hold, written over one file again and again.
+        let mut last = Vec::new();
+        for round in 0..40u8 {
+            let handle = writes.open("big.bin", true).unwrap();
+            last = vec![round; 100 << 10];
+            writes.write(handle, 0, &last).unwrap();
+            writes.close(handle, false).unwrap();
+            writes.settle();
+        }
+        assert_eq!(writes.read("waits.txt", 0, 100).unwrap(), b"written first, and kept");
+        assert_eq!(writes.read("big.bin", 0, 200 << 10).unwrap(), last);
+        let segments = std::fs::read_dir(dir.join("sfs").join("log")).unwrap().count();
+        assert!(segments <= 8, "the log keeps what is read from, not all that was written: {segments} segments");
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long the library itself takes for what programs do, with no backend before it.
+    #[test]
+    #[ignore = "a measurement"]
+    fn bench_writes() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-bench-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let writes = Writes::new(&served, Arc::new(Told::default()), &dir).unwrap();
+        let said = |what: &str, mut took: Vec<Duration>| {
+            took.sort_unstable();
+            let at = |part: usize| took[took.len() * part / 100].as_secs_f64() * 1e6;
+            println!("BENCH {what}: median {:.2} us, 99th {:.2} us", at(50), at(99));
+        };
+        let timed = |run: &mut dyn FnMut(usize), count: usize| -> Vec<Duration> {
+            (0..count)
+                .map(|n| {
+                    let started = Instant::now();
+                    run(n);
+                    started.elapsed()
+                })
+                .collect()
+        };
+        let block = [7u8; 4096];
+        let new = timed(
+            &mut |n| {
+                let handle = writes.create(&format!("new{n}.bin")).unwrap();
+                writes.write(handle, 0, &block).unwrap();
+                writes.close(handle, true).unwrap();
+            },
+            2000,
+        );
+        said("a new file: create, write 4 KiB, close", new);
+        let handle = writes.create("writes.bin").unwrap();
+        let wrote = timed(
+            &mut |n| {
+                writes.write(handle, n as u64 * 4096, &block).unwrap();
+            },
+            20000,
+        );
+        said("a write of 4 KiB", wrote);
+        let mut buffer = [0u8; 4096];
+        let read = timed(
+            &mut |n| {
+                writes.read_into("writes.bin", (n * 37 % 20000) as u64 * 4096, &mut buffer).unwrap();
+            },
+            20000,
+        );
+        said("a read of 4 KiB of what was written", read);
+        said("what a written file is (its length and time)", timed(&mut |_| drop(writes.shown("writes.bin")), 20000));
+        writes.close(handle, true).unwrap();
+        said("a file removed", timed(&mut |n| writes.remove(&format!("new{n}.bin")).unwrap(), 2000));
         drop(writes);
         let _ = std::fs::remove_dir_all(&dir);
     }

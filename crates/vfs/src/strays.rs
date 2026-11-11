@@ -80,7 +80,7 @@ pub fn take_in(
     for path in &ordered {
         let staged: PathBuf = staging.join(format!("stray-{}", std::process::id()));
         std::fs::copy(at.join(path), &staged)?;
-        let applied = owner.change(Change::Write { path: path.clone(), staged: staged.clone() });
+        let applied = owner.change(Change::Write { path: path.clone(), staged: staged.clone().into() });
         let _ = std::fs::remove_file(&staged);
         applied.map_err(|why| io::Error::other(format!("{path}: {why}")))?;
         std::fs::remove_file(at.join(path))?;

@@ -62,6 +62,7 @@ pe2-model = { path = "crates/model" }
 codecs = { path = "crates/codecs" }
 typeface = { path = "crates/typeface" }
 vfs = { path = "crates/vfs" }
+sfs = { path = "crates/sfs" }
 pe2-value = { path = "crates/value" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }

@@ -511,7 +511,7 @@ impl Worker {
         } else {
             let staged = self.staging.join(format!("cloud-{}", std::process::id()));
             std::fs::copy(path, &staged)?;
-            Change::Write { path: tree_path, staged }
+            Change::Write { path: tree_path, staged: staged.into() }
         };
         owner.change(change).map_err(|why| io::Error::other(why.to_string()))?;
         mark_in_sync(path, state.is_some(), meta.is_dir())

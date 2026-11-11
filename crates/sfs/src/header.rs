@@ -19,6 +19,7 @@ mod at {
     pub const APPLIED: usize = 16;
     pub const DURABLE: usize = 24;
     pub const HOLDER: usize = 32;
+    pub const SEGMENT: usize = 40;
 }
 
 /// The page, mapped: shared with every process that maps the same file.
@@ -110,6 +111,15 @@ impl Header {
     /// What the project has is on disk up to here: only ever said further on.
     pub fn set_durable(&self, position: u64) {
         self.u64_at(at::DURABLE).fetch_max(position, Ordering::AcqRel);
+    }
+
+    /// The size of the log's segments: what whoever made the log first laid it out with, whatever is asked for after.
+    #[must_use]
+    pub fn segment_or(&self, size: u64) -> u64 {
+        match self.u64_at(at::SEGMENT).compare_exchange(0, size, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => size,
+            Err(set) => set,
+        }
     }
 
     /// The process holding the project, where one said so; 0 where none.

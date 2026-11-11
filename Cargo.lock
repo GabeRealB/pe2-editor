@@ -6854,6 +6854,7 @@ dependencies = [
  "project",
  "serde",
  "serde_json",
+ "sfs",
  "tokio",
  "tracing",
  "windows 0.62.2",

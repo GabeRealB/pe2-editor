@@ -19,13 +19,68 @@ use project::history::History;
 use project::index::{BUNDLE_SUFFIX, Index, Kind, NODE_FILE};
 use project::{Project, edit};
 
+/// Where what a program wrote is, until it is applied.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Written {
+    /// A file of its own.
+    File(PathBuf),
+    /// In the log the project's processes share (`sfs::Log`), kept in this folder: how long it is, and its ranges -
+    /// where each starts in the file, how long it is, where it is in the log. Read where the log is mapped.
+    Logged { log: PathBuf, len: u64, ranges: Vec<(u64, u64, u64)> },
+}
+
+impl From<PathBuf> for Written {
+    fn from(file: PathBuf) -> Written {
+        Written::File(file)
+    }
+}
+
+impl Written {
+    /// All of it.
+    ///
+    /// # Errors
+    /// Its file, or the log, cannot be read.
+    pub fn read(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Written::File(file) => std::fs::read(file),
+            Written::Logged { log, len, ranges } => {
+                let log = sfs::Log::shared(log, sfs::log::Config::default())?;
+                let mut bytes = Vec::with_capacity(usize::try_from(*len).unwrap_or(0));
+                sfs::Content::of_ranges(*len, ranges).write_to(&log, &mut bytes)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// What it is said as, where reading it failed.
+    fn shown(&self) -> String {
+        match self {
+            Written::File(file) => file.display().to_string(),
+            Written::Logged { log, .. } => format!("the log in {}", log.display()),
+        }
+    }
+}
+
+/// The logs whoever applies changes has read from: kept open, since opening one beside another process that has
+/// it takes a moment.
+fn keep_open(written: &Written) {
+    static KEPT: std::sync::Mutex<Vec<std::sync::Arc<sfs::Log>>> = std::sync::Mutex::new(Vec::new());
+    let Written::Logged { log, .. } = written else { return };
+    let Ok(log) = sfs::Log::shared(log, sfs::log::Config::default()) else { return };
+    let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !kept.iter().any(|open| std::sync::Arc::ptr_eq(open, &log)) {
+        kept.push(log);
+    }
+}
+
 /// A change a program made through the filesystem, by resolved paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// A file's new content, kept at `staged` until applied.
+    /// A file's new content, kept where `staged` says until applied.
     Write {
         path: String,
-        staged: PathBuf,
+        staged: Written,
     },
     Remove {
         path: String,
@@ -193,7 +248,8 @@ pub fn apply(
     let label = change.label();
     match change {
         Change::Write { path, staged } => {
-            let bytes = std::fs::read(staged).with_context(|| staged.display().to_string())?;
+            keep_open(staged);
+            let bytes = staged.read().with_context(|| staged.shown())?;
             write(project, index, layer, path, &bytes, label, history)
         }
         Change::Remove { path } => match place(index, path) {

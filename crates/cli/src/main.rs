@@ -1566,7 +1566,9 @@ fn project_command(command: &ProjectCommand) -> Result<()> {
     let (op, at) = edit_of(command).context("no such command")??;
     let done = edit(&op, at);
     // What standard input was kept in is the edit's alone.
-    if let (ProjectCommand::Write { from: None, .. }, vfs::ops::Op::Write { from, .. }) = (command, &op) {
+    if let (ProjectCommand::Write { from: None, .. }, vfs::ops::Op::Write { from, .. }) = (command, &op)
+        && let vfs::write::Written::File(from) = from
+    {
         let _ = std::fs::remove_file(from);
     }
     done
@@ -1583,7 +1585,7 @@ fn edit_of(command: &ProjectCommand) -> Option<Result<(vfs::ops::Op, &EditAt)>> 
                 None => read_stdin_to_file(),
             };
             match from {
-                Ok(from) => (Op::Write { path: path(at_path), from }, at),
+                Ok(from) => (Op::Write { path: path(at_path), from: from.into() }, at),
                 Err(e) => return Some(Err(e)),
             }
         }
