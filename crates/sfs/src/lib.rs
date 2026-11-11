@@ -12,6 +12,10 @@
 //!   written again from the log where it may not have been.
 //! - `header`: one page of positions every process reads without asking another - how far the log goes, how far
 //!   the project has it, how far that is on disk.
+//! - `space`: pages every process maps, changed by one writer at a time by copying what it changes and read with
+//!   no lock at the commit a reader began with; what is found not to be the page that was pointed to is said to
+//!   every process.
+//! - `tree`: keys in order with their values, in the space's pages.
 //!
 //! It knows nothing of what a project is: it is given a folder to keep its state in.
 
@@ -19,10 +23,13 @@ pub mod content;
 pub mod header;
 pub mod log;
 pub mod ops;
+pub mod space;
 pub mod storage;
+pub mod tree;
 
 pub use content::Content;
 pub use header::Header;
 pub use log::{Log, Record};
 pub use ops::Op;
+pub use space::Space;
 pub use storage::Stored;
