@@ -61,7 +61,9 @@ pub struct Node {
 /// The tree an index resolves, by inode number.
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
-    nodes: HashMap<u64, Node>,
+    /// Each node shared with the trees this one was made from: a tree changed is a copy of the one before, which
+    /// costs a count a node where the nodes themselves are not copied.
+    nodes: HashMap<u64, Arc<Node>>,
     /// While a node's files are placed: the folders made are of its files.
     of_files: bool,
 }
@@ -119,17 +121,17 @@ impl Inodes {
     /// A path renamed: its number, and those of what is inside it, go with it - as the kernel keeps them - and what
     /// was at the new path before lets go of its number.
     pub fn rename(&mut self, from: &str, to: &str) {
+        let (in_from, in_to) = (format!("{from}/"), format!("{to}/"));
         let moved: Vec<(String, u64)> = self
             .by_path
             .iter()
-            .filter(|(path, _)| *path == from || path.starts_with(&format!("{from}/")))
+            .filter(|(path, _)| *path == from || path.starts_with(&in_from))
             .map(|(path, ino)| (path.clone(), *ino))
             .collect();
         for (path, _) in &moved {
             self.by_path.remove(path);
         }
-        let replaced: Vec<String> =
-            self.by_path.keys().filter(|p| *p == to || p.starts_with(&format!("{to}/"))).cloned().collect();
+        let replaced: Vec<String> = self.by_path.keys().filter(|p| *p == to || p.starts_with(&in_to)).cloned().collect();
         for path in replaced {
             if let Some(ino) = self.by_path.remove(&path) {
                 self.by_ino.remove(&ino);
@@ -159,7 +161,7 @@ impl Tree {
         let mut tree = Tree::default();
         tree.nodes.insert(
             ROOT,
-            Node {
+            Arc::new(Node {
                 path: String::new(),
                 parent: ROOT,
                 what: What::Folder(BTreeMap::new()),
@@ -167,7 +169,7 @@ impl Tree {
                 modified: SystemTime::UNIX_EPOCH,
                 asset: false,
                 of_files: false,
-            },
+            }),
         );
         let time = |(secs, nanos): (u64, u32)| SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         for (path, shown) in listing {
@@ -176,7 +178,7 @@ impl Tree {
                 Shown::Node => {
                     // A node is the folder of its name, beside - one with - its folder of children.
                     let ino = tree.folder(path, inodes);
-                    if let Some(node) = tree.nodes.get_mut(&ino) {
+                    if let Some(node) = tree.nodes.get_mut(&ino).map(Arc::make_mut) {
                         node.asset = true;
                     }
                 }
@@ -210,7 +212,7 @@ impl Tree {
             asset: false,
             of_files: false,
         };
-        tree.nodes.insert(ROOT, root);
+        tree.nodes.insert(ROOT, Arc::new(root));
         for (path, given) in files {
             let (size, modified) = match given {
                 Given::Disk(disk) => project::content::stat(disk).unwrap_or((0, SystemTime::UNIX_EPOCH)),
@@ -242,7 +244,7 @@ impl Tree {
             asset: false,
             of_files: self.of_files,
         };
-        self.nodes.insert(ino, node);
+        self.nodes.insert(ino, Arc::new(node));
         ino
     }
 
@@ -253,7 +255,7 @@ impl Tree {
         self.adopt(parent, name, ino);
         self.nodes.insert(
             ino,
-            Node {
+            Arc::new(Node {
                 path: path.to_string(),
                 parent,
                 what: What::File(content),
@@ -261,7 +263,7 @@ impl Tree {
                 modified,
                 asset: false,
                 of_files: false,
-            },
+            }),
         );
     }
 
@@ -288,7 +290,7 @@ impl Tree {
                         self.remove(path);
                     }
                     let ino = self.folder(path, inodes);
-                    if let Some(node) = self.nodes.get_mut(&ino) {
+                    if let Some(node) = self.nodes.get_mut(&ino).map(Arc::make_mut) {
                         node.asset = matches!(shown, Shown::Node);
                     }
                 }
@@ -314,17 +316,47 @@ impl Tree {
         }
     }
 
+    /// Move a path, with what is in it, to another: there at once, each keeping its number. What was at the new
+    /// path goes. Whether anything was there to move.
+    pub fn rename(&mut self, from: &str, to: &str, inodes: &mut Inodes) -> bool {
+        let Some((ino, above)) = self.at(from).map(|(ino, node)| (ino, node.parent)) else { return false };
+        if self.at(to).is_some() {
+            self.remove(to);
+        }
+        let name = |path: &str| path.rsplit_once('/').map_or(path, |(_, name)| name).to_string();
+        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&above).map(Arc::make_mut) {
+            children.remove(&name(from));
+        }
+        let parent = self.folder(to.rsplit_once('/').map_or("", |(parent, _)| parent), inodes);
+        inodes.rename(from, to);
+        self.adopt(parent, &name(to), ino);
+        let mut moving = vec![ino];
+        while let Some(at) = moving.pop() {
+            let Some(node) = self.nodes.get_mut(&at).map(Arc::make_mut) else { continue };
+            node.path = format!("{to}{}", &node.path[from.len()..]);
+            if at == ino {
+                node.parent = parent;
+            }
+            if let What::Folder(children) = &node.what {
+                moving.extend(children.values().copied());
+            }
+        }
+        true
+    }
+
     /// Take a path out of the tree, with what is in it.
     fn remove(&mut self, path: &str) {
         let Some((ino, node)) = self.at(path).map(|(ino, node)| (ino, node.parent)) else { return };
         let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
-        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&node) {
+        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&node).map(Arc::make_mut) {
             children.remove(name);
         }
         let mut going = vec![ino];
         while let Some(ino) = going.pop() {
-            if let Some(Node { what: What::Folder(children), .. }) = self.nodes.remove(&ino) {
-                going.extend(children.into_values());
+            if let Some(node) = self.nodes.remove(&ino)
+                && let What::Folder(children) = &node.what
+            {
+                going.extend(children.values().copied());
             }
         }
         // A folder a node's files made, left empty, is no entry of its own: it goes with the last of them.
@@ -338,14 +370,14 @@ impl Tree {
     }
 
     fn adopt(&mut self, parent: u64, name: &str, ino: u64) {
-        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&parent) {
+        if let Some(Node { what: What::Folder(children), .. }) = self.nodes.get_mut(&parent).map(Arc::make_mut) {
             children.insert(name.to_string(), ino);
         }
     }
 
     #[must_use]
     pub fn node(&self, ino: u64) -> Option<&Node> {
-        self.nodes.get(&ino)
+        self.nodes.get(&ino).map(|node| &**node)
     }
 
     /// A node by its path.
@@ -377,6 +409,7 @@ impl Tree {
             if !matches!(node.what, What::File(_)) || node.modified > old.modified {
                 continue;
             }
+            let node = Arc::make_mut(node);
             // A second on at least: what polls compares whole seconds.
             let later = old.modified + std::time::Duration::from_secs(1);
             node.modified = if node.what != old.what || node.size != old.size { now.max(later) } else { old.modified };
@@ -579,6 +612,23 @@ impl Served {
         self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).forget(folder);
     }
 
+    /// A path moved in the tree served, with what is in it, before whoever holds the project lists it so: shown at
+    /// its new path at once, numbers kept. Whether the tree had it; where not, its number alone goes with it.
+    pub fn moved(&self, from: &str, to: &str) -> bool {
+        if self.tree().at(from).is_none() {
+            self.rename(from, to);
+            return false;
+        }
+        let mut tree = (*self.tree()).clone();
+        {
+            let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tree.rename(from, to, &mut inodes);
+        }
+        *self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(tree);
+        self.wake();
+        true
+    }
+
     /// A path renamed: its inode number goes with it (`Inodes::rename`).
     pub fn rename(&self, from: &str, to: &str) {
         self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rename(from, to);
@@ -691,6 +741,27 @@ mod tests {
         let mut listing = before.clone();
         delta.apply(&mut listing);
         assert_eq!(listing, after);
+    }
+
+    #[test]
+    fn a_path_moved_takes_what_is_in_it_and_keeps_its_numbers() {
+        let served = super::Served::default();
+        let bytes = |text: &str| project::content::Given::Bytes(std::sync::Arc::from(text.as_bytes()));
+        let files = [("a/x.txt", "x"), ("a/sub/y.txt", "y"), ("b.txt", "b"), ("c/x.txt", "old")];
+        served.set_files(&files.into_iter().map(|(path, text)| (path.to_string(), bytes(text))).collect());
+        let (x, y) = (served.ino("a/x.txt"), served.ino("a/sub/y.txt"));
+        // Onto a folder that is there: what it held goes.
+        assert!(served.moved("a", "c"));
+        let tree = served.tree();
+        assert!(tree.at("a").is_none(), "nothing where it was");
+        assert_eq!(tree.at("c/x.txt").map(|(ino, node)| (ino, node.path.clone())), Some((x, "c/x.txt".to_string())));
+        assert_eq!(tree.at("c/sub/y.txt").map(|(ino, _)| ino), Some(y));
+        assert_eq!(tree.read(x, 0, 8).unwrap(), b"x", "the file moved there, not the one that was");
+        assert_eq!(served.path(y).as_deref(), Some("c/sub/y.txt"));
+        // Into a folder not there yet, and a file alone.
+        assert!(served.moved("b.txt", "made/for/it.txt"));
+        assert!(served.tree().at("made/for/it.txt").is_some() && served.tree().at("b.txt").is_none());
+        assert!(!served.moved("nothing", "anywhere"), "what is not there is not moved");
     }
 
     #[test]
