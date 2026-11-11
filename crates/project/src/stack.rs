@@ -249,6 +249,6 @@ mod tests {
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
         assert!(!root.join(".layers/fixes").exists());
         drop(lock);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 }

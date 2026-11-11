@@ -1023,7 +1023,7 @@ mod tests {
         o.refresh(&paths);
         assert!(junk.exists());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&entry.disk).unwrap(), "notes");
         assert!(o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1074,7 +1074,7 @@ mod tests {
         o.refresh(&paths);
         assert!(o.index.assets.contains_key("g/c/b"));
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1135,7 +1135,7 @@ mod tests {
         write(&mut o, "notes.txt", b"one\ntwo\nTHREE\n");
         assert!(!root.join(".layers/top/g/a.node/notes.txt").exists());
         assert!(matches!(o.op("g/a.node"), Some(Op::Override { files, .. }) if !files.contains_key("notes.txt")));
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1163,6 +1163,8 @@ mod tests {
         o.index.set_hidden(&std::collections::BTreeSet::from(["top".to_string()]));
         assert!(!o.index.entries.contains_key("h/made.node"));
         assert_eq!(o.index.served(), served);
+        drop(o);
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1208,6 +1210,8 @@ mod tests {
         assert!(refreshed.restacked);
         assert!(o.index.assets.contains_key("h/won") && !o.index.assets.contains_key("h/one"));
         assert!(o.index.assets.contains_key("h/two"));
+        drop(o);
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1261,7 +1265,7 @@ mod tests {
         }
         assert!(!o.index.assets.contains_key("h/one"));
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1282,7 +1286,7 @@ mod tests {
         let entry = o.index.entries.get("long.txt").expect("read again, it is there");
         assert_eq!(crate::content::read(&entry.disk).unwrap().len(), long.len());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1382,7 +1386,7 @@ mod tests {
         assert!(o.index.entries.contains_key("n") && !o.index.entries.contains_key("h"));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1424,7 +1428,7 @@ mod tests {
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert_eq!(o.uid("n"), n);
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1469,7 +1473,7 @@ mod tests {
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert!(!root.join(".layers/top/g").exists());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1510,7 +1514,7 @@ mod tests {
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert!(o.op("g/a.node").is_none());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1544,7 +1548,7 @@ mod tests {
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         assert!(mounted.join("kept.c").exists());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1574,7 +1578,7 @@ mod tests {
         assert!(!o.index.problems.iter().any(|p| matches!(p, Problem::Missing { .. })), "{:?}", o.index.problems);
         assert!(held.join("extension.toml").exists(), "only the list is written");
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1593,6 +1597,6 @@ mod tests {
         assert!(o.index.changeset("top").unwrap().entries.is_empty());
         assert!(!root.join(".layers/top/ours").exists());
         drop(o);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 }

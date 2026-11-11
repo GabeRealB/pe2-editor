@@ -100,6 +100,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&temporary, path).with_context(|| format!("{}", path.display()))
 }
 
+/// Remove a test's project, whatever a history still alive in it is writing behind this moment: tried again
+/// until nothing is put there meanwhile.
+#[cfg(test)]
+pub(crate) fn remove_all(root: &Path) {
+    for _ in 0..200 {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

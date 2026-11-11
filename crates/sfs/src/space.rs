@@ -46,6 +46,9 @@ const CHUNK_PAGES: u64 = 1024;
 const CHUNK: usize = 1024 * PAGE;
 /// The most chunks a space maps: 16 GiB.
 const CHUNKS: usize = 4096;
+/// How many pages of its first chunk a space is made ready to write (`Space::ready`): what the first transactions
+/// of a holder take.
+const READY_PAGES: usize = 64;
 /// How many trees a space has roots for.
 pub const ROOTS: usize = 16;
 /// How many processes have one space attached at a time.
@@ -496,7 +499,28 @@ impl Space {
     /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
     /// so that the first to write does not.
     pub fn ready(&self) {
-        let _ = self.chunk(0, true);
+        let Ok(first) = self.chunk(0, true) else { return };
+        // And its first pages, the two a commit is written to and the list of free ones touched: the first write
+        // to a page of a file that was given its blocks unwritten is what the system takes its time over. Touched
+        // without changing a byte, whoever may be writing there meanwhile.
+        let touch = |at: *mut u8| {
+            // SAFETY: a byte of a mapping of the space's, valid for as long as `self`, read and written here as an
+            // atomic that is left as it is.
+            let byte = unsafe { &*at.cast::<std::sync::atomic::AtomicU8>() };
+            // Exchanged for itself: a write the system sees, which one that changes nothing may be compiled out of
+            // being - and none at all where somebody wrote there meanwhile, which is as good.
+            let holds = byte.load(Ordering::Relaxed);
+            let _ = byte.compare_exchange(holds, holds, Ordering::AcqRel, Ordering::Relaxed);
+        };
+        for page in 0..READY_PAGES {
+            // SAFETY: within the first chunk, which holds more pages than that.
+            touch(unsafe { first.add(page * PAGE) });
+        }
+        for page in 1..3 {
+            // SAFETY: the head's second and third pages.
+            touch(unsafe { self.head().add(page * PAGE) });
+        }
+        touch(self.free().as_mut_ptr());
     }
 
     /// Whether it began empty when it was opened here: what it is to hold is to be put there.

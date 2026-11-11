@@ -3401,6 +3401,8 @@ mod tests {
         let (_, index) = open(&root);
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::Conflict { .. })), "{:?}", index.problems);
         assert!(index.assets.contains_key("g/a") && index.assets.contains_key("g/beside"));
+        drop(index);
+        crate::cache::remove_all(&root);
     }
 
     #[test]

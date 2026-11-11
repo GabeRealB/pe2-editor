@@ -1560,7 +1560,7 @@ mod tests {
         history.redo(&index, None, false).unwrap();
         assert!(!one.exists() && root.join("layer/d/c/two").exists());
         assert!(history.redo(&index, None, false).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1589,7 +1589,7 @@ mod tests {
         assert!(!crate::content::exists(&file));
         history.undo(&index, None, false).unwrap();
         assert_eq!(crate::content::read(&file).unwrap(), big);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1611,7 +1611,7 @@ mod tests {
         // Redo brings back what the forced undo overwrote.
         history.redo(&index, None, false).unwrap();
         assert_eq!(read(&one).as_deref(), Some("theirs"));
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1643,7 +1643,7 @@ mod tests {
         assert_eq!(read(&root.join("layer/moved/one")).as_deref(), Some("whole"));
         assert!(!root.join("layer/a").exists());
         drop(history);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1679,7 +1679,7 @@ mod tests {
         let (history, recovered) = self::history(&root);
         assert_eq!(recovered, None);
         drop(history);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
@@ -1740,7 +1740,7 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!((read(&a).as_deref(), read(&root.join("layer/a/one")).as_deref()), (Some("last"), Some("ONE")));
         drop(history);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1762,7 +1762,7 @@ mod tests {
         assert_eq!(read(&root.join(".cache/conflicts/.layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
         assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
         drop(history);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1784,7 +1784,7 @@ mod tests {
         assert_eq!(read(&a).as_deref(), Some("one"));
         assert!(crate::storage::waiting(&a).is_none(), "nothing waits of what was written again");
         drop(history);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1801,7 +1801,7 @@ mod tests {
         assert_eq!(history.done().len(), 1);
         history.undo(&index, None, false).unwrap();
         assert_eq!(read(&one).as_deref(), Some("one"));
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     /// A project of one layer holding the assets `a` and `b`.
@@ -1855,7 +1855,7 @@ mod tests {
         assert!(history.document("uid://a").is_none());
         history.undo(&index, None, false).unwrap();
         assert!(history.document("uid://b").is_none());
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1889,7 +1889,7 @@ mod tests {
         assert!(history.document("uid://a").unwrap().stale.is_none());
         history.revert("uid://a", "Revert a".into());
         assert!(history.document("uid://a").is_none());
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1919,7 +1919,7 @@ mod tests {
         assert_eq!(history.done().len(), steps + 1);
         history.undo(&index, None, false).unwrap();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 3"));
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1956,7 +1956,7 @@ mod tests {
         history.resume();
         assert_eq!(working_text(&history, "uid://a").as_deref(), Some("x = 5"));
         history.close();
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     #[test]
@@ -1983,6 +1983,6 @@ mod tests {
         history.close();
         let (history, _) = self::history(&root);
         assert!(history.left().is_none());
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 }

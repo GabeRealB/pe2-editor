@@ -259,7 +259,7 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text);
         drop(lock);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 
     /// A folder the way an extension is kept, its manifest beside a component carrying another: what the check
@@ -290,6 +290,6 @@ mod tests {
         // Neither held nor required, it cannot go.
         assert!(remove_extension(&project, "my.tool", &mut history, "remove".into()).is_err());
         drop(lock);
-        std::fs::remove_dir_all(&root).unwrap();
+        crate::cache::remove_all(&root);
     }
 }
