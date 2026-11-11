@@ -15,3 +15,7 @@ crc32fast = "1"
 # The ring of pages, in memory Windows keeps for the processes that name it (`ring::Ring::shared`).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory"] }
+
+# A file given its whole length of the disk without writing it (`space`: `posix_fallocate`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

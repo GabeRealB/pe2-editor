@@ -679,6 +679,19 @@ fn read_changed(dir: &Path, before: &Read, changed: &[PathBuf]) -> Option<Result
     Some((|| {
         let mut read = before.clone();
         for (uid, path) in records {
+            // One that waits to be written is as that leaves it, whatever the disk has yet.
+            match crate::storage::waiting_since(path) {
+                Some((at, Some(bytes))) => {
+                    let text = String::from_utf8(bytes).with_context(|| path.display().to_string())?;
+                    waits(&mut read, uid, &text, at).with_context(|| path.display().to_string())?;
+                    continue;
+                }
+                Some((_, None)) => {
+                    read.remove(&uid);
+                    continue;
+                }
+                None => {}
+            }
             match std::fs::metadata(path) {
                 Ok(meta) => {
                     let (modified, len) = (meta.modified()?, meta.len());
@@ -687,7 +700,13 @@ fn read_changed(dir: &Path, before: &Read, changed: &[PathBuf]) -> Option<Result
                     }
                     let text = std::fs::read_to_string(path)?;
                     let record = Record::parse(&text).with_context(|| path.display().to_string())?;
-                    read.insert(uid, Held { record: std::sync::Arc::new(record), modified, len });
+                    // As it was read before - what was written behind, read again once it is written - it is the
+                    // same record to whoever compares the two readings: only its file's stamp is new.
+                    let record = match read.get(&uid) {
+                        Some(held) if *held.record == record => held.record.clone(),
+                        _ => std::sync::Arc::new(record),
+                    };
+                    read.insert(uid, Held { record, modified, len });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => drop(read.remove(&uid)),
                 Err(e) => return Err(e).with_context(|| path.display().to_string()),
@@ -697,8 +716,24 @@ fn read_changed(dir: &Path, before: &Read, changed: &[PathBuf]) -> Option<Result
     })())
 }
 
+/// A record that waits to be written, among those read: as its text is, stamped as its file will be once written -
+/// its length, and the time it was said, which the file is given - so that the file written is the one read here.
+fn waits(read: &mut Read, uid: String, text: &str, at: std::time::SystemTime) -> Result<()> {
+    let record = Record::parse(text)?;
+    let record = match read.get(&uid) {
+        Some(held) if *held.record == record => held.record.clone(),
+        _ => std::sync::Arc::new(record),
+    };
+    read.insert(uid, Held { record, modified: at, len: text.len() as u64 });
+    Ok(())
+}
+
 /// A records layer's records, read on every core: those whose file is as it was when `before` read it taken from it.
+/// What waits to be written of them is as that leaves it.
 fn read_records(dir: &Path, before: Option<&Read>) -> Result<Read> {
+    // What waits is asked first: a record not waiting by now is in its file already, as it was last said - where
+    // one read from its file first, and found waiting no more after, would be missed in both.
+    let waiting = crate::storage::waiting_under(&dir.join(DIR));
     let shards: Vec<PathBuf> = std::fs::read_dir(dir.join(DIR))
         .into_iter()
         .flatten()
@@ -723,13 +758,10 @@ fn read_records(dir: &Path, before: Option<&Read>) -> Result<Read> {
         }
         Ok(out)
     };
-    if shards.is_empty() {
-        return Ok(BTreeMap::new());
-    }
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let parts: Vec<Result<Vec<(String, Held)>>> = std::thread::scope(|scope| {
         let workers: Vec<_> = shards
-            .chunks(shards.len().div_ceil(threads))
+            .chunks(shards.len().div_ceil(threads).max(1))
             .map(|part| {
                 scope.spawn(move || {
                     part.iter().map(read_shard).collect::<Result<Vec<_>>>().map(|v| v.into_iter().flatten().collect())
@@ -741,6 +773,16 @@ fn read_records(dir: &Path, before: Option<&Read>) -> Result<Read> {
     let mut out = BTreeMap::new();
     for part in parts {
         out.extend(part?);
+    }
+    for (path, at, bytes) in waiting {
+        let Some(uid) = uid_of(&path) else { continue };
+        match bytes {
+            Some(bytes) => {
+                let text = String::from_utf8(bytes).with_context(|| path.display().to_string())?;
+                waits(&mut out, uid, &text, at).with_context(|| path.display().to_string())?;
+            }
+            None => drop(out.remove(&uid)),
+        }
     }
     Ok(out)
 }

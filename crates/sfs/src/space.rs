@@ -51,8 +51,9 @@ pub const ROOTS: usize = 16;
 /// How many processes have one space attached at a time.
 const READERS: usize = 64;
 /// How long the list of free pages is, in bytes: a count, then a page's number and the generation that freed it for
-/// each - 65,535 of them. What is freed beyond that is not listed.
-const FREE: usize = 1 << 20;
+/// each - 8,191 of them. What is freed beyond that is not listed. Its file is written whole for every space there
+/// is, so it is no longer than a long hold on old pages needs.
+const FREE: usize = 1 << 17;
 /// What a page begins with: its kind (1), nothing (3), its own number (4), the generation that wrote it (8).
 pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
@@ -268,23 +269,47 @@ fn opened(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
 }
 
-/// A file of a space, written whole with zeros where it is shorter than it has to be: its pages are the file's own,
-/// never a hole a full disk could refuse to who writes through a mapping.
+/// A file of a space, of at least this length, all of it the file's own on the disk - never a hole a full disk
+/// could refuse to who writes through a mapping: a full disk is an error here, to who asks for the room. Given
+/// by the system where it can give a file its blocks without writing them; written as zeros elsewhere.
 fn sized(path: &Path, len: u64) -> io::Result<File> {
-    use std::io::{Seek as _, Write as _};
-    let mut file = opened(path)?;
+    let file = opened(path)?;
     let has = file.metadata()?.len();
     if has < len {
-        file.seek(io::SeekFrom::Start(has))?;
-        let zeros = vec![0u8; 1 << 16];
-        let mut left = len - has;
-        while left > 0 {
-            let part = usize::try_from(left).unwrap_or(usize::MAX).min(zeros.len());
-            file.write_all(&zeros[..part])?;
-            left -= part as u64;
-        }
+        allocate(&file, has, len)?;
     }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn allocate(file: &File, _has: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let len = libc::off_t::try_from(len).map_err(io::Error::other)?;
+    // SAFETY: a file open here, for its whole length from its start.
+    match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
+        0 => Ok(()),
+        failed => Err(io::Error::from_raw_os_error(failed)),
+    }
+}
+
+/// On Windows a file made longer is given its clusters then, and reads as zeros until written.
+#[cfg(windows)]
+fn allocate(file: &File, _has: u64, len: u64) -> io::Result<()> {
+    file.set_len(len)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn allocate(mut file: &File, has: u64, len: u64) -> io::Result<()> {
+    use std::io::{Seek as _, Write as _};
+    file.seek(io::SeekFrom::Start(has))?;
+    let zeros = vec![0u8; 1 << 16];
+    let mut left = len - has;
+    while left > 0 {
+        let part = usize::try_from(left).unwrap_or(usize::MAX).min(zeros.len());
+        file.write_all(&zeros[..part])?;
+        left -= part as u64;
+    }
+    Ok(())
 }
 
 /// Whether a file of a space's folder is one of its pages' - not one of its locks.
@@ -466,6 +491,12 @@ impl Space {
             }
         }
         Ok(())
+    }
+
+    /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
+    /// so that the first to write does not.
+    pub fn ready(&self) {
+        let _ = self.chunk(0, true);
     }
 
     /// Whether it began empty when it was opened here: what it is to hold is to be put there.

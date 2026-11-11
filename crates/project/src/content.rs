@@ -138,6 +138,21 @@ const RECORDS_HELD: usize = 256;
 
 /// The text a record holds for one of its files, read from the record's own file.
 fn record_text(record: &Path, name: &str) -> io::Result<Vec<u8>> {
+    // A record that waits to be written is read as that leaves it: whoever holds the project said its files
+    // served from it already.
+    match crate::storage::waiting(record) {
+        Some(Some(bytes)) => {
+            let text = String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let parsed = crate::records::Record::parse(&text)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e:#}", record.display())))?;
+            return match parsed.files.get(name).and_then(|file| file.content.as_ref()) {
+                Some(crate::records::Content::Text(text)) => Ok(text.clone().into_bytes()),
+                _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{}: no text of `{name}`", record.display()))),
+            };
+        }
+        Some(None) => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        None => {}
+    }
     let written = std::fs::metadata(record)?.modified()?;
     let mut held = RECORDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let known = held.iter().position(|(path, at, _)| path == record && *at == written);

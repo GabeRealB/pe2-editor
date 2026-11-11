@@ -83,6 +83,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     };
     let ring = (pages > 0).then(|| project::shared::ring(&p.root, &shared, pages)).transpose().context("the pages kept of what is read")?;
     let ring = ring.map(Arc::new);
+    // A record whoever holds the project changed and has yet to write is read as that leaves it.
+    project::storage::read_through(&p.root, shared.clone());
     let server = Arc::new(Server {
         project: p.clone(),
         // The tree it serves is the shared filesystem itself, read as it is asked: nothing of it is kept here.

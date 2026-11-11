@@ -879,7 +879,14 @@ impl History {
             Some(storage) => {
                 let said: Vec<crate::storage::Stored> =
                     changes.iter().map(|change| self.said(storage, change)).collect::<Result<_>>()?;
+                // Records of records layers alone: said, kept as waiting for whoever reads them, and written
+                // behind - nothing here waits for a disk.
+                let behind = self.behind(changes).filter(|files| storage.defers(files));
                 let storage = self.storage.as_mut().context("the log is gone")?;
+                if let Some(files) = behind {
+                    storage.say_later(label, &said, files).context("saying the changes in the log")?;
+                    return Ok(());
+                }
                 Some(storage.say(label, &said).context("saying the changes in the log")?)
             }
             None => None,
@@ -900,6 +907,47 @@ impl History {
             storage.wrote(changes.iter().flat_map(Change::paths).map(Path::to_path_buf));
         }
         Ok(())
+    }
+
+    /// The files of a set as they are written behind; none where it does more than write and remove files and make
+    /// folders.
+    fn behind(&self, changes: &[Change]) -> Option<Vec<crate::storage::Behind>> {
+        use crate::storage::Behind;
+        let at = crate::storage::stamped(std::time::SystemTime::now());
+        changes
+            .iter()
+            .map(|change| match change {
+                Change::Write { path, before, after } => {
+                    let after = after.as_ref().map(|hash| self.blob(hash)).transpose().ok()?;
+                    Some(Behind { path: path.clone(), after, before: before.clone(), folder: false, at })
+                }
+                Change::MakeDir { path } => Some(Behind { path: path.clone(), after: None, before: None, folder: true, at }),
+                Change::Rename { .. } | Change::RemoveDir { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Have what writing behind needs made ahead of the first edit (`Storage::prepare`): for whoever holds the
+    /// project to stay.
+    pub fn prepare(&self) {
+        if let Some(storage) = &self.storage {
+            storage.prepare();
+        }
+    }
+
+    /// Hold back what is written behind, or write it again (`Storage::hold_back`).
+    pub fn hold_back(&self, held: bool) {
+        if let Some(storage) = &self.storage {
+            storage.hold_back(held);
+        }
+    }
+
+    /// Wait for what was said to be written behind to be in the project's files: for who answers something that
+    /// is to find them so - a command, an agent, whatever reads the files by other means next.
+    pub fn settle(&self) {
+        if let Some(storage) = &self.storage {
+            storage.settle();
+        }
     }
 
     /// A change as the log says it: a file with the bytes it comes to hold.
@@ -1005,9 +1053,9 @@ impl History {
 
     /// Keep a file's current content; its hash, none where it is absent.
     fn keep_current(&self, path: &Path) -> Result<Option<String>> {
-        match std::fs::read(path) {
-            Ok(bytes) => self.keep(&bytes).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        match crate::storage::read(path) {
+            Ok(Some(bytes)) => self.keep(&bytes).map(Some),
+            Ok(None) => Ok(None),
             Err(e) => Err(e).with_context(|| path.display().to_string()),
         }
     }
@@ -1208,22 +1256,23 @@ impl Transaction<'_> {
         match self.seen(path) {
             Seen::File(Some(hash)) => self.history.blob(&hash).map(Some),
             Seen::File(None) | Seen::Folder | Seen::Gone => Ok(None),
-            Seen::Disk(at) => match std::fs::read(&at) {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e).with_context(|| at.display().to_string()),
-            },
+            // As what waits to be written leaves it, then as the disk has it.
+            Seen::Disk(at) => crate::storage::read(&at).with_context(|| at.display().to_string()),
         }
     }
 
     fn exists(&self, path: &Path) -> bool {
-        self.pending(path).unwrap_or_else(|| self.on_disk(path).exists())
+        self.pending(path).unwrap_or_else(|| {
+            let at = self.on_disk(path);
+            // A file as what waits to be written leaves it; a folder there for what waits in it.
+            crate::storage::waiting(&at).map_or_else(|| at.exists() || crate::storage::folder_waits(&at), |waits| waits.is_some())
+        })
     }
 
     fn is_file(&self, path: &Path) -> bool {
         match self.seen(path) {
             Seen::File(after) => after.is_some(),
-            Seen::Disk(at) => at.is_file(),
+            Seen::Disk(at) => crate::storage::is_file(&at),
             Seen::Folder | Seen::Gone => false,
         }
     }
@@ -1442,8 +1491,9 @@ fn keep_in(dir: &Path, bytes: &[u8]) -> Result<String> {
     Ok(hash)
 }
 
+/// The hash of what a file holds - as what waits to be written leaves it; none where it is absent.
 fn current_hash(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|bytes| sha1_hex(&bytes))
+    crate::storage::read(path).ok().flatten().map(|bytes| sha1_hex(&bytes))
 }
 
 fn is_empty_dir(path: &Path) -> bool {
@@ -1628,6 +1678,111 @@ mod tests {
         // Written again once: the next to take it finds nothing to write.
         let (history, recovered) = self::history(&root);
         assert_eq!(recovered, None);
+        drop(history);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
+    /// layer's is: only a record and the folder of its first two letters are written behind.
+    fn record(root: &Path, uid: &str) -> PathBuf {
+        // Under the root as the project names it, which is how every path of an edit is made.
+        let records = std::fs::canonicalize(root).unwrap().join(".layers").join("top").join(".records");
+        std::fs::create_dir_all(&records).unwrap();
+        records.join(&uid[..2]).join(format!("{uid}.toml"))
+    }
+
+    #[test]
+    fn records_are_written_behind_and_read_as_they_wait() {
+        use crate::storage::{is_file, read as read_through, waiting, waiting_since, waiting_under};
+        let root = project("behind");
+        let (a, b) = (record(&root, "aa1"), record(&root, "bb2"));
+        let index = index(&root);
+        let (mut history, _) = history(&root);
+        history.hold_back(true);
+        let mut tx = history.begin("made");
+        tx.write_stored(&a, b"one").unwrap();
+        tx.write_stored(&b, b"two").unwrap();
+        tx.commit().unwrap();
+        // Said, and no file touched - nor their folders made: read as the set leaves them by whoever asks.
+        assert!(!a.exists() && !a.parent().unwrap().exists());
+        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(waiting_under(a.parent().unwrap().parent().unwrap()).len(), 2);
+        // Changed again and removed while they wait: each as the last set leaves it.
+        let mut tx = history.begin("again");
+        tx.write_stored(&a, b"ONE!").unwrap();
+        tx.remove(&b).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"ONE!"[..]));
+        assert!(!is_file(&b) && read_through(&b).unwrap().is_none());
+        // Undone and redone while they wait, as when they are files.
+        history.undo(&index, None, false).unwrap();
+        assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(read_through(&b).unwrap().as_deref(), Some(&b"two"[..]));
+        history.redo(&index, None, false).unwrap();
+        let (said, _) = waiting_since(&a).unwrap();
+        // Written: the files as the last set left them, each stamped with when its change was said - what read
+        // it while it waited finds the file to be the one it read - and nothing waits.
+        history.hold_back(false);
+        history.settle();
+        assert_eq!(read(&a).as_deref(), Some("ONE!"));
+        assert!(!b.exists());
+        assert_eq!(std::fs::metadata(&a).unwrap().modified().unwrap(), said);
+        assert!(waiting(&a).is_none() && waiting(&b).is_none());
+        // What is no record alone is written as it is said, after all that waited.
+        history.hold_back(true);
+        let mut tx = history.begin("a record");
+        tx.write_stored(&a, b"last").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(read(&a).as_deref(), Some("ONE!"));
+        history.hold_back(false);
+        let mut tx = history.begin("a file");
+        tx.write(&root.join("layer/a/one"), b"ONE").unwrap();
+        tx.commit().unwrap();
+        assert_eq!((read(&a).as_deref(), read(&root.join("layer/a/one")).as_deref()), (Some("last"), Some("ONE")));
+        drop(history);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_by_something_else_while_ours_waits_is_left_and_ours_kept_aside() {
+        let root = project("conflict");
+        let (mut history, _) = history(&root);
+        let a = record(&root, "aa1");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::write(&a, "was").unwrap();
+        history.hold_back(true);
+        let mut tx = history.begin("ours");
+        tx.write_stored(&a, b"ours").unwrap();
+        tx.commit().unwrap();
+        // Something else writes it before ours is.
+        std::fs::write(&a, "theirs").unwrap();
+        history.hold_back(false);
+        history.settle();
+        assert_eq!(read(&a).as_deref(), Some("theirs"), "not written over");
+        assert_eq!(read(&root.join(".cache/conflicts/.layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
+        assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
+        drop(history);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn what_waited_when_its_process_ended_is_written_by_who_takes_the_project_next() {
+        let root = project("behind-redo");
+        let a = record(&root, "aa1");
+        {
+            let (mut history, _) = history(&root);
+            history.hold_back(true);
+            let mut tx = history.begin("made");
+            tx.write_stored(&a, b"one").unwrap();
+            tx.commit().unwrap();
+            // Its process gone, with nothing written.
+            std::mem::forget(history);
+        }
+        assert!(!a.exists());
+        let (history, recovered) = history(&root);
+        assert!(recovered.as_deref().is_some_and(|said| said.contains("made")), "{recovered:?}");
+        assert_eq!(read(&a).as_deref(), Some("one"));
+        assert!(crate::storage::waiting(&a).is_none(), "nothing waits of what was written again");
         drop(history);
         std::fs::remove_dir_all(&root).unwrap();
     }

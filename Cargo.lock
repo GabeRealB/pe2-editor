@@ -5708,6 +5708,7 @@ name = "sfs"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "memmap2",
  "windows-sys 0.61.2",
 ]

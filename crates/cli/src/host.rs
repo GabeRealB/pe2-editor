@@ -190,6 +190,8 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
 fn hold(p: &Project, lock: &Lock) -> Result<(Index, History)> {
     let cache = Cache::open(p, lock)?;
     let (history, recovered) = History::open(&cache)?;
+    // It holds the project to stay: what its first edit would wait for is made ahead of it.
+    history.prepare();
     if let Some(recovered) = recovered {
         println!("{recovered}");
     }
@@ -378,6 +380,10 @@ impl Host {
             Ok(refreshed) => all.and(refreshed),
             Err(e) => return failed(format!("{e:#}")),
         }
+        // Answered once the project's files have what was asked: whoever reads them next by other means - a
+        // command after this one, a tool - finds them so. All that was asked together is had on disk together,
+        // and each file is as its own writing left it when what watches the layers tells of it.
+        held.history.settle();
         if written.len() > 10_000 {
             written.clear();
         }
@@ -594,6 +600,8 @@ impl Host {
             let held = (|| {
                 let cache = Cache::open(&self.project, &taken)?;
                 let (history, recovered) = History::open(&cache)?;
+                // It holds the project to stay: what its first edit would wait for is made ahead of it.
+                history.prepare();
                 if let Some(recovered) = recovered {
                     println!("{recovered}");
                 }

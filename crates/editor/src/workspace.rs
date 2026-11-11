@@ -390,10 +390,10 @@ pub fn adding(asset: &Asset, file: &Path) -> std::result::Result<EditRequest, St
 /// A path's size and time of change.
 type Stamp = (u64, std::time::SystemTime);
 
-/// A path's stamp, where it is.
+/// A path's stamp, where it is - as what waits to be written of it will leave it: what the editor wrote is known
+/// again as its own when its file is written, a moment after.
 fn stamp(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
+    project::storage::stamp(path)
 }
 
 /// How many GPU errors are kept: an extension failing a frame says the same each frame.
@@ -677,6 +677,8 @@ impl Workspace {
         // The history first: a transaction a crash left half done is rolled back before the index reads the files.
         // Journaled: a session a crash ends is offered back on the next opening.
         let (history, recovered) = History::open(&cache)?;
+        // It holds the project to stay: what its first edit would wait for is made ahead of it.
+        history.prepare();
         let history = history.journaled();
         let index = Index::open_reporting(&project, &cache, report)?;
         // What is served of it, listed for the server, which has no index: it serves from this first listing on.
