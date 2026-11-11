@@ -2451,6 +2451,7 @@ fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, proje
             row(ui, "Files given to programs", &mut says.scopes, Can::BY_PATH, "Nothing: copies");
             budget(ui, "Copies written up to", &mut says.copies, vfs::backend::COPIES);
             budget(ui, "Kept of a folder up to", &mut says.kept, vfs::backend::KEPT);
+            budget(ui, "Pages kept of what was read", &mut says.pages, vfs::backend::PAGES);
             // Where a backend keeping a folder's content apart from it keeps it: empty is the system's place for it.
             ui.label("Kept apart in");
             let mut text = says.cache.clone().unwrap_or_default();

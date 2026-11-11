@@ -176,6 +176,9 @@ pub struct Filesystem {
     /// How much may be kept of what was read of a project's folder (`2 GiB`), by a backend that keeps what is read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
+    /// How much memory the pages kept of what was read of a project's files may take (`256 MiB`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<String>,
     /// Where what a backend keeps apart from the folder it serves is kept: a folder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<String>,
@@ -183,7 +186,7 @@ pub struct Filesystem {
 
 impl Filesystem {
     fn says_nothing(&self) -> bool {
-        let budgets = self.copies.is_none() && self.kept.is_none();
+        let budgets = self.copies.is_none() && self.kept.is_none() && self.pages.is_none();
         self.serve.is_none() && self.scopes.is_none() && budgets && self.cache.is_none()
     }
 }

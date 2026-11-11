@@ -405,6 +405,8 @@ pub struct FilesystemDefaults {
     /// folder: budgets of bytes (`16 MiB`).
     pub copies: Option<String>,
     pub kept: Option<String>,
+    /// How much memory the pages kept of what was read of a project's files may take (`256 MiB`).
+    pub pages: Option<String>,
     /// Where what a backend keeps apart from the folder it serves is kept: a folder.
     pub cache: Option<String>,
 }
@@ -424,6 +426,7 @@ pub fn filesystem_defaults() -> FilesystemDefaults {
             scopes: said("scopes"),
             copies: said("copies"),
             kept: said("kept"),
+            pages: said("pages"),
             cache: said("cache"),
         })
     };

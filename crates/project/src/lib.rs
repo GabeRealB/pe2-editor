@@ -293,6 +293,7 @@ struct FilesystemFile {
     keep: Option<bool>,
     copies: Option<String>,
     kept: Option<String>,
+    pages: Option<String>,
     cache: Option<String>,
 }
 
@@ -322,6 +323,8 @@ pub struct Filesystem {
     pub copies: Option<String>,
     /// How much a backend that keeps what is read may keep of the project's folder (`[filesystem] kept`, as `2 GiB`).
     pub kept: Option<String>,
+    /// How much memory the pages kept of what was read of its files may take (`[filesystem] pages`, as `256 MiB`).
+    pub pages: Option<String>,
     /// Where a backend that keeps the folder's content apart from it keeps it (`[filesystem] cache`, a folder).
     pub cache: Option<String>,
 }
@@ -336,6 +339,7 @@ impl Filesystem {
             keep: file.keep.unwrap_or(false),
             copies: file.copies,
             kept: file.kept,
+            pages: file.pages,
             cache: file.cache,
         }
     }

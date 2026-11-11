@@ -32,6 +32,27 @@ pub fn space(root: &Path) -> std::io::Result<std::sync::Arc<sfs::Space>> {
     sfs::space::shared(&root.join(crate::cache::DIR).join(crate::cache::STAGING).join(SPACE))
 }
 
+/// The pages kept of what is read of the files of the project in `root` (`sfs::ring`), of about this many bytes:
+/// in memory the system keeps for its processes by a name of the project's folder, or - where it has none to
+/// name, or cannot give it - in this process's own. Cleared where this process has the shared space alone, a
+/// slot some process died writing a slot again.
+///
+/// # Errors
+/// There is no memory for it.
+pub fn ring(root: &Path, space: &sfs::Space, bytes: u64) -> std::io::Result<sfs::ring::Ring> {
+    // What a process of any project left there as it died goes first: it is taken until it is removed.
+    sfs::ring::sweep("pe2-ring-");
+    let named = crate::extract::sha1_hex(root.to_string_lossy().as_bytes());
+    let ring = match sfs::ring::Ring::shared(&format!("pe2-ring-{}", &named[..16]), bytes) {
+        Ok(ring) => ring,
+        Err(_) => sfs::ring::Ring::private(bytes)?,
+    };
+    if space.fresh() {
+        ring.clear();
+    }
+    Ok(ring)
+}
+
 fn now() -> u64 {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)

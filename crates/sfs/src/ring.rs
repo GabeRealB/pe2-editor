@@ -10,6 +10,12 @@
 //! that is no longer read is never found again, and goes as its slots are taken for others. A process that dies
 //! writing leaves its slot claimed: a miss from then on, until the ring is made anew (`Ring::clear`, by whoever
 //! has the space alone).
+//!
+//! Shared, it is in memory the system keeps for the processes that name it (`Ring::shared`): a file where Linux
+//! keeps such memory (`/dev/shm`), removed by the last process to let go of it (`Ring::let_go`, said as a process
+//! stops: a process that ends runs nothing of its own) - and, left by one that died, by the next to open any
+//! (`sweep`); a section Windows backs by its paging file, gone with the last handle to it. Neither is ever
+//! written to a disk for being a ring.
 
 use std::io;
 use std::path::Path;
@@ -42,11 +48,116 @@ impl Key {
     }
 }
 
+/// Where a ring is mapped.
+enum Map {
+    Mapped(memmap2::MmapRaw),
+    #[cfg(windows)]
+    Section(section::Section),
+}
+
+impl Map {
+    fn first(&self) -> *mut u8 {
+        match self {
+            Map::Mapped(map) => map.as_mut_ptr(),
+            #[cfg(windows)]
+            Map::Section(section) => section.first,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Map::Mapped(map) => map.len(),
+            #[cfg(windows)]
+            Map::Section(section) => section.len,
+        }
+    }
+}
+
+/// A section of memory Windows keeps under a name for as long as any process has it: mapped here.
+#[cfg(windows)]
+mod section {
+    use std::io;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    pub struct Section {
+        pub first: *mut u8,
+        pub len: usize,
+        handle: HANDLE,
+    }
+
+    // SAFETY: memory shared between processes, read and written as a mapping of a file is: by atomics and by
+    // slots under their counters.
+    unsafe impl Send for Section {}
+    // SAFETY: as above.
+    unsafe impl Sync for Section {}
+
+    impl Section {
+        /// The section of a name, made - of this length, all zeros - where no process has one.
+        pub fn open(name: &str, len: usize) -> io::Result<Section> {
+            let wide: Vec<u16> = format!("Local\\{name}").encode_utf16().chain([0]).collect();
+            // Its length in two halves, as Windows takes it.
+            let long = len as u64;
+            let (high, low) = (u32::try_from(long >> 32).unwrap_or(0), u32::try_from(long & 0xFFFF_FFFF).unwrap_or(0));
+            // SAFETY: a name ended by a zero; no file behind it, so the paging file is.
+            let handle = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, high, low, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the section just opened; a section there already and shorter than this fails here.
+            let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
+            if view.Value.is_null() {
+                let failed = io::Error::last_os_error();
+                // SAFETY: the handle opened above, closed once.
+                unsafe { CloseHandle(handle) };
+                return Err(failed);
+            }
+            Ok(Section { first: view.Value.cast(), len, handle })
+        }
+    }
+
+    impl Drop for Section {
+        fn drop(&mut self) {
+            // SAFETY: the view and the handle `open` made, let go of once.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.first.cast() });
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
 /// The ring, mapped here.
 pub struct Ring {
-    map: memmap2::MmapRaw,
+    map: Map,
     /// How many slots it has: a multiple of `WAYS`.
     slots: usize,
+    /// A file of memory it is in, held while it is mapped here: removed by the last process to let go of it.
+    shared: Option<(std::fs::File, std::path::PathBuf)>,
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.let_go();
+    }
+}
+
+/// Remove the rings of names beginning so that no process has: what one that died left in the memory the system
+/// keeps by name, which stays taken until it is removed. Nothing to do where such memory goes with its last handle.
+pub fn sweep(names: &str) {
+    if cfg!(windows) {
+        return;
+    }
+    let Ok(kept) = std::fs::read_dir("/dev/shm") else { return };
+    for entry in kept.flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(names)) {
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(entry.path()) else { continue };
+        // Held by nobody: nobody's.
+        if file.try_lock().is_ok() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 impl std::fmt::Debug for Ring {
@@ -74,10 +185,50 @@ impl Ring {
     pub fn private(bytes: u64) -> io::Result<Ring> {
         let slots = slots_in(bytes);
         let map = memmap2::MmapOptions::new().len(len_of(slots)).map_anon()?;
-        let ring = Ring { map: map.into(), slots };
+        let ring = Ring { map: Map::Mapped(map.into()), slots, shared: None };
         ring.word(0).store(MAGIC, Ordering::Release);
         ring.word(8).store(slots as u64, Ordering::Release);
         Ok(ring)
+    }
+
+    /// The ring of a name, of about this many bytes, in memory the system keeps for the processes that name it:
+    /// made where no process has it, and gone when the last lets go of it. Unsupported where the system has no
+    /// such memory to name.
+    ///
+    /// # Errors
+    /// The memory cannot be had, or a ring of that name is there of another length.
+    pub fn shared(name: &str, bytes: u64) -> io::Result<Ring> {
+        #[cfg(windows)]
+        {
+            let slots = slots_in(bytes);
+            let ring = Ring { map: Map::Section(section::Section::open(name, len_of(slots))?), slots, shared: None };
+            ring.said_what_it_is()?;
+            Ok(ring)
+        }
+        #[cfg(not(windows))]
+        {
+            let memory = Path::new("/dev/shm");
+            if !memory.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "no memory to name here"));
+            }
+            let path = memory.join(name);
+            // Held shared while it is mapped here: who lets go of it last removes it.
+            let held = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+            // One of another length is made anew only where no process has it: it is not cut short under one that
+            // has it mapped.
+            let alone = held.try_lock().is_ok();
+            if alone {
+                held.unlock()?;
+            }
+            held.lock_shared()?;
+            let length = held.metadata()?.len();
+            if !alone && length != 0 && length != len_of(slots_in(bytes)) as u64 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "a ring of another length is in use"));
+            }
+            let mut ring = Ring::open(&path, bytes)?;
+            ring.shared = Some((held, path));
+            Ok(ring)
+        }
     }
 
     /// The ring in a file, of about this many bytes, made where there is none - or where the one there is of
@@ -95,17 +246,34 @@ impl Ring {
             file.set_len(len_of(slots) as u64)?;
         }
         let map = memmap2::MmapOptions::new().len(len_of(slots)).map_raw(&file)?;
-        let ring = Ring { map, slots };
-        // Whoever comes first says what it is; the others find it said.
-        let said = ring.word(0).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire);
+        let ring = Ring { map: Map::Mapped(map), slots, shared: None };
+        ring.said_what_it_is()?;
+        Ok(ring)
+    }
+
+    /// Whoever comes first says what it is and how many slots it has; the others find it said, and so.
+    fn said_what_it_is(&self) -> io::Result<()> {
+        let said = self.word(0).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire);
         if said.is_err_and(|other| other != MAGIC) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "no ring of this format"));
         }
-        let _ = ring.word(8).compare_exchange(0, slots as u64, Ordering::AcqRel, Ordering::Acquire);
-        if ring.word(8).load(Ordering::Acquire) != slots as u64 {
+        let _ = self.word(8).compare_exchange(0, self.slots as u64, Ordering::AcqRel, Ordering::Acquire);
+        if self.word(8).load(Ordering::Acquire) != self.slots as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "a ring of another length"));
         }
-        Ok(ring)
+        Ok(())
+    }
+
+    /// Let go of the memory it is in, where that is kept by name: removed if no other process has it. For a
+    /// process to say as it stops; what it has mapped stays as it is until it ends.
+    pub fn let_go(&self) {
+        if let Some((file, path)) = &self.shared {
+            let _ = file.unlock();
+            if file.try_lock().is_ok() {
+                let _ = std::fs::remove_file(path);
+                // Held alone from here on: nobody takes what was removed for one that is there.
+            }
+        }
     }
 
     /// How many pages it holds at most.
@@ -119,7 +287,7 @@ impl Ring {
         debug_assert!(at.is_multiple_of(8) && at + 8 <= self.map.len());
         // SAFETY: within the mapping, aligned to eight bytes, valid for as long as `self`; every process reads and
         // writes it as an atomic.
-        unsafe { &*self.map.as_mut_ptr().add(at).cast::<AtomicU64>() }
+        unsafe { &*self.map.first().add(at).cast::<AtomicU64>() }
     }
 
     /// What is said of a slot begins here.
@@ -130,19 +298,19 @@ impl Ring {
     #[expect(clippy::cast_ptr_alignment, reason = "what is said of a slot begins at a multiple of eight, this four after one")]
     fn used(&self, slot: usize) -> &AtomicU32 {
         // SAFETY: as `word`: within what is said of the slot, aligned to four bytes.
-        unsafe { &*self.map.as_mut_ptr().add(Ring::said(slot) + 36).cast::<AtomicU32>() }
+        unsafe { &*self.map.first().add(Ring::said(slot) + 36).cast::<AtomicU32>() }
     }
 
     #[expect(clippy::cast_ptr_alignment, reason = "what is said of a slot begins at a multiple of eight, this at one")]
     fn held(&self, slot: usize) -> &AtomicU32 {
         // SAFETY: as `word`.
-        unsafe { &*self.map.as_mut_ptr().add(Ring::said(slot) + 32).cast::<AtomicU32>() }
+        unsafe { &*self.map.first().add(Ring::said(slot) + 32).cast::<AtomicU32>() }
     }
 
     fn data(&self, slot: usize) -> *mut u8 {
         let first = PAGE + (self.slots * SAID).next_multiple_of(PAGE);
         // SAFETY: within the mapping: the slots' pages follow what is said of them.
-        unsafe { self.map.as_mut_ptr().add(first + slot * PAGE) }
+        unsafe { self.map.first().add(first + slot * PAGE) }
     }
 
     /// The slots a key may be in.
@@ -172,16 +340,25 @@ impl Ring {
     /// reason - never held, taken for another, or being written this moment.
     #[must_use]
     pub fn get(&self, key: &Key, out: &mut [u8; PAGE]) -> Option<usize> {
+        self.get_part(key, 0, out).map(|(_, held)| held)
+    }
+
+    /// The bytes of a page from `within` it on, copied into `out` where the ring holds the page - as many as `out`
+    /// takes or the page has from there: how many were copied, and how many the page holds. What a read of part
+    /// of a page, or into where the bytes are wanted, asks.
+    #[must_use]
+    pub fn get_part(&self, key: &Key, within: usize, out: &mut [u8]) -> Option<(usize, usize)> {
         for slot in self.ways(key) {
             let counter = self.word(Ring::said(slot));
             let before = counter.load(Ordering::Acquire);
             if before == 0 || before % 2 == 1 || !self.is(slot, key) {
                 continue;
             }
-            let len = (self.held(slot).load(Ordering::Acquire) as usize).min(PAGE);
-            // SAFETY: the slot's page, within the mapping; what a writer changes of it meanwhile is found by the
-            // counter read after, and thrown away.
-            unsafe { std::ptr::copy_nonoverlapping(self.data(slot), out.as_mut_ptr(), len) };
+            let held = (self.held(slot).load(Ordering::Acquire) as usize).min(PAGE);
+            let len = held.saturating_sub(within).min(out.len());
+            // SAFETY: within the slot's page, within the mapping; what a writer changes of it meanwhile is found by
+            // the counter read after, and thrown away.
+            unsafe { std::ptr::copy_nonoverlapping(self.data(slot).add(within.min(held)), out.as_mut_ptr(), len) };
             if counter.load(Ordering::Acquire) != before {
                 return None;
             }
@@ -191,7 +368,7 @@ impl Ring {
             if now.wrapping_sub(self.used(slot).load(Ordering::Relaxed)) as usize > self.slots / 8 {
                 self.used(slot).store(now, Ordering::Relaxed);
             }
-            return Some(len);
+            return Some((len, held));
         }
         None
     }
@@ -382,6 +559,55 @@ mod tests {
         assert_eq!(other.get(&Key { number: 1, version: 2, page: 0 }, &mut out), None);
         drop(other);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run by a_ring_of_a_name_is_one_for_every_process_and_gone_with_the_last, as its second process"]
+    fn the_second_process_of_a_name() {
+        let Ok(name) = std::env::var("PE2_SFS_RING_NAMED") else { return };
+        let ring = Ring::shared(&name, 4 << 20).unwrap();
+        let mut out = [0u8; PAGE];
+        let key = Key { number: 1, version: 1, page: 0 };
+        assert_eq!(ring.get(&key, &mut out), Some(PAGE));
+        assert_eq!(out[..], page_of(&key, PAGE)[..]);
+        let key = Key { number: 2, version: 1, page: 0 };
+        ring.put(&key, &page_of(&key, PAGE));
+        // Of another length while this one is had: refused, not made anew under who has it.
+        assert!(Ring::shared(&name, 8 << 20).is_err());
+    }
+
+    #[test]
+    fn a_ring_of_a_name_is_one_for_every_process_and_gone_with_the_last() {
+        let name = format!("pe2-sfs-ring-test-{}", std::process::id());
+        let ring = match Ring::shared(&name, 4 << 20) {
+            Ok(ring) => ring,
+            // No memory to name on this system: nothing to hold to.
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => return,
+            Err(e) => panic!("{e}"),
+        };
+        let key = Key { number: 1, version: 1, page: 0 };
+        ring.put(&key, &page_of(&key, PAGE));
+        let second = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "ring::tests::the_second_process_of_a_name"])
+            .env("PE2_SFS_RING_NAMED", &name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(second.success());
+        let mut out = [0u8; PAGE];
+        let key = Key { number: 2, version: 1, page: 0 };
+        assert_eq!(ring.get(&key, &mut out), Some(PAGE), "what the other process put");
+        // A second of the name here is the same; the last to let go of it takes it away.
+        let again = Ring::shared(&name, 4 << 20).unwrap();
+        assert_eq!(again.get(&key, &mut out), Some(PAGE));
+        drop(ring);
+        assert_eq!(again.get(&key, &mut out), Some(PAGE));
+        drop(again);
+        let anew = Ring::shared(&name, 4 << 20).unwrap();
+        assert_eq!(anew.get(&key, &mut out), None, "made anew once nobody had it");
+        drop(anew);
+        assert!(!Path::new("/dev/shm").join(&name).exists(), "left behind");
     }
 
     #[test]

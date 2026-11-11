@@ -74,8 +74,12 @@ pub struct Tree {
     shared: Option<View>,
 }
 
-/// What a path was found to be, at one commit of the shared space and one state of what was moved here.
-type Found = HashMap<String, Option<(u64, Arc<Node>)>>;
+/// The longest file whose pages are kept of what was read of it (`View::read_into`).
+const PAGED: u64 = 256 << 10;
+
+/// What a path was found to be, at one commit of the shared space and one state of what was moved here: its inode
+/// number and node, and what the shared filesystem knows it by - its number there and its version.
+type Found = HashMap<String, Option<(u64, Arc<Node>, (u64, u64))>>;
 
 /// The shared filesystem as a tree: what whoever holds the project says is served (`project::shared`), read by
 /// path as it is asked for, with what was moved through the served folder and the project has yet to say so
@@ -88,6 +92,9 @@ struct View {
     moves: Arc<Vec<(String, String)>>,
     /// What was found, and at which commit.
     found: Arc<Mutex<(u64, Found)>>,
+    /// What was read of its files, where that is kept: a file's pages by its number and version in the shared
+    /// filesystem, read from here where they are.
+    ring: Option<Arc<sfs::ring::Ring>>,
 }
 
 impl std::fmt::Debug for View {
@@ -131,7 +138,7 @@ impl View {
         }
     }
 
-    fn build(&self, pages: &impl sfs::space::Pages, path: &str) -> Option<(u64, Arc<Node>)> {
+    fn build(&self, pages: &impl sfs::space::Pages, path: &str) -> Option<(u64, Arc<Node>, (u64, u64))> {
         use project::shared::{NODE, OF_FILES};
         use sfs::fs::{Bytes, SERVED};
         let place = self.place(pages, path)?;
@@ -156,11 +163,16 @@ impl View {
             asset: said.folder && said.flags & NODE != 0,
             of_files: said.folder && said.flags & OF_FILES != 0 && said.flags & NODE == 0,
         };
-        Some((ino, Arc::new(node)))
+        Some((ino, Arc::new(node), (number, said.version)))
     }
 
     /// What is at a path: as found before at this commit, or read now.
     fn at(&self, path: &str) -> Option<(u64, Arc<Node>)> {
+        self.known(path).map(|(ino, node, _)| (ino, node))
+    }
+
+    /// As `at`, with what the shared filesystem knows it by.
+    fn known(&self, path: &str) -> Option<(u64, Arc<Node>, (u64, u64))> {
         let path = path.trim_matches('/');
         let pages = self.space.read().ok()?;
         let generation = pages.commit().generation;
@@ -209,6 +221,48 @@ impl View {
             Some((name, matches!(node.what, What::Folder(_))))
         });
         Some(shown.collect())
+    }
+
+    /// Bytes of a file from `offset`, read into a buffer: page by page from the ring where it holds them, and
+    /// where it does not, read where the file's content lives - all that is still asked for at once - and kept.
+    fn read_into(&self, ino: u64, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sfs::ring::{Key, PAGE};
+        let path = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(ino).map(str::to_string);
+        let found = path.and_then(|path| self.known(&path));
+        let Some((_, node, (number, version))) = found else { return Err(std::io::Error::from(std::io::ErrorKind::NotFound)) };
+        let What::File(Given::Disk(disk)) = &node.what else { return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory)) };
+        // A long file is read where it lives: read from one end to the other, the system has it there faster than
+        // page by page from here, and it would take the place of very many short ones.
+        let Some(ring) = self.ring.as_ref().filter(|_| node.size <= PAGED) else {
+            return project::content::read_range_into(disk, offset, buffer);
+        };
+        let end = node.size.min(offset.saturating_add(buffer.len() as u64));
+        let mut at = offset;
+        while at < end {
+            let key = Key { number, version, page: at / PAGE as u64 };
+            let (start, within) = (key.page * PAGE as u64, usize::try_from(at % PAGE as u64).unwrap_or(0));
+            let done = usize::try_from(at - offset).unwrap_or(usize::MAX);
+            if let Some((take, held)) = ring.get_part(&key, within, &mut buffer[done..]) {
+                at += take as u64;
+                // A page shorter than one is the file's last - or one of a file that is shorter than was said.
+                if held < PAGE || take == 0 {
+                    break;
+                }
+                continue;
+            }
+            // Not held: from this page on, all that is asked for, read where it lives at once.
+            let ends = end.next_multiple_of(PAGE as u64).min(node.size.max(end));
+            let mut read = vec![0u8; usize::try_from(ends - start).unwrap_or(0)];
+            let got = project::content::read_range_into(disk, start, &mut read)?;
+            for (n, bytes) in read[..got].chunks(PAGE).enumerate() {
+                ring.put(&Key { number, version, page: key.page + n as u64 }, bytes);
+            }
+            let take = got.saturating_sub(within).min(buffer.len() - done);
+            buffer[done..done + take].copy_from_slice(&read[within..within + take]);
+            at += take as u64;
+            break;
+        }
+        Ok(usize::try_from(at - offset).unwrap_or(0))
     }
 
     /// How many folders and files it shows.
@@ -661,6 +715,9 @@ impl Tree {
     /// # Errors
     /// It is no file of the tree, or it cannot be read.
     pub fn read_into(&self, ino: u64, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(view) = &self.shared {
+            return view.read_into(ino, offset, buffer);
+        }
         match self.node(ino).as_deref().map(|n| &n.what) {
             Some(What::File(Given::Disk(disk))) => project::content::read_range_into(disk, offset, buffer),
             Some(What::File(Given::Bytes(bytes))) => {
@@ -679,6 +736,14 @@ impl Tree {
     /// # Errors
     /// It is no file of the tree, or it cannot be read.
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        if let Some(view) = &self.shared {
+            // No more than the file has left: nothing is made for what it has not.
+            let left = self.node(ino).map_or(0, |node| node.size.saturating_sub(offset));
+            let mut read = vec![0u8; len.min(usize::try_from(left).unwrap_or(usize::MAX))];
+            let got = view.read_into(ino, offset, &mut read)?;
+            read.truncate(got);
+            return Ok(read);
+        }
         match self.node(ino).as_deref().map(|n| &n.what) {
             Some(What::File(Given::Disk(disk))) => project::content::read_range(disk, offset, len),
             Some(What::File(Given::Bytes(bytes))) => {
@@ -850,11 +915,12 @@ impl Served {
     }
 
     /// What the filesystem a project's processes share says is served (`project::shared`), as a tree: read there
-    /// as it is asked, nothing of it held here. What a project's server serves.
+    /// as it is asked, nothing of it held here - its files' content through a ring of pages, where one is given.
+    /// What a project's server serves.
     #[must_use]
-    pub fn shared(space: Arc<sfs::Space>) -> Served {
+    pub fn shared(space: Arc<sfs::Space>, ring: Option<Arc<sfs::ring::Ring>>) -> Served {
         let served = Served::default();
-        let view = View { space, inodes: served.inodes.clone(), moves: Arc::default(), found: Arc::default() };
+        let view = View { space, inodes: served.inodes.clone(), moves: Arc::default(), found: Arc::default(), ring };
         *served.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Arc::new(Tree { shared: Some(view), ..Tree::default() });
         served
@@ -1187,7 +1253,7 @@ mod tests {
     fn viewed(listing: &Listing) -> (std::sync::Arc<sfs::Space>, super::Served) {
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
         project::shared::say_whole(&space, listing).unwrap();
-        let served = super::Served::shared(space.clone());
+        let served = super::Served::shared(space.clone(), None);
         (space, served)
     }
 
@@ -1228,6 +1294,53 @@ mod tests {
         assert!(served.tree().at("a/plain.txt").is_none());
         assert_eq!(served.tree().at("b/new.txt").map(|(_, node)| node.size), Some(8));
         assert_eq!(served.tree().children("b").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["new.txt".to_string()]));
+    }
+
+    #[test]
+    fn a_views_files_are_read_through_the_pages_kept_of_them() {
+        let dir = std::env::temp_dir().join(format!("pe2-vfs-pages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file of some pages and a part of one, and an empty one.
+        let content: Vec<u8> = (0..3 * 4096 + 1000u32).map(|n| u8::try_from(n % 251).unwrap()).collect();
+        std::fs::write(dir.join("a.bin"), &content).unwrap();
+        std::fs::write(dir.join("empty"), b"").unwrap();
+        let shown = |name: &str, size: usize, at: u64| Shown::File {
+            disk: dir.join(name),
+            size: size as u64,
+            modified: (at, 0),
+            of_files: false,
+            source: Source::Disk,
+        };
+        let listing: Listing =
+            [("a.bin".to_string(), shown("a.bin", content.len(), 1)), ("empty".to_string(), shown("empty", 0, 1))].into();
+        let space = std::sync::Arc::new(sfs::Space::private().unwrap());
+        project::shared::say_whole(&space, &listing).unwrap();
+        let ring = std::sync::Arc::new(sfs::ring::Ring::private(1 << 20).unwrap());
+        let served = super::Served::shared(space.clone(), Some(ring));
+        let (tree, a) = (served.tree(), served.ino("a.bin"));
+        // Whatever is asked - within a page, across pages, past the end - is what the file holds there.
+        for (offset, len) in [(0usize, 10usize), (4090, 20), (100, 9000), (12_000, 5000), (0, 1 << 20), (13_288, 10), (20_000, 10)] {
+            let read = tree.read(a, offset as u64, len).unwrap();
+            let end = content.len().min(offset + len);
+            assert_eq!(read, &content[offset.min(end)..end], "from {offset}, {len}");
+        }
+        assert_eq!(tree.read(served.ino("empty"), 0, 100).unwrap(), b"");
+        // Read from the pages kept: the file itself is gone, and all of it is read again.
+        std::fs::remove_file(dir.join("a.bin")).unwrap();
+        assert_eq!(tree.read(a, 0, 1 << 20).unwrap(), content);
+        let mut part = [0u8; 300];
+        assert_eq!(tree.read_into(a, 5000, &mut part).unwrap(), 300);
+        assert_eq!(part[..], content[5000..5300]);
+        // Another version of the file is another file to them: what was kept of the one before is not read as it.
+        let other: Vec<u8> = content.iter().rev().copied().collect();
+        std::fs::write(dir.join("a.bin"), &other).unwrap();
+        let mut next = listing.clone();
+        next.insert("a.bin".into(), shown("a.bin", other.len(), 2));
+        project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
+        assert_eq!(served.tree().read(a, 0, 1 << 20).unwrap(), other);
+        assert_eq!(served.tree().read(a, 4000, 200).unwrap(), &other[4000..4200]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

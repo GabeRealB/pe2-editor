@@ -76,10 +76,17 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let (serving, address) = serving_of(&p, backend, address)?;
     let _one = ROLE.claim(&p.root)?;
     let shared = project::shared::space(&p.root).context("the space the project's processes share")?;
+    // What is read of its files is kept in a ring of pages, in memory every process of the project can name.
+    let pages = {
+        let machine = extensions::filesystem_defaults();
+        vfs::backend::budget(&[p.filesystem.pages.as_deref(), machine.pages.as_deref()], vfs::backend::PAGES)
+    };
+    let ring = (pages > 0).then(|| project::shared::ring(&p.root, &shared, pages)).transpose().context("the pages kept of what is read")?;
+    let ring = ring.map(Arc::new);
     let server = Arc::new(Server {
         project: p.clone(),
         // The tree it serves is the shared filesystem itself, read as it is asked: nothing of it is kept here.
-        served: vfs::Served::shared(shared.clone()),
+        served: vfs::Served::shared(shared.clone(), ring.clone()),
         shared,
         serving,
         address,
@@ -115,6 +122,10 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         }
         record.save();
         drop(mount);
+    }
+    // The memory the pages are in is let go of here: a process that ends runs nothing more of its own.
+    if let Some(ring) = &ring {
+        ring.let_go();
     }
     println!("stopped");
     Ok(())

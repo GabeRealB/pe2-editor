@@ -255,6 +255,9 @@ pub fn all() -> &'static [&'static dyn Backend] {
 pub const COPIES: u64 = 16 << 20;
 /// What a backend that keeps what is read may keep of a project's folder where nothing says (`[filesystem] kept`).
 pub const KEPT: u64 = 2 << 30;
+/// How much memory the pages kept of what was read of a project's files may take where nothing says
+/// (`[filesystem] pages`); none are kept where it says 0.
+pub const PAGES: u64 = 256 << 20;
 
 /// A budget of bytes: the first of these that says one - the project, then the machine - else the default.
 #[must_use]

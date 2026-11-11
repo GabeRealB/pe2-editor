@@ -283,7 +283,19 @@ fn tree() {
     };
     let project = project::Project::load(Path::new(&root)).expect("a project");
     let (indexed, index) = timed(|| project::index::Index::without_store(&project).expect("indexed"));
-    let (made, served) = timed(|| vfs::Served::of(&index));
+    // Held in memory, as it was; a view of the shared filesystem; and that view with pages kept of what is read.
+    let listing = index.served();
+    let space = std::sync::Arc::new(sfs::Space::private().expect("a space"));
+    project::shared::say_whole(&space, &listing).expect("said");
+    let ring = std::sync::Arc::new(sfs::ring::Ring::private(256 << 20).expect("a ring"));
+    tree_of("held", indexed, &|| vfs::Served::of(&index));
+    tree_of("a view", indexed, &|| vfs::Served::shared(space.clone(), None));
+    tree_of("a view with pages kept", indexed, &|| vfs::Served::shared(space.clone(), Some(ring.clone())));
+}
+
+/// The times of one kind of tree: made, every path looked up, its small files and its largest read twice.
+fn tree_of(kind: &str, indexed: Duration, of: &dyn Fn() -> vfs::Served) {
+    let (made, served) = timed(of);
     let tree = served.tree();
     let mut files: Vec<(String, u64)> = Vec::new();
     let mut folders = vec![String::new()];
@@ -323,7 +335,7 @@ fn tree() {
     #[expect(clippy::cast_precision_loss, reason = "a mean, as it is said")]
     let each = |time: Duration, count: usize| time.as_secs_f64() * 1e6 / count.max(1) as f64;
     println!(
-        "BENCH tree: indexed in {indexed:.2?}, tree of {} entries made in {made:.0?} | {found} lookups {:.2} us each | \
+        "BENCH tree, {kind}: indexed in {indexed:.2?}, tree of {} entries made in {made:.0?} | {found} lookups {:.2} us each | \
          {} small files ({} KiB) read first {:.0} us each, again {:.0} us each | large {} MiB first {:.0} MiB/s again \
          {:.0} MiB/s",
         tree.len(),
