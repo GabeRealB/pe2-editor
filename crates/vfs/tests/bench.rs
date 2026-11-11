@@ -283,12 +283,11 @@ fn tree() {
     };
     let project = project::Project::load(Path::new(&root)).expect("a project");
     let (indexed, index) = timed(|| project::index::Index::without_store(&project).expect("indexed"));
-    // Held in memory, as it was; a view of the shared filesystem; and that view with pages kept of what is read.
+    // A view of the shared filesystem, and that view with pages kept of what is read.
     let listing = index.served();
     let space = std::sync::Arc::new(sfs::Space::private().expect("a space"));
     project::shared::say_whole(&space, &listing).expect("said");
     let ring = std::sync::Arc::new(sfs::ring::Ring::private(256 << 20).expect("a ring"));
-    tree_of("held", indexed, &|| vfs::Served::of(&index));
     tree_of("a view", indexed, &|| vfs::Served::shared(space.clone(), None));
     tree_of("a view with pages kept", indexed, &|| vfs::Served::shared(space.clone(), Some(ring.clone())));
 }
