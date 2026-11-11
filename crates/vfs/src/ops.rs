@@ -143,6 +143,12 @@ pub fn apply(
         }
         Op::Write { .. } | Op::Folder { .. } | Op::Remove { .. } | Op::Rename { .. } => bail!("not a change"),
     };
+    // Nothing touched, no step was made of it - what was written is what was there: said as that, not as the step
+    // before it.
+    if touched.is_empty() {
+        let what = op.as_change().map_or_else(|| "Nothing".to_string(), |change| change.label());
+        return Ok((format!("{what}: as it was, nothing changed"), touched));
+    }
     let label = history.done().last().map_or_else(String::new, |s| s.label.clone());
     Ok((label, touched))
 }
