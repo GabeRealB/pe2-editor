@@ -52,6 +52,20 @@ pub struct Record {
 pub struct Store {
     _db: turso::Database,
     conn: turso::Connection,
+    /// What is to be written and is not yet (`write_later`).
+    later: std::sync::Mutex<Later>,
+}
+
+/// What waits to be written: each file's record, or (none) that it is gone; and since when the first of them waits.
+type Later = (HashMap<PathBuf, Option<Record>>, Option<std::time::Instant>);
+
+/// How long what is to be written may wait for more (`Store::write_later`).
+const LATER: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
 }
 
 fn int(value: &Value) -> i64 {
@@ -87,7 +101,7 @@ impl Store {
         }
         let db = block_on(turso::Builder::new_local(name).build()).with_context(|| name.to_string())?;
         let conn = db.connect()?;
-        let store = Store { _db: db, conn };
+        let store = Store { _db: db, conn, later: std::sync::Mutex::default() };
         let mut mode = block_on(store.conn.query("PRAGMA journal_mode = WAL", ()))?;
         while block_on(mode.next())?.is_some() {}
         drop(mode);
@@ -156,6 +170,41 @@ impl Store {
             );
         }
         Ok(out)
+    }
+
+    /// Write records and forget files in a moment, with what else comes to be written by then: one transaction for
+    /// all of it, where each would be one of its own. The store is what the next opening is spared reading again, so
+    /// what was not written when a process ends without a word is read again then, and nothing else.
+    ///
+    /// # Errors
+    /// What waited long enough could not be written.
+    pub fn write_later<'a>(
+        &self,
+        records: impl IntoIterator<Item = (&'a Path, &'a Record)>,
+        gone: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<()> {
+        let due = {
+            let mut later = self.later.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            later.0.extend(records.into_iter().map(|(path, record)| (path.to_path_buf(), Some(record.clone()))));
+            later.0.extend(gone.into_iter().map(|path| (path.to_path_buf(), None)));
+            let since = *later.1.get_or_insert_with(std::time::Instant::now);
+            !later.0.is_empty() && since.elapsed() > LATER
+        };
+        if due { self.flush() } else { Ok(()) }
+    }
+
+    /// Write what waits to be (`write_later`).
+    ///
+    /// # Errors
+    /// The database cannot be written.
+    pub fn flush(&self) -> Result<()> {
+        let (waiting, _) = std::mem::take(&mut *self.later.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        let records = waiting.iter().filter_map(|(path, record)| Some((path.as_path(), record.as_ref()?)));
+        let gone = waiting.iter().filter(|(_, record)| record.is_none()).map(|(path, _)| path.as_path());
+        self.write(records, gone)
     }
 
     /// Write records and drop the files gone, in one transaction.

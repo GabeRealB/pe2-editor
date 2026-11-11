@@ -37,6 +37,7 @@ pub enum Resolution {
 
 /// The layer to edit and its changeset as it stands.
 fn layer<'a>(project: &'a Project, index: &Index, name: &str) -> Result<(&'a Layer, Changeset)> {
+    let _span = tracing::info_span!("edit: the layer's changeset copied").entered();
     let layer = project.layer(name)?;
     let changeset = index.changeset(name).with_context(|| format!("the index has no layer {name}"))?.clone();
     Ok((layer, changeset))
@@ -169,8 +170,10 @@ impl<'a, 'h> Out<'a, 'h> {
         let Some(written) = &self.records else {
             return self.tx.write(&self.layer.changeset, changeset.render().as_bytes());
         };
-        let old = crate::records::Set::records_of(&self.layer.path).unwrap_or_default();
-        let (new, gone) = crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written)?;
+        let old = tracing::info_span!("edit: the layer's records copied")
+            .in_scope(|| crate::records::Set::records_of(&self.layer.path).unwrap_or_default());
+        let (new, gone) = tracing::info_span!("edit: the layer's records made")
+            .in_scope(|| crate::records::records_for(self.project, self.index, self.layer, changeset, &old, written))?;
         for (uid, record) in &new {
             self.tx.write(&crate::records::path_of(&self.layer.path, uid), record.render().as_bytes())?;
         }
@@ -913,6 +916,18 @@ mod tests {
                 // And what it says differs is no more than does.
                 assert!(delta.shown.iter().all(|(path, it)| whole.get(path) == Some(it)));
                 assert!(delta.gone.iter().all(|path| !whole.contains_key(path)));
+            }
+            // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
+            // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and
+            // writes that, which one indexed already never does.
+            if self.index.problems.iter().any(|p| matches!(p, Problem::Unlisted { .. })) {
+                return;
+            }
+            let fresh = Index::without_store(&Project::load(&self.project.root).unwrap()).unwrap();
+            let (kept, afresh) = (self.index.shown_whole(), fresh.shown_whole());
+            if kept != afresh {
+                let differing = kept.lines().zip(afresh.lines()).find(|(a, b)| a != b);
+                panic!("the index changed in place is not the index opened afresh:\n{differing:#?}");
             }
         }
 

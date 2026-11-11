@@ -1282,7 +1282,7 @@ impl Transaction<'_> {
     /// The changes cannot be said in the log, or a file cannot be written: nothing is changed then.
     pub fn commit(mut self) -> Result<Vec<PathBuf>> {
         let label = self.step.label.clone();
-        self.history.apply_all(&label, &self.step.changes)?;
+        tracing::info_span!("edit: said in the log and written").in_scope(|| self.history.apply_all(&label, &self.step.changes))?;
         self.committed = true;
         let paths = self.step.paths();
         self.history.written.extend(paths.iter().cloned());

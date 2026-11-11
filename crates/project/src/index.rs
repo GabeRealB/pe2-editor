@@ -399,6 +399,20 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// Whether it is one the stack says as it is applied, of this layer or at one of these paths: what applying
+    /// the stack for some entries alone would have to say again.
+    fn of_stack(&self, layer: &str, paths: &HashSet<&str>) -> bool {
+        match self {
+            Problem::DuplicateUid { paths: at, .. } => at.iter().any(|path| paths.contains(path.as_str())),
+            Problem::Conflict { path, layers } => paths.contains(path.as_str()) || layers.iter().any(|l| l == layer),
+            Problem::Unlisted { layer: of, path }
+            | Problem::Missing { layer: of, path, .. }
+            | Problem::Stale { layer: of, path } => of == layer || paths.contains(path.as_str()),
+            Problem::Unbound { layer: of, .. } => of == layer,
+            _ => false,
+        }
+    }
+
     /// The paths it is about.
     #[must_use]
     pub fn paths(&self) -> Vec<&str> {
@@ -995,6 +1009,34 @@ struct Resolution {
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
 }
 
+/// What the layers below a layer resolve (`Index::under`).
+pub struct Under(Option<Arc<Beneath>>);
+
+impl Under {
+    /// The uid and kind of the entry at a path.
+    #[must_use]
+    pub fn at(&self, path: &str) -> Option<(&str, Kind)> {
+        let node = self.0.as_ref()?.resolution.resolved.get(path)?;
+        Some((node.uid.as_str(), node.kind))
+    }
+
+    /// The path and kind of the entry of a uid.
+    #[must_use]
+    pub fn of(&self, uid: &str) -> Option<(&str, Kind)> {
+        let beneath = self.0.as_ref()?;
+        let (path, node) = beneath.resolution.resolved.get_key_value(beneath.by_uid.get(uid)?)?;
+        Some((path.as_str(), node.kind))
+    }
+}
+
+/// The entries a layer let go of and made, by uid and path, those made each with its kind: what the stack is applied
+/// for alone (`Index::restack_entries`).
+struct Restacked {
+    gone: Vec<(String, String)>,
+    came: Vec<(String, String)>,
+    kinds: Vec<Kind>,
+}
+
 /// What the layers below one resolve, with where each uid is.
 struct Beneath {
     resolution: Resolution,
@@ -1113,6 +1155,10 @@ pub struct Index {
     /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
     /// of a layer's content touches.
     winning: Arc<HashMap<(usize, String), String>>,
+    /// The files the overrides' merges read (every node's `inputs`), as the stack was last applied: a change to
+    /// one merges again. An entry a layer makes by itself reads none, so applying the stack for such alone
+    /// (`restack_entries`) leaves it as it is.
+    merge_inputs: Arc<HashSet<PathBuf>>,
     /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
     working: Arc<HashMap<String, Working>>,
     /// What the layers below each layer resolve (`below_layer`), as asked since the stack was last applied: made anew,
@@ -1162,7 +1208,10 @@ impl Index {
     /// Stop keeping the records in the cache's store, and close it, for another process to open: what is read from now
     /// on is kept in memory alone, until `keep_records`.
     pub fn let_go_of_store(&mut self) {
-        self.store = None;
+        // What it was still to be given is written first: whoever opens it next reads what this one read.
+        if let Some(store) = self.store.take() {
+            let _ = store.flush();
+        }
     }
 
     /// Keep the records in the cache's store again, opened anew: what it has is the last holder's, and what changes
@@ -1228,6 +1277,7 @@ impl Index {
             dependencies: vec![],
             hashes: Arc::default(),
             winning: Arc::default(),
+            merge_inputs: Arc::default(),
             working: Arc::default(),
             beneath: Arc::default(),
             full: Arc::default(),
@@ -1295,7 +1345,9 @@ impl Index {
         // The layer filling each layer, where one does.
         let filled: Vec<Option<usize>> = (0..self.layers.len()).map(|layer| self.filled_by(layer)).collect();
         let touched = |node: &Node| in_rescanned(node, regions, &rescanned, &filled);
-        self.served_differences(whole_before, &touched, refreshed);
+        tracing::info_span!("after: what is served compared")
+            .in_scope(|| self.served_differences(whole_before, &touched, refreshed));
+        let scanning = tracing::info_span!("after: every asset looked at").entered();
         // An asset changed when its entry did, or when its content - or what a generated layer gives it - lies in what
         // was rescanned.
         for (path, node) in self.resolved.iter().filter(|(_, node)| node.kind == Kind::Asset) {
@@ -1306,12 +1358,13 @@ impl Index {
         refreshed.assets.extend(
             self.assets.keys().filter(|a| !self.resolved.contains_key(&format!("{a}{BUNDLE_SUFFIX}"))).cloned(),
         );
+        drop(scanning);
         let paths: Vec<String> = refreshed.assets.iter().map(|a| format!("{a}{BUNDLE_SUFFIX}")).collect();
-        self.assemble(&paths);
+        tracing::info_span!("after: entries and assets assembled").in_scope(|| self.assemble(&paths));
         if refreshed.assets.is_empty() {
             self.problems.extend(unreadable);
         } else {
-            self.link();
+            tracing::info_span!("after: linked").in_scope(|| self.link());
         }
     }
 
@@ -1487,13 +1540,16 @@ impl Index {
         project: &Project,
         changed: &[PathBuf],
         wanted: &mut Vec<(usize, String)>,
+        were: &mut Vec<(usize, Changeset)>,
     ) -> Result<bool> {
         let before = crate::records::Set::current(&project.root);
         let now = crate::records::Set::open_after(project, changed)?;
-        let differences = crate::records::Set::differences(before.as_deref(), &now);
+        let differences = tracing::info_span!("refresh: the records compared")
+            .in_scope(|| crate::records::Set::differences(before.as_deref(), &now));
+        let _span = tracing::info_span!("refresh: the changesets made again").entered();
         let (changed, placed) = (&differences.paths, differences.placed);
         // An override changed merges again as the stack is applied.
-        let mut any = differences.overrides;
+        let any = differences.overrides;
         let mut lowest_changed = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             // A layer whose records are as they were says of itself what it said.
@@ -1502,7 +1558,9 @@ impl Index {
             }
             let was = layer.changeset.clone();
             layer.reload_changeset()?;
-            any |= layer.changeset != was;
+            if layer.changeset != was {
+                were.push((i, was));
+            }
             if let Some((_, paths)) = changed.iter().find(|(dir, _)| *dir == layer.place.root) {
                 lowest_changed.get_or_insert(i);
                 wanted.extend(paths.iter().map(|path| (i, path.clone())));
@@ -1523,8 +1581,10 @@ impl Index {
         let mut refreshed = Refreshed::default();
         let mut changesets = false;
         let mut wanted: Vec<(usize, String)> = Vec::new();
+        // The records layers whose changesets changed, with what each said before.
+        let mut were: Vec<(usize, Changeset)> = Vec::new();
         if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
-            changesets |= self.take_in_records(project, changed, &mut wanted)?;
+            changesets |= self.take_in_records(project, changed, &mut wanted, &mut were)?;
         }
         for path in changed {
             // `project.toml` is read again whole, records with their layers (above).
@@ -1568,6 +1628,7 @@ impl Index {
         let mut gone = Vec::new();
         let mut files = Vec::new();
         let mut paths_same = true;
+        let rescanning = tracing::info_span!("refresh: regions scanned and read").entered();
         for (i, at) in &regions {
             let layer = &mut self.layers[*i];
             let before = layer.scan.under(at);
@@ -1587,22 +1648,30 @@ impl Index {
             Arc::make_mut(&mut self.records).remove(file);
         }
         let reported: HashSet<&PathBuf> = changed.iter().collect();
-        let (read, vanished) = self.reload(&files, &reported);
+        let (read, vanished) = tracing::info_span!("refresh: files looked at and read").in_scope(|| self.reload(&files, &reported));
         gone.extend(vanished);
         self.read = read.len();
         let records = read.iter().filter_map(|p| Some((p.as_path(), &**self.records.get(p)?)));
         if let Some(store) = &self.store {
-            store.write(records, gone.iter().map(PathBuf::as_path))?;
+            store.write_later(records, gone.iter().map(PathBuf::as_path))?;
         }
+        drop(rescanning);
         // An override's files are merged as the stack is applied: one of them, or what is below it, changed applies it
         // again.
-        let inputs: HashSet<&PathBuf> = self.resolved.values().flat_map(|n| n.inputs.iter()).collect();
-        let patched = changed.iter().any(|p| inputs.contains(p));
-        if paths_same && !changesets && !patched && self.contents_only(&regions) {
+        let patched = changed.iter().any(|p| self.merge_inputs.contains(p));
+        if paths_same && !changesets && were.is_empty() && !patched && self.contents_only(&regions) {
             self.refresh_contents(&regions, &before_references, &mut refreshed);
             return Ok(refreshed);
         }
         refreshed.restacked = true;
+        // One layer's entries came, went or moved, and nothing else: the stack is as it was but for those.
+        if let [(layer, was)] = were.as_slice()
+            && !changesets
+            && !patched
+            && self.restack_entries(*layer, was, &regions, &before_references, &mut refreshed)
+        {
+            return Ok(refreshed);
+        }
         let before = std::mem::take(&mut self.resolved);
         let whole_before = self.full.clone();
         // What says an asset cannot be read is the link's to say; where no asset changed, it says what it said.
@@ -1610,6 +1679,178 @@ impl Index {
         tracing::info_span!("index apply stack").in_scope(|| self.apply_stack())?;
         self.after_restack(&regions, (&before, &whole_before), unreadable, &mut refreshed);
         Ok(refreshed)
+    }
+
+    /// The stack applied for the entries one layer made, moved or let go of, where its changeset changed in nothing
+    /// else and nothing could say otherwise of them: what applying the whole stack again comes to, at the cost of
+    /// those entries. False where that cannot be told - nothing is changed then, and the stack is applied whole.
+    ///
+    /// It can be told where: every layer is shown; the layer is a records layer nothing fills, with no layer above
+    /// it creating or doing anything; none of the stack's problems is this layer's or at these paths; each entry gone
+    /// was the layer's own, as it made it, and nothing is held where it was; each entry come is held, at a path
+    /// nothing resolves to, under a uid no layer lists.
+    fn restack_entries(
+        &mut self,
+        at: usize,
+        was: &Changeset,
+        regions: &[(usize, String)],
+        before_references: &HashMap<String, Vec<Reference>>,
+        refreshed: &mut Refreshed,
+    ) -> bool {
+        let Some(entries) = self.entries_alone(at, was) else { return false };
+        self.restack(at, &entries, regions, before_references, refreshed);
+        true
+    }
+
+    /// The entries a layer's changeset lets go of and makes, against what it said before, each made with its kind -
+    /// where those are all that changed and the stack can be applied for them alone (`restack_entries`).
+    fn entries_alone(&self, at: usize, was: &Changeset) -> Option<Restacked> {
+        let layer = &self.layers[at];
+        let now = &layer.changeset;
+        let silent = |l: &LayerState| l.kind == LayerKind::Generated || (l.changeset.entries.is_empty() && l.changeset.ops.is_empty());
+        if !self.hidden.is_empty()
+            || was.ops != now.ops
+            || was.read_only != now.read_only
+            || was.ignore != now.ignore
+            || layer.kind == LayerKind::Generated
+            || !crate::records::is_records(&layer.place.root)
+            || self.filled_by(at).is_some()
+            || !self.layers[at + 1..].iter().all(silent)
+        {
+            return None;
+        }
+        let differs = |a: &Changeset, b: &Changeset| -> Vec<(String, String)> {
+            let other = a.entries.iter().filter(|(uid, path)| b.entries.get(*uid) != Some(*path));
+            other.map(|(uid, path)| (uid.clone(), path.clone())).collect()
+        };
+        let (gone, came) = (differs(was, now), differs(now, was));
+        let uids: HashSet<&str> = gone.iter().chain(&came).map(|(uid, _)| uid.as_str()).collect();
+        let paths: HashSet<&str> = gone.iter().chain(&came).map(|(_, path)| path.as_str()).collect();
+        let came_at: HashSet<&str> = came.iter().map(|(_, path)| path.as_str()).collect();
+        if uids.is_empty()
+            || came_at.len() != came.len()
+            || uids.iter().any(|uid| now.ops.contains_key(*uid))
+            || self.problems.iter().any(|problem| problem.of_stack(&layer.name, &paths))
+        {
+            return None;
+        }
+        for (uid, path) in &gone {
+            let own = self.full.get(path).is_some_and(|node| {
+                node.uid == *uid
+                    && node.home == at
+                    && node.content.0 == at
+                    && node.content.1 == *path
+                    && node.overrides.is_empty()
+                    && node.moved.is_none()
+                    && node.files.is_none()
+            });
+            if !own || (!came_at.contains(path.as_str()) && layer.scan.kind(path).is_some()) {
+                return None;
+            }
+        }
+        let gone_at: HashSet<&str> = gone.iter().map(|(_, path)| path.as_str()).collect();
+        let gone_uids: HashSet<&str> = gone.iter().map(|(uid, _)| uid.as_str()).collect();
+        let mut kinds = Vec::with_capacity(came.len());
+        for (uid, path) in &came {
+            let kind = layer.scan.kind(path)?;
+            let free = !self.full.contains_key(path) || gone_at.contains(path.as_str());
+            let listed = |l: &LayerState| l.changeset.entries.contains_key(uid);
+            let elsewhere = self.layers.iter().enumerate().any(|(i, l)| i != at && listed(l));
+            if !free || elsewhere || (was.entries.contains_key(uid) && !gone_uids.contains(uid.as_str())) {
+                return None;
+            }
+            kinds.push(kind);
+        }
+        Some(Restacked { gone, came, kinds })
+    }
+
+    /// Change the stack for entries a layer let go of and made (`entries_alone`).
+    fn restack(
+        &mut self,
+        at: usize,
+        Restacked { gone, came, kinds }: &Restacked,
+        regions: &[(usize, String)],
+        before_references: &HashMap<String, Vec<Reference>>,
+        refreshed: &mut Refreshed,
+    ) {
+        let uids: HashSet<&str> = gone.iter().chain(came).map(|(uid, _)| uid.as_str()).collect();
+        let paths: HashSet<&str> = gone.iter().chain(came).map(|(_, path)| path.as_str()).collect();
+        let came_at: HashSet<&str> = came.iter().map(|(_, path)| path.as_str()).collect();
+        let gone_at: HashSet<&str> = gone.iter().map(|(_, path)| path.as_str()).collect();
+        let layer = &self.layers[at];
+        // The references that named a uid nothing had, or have one that goes: what a layer needs of another is
+        // counted again.
+        let named = self.dangling.iter().any(|reference| uids.contains(reference.uid.as_str()));
+        let (name, writable) = (layer.name.clone(), layer.writable);
+        let disk = |path: &str| self.layers[at].place.disk(path);
+        let entries: Vec<Entry> = came
+            .iter()
+            .zip(kinds)
+            .map(|((uid, path), kind)| Entry {
+                kind: *kind,
+                uid: uid.clone(),
+                home: name.clone(),
+                layer: name.clone(),
+                disk: disk(path),
+                overrides: vec![],
+                moved: None,
+            })
+            .collect();
+        // What stood on the stack as it was, above this layer, stands on another now.
+        self.beneath.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|above, _| *above <= at);
+        // With every layer shown, what is resolved is the whole stack: let go of here, so that the stack is changed
+        // where it is and not copied to be.
+        self.resolved = Arc::default();
+        {
+            let full = Arc::make_mut(&mut self.full);
+            let listed = Arc::make_mut(&mut self.entries);
+            let winning = Arc::make_mut(&mut self.winning);
+            let hashes = &mut Arc::make_mut(&mut self.hashes)[at];
+            for (_, path) in gone {
+                full.remove(path);
+                listed.remove(path);
+                winning.remove(&(at, path.clone()));
+                hashes.remove(path);
+            }
+            for (((uid, path), kind), entry) in came.iter().zip(kinds).zip(entries) {
+                full.insert(path.clone(), Node::created(*kind, uid, at, path));
+                listed.insert(path.clone(), entry);
+                winning.insert((at, path.clone()), path.clone());
+            }
+        }
+        self.resolved = self.full.clone();
+        if writable {
+            for ((_, path), kind) in came.iter().zip(kinds) {
+                if let Some(hash) = self.content_hash(at, path, *kind) {
+                    Arc::make_mut(&mut self.hashes)[at].insert(path.clone(), hash);
+                }
+            }
+        }
+        // What is served differs of these, and of a node an entry came or went in.
+        let came_paths: BTreeSet<&String> = came.iter().map(|(_, path)| path).collect();
+        refreshed.gone.extend(gone.iter().map(|(_, path)| path).filter(|path| !came_paths.contains(path)).cloned());
+        refreshed.touched.extend(came.iter().map(|(_, path)| path.clone()));
+        let around: Vec<String> = paths
+            .iter()
+            .filter(|path| gone_at.contains(**path) != came_at.contains(**path))
+            .filter_map(|path| asset_of(path).rsplit_once('/').map(|(parent, _)| format!("{parent}{BUNDLE_SUFFIX}")))
+            .filter(|parent| self.full.contains_key(parent))
+            .collect();
+        refreshed.touched.extend(around);
+        // What the entries that stay hold changed with them, as where contents alone change.
+        self.refresh_contents(regions, before_references, refreshed);
+        // An asset come or gone: the assets are those of the stack again, and linked as a whole - a uid is another's
+        // to name from now on, or no more.
+        let bundles: Vec<String> =
+            paths.iter().filter(|path| path.ends_with(BUNDLE_SUFFIX)).map(|path| (*path).to_string()).collect();
+        if !bundles.is_empty() {
+            self.assemble_assets(&bundles);
+            refreshed.assets.extend(bundles.iter().map(|path| asset_of(path).to_string()));
+            self.link();
+        }
+        if named || !bundles.is_empty() {
+            self.dependencies = self.dependencies();
+        }
     }
 
     /// A refresh where only contents changed, each its entry's winning one: the entries stand; the changed assets
@@ -1930,8 +2171,8 @@ impl Index {
     /// dependencies are the whole stack's; the view leaves out the hidden layers.
     fn apply_stack(&mut self) -> Result<()> {
         self.beneath = Arc::default();
-        self.list_unlisted()?;
-        let full = self.resolve_stack(&HashSet::new());
+        tracing::info_span!("stack: unlisted").in_scope(|| self.list_unlisted())?;
+        let full = tracing::info_span!("stack: resolved").in_scope(|| self.resolve_stack(&HashSet::new()));
         self.problems = full.problems;
         self.problems.extend(self.properties.iter().cloned());
         self.ops = full.ops;
@@ -1941,10 +2182,12 @@ impl Index {
         } else {
             Arc::new(self.resolve_stack(&self.hidden).resolved)
         };
-        self.dependencies = self.dependencies();
-        self.remember_hashes();
+        self.dependencies = tracing::info_span!("stack: dependencies").in_scope(|| self.dependencies());
+        tracing::info_span!("stack: hashes").in_scope(|| self.remember_hashes());
+        let _span = tracing::info_span!("stack: winning").entered();
         self.winning =
             Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
+        self.merge_inputs = Arc::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
         Ok(())
     }
 
@@ -2124,6 +2367,37 @@ impl Index {
         out
     }
 
+    /// All that the index derives, as text: what a test holds an index changed in place to, against one opened
+    /// afresh.
+    #[cfg(test)]
+    pub(crate) fn shown_whole(&self) -> String {
+        use std::fmt::Write;
+        let index = self;
+        let mut out = String::new();
+        for (path, a) in index.assets.iter() {
+            let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
+            let _ = writeln!(
+                out,
+                "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                a.uid, a.shape, a.variants, a.layers, a.error, a.text, files
+            );
+        }
+        for (path, e) in index.entries.iter() {
+            let _ = writeln!(out, "entry {path} {e:?}");
+        }
+        let by_uid: std::collections::BTreeMap<_, _> = index.by_uid.iter().collect();
+        let _ = writeln!(out, "uids {by_uid:?}");
+        let referenced: std::collections::BTreeMap<_, _> = index.referenced_by.iter().collect();
+        let _ = writeln!(out, "referenced {referenced:?}\ndangling {:?}", index.dangling);
+        let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
+        problems.sort();
+        let _ = writeln!(out, "problems {problems:?}\nops {:?}\ndependencies {:?}", index.ops, index.dependencies);
+        let mut winning: Vec<_> = index.winning.iter().collect();
+        winning.sort();
+        let _ = writeln!(out, "winning {winning:?}");
+        out
+    }
+
     /// A layer's changeset as the index read it.
     #[must_use]
     pub fn changeset(&self, layer: &str) -> Option<&Changeset> {
@@ -2142,6 +2416,12 @@ impl Index {
         let found = Arc::new(Beneath { resolution, by_uid });
         beneath.insert(at, found.clone());
         Some(found)
+    }
+
+    /// What the layers below `layer` resolve, to be asked by path and by uid: nothing is copied of it.
+    #[must_use]
+    pub fn under(&self, layer: &str) -> Under {
+        Under(self.below_layer(layer))
     }
 
     /// What the layers below `layer` resolve, by path: each entry's uid and kind.
@@ -3088,30 +3368,7 @@ mod tests {
     /// What an index shows, in a form to compare: its assets (their declarations and files by name, hash and layer),
     /// entries, uids, references both ways and problems (in no particular order), stack and statuses.
     fn shown(index: &Index) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for (path, a) in index.assets.iter() {
-            let files: Vec<_> = a.files.iter().map(|f| (&f.name, &f.sha1, &f.layer, f.size)).collect();
-            let _ = writeln!(
-                out,
-                "asset {path} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
-                a.uid, a.shape, a.variants, a.layers, a.error, a.text, files
-            );
-        }
-        for (path, e) in index.entries.iter() {
-            let _ = writeln!(out, "entry {path} {e:?}");
-        }
-        let by_uid: std::collections::BTreeMap<_, _> = index.by_uid.iter().collect();
-        let _ = writeln!(out, "uids {by_uid:?}");
-        let referenced: std::collections::BTreeMap<_, _> = index.referenced_by.iter().collect();
-        let _ = writeln!(out, "referenced {referenced:?}\ndangling {:?}", index.dangling);
-        let mut problems: Vec<String> = index.problems.iter().map(|p| format!("{p:?}")).collect();
-        problems.sort();
-        let _ = writeln!(out, "problems {problems:?}\nops {:?}\ndependencies {:?}", index.ops, index.dependencies);
-        let mut winning: Vec<_> = index.winning.iter().collect();
-        winning.sort();
-        let _ = writeln!(out, "winning {winning:?}");
-        out
+        index.shown_whole()
     }
 
     #[test]

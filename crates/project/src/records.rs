@@ -520,6 +520,9 @@ struct View {
     folders: std::collections::BTreeSet<String>,
     /// Where each of its records' entries is.
     placed: std::collections::HashMap<String, String>,
+    /// Where the entries its records name are - those it makes and those it moves: what the layers above place
+    /// theirs through. Shared with each reading that takes this view as it is.
+    named: std::sync::Arc<std::collections::HashMap<String, String>>,
     /// What each folder holds, by its path ("" the layer's top): each name, and whether it is a folder.
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
     /// What is wrong with its records: those with no place.
@@ -592,12 +595,50 @@ fn joined(parent: Option<&str>, name: &str, kind: Kind) -> String {
     }
 }
 
+/// Where the layers below one place the entries they name, each layer's own map, bottom to top: asked from the top,
+/// the highest that names an entry says where it is. Nothing of them is copied to ask.
+#[derive(Default)]
+struct Below {
+    layers: Vec<std::sync::Arc<std::collections::HashMap<String, String>>>,
+}
+
+impl Below {
+    fn get(&self, uid: &str) -> Option<&String> {
+        self.layers.iter().rev().find_map(|layer| layer.get(uid))
+    }
+}
+
+/// Where a tree layer's changeset places the entries it names, kept by its file's stamp: read again only when the
+/// file changed.
+fn tree_places(changeset: &Path) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+    type Kept = (Option<(std::time::SystemTime, u64)>, std::sync::Arc<std::collections::HashMap<String, String>>);
+    static KEPT: std::sync::Mutex<Vec<(PathBuf, Kept)>> = std::sync::Mutex::new(Vec::new());
+    let stamp = std::fs::metadata(changeset).ok().and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, (was, places))) = kept.iter().find(|(path, _)| path == changeset)
+        && *was == stamp
+    {
+        return places.clone();
+    }
+    let read = crate::changeset::Changeset::load(changeset).unwrap_or_default();
+    let mut places = read.entries;
+    for (uid, op) in read.ops {
+        if let crate::changeset::Op::Move { to } | crate::changeset::Op::Override { to: Some(to), .. } = op {
+            places.insert(uid, to);
+        }
+    }
+    let places: std::sync::Arc<std::collections::HashMap<String, String>> = std::sync::Arc::new(places.into_iter().collect());
+    kept.retain(|(path, _)| path != changeset);
+    kept.push((changeset.to_path_buf(), (stamp, places.clone())));
+    places
+}
+
 /// Where a record's entry is - through its parent, in its layer or below, or where it is below - remembered in
 /// `placed`; none where its parent is nowhere.
 fn place(
     uid: &str,
     records: &Read,
-    below: &std::collections::HashMap<String, String>,
+    below: &Below,
     placed: &mut std::collections::HashMap<String, String>,
     depth: usize,
 ) -> Option<String> {
@@ -616,6 +657,44 @@ fn place(
     };
     placed.insert(uid.to_string(), at.clone());
     Some(at)
+}
+
+/// A records layer's records after these files changed, from what was read of it before: each record among them
+/// read again, or gone with its file - the others neither listed nor looked at. None where that cannot be told from
+/// the paths: a folder of records is among them, or anything of the layer's that is no record.
+fn read_changed(dir: &Path, before: &Read, changed: &[PathBuf]) -> Option<Result<Read>> {
+    let within = dir.join(DIR);
+    let ours: Vec<&PathBuf> = changed.iter().filter(|path| path.starts_with(&within)).collect();
+    let records: Option<Vec<(String, &PathBuf)>> = ours
+        .iter()
+        .map(|path| {
+            // A record is `<shard>/<uid>.toml`, its shard a folder of the records' own named by two letters -
+            // what is beside the shards (the extensions the layer holds, its settings) is no record of an entry.
+            let shard = path.parent().filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2));
+            let in_shard = shard.and_then(Path::parent) == Some(within.as_path());
+            Some((uid_of(path).filter(|_| in_shard)?, *path))
+        })
+        .collect();
+    let records = records?;
+    Some((|| {
+        let mut read = before.clone();
+        for (uid, path) in records {
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let (modified, len) = (meta.modified()?, meta.len());
+                    if read.get(&uid).is_some_and(|held| held.modified == modified && held.len == len) {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(path)?;
+                    let record = Record::parse(&text).with_context(|| path.display().to_string())?;
+                    read.insert(uid, Held { record: std::sync::Arc::new(record), modified, len });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => drop(read.remove(&uid)),
+                Err(e) => return Err(e).with_context(|| path.display().to_string()),
+            }
+        }
+        Ok(read)
+    })())
 }
 
 /// A records layer's records, read on every core: those whose file is as it was when `before` read it taken from it.
@@ -690,7 +769,7 @@ impl Set {
         let _span = tracing::info_span!("records open").entered();
         // What was read of it before: a record whose file is as it was is not read again.
         let previous = Set::current(&project.root);
-        let mut places: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut places = Below::default();
         let mut views: Vec<std::sync::Arc<View>> = Vec::new();
         // Whether anything below the layer at hand may place its entries otherwise than before: all of it read anew,
         // or a layer below changed.
@@ -699,33 +778,26 @@ impl Set {
         for layer in &project.layers {
             if !is_records(&layer.path) {
                 below_changed |= changed.is_some_and(|paths| paths.contains(&layer.changeset));
-                let changeset = crate::changeset::Changeset::load(&layer.changeset).unwrap_or_default();
-                places.extend(changeset.entries);
-                for (uid, op) in changeset.ops {
-                    if let crate::changeset::Op::Move { to } | crate::changeset::Op::Override { to: Some(to), .. } = op
-                    {
-                        places.insert(uid, to);
-                    }
-                }
+                places.layers.push(tree_places(&layer.changeset));
                 continue;
             }
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
             if let Some(before) = before.filter(|_| !below_changed && !touched(&layer.path.join(DIR))) {
                 // As it was read: what it places is there for the layers above, as it was.
-                for (uid, held) in &before.records {
-                    if held.record.name.is_some()
-                        && let Some(at) = before.placed.get(uid)
-                    {
-                        places.insert(uid.clone(), at.clone());
-                    }
-                }
+                places.layers.push(before.named.clone());
                 views.push(before.clone());
                 continue;
             }
             below_changed = true;
             let settings = settings(&layer.path)?;
-            let records = read_records(&layer.path, before.map(|v| &v.records))?;
+            // The records that changed read again, where the paths say which; else all of them looked at.
+            let after = before.zip(changed).and_then(|(view, paths)| read_changed(&layer.path, &view.records, paths));
+            let records = match after {
+                Some(records) => records?,
+                None => read_records(&layer.path, before.map(|v| &v.records))?,
+            };
             let mut view = View { dir: layer.path.clone(), settings, ..View::default() };
+            let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             for uid in records.keys() {
@@ -737,7 +809,7 @@ impl Set {
                 let Some(at) = located.get(uid) else { continue };
                 // What it places (creates, moves) is there for the layers above.
                 if record.name.is_some() {
-                    places.insert(uid.clone(), at.clone());
+                    named.insert(uid.clone(), at.clone());
                 }
                 if record.op == Op::Delete || record.op == Op::Move {
                     continue;
@@ -773,6 +845,8 @@ impl Set {
             }
             view.records = records;
             view.placed = located;
+            view.named = std::sync::Arc::new(named);
+            places.layers.push(view.named.clone());
             view.list_children();
             views.push(std::sync::Arc::new(view));
         }
@@ -1213,11 +1287,9 @@ pub fn records_for(
 ) -> Result<(BTreeMap<String, Record>, Vec<String>)> {
     use crate::changeset::Op as Did;
     let store = crate::chunks::Store::at(&project.root);
-    let below = index.entries_below(&layer.name);
-    let mut uid_at: std::collections::HashMap<String, String> =
-        below.iter().map(|(path, (uid, _))| (path.clone(), uid.clone())).collect();
-    let mut path_below: std::collections::HashMap<&String, (&String, crate::index::Kind)> =
-        below.iter().map(|(path, (uid, kind))| (uid, (path, *kind))).collect();
+    // What the layers below resolve is asked, entry by entry: the layer's own are few beside it.
+    let below = index.under(&layer.name);
+    let mut uid_at: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (uid, path) in &changeset.entries {
         uid_at.insert(path.clone(), uid.clone());
     }
@@ -1228,8 +1300,9 @@ pub fn records_for(
     }
     let place = |path: &str| -> Result<(Option<String>, String)> {
         let (parent, name) = path.rsplit_once('/').map_or((None, path), |(p, n)| (Some(p), n));
+        let named = |p: &str| uid_at.get(p).cloned().or_else(|| below.at(p).map(|(uid, _)| uid.to_string()));
         let parent = match parent {
-            Some(p) => Some(uid_at.get(p).cloned().with_context(|| format!("{path}: nothing names {p}"))?),
+            Some(p) => Some(named(p).with_context(|| format!("{path}: nothing names {p}"))?),
             None => None,
         };
         Ok((parent, name.strip_suffix(crate::index::BUNDLE_SUFFIX).unwrap_or(name).to_string()))
@@ -1280,7 +1353,7 @@ pub fn records_for(
         new.insert(uid.clone(), Record { op: Op::Create, kind, parent, name: Some(name), files });
     }
     for (uid, op) in &changeset.ops {
-        let from = path_below.remove(uid);
+        let from = below.of(uid);
         let kind = old.get(uid).map(|r| r.kind).or_else(|| from.map(|(_, k)| of_kind(k))).unwrap_or(Kind::File);
         let record = match op {
             Did::Delete => Record { op: Op::Delete, kind, parent: None, name: None, files: BTreeMap::new() },
@@ -1289,7 +1362,7 @@ pub fn records_for(
                 Record { op: Op::Move, kind, parent, name: Some(name), files: BTreeMap::new() }
             }
             Did::Override { files: bases, to } => {
-                let at = to.clone().or_else(|| from.map(|(p, _)| p.clone())).context("an override of nothing")?;
+                let at = to.clone().or_else(|| from.map(|(p, _)| p.to_string())).context("an override of nothing")?;
                 let (parent, name) = match to {
                     Some(to) => place(to).map(|(p, n)| (p, Some(n)))?,
                     None => (None, None),
