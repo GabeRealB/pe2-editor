@@ -394,6 +394,15 @@ impl Filesystem for Fuse {
         }
     }
 
+    /// A program closes a descriptor of the file: what the project refused of it since the program was last
+    /// answered is said here, which is what `close` returns.
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        match self.writes.as_ref().filter(|_| u64::from(fh) != 0).map(|w| w.flush(u64::from(fh))) {
+            Some(Err(e)) => reply.error(errno(&e)),
+            _ => reply.ok(),
+        }
+    }
+
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         match self.writes.as_ref().map(|w| w.close(u64::from(fh), false)) {
             Some(Err(e)) => reply.error(errno(&e)),

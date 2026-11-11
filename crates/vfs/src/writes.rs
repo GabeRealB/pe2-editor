@@ -122,6 +122,10 @@ struct State {
     removals: HashMap<String, u64>,
     /// Paths whose change nobody took yet (`Refusal::Later`): asked again, and said once.
     waiting: BTreeSet<String>,
+    /// Files the project refused for good after the program that wrote them was answered, each with why: said to
+    /// whoever next syncs or closes a handle on the path (`Writes::close`, `flush`), once - as a system says a
+    /// write it could not carry out later - or until the project takes the file after all.
+    refused: HashMap<String, String>,
     next: u64,
 }
 
@@ -757,7 +761,25 @@ impl Writes {
                 self.due(&state, now);
             }
         }
-        if release { Ok(()) } else { self.log.flush(self.log.header().tail()) }
+        if release {
+            return Ok(());
+        }
+        self.log.flush(self.log.header().tail())?;
+        self.flush(handle)
+    }
+
+    /// A program closes a handle, or syncs it: told now what the project refused of the file after the program
+    /// was last answered - once, to the first that asks.
+    ///
+    /// # Errors
+    /// The project did not take what was written to the file earlier, and why.
+    pub fn flush(&self, handle: u64) -> io::Result<()> {
+        let mut state = self.lock();
+        let Some(path) = state.handles.get(&handle).cloned() else { return Ok(()) };
+        match state.refused.remove(&path) {
+            Some(why) => Err(io::Error::other(format!("{path}: what was written before was not taken into the project: {why}"))),
+            None => Ok(()),
+        }
     }
 
     /// A path's change nobody took: asked again in a moment, and said the first time.
@@ -807,6 +829,7 @@ impl Writes {
             match applied {
                 Ok(()) => {
                     state.waiting.remove(&path);
+                    state.refused.remove(&path);
                     let Ok((_, said)) = said else { continue };
                     if let Some((file, upto)) = said.taken {
                         let _ = self.record(&sfs::Op::Taken { file, upto });
@@ -821,8 +844,12 @@ impl Writes {
                     }
                 }
                 Err(Refusal::Later(why)) => Self::waits(&mut state, &path, &why),
-                // It stays as written, shown in the folder and not the project's: said, since nothing else tells.
-                Err(Refusal::Never(why)) => eprintln!("{path}: written, and not taken into the project: {why}"),
+                // It stays as written, shown in the folder and not the project's: said here, and to the program
+                // at its next sync or close of the file - its last one was answered before the project was asked.
+                Err(Refusal::Never(why)) => {
+                    eprintln!("{path}: written, and not taken into the project: {why}");
+                    state.refused.insert(path, why);
+                }
             }
         }
     }
@@ -1749,6 +1776,46 @@ mod tests {
         fn change(&self, _change: Change) -> Result<(), Refusal> {
             Err(Refusal::Never("not here".into()))
         }
+    }
+
+    #[test]
+    fn what_the_project_refuses_late_is_said_at_the_next_sync_or_close() {
+        let dir = std::env::temp_dir().join(format!("pe2-writes-late-{}", std::process::id()));
+        let served = Served::default();
+        served.set_files(&BTreeMap::new());
+        let writes = Writes::new(&served, Arc::new(Refusing), &dir).unwrap();
+        // Written and closed: answered at once, before the project is asked.
+        let handle = writes.create("a.txt").unwrap();
+        writes.write(handle, 0, b"one").unwrap();
+        writes.flush(handle).expect("nothing was refused yet");
+        writes.close(handle, true).expect("closed");
+        // The project refuses it a moment later - once nothing has it open. The file stays as written; whoever
+        // opens it next is told as it closes or syncs.
+        let told_at = |sync: bool| {
+            let waited = Instant::now();
+            loop {
+                let handle = writes.open("a.txt", false).unwrap();
+                let told = if sync { writes.close(handle, false) } else { writes.flush(handle) };
+                if let Err(told) = told {
+                    break (handle, told);
+                }
+                writes.close(handle, true).unwrap();
+                assert!(waited.elapsed() < Duration::from_secs(10), "never told");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (again, told) = told_at(false);
+        assert!(told.to_string().contains("not here"), "{told}");
+        // Once: the next close of the same handle says nothing of it - and a sync says what is refused after it.
+        writes.flush(again).expect("said once");
+        writes.write(again, 3, b"!").unwrap();
+        writes.close(again, true).unwrap();
+        let (third, told) = told_at(true);
+        assert!(told.to_string().contains("not here"), "{told}");
+        writes.close(third, true).unwrap();
+        assert_eq!(writes.read("a.txt", 0, 16).unwrap(), b"one!", "as written, whatever the project took");
+        drop(writes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
