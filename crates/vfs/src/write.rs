@@ -155,6 +155,15 @@ pub trait Owner: Send + Sync {
         changes.into_iter().map(|change| self.change(change)).collect()
     }
 
+    /// Ask whoever holds the project to look at what is due where the project's processes share it (`due`), and
+    /// wait until it has said what became of what it took.
+    ///
+    /// # Errors
+    /// Nobody takes anything now (`Later`): what is due stays so, and is asked for again.
+    fn look(&self) -> Result<(), Refusal> {
+        Ok(())
+    }
+
     /// Whether a change would be taken this moment, asked without giving one.
     ///
     /// # Errors

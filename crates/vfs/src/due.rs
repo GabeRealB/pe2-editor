@@ -47,20 +47,51 @@ fn decoded<T: serde::de::DeserializeOwned>(mut bytes: &[u8]) -> io::Result<T> {
     project::wire::receive(&mut bytes)?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "nothing is said"))
 }
 
+/// Something due, as the tree keeps it: the edit, and - a move whoever serves the folder made in what is served
+/// already - what that move is known by there (`project::shared::moved`), for whoever takes it to say in its
+/// commit that the project has it (`unmoved`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Due {
+    op: Op,
+    moved: Option<u64>,
+}
+
 /// Say these due, in this order, after all that is due already: their numbers.
 ///
 /// # Errors
 /// The space cannot be written.
 pub fn put(space: &Space, ops: &[Op]) -> io::Result<Vec<u64>> {
     let mut txn = space.write()?;
-    let mut numbers = Vec::with_capacity(ops.len());
-    for op in ops {
-        let number = number();
-        sfs::tree::put(&mut txn, DUE, &number.to_be_bytes(), &encoded(op)?)?;
-        numbers.push(number);
-    }
+    let numbers = ops.iter().map(|op| put_in(&mut txn, op, None)).collect::<io::Result<Vec<u64>>>()?;
     txn.commit()?;
     Ok(numbers)
+}
+
+/// Say one thing due as part of a commit - the one that makes it so in what is served, where whoever serves the
+/// folder did (`moved`: the move it is, as said there): its number.
+///
+/// # Errors
+/// The space cannot be written.
+pub fn put_in(txn: &mut Txn<'_>, op: &Op, moved: Option<u64>) -> io::Result<u64> {
+    let number = number();
+    sfs::tree::put(txn, DUE, &number.to_be_bytes(), &encoded(&Due { op: op.clone(), moved })?)?;
+    Ok(number)
+}
+
+/// Say something that is due as it is now, under the number it is due by - its place among what is due kept:
+/// what a written file holds, said long ago and written since or moved on in the log. Whether it was still due;
+/// taken meanwhile, it is as it was said.
+///
+/// # Errors
+/// The space cannot be written.
+pub fn replace(space: &Space, number: u64, op: &Op) -> io::Result<bool> {
+    let mut txn = space.write()?;
+    let key = number.to_be_bytes();
+    let Some(was) = sfs::tree::get(&txn, DUE, &key)? else { return Ok(false) };
+    let moved = decoded::<Due>(&was)?.moved;
+    sfs::tree::put(&mut txn, DUE, &key, &encoded(&Due { op: op.clone(), moved })?)?;
+    txn.commit()?;
+    Ok(true)
 }
 
 /// All that is due, in the order it came due.
@@ -72,8 +103,8 @@ pub fn due(pages: &impl Pages) -> io::Result<Vec<(u64, Op)>> {
     let mut failed = None;
     sfs::tree::scan(pages, DUE, &[], &mut |key, value| {
         let number = <[u8; 8]>::try_from(key).map(u64::from_be_bytes);
-        match (number, decoded::<Op>(value)) {
-            (Ok(number), Ok(op)) => found.push((number, op)),
+        match (number, decoded::<Due>(value)) {
+            (Ok(number), Ok(due)) => found.push((number, due.op)),
             (_, Err(e)) => failed = Some(e),
             (Err(_), _) => failed = Some(io::Error::new(io::ErrorKind::InvalidData, "a number of another length")),
         }
@@ -102,8 +133,14 @@ pub fn any(pages: &impl Pages) -> bool {
 /// The space cannot be written.
 pub fn answer(txn: &mut Txn<'_>, answers: &[(u64, Answer)]) -> io::Result<()> {
     for (number, answer) in answers {
-        if sfs::tree::remove(txn, DUE, &number.to_be_bytes())? {
-            sfs::tree::put(txn, ANSWERS, &number.to_be_bytes(), &encoded(answer)?)?;
+        let key = number.to_be_bytes();
+        let Some(due) = sfs::tree::get(&*txn, DUE, &key)? else { continue };
+        sfs::tree::remove(txn, DUE, &key)?;
+        sfs::tree::put(txn, ANSWERS, &key, &encoded(answer)?)?;
+        // A move the project has now: what it says of paths from here on is said with the move made. One it
+        // refused stays one its paths are read through, until whoever serves the folder has put it back.
+        if let (Ok(_), Some(moved)) = (answer, decoded::<Due>(&due)?.moved) {
+            project::shared::unmoved(txn, moved)?;
         }
     }
     Ok(())

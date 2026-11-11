@@ -87,7 +87,7 @@ impl From<Change> for Op {
 impl Op {
     /// Whether it changes what a layer holds as a program writes it (a file, a folder, a removal, a move): what the
     /// served folder sends.
-    fn as_change(&self) -> Option<Change> {
+    pub(crate) fn as_change(&self) -> Option<Change> {
         Some(match self {
             Op::Write { path, from } => Change::Write { path: path.clone(), staged: from.clone() },
             Op::Folder { path } => Change::Folder { path: path.clone() },

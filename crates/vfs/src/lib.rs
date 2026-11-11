@@ -81,15 +81,13 @@ const PAGED: u64 = 256 << 10;
 /// number and node, and what the shared filesystem knows it by - its number there and its version.
 type Found = HashMap<String, Option<(u64, Arc<Node>, (u64, u64))>>;
 
-/// The shared filesystem as a tree: what whoever holds the project says is served (`project::shared`), read by
-/// path as it is asked for, with what was moved through the served folder and the project has yet to say so
-/// (`moves`) shown where it was moved to. What was found is kept until the next commit.
+/// The shared filesystem as a tree: what whoever holds the project says is served (`project::shared`), and what
+/// whoever serves the folder made of it as programs asked - a folder made, a path moved, a thing removed - read
+/// by path as it is asked for. What was found is kept until the next commit.
 #[derive(Clone)]
 struct View {
     space: Arc<sfs::Space>,
     inodes: Arc<Mutex<Inodes>>,
-    /// Each path moved, and where to, in the order they were: shown so until the shared filesystem says so itself.
-    moves: Arc<Vec<(String, String)>>,
     /// What was found, and at which commit.
     found: Arc<Mutex<(u64, Found)>>,
     /// What was read of its files, where that is kept: a file's pages by its number and version in the shared
@@ -99,7 +97,7 @@ struct View {
 
 impl std::fmt::Debug for View {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a view of the shared filesystem, {} moved", self.moves.len())
+        write!(f, "a view of the shared filesystem")
     }
 }
 
@@ -107,49 +105,23 @@ fn joined(folder: &str, name: &str) -> String {
     if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") }
 }
 
-/// A path at or inside another: what follows that one in it.
-fn inside<'a>(path: &'a str, folder: &str) -> Option<&'a str> {
-    let rest = path.strip_prefix(folder)?;
-    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
-}
-
 impl View {
-    /// Where the shared filesystem has what is shown at a path: the path itself, or - moved here and the project
-    /// yet to say so - where it was moved from. None where what was there is shown elsewhere now.
-    fn place(&self, pages: &impl sfs::space::Pages, path: &str) -> Option<String> {
-        self.place_after(pages, path, self.moves.len())
-    }
-
-    /// As `place`, after the first so many of what was moved.
-    fn place_after(&self, pages: &impl sfs::space::Pages, path: &str, moves: usize) -> Option<String> {
-        let Some((from, to)) = moves.checked_sub(1).and_then(|last| self.moves.get(last)) else {
-            return Some(path.to_string());
-        };
-        let there = |place: &str| sfs::fs::at(pages, sfs::fs::SERVED, place).ok().flatten().is_some();
-        let (moved_here, moved_away) = (inside(path, to), inside(path, from).is_some());
-        // The project is yet to say so, where what was moved is still where it was moved from.
-        let pending = (moved_here.is_some() || moved_away) && self.place_after(pages, from, moves - 1).is_some_and(|was| there(&was));
-        match moved_here {
-            // Moved here: read where it was before - what was here before it is shown no more.
-            Some(rest) if pending => self.place_after(pages, &format!("{from}{rest}"), moves - 1),
-            // Moved away: nothing is shown here.
-            None if pending => None,
-            _ => self.place_after(pages, path, moves - 1),
-        }
-    }
-
     fn build(&self, pages: &impl sfs::space::Pages, path: &str) -> Option<(u64, Arc<Node>, (u64, u64))> {
-        use project::shared::{NODE, OF_FILES};
+        use project::shared::{GONE, NEW, NODE, OF_FILES};
         use sfs::fs::{Bytes, SERVED};
-        let place = self.place(pages, path)?;
-        let number = sfs::fs::at(pages, SERVED, &place).ok()??;
-        let said = sfs::fs::node(pages, SERVED, number).ok()??;
+        let number = sfs::fs::at(pages, SERVED, path).ok()??;
+        // Removed through the folder: shown no more, whatever the project has of it.
+        let said = sfs::fs::node(pages, SERVED, number).ok()?.filter(|said| said.flags & GONE == 0)?;
         let what = if said.folder {
             // What it holds is asked of the tree (`Tree::children`), not kept with it.
             What::Folder(BTreeMap::new())
         } else {
-            let Bytes::Derived(lives) = &said.bytes else { return None };
-            What::File(Given::Disk(project::shared::placed(lives)?.0))
+            match &said.bytes {
+                Bytes::Derived(lives) => What::File(Given::Disk(project::shared::placed(lives)?.0)),
+                // Made through the folder: what it holds is whoever serves it's to say (`Writes`).
+                _ if said.flags & NEW != 0 => What::File(Given::Bytes(Arc::from(&[][..]))),
+                _ => return None,
+            }
         };
         let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ino, parent) = (inodes.of(path), inodes.of(parent_of(path)));
@@ -198,9 +170,11 @@ impl View {
         use sfs::fs::SERVED;
         let path = path.trim_matches('/');
         let pages = self.space.read().ok()?;
-        let place = self.place(&pages, path)?;
-        let number = sfs::fs::at(&pages, SERVED, &place).ok()??;
-        if !sfs::fs::node(&pages, SERVED, number).ok()??.folder {
+        let number = sfs::fs::at(&pages, SERVED, path).ok()??;
+        let shown = |number: u64| {
+            sfs::fs::node(&pages, SERVED, number).ok().flatten().filter(|node| node.flags & project::shared::GONE == 0)
+        };
+        if !shown(number)?.folder {
             return None;
         }
         let mut listed = Vec::new();
@@ -208,19 +182,8 @@ impl View {
             listed.push((name.to_string(), number));
             true
         });
-        if self.moves.is_empty() {
-            let folder = |number: u64| sfs::fs::node(&pages, SERVED, number).ok().flatten().is_some_and(|node| node.folder);
-            return Some(listed.into_iter().map(|(name, number)| (name, folder(number))).collect());
-        }
-        drop(pages);
-        // Something was moved: each name the folder lists, and each moved into it, is there if it is shown there.
-        let moved_in = self.moves.iter().filter(|(_, to)| parent_of(to) == path).map(|(_, to)| name_of(to).to_string());
-        let names: Vec<String> = listed.into_iter().map(|(name, _)| name).chain(moved_in).collect();
-        let shown = names.into_iter().filter_map(|name| {
-            let (_, node) = self.at(&joined(path, &name))?;
-            Some((name, matches!(node.what, What::Folder(_))))
-        });
-        Some(shown.collect())
+        // Each name with whether it is a folder, less what was removed through the folder.
+        Some(listed.into_iter().filter_map(|(name, number)| Some((name, shown(number)?.folder))).collect())
     }
 
     /// Bytes of a file from `offset`, read into a buffer: page by page from the ring where it holds them, and
@@ -283,10 +246,6 @@ impl View {
 
 fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
-fn name_of(path: &str) -> &str {
-    path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
 /// The inode numbers given to paths, kept across trees so that a path keeps its number.
@@ -834,28 +793,31 @@ impl Served {
     #[must_use]
     pub fn shared(space: Arc<sfs::Space>, ring: Option<Arc<sfs::ring::Ring>>) -> Served {
         let served = Served::default();
-        let view = View { space, inodes: served.inodes.clone(), moves: Arc::default(), found: Arc::default(), ring };
+        let view = View { space, inodes: served.inodes.clone(), found: Arc::default(), ring };
         *served.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Arc::new(Tree { shared: Some(view), ..Tree::default() });
         served
     }
 
-    /// The tree is a view of the shared filesystem, and that changed: what tells others of it is told what did,
-    /// and what was moved here is shown so no longer where the shared filesystem says so itself by now.
+    /// The tree is a view of the shared filesystem, and that changed: what tells others of it is told what did.
     pub fn told(&self, changes: Changes) {
-        {
-            let mut tree = self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let fewer = tree.shared.as_ref().filter(|view| !view.moves.is_empty()).and_then(|view| {
-                let pages = view.space.read().ok()?;
-                let there = |path: &str| sfs::fs::at(&pages, sfs::fs::SERVED, path).ok().flatten().is_some();
-                let still: Vec<(String, String)> = view.moves.iter().filter(|(from, to)| there(from) || !there(to)).cloned().collect();
-                (still.len() != view.moves.len()).then(|| View { moves: Arc::new(still), found: Arc::default(), ..view.clone() })
-            });
-            if let Some(view) = fewer {
-                *tree = Arc::new(Tree { shared: Some(view), ..Tree::default() });
-            }
-        }
         self.changed(changes);
+    }
+
+    /// The shared filesystem the tree is a view of, where it is one.
+    #[must_use]
+    pub fn space(&self) -> Option<Arc<sfs::Space>> {
+        self.tree().shared.as_ref().map(|view| view.space.clone())
+    }
+
+    /// A path was moved in the shared filesystem the tree is a view of, with what is in it, by whoever serves it,
+    /// a program having asked: each file keeps its number, and those that tell of the tree are told it is gone
+    /// where it was and new where it is, with what was at its new path before (`replaced`: whether a folder).
+    pub fn moved_there(&self, from: &str, to: &str, folder: bool, replaced: Option<bool>) {
+        self.rename(from, to);
+        let mut gone = vec![(from.to_string(), folder)];
+        gone.extend(replaced.map(|folder| (to.to_string(), folder)));
+        self.changed(Changes { gone, new: vec![(to.to_string(), folder)], ..Changes::default() });
     }
 
     /// Say what changed of the tree to those that tell of it, and wake them.
@@ -960,26 +922,12 @@ impl Served {
             self.rename(from, to);
             return false;
         };
-        let folder = matches!(there.what, What::Folder(_));
         let before = self.tree();
-        if let Some(view) = &before.shared {
-            // A view of the shared filesystem: shown moved, until that says so itself. Moved back where it was
-            // moved from, it is as it was.
-            let replaced = before.at(to).map(|(_, node)| matches!(node.what, What::Folder(_)));
-            let mut moves = (*view.moves).clone();
-            match moves.iter().rposition(|(was, now)| was == to && now == from) {
-                Some(back) => drop(moves.remove(back)),
-                None => moves.push((from.to_string(), to.to_string())),
-            }
-            self.rename(from, to);
-            let view = View { moves: Arc::new(moves), found: Arc::default(), ..view.clone() };
-            *self.tree.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Arc::new(Tree { shared: Some(view), ..Tree::default() });
-            let mut gone = vec![(from.to_string(), folder)];
-            gone.extend(replaced.map(|folder| (to.to_string(), folder)));
-            self.changed(Changes { gone, new: vec![(to.to_string(), folder)], ..Changes::default() });
-            return true;
+        // A view of the shared filesystem is what that says: moved there by who serves it (`moved_there`).
+        if before.shared.is_some() {
+            return false;
         }
+        drop(there);
         let mut tree = (*before).clone();
         {
             let mut inodes = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1203,41 +1151,48 @@ mod tests {
         let (space, served) = viewed(&listing);
         let from = served.changes_from_now();
         let (x, y) = (served.ino("a/x.txt"), served.ino("a/sub/y.txt"));
-        // Onto a folder that is there: what it held is shown no more.
-        assert!(served.moved("a", "c"));
+        // Whoever serves the folder moves it in the shared filesystem, onto a folder that is there - what that held
+        // is shown no more - and says so here.
+        let moved = |from: &str, to: &str| {
+            use sfs::fs::{ROOT, SERVED};
+            let mut txn = space.write().unwrap();
+            let replaced = sfs::fs::at(&txn, SERVED, to).unwrap();
+            if let Some(there) = replaced {
+                sfs::fs::remove(&mut txn, SERVED, there, project::shared::SERVER).unwrap();
+            }
+            let number = sfs::fs::at(&txn, SERVED, from).unwrap().unwrap();
+            sfs::fs::rename(&mut txn, SERVED, number, ROOT, to, project::shared::SERVER).unwrap();
+            txn.commit().unwrap();
+            served.moved_there(from, to, true, replaced.map(|_| true));
+        };
+        moved("a", "c");
         let tree = served.tree();
         assert!(tree.at("a").is_none() && tree.at("a/x.txt").is_none() && tree.at("c/old.txt").is_none());
         assert_eq!(tree.at("c/x.txt").map(|(ino, node)| (ino, node.size)), Some((x, 1)));
         assert_eq!(tree.at("c/sub/y.txt").map(|(ino, _)| ino), Some(y));
         assert_eq!(tree.children("").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["c".to_string(), "d.txt".to_string()]));
         assert_eq!(tree.children("c").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["sub".to_string(), "x.txt".to_string()]));
-        // And moved on: where it was moved to first is read through both.
-        assert!(served.moved("c", "e"));
+        // And moved on, and back - a rename the project refused.
+        moved("c", "e");
         assert_eq!(served.tree().at("e/sub/y.txt").map(|(ino, _)| ino), Some(y));
         assert!(served.tree().at("c").is_none());
-        // Moved back - a rename the project refused: as before it.
-        assert!(served.moved("e", "c"));
+        moved("e", "c");
         assert!(served.tree().at("e").is_none() && served.tree().at("c/x.txt").is_some());
-        assert!(!served.moved("nothing", "anywhere"), "what is not there is not moved");
         // Those that tell of the tree were told each: gone where it was, new where it is.
         let mut cursor = from;
         let told = served.changes_since(&mut cursor).unwrap();
         assert_eq!(told.gone.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), ["a", "c", "c", "e"]);
         assert_eq!(told.new.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), ["c", "e", "c"]);
         assert!(served.changes_since(&mut cursor).unwrap().is_empty());
-        // The project says the move itself: shown by what it says, the move here let go of.
-        let mut next: Listing = listing.iter().filter(|(path, _)| !path.starts_with('a') && !path.starts_with('c')).map(|(p, s)| (p.clone(), s.clone())).collect();
-        next.insert("c".into(), Shown::Folder);
-        next.insert("c/x.txt".into(), file("/l/c/x.txt", 1, false));
-        next.insert("c/sub".into(), Shown::Folder);
-        next.insert("c/sub/y.txt".into(), file("/l/c/sub/y.txt", 2, false));
-        project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
-        // Read right before it is told, and after.
-        assert_eq!(served.tree().at("c/x.txt").map(|(ino, node)| (ino, node.size)), Some((x, 1)));
-        served.told(Changes::default());
-        assert!(served.tree().shared.as_ref().is_some_and(|view| view.moves.is_empty()));
-        assert_eq!(served.tree().at("c/sub/y.txt").map(|(ino, _)| ino), Some(y));
-        assert!(served.tree().at("a").is_none());
+        // What was removed through the folder is shown no more, and listed no more, while the project has it.
+        let mut txn = space.write().unwrap();
+        let number = sfs::fs::at(&txn, sfs::fs::SERVED, "d.txt").unwrap().unwrap();
+        let node = sfs::fs::node(&txn, sfs::fs::SERVED, number).unwrap().unwrap();
+        let gone = sfs::fs::Node { flags: node.flags | project::shared::GONE, ..node };
+        sfs::fs::set(&mut txn, sfs::fs::SERVED, number, &gone, project::shared::SERVER).unwrap();
+        txn.commit().unwrap();
+        assert!(served.tree().at("d.txt").is_none());
+        assert_eq!(served.tree().children("").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["c".to_string()]));
     }
 
     #[test]

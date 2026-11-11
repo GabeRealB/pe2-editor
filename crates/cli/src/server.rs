@@ -557,6 +557,18 @@ impl vfs::write::Owner for Server {
         became.into_iter().map(told).collect()
     }
 
+    /// Ask whoever holds the project - a host started where nothing does - to look at what is due, and wait for
+    /// it to have said what became of what it took.
+    fn look(&self) -> std::result::Result<(), Refusal> {
+        match self.ask(&mcp::Request::Due) {
+            Asked::Answered(mcp::Reply::Taken { .. }) => Ok(()),
+            // It holds the project and takes nothing now - a host that lent it, an editor still opening.
+            Asked::Answered(reply) => Err(Refusal::Later(reply.told().unwrap_or_else(|why| why))),
+            Asked::Later(later) => Err(later),
+            Asked::Nobody => Err(nobody()),
+        }
+    }
+
     fn ready(&self) -> std::result::Result<(), Refusal> {
         Server::ready(self)
     }
