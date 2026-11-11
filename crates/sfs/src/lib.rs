@@ -24,6 +24,7 @@ pub mod fs;
 pub mod header;
 pub mod log;
 pub mod ops;
+pub mod ring;
 pub mod space;
 pub mod storage;
 pub mod tree;
