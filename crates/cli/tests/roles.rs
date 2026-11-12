@@ -220,9 +220,9 @@ impl StandIn {
             match request {
                 // A command's edit comes as it is; what is due is taken where it is said.
                 mcp::Request::Edit { op, layer } => {
-                    core.edits(history, &[op], layer.as_deref(), None).pop().unwrap_or(mcp::Reply::Declined)
+                    core.edits(history, &[op], layer.as_deref()).0.pop().unwrap_or(mcp::Reply::Declined)
                 }
-                mcp::Request::Due => core.take_due(history),
+                mcp::Request::Due => core.take_due(history, Ok(None), None).0,
                 _ => mcp::Reply::Declined,
             }
         };

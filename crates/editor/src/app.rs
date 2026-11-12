@@ -65,6 +65,8 @@ struct Capture {
 enum Deferred {
     Edit(EditRequest),
     Step { redo: bool, force: bool, scope: Option<String> },
+    /// A files layer made of this name, and the entry of this uid overridden in it.
+    OverrideInNew { uid: String, name: String },
 }
 
 /// What waits on the documents with unsaved changes being saved or let go.
@@ -483,6 +485,7 @@ impl Editor {
             match deferred {
                 Deferred::Edit(request) => self.edit(&request),
                 Deferred::Step { redo, force, scope } => drop(self.step(redo, force, scope)),
+                Deferred::OverrideInNew { uid, name } => self.override_in_new(uid, name),
             }
         }
     }
@@ -544,7 +547,7 @@ impl Editor {
             self.deferred.push((ticket, Deferred::Step { redo, force, scope }));
             return true;
         }
-        ws.history.set_author(author);
+        ws.author = author;
         let verb = if redo { "Redo" } else { "Undo" };
         match ws.step(redo, force, scope.as_deref()) {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
@@ -584,7 +587,7 @@ impl Editor {
             self.deferred.push((ticket, Deferred::Edit(request.clone())));
             return;
         }
-        ws.history.set_author(author);
+        ws.author = author;
         if let EditRequest::Override(uid) = request {
             match ws.override_choice(uid) {
                 Err(why) => {
@@ -658,13 +661,22 @@ impl Editor {
         } else if create {
             let (uid, name) = (choosing.uid.clone(), choosing.name.trim().to_string());
             self.choosing = None;
-            let added = self.workspace.as_mut().map(|ws| ws.add_layer(&name, project::LayerKind::Files));
-            match added {
-                // The layer has to be there: the project is read again with it first.
-                Some(Ok(ticket)) => self.deferred.push((ticket, Deferred::Edit(EditRequest::OverrideIn(uid, name)))),
-                Some(Err(e)) => self.message = Some(format!("{e:#}")),
-                None => {}
-            }
+            self.override_in_new(uid, name);
+        }
+    }
+
+    /// Make a files layer of this name and override the entry of this uid in it: once the project has been read,
+    /// where it is being read - the window goes on meanwhile.
+    fn override_in_new(&mut self, uid: String, name: String) {
+        let Some(ws) = &mut self.workspace else { return };
+        if let Some(ticket) = ws.reading_until() {
+            self.deferred.push((ticket, Deferred::OverrideInNew { uid, name }));
+            return;
+        }
+        match ws.add_layer(&name, project::LayerKind::Files) {
+            // The layer has to be there: the project is read again with it first.
+            Ok(ticket) => self.deferred.push((ticket, Deferred::Edit(EditRequest::OverrideIn(uid, name)))),
+            Err(e) => self.message = Some(format!("{e:#}")),
         }
     }
 
@@ -1356,7 +1368,7 @@ impl Editor {
     fn save(&mut self, uids: &[String]) -> bool {
         let author = self.author();
         let Some(ws) = &mut self.workspace else { return false };
-        ws.history.set_author(author);
+        ws.author = author;
         let mut saved = vec![];
         for uid in uids {
             match ws.save(uid) {
@@ -1379,7 +1391,7 @@ impl Editor {
     fn revert(&mut self, uid: &str) {
         let author = self.author();
         if let Some(ws) = &mut self.workspace {
-            ws.history.set_author(author);
+            ws.author = author;
             self.message = Some(ws.revert(uid));
         }
     }
@@ -2065,7 +2077,7 @@ impl Editor {
         use crate::history_pane::HistoryAsk;
         let author = self.author();
         let Some(ws) = &mut self.workspace else { return };
-        ws.history.set_author(author);
+        ws.author = author;
         match ask {
             HistoryAsk::View(viewing) => ws.view(viewing),
             HistoryAsk::Restore => self.message = Some(ws.restore_viewed()),
@@ -2933,7 +2945,7 @@ impl eframe::App for Editor {
         // What is done this frame, by whoever gave its input.
         let author = self.author();
         if let Some(ws) = &mut self.workspace {
-            ws.history.set_author(author);
+            ws.author = author;
         }
         self.note_place(&ctx);
         // A frame of the extensions' readings: one unused for long enough gives its memory back.

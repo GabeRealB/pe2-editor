@@ -244,6 +244,9 @@ pub struct View {
 pub struct History {
     /// Its steps, its documents and what it keeps: read through it as of the history itself (`Deref`).
     view: View,
+    /// How many times what it shows changed: counted where the session is written, which every change of its
+    /// steps and documents does.
+    revision: std::cell::Cell<u64>,
     /// Whether the session is written as it changes.
     journaled: bool,
     /// What the session's file holds, where it was written whole and appended to since: how many steps done and
@@ -386,6 +389,7 @@ impl History {
         let dir = cache.path(DIR);
         let mut history = History {
             view: View { dir: dir.clone(), ..View::default() },
+            revision: std::cell::Cell::new(0),
             journaled: false,
             appended: std::cell::Cell::new(None),
             author: "user".into(),
@@ -442,7 +446,18 @@ impl History {
 
     /// The session closed cleanly: what it kept is wiped.
     pub fn close(self) {
+        self.wipe();
+    }
+
+    /// What the session kept, wiped: it is closing cleanly, and goes with this.
+    pub fn wipe(&self) {
         let _ = std::fs::remove_dir_all(&self.view.dir);
+    }
+
+    /// Which of its revisions it is at: another, once what it shows (`view`) changed.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.get()
     }
 
     /// Let go of the log where it was opened for a moment's work (a host, a command's edit), not taken up: closed, unless
@@ -996,6 +1011,7 @@ impl History {
 
     /// The session written whole, where it is journaled: what a crash would leave.
     fn journal(&self) {
+        self.revision.set(self.revision.get() + 1);
         if !self.journaled {
             return;
         }
@@ -1015,11 +1031,13 @@ impl History {
     /// has grown long.
     fn journal_last(&self, documents: &[String]) {
         if !self.journaled {
+            self.revision.set(self.revision.get() + 1);
             return;
         }
         let Some((done, undone, long)) = self.appended.get().filter(|(done, _, long)| *done <= self.view.done.len() && *long < SESSION_LONG) else {
             return self.journal();
         };
+        self.revision.set(self.revision.get() + 1);
         // The last step it held may be the one joined: from that one on.
         let from = done.saturating_sub(1);
         let since = Journaled::Since {

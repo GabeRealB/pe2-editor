@@ -273,15 +273,11 @@ fn settings_ui(
                     let said = next.as_ref().map_or_else(|| "its default".to_string(), ToString::to_string);
                     match setting.scope {
                         Scope::Project => {
-                            let written = project::switches::set_setting(
-                                &ws.project,
-                                &p.id,
-                                &setting.key,
-                                next.as_ref(),
-                                &mut ws.history,
-                                format!("Set {label} to {said}"),
-                            );
-                            if let Err(e) = written {
+                            let (id, key, said) = (p.id.clone(), setting.key.clone(), format!("Set {label} to {said}"));
+                            let written = ws.held(move |w| {
+                                project::switches::set_setting(&w.core.project, &id, &key, next.as_ref(), &mut w.history, said)
+                            });
+                            if let Err(e) = written.map_err(anyhow::Error::msg).flatten() {
                                 *message = Some(format!("project.toml: {e:#}"));
                             }
                         }
@@ -580,12 +576,19 @@ fn adding_ui(
         if clicked {
             let to = format!("{} {}", if held { "Update" } else { "Add" }, p.id);
             // An archive is unpacked first, and copied in as its folder.
-            let added = if extensions::archive::is_archive(folder) {
-                extensions::archive::unpack(folder).and_then(|unpacked| {
-                    project::switches::add_extension(&ws.project, &unpacked.folder, None, &mut ws.history, to)
-                })
-            } else {
-                project::switches::add_extension(&ws.project, folder, None, &mut ws.history, to)
+            let unpacked = extensions::archive::is_archive(folder).then(|| extensions::archive::unpack(folder));
+            let added = match unpacked {
+                Some(Err(e)) => Err(e),
+                Some(Ok(unpacked)) => ws
+                    .held(move |w| project::switches::add_extension(&w.core.project, &unpacked.folder, None, &mut w.history, to))
+                    .map_err(anyhow::Error::msg)
+                    .flatten(),
+                None => {
+                    let folder = folder.to_path_buf();
+                    ws.held(move |w| project::switches::add_extension(&w.core.project, &folder, None, &mut w.history, to))
+                        .map_err(anyhow::Error::msg)
+                        .flatten()
+                }
             };
             change = Some((verb, added.map(|about| about.described.install.is_some())));
         }
@@ -596,8 +599,11 @@ fn adding_ui(
             .on_hover_text("Its folder goes, and what the project requires of it")
             .clicked()
     {
-        let removed =
-            project::switches::remove_extension(&ws.project, &p.id, &mut ws.history, format!("Remove {}", p.id));
+        let (id, said) = (p.id.clone(), format!("Remove {}", p.id));
+        let removed = ws
+            .held(move |w| project::switches::remove_extension(&w.core.project, &id, &mut w.history, said))
+            .map_err(anyhow::Error::msg)
+            .flatten();
         change = Some(("removed", removed.map(|()| false)));
     }
     if let Some((verb, written)) = change {
@@ -654,7 +660,10 @@ fn switch_ui(
                 }
                 let next: Vec<String> = next.into_iter().collect();
                 let label = format!("Turn {asked} {verb}");
-                let written = project::switches::set_disabled(&ws.project, &next, &mut ws.history, label);
+                let written = ws
+                    .held(move |w| project::switches::set_disabled(&w.core.project, &next, &mut w.history, label))
+                    .map_err(anyhow::Error::msg)
+                    .flatten();
                 *message = Some(match written {
                     Ok(()) => format!("{asked} turned {verb}"),
                     Err(e) => format!("project.toml: {e:#}"),

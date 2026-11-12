@@ -7,9 +7,11 @@ use super::{Fixture, Scenario};
 /// The project, turned to leave this extension off, as the Extensions pane does.
 fn turn_off(editor: &mut Scenario, id: &str) {
     let ws = editor.workspace();
-    let written =
-        project::switches::set_disabled(&ws.project, &[id.to_string()], &mut ws.history, "Turn it off".to_string());
-    written.expect("project.toml written");
+    let off = vec![id.to_string()];
+    let written = ws.held(move |w| {
+        project::switches::set_disabled(&w.core.project, &off, &mut w.history, "Turn it off".to_string())
+    });
+    written.expect("the worker is there").expect("project.toml written");
 }
 
 #[test]
@@ -109,16 +111,18 @@ fn code_is_overridden_in_a_layer_made_for_it() {
 }
 
 #[test]
-fn code_overridden_while_the_project_is_read_waits_for_the_layer() {
+fn code_overridden_while_the_project_is_read_waits_its_turn() {
     let mut editor = Scenario::open(Fixture::code());
     let root = editor.fixture.root().to_path_buf();
     editor.override_entry("src/thing.c").expect("an entry");
     editor.type_into("new files layer", "mine");
     editor.hold_reading().expect("held");
     editor.click("Create and override");
-    assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    assert!(!root.join(".layers/mine/src/thing.c").exists(), "it waits for the project to have the layer");
+    // The thread holding the project is reading it: what was asked is done after, the window going on.
+    assert!(editor.editor().is_deferring(), "it waits its turn");
+    assert!(!editor.project_file().contains("name = \"mine\""), "nothing is written while the project is read");
     editor.release_reading().expect("let go");
+    assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
     assert!(root.join(".layers/mine/src/thing.c").is_file());
 }
 

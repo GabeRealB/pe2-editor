@@ -360,7 +360,7 @@ impl Host {
             let held = state.held.as_mut()?;
             // What reads were answered from changes: made again at the next.
             state.reading = None;
-            held.core.edits(&mut held.history, &[op], layer.as_deref(), None).pop()
+            held.core.edits(&mut held.history, &[op], layer.as_deref()).0.pop()
         });
         match made {
             Some(Some(made)) => made,
@@ -377,7 +377,7 @@ impl Host {
         core.took(move || {
             let Some(host) = host.upgrade() else { return };
             host.queue.post(|state| {
-                if state.held.as_mut().is_some_and(|held| held.core.verified()) {
+                if state.held.as_mut().is_some_and(|held| held.core.verified().is_some()) {
                     state.reading = None;
                 }
             });
@@ -391,7 +391,7 @@ impl Host {
         let taken = self.ask(|state| {
             let held = state.held.as_mut()?;
             state.reading = None;
-            Some(held.core.take_due(&mut held.history))
+            Some(held.core.take_due(&mut held.history, Ok(None), None).0)
         });
         taken.flatten().unwrap_or(mcp::Reply::Declined)
     }
@@ -400,8 +400,11 @@ impl Host {
     /// again. While another holds it, that one does.
     fn take_in(&self, changed: Vec<PathBuf>) {
         self.ask(move |state| {
-            if state.held.as_mut().is_some_and(|held| held.core.take_in(&changed)) {
-                state.reading = None;
+            let Some(held) = state.held.as_mut() else { return };
+            match held.core.take_in(&changed) {
+                Ok(Some(_)) => state.reading = None,
+                Ok(None) => {}
+                Err(e) => eprintln!("{e}"),
             }
         });
     }

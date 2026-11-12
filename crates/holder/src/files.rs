@@ -221,10 +221,31 @@ impl Files {
     /// Say it here, on the thread that asks - what became of what was due is said once this returns - and have
     /// the server told, waited for where it serves already.
     fn say(&self, said: Said, changed: Vec<std::path::PathBuf>, model: &project::model::Delta, answers: &crate::says::Answers) {
+        self.say_then(said, changed, model, answers, true, None);
+    }
+
+    /// Say this here, on the thread that asks - what is served, with what changed of the model and what became
+    /// of what was due, in one commit - and have the server told: of these files of the layers that changed
+    /// first, for what it reads of them to be read again. Where `wait`, and it serves already, it is waited for
+    /// to serve it; `then` is done once it does, or will not.
+    pub fn say_then(
+        &self,
+        said: Said,
+        changed: Vec<std::path::PathBuf>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
+        wait: bool,
+        then: Option<Then>,
+    ) {
         let failed = self.says.say(said, model, answers).err();
         let (served, waited) = mpsc::channel();
-        let wait = matches!(self.state(), State::Served(..));
-        let _ = self.shown.send(Shown { changed, failed, served: wait.then_some(served), then: None });
+        let wait = wait && matches!(self.state(), State::Served(..));
+        // What could not be given to the thread telling it - which is gone - is done with here.
+        if let Err(mpsc::SendError(Shown { then: Some(then), .. })) =
+            self.shown.send(Shown { changed, failed, served: wait.then_some(served), then })
+        {
+            then();
+        }
         if wait {
             let _ = waited.recv_timeout(PATIENCE);
         }
