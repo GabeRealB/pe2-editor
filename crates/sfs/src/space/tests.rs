@@ -300,11 +300,43 @@ fn two_processes_write_one_space() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// What the lists of pages have to hold to, whatever was done and wherever a writer stopped: no page is listed
+/// twice; none listed - free or held - is reached by the last commit; none free is reached by a view held.
+fn lists_hold(space: &Space, views: &[&Pinned]) {
+    let (free, held) = space.listed_pages();
+    let mut listed: Vec<u64> = free.iter().copied().chain(held.iter().map(|(number, ..)| *number)).collect();
+    listed.sort_unstable();
+    let twice = listed.windows(2).find(|pair| pair[0] == pair[1]);
+    assert!(twice.is_none(), "a page is listed twice: {twice:?}");
+    let reached = |pages: &dyn Fn(usize, &mut Vec<u64>)| {
+        let mut reached = Vec::new();
+        for tree in 0..ROOTS {
+            pages(tree, &mut reached);
+        }
+        reached
+    };
+    let last = space.read().unwrap();
+    for page in reached(&|tree, into| tree::reached(&last, tree, into).unwrap()) {
+        assert!(listed.binary_search(&page).is_err(), "page {page} is listed, and the last commit reaches it");
+    }
+    let free: HashSet<u64> = free.into_iter().collect();
+    for view in views {
+        for page in reached(&|tree, into| tree::reached(*view, tree, into).unwrap()) {
+            assert!(!free.contains(&page), "page {page} is free, and a view at {} reaches it", view.commit().generation);
+        }
+    }
+    // Those held are in the order they were freed, each written before it was freed.
+    assert!(held.windows(2).all(|pair| pair[0].2 <= pair[1].2) && held.iter().all(|(_, written, freed)| written < freed), "{held:?}");
+}
+
 /// The steps a writer may stop at.
-const STEPS: [&str; 7] = [
+const STEPS: [&str; 10] = [
     "make: a page taken",
     "free: one fewer said",
     "free: an entry written",
+    "free: one held",
+    "free: one held taken out",
+    "free: what readers were at half said",
     "commit: before its page",
     "commit: its page written",
     "publish: half said",
@@ -317,7 +349,7 @@ fn the_writer_that_stops() {
     let (Ok(dir), Ok(at)) = (std::env::var("PE2_SFS_SPACE_STOPS"), std::env::var("PE2_SFS_SPACE_AT")) else { return };
     let (step, nth) = at.split_once('#').unwrap();
     let (step, nth) = (step.to_owned(), nth.parse::<usize>().unwrap());
-    let space = Space::open(Path::new(&dir)).unwrap();
+    let space = Arc::new(Space::open(Path::new(&dir)).unwrap());
     let hits = AtomicUsize::new(0);
     space.set_faults(Arc::new(move |point| {
         if point == step && hits.fetch_add(1, Ordering::AcqRel) + 1 == nth {
@@ -325,7 +357,18 @@ fn the_writer_that_stops() {
             std::process::exit(3);
         }
     }));
-    run(&space, "stops", 0..300, 150, &mut Model::new());
+    // With views held and let go of as it writes: what it frees is held for them, and looked through as they go.
+    let mut rng = Rng::of("stops", 7);
+    let mut views = Vec::new();
+    for n in 0..300 {
+        run(&space, "stops", n..n + 1, 150, &mut Model::new());
+        if rng.below(2) == 0 {
+            views.push(space.pinned().unwrap());
+        }
+        if views.len() > 4 || (rng.below(3) == 0 && !views.is_empty()) {
+            views.swap_remove(usize::try_from(rng.below(views.len() as u64)).unwrap());
+        }
+    }
 }
 
 #[test]
@@ -349,9 +392,14 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             after("stops", made, 150, &mut model);
             same(&snapshot, &model);
             drop(snapshot);
-            // And the next writer goes on from there.
+            lists_hold(&space, &[]);
+            // And the next writer goes on from there - what the one that stopped held for its views free once
+            // it is found gone.
+            std::thread::sleep(PROBE);
             run(&space, "stays", 40..120, 150, &mut model);
             same(&space.read().unwrap(), &model);
+            lists_hold(&space, &[]);
+            assert_eq!(space.usage().unwrap().held, 0, "{step} #{nth}: pages are held for views that are gone");
             drop(space);
             // Alone, and never had on disk: nothing of it is trusted.
             let alone = Space::open(&dir).unwrap();
@@ -395,7 +443,9 @@ fn a_reader_stopped_about_its_pin_reads_what_is_there_when_it_goes_on() {
             assert_eq!(generation, now.generation, "{step}: it read a commit that was no longer the one");
             assert!(read == model, "{step}: what it read is not what the last commit holds");
             if step == "read: pinned" {
-                assert!(now.pages > before.pages + 100, "{step}: its pin held no page back: {before:?}, {now:?}");
+                assert!(now.held > 0, "{step}: its pin held no page back: {before:?}, {now:?}");
+            } else {
+                assert_eq!(now.held, 0, "{step}: pages are held for a reader that is nowhere yet: {now:?}");
             }
         });
         // Its pin is gone with it: pages are taken again.
@@ -427,17 +477,23 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
         assert!(waited.elapsed() < Duration::from_secs(30), "the reader never pinned");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // While it lives, what is freed after its pin is not taken again.
+    // While it lives, what the commit it reads reaches is not taken again - and what was written since is.
+    let before = space.usage().unwrap();
     run(&space, "p", 60..160, 100, &mut model);
     let held = space.usage().unwrap();
-    run(&space, "p", 160..260, 100, &mut model);
+    assert!(held.held > 0, "its pin held no page back: {held:?}");
+    run(&space, "p", 160..460, 100, &mut model);
     let held_on = space.usage().unwrap();
-    assert!(held_on.pages > held.pages + 50, "its pin held no page back: {held:?}, {held_on:?}");
+    assert!(held_on.held >= held.held && held_on.held <= before.pages - before.free, "{before:?}, {held:?}, {held_on:?}");
+    assert!(held_on.pages <= before.pages + (before.pages - before.free) + 64, "it held back more than it reads: {before:?}, {held_on:?}");
+    lists_hold(&space, &[]);
     reader.kill().unwrap();
     reader.wait().unwrap();
     std::thread::sleep(PROBE * 2);
-    run(&space, "p", 260..660, 100, &mut model);
-    assert_eq!(space.usage().unwrap().pages, held_on.pages, "a dead reader's pin held pages back");
+    run(&space, "p", 460..860, 100, &mut model);
+    let after = space.usage().unwrap();
+    assert_eq!(after.pages, held_on.pages, "a dead reader's pin held pages back");
+    assert_eq!(after.held, 0, "a dead reader's pin held pages back");
     same(&space.read().unwrap(), &model);
     drop(space);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -555,7 +611,7 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
                 std::fs::write(mixed.join(name), now).unwrap();
                 continue;
             };
-            let of_list = name == "head" || name == "free";
+            let of_list = name == "head" || name == "free" || name.contains(".free") || name.contains(".held");
             let kept = match (seed % 4, of_list) {
                 (0, _) | (1, true) => 0,
                 (3, false) => 1,
@@ -725,6 +781,140 @@ fn a_view_pinned_is_held_by_whoever_holds_it_and_reads_what_it_began_with() {
 }
 
 #[test]
+fn a_view_held_through_many_commits_holds_back_the_pages_of_its_commit_and_no_more() {
+    let space = Arc::new(Space::private().unwrap());
+    let mut model = Model::new();
+    run(&space, "long", 0..400, 300, &mut model);
+    let began = model.clone();
+    let before = space.usage().unwrap();
+    let reads = before.pages - before.free;
+    let view = space.pinned().unwrap();
+    assert_eq!(space.reading_longest().map(|(generation, _)| generation), Some(view.commit().generation));
+    // A hundred thousand commits under it: every page of the commit it reads is written anew, many times over.
+    for n in 0..100_000u64 {
+        if n % 500 == 0 {
+            run(&space, "long", 400 + n..401 + n, 300, &mut model);
+            continue;
+        }
+        let (key, value) = (key("long", n % 300), n.to_le_bytes().to_vec());
+        let mut txn = space.write().unwrap();
+        tree::put(&mut txn, 0, &key, &value).unwrap();
+        txn.commit().unwrap();
+        model.insert(key, value);
+    }
+    let after = space.usage().unwrap();
+    assert!(after.held > 0 && after.held <= reads, "{} pages held for a view that reads {reads}", after.held);
+    assert!(after.pages <= before.pages + reads + 256, "the space grew under a view held: {before:?}, {after:?}");
+    lists_hold(&space, &[&view]);
+    same(&view, &began);
+    same(&space.read().unwrap(), &model);
+    // Let go of, what it held back is free, and taken again.
+    drop(view);
+    assert_eq!(space.reading_longest(), None);
+    for n in 0..2000u64 {
+        let (key, value) = (key("long", n % 300), n.to_le_bytes().to_vec());
+        let mut txn = space.write().unwrap();
+        tree::put(&mut txn, 0, &key, &value).unwrap();
+        txn.commit().unwrap();
+        model.insert(key, value);
+    }
+    let settled = space.usage().unwrap();
+    assert_eq!((settled.held, settled.pages), (0, after.pages), "{after:?}, {settled:?}");
+    lists_hold(&space, &[]);
+    same(&space.read().unwrap(), &model);
+}
+
+#[test]
+fn views_at_many_commits_each_hold_back_what_they_read_and_nothing_else() {
+    let space = Arc::new(Space::private().unwrap());
+    let mut rng = Rng::of("views", 0);
+    let mut model = Model::new();
+    let mut views: Vec<(Pinned, Model)> = Vec::new();
+    let mut most_held = 0;
+    for round in 0..3000u64 {
+        run(&space, "v", round..round + 1, 300, &mut model);
+        // For a while more at a time than a process says by themselves: it then counts as reading at every commit
+        // from the lowest of the rest on.
+        let most = if (1000..1600).contains(&round) { 45 } else { 6 };
+        if rng.below(2) == 0 && views.len() < most {
+            views.push((space.pinned().unwrap(), model.clone()));
+        }
+        if (rng.below(3) == 0 || views.len() >= most) && !views.is_empty() {
+            let (view, was) = views.swap_remove(usize::try_from(rng.below(views.len() as u64)).unwrap());
+            same(&view, &was);
+        }
+        most_held = most_held.max(views.len());
+        if round % 61 == 0 {
+            lists_hold(&space, &views.iter().map(|(view, _)| view).collect::<Vec<_>>());
+            for (view, was) in &views {
+                same(view, was);
+            }
+        }
+    }
+    assert!(most_held > 40, "{most_held} views at a time at most");
+    for (view, was) in views.drain(..) {
+        same(&view, &was);
+    }
+    same(&space.read().unwrap(), &model);
+    // With no view left and everything removed, every page ever written is free, and none held.
+    let mut txn = space.write().unwrap();
+    for key in model.keys() {
+        assert!(tree::remove(&mut txn, 0, key).unwrap());
+    }
+    txn.commit().unwrap();
+    lists_hold(&space, &[]);
+    let usage = space.usage().unwrap();
+    assert_eq!((usage.free, usage.held), (usage.pages, 0), "{usage:?}");
+}
+
+#[test]
+fn the_lists_of_pages_grow_by_pieces_and_what_they_list_is_taken_again() {
+    let space = Arc::new(Space::private().unwrap());
+    // A tree of some 10,000 pages: more than a piece of either list holds.
+    let fill = |space: &Space, with: u8| {
+        let mut txn = space.write().unwrap();
+        for n in 0..10_000u32 {
+            tree::put(&mut txn, 0, &n.to_be_bytes(), &[with; 3000]).unwrap();
+        }
+        txn.commit().unwrap();
+    };
+    let empty = |space: &Space| {
+        let mut txn = space.write().unwrap();
+        for n in 0..10_000u32 {
+            assert!(tree::remove(&mut txn, 0, &n.to_be_bytes()).unwrap());
+        }
+        txn.commit().unwrap();
+    };
+    fill(&space, 1);
+    let filled = space.usage().unwrap();
+    assert!(filled.pages > 10_000, "{filled:?}");
+    // All of it let go of under a view: held, every page of it.
+    let view = space.pinned().unwrap();
+    empty(&space);
+    let held = space.usage().unwrap();
+    assert!(held.held >= filled.pages - filled.free && held.pages <= filled.pages + 8, "{filled:?}, {held:?}");
+    lists_hold(&space, &[&view]);
+    assert_eq!(tree::get(&view, 0, &77u32.to_be_bytes()).unwrap().as_deref(), Some(&[1u8; 3000][..]));
+    // Filled again while it is held, the space is twice as large; the view let go of, all of that is free.
+    fill(&space, 2);
+    let twice = space.usage().unwrap();
+    assert!(twice.pages >= 2 * filled.pages - 16, "{filled:?}, {twice:?}");
+    lists_hold(&space, &[&view]);
+    drop(view);
+    empty(&space);
+    let emptied = space.usage().unwrap();
+    assert_eq!((emptied.free, emptied.held), (emptied.pages, 0), "{emptied:?}");
+    assert!(emptied.pages <= twice.pages + 8, "{twice:?}, {emptied:?}");
+    lists_hold(&space, &[]);
+    // And taken again: filled twice over, the space is no larger.
+    fill(&space, 3);
+    empty(&space);
+    fill(&space, 4);
+    assert_eq!(space.usage().unwrap().pages, emptied.pages);
+    assert_eq!(tree::get(&space.read().unwrap(), 0, &9_999u32.to_be_bytes()).unwrap().as_deref(), Some(&[4u8; 3000][..]));
+}
+
+#[test]
 #[ignore = "a measurement"]
 fn bench_tree() {
     let dir = folder("bench");
@@ -864,29 +1054,45 @@ fn bench_model() {
             txn.commit().unwrap();
         };
         let before = space.usage().unwrap();
+        let each = |started: Instant| started.elapsed().as_secs_f64() * 1e6 / commits as f64;
+        let started = Instant::now();
         for _ in 0..commits {
             edit(&space);
         }
-        let unpinned = space.usage().unwrap();
+        let (unpinned, alone) = (space.usage().unwrap(), each(started));
         let pin = space.read().unwrap();
+        let started = Instant::now();
         for _ in 0..commits {
             edit(&space);
         }
-        let pinned = space.usage().unwrap();
-        drop(pin);
+        let (pinned, under_one) = (space.usage().unwrap(), each(started));
+        // And with another reader beside it that moves to every commit, as a window's view does.
+        let mut moving = space.read().unwrap();
+        let started = Instant::now();
+        for _ in 0..commits {
+            edit(&space);
+            drop(moving);
+            moving = space.read().unwrap();
+        }
+        let (moved, under_two) = (space.usage().unwrap(), each(started));
+        drop((pin, moving));
         for _ in 0..commits {
             edit(&space);
         }
         let after = space.usage().unwrap();
         eprintln!(
-            "{commits} commits of 8 puts: {} pages before; +{} with nothing pinned; +{} with a reader pinned throughout \
-             ({:.1} a commit); +{} more once it let go ({} listed free)",
+            "{commits} commits of 8 puts: {} pages before; +{} with nothing pinned ({alone:.1} us a commit); +{} with a \
+             reader pinned throughout ({under_one:.1} us a commit, {} held); +{} more with another moving to every commit \
+             ({under_two:.1} us a commit, {} held); +{} more once they let go ({} listed free, {} held)",
             before.pages,
             unpinned.pages - before.pages,
             pinned.pages - unpinned.pages,
-            (pinned.pages - unpinned.pages) as f64 / commits as f64,
-            after.pages - pinned.pages,
-            after.free
+            pinned.held,
+            moved.pages - pinned.pages,
+            moved.held,
+            after.pages - moved.pages,
+            after.free,
+            after.held
         );
     }
     // A model filled whole, in the order of its keys: 170,000 of them, a thousand a commit.

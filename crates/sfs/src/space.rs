@@ -10,15 +10,24 @@
 //!   lock.
 //! - **One writer at a time**: a lock the system holds on a file (`writer`), let go of where its holder dies. A
 //!   writer changes no page a reader can reach: it copies the page into one of its own (`Txn::own`), and the old one
-//!   is free once no reader is at a generation that could reach it. The free pages are listed in a file of their
-//!   own every writer maps (`free`), each with the generation whose commit freed it, changed under the writer's
-//!   lock in an order that a death at any point leaves without a page listed twice: at worst a page is listed no
-//!   more, and is not used again until the space is made anew. A writer that dies inside a transaction has
-//!   published nothing; the pages it took are past what the last commit says is in use, or lost that way.
-//! - **Readers take no lock**: a reader pins the generation it reads at in a slot of the header (pinned, then
-//!   checked that it is still the current one, else pinned again), which a writer reads before it takes a freed page
-//!   again. A slot is its process's by a lock on a file of its own (`reader.<n>`), so the pin of a process that died
-//!   is found and cleared.
+//!   is free once no reader is at a generation that could reach it: one from the generation that wrote the page on,
+//!   before the one whose commit let go of it. So a reader held long holds back the pages of the commit it reads,
+//!   and none written since. The writer keeps two lists, in files every writer maps, each in pieces that are made
+//!   as it grows (`<n>.free`, `<n>.held`, their counts in `free`): the pages free to be taken again, and those
+//!   held - each with the generation that wrote it and the one that freed it, in the order they were freed. A
+//!   held page is free once the readers that could reach it are gone, and stays so: a reader only ever begins at
+//!   the current commit, which reaches nothing freed before it. So those held are looked through only where a
+//!   reader that was there when they were last judged is gone, from the first freed after it. The lists are
+//!   changed under the writer's lock in an order that a death at any point leaves without a page listed twice: at
+//!   worst a page is listed no more, and is not used again until the space is made anew. A writer that dies
+//!   inside a transaction has published nothing; the pages it took are past what the last commit says is in use,
+//!   or lost that way.
+//! - **Readers take no lock**: a reader says the generation it reads at in a cell of its process's (`pins`; said,
+//!   then checked that it is still the current one, else said again), which a writer reads once its commit is
+//!   published, before it judges what the commit freed. A process says each generation it reads at by itself, up
+//!   to `PINS` of them; reading at more, it says the lowest of the rest and counts as reading at every one from
+//!   there on. Its cells are its own by a lock on a file (`reader.<n>`), so those of a process that died are
+//!   found and cleared.
 //! - **Loud**: every page says its kind, its own number and the generation that wrote it, and a pointer to a page
 //!   says both its number and that generation - so whoever follows one finds the very page that was pointed to, or
 //!   says so (`Pages::page`). What fails marks the space damaged for every process, with what was found; its files
@@ -53,16 +62,24 @@ const READY_PAGES: usize = 64;
 pub const ROOTS: usize = 16;
 /// How many processes have one space attached at a time.
 const READERS: usize = 64;
-/// How long the list of free pages is, in bytes: a count, then a page's number and the generation that freed it for
-/// each - 8,191 of them. What is freed beyond that is not listed. Its file is written whole for every space there
-/// is, so it is no longer than a long hold on old pages needs.
-const FREE: usize = 1 << 17;
+/// How many generations a process says it reads at, each by itself; reading at more, it says the lowest of the
+/// rest, and counts as reading at every one from there on (`Readers::from`).
+const PINS: usize = 31;
+/// How long what the readers of every process say is (`pins`): a process's cells, for each that may attach.
+const PINNED: usize = READERS * (PINS + 1) * 8;
+/// How long the header of the writer's lists of pages is (`free`): how many each holds, and what readers were at
+/// when the held ones were last looked through - a generation for every cell there is, at most.
+const LISTS: usize = 1 << 15;
+/// A piece of one of the writer's lists: 64 KiB, a file of its own.
+const PIECE: usize = 1 << 16;
+/// The most pieces a list has: room for more entries than a space has pages.
+const PIECES: usize = 2048;
 /// What a page begins with: its kind (1), nothing (3), its own number (4), the generation that wrote it (8).
 pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
 const PROBE: Duration = Duration::from_millis(100);
 
-const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x02");
+const MAGIC: u64 = u64::from_le_bytes(*b"pe2spc\x00\x03");
 
 /// Where each value of the shared header (page 0 of `head`) is.
 mod at {
@@ -77,11 +94,27 @@ mod at {
     /// Whether `clean` says the space is on disk as it is.
     pub const CLEAN: usize = 48;
     pub const ROOTS: usize = 64;
-    /// Each attached process's pin: the generation it reads at, plus one; 0 for none.
+    /// How many of its cells each attached process says something in (`pins`): 0, and a writer does not look.
     pub const READERS: usize = 256;
     /// Whether each attached process wrote pages it has not flushed.
     pub const WROTE: usize = 768;
     pub const WHY: usize = 1280;
+}
+
+/// Where each value of the header of the writer's lists (`free`) is.
+mod listed {
+    /// How many pages are free to be taken again.
+    pub const FREE: usize = 0;
+    /// How many are held: freed, and reached by a reader still when last judged.
+    pub const HELD: usize = 8;
+    /// Set while what follows is written, while those held are looked through, and where what follows may not be
+    /// what they were judged by: found set, they are looked through whole.
+    pub const TORN: usize = 16;
+    /// What readers were at when those held were last judged (`Readers`): from which generation on every one
+    /// counted as read at, plus one - 0 for none; how many generations by themselves; and those, in order.
+    pub const FROM: usize = 24;
+    pub const SEEN: usize = 32;
+    pub const AT: usize = 40;
 }
 
 /// A pointer to a page: its number, and - above it - the low half of the generation that wrote it.
@@ -224,6 +257,7 @@ enum Backing {
         maps: Mutex<Vec<memmap2::MmapRaw>>,
         head: memmap2::MmapRaw,
         free: memmap2::MmapRaw,
+        pins: memmap2::MmapRaw,
         writer: File,
         /// Held shared while the space is attached here; and this process's slot, held alone.
         _attached: File,
@@ -233,7 +267,73 @@ enum Backing {
         chunks: Mutex<Vec<Mem>>,
         head: Mem,
         free: Mem,
+        pins: Mem,
     },
+}
+
+/// One of the writer's two lists of pages: entries of one length in pieces, each piece a file of the space mapped
+/// by itself - memory, of a private one - and made as the list comes to need it. Read and written by who has the
+/// writer's lock alone.
+struct List {
+    /// What its files' names end with.
+    name: &'static str,
+    /// How many numbers an entry is.
+    entry: usize,
+    /// Each piece's first byte, once mapped here.
+    pieces: Box<[AtomicPtr<u8>]>,
+}
+
+impl List {
+    fn new(name: &'static str, entry: usize) -> List {
+        List { name, entry, pieces: (0..PIECES).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect() }
+    }
+
+    /// How many entries a piece holds.
+    fn per(&self) -> u64 {
+        (PIECE / (self.entry * 8)) as u64
+    }
+}
+
+/// A generation this process reads at.
+struct Reading {
+    /// How many read at it.
+    readers: usize,
+    /// The cell of the process's that says it; none where every cell says another, and it is said by the lowest
+    /// of those that have none.
+    cell: Option<usize>,
+    since: Instant,
+}
+
+/// The generations readers are at, as a writer finds them said.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Readers {
+    /// Those said by themselves, in order.
+    at: Vec<u64>,
+    /// The generation from which on every one counts as read at: the lowest a process says for all those it has
+    /// no cell for.
+    from: Option<u64>,
+}
+
+impl Readers {
+    /// Whether a reader here may reach a page that one generation wrote and the commit of another let go of: it
+    /// reads at one from the first on, before the second.
+    fn reach(&self, written: u64, freed: u64) -> bool {
+        self.from.is_some_and(|from| from < freed) || {
+            let first = self.at.partition_point(|at| *at < written);
+            self.at.get(first).is_some_and(|at| *at < freed)
+        }
+    }
+
+    /// The lowest generation read at here that `now` no longer has a reader at: what was freed after it may be
+    /// reached by nobody any more.
+    fn left(&self, now: &Readers) -> Option<u64> {
+        let from = self.from.filter(|from| now.from.is_none_or(|still| still > *from));
+        let at = self.at.iter().copied().find(|at| now.at.binary_search(at).is_err());
+        match (from, at) {
+            (Some(from), Some(at)) => Some(from.min(at)),
+            (from, at) => from.or(at),
+        }
+    }
 }
 
 /// What a test has a space call at each step that a process may stop at.
@@ -248,9 +348,14 @@ pub struct Space {
     /// One of this process's threads writes at a time; with it, when it last looked whether the processes whose
     /// pins hold pages back still run.
     writing: Mutex<Option<Instant>>,
-    /// The generations this process's readers are at, each with how many: the lowest is what its slot says.
-    pins: Mutex<BTreeMap<u64, usize>>,
+    /// The generations this process's readers are at.
+    pins: Mutex<BTreeMap<u64, Reading>>,
     slot: usize,
+    /// The pages free to be taken again: each its number.
+    free: List,
+    /// Those held: each its number - 0 for none -, the generation that wrote it and the one that freed it, in the
+    /// order they were freed.
+    held: List,
     /// It began empty: what it is to hold is put there again by whoever owns it.
     fresh: AtomicBool,
     #[cfg(test)]
@@ -315,38 +420,57 @@ fn allocate(mut file: &File, has: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a file of a space's folder is one of its pages' - not one of its locks.
+/// Whether a file of a space's folder is one of its pages' - not one of its locks, nor what its readers say.
 fn of_pages(name: &str) -> bool {
-    ["head", "free", "clean"].contains(&name) || name.contains(".chunk")
+    ["head", "free", "clean"].contains(&name) || [".chunk", ".free", ".held"].iter().any(|of| name.contains(of))
 }
 
-/// What `clean` says: the generation the space was had on disk at, and the checksum of its list of free pages.
-fn said_clean(generation: u64, free: &[u8]) -> [u8; 12] {
-    let count = usize::try_from(number_at(free, 0)).unwrap_or(0).min((FREE - 8) / 16);
+/// The checksum of the writer's lists: their header as far as it says anything, and every entry they hold - of
+/// each list's pieces, given by name and number. None where a piece is not there, or not whole.
+fn lists_sum(header: &[u8], piece: &mut dyn FnMut(&str, usize) -> Option<Vec<u8>>) -> Option<u32> {
+    let seen = usize::try_from(number_at(header, listed::SEEN)).ok()?.min((LISTS - listed::AT) / 8);
+    let mut sum = crc32fast::Hasher::new();
+    sum.update(header.get(..listed::AT + seen * 8)?);
+    for (name, entry, count) in [("free", 8, number_at(header, listed::FREE)), ("held", 24, number_at(header, listed::HELD))] {
+        let mut left = usize::try_from(count).ok()?;
+        let mut number = 0;
+        while left > 0 {
+            let here = left.min(PIECE / entry);
+            sum.update(piece(name, number)?.get(..here * entry)?);
+            left -= here;
+            number += 1;
+        }
+    }
+    Some(sum.finalize())
+}
+
+/// What `clean` says: the generation the space was had on disk at, and the checksum of its lists of pages.
+fn said_clean(generation: u64, lists: u32) -> [u8; 12] {
     let mut said = [0u8; 12];
     said[..8].copy_from_slice(&generation.to_le_bytes());
-    said[8..].copy_from_slice(&crc32fast::hash(&free[..8 + count * 16]).to_le_bytes());
+    said[8..].copy_from_slice(&lists.to_le_bytes());
     said
 }
 
 /// Whether the files in `dir` are a space had on disk as it is: `clean` says the generation its header is at - which
-/// is whole, the last commit written, not damaged - and its list of free pages is the one it was said with.
+/// is whole, the last commit written, not damaged - and its lists of pages are those it was said with.
 fn is_clean(dir: &Path) -> bool {
     let (Ok(said), Ok(head), Ok(free)) = (std::fs::read(dir.join("clean")), std::fs::read(dir.join("head")), std::fs::read(dir.join("free")))
     else {
         return false;
     };
-    if head.len() < 3 * PAGE || free.len() < FREE {
+    if head.len() < 3 * PAGE || free.len() < LISTS {
         return false;
     }
     let header = Commit::of_header(&head);
     let latest = [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation);
+    let lists = lists_sum(&free, &mut |name, number| std::fs::read(dir.join(format!("{number:08}.{name}"))).ok());
     number_at(&head, at::MAGIC) == MAGIC
         && number_at(&head, at::SEQ) % 2 == 0
         && number_at(&head, at::DAMAGED) == 0
         // A space nothing was ever committed to has no commit written.
         && (latest == Some(header) || (latest.is_none() && header == Commit::default()))
-        && said == said_clean(header.generation, &free)
+        && lists.is_some_and(|lists| said == said_clean(header.generation, lists))
 }
 
 /// Make a chunk's file, whole, where there is none: by one process at a time, under a name of its own until it is
@@ -384,6 +508,8 @@ impl Space {
             writing: Mutex::default(),
             pins: Mutex::default(),
             slot,
+            free: List::new("free", 1),
+            held: List::new("held", 3),
             fresh: AtomicBool::new(fresh),
             #[cfg(test)]
             faults: Mutex::default(),
@@ -395,7 +521,7 @@ impl Space {
     /// # Errors
     /// There is no memory for it.
     pub fn private() -> io::Result<Space> {
-        let backing = Backing::Memory { chunks: Mutex::default(), head: Mem::zeroed(3 * PAGE)?, free: Mem::zeroed(FREE)? };
+        let backing = Backing::Memory { chunks: Mutex::default(), head: Mem::zeroed(3 * PAGE)?, free: Mem::zeroed(LISTS)?, pins: Mem::zeroed(PINNED)? };
         let space = Space::with(backing, 0, true);
         space.atom(at::MAGIC).store(MAGIC, Ordering::Release);
         Ok(space)
@@ -431,16 +557,18 @@ impl Space {
             attached.lock_shared()?;
             let head = sized(&dir.join("head"), 3 * PAGE as u64)?;
             let head = memmap2::MmapOptions::new().len(3 * PAGE).map_raw(&head)?;
-            let free = sized(&dir.join("free"), FREE as u64)?;
-            let free = memmap2::MmapOptions::new().len(FREE).map_raw(&free)?;
+            let free = sized(&dir.join("free"), LISTS as u64)?;
+            let free = memmap2::MmapOptions::new().len(LISTS).map_raw(&free)?;
+            let pins = sized(&dir.join("pins"), PINNED as u64)?;
+            let pins = memmap2::MmapOptions::new().len(PINNED).map_raw(&pins)?;
             let reader = (0..READERS).find_map(|slot| {
                 let file = opened(&dir.join(format!("reader.{slot}"))).ok()?;
                 file.try_lock().ok().map(|()| (slot, file))
             });
             let (slot, reader) = reader.ok_or_else(|| io::Error::other("every slot of the space is taken"))?;
-            Ok::<_, io::Error>((head, free, slot, reader, alone))
+            Ok::<_, io::Error>((head, free, pins, slot, reader, alone))
         })();
-        let (head, free, slot, reader, alone) = match parts {
+        let (head, free, pins, slot, reader, alone) = match parts {
             Ok(parts) => parts,
             Err(e) => {
                 let _ = writer.unlock();
@@ -448,7 +576,7 @@ impl Space {
             }
         };
         let backing =
-            Backing::Files { dir: dir.to_path_buf(), maps: Mutex::default(), head, free, writer, _attached: attached, _reader: reader };
+            Backing::Files { dir: dir.to_path_buf(), maps: Mutex::default(), head, free, pins, writer, _attached: attached, _reader: reader };
         let space = Space::with(backing, slot, false);
         let made = match space.atom(at::MAGIC).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(true),
@@ -460,13 +588,13 @@ impl Space {
             if alone {
                 // What the processes before it said of themselves says nothing now.
                 for slot in 0..READERS {
-                    space.atom(at::READERS + slot * 8).store(0, Ordering::Release);
+                    space.reads_nowhere(slot);
                     space.atom(at::WROTE + slot * 8).store(0, Ordering::Release);
                 }
                 space.atom(at::CLEAN).store(u64::from(!made), Ordering::Release);
             }
             // Its own slot says nothing yet, whoever had it before.
-            space.atom(at::READERS + slot * 8).store(0, Ordering::Release);
+            space.reads_nowhere(slot);
             space.atom(at::WROTE + slot * 8).store(0, Ordering::Release);
         }
         space.unlock_writer();
@@ -520,7 +648,22 @@ impl Space {
             // SAFETY: the head's second and third pages.
             touch(unsafe { self.head().add(page * PAGE) });
         }
-        touch(self.free().as_mut_ptr());
+        // The lists of pages, as far as the first transactions write them, and what this process's readers say.
+        for page in 0..LISTS / PAGE {
+            // SAFETY: within the lists' header.
+            touch(unsafe { self.lists().add(page * PAGE) });
+        }
+        for list in [&self.free, &self.held] {
+            let Ok(first) = self.piece(list, 0) else { continue };
+            for page in 0..PIECE / PAGE {
+                // SAFETY: within the piece.
+                touch(unsafe { first.add(page * PAGE) });
+            }
+        }
+        for page in 0..PINNED / PAGE {
+            // SAFETY: within what the readers say.
+            touch(unsafe { self.pinned_at().add(page * PAGE) });
+        }
     }
 
     /// Whether it began empty when it was opened here: what it is to hold is to be put there.
@@ -572,15 +715,155 @@ impl Space {
         unsafe { std::slice::from_raw_parts_mut(self.head().add(at), PAGE) }
     }
 
-    /// The list of free pages: read and written by who has the writer's lock.
-    #[expect(clippy::mut_from_ref, reason = "the one writer's alone, under its lock")]
-    fn free(&self) -> &mut [u8] {
-        let first = match &self.backing {
+    /// The header of the writer's lists of pages.
+    fn lists(&self) -> *mut u8 {
+        match &self.backing {
             Backing::Files { free, .. } => free.as_mut_ptr(),
             Backing::Memory { free, .. } => free.at,
+        }
+    }
+
+    /// One of the values of the lists' header: read and written by who has the writer's lock.
+    #[expect(clippy::cast_ptr_alignment, reason = "the header begins a page, and `at` is a multiple of eight")]
+    fn list(&self, at: usize) -> &AtomicU64 {
+        debug_assert!(at.is_multiple_of(8) && at + 8 <= LISTS);
+        // SAFETY: within the header, aligned to eight bytes, valid for as long as `self`.
+        unsafe { &*self.lists().add(at).cast::<AtomicU64>() }
+    }
+
+    /// A piece of one of the lists: mapped here where it is not yet, and made where there is none.
+    fn piece(&self, list: &List, number: usize) -> io::Result<*mut u8> {
+        let Some(known) = list.pieces.get(number) else {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "a list of the shared space's pages holds all it may"));
         };
-        // SAFETY: the list's whole length; nobody reads or writes it but who has the writer's lock.
-        unsafe { std::slice::from_raw_parts_mut(first, FREE) }
+        let mapped = known.load(Ordering::Acquire);
+        if !mapped.is_null() {
+            return Ok(mapped);
+        }
+        match &self.backing {
+            Backing::Memory { chunks, .. } => {
+                let mut chunks = lock(chunks);
+                let again = known.load(Ordering::Acquire);
+                if !again.is_null() {
+                    return Ok(again);
+                }
+                let piece = Mem::zeroed(PIECE)?;
+                let first = piece.at;
+                chunks.push(piece);
+                known.store(first, Ordering::Release);
+                Ok(first)
+            }
+            Backing::Files { dir, maps, .. } => {
+                let mut maps = lock(maps);
+                let again = known.load(Ordering::Acquire);
+                if !again.is_null() {
+                    return Ok(again);
+                }
+                let file = sized(&dir.join(format!("{number:08}.{}", list.name)), PIECE as u64)?;
+                let map = memmap2::MmapOptions::new().len(PIECE).map_raw(&file)?;
+                let first = map.as_mut_ptr();
+                maps.push(map);
+                known.store(first, Ordering::Release);
+                Ok(first)
+            }
+        }
+    }
+
+    /// An entry of one of the lists, by its place: its numbers, read and written by who has the writer's lock.
+    #[expect(clippy::cast_ptr_alignment, reason = "a piece begins a page, and an entry is whole numbers")]
+    fn entry(&self, list: &List, index: u64) -> io::Result<&[AtomicU64]> {
+        let piece = self.piece(list, usize::try_from(index / list.per()).unwrap_or(usize::MAX))?;
+        let within = usize::try_from(index % list.per()).unwrap_or(0) * list.entry * 8;
+        // SAFETY: within the piece, which holds `per` entries; aligned to eight bytes; valid for as long as `self`.
+        Ok(unsafe { std::slice::from_raw_parts(piece.add(within).cast::<AtomicU64>(), list.entry) })
+    }
+
+    /// What the readers of every process say.
+    fn pinned_at(&self) -> *mut u8 {
+        match &self.backing {
+            Backing::Files { pins, .. } => pins.as_mut_ptr(),
+            Backing::Memory { pins, .. } => pins.at,
+        }
+    }
+
+    /// One of a process's cells: the first for the generation from which on it reads at every one, the others
+    /// for a generation each - plus one; 0 for none.
+    #[expect(clippy::cast_ptr_alignment, reason = "the cells begin a page, eight bytes each")]
+    fn cell(&self, slot: usize, cell: usize) -> &AtomicU64 {
+        debug_assert!(slot < READERS && cell <= PINS);
+        // SAFETY: within the cells, aligned to eight bytes, valid for as long as `self`; every process reads and
+        // writes them as atomics.
+        unsafe { &*self.pinned_at().add((slot * (PINS + 1) + cell) * 8).cast::<AtomicU64>() }
+    }
+
+    /// A process's cells say nothing: it reads nowhere.
+    fn reads_nowhere(&self, slot: usize) {
+        for cell in 0..=PINS {
+            self.cell(slot, cell).store(0, Ordering::SeqCst);
+        }
+        self.atom(at::READERS + slot * 8).store(0, Ordering::SeqCst);
+    }
+
+    /// The generations readers are at now, as every process says them.
+    fn readers(&self) -> Readers {
+        let mut readers = Readers::default();
+        for slot in 0..READERS {
+            if self.atom(at::READERS + slot * 8).load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            if let Some(from) = self.cell(slot, 0).load(Ordering::SeqCst).checked_sub(1) {
+                readers.from = Some(readers.from.map_or(from, |lowest| lowest.min(from)));
+            }
+            readers.at.extend((1..=PINS).filter_map(|cell| self.cell(slot, cell).load(Ordering::SeqCst).checked_sub(1)));
+        }
+        readers.at.sort_unstable();
+        readers.at.dedup();
+        readers
+    }
+
+    /// What readers were at when the held pages were last judged, as the lists' header says.
+    fn seen(&self) -> Readers {
+        let count = usize::try_from(self.list(listed::SEEN).load(Ordering::Acquire)).unwrap_or(0).min((LISTS - listed::AT) / 8);
+        Readers {
+            at: (0..count).map(|i| self.list(listed::AT + i * 8).load(Ordering::Acquire)).collect(),
+            from: self.list(listed::FROM).load(Ordering::Acquire).checked_sub(1),
+        }
+    }
+
+    /// Say what the held pages are judged by from now on - torn while it is said, so that a writer stopped here
+    /// leaves them to be looked through whole.
+    fn see(&self, readers: &Readers) {
+        self.list(listed::TORN).store(1, Ordering::Release);
+        self.fault("free: what readers were at half said");
+        let count = readers.at.len().min((LISTS - listed::AT) / 8);
+        self.list(listed::FROM).store(readers.from.map_or(0, |from| from + 1), Ordering::Release);
+        for (i, at) in readers.at[..count].iter().enumerate() {
+            self.list(listed::AT + i * 8).store(*at, Ordering::Release);
+        }
+        self.list(listed::SEEN).store(count as u64, Ordering::Release);
+        self.list(listed::TORN).store(0, Ordering::Release);
+    }
+
+    /// The pages listed free, and those held - each with the generation that wrote it and the one that freed
+    /// it -, as the lists hold them.
+    #[cfg(test)]
+    fn listed_pages(&self) -> (Vec<u64>, Vec<(u64, u64, u64)>) {
+        let _held = self.write().unwrap();
+        let free = (0..self.list(listed::FREE).load(Ordering::Acquire))
+            .map(|at| self.entry(&self.free, at).unwrap()[0].load(Ordering::Acquire))
+            .filter(|number| *number != 0);
+        let held = (0..self.list(listed::HELD).load(Ordering::Acquire)).map(|at| {
+            let entry = self.entry(&self.held, at).unwrap();
+            (entry[0].load(Ordering::Acquire), entry[1].load(Ordering::Acquire), entry[2].load(Ordering::Acquire))
+        });
+        (free.collect(), held.filter(|(number, ..)| *number != 0).collect())
+    }
+
+    /// The lowest generation this process reads at, and for how long it has: what a view held long is told by.
+    /// It holds back the pages of the commit it reads, and nothing written since.
+    #[must_use]
+    pub fn reading_longest(&self) -> Option<(u64, Duration)> {
+        lock(&self.pins).iter().next().map(|(generation, reading)| (*generation, reading.since.elapsed()))
     }
 
     /// What was found that should not be: said to every process, from now on.
@@ -767,26 +1050,57 @@ impl Space {
 
     fn pin(&self, generation: u64) {
         let mut pins = lock(&self.pins);
-        *pins.entry(generation).or_default() += 1;
-        let lowest = pins.keys().next().copied().unwrap_or(generation);
-        self.atom(at::READERS + self.slot * 8).store(lowest + 1, Ordering::SeqCst);
+        if let Some(reading) = pins.get_mut(&generation) {
+            reading.readers += 1;
+            return;
+        }
+        let cell = (0..PINS).find(|cell| !pins.values().any(|reading| reading.cell == Some(*cell)));
+        // How many cells say something goes up before one does: a writer that finds none said does not look.
+        let said = self.atom(at::READERS + self.slot * 8);
+        if let Some(cell) = cell {
+            said.fetch_add(1, Ordering::SeqCst);
+            self.cell(self.slot, 1 + cell).store(generation + 1, Ordering::SeqCst);
+        } else {
+            // Every cell says another: said by the lowest of those that have none, from which on this process
+            // counts as reading at every generation.
+            let lowest = pins.iter().find(|(_, reading)| reading.cell.is_none()).map_or(generation, |(lowest, _)| generation.min(*lowest));
+            let from = self.cell(self.slot, 0);
+            if from.load(Ordering::SeqCst) == 0 {
+                said.fetch_add(1, Ordering::SeqCst);
+            }
+            from.store(lowest + 1, Ordering::SeqCst);
+        }
+        pins.insert(generation, Reading { readers: 1, cell, since: Instant::now() });
     }
 
     fn unpin(&self, generation: u64) {
         let mut pins = lock(&self.pins);
-        if let Some(count) = pins.get_mut(&generation) {
-            *count -= 1;
-            if *count == 0 {
-                pins.remove(&generation);
+        let Some(reading) = pins.get_mut(&generation) else { return };
+        reading.readers -= 1;
+        if reading.readers > 0 {
+            return;
+        }
+        let cell = pins.remove(&generation).and_then(|reading| reading.cell);
+        let said = self.atom(at::READERS + self.slot * 8);
+        if let Some(cell) = cell {
+            // Its cell goes to the lowest of those that have none - said there before it is said nowhere else.
+            if let Some((waiting, reading)) = pins.iter_mut().find(|(_, reading)| reading.cell.is_none()) {
+                reading.cell = Some(cell);
+                self.cell(self.slot, 1 + cell).store(*waiting + 1, Ordering::SeqCst);
+            } else {
+                self.cell(self.slot, 1 + cell).store(0, Ordering::SeqCst);
+                said.fetch_sub(1, Ordering::SeqCst);
             }
         }
-        let lowest = pins.keys().next().map_or(0, |lowest| lowest + 1);
-        self.atom(at::READERS + self.slot * 8).store(lowest, Ordering::SeqCst);
-    }
-
-    /// The lowest generation any reader is at; none where none reads.
-    fn oldest_reader(&self) -> Option<u64> {
-        (0..READERS).filter_map(|slot| self.atom(at::READERS + slot * 8).load(Ordering::SeqCst).checked_sub(1)).min()
+        let from = self.cell(self.slot, 0);
+        if from.load(Ordering::SeqCst) != 0 {
+            if let Some((lowest, _)) = pins.iter().find(|(_, reading)| reading.cell.is_none()) {
+                from.store(*lowest + 1, Ordering::SeqCst);
+            } else {
+                from.store(0, Ordering::SeqCst);
+                said.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Whether the process a slot is of is gone: nobody holds the slot's file.
@@ -805,11 +1119,11 @@ impl Space {
         gone
     }
 
-    /// Clear the pins of processes that are gone.
+    /// Clear what the readers of processes that are gone say.
     fn clear_gone(&self) {
         for slot in 0..READERS {
             if self.atom(at::READERS + slot * 8).load(Ordering::SeqCst) != 0 && self.gone(slot) {
-                self.atom(at::READERS + slot * 8).store(0, Ordering::SeqCst);
+                self.reads_nowhere(slot);
             }
         }
     }
@@ -838,7 +1152,7 @@ impl Space {
         match from {
             Ok(from) => {
                 let commit = Commit { generation: from.generation + 1, ..from };
-                Ok(Txn { space: self, writing, from, commit, own: HashSet::new(), let_go: Vec::new(), spare: Vec::new(), touched: false, done: false })
+                Ok(Txn { space: self, writing, from, commit, own: HashSet::new(), let_go: Vec::new(), spare: Vec::new(), looked: false, touched: false, done: false })
             }
             Err(e) => {
                 self.unlock_writer();
@@ -903,7 +1217,15 @@ impl Space {
             }
         }
         let clean = dir.join("clean");
-        std::fs::write(&clean, said_clean(held.from.generation, self.free()))?;
+        // SAFETY: the lists' header, whole; nobody writes it but who has the writer's lock, held here.
+        let header = unsafe { std::slice::from_raw_parts(self.lists(), LISTS) }.to_vec();
+        let lists = lists_sum(&header, &mut |name, number| {
+            let list = if name == self.free.name { &self.free } else { &self.held };
+            // SAFETY: a piece, whole, read under the writer's lock.
+            self.piece(list, number).ok().map(|piece| unsafe { std::slice::from_raw_parts(piece, PIECE) }.to_vec())
+        });
+        let lists = lists.ok_or_else(|| io::Error::other("the lists of the shared space's pages cannot be read"))?;
+        std::fs::write(&clean, said_clean(held.from.generation, lists))?;
         std::fs::OpenOptions::new().read(true).write(true).open(&clean)?.sync_all()?;
         if cfg!(unix) {
             File::open(dir)?.sync_all()?;
@@ -933,14 +1255,15 @@ impl Space {
     }
 
     /// How much of it is in use: its generation, how many pages were ever written, how many of those are listed
-    /// free.
+    /// free, and how many of these held for readers.
     ///
     /// # Errors
     /// As `write`.
     pub fn usage(&self) -> Result<Usage> {
         let held = self.write()?;
-        let free = number_at(self.free(), 0);
-        Ok(Usage { generation: held.from.generation, pages: held.from.high.saturating_sub(1), free })
+        let held_back = self.list(listed::HELD).load(Ordering::Acquire);
+        let free = self.list(listed::FREE).load(Ordering::Acquire) + held_back;
+        Ok(Usage { generation: held.from.generation, pages: held.from.high.saturating_sub(1), free, held: held_back })
     }
 }
 
@@ -950,8 +1273,10 @@ pub struct Usage {
     pub generation: u64,
     /// The pages ever written.
     pub pages: u64,
-    /// Those of them listed free.
+    /// Those of them no commit reaches any more: free to be taken again, or held.
     pub free: u64,
+    /// Those of the free ones held: reached by a reader still, when last judged.
+    pub held: u64,
 }
 
 /// Pages, read: what a tree is read through, by a reader at its generation or by the writer among its own.
@@ -1089,10 +1414,12 @@ pub struct Txn<'a> {
     commit: Commit,
     /// The pages this transaction made, by number: written where they are.
     own: HashSet<u64>,
-    /// The pages it reaches no more, free once it is committed and no reader is before it.
+    /// The pages it reaches no more, free once it is committed and no reader can reach them.
     let_go: Vec<u64>,
     /// Pages it made and reaches no more: the first it takes again, and free at once when it ends.
     spare: Vec<u64>,
+    /// Whether it looked, for want of a free page, whether those held are reached still.
+    looked: bool,
     /// Whether it said, on disk, that the space is no longer as it was had there.
     touched: bool,
     done: bool,
@@ -1151,13 +1478,12 @@ impl Txn<'_> {
     /// No room can be made for it, or the space is damaged.
     pub fn make(&mut self, kind: u8) -> Result<u64> {
         self.touch()?;
-        // One freed before every reader there is, where there is one; else one never written - never 0, which no
-        // pointer leads to.
+        // One that is free, where there is one; else one never written - never 0, which no pointer leads to.
         let number = match self.spare.pop().or_else(|| self.take_free()) {
             Some(number) => number,
             None => self.commit.high.max(1),
         };
-        // SAFETY: a page nobody reaches: freed before every reader, or never written.
+        // SAFETY: a page nobody reaches: free, or never written.
         let page = unsafe { std::slice::from_raw_parts_mut(self.space.page_at(number, true)?, PAGE) };
         self.commit.high = self.commit.high.max(number + 1);
         page.fill(0);
@@ -1169,61 +1495,146 @@ impl Txn<'_> {
         Ok(pointer(number, self.commit.generation))
     }
 
-    fn free_entry(list: &[u8], i: usize) -> (u64, u64) {
-        (number_at(list, 8 + i * 16), number_at(list, 16 + i * 16))
-    }
-
-    fn free_count(list: &[u8]) -> usize {
-        usize::try_from(number_at(list, 0)).unwrap_or(0).min((FREE - 8) / 16)
-    }
-
-    /// Take a page from the free list: one freed by a commit no reader is before. Its entry goes first - the count
-    /// said one less, then the last entry put in its place - so that a death between leaves a page unlisted, never
-    /// one listed twice.
+    /// Take a free page: the last listed, said one fewer before it is anyone's - a writer stopped between leaves
+    /// it listed no more. Where none is free and some are held, those are looked through once, for what the
+    /// readers that are gone since no longer reach.
     fn take_free(&mut self) -> Option<u64> {
-        let count = Txn::free_count(self.space.free());
-        if count == 0 {
-            return None;
+        let space = self.space;
+        loop {
+            let count = space.list(listed::FREE).load(Ordering::Acquire);
+            if count > 0 {
+                let number = space.entry(&space.free, count - 1).ok()?[0].load(Ordering::Acquire);
+                space.list(listed::FREE).store(count - 1, Ordering::Release);
+                space.fault("free: one fewer said");
+                // No page is 0: an entry that says so is none.
+                if number != 0 {
+                    return Some(number);
+                }
+                continue;
+            }
+            if self.looked || space.list(listed::HELD).load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            self.looked = true;
+            if self.writing.is_none_or(|probed| probed.elapsed() >= PROBE) {
+                // Readers hold every one back: those whose processes are gone, no longer.
+                *self.writing = Some(Instant::now());
+                space.clear_gone();
+            }
+            self.settled();
         }
-        // Looked for from the end: what was freed last is what a writer that frees and makes in turn takes first.
-        let takeable = |space: &Space| {
-            let oldest = space.oldest_reader();
-            let list = space.free();
-            (0..count).rev().take(256).find(|i| oldest.is_none_or(|oldest| oldest >= Txn::free_entry(list, *i).1))
-        };
-        let mut at = takeable(self.space);
-        if at.is_none() && self.writing.is_none_or(|probed| probed.elapsed() >= PROBE) {
-            // Readers hold every one back: those whose processes are gone, no longer.
-            *self.writing = Some(Instant::now());
-            self.space.clear_gone();
-            at = takeable(self.space);
-        }
-        let at = at?;
-        let list = self.space.free();
-        let (number, _) = Txn::free_entry(list, at);
-        let (moved, freed) = Txn::free_entry(list, count - 1);
-        list[..8].copy_from_slice(&((count - 1) as u64).to_le_bytes());
-        self.space.fault("free: one fewer said");
-        if at != count - 1 {
-            list[8 + at * 16..16 + at * 16].copy_from_slice(&moved.to_le_bytes());
-            list[16 + at * 16..24 + at * 16].copy_from_slice(&freed.to_le_bytes());
-        }
-        // No page is 0: an entry that says so is none.
-        (number != 0).then_some(number)
     }
 
-    /// List a page free, by the generation whose commit freed it (0: never reached by anyone). The entry is written
-    /// before the count says it is there. Past what the list holds, the page is not listed.
-    fn list_free(&mut self, number: u64, generation: u64) {
-        let list = self.space.free();
-        let count = Txn::free_count(list);
-        if count >= (FREE - 8) / 16 {
-            return;
+    /// The readers there are now, with the held pages brought to them: those none of them reaches any more are
+    /// free. Where that fails, the held ones are left to be looked through whole.
+    fn settled(&mut self) -> Readers {
+        let now = self.space.readers();
+        if self.settle(&now).is_err() {
+            self.space.list(listed::TORN).store(1, Ordering::Release);
         }
-        list[8 + count * 16..16 + count * 16].copy_from_slice(&number.to_le_bytes());
-        list[16 + count * 16..24 + count * 16].copy_from_slice(&generation.to_le_bytes());
-        self.space.fault("free: an entry written");
-        list[..8].copy_from_slice(&((count + 1) as u64).to_le_bytes());
+        now
+    }
+
+    /// Bring the held pages to the readers there are now. They were judged by those there were when it was last
+    /// done (`seen`), and none came to be reached since - a reader begins at the current commit, which reaches
+    /// nothing that was freed. So they are looked through only where a reader of then is gone: from the first
+    /// freed after the lowest generation that one read at, the ones before it being held by readers before it.
+    fn settle(&mut self, now: &Readers) -> io::Result<()> {
+        let space = self.space;
+        let held = space.list(listed::HELD).load(Ordering::Acquire);
+        let seen = (space.list(listed::TORN).load(Ordering::Acquire) == 0).then(|| space.seen());
+        let mut looked = false;
+        if held != 0 {
+            let from = match &seen {
+                None => Some(0),
+                Some(seen) => match seen.left(now) {
+                    Some(gone) => Some(self.held_after(gone, held)?),
+                    None => None,
+                },
+            };
+            if let Some(from) = from {
+                self.look_through(from, held, now)?;
+                looked = true;
+            }
+        }
+        if looked || seen.as_ref() != Some(now) {
+            space.see(now);
+        }
+        Ok(())
+    }
+
+    /// The place of the first held page freed after a generation: they are in the order they were freed.
+    fn held_after(&self, generation: u64, held: u64) -> io::Result<u64> {
+        let (mut low, mut high) = (0, held);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.space.entry(&self.space.held, middle)?[2].load(Ordering::Acquire) <= generation {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    /// Look through the held pages from a place on: one no reader reaches any more is free, the others move up
+    /// to where those were, in their order. Each is taken out of where it is before it is anywhere else, so that
+    /// a writer stopped between leaves it listed no more, never twice - and the list said torn until it is whole
+    /// again, since stopped here it is not in its order.
+    fn look_through(&mut self, from: u64, held: u64, now: &Readers) -> io::Result<()> {
+        let space = self.space;
+        space.list(listed::TORN).store(1, Ordering::Release);
+        let mut kept = from;
+        for at in from..held {
+            let entry = space.entry(&space.held, at)?;
+            let number = entry[0].load(Ordering::Acquire);
+            if number == 0 {
+                continue;
+            }
+            let (written, freed) = (entry[1].load(Ordering::Acquire), entry[2].load(Ordering::Acquire));
+            let reached = now.reach(written, freed);
+            if reached && at == kept {
+                kept += 1;
+                continue;
+            }
+            entry[0].store(0, Ordering::Release);
+            space.fault("free: one held taken out");
+            if reached {
+                let to = space.entry(&space.held, kept)?;
+                to[1].store(written, Ordering::Release);
+                to[2].store(freed, Ordering::Release);
+                to[0].store(number, Ordering::Release);
+                kept += 1;
+            } else {
+                self.list_free(number)?;
+            }
+        }
+        space.list(listed::HELD).store(kept, Ordering::Release);
+        Ok(())
+    }
+
+    /// List a page free. The entry is written before the count says it is there.
+    fn list_free(&mut self, number: u64) -> io::Result<()> {
+        let space = self.space;
+        let count = space.list(listed::FREE).load(Ordering::Acquire);
+        space.entry(&space.free, count)?[0].store(number, Ordering::Release);
+        space.fault("free: an entry written");
+        space.list(listed::FREE).store(count + 1, Ordering::Release);
+        Ok(())
+    }
+
+    /// List a page held, after those freed before it: by the generation that wrote it and the one whose commit
+    /// let go of it. The entry is written before the count says it is there.
+    fn list_held(&mut self, number: u64, written: u64, freed: u64) -> io::Result<()> {
+        let space = self.space;
+        let count = space.list(listed::HELD).load(Ordering::Acquire);
+        let entry = space.entry(&space.held, count)?;
+        entry[1].store(written, Ordering::Release);
+        entry[2].store(freed, Ordering::Release);
+        entry[0].store(number, Ordering::Release);
+        space.fault("free: one held");
+        space.list(listed::HELD).store(count + 1, Ordering::Release);
+        Ok(())
     }
 
     /// A page to write: the one pointed to where it is this transaction's own, else a copy of it that is - the one
@@ -1284,12 +1695,31 @@ impl Txn<'_> {
         self.space.fault("commit: its page written");
         self.space.publish(&commit);
         self.space.fault("commit: published");
-        // What it reaches no more is free once no reader is before this commit.
+        // What it reaches no more is free where no reader can reach it: none reads at a generation from the one
+        // that wrote the page on, before this one. Judged by the readers there are once this is published - one
+        // that says itself after reads this commit, or finds it is no longer at the current one. A page that
+        // cannot be listed - no room for the list - is listed no more.
+        let now = self.settled();
+        let any = now.from.is_some() || !now.at.is_empty();
         for page in std::mem::take(&mut self.let_go) {
-            self.list_free(page, commit.generation);
+            let written = if any {
+                // SAFETY: the head of a page this transaction reached, which nobody writes.
+                let Ok(head) = self.space.page_at(page, false).map(|at| unsafe { std::slice::from_raw_parts(at, PAGE_HEAD) }) else {
+                    continue;
+                };
+                number_at(head, 8)
+            } else {
+                0
+            };
+            let _ = if now.reach(written, commit.generation) {
+                self.list_held(page, written, commit.generation)
+            } else {
+                self.list_free(page)
+            };
         }
+        // What it made and reaches no more was never reached by anyone.
         for page in std::mem::take(&mut self.spare) {
-            self.list_free(page, 0);
+            let _ = self.list_free(page);
         }
         self.space.fresh.store(false, Ordering::Release);
         self.done = true;
@@ -1305,7 +1735,7 @@ impl Drop for Txn<'_> {
             let high = self.from.high;
             let made: Vec<u64> = self.own.drain().chain(self.spare.drain(..)).filter(|page| *page < high).collect();
             for page in made {
-                self.list_free(page, 0);
+                let _ = self.list_free(page);
             }
         }
         self.space.unlock_writer();

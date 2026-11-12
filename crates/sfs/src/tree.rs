@@ -182,6 +182,38 @@ fn long(pages: &impl Pages, len: u32, mut at: u64) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Every page a tree reaches, by number: what a test holds the lists of free pages against.
+#[cfg(test)]
+pub(crate) fn reached(pages: &impl Pages, tree: usize, into: &mut Vec<u64>) -> Result<()> {
+    fn under(pages: &impl Pages, at: u64, into: &mut Vec<u64>) -> Result<()> {
+        into.push(at & 0xFFFF_FFFF);
+        let page = pages.page_either(at, LEAF, BRANCH)?;
+        if page[0] == BRANCH {
+            under(pages, u64_at(page, PAGE_HEAD + 4), into)?;
+            for i in 0..count(page) {
+                under(pages, branch_cell(page, i).ok_or_else(|| torn(pages, page))?.1, into)?;
+            }
+            return Ok(());
+        }
+        for i in 0..count(page) {
+            if let Value::Long { len, mut first } = leaf_cell(page, i).ok_or_else(|| torn(pages, page))?.1 {
+                let mut left = usize::try_from(len).unwrap_or(0);
+                while left > 0 {
+                    into.push(first & 0xFFFF_FFFF);
+                    let more = pages.page(first, MORE)?;
+                    left = left.saturating_sub(usize::try_from(u32_at(more, PAGE_HEAD + 8)).unwrap_or(usize::MAX).max(1));
+                    first = u64_at(more, PAGE_HEAD);
+                }
+            }
+        }
+        Ok(())
+    }
+    match pages.root(tree) {
+        0 => Ok(()),
+        root => under(pages, root, into),
+    }
+}
+
 /// The value of a key in a tree of the space; none where the tree has no such key.
 ///
 /// # Errors

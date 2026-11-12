@@ -29,6 +29,9 @@ pub use sfs::Stored;
 
 /// How long what was written may wait to be had on disk, while more is written.
 const EVERY: Duration = Duration::from_secs(5);
+/// How long a view of the shared structures is held before it is said: it keeps the pages of the commit it reads
+/// from being taken again, which one that was forgotten does for as long as its process runs.
+const HELD_LONG: Duration = Duration::from_secs(600);
 
 /// The log's folder, in the project's.
 fn log_dir(root: &Path) -> PathBuf {
@@ -258,6 +261,24 @@ impl Shared {
         self.space.get_or_init(attach).as_ref()
     }
 
+    /// Say, once, the view of the shared structures this process has held longest, where that is long: the commit
+    /// it reads at, which was last said.
+    fn say_held_long(&self, said: &mut Option<u64>) {
+        let Some(space) = self.space.get().and_then(Option::as_ref) else { return };
+        if let Some((commit, held)) = space.reading_longest()
+            && held >= HELD_LONG
+            && *said != Some(commit)
+        {
+            eprintln!(
+                "{}: a view of the project's shared structures has been held for {} minutes, at commit {commit}: the pages \
+                 that commit reaches are kept for it",
+                self.root.display(),
+                held.as_secs() / 60
+            );
+            *said = Some(commit);
+        }
+    }
+
     /// Have on disk what was written by now, and say from where the log is still needed: where the first set
     /// began that was said since - its files are not in what was taken - or for nothing.
     fn checkpoint(&self) {
@@ -409,6 +430,7 @@ impl Shared {
     fn run(&self) {
         // When what was written is next had on disk: every few seconds, however much is written behind meanwhile.
         let mut due = std::time::Instant::now() + EVERY;
+        let mut said_held = None;
         loop {
             self.write_behind();
             let (stopping, checkpoint) = {
@@ -437,6 +459,7 @@ impl Shared {
             }
             self.write_behind();
             due = std::time::Instant::now() + EVERY;
+            self.say_held_long(&mut said_held);
             let waits = !self.lock().unsynced.is_empty() || self.log.header().storage().is_some();
             if waits {
                 self.checkpoint();
