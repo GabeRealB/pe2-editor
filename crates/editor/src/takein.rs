@@ -967,7 +967,12 @@ impl Worker {
         }
         // What the job freed, given back: the worker's threads each keep what they freed otherwise.
         project::give_back_memory();
-        let shown = Arc::new(self.core.index.clone());
+        // Its maps as copies of their own, made here for those that changed: the worker's index goes on changing
+        // in place whatever holds this one.
+        let shown = {
+            let _span = tracing::info_span!("take-in worker: the index handed over").entered();
+            Arc::new(self.core.index.hand_over())
+        };
         self.shown = Some(shown.clone());
         let reading = Reading { project: self.project_shown.clone(), index: shown.clone(), extensions: self.extensions.clone() };
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(reading);

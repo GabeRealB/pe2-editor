@@ -264,7 +264,7 @@ impl Imports {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What the project defines, for the stacks laying it in.
-        let defined = tracing::info_span!("attach: definitions taken").in_scope(|| extensions.take_definitions(index));
+        let defined = definitions(index, extensions, only);
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
         tracing::info_span!("attach: earlier imports forgotten").in_scope(|| forget_imports(index, &of));
         let engine = self.engine(extensions);
@@ -376,7 +376,9 @@ impl Imports {
         });
         for ((path, _, import), resolved) in found.into_iter().zip(resolved) {
             let Some((layer, resolved)) = resolved else { continue };
-            let Some(asset) = Arc::make_mut(&mut index.assets).get_mut(&path).map(Arc::make_mut) else { continue };
+            let Some(asset) = crate::index::Shared::make_mut(&mut index.assets).get_mut(&path).map(Arc::make_mut) else {
+                continue;
+            };
             asset.files.retain(|f| !import.files.iter().any(|(name, _)| *name == f.name));
             for (name, blob) in &import.files {
                 asset.files.push(BundleFile {
@@ -415,7 +417,19 @@ impl Imports {
             *known = listed_kept(&self.listed_at, &builds);
         }
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
-        let targets: Vec<_> = index.referenced_by.iter().collect();
+        // Of the assets attached: those referred to, and those they refer to.
+        let targets: Vec<_> = match only {
+            None => index.referenced_by.iter().collect(),
+            Some(only) => {
+                let mut around: BTreeSet<String> = only.clone();
+                for reference in only.iter().flat_map(|path| index.references_from(path)) {
+                    // Named by its uid, or by its path where that names nothing.
+                    around.extend(index.by_uid.get(&reference.uid).cloned());
+                    around.insert(reference.target);
+                }
+                around.iter().filter_map(|target| index.referenced_by.get_key_value(target)).collect()
+            }
+        };
         // Each by itself, listed where its settings changed.
         let held = &*known;
         let listed = crate::parallel(&targets, |(target, references)| {
@@ -478,14 +492,16 @@ impl Imports {
         reach: graph::exec::Reach<'_>,
         held: &HashMap<String, (Reads, Arc<Known>)>,
     ) -> Look {
-        let (plan, wrong) = extensions.plan(asset);
+        let (plan, wrong) = tracing::info_span!("look: the plan made").in_scope(|| extensions.plan(asset));
         let Some((importer, output)) = import_output(&plan, extensions) else { return Look { wrong, import: None } };
-        let key = reach.engine.key(&plan, asset, output, None);
+        let key = tracing::info_span!("look: its key").in_scope(|| reach.engine.key(&plan, asset, output, None));
         if let Some((_, import)) = held.get(&key).filter(|(reads, _)| reads.hold(asset, Some(reach))) {
             return Look { wrong, import: Some((key, Import::Held(import.clone()))) };
         }
-        let kept = reach.engine.kept_in(Some(reach), &plan, asset, output, None);
-        let kept = kept.and_then(|trace| Some((self.store.describe(&trace.value)?, trace)));
+        let kept = tracing::info_span!("look: found kept, its trace held to what it read")
+            .in_scope(|| reach.engine.kept_in(Some(reach), &plan, asset, output, None));
+        let kept = tracing::info_span!("look: what was kept read")
+            .in_scope(|| kept.and_then(|trace| Some((self.store.describe(&trace.value)?, trace))));
         let import = match kept {
             Some((kept, trace)) => match known_of(extensions, importer, kept, trace.reads) {
                 Ok((reads, import)) => Import::Kept(reads, import),
@@ -552,6 +568,16 @@ impl Imports {
     }
 }
 
+/// What the project defines taken from its index (`Extensions::take_definitions`), and what is wrong with it:
+/// taken again where an asset that defines - or did - is among those that changed, and left as it was taken
+/// otherwise, nothing of the project looked through for it.
+fn definitions(index: &Index, extensions: &Extensions, only: Option<&BTreeSet<String>>) -> Vec<Problem> {
+    if only.is_some_and(|only| !extensions.definitions_among(index, only)) {
+        return Vec::new();
+    }
+    tracing::info_span!("attach: definitions taken").in_scope(|| extensions.take_definitions(index))
+}
+
 /// What earlier imports made of the assets `of` takes, gone. Copied where shared with a snapshot, and only where
 /// something goes.
 fn forget_imports(index: &mut Index, of: &dyn Fn(&str) -> bool) {
@@ -561,7 +587,7 @@ fn forget_imports(index: &mut Index, of: &dyn Fn(&str) -> bool) {
     if going.is_empty() {
         return;
     }
-    let assets = Arc::make_mut(&mut index.assets);
+    let assets = crate::index::Shared::make_mut(&mut index.assets);
     for path in going {
         if let Some(asset) = assets.get_mut(&path) {
             let asset = Arc::make_mut(asset);

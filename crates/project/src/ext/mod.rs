@@ -391,6 +391,9 @@ pub struct Extensions {
     graph_ops: std::sync::OnceLock<graph::Ops>,
     /// What the open project defines: its operations and templates, by uid (`take_definitions`).
     definitions: RwLock<Arc<graph::Definitions>>,
+    /// The assets that defined an operation or a template when the project's definitions were last taken, by
+    /// path: one of them changing, or going, has them taken again.
+    defined_at: RwLock<std::collections::BTreeSet<String>>,
     project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
     /// The store outputs asked for in passing read and keep: the open project's, as these outlive it (`extensions::loaded`).
     store: std::sync::RwLock<Option<graph::store::Store>>,
@@ -1906,6 +1909,9 @@ impl Extensions {
     pub fn take_definitions(&self, index: &index::Index) -> Vec<index::Problem> {
         let mut problems = Vec::new();
         let mut definitions = graph::Definitions::new();
+        let defining = [graph::DEFINED, graph::DEFINED_TEMPLATE].into_iter().flat_map(|defined| self.find(index, defined));
+        let defined_at: std::collections::BTreeSet<String> = defining.map(|asset| asset.path.clone()).collect();
+        *self.defined_at.write().unwrap_or_else(std::sync::PoisonError::into_inner) = defined_at;
         for asset in self.find(index, graph::DEFINED) {
             let Some(uid) = asset.uid.clone() else { continue };
             let version = graph::exec::Node::declaration_sha1(asset);
@@ -1937,6 +1943,20 @@ impl Extensions {
         drop(held);
         *self.project_templates.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(templates);
         problems
+    }
+
+    /// Whether what the project defines may be otherwise after these assets changed: one of them defined
+    /// something when the definitions were last taken, or is of a type that defines. Where none did or is, they
+    /// stand as taken, and nothing of the project is looked through for them.
+    #[must_use]
+    pub fn definitions_among(&self, index: &index::Index, changed: &std::collections::BTreeSet<String>) -> bool {
+        let defining: Vec<&str> = [graph::DEFINED, graph::DEFINED_TEMPLATE]
+            .into_iter()
+            .filter_map(|defined| self.node_type_named(defined).map(|(of, _)| of.name.as_str()))
+            .collect();
+        let defines = |asset: &index::Asset| self.node_types_of(asset).iter().any(|of| defining.contains(&of.name.as_str()));
+        let defined_at = self.defined_at.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        changed.iter().any(|path| defined_at.contains(path) || index.assets.get(path).is_some_and(|asset| defines(asset)))
     }
 
     /// An operation the project defines, by its uid (`uid://...`).

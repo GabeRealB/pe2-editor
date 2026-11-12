@@ -549,6 +549,8 @@ pub struct Opened {
     /// The label of an edit a crash left half done, rolled back.
     pub recovered: Option<String>,
     index: Index,
+    /// The index as the window shows it from the start.
+    shown: Arc<Index>,
     store: project::graph::store::Store,
     extensions: Arc<Extensions>,
     extensions_found: Vec<extensions::Found>,
@@ -788,6 +790,10 @@ impl Workspace {
         let imports = project::imports::Imports::open(&cache)?;
         report("Building the tree", 0, 0);
         let tree = Arc::new(Node::build(&index, &extensions));
+        // What the window shows from the start: a snapshot with maps of its own, so that the worker changes its
+        // index in place from its first change on.
+        let mut index = index;
+        let shown = Arc::new(index.hand_over());
         Ok(Opened {
             project,
             lock,
@@ -795,6 +801,7 @@ impl Workspace {
             history,
             recovered,
             index,
+            shown,
             store,
             extensions,
             extensions_found,
@@ -819,6 +826,7 @@ impl Workspace {
             cache,
             history,
             index,
+            shown,
             store,
             extensions,
             extensions_found,
@@ -839,8 +847,7 @@ impl Workspace {
         };
         let thumbs = crate::thumbs::Thumbs::start(extensions.clone(), store.clone());
         let layers = index.layers();
-        // The worker takes the index from here; the UI shows a snapshot of it.
-        let shown = Arc::new(index.clone());
+        // The worker takes the index from here; the UI shows a snapshot of it, made as the project was opened.
         let pictures = crate::pictures::Pictures::start(shown.clone(), extensions.clone());
         let outputs = project::ext::requests::Requests::start(shown.clone());
         outputs.set_extensions(&extensions);
@@ -1579,6 +1586,12 @@ impl Workspace {
     /// Changes other programs made, not taken in yet.
     pub fn pending_changes(&self) -> usize {
         self.pending().len()
+    }
+
+    /// The changes other programs made that wait to be taken in.
+    #[cfg(test)]
+    pub fn pending_paths(&self) -> Vec<PathBuf> {
+        self.pending().iter().cloned().collect()
     }
 
     /// A take-in is running.

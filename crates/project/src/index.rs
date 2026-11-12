@@ -506,6 +506,68 @@ impl Problem {
     }
 }
 
+/// A map of the index: changed in place by whoever has the index, and handed to the snapshots made of it as a
+/// copy of its own (`hand_over`) - made when one is handed over after a change, not when the change is made, and
+/// handed again as it is for as long as nothing changes. So changing the index costs what the change does,
+/// whatever holds a snapshot of it; and a snapshot is never changed under whoever reads it. Cloned, it is shared
+/// as it is, and copied where one of the two is changed (`make_mut`), as an `Arc` is.
+#[derive(Debug)]
+pub struct Shared<T> {
+    now: Arc<T>,
+    /// What was last handed over, where nothing changed since.
+    handed: Option<Arc<T>>,
+}
+
+impl<T> Shared<T> {
+    #[must_use]
+    pub fn new(of: T) -> Shared<T> {
+        Shared { now: Arc::new(of), handed: None }
+    }
+
+    /// Whether two are one map, shared.
+    #[must_use]
+    pub fn same(this: &Shared<T>, other: &Shared<T>) -> bool {
+        Arc::ptr_eq(&this.now, &other.now)
+    }
+}
+
+impl<T: Clone> Shared<T> {
+    /// The map, to change in place: copied first where it is shared as it is (`clone`), never for what was
+    /// handed over.
+    pub fn make_mut(this: &mut Shared<T>) -> &mut T {
+        this.handed = None;
+        Arc::make_mut(&mut this.now)
+    }
+
+    /// The map as it is now, for a snapshot: a copy of its own, made here where it changed since the last was
+    /// handed over.
+    #[must_use]
+    pub fn hand_over(&mut self) -> Shared<T> {
+        let handed = self.handed.get_or_insert_with(|| Arc::new(T::clone(&self.now))).clone();
+        Shared { now: handed, handed: None }
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared { now: self.now.clone(), handed: None }
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Shared::new(T::default())
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.now
+    }
+}
+
 /// What a refresh changed: the assets whose index entry changed (added, changed or gone), and whether `project.toml`
 /// changed - the layers themselves may have, which a refresh does not follow: the project is read again.
 #[derive(Debug, Default)]
@@ -1334,19 +1396,19 @@ pub type Report<'a> = dyn Fn(&str, usize, usize) + 'a;
 pub struct Index {
     /// The resolved assets, by path: shared with the snapshots made of the index, copied where changed.
     /// Shared with the snapshots made of the index, copied where one is changed while they hold it.
-    pub assets: Arc<BTreeMap<String, Arc<Asset>>>,
+    pub assets: Shared<BTreeMap<String, Arc<Asset>>>,
     /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
     /// nodes of their own, read through the graph's `below` operation - made when first asked for (`version`),
     /// of the stack as it is then, and let go of whenever an asset is assembled again.
     versions: Arc<OnceLock<HashMap<String, Arc<Asset>>>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
-    pub entries: Arc<BTreeMap<String, Entry>>,
+    pub entries: Shared<BTreeMap<String, Entry>>,
     /// How many files the last opening or refresh read, rather than took from what it knew.
     pub read: usize,
-    pub by_uid: Arc<HashMap<String, String>>,
+    pub by_uid: Shared<HashMap<String, String>>,
     /// For each asset, the references naming it.
-    pub referenced_by: Arc<HashMap<String, Vec<Reference>>>,
+    pub referenced_by: Shared<HashMap<String, Vec<Reference>>>,
     /// References whose uid or path names no asset of the project.
     pub dangling: Vec<Reference>,
     pub problems: Vec<Problem>,
@@ -1354,7 +1416,7 @@ pub struct Index {
     properties: Vec<Problem>,
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
-    records: Arc<HashMap<PathBuf, Arc<Record>>>,
+    records: Shared<HashMap<PathBuf, Arc<Record>>>,
     /// What its opening read that differs from what it opened over, of the project's model: for whoever holds the
     /// project to say there (`take_opened`, `model::took`).
     opened: crate::model::Delta,
@@ -1369,31 +1431,31 @@ pub struct Index {
     stack_said: Arc<[Vec<u8>; 3]>,
     /// Whether its opening took the stack as the model had it, where it applied none.
     stack_taken: bool,
-    resolved: Arc<BTreeMap<String, Node>>,
+    resolved: Shared<BTreeMap<String, Node>>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
-    full: Arc<BTreeMap<String, Node>>,
+    full: Shared<BTreeMap<String, Node>>,
     /// The layers left out of the view (the editor's eyes); problems and statuses are the full stack's.
     hidden: HashSet<usize>,
     ops: Vec<BTreeMap<String, (OpStatus, Option<String>)>>,
     dependencies: Vec<BTreeMap<usize, (usize, usize)>>,
     /// The content hash of each entry a writable layer holds, as of the last pass: what tells a move made outside
     /// the editor from a deletion and a new entry.
-    hashes: Arc<Vec<HashMap<String, String>>>,
+    hashes: Shared<Vec<HashMap<String, String>>>,
     /// The resolved path of each entry by where its winning content is (a layer and its path there): what a change
     /// of a layer's content touches.
-    winning: Arc<HashMap<(usize, String), String>>,
+    winning: Shared<HashMap<(usize, String), String>>,
     /// The files the overrides' merges read (every node's `inputs`), as the stack was last applied: a change to
     /// one merges again. An entry a layer makes by itself reads none, so applying the stack for such alone
     /// (`restack_entries`) leaves it as it is.
-    merge_inputs: Arc<HashSet<PathBuf>>,
+    merge_inputs: Shared<HashSet<PathBuf>>,
     /// Where each entry is, by its uid: its real path.
-    placed: Arc<HashMap<String, String>>,
+    placed: Shared<HashMap<String, String>>,
     /// How many references name each uid, whatever they resolve to: a uid none names can come or go without any
     /// other asset's links changing.
-    named: Arc<HashMap<String, usize>>,
+    named: Shared<HashMap<String, usize>>,
     /// The working copies of assets with unsaved changes, by uid: shown in place of their files on disk.
-    working: Arc<HashMap<String, Working>>,
+    working: Shared<HashMap<String, Working>>,
     /// What the layers below each layer resolve (`below_layer`), as asked since the stack was last applied: made anew,
     /// not cleared, as the stack is applied, so a snapshot keeps what was so of it.
     beneath: Arc<Mutex<HashMap<usize, Arc<Beneath>>>>,
@@ -1404,6 +1466,61 @@ pub struct Index {
 }
 
 impl Index {
+    /// The index as it is now, for a snapshot: its maps handed over as copies of their own (`Shared::hand_over`),
+    /// so that this one goes on changing them in place whatever holds the snapshot. What a copy costs is paid
+    /// here, for the maps that changed since the last was handed over.
+    #[must_use]
+    pub fn hand_over(&mut self) -> Index {
+        // What is resolved is the whole stack where nothing is hidden: one map, handed over once.
+        let one = Shared::same(&self.resolved, &self.full);
+        let full = self.full.hand_over();
+        let resolved = if one { full.clone() } else { self.resolved.hand_over() };
+        let assets = self.assets.hand_over();
+        let entries = self.entries.hand_over();
+        let by_uid = self.by_uid.hand_over();
+        let referenced_by = self.referenced_by.hand_over();
+        let records = self.records.hand_over();
+        let hashes = self.hashes.hand_over();
+        let winning = self.winning.hand_over();
+        let merge_inputs = self.merge_inputs.hand_over();
+        let placed = self.placed.hand_over();
+        let named = self.named.hand_over();
+        let working = self.working.hand_over();
+        Index {
+            assets,
+            entries,
+            by_uid,
+            referenced_by,
+            records,
+            resolved,
+            full,
+            hashes,
+            winning,
+            merge_inputs,
+            placed,
+            named,
+            working,
+            versions: self.versions.clone(),
+            read: self.read,
+            dangling: self.dangling.clone(),
+            problems: self.problems.clone(),
+            properties: self.properties.clone(),
+            layers: self.layers.clone(),
+            opened: crate::model::Delta::default(),
+            root: self.root.clone(),
+            stack_problems: self.stack_problems.clone(),
+            made_of: self.made_of.clone(),
+            stack_said: self.stack_said.clone(),
+            stack_taken: self.stack_taken,
+            hidden: self.hidden.clone(),
+            ops: self.ops.clone(),
+            dependencies: self.dependencies.clone(),
+            beneath: self.beneath.clone(),
+            merged: self.merged.clone(),
+            objects: self.objects.clone(),
+        }
+    }
+
     /// Whether a layer leaves a path out (an extension's folder, a name it ignores): no asset, whatever is on disk.
     #[must_use]
     pub fn leaves_out(&self, layer: &str, path: &str) -> bool {
@@ -1589,7 +1706,7 @@ impl Index {
         let layers = self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect();
         let known = crate::model::Known { files, layers, records: self.records_known(), stack: Some(self.stack_known()) };
         let mut index = Index::over(known, true, project, report)?;
-        index.set_working(self.working.as_ref().clone());
+        index.set_working(HashMap::clone(&self.working));
         Ok(index)
     }
 
@@ -1643,12 +1760,12 @@ impl Index {
             opened.layer(&layer, None);
         }
         let mut index = Index {
-            assets: Arc::default(),
+            assets: Shared::default(),
             versions: Arc::default(),
-            entries: Arc::default(),
+            entries: Shared::default(),
             read: 0,
-            by_uid: Arc::default(),
-            referenced_by: Arc::default(),
+            by_uid: Shared::default(),
+            referenced_by: Shared::default(),
             dangling: vec![],
             problems: vec![],
             properties: project
@@ -1661,7 +1778,7 @@ impl Index {
                 })
                 .collect(),
             layers,
-            records: Arc::default(),
+            records: Shared::default(),
             merged: project.root.join(crate::cache::DIR).join("merged"),
             objects: crate::chunks::Store::at(&project.root),
             opened,
@@ -1670,18 +1787,18 @@ impl Index {
             made_of: stack_made_of(project),
             stack_said: Arc::default(),
             stack_taken: false,
-            resolved: Arc::default(),
+            resolved: Shared::default(),
             hidden: HashSet::new(),
             ops: vec![],
             dependencies: vec![],
-            hashes: Arc::default(),
-            winning: Arc::default(),
-            merge_inputs: Arc::default(),
-            placed: Arc::default(),
-            named: Arc::default(),
-            working: Arc::default(),
+            hashes: Shared::default(),
+            winning: Shared::default(),
+            merge_inputs: Shared::default(),
+            placed: Shared::default(),
+            named: Shared::default(),
+            working: Shared::default(),
             beneath: Arc::default(),
-            full: Arc::default(),
+            full: Shared::default(),
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         report("Reading the files that changed", 0, files.len());
@@ -1693,7 +1810,7 @@ impl Index {
         } else {
             let _span = tracing::info_span!("index: records taken as known").entered();
             // As known, each: only those nothing is known of are looked at, and read.
-            let records = Arc::make_mut(&mut index.records);
+            let records = Shared::make_mut(&mut index.records);
             let mut unknown = Vec::new();
             for file in &files {
                 match known.remove(file) {
@@ -2060,11 +2177,11 @@ impl Index {
         self.problems = problems;
         self.problems.extend(self.properties.iter().cloned());
         self.dependencies = dependencies;
-        self.full = Arc::new(nodes);
+        self.full = Shared::new(nodes);
         self.resolved = self.full.clone();
         self.remember_hashes();
-        self.winning = Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
-        self.merge_inputs = Arc::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
+        self.winning = Shared::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
+        self.merge_inputs = Shared::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
         true
     }
 
@@ -2198,7 +2315,7 @@ impl Index {
             files.extend(after.all_files().cloned());
         }
         for file in &gone {
-            Arc::make_mut(&mut self.records).remove(file);
+            Shared::make_mut(&mut self.records).remove(file);
         }
         let reported: HashSet<&PathBuf> = changed.iter().collect();
         let (read, vanished) = tracing::info_span!("refresh: files looked at and read").in_scope(|| self.reload(&files, &reported));
@@ -2354,13 +2471,13 @@ impl Index {
         self.beneath.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|above, _| *above <= at);
         // With every layer shown, what is resolved is the whole stack: let go of here, so that the stack is changed
         // where it is and not copied to be.
-        self.resolved = Arc::default();
+        self.resolved = Shared::default();
         {
-            let full = Arc::make_mut(&mut self.full);
-            let listed = Arc::make_mut(&mut self.entries);
-            let winning = Arc::make_mut(&mut self.winning);
-            let placed = Arc::make_mut(&mut self.placed);
-            let hashes = &mut Arc::make_mut(&mut self.hashes)[at];
+            let full = Shared::make_mut(&mut self.full);
+            let listed = Shared::make_mut(&mut self.entries);
+            let winning = Shared::make_mut(&mut self.winning);
+            let placed = Shared::make_mut(&mut self.placed);
+            let hashes = &mut Shared::make_mut(&mut self.hashes)[at];
             for (uid, path) in gone {
                 placed.remove(uid);
                 full.remove(path);
@@ -2379,7 +2496,7 @@ impl Index {
         if writable {
             for ((_, path), kind) in came.iter().zip(kinds) {
                 if let Some(hash) = self.content_hash(at, path, *kind) {
-                    Arc::make_mut(&mut self.hashes)[at].insert(path.clone(), hash);
+                    Shared::make_mut(&mut self.hashes)[at].insert(path.clone(), hash);
                 }
             }
         }
@@ -2406,7 +2523,7 @@ impl Index {
             || come.iter().any(|(_, asset)| self.dangling.iter().any(|r| r.target == *asset))
             || went.iter().any(|(_, asset)| others_refer(asset));
         {
-            let by_uid = Arc::make_mut(&mut self.by_uid);
+            let by_uid = Shared::make_mut(&mut self.by_uid);
             for (uid, asset) in &went {
                 if by_uid.get(uid) == Some(asset) {
                     by_uid.remove(uid);
@@ -2471,7 +2588,7 @@ impl Index {
                     scan.bundles.keys().map(|p| (p, Kind::Asset)).chain(scan.files.keys().map(|p| (p, Kind::File)))
                 {
                     if let Some(hash) = self.content_hash(*i, path, kind) {
-                        Arc::make_mut(&mut self.hashes)[*i].insert(path.clone(), hash);
+                        Shared::make_mut(&mut self.hashes)[*i].insert(path.clone(), hash);
                     }
                 }
             }
@@ -2523,7 +2640,7 @@ impl Index {
         for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
             let Some(size) = size else { continue };
             if let Some(record) = known(file, size, modified) {
-                Arc::make_mut(&mut self.records).insert(file.clone(), Arc::new(record));
+                Shared::make_mut(&mut self.records).insert(file.clone(), Arc::new(record));
             } else {
                 let declaration = file.file_name().is_some_and(|n| n == NODE_FILE || n == SETTINGS_FILE)
                     && file.parent().is_some_and(|d| d.to_string_lossy().ends_with(BUNDLE_SUFFIX));
@@ -2533,7 +2650,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
+                Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -2546,7 +2663,7 @@ impl Index {
         let (mut pending, mut vanished) = (Vec::new(), Vec::new());
         for (file, (size, modified)) in files.iter().zip(stat_all(files)) {
             let Some(size) = size else {
-                Arc::make_mut(&mut self.records).remove(file);
+                Shared::make_mut(&mut self.records).remove(file);
                 vanished.push(file.clone());
                 continue;
             };
@@ -2561,7 +2678,7 @@ impl Index {
         let mut read = Vec::new();
         for (file, record) in pending.iter().zip(read_all(&pending)) {
             if let Some(record) = record {
-                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
+                Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 read.push(file.path.clone());
             }
         }
@@ -2791,18 +2908,18 @@ impl Index {
         self.problems = full.problems;
         self.problems.extend(self.properties.iter().cloned());
         self.ops = full.ops;
-        self.full = Arc::new(full.resolved);
+        self.full = Shared::new(full.resolved);
         self.resolved = if self.hidden.is_empty() {
             self.full.clone()
         } else {
-            Arc::new(self.resolve_stack(&self.hidden).resolved)
+            Shared::new(self.resolve_stack(&self.hidden).resolved)
         };
         self.dependencies = tracing::info_span!("stack: dependencies").in_scope(|| self.dependencies());
         tracing::info_span!("stack: hashes").in_scope(|| self.remember_hashes());
         let _span = tracing::info_span!("stack: winning").entered();
         self.winning =
-            Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
-        self.merge_inputs = Arc::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
+            Shared::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
+        self.merge_inputs = Shared::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
         Ok(())
     }
 
@@ -3214,8 +3331,8 @@ impl Index {
             return false;
         }
         self.hidden = hidden;
-        self.resolved = Arc::new(self.resolve_stack(&self.hidden).resolved);
-        Arc::make_mut(&mut self.assets).clear();
+        self.resolved = Shared::new(self.resolve_stack(&self.hidden).resolved);
+        Shared::make_mut(&mut self.assets).clear();
         let paths: Vec<String> = self.resolved.keys().cloned().collect();
         self.assemble(&paths);
         self.link();
@@ -3246,10 +3363,10 @@ impl Index {
             .collect();
         for (file, record) in unread.iter().zip(read_all(&unread)) {
             if let Some(record) = record {
-                Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
+                Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
             }
         }
-        self.working = Arc::new(working);
+        self.working = Shared::new(working);
         if changed.is_empty() {
             return BTreeSet::new();
         }
@@ -3318,7 +3435,7 @@ impl Index {
     /// and no longer holds, as last known, until it is adopted somewhere else (`adoption`) or forgotten.
     fn remember_hashes(&mut self) {
         let before = self.hashes.clone();
-        self.hashes = Arc::new(
+        self.hashes = Shared::new(
             (0..self.layers.len())
                 .map(|i| {
                     let layer = &self.layers[i];
@@ -3507,8 +3624,8 @@ impl Index {
 
     /// The entries, from the resolved stack.
     fn assemble_entries(&mut self) {
-        self.placed = Arc::new(self.resolved.iter().map(|(path, node)| (node.uid.clone(), path.clone())).collect());
-        self.entries = Arc::new(
+        self.placed = Shared::new(self.resolved.iter().map(|(path, node)| (node.uid.clone(), path.clone())).collect());
+        self.entries = Shared::new(
             self.resolved
                 .iter()
                 .map(|(path, node)| {
@@ -3564,7 +3681,7 @@ impl Index {
             let unread: Vec<Pending> = unread.into_iter().map(|file| Pending { path: file.path.clone(), ..*file }).collect();
             for (file, record) in unread.iter().zip(read_all(&unread)) {
                 if let Some(record) = record {
-                    Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
+                    Shared::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 }
             }
         }
@@ -3578,10 +3695,10 @@ impl Index {
         let _span = tracing::info_span!("assemble: the assets kept").entered();
         for (path, asset) in paths.iter().zip(assets) {
             let Some(asset) = asset else {
-                Arc::make_mut(&mut self.assets).remove(asset_of(path));
+                Shared::make_mut(&mut self.assets).remove(asset_of(path));
                 continue;
             };
-            Arc::make_mut(&mut self.assets).insert(asset.path.clone(), Arc::new(asset));
+            Shared::make_mut(&mut self.assets).insert(asset.path.clone(), Arc::new(asset));
         }
     }
 
@@ -3699,7 +3816,7 @@ impl Index {
 
     /// Resolve the uids and the references, and add what is wrong with the assets' declarations.
     fn link(&mut self) {
-        self.by_uid = Arc::new(self.assets.values().filter_map(|a| Some((a.uid.clone()?, a.path.clone()))).collect());
+        self.by_uid = Shared::new(self.assets.values().filter_map(|a| Some((a.uid.clone()?, a.path.clone()))).collect());
         self.problems.retain(|p| !matches!(p, Problem::Unreadable { .. }));
         for asset in self.assets.values() {
             if let Some(error) = &asset.error {
@@ -3730,9 +3847,9 @@ impl Index {
                 }
             }
         }
-        self.referenced_by = Arc::new(referenced_by);
+        self.referenced_by = Shared::new(referenced_by);
         self.dangling = dangling;
-        self.named = Arc::new(named);
+        self.named = Shared::new(named);
     }
 
     /// Link again what these assets declare, which declared `before` (by asset): their unreadable declarations, and
@@ -3750,7 +3867,7 @@ impl Index {
             index.by_uid.get(&r.uid).cloned().or_else(|| index.assets.contains_key(&r.target).then(|| r.target.clone()))
         };
         for (from, references) in before.iter().filter(|(a, _)| changed.contains(a.as_str())) {
-            let named = Arc::make_mut(&mut self.named);
+            let named = Shared::make_mut(&mut self.named);
             for reference in references {
                 if let Some(count) = named.get_mut(&reference.uid) {
                     *count -= 1;
@@ -3761,7 +3878,7 @@ impl Index {
             }
             let targets: Vec<String> = references.iter().filter_map(|r| resolved(self, r)).collect();
             for target in targets {
-                let referenced_by = Arc::make_mut(&mut self.referenced_by);
+                let referenced_by = Shared::make_mut(&mut self.referenced_by);
                 if let Some(list) = referenced_by.get_mut(&target) {
                     list.retain(|r| r.from != *from);
                     if list.is_empty() {
@@ -3777,9 +3894,9 @@ impl Index {
             let mut placed: HashMap<String, usize> = HashMap::new();
             let mut dangling_at = self.dangling.partition_point(|r| r.from < *from);
             for reference in self.references_from(from) {
-                *Arc::make_mut(&mut self.named).entry(reference.uid.clone()).or_default() += 1;
+                *Shared::make_mut(&mut self.named).entry(reference.uid.clone()).or_default() += 1;
                 if let Some(target) = resolved(self, &reference) {
-                    let list = Arc::make_mut(&mut self.referenced_by).entry(target.clone()).or_default();
+                    let list = Shared::make_mut(&mut self.referenced_by).entry(target.clone()).or_default();
                     // After the references of the assets before it, then each of its own after the last.
                     let at = placed.entry(target).or_insert_with(|| list.partition_point(|r| r.from < *from));
                     list.insert(*at, reference);

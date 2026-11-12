@@ -129,3 +129,20 @@ fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
     // Written by the worker's thread, aside: there a moment after, with no frame waited for.
     editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
 }
+
+#[test]
+fn what_the_editor_wrote_is_no_change_of_another_program() {
+    let mut editor = Scenario::open(Fixture::notes_under_records());
+    let outside = editor.workspace().outside();
+    let edit = |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
+    assert!(matches!(edit(vfs::ops::Op::Folder { path: "made".into() }), mcp::Reply::Edited { .. }));
+    assert!(matches!(edit(vfs::ops::Op::Override { path: "notes".into() }), mcp::Reply::Edited { .. }));
+    // What watches the layers tells of the files those wrote, a moment after: they are the editor's own.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(900) {
+        editor.frame();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let waiting = editor.workspace().pending_paths();
+    assert!(waiting.is_empty(), "taken for another program's: {waiting:?}");
+}
