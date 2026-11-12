@@ -100,8 +100,14 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     // The last step taken back, as the History pane's undo does.
     let undone = edit(vfs::ops::Op::Undo);
     assert!(matches!(&undone, mcp::Reply::Edited { label, .. } if label.starts_with("Undid")), "{undone:?}");
-    // What needs the window is the window's.
-    assert!(outside.answer(mcp::Request::Hello).is_err());
+    // What reads the project is answered here too, against the project as those left it.
+    let call = |name: &str| mcp::Request::Call { name: name.into(), arguments: serde_json::Map::new() };
+    let listed = outside.answer(call("list_folder")).expect("answered off the window");
+    assert!(listed.told().is_ok_and(|said| said.contains("made")), "{listed:?}");
+    assert!(matches!(outside.answer(mcp::Request::Hello), Ok(mcp::Reply::Hello(_))));
+    // What the window itself shows is the window's to say.
+    assert!(outside.answer(call("editor_selection")).is_err());
+    assert!(outside.answer(call("editor_ui")).is_err());
     // The window shows all of it once it draws again.
     editor.until("the window to show it", |e| {
         let entries = &e.workspace().index.entries;

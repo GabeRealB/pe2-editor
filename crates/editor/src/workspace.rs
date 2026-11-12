@@ -830,6 +830,7 @@ impl Workspace {
             layers: layer_view.clone(),
             viewing: false,
             author: "user",
+            selected: None,
             config: None,
             holding: true,
         };
@@ -838,6 +839,7 @@ impl Workspace {
         let pending: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::default();
         let mut takein = crate::takein::TakeIn::start(crate::takein::Start {
             core,
+            shown: shown.clone(),
             history,
             showing: showing.clone(),
             pending: pending.clone(),
@@ -1492,6 +1494,7 @@ impl Workspace {
         let same = told.layers == self.layer_view
             && told.viewing == viewing
             && told.author == self.author
+            && told.selected == self.selected
             && told.config == self.config
             && told.holding == holding;
         if !same {
@@ -1499,6 +1502,7 @@ impl Workspace {
                 layers: self.layer_view.clone(),
                 viewing,
                 author: self.author,
+                selected: self.selected.clone(),
                 config: self.config.clone(),
                 holding,
             };

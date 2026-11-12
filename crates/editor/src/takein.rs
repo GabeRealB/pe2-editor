@@ -64,33 +64,82 @@ pub struct Showing {
     pub layers: LayerView,
     pub viewing: bool,
     pub author: &'static str,
+    /// The asset selected: what an extension's tool asked for by an agent works on where it names none.
+    pub selected: Option<String>,
     /// The config in use: what an event signaled with none named is for.
     pub config: Option<project::Config>,
     /// Whether the window holds events back - a plan is filling a layer: they are signaled once it has.
     pub holding: bool,
 }
 
+/// The project as the worker last handed it over, for what reads it off the worker's thread.
+#[derive(Clone)]
+pub struct Reading {
+    project: Arc<Project>,
+    index: Arc<Index>,
+    extensions: Arc<Extensions>,
+}
+
+/// The tools that read or change what the window itself shows: answered by a frame.
+const OF_THE_WINDOW: [&str; 2] = ["editor_selection", "editor_show"];
+
 /// The worker, for what is asked of the project from outside the window: on the agents' link, by its threads.
 #[derive(Clone)]
-pub struct Outside(Weak<Queue<Worker>>);
+pub struct Outside {
+    queue: Weak<Queue<Worker>>,
+    /// The project as last handed over, and what the window shows.
+    last: Arc<Mutex<Option<Reading>>>,
+    showing: Arc<Mutex<Showing>>,
+}
 
 impl Outside {
-    /// Answer what is the worker's to answer with no frame drawn for it - an edit, what is due of what programs
-    /// did through the served folder - once all asked before it is done. Anything else is given back: the
-    /// window's to answer.
+    /// Answer what needs no frame drawn for it, on the thread that asks: an edit, what is due of what programs
+    /// did through the served folder and an event signaled, by the worker, once all asked before is done; and
+    /// what reads the project - a tool, a resource - here, against the project as the worker last handed it
+    /// over, once it has taken in what was asked before. What the window itself shows or does is given back:
+    /// the window's to answer.
     ///
     /// # Errors
-    /// The request is not the worker's.
+    /// The request is the window's.
     pub fn answer(&self, request: mcp::Request) -> Result<mcp::Reply, mcp::Request> {
         let closed = || mcp::Reply::Error("the editor closed the project".into());
         match request {
+            mcp::Request::Call { ref name, .. } if request.uses_window() || OF_THE_WINDOW.contains(&name.as_str()) => {
+                Err(request)
+            }
+            mcp::Request::Call { .. } | mcp::Request::Read { .. } | mcp::Request::Tools | mcp::Request::Hello => {
+                // What the editor says of itself - what it is, what it costs - reads nothing of the project:
+                // said whatever the worker is doing.
+                let costs = matches!(&request, mcp::Request::Call { name, .. } if name == "editor_performance");
+                if !costs && !matches!(&request, mcp::Request::Hello) {
+                    // What was asked before - an edit this agent made, what other programs changed - is taken in
+                    // first: an agent reads what it just wrote.
+                    let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
+                    if queue.call(Worker::caught_up).is_none() {
+                        return Ok(closed());
+                    }
+                }
+                let last = self.last.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                // Nothing was handed over yet: the window says how far opening is.
+                let Some(reading) = last else { return Err(request) };
+                let selection = self.showing.lock().unwrap_or_else(PoisonError::into_inner).selected.clone();
+                let performance = if costs { crate::perf::read() } else { serde_json::Value::Null };
+                let editor = mcp::EditorState { selection, variant: None, show: None, performance };
+                let mut view = mcp::View {
+                    project: &reading.project,
+                    index: &reading.index,
+                    extensions: &reading.extensions,
+                    editor: Some(editor),
+                };
+                Ok(mcp::answer(&mut view, &request))
+            }
             mcp::Request::Edit { op, layer } => {
-                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
                 let made = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_edit(&op, layer.as_deref())));
                 Ok(made.unwrap_or_else(closed))
             }
             mcp::Request::Due => {
-                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
                 // Answered once what became of it is said and served: by what tells the server.
                 let (said, answered) = mpsc::channel();
                 let then: holder::core::Then = Box::new(move |answer| drop(said.send(answer)));
@@ -98,7 +147,7 @@ impl Outside {
                 Ok(answered.recv().unwrap_or_else(|_| closed()))
             }
             mcp::Request::Signal { events, config } => {
-                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
                 let asked = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_signal(events, config)));
                 drop(queue);
                 match asked {
@@ -108,7 +157,6 @@ impl Outside {
                     None => Ok(closed()),
                 }
             }
-            other => Err(other),
         }
     }
 }
@@ -167,6 +215,10 @@ pub struct TakeIn {
     stage: Arc<Mutex<String>>,
     /// What gives up attaching when nobody will see it.
     stop: Arc<AtomicBool>,
+    /// The project as the worker last handed it over, for what reads it off its thread; and what the window
+    /// shows.
+    last: Arc<Mutex<Option<Reading>>>,
+    showing: Arc<Mutex<Showing>>,
 }
 
 /// What the worker owns.
@@ -200,8 +252,11 @@ pub struct Worker {
     pub found: Vec<extensions::Found>,
     pub tree: Arc<Node>,
     pub stage: Arc<Mutex<String>>,
-    /// The index as last handed over.
+    /// The index as last handed over; with the project and the extensions, where what reads the project off
+    /// this thread finds it.
     pub shown: Option<Arc<Index>>,
+    last: Arc<Mutex<Option<Reading>>>,
+    project_shown: Arc<Project>,
     /// Files were found not to be as the index took them when it was opened: a change of files, as any.
     pub changed_behind: bool,
     /// What is asked of it (`TakeIn::asked`), where its snapshots go, and the window to wake for them.
@@ -215,6 +270,8 @@ pub struct Worker {
 /// What a worker is made of, besides what `TakeIn::start` gives it.
 pub struct Start {
     pub core: Core,
+    /// The index as the window shows it from the start.
+    pub shown: Arc<Index>,
     pub history: History,
     pub showing: Arc<Mutex<Showing>>,
     pub pending: Arc<Mutex<BTreeSet<PathBuf>>>,
@@ -235,7 +292,12 @@ impl TakeIn {
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
         let stage: Arc<Mutex<String>> = Arc::default();
         let stop = start.imports.stopper();
-        let Start { core, history, showing, pending, runner, cache, store, imports, extensions, found, tree } = start;
+        let Start { core, shown, history, showing, pending, runner, cache, store, imports, extensions, found, tree } =
+            start;
+        let project_shown = Arc::new(core.project.clone());
+        let reading = Reading { project: project_shown.clone(), index: shown.clone(), extensions: extensions.clone() };
+        let last = Arc::new(Mutex::new(Some(reading)));
+        let window = showing.clone();
         let worker = Worker {
             core,
             viewed: (history.revision(), Arc::new(history.view())),
@@ -255,7 +317,9 @@ impl TakeIn {
             found,
             tree,
             stage: stage.clone(),
-            shown: None,
+            shown: Some(shown),
+            last: last.clone(),
+            project_shown,
             changed_behind: false,
             asked: asked.clone(),
             made,
@@ -264,12 +328,13 @@ impl TakeIn {
         };
         let queue = Queue::start("take-in", worker).map_err(|e| eprintln!("no thread takes changes in: {e}")).ok();
         let queue = queue.map(Arc::new);
-        TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop }
+        TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop, last, showing: window }
     }
 
     /// The worker, for the agents' link to ask without the window.
     pub fn outside(&self) -> Outside {
-        Outside(self.queue.as_ref().map_or_else(Weak::new, Arc::downgrade))
+        let queue = self.queue.as_ref().map_or_else(Weak::new, Arc::downgrade);
+        Outside { queue, last: self.last.clone(), showing: self.showing.clone() }
     }
 
     /// The window to wake when a snapshot is ready.
@@ -453,12 +518,24 @@ impl Worker {
     /// Do what is asked from outside the window as work on the history (`held`), once what other programs
     /// changed and the window has collected is taken in: an agent reads what it just wrote.
     pub fn asked_outside<R>(&mut self, work: impl FnOnce(&mut Worker) -> R) -> R {
+        self.ask_pending();
+        self.held(0, work)
+    }
+
+    /// Take in all that was asked and is not yet, with what other programs changed and the window has
+    /// collected: what reads the project off this thread waits for, and then reads it as handed over.
+    pub fn caught_up(&mut self) {
+        self.ask_pending();
+        self.work();
+    }
+
+    /// What other programs changed, as the window collected it, asked to be taken in.
+    fn ask_pending(&mut self) {
         let pending: Vec<PathBuf> =
             std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner)).into_iter().collect();
         if !pending.is_empty() {
             self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((0, Job::Paths(pending)));
         }
-        self.held(0, work)
     }
 
     fn showing(&self) -> Showing {
@@ -728,6 +805,7 @@ impl Worker {
         }
         self.core.index = loaded.index;
         self.extensions = loaded.extensions;
+        self.project_shown = Arc::new(self.core.project.clone());
         // The documents shown as the history has them, in the index made again.
         self.core.index.set_working(self.working());
         // What the index read again that differs from what it knew of the files, and all that is served as it
@@ -759,6 +837,8 @@ impl Worker {
         project::give_back_memory();
         let shown = Arc::new(self.core.index.clone());
         self.shown = Some(shown.clone());
+        let reading = Reading { project: self.project_shown.clone(), index: shown.clone(), extensions: self.extensions.clone() };
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(reading);
         Snapshot {
             ticket,
             index: shown,
