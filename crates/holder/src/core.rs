@@ -100,8 +100,9 @@ pub struct Core {
     pub files: Option<Arc<Files>>,
     /// Told each step made, by its label.
     pub made: Box<dyn Fn(&str) + Send>,
-    /// What is served, as last said to the server fed: brought up to each change, to say what differs.
-    listing: Listing,
+    /// What is served, as last listed for the server fed - none until all of it was: brought up to each change,
+    /// to say what differs.
+    pub listing: Option<Listing>,
     /// The files its own edits wrote, as they were then: reported again as they are - by what watches the layers,
     /// by the program that asked for the edit - they are taken in already.
     written: HashMap<PathBuf, Option<Stamp>>,
@@ -123,7 +124,7 @@ impl Core {
             says,
             files: None,
             made: Box::new(|_| {}),
-            listing: Listing::new(),
+            listing: None,
             written: HashMap::new(),
             due_taken: HashSet::new(),
             verifying: None,
@@ -163,8 +164,9 @@ impl Core {
     /// Feed a server what is served, from now on: all the index lists first, kept to tell what differs after
     /// each change.
     pub fn feed_whole(&mut self, files: Arc<Files>) {
-        self.listing = self.index.served();
-        files.show(Arc::new(self.listing.clone()));
+        let listing = self.index.served();
+        files.show(Arc::new(listing.clone()));
+        self.listing = Some(listing);
         self.files = Some(files);
     }
 
@@ -351,14 +353,14 @@ impl Core {
     fn feed(&mut self, changed: &[PathBuf], refreshed: &Refreshed, answers: &Answers) {
         let _span = tracing::info_span!("holder served update").entered();
         if let Some(files) = &self.files {
-            // `project.toml` changed: the layers themselves may have. All of it, listed again.
-            if refreshed.project_file {
-                self.listing = self.index.served();
-                let listing = Arc::new(self.listing.clone());
-                files.show_changed_answering(changed.to_vec(), Some(listing), &refreshed.model, answers);
-            } else {
-                let delta = self.index.serve_changed(&mut self.listing, refreshed);
+            if let Some(listing) = self.listing.as_mut().filter(|_| !refreshed.project_file) {
+                let delta = self.index.serve_changed(listing, refreshed);
                 files.show_delta_answering(changed.to_vec(), delta, &refreshed.model, answers);
+            } else {
+                // `project.toml` changed: the layers themselves may have. All of it, listed again.
+                let listing = self.index.served();
+                self.listing = Some(listing.clone());
+                files.show_changed_answering(changed.to_vec(), Some(Arc::new(listing)), &refreshed.model, answers);
             }
             return;
         }

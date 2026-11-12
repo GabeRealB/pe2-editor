@@ -759,22 +759,16 @@ impl Workspace {
         outputs.set_extensions(&extensions);
         extensions.serve_requests(Some(outputs.clone()));
         let cache_dir = cache.dir.clone();
-        let mut takein = crate::takein::TakeIn::start(crate::takein::Worker {
-            project: project.clone(),
-            index,
+        let mut core = holder::core::Core::new(project.clone(), index, says);
+        core.files.clone_from(&files);
+        let mut takein = crate::takein::TakeIn::start(crate::takein::Start {
+            core,
             cache,
             store: store.clone(),
             imports,
             extensions: extensions.clone(),
             found: extensions_found.clone(),
             tree: tree.clone(),
-            stage: Arc::default(),
-            listing: None,
-            says,
-            files: files.clone(),
-            unsaid: crate::takein::Unsaid::default(),
-            shown: None,
-            changed_behind: false,
         });
         // The files held to what the index took of them as known, first: what an edit waits for.
         takein.verify(verify);

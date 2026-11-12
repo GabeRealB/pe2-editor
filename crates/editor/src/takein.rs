@@ -1,8 +1,9 @@
-//! The take-in worker: what changed on disk taken into the project, off the UI thread. It owns the index, the imports
-//! and what the extensions were found as; each job - paths changed, the layers hidden from view - is taken in on its
-//! own thread, jobs queued meanwhile merged into one, and the result handed to the UI as a snapshot: the index (its
-//! records shared with the worker's, so making one costs what changed), the tree and the layers. The UI swaps it in;
-//! nothing it draws waits for a take-in.
+//! The take-in worker: what changed on disk taken into the project, off the UI thread. It holds the project as any
+//! holder does (`holder::core`: one thread with the index, saying what it comes to where the project's processes
+//! share it), with the imports and what the extensions were found as; each job - paths changed, the layers hidden
+//! from view - is taken in on that thread, jobs asked meanwhile merged into one, and the result handed to the UI as
+//! a snapshot: the index (its records shared with the worker's, so making one costs what changed), the tree and the
+//! layers. The UI swaps it in; nothing it draws waits for a take-in.
 //!
 //! Every job gets a ticket, and a snapshot says the last it covers: an edit waits until the jobs before it are taken
 //! in (it reads the index), an undo shows its selection once its job is, an agent's request is answered once what was
@@ -12,6 +13,7 @@
 //! is read again here, the old one answering until a snapshot hands the new one over, so that nothing shown goes away
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
+use holder::core::{Core, Queue};
 use project::Project;
 use project::cache::Cache;
 use project::ext::Extensions;
@@ -21,13 +23,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::workspace::{Loaded, Node};
 
 /// What the worker is asked.
-enum Job {
+pub enum Job {
     /// Paths changed on disk: by the editor, or by another program.
     Paths(Vec<PathBuf>),
     /// The layers hidden from view (the editor's eyes): every asset assembled again.
@@ -113,7 +114,10 @@ pub enum Served {
 
 /// The worker, as the UI holds it.
 pub struct TakeIn {
-    jobs: Option<Sender<(u64, Job)>>,
+    /// The thread holding the project, with what it owns; none once it was told to end.
+    queue: Option<Queue<Worker>>,
+    /// What was asked and is not taken in yet: taken together by the thread, whichever asking wakes it.
+    asked: Arc<Mutex<Vec<(u64, Job)>>>,
     snapshots: Receiver<Snapshot>,
     /// The last ticket given, and the last a snapshot covered.
     issued: u64,
@@ -124,13 +128,12 @@ pub struct TakeIn {
     stage: Arc<Mutex<String>>,
     /// What gives up attaching when nobody will see it.
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
 }
 
 /// What the worker owns.
 pub struct Worker {
-    pub project: Project,
-    pub index: Index,
+    /// The project held: its index, and what is said of it where the project's processes share it.
+    pub core: Core,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -138,53 +141,59 @@ pub struct Worker {
     pub found: Vec<extensions::Found>,
     pub tree: Arc<Node>,
     pub stage: Arc<Mutex<String>>,
-    /// What is served, as last listed: brought up to what each change of files changed, to say what differs.
-    pub listing: Option<project::server::Listing>,
-    /// Where what it takes in is said - the project's model, what is served, what became of what was due - a
-    /// commit a take-in, by this thread; and what tells the server of it, where one is fed.
-    pub says: Arc<holder::says::Says>,
-    pub files: Option<Arc<holder::files::Files>>,
+    /// What it took in and has yet to say where the project's processes share it (`Core::says`).
     pub unsaid: Unsaid,
     /// The index as last handed over.
     pub shown: Option<Arc<Index>>,
     /// Files were found not to be as the index took them when it was opened: a change of files, as any.
     pub changed_behind: bool,
+    /// What is asked of it (`TakeIn::asked`), where its snapshots go, and the window to wake for them.
+    pub asked: Arc<Mutex<Vec<(u64, Job)>>>,
+    pub made: Sender<Snapshot>,
+    pub wake: Arc<OnceLock<eframe::egui::Context>>,
+    /// Taking in changes is the editor's own doing, behind what the user looks at.
+    pub group: project::schedule::Group,
+}
+
+/// What a worker is made of, besides what `TakeIn::start` gives it.
+pub struct Start {
+    pub core: Core,
+    pub cache: Cache,
+    pub store: project::graph::store::Store,
+    pub imports: Imports,
+    pub extensions: Arc<Extensions>,
+    pub found: Vec<extensions::Found>,
+    pub tree: Arc<Node>,
 }
 
 impl TakeIn {
     /// Start the worker on the project as opened.
-    pub fn start(mut worker: Worker) -> TakeIn {
-        let (jobs, queued) = mpsc::channel::<(u64, Job)>();
+    pub fn start(start: Start) -> TakeIn {
+        let asked: Arc<Mutex<Vec<(u64, Job)>>> = Arc::default();
         let (made, snapshots) = mpsc::channel();
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
-        let wake = ctx.clone();
-        let (stage, stop) = (worker.stage.clone(), worker.imports.stopper());
-        let thread = std::thread::Builder::new()
-            .name("take-in".into())
-            .spawn(move || {
-                // Each job as it comes, with those queued behind it merged in.
-                // Taking in changes is the editor's own doing, behind what the user looks at.
-                let group = project::schedule::Group::new(project::schedule::Class::Background, "take-in");
-                while let Ok(first) = queued.recv() {
-                    let jobs: Vec<(u64, Job)> = std::iter::once(first).chain(queued.try_iter()).collect();
-                    let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
-                    let snapshot = group.enter(|| {
-                        let _span = tracing::info_span!("take-in worker: a take-in").entered();
-                        worker.take_in(jobs)
-                    });
-                    // Nothing was asked but to say what became of what was due: said, and nothing to hand over.
-                    let Some(mut snapshot) = snapshot else { continue };
-                    snapshot.files |= files;
-                    if made.send(snapshot).is_err() {
-                        return;
-                    }
-                    if let Some(ctx) = wake.get() {
-                        ctx.request_repaint();
-                    }
-                }
-            })
-            .ok();
-        TakeIn { jobs: Some(jobs), snapshots, issued: 0, covered: 0, ctx, stage, stop, thread }
+        let stage: Arc<Mutex<String>> = Arc::default();
+        let stop = start.imports.stopper();
+        let Start { core, cache, store, imports, extensions, found, tree } = start;
+        let worker = Worker {
+            core,
+            cache,
+            store,
+            imports,
+            extensions,
+            found,
+            tree,
+            stage: stage.clone(),
+            unsaid: Unsaid::default(),
+            shown: None,
+            changed_behind: false,
+            asked: asked.clone(),
+            made,
+            wake: ctx.clone(),
+            group: project::schedule::Group::new(project::schedule::Class::Background, "take-in"),
+        };
+        let queue = Queue::start("take-in", worker).map_err(|e| eprintln!("no thread takes changes in: {e}")).ok();
+        TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop }
     }
 
     /// The window to wake when a snapshot is ready.
@@ -192,11 +201,16 @@ impl TakeIn {
         let _ = self.ctx.set(ctx.clone());
     }
 
+    /// Ask this of the worker, under the ticket given: taken in with all that was asked and is not yet.
+    fn ask(&self, ticket: u64, job: Job) {
+        let Some(queue) = &self.queue else { return };
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((ticket, job));
+        queue.post(Worker::work);
+    }
+
     fn send(&mut self, job: Job) -> u64 {
         self.issued += 1;
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send((self.issued, job));
-        }
+        self.ask(self.issued, job);
         // That it is under way shows.
         if let Some(ctx) = self.ctx.get() {
             ctx.request_repaint();
@@ -207,16 +221,14 @@ impl TakeIn {
     /// Edits are about to be made of what was due: what the worker takes in from here on is said once what became
     /// of them is (`due_end`), never before. No job to wait for: it has no ticket of its own.
     pub fn due_begin(&mut self) {
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send((self.issued, Job::DueBegin));
-        }
+        self.ask(self.issued, Job::DueBegin);
     }
 
     /// What became of what was due, said by the worker with what is served after the edits made of it - those
     /// asked to be taken in so far - and `then` done once it is.
     pub fn due_end(&mut self, answers: Vec<(u64, vfs::due::Answer)>, then: holder::files::Then) {
-        match &self.jobs {
-            Some(jobs) => drop(jobs.send((self.issued, Job::DueEnd { answers, then }))),
+        match &self.queue {
+            Some(_) => self.ask(self.issued, Job::DueEnd { answers, then }),
             None => then(),
         }
     }
@@ -309,14 +321,35 @@ impl Drop for TakeIn {
     /// gives up where it is: what it would come to is for a window that is going.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.jobs = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // Waited for: what it was given before this is done first.
+        self.queue = None;
     }
 }
 
 impl Worker {
+    /// Take in all that was asked and is not yet, as one, and hand over what it came to: what the thread does
+    /// each time something was asked - nothing, where an asking before this one took it along.
+    fn work(&mut self) {
+        let jobs: Vec<(u64, Job)> = std::mem::take(&mut *self.asked.lock().unwrap_or_else(PoisonError::into_inner));
+        if jobs.is_empty() {
+            return;
+        }
+        let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
+        let group = self.group.clone();
+        let snapshot = group.enter(|| {
+            let _span = tracing::info_span!("take-in worker: a take-in").entered();
+            self.take_in(jobs)
+        });
+        // Nothing was asked but to say what became of what was due: said, and nothing to hand over.
+        let Some(mut snapshot) = snapshot else { return };
+        snapshot.files |= files;
+        if self.made.send(snapshot).is_ok()
+            && let Some(ctx) = self.wake.get()
+        {
+            ctx.request_repaint();
+        }
+    }
+
     /// Take the jobs in, as one, and say what that came to where the project's processes share it - unless edits
     /// are being made of what was due, whose outcome is said with it. None where nothing was asked to be taken in.
     fn take_in(&mut self, jobs: Vec<(u64, Job)>) -> Option<Snapshot> {
@@ -366,7 +399,7 @@ impl Worker {
                         Said::Changes(each)
                     }
                     // One of them listed all of it, and this one what changed since: all of it, as it is now.
-                    None => self.listing.as_ref().map_or(Said::Unchanged, |listing| Said::Whole(Arc::new(listing.clone()))),
+                    None => self.core.listing.as_ref().map_or(Said::Unchanged, |listing| Said::Whole(Arc::new(listing.clone()))),
                 }
             }
         };
@@ -374,7 +407,7 @@ impl Worker {
         let mut thens = unsaid.then;
         let then = (!thens.is_empty()).then(|| Box::new(move || thens.drain(..).for_each(|then| then())) as holder::files::Then);
         let anything = !model.is_empty() || !answers.is_empty() || then.is_some();
-        match (&self.files, said) {
+        match (&self.core.files, said) {
             (Some(files), Said::Whole(listing)) => files.show_answering(listing, &model, &answers, then),
             (Some(files), Said::Changed(delta)) => files.show_delta_then(delta, &model, &answers, then),
             (Some(files), Said::Changes(deltas)) => files.show_deltas_then(deltas, &model, &answers, then),
@@ -382,7 +415,7 @@ impl Worker {
             (Some(_), Said::Unchanged) => {}
             // Nothing feeds a server: what changed of the model and what became of what was due, by themselves.
             (None, _) => {
-                if anything && let Err(e) = self.says.say(Said::Unchanged, &model, &answers) {
+                if anything && let Err(e) = self.core.says.say(Said::Unchanged, &model, &answers) {
                     eprintln!("what the take-in came to could not be said: {e}");
                 }
                 if let Some(then) = then {
@@ -431,10 +464,10 @@ impl Worker {
         let only_paths = hidden.is_none() && working.is_none() && !attach && reload.is_none();
         let mut all = false;
         if let Some(names) = hidden
-            && self.index.set_hidden(&names)
+            && self.core.index.set_hidden(&names)
         {
             // Every asset assembled again: their imports attached again.
-            let _ = self.imports.attach(&mut self.index, &self.extensions);
+            let _ = self.imports.attach(&mut self.core.index, &self.extensions);
             all = true;
         }
         if attach && !all {
@@ -445,9 +478,9 @@ impl Worker {
         let mut edited = BTreeSet::new();
         if let Some(working) = working {
             // The assets whose working copies changed, shown as they have them: what their imports make of them too.
-            edited = self.index.set_working(working);
+            edited = self.core.index.set_working(working);
             if !edited.is_empty() {
-                let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &edited);
+                let _ = self.imports.attach_changed(&mut self.core.index, &self.extensions, &edited);
                 self.sweep_if_due();
             }
         }
@@ -457,7 +490,7 @@ impl Worker {
                 None => self.snapshot(ticket, edited, all, None, None),
             };
         }
-        let mut refreshed = match self.index.refresh(&self.project, &paths) {
+        let mut refreshed = match self.core.index.refresh(&self.core.project, &paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 let error = format!("the index could not follow a change: {e:#}");
@@ -470,18 +503,18 @@ impl Worker {
             return self.reload(ticket, "project.toml changed", whole);
         }
         // An extension the project holds came, went or changed.
-        if extensions::found(&self.project) != self.found {
+        if extensions::found(&self.core.project) != self.found {
             return self.reload(ticket, "an extension changed", whole);
         }
         // The assets the refresh assembled again: their imports attached again; the others keep theirs.
-        let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
+        let _ = self.imports.attach_changed(&mut self.core.index, &self.extensions, &refreshed.assets);
         self.sweep_if_due();
         // What is served follows what the refresh changed - the entries it touched, those gone - where it was
         // listed before and only files changed: listed whole, it costs what the project holds at every change.
-        let served = match self.listing.as_mut().filter(|_| only_paths) {
+        let served = match self.core.listing.as_mut().filter(|_| only_paths) {
             Some(listing) => {
                 let _span = tracing::info_span!("take-in worker: what changed of what is served").entered();
-                Some(Served::Changed(self.index.serve_changed(listing, &refreshed)))
+                Some(Served::Changed(self.core.index.serve_changed(listing, &refreshed)))
             }
             None => None,
         };
@@ -506,7 +539,7 @@ impl Worker {
     /// What the importers made attached to every asset, and what the store keeps that nothing makes any more swept away.
     fn attach_all(&mut self) {
         let report = self.reporter();
-        let _ = self.imports.attach_reporting(&mut self.index, &self.extensions, &report);
+        let _ = self.imports.attach_reporting(&mut self.core.index, &self.extensions, &report);
         self.sweep_aside();
     }
 
@@ -514,8 +547,8 @@ impl Worker {
     /// first, so that nothing else starts one meanwhile.
     fn sweep_aside(&self) {
         self.store.mark_swept();
-        let (store, nodes) = (self.store.clone(), project::imports::live_nodes(&self.index));
-        let project = self.project.clone();
+        let (store, nodes) = (self.store.clone(), project::imports::live_nodes(&self.core.index));
+        let project = self.core.project.clone();
         let _ = std::thread::Builder::new().name("store sweep".into()).spawn(move || {
             let _ = project::imports::sweep_store(&store, &nodes);
             // The layers' chunks too, where it is due: those nothing names, and long enough ago to be no write's.
@@ -542,7 +575,7 @@ impl Worker {
         let snapshot = match read {
             Ok(changed) => {
                 let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None, None);
-                let (project, extensions, found) = (self.project.clone(), self.extensions.clone(), self.found.clone());
+                let (project, extensions, found) = (self.core.project.clone(), self.extensions.clone(), self.found.clone());
                 snapshot.reloaded = Some(Reloaded { project, extensions, found, why });
                 snapshot
             }
@@ -560,22 +593,22 @@ impl Worker {
     /// `project.toml` changed in what neither the layers nor the extensions read has it go on as it is.
     fn read_again(&mut self, whole: bool) -> anyhow::Result<bool> {
         let report = self.reporter();
-        let project = Project::load(&self.project.root)?;
+        let project = Project::load(&self.core.project.root)?;
         // Where the layers are the same, what is in them is what the index holds: it has followed them all along. What
         // extensions make of it is attached anew, and an index knows nothing of them.
-        let read = whole || project.layers != self.project.layers;
-        let index = if read { self.index.again(&project, &report)? } else { self.index.clone() };
+        let read = whole || project.layers != self.core.project.layers;
+        let index = if read { self.core.index.again(&project, &report)? } else { self.core.index.clone() };
         let loaded = Loaded::of(project, index, &self.cache, &self.store, &report);
-        self.project = loaded.project;
+        self.core.project = loaded.project;
         self.found = loaded.found;
         if !read && Arc::ptr_eq(&loaded.extensions, &self.extensions) {
             return Ok(false);
         }
-        self.index = loaded.index;
+        self.core.index = loaded.index;
         self.extensions = loaded.extensions;
         // What the index read again that differs from what it knew of the files: said with what the take-in
         // came to (`say`).
-        self.unsaid.model.and(self.index.take_opened());
+        self.unsaid.model.and(self.core.index.take_opened());
         self.attach_all();
         Ok(true)
     }
@@ -592,26 +625,26 @@ impl Worker {
     ) -> Snapshot {
         if all || !changed.is_empty() {
             let _span = tracing::info_span!("take-in worker: the tree built").entered();
-            self.tree = Arc::new(Node::build(&self.index, &self.extensions));
+            self.tree = Arc::new(Node::build(&self.core.index, &self.extensions));
         }
         // What is served: a plain file changed is no asset changed, so it is said at every take-in - where a
         // server is fed it.
         let served = served.or_else(|| {
-            self.files.as_ref()?;
+            self.core.files.as_ref()?;
             let _span = tracing::info_span!("take-in worker: what is served listed").entered();
-            let listing = self.index.served();
-            self.listing = Some(listing.clone());
+            let listing = self.core.index.served();
+            self.core.listing = Some(listing.clone());
             Some(Served::Whole(Arc::new(listing)))
         });
         // What the job freed, given back: the worker's threads each keep what they freed otherwise.
         project::give_back_memory();
-        let shown = Arc::new(self.index.clone());
+        let shown = Arc::new(self.core.index.clone());
         self.shown = Some(shown.clone());
         Snapshot {
             ticket,
             index: shown,
             tree: self.tree.clone(),
-            layers: self.index.layers(),
+            layers: self.core.index.layers(),
             changed,
             all,
             reloaded: None,

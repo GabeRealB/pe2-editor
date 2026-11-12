@@ -228,13 +228,22 @@ fn disk_file<'i>(index: &'i Index, uid: &str, file: &str) -> Option<&'i crate::i
     asset.files.iter().find(|f| f.name == file && f.made_by.is_none())
 }
 
-pub struct History {
+/// What a history shows of itself - its steps done and undone, the documents with unsaved changes, a session a
+/// crash left, and the contents it keeps by their hash: the history's own, or a copy as of a moment
+/// (`History::view`) for whoever shows it while another thread has the history.
+#[derive(Clone, Debug, Default)]
+pub struct View {
     dir: PathBuf,
     done: Vec<Step>,
     undone: Vec<Step>,
     documents: BTreeMap<String, Document>,
     /// What a session a crash ended left, until it is taken up or let go.
     left: Option<Session>,
+}
+
+pub struct History {
+    /// Its steps, its documents and what it keeps: read through it as of the history itself (`Deref`).
+    view: View,
     /// Whether the session is written as it changes.
     journaled: bool,
     /// What the session's file holds, where it was written whole and appended to since: how many steps done and
@@ -250,125 +259,11 @@ pub struct History {
     storage: Option<crate::storage::Storage>,
 }
 
-impl History {
-    /// The project's log for this session: a session a crash ended is kept aside (`left`), and otherwise what an
-    /// earlier session kept is wiped. Returns it and what was written again from the log as the cache was opened,
-    /// if anything was - changes whoever held the project before had not had in its files.
-    ///
-    /// # Errors
-    /// The history's folder cannot be read, cleared or made.
-    pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
-        let dir = cache.path(DIR);
-        let mut history = History {
-            dir: dir.clone(),
-            done: vec![],
-            undone: vec![],
-            documents: BTreeMap::new(),
-            left: None,
-            journaled: false,
-            appended: std::cell::Cell::new(None),
-            author: "user".into(),
-            trashed: 0,
-            written: vec![],
-            storage: cache.dir.parent().and_then(crate::storage::Storage::open),
-        };
-        let recovered = cache.recovered.clone();
-        let left = std::fs::read_to_string(dir.join(SESSION))
-            .ok()
-            .and_then(|text| Session::read(&text))
-            .filter(|left| !left.done.is_empty() || !left.undone.is_empty() || !left.documents.is_empty());
-        if left.is_some() {
-            // What it kept stays, for what it left to be taken up; the trash goes on numbering after it.
-            history.trashed = std::fs::read_dir(dir.join("trash"))
-                .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<usize>().ok()).max())
-                .ok()
-                .flatten()
-                .unwrap_or(0);
-        } else if dir.exists() {
-            std::fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
-        }
-        std::fs::create_dir_all(dir.join("blobs")).with_context(|| format!("{}", dir.display()))?;
-        history.left = left;
-        Ok((history, recovered))
-    }
-
-    /// Written as it changes, so that a crash leaves the session to be taken up again (the editor's).
-    #[must_use]
-    pub fn journaled(mut self) -> Self {
-        self.journaled = true;
-        self
-    }
-
+impl View {
     /// The session a crash ended, where one was left and is not taken up or let go yet.
     #[must_use]
     pub fn left(&self) -> Option<&Session> {
         self.left.as_ref()
-    }
-
-    /// Take up the session a crash ended: its steps before this one's, its documents where this one has none.
-    pub fn resume(&mut self) {
-        let Some(left) = self.left.take() else { return };
-        let done = std::mem::replace(&mut self.done, left.done);
-        self.done.extend(done);
-        if self.undone.is_empty() {
-            self.undone = left.undone;
-        }
-        for (uid, document) in left.documents {
-            self.documents.entry(uid).or_insert(document);
-        }
-        self.journal();
-    }
-
-    /// Let the session a crash ended go.
-    pub fn discard_left(&mut self) {
-        self.left = None;
-        self.journal();
-    }
-
-    /// The session closed cleanly: what it kept is wiped.
-    pub fn close(self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-
-    /// Let go of the log where it was opened for a moment's work (a host, a command's edit), not taken up: closed, unless
-    /// it found a session another left - an editor's, crashed or closed with documents unsaved - which stays, for the
-    /// editor to offer back.
-    pub fn let_go(self) {
-        if self.left.is_none() {
-            self.close();
-        }
-    }
-
-    /// Who makes the steps begun from now on (`user`, `agent`).
-    pub fn set_author(&mut self, author: &str) {
-        if self.author != author {
-            author.clone_into(&mut self.author);
-        }
-    }
-
-    /// Begin a transaction, named as the user will see it in the history.
-    pub fn begin(&mut self, label: impl Into<String>) -> Transaction<'_> {
-        let step = Step::new(label.into(), self.author.clone());
-        Transaction { history: self, step, committed: false }
-    }
-
-    /// Note what was selected when the last step was made: undoing it shows that again.
-    pub fn note_selection(&mut self, selection: Option<String>) {
-        if let Some(step) = self.done.last_mut() {
-            step.selection = selection;
-        }
-        self.journal_last(&[]);
-    }
-
-    /// The paths its steps wrote since they were last taken, made, undone or redone.
-    #[must_use]
-    pub fn written(&self) -> &[PathBuf] {
-        &self.written
-    }
-
-    /// The files steps wrote since this was last asked, for the index to take in.
-    pub fn take_written(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.written)
     }
 
     /// The steps done, oldest first.
@@ -394,8 +289,6 @@ impl History {
     pub fn to_redo(&self, scope: Option<&str>) -> Option<&Step> {
         self.undone.iter().rev().find(|s| scope.is_none_or(|uid| s.edits_document(uid)))
     }
-
-    // --- documents -------------------------------------------------------------------------------------------------
 
     /// The documents with unsaved changes, by uid.
     #[must_use]
@@ -432,6 +325,169 @@ impl History {
         self.blob(sha1)
     }
 
+    /// The documents' files as they were at a point of the log - after its first `point` steps done - where a step
+    /// since edited them: each by uid and name, by hash (none: absent). Of one document, or all. What steps did to
+    /// files otherwise (a move, a new asset) is not taken back: a point is of the documents.
+    #[must_use]
+    pub fn states_at(&self, point: usize, scope: Option<&str>) -> BTreeMap<(String, String), Option<String>> {
+        let mut states = BTreeMap::new();
+        for step in self.done[point.min(self.done.len())..].iter().rev() {
+            for edit in step.edits.iter().rev().filter(|e| scope.is_none_or(|uid| e.uid == uid)) {
+                states.insert((edit.uid.clone(), edit.file.clone()), edit.before.clone());
+            }
+        }
+        states
+    }
+
+    /// The working copies as they were at a point of the log, for the index to show (`Index::set_working`): those of
+    /// now, with what steps since changed as it was.
+    #[must_use]
+    pub fn working_at(&self, point: usize, scope: Option<&str>) -> HashMap<String, Working> {
+        let mut working = self.working();
+        for ((uid, file), sha1) in self.states_at(point, scope) {
+            let file_at = sha1.map(|sha1| WorkingFile { path: self.blob_path(&sha1), sha1 });
+            working.entry(uid).or_default().files.insert(file, file_at);
+        }
+        working
+    }
+
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        self.dir.join("blobs").join(hash)
+    }
+
+    fn blob(&self, hash: &str) -> Result<Vec<u8>> {
+        let path = self.blob_path(hash);
+        std::fs::read(&path).with_context(|| format!("{}: a content the history kept is gone", path.display()))
+    }
+}
+
+impl std::ops::Deref for History {
+    type Target = View;
+
+    fn deref(&self) -> &View {
+        &self.view
+    }
+}
+
+impl History {
+    /// What it shows of itself, as it is now: for whoever shows it while another thread has the history.
+    #[must_use]
+    pub fn view(&self) -> View {
+        self.view.clone()
+    }
+
+    /// The project's log for this session: a session a crash ended is kept aside (`left`), and otherwise what an
+    /// earlier session kept is wiped. Returns it and what was written again from the log as the cache was opened,
+    /// if anything was - changes whoever held the project before had not had in its files.
+    ///
+    /// # Errors
+    /// The history's folder cannot be read, cleared or made.
+    pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
+        let dir = cache.path(DIR);
+        let mut history = History {
+            view: View { dir: dir.clone(), ..View::default() },
+            journaled: false,
+            appended: std::cell::Cell::new(None),
+            author: "user".into(),
+            trashed: 0,
+            written: vec![],
+            storage: cache.dir.parent().and_then(crate::storage::Storage::open),
+        };
+        let recovered = cache.recovered.clone();
+        let left = std::fs::read_to_string(dir.join(SESSION))
+            .ok()
+            .and_then(|text| Session::read(&text))
+            .filter(|left| !left.done.is_empty() || !left.undone.is_empty() || !left.documents.is_empty());
+        if left.is_some() {
+            // What it kept stays, for what it left to be taken up; the trash goes on numbering after it.
+            history.trashed = std::fs::read_dir(dir.join("trash"))
+                .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<usize>().ok()).max())
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+        } else if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
+        }
+        std::fs::create_dir_all(dir.join("blobs")).with_context(|| format!("{}", dir.display()))?;
+        history.view.left = left;
+        Ok((history, recovered))
+    }
+
+    /// Written as it changes, so that a crash leaves the session to be taken up again (the editor's).
+    #[must_use]
+    pub fn journaled(mut self) -> Self {
+        self.journaled = true;
+        self
+    }
+
+    /// Take up the session a crash ended: its steps before this one's, its documents where this one has none.
+    pub fn resume(&mut self) {
+        let Some(left) = self.view.left.take() else { return };
+        let done = std::mem::replace(&mut self.view.done, left.done);
+        self.view.done.extend(done);
+        if self.view.undone.is_empty() {
+            self.view.undone = left.undone;
+        }
+        for (uid, document) in left.documents {
+            self.view.documents.entry(uid).or_insert(document);
+        }
+        self.journal();
+    }
+
+    /// Let the session a crash ended go.
+    pub fn discard_left(&mut self) {
+        self.view.left = None;
+        self.journal();
+    }
+
+    /// The session closed cleanly: what it kept is wiped.
+    pub fn close(self) {
+        let _ = std::fs::remove_dir_all(&self.view.dir);
+    }
+
+    /// Let go of the log where it was opened for a moment's work (a host, a command's edit), not taken up: closed, unless
+    /// it found a session another left - an editor's, crashed or closed with documents unsaved - which stays, for the
+    /// editor to offer back.
+    pub fn let_go(self) {
+        if self.view.left.is_none() {
+            self.close();
+        }
+    }
+
+    /// Who makes the steps begun from now on (`user`, `agent`).
+    pub fn set_author(&mut self, author: &str) {
+        if self.author != author {
+            author.clone_into(&mut self.author);
+        }
+    }
+
+    /// Begin a transaction, named as the user will see it in the history.
+    pub fn begin(&mut self, label: impl Into<String>) -> Transaction<'_> {
+        let step = Step::new(label.into(), self.author.clone());
+        Transaction { history: self, step, committed: false }
+    }
+
+    /// Note what was selected when the last step was made: undoing it shows that again.
+    pub fn note_selection(&mut self, selection: Option<String>) {
+        if let Some(step) = self.view.done.last_mut() {
+            step.selection = selection;
+        }
+        self.journal_last(&[]);
+    }
+
+    /// The paths its steps wrote since they were last taken, made, undone or redone.
+    #[must_use]
+    pub fn written(&self) -> &[PathBuf] {
+        &self.written
+    }
+
+    /// The files steps wrote since this was last asked, for the index to take in.
+    pub fn take_written(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.written)
+    }
+
+    // --- documents -------------------------------------------------------------------------------------------------
+
     /// Edit a file of an asset's working copy - made of its files on disk where it has none - as a step of its own,
     /// joining the last where `merge` continues it. Whether it changed anything.
     ///
@@ -464,7 +520,7 @@ impl History {
 
     /// A file of an asset as its working copy has it, else as on disk.
     fn current(&self, index: &Index, uid: &str, file: &str) -> Option<String> {
-        match self.documents.get(uid).and_then(|d| d.working.get(file)) {
+        match self.view.documents.get(uid).and_then(|d| d.working.get(file)) {
             Some(working) => working.clone(),
             None => on_disk(index, uid, file),
         }
@@ -474,7 +530,7 @@ impl History {
     /// is no longer unsaved.
     fn set_working(&mut self, index: &Index, edit: &Edit) {
         let path = index.by_uid.get(&edit.uid).cloned().unwrap_or_else(|| edit.path.clone());
-        let document = self.documents.entry(edit.uid.clone()).or_insert_with(|| Document {
+        let document = self.view.documents.entry(edit.uid.clone()).or_insert_with(|| Document {
             path,
             base: BTreeMap::new(),
             working: BTreeMap::new(),
@@ -486,12 +542,12 @@ impl History {
             if let Some(file) = disk_file(index, &edit.uid, &edit.file)
                 && let Ok(bytes) = crate::content::read(&file.path)
             {
-                let _ = keep_in(&self.dir, &bytes);
+                let _ = keep_in(&self.view.dir, &bytes);
             }
         }
         document.working.insert(edit.file.clone(), edit.after.clone());
         if document.working == document.base && document.stale.is_none() {
-            self.documents.remove(&edit.uid);
+            self.view.documents.remove(&edit.uid);
         }
     }
 
@@ -500,7 +556,7 @@ impl History {
     /// # Errors
     /// A content is not kept.
     pub fn to_save(&self, uid: &str) -> Result<Vec<(String, Option<Vec<u8>>)>> {
-        let Some(document) = self.documents.get(uid) else { return Ok(vec![]) };
+        let Some(document) = self.view.documents.get(uid) else { return Ok(vec![]) };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let changed = document.working.iter().filter(|(name, sha1)| disk.get(*name) != Some(*sha1));
         changed.map(|(name, sha1)| Ok((name.clone(), sha1.as_deref().map(|s| self.blob(s)).transpose()?))).collect()
@@ -508,13 +564,13 @@ impl History {
 
     /// A document was saved: its working copy is what is on disk.
     pub fn saved(&mut self, uid: &str) {
-        self.documents.remove(uid);
+        self.view.documents.remove(uid);
         self.journal();
     }
 
     /// Put a document back as on disk, as a step: its unsaved changes undone, or - stale - the disk's taken.
     pub fn revert(&mut self, uid: &str, label: String) {
-        let Some(document) = self.documents.get(uid).cloned() else { return };
+        let Some(document) = self.view.documents.get(uid).cloned() else { return };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
         let mut step = Step::new(label, self.author.clone());
         for (file, working) in &document.working {
@@ -530,7 +586,7 @@ impl History {
                 step.edits.push(edit);
             }
         }
-        self.documents.remove(uid);
+        self.view.documents.remove(uid);
         if step.edits.is_empty() {
             self.journal();
         } else {
@@ -540,7 +596,7 @@ impl History {
 
     /// Keep a stale document's working copy: what is on disk now is what saving overwrites.
     pub fn keep_mine(&mut self, uid: &str) {
-        if let Some(document) = self.documents.get_mut(uid)
+        if let Some(document) = self.view.documents.get_mut(uid)
             && let Some(disk) = document.stale.take()
         {
             document.base = disk;
@@ -554,7 +610,7 @@ impl History {
     pub fn reconcile(&mut self, index: &Index) -> bool {
         let mut changed = false;
         let mut clean = vec![];
-        for (uid, document) in &mut self.documents {
+        for (uid, document) in &mut self.view.documents {
             if let Some(path) = index.by_uid.get(uid)
                 && *path != document.path
             {
@@ -570,7 +626,7 @@ impl History {
                     if let Some(file) = disk_file(index, uid, file)
                         && let Ok(bytes) = crate::content::read(&file.path)
                     {
-                        let _ = keep_in(&self.dir, &bytes);
+                        let _ = keep_in(&self.view.dir, &bytes);
                     }
                 }
             }
@@ -582,7 +638,7 @@ impl History {
             }
         }
         for uid in clean {
-            self.documents.remove(&uid);
+            self.view.documents.remove(&uid);
             changed = true;
         }
         if changed {
@@ -593,37 +649,11 @@ impl History {
 
     /// Let every unsaved change go: documents back as on disk, not as a step (the session is closing).
     pub fn discard_documents(&mut self) {
-        self.documents.clear();
+        self.view.documents.clear();
         self.journal();
     }
 
     // --- points of the log -----------------------------------------------------------------------------------------
-
-    /// The documents' files as they were at a point of the log - after its first `point` steps done - where a step
-    /// since edited them: each by uid and name, by hash (none: absent). Of one document, or all. What steps did to
-    /// files otherwise (a move, a new asset) is not taken back: a point is of the documents.
-    #[must_use]
-    pub fn states_at(&self, point: usize, scope: Option<&str>) -> BTreeMap<(String, String), Option<String>> {
-        let mut states = BTreeMap::new();
-        for step in self.done[point.min(self.done.len())..].iter().rev() {
-            for edit in step.edits.iter().rev().filter(|e| scope.is_none_or(|uid| e.uid == uid)) {
-                states.insert((edit.uid.clone(), edit.file.clone()), edit.before.clone());
-            }
-        }
-        states
-    }
-
-    /// The working copies as they were at a point of the log, for the index to show (`Index::set_working`): those of
-    /// now, with what steps since changed as it was.
-    #[must_use]
-    pub fn working_at(&self, point: usize, scope: Option<&str>) -> HashMap<String, Working> {
-        let mut working = self.working();
-        for ((uid, file), sha1) in self.states_at(point, scope) {
-            let file_at = sha1.map(|sha1| WorkingFile { path: self.blob_path(&sha1), sha1 });
-            working.entry(uid).or_default().files.insert(file, file_at);
-        }
-        working
-    }
 
     /// Put the documents back as they were at a point of the log - one, or all - as a new step: what was done since
     /// stays in the log, undone by undoing this. Whether anything changed.
@@ -644,14 +674,14 @@ impl History {
     /// # Errors
     /// Why it cannot be: it is no edit, it changed files (undo takes those back), or what it edited was edited since.
     pub fn revert_step(&mut self, index: &Index, at: usize, label: String) -> Result<bool, String> {
-        let step = self.done.get(at).ok_or("no such step")?;
+        let step = self.view.done.get(at).ok_or("no such step")?;
         if !step.undoable() {
             return Err("It changed nothing to take back".into());
         }
         if !step.changes.is_empty() {
             return Err("It changed the project's files: undoing takes it back".into());
         }
-        let later = &self.done[at + 1..];
+        let later = &self.view.done[at + 1..];
         for edit in &step.edits {
             let since = later.iter().any(|s| s.edits.iter().any(|e| e.uid == edit.uid && e.file == edit.file));
             if since || self.current(index, &edit.uid, &edit.file) != edit.after {
@@ -688,9 +718,9 @@ impl History {
         index
             .by_uid
             .get(uid)
-            .or_else(|| self.documents.get(uid).map(|d| &d.path))
+            .or_else(|| self.view.documents.get(uid).map(|d| &d.path))
             .cloned()
-            .or_else(|| self.done.iter().flat_map(|s| &s.edits).find(|e| e.uid == uid).map(|e| e.path.clone()))
+            .or_else(|| self.view.done.iter().flat_map(|s| &s.edits).find(|e| e.uid == uid).map(|e| e.path.clone()))
             .unwrap_or_default()
     }
 
@@ -702,7 +732,7 @@ impl History {
     /// # Errors
     /// There is nothing to undo, what it changed was changed since (unless forced), or files cannot be written.
     pub fn undo(&mut self, index: &Index, scope: Option<&str>, force: bool) -> Result<&Step, StepError> {
-        let at = self.done.iter().rposition(|s| s.undoable() && scope.is_none_or(|uid| s.edits_document(uid)));
+        let at = self.view.done.iter().rposition(|s| s.undoable() && scope.is_none_or(|uid| s.edits_document(uid)));
         let Some(at) = at else {
             return Err(StepError::Io(anyhow::anyhow!("nothing to undo")));
         };
@@ -710,9 +740,9 @@ impl History {
         match self.run(index, &mut step, false, force) {
             Ok(()) => {
                 self.written.extend(step.paths());
-                self.undone.push(step);
+                self.view.undone.push(step);
                 self.journal();
-                self.undone.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step undone is gone")))
+                self.view.undone.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step undone is gone")))
             }
             Err(e) => {
                 self.give_back(at, step, true);
@@ -726,7 +756,7 @@ impl History {
     /// # Errors
     /// There is nothing to redo, what it changed was changed since (unless forced), or files cannot be written.
     pub fn redo(&mut self, index: &Index, scope: Option<&str>, force: bool) -> Result<&Step, StepError> {
-        let at = self.undone.iter().rposition(|s| scope.is_none_or(|uid| s.edits_document(uid)));
+        let at = self.view.undone.iter().rposition(|s| scope.is_none_or(|uid| s.edits_document(uid)));
         let Some(at) = at else {
             return Err(StepError::Io(anyhow::anyhow!("nothing to redo")));
         };
@@ -734,9 +764,9 @@ impl History {
         match self.run(index, &mut step, true, force) {
             Ok(()) => {
                 self.written.extend(step.paths());
-                self.done.push(step);
+                self.view.done.push(step);
                 self.journal();
-                self.done.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step redone is gone")))
+                self.view.done.last().ok_or_else(|| StepError::Io(anyhow::anyhow!("the step redone is gone")))
             }
             Err(e) => {
                 self.give_back(at, step, false);
@@ -748,7 +778,7 @@ impl History {
     /// Take a step out of the done (or undone) steps, whole - or, scoped to a document where it changed more, its part
     /// of it, the rest staying where it was.
     fn take_part(&mut self, at: usize, scope: Option<&str>, done: bool) -> Step {
-        let steps = if done { &mut self.done } else { &mut self.undone };
+        let steps = if done { &mut self.view.done } else { &mut self.view.undone };
         let whole =
             scope.is_none_or(|uid| steps[at].changes.is_empty() && steps[at].edits.iter().all(|e| e.uid == uid));
         if whole {
@@ -767,7 +797,7 @@ impl History {
 
     /// Put a step that could not be run back where it was taken from: whole, or a part joining what it was taken from.
     fn give_back(&mut self, at: usize, step: Step, done: bool) {
-        let steps = if done { &mut self.done } else { &mut self.undone };
+        let steps = if done { &mut self.view.done } else { &mut self.view.undone };
         match steps.get_mut(at) {
             Some(rest) if rest.at == step.at && rest.label == step.label && step.changes.is_empty() => {
                 rest.edits.extend(step.edits);
@@ -969,12 +999,12 @@ impl History {
         if !self.journaled {
             return;
         }
-        let session = SessionRef { done: &self.done, undone: &self.undone, documents: &self.documents };
+        let session = SessionRef { done: &self.view.done, undone: &self.view.undone, documents: &self.view.documents };
         self.appended.set(None);
         if let Ok(mut text) = serde_json::to_string(&Journaled::Whole(session)) {
             text.push('\n');
-            if write_atomic(&self.dir.join(SESSION), text.as_bytes()).is_ok() {
-                self.appended.set(Some((self.done.len(), self.undone.len(), text.len() as u64)));
+            if write_atomic(&self.view.dir.join(SESSION), text.as_bytes()).is_ok() {
+                self.appended.set(Some((self.view.done.len(), self.view.undone.len(), text.len() as u64)));
             }
         }
     }
@@ -987,26 +1017,26 @@ impl History {
         if !self.journaled {
             return;
         }
-        let Some((done, undone, long)) = self.appended.get().filter(|(done, _, long)| *done <= self.done.len() && *long < SESSION_LONG) else {
+        let Some((done, undone, long)) = self.appended.get().filter(|(done, _, long)| *done <= self.view.done.len() && *long < SESSION_LONG) else {
             return self.journal();
         };
         // The last step it held may be the one joined: from that one on.
         let from = done.saturating_sub(1);
         let since = Journaled::Since {
             from,
-            done: &self.done[from..],
-            undone: (undone != self.undone.len()).then_some(self.undone.as_slice()),
-            documents: documents.iter().map(|uid| (uid.as_str(), self.documents.get(uid))).collect(),
+            done: &self.view.done[from..],
+            undone: (undone != self.view.undone.len()).then_some(self.view.undone.as_slice()),
+            documents: documents.iter().map(|uid| (uid.as_str(), self.view.documents.get(uid))).collect(),
         };
         let appended = serde_json::to_string(&since).ok().and_then(|mut text| {
             use std::io::Write as _;
             text.push('\n');
-            let mut file = std::fs::OpenOptions::new().append(true).open(self.dir.join(SESSION)).ok()?;
+            let mut file = std::fs::OpenOptions::new().append(true).open(self.view.dir.join(SESSION)).ok()?;
             file.write_all(text.as_bytes()).ok()?;
             Some(text.len() as u64)
         });
         match appended {
-            Some(more) => self.appended.set(Some((self.done.len(), self.undone.len(), long + more))),
+            Some(more) => self.appended.set(Some((self.view.done.len(), self.view.undone.len(), long + more))),
             None => self.journal(),
         }
     }
@@ -1037,18 +1067,9 @@ impl History {
         }
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("blobs").join(hash)
-    }
-
-    fn blob(&self, hash: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash);
-        std::fs::read(&path).with_context(|| format!("{}: a content the history kept is gone", path.display()))
-    }
-
     /// Keep bytes in the history; their hash.
     fn keep(&self, bytes: &[u8]) -> Result<String> {
-        keep_in(&self.dir, bytes)
+        keep_in(&self.view.dir, bytes)
     }
 
     /// Keep a file's current content; its hash, none where it is absent.
@@ -1062,11 +1083,11 @@ impl History {
 
     fn push(&mut self, mut step: Step) {
         if step.undoable() {
-            self.undone.retain(|undone| !undone.overtaken_by(&step));
+            self.view.undone.retain(|undone| !undone.overtaken_by(&step));
         }
         // The documents it edited: written with it.
         let edited: Vec<String> = step.edits.iter().map(|edit| edit.uid.clone()).collect();
-        if let (Some(last), Some((key, _))) = (self.done.last_mut(), &step.merge)
+        if let (Some(last), Some((key, _))) = (self.view.done.last_mut(), &step.merge)
             && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < MERGE_WITHIN)
         {
             // One edit continued: the step keeps where it started from and takes where it ends - the last write of a
@@ -1093,10 +1114,10 @@ impl History {
             self.journal_last(&edited);
             return;
         }
-        self.done.push(step);
-        if self.done.len() > STEPS {
+        self.view.done.push(step);
+        if self.view.done.len() > STEPS {
             // The oldest goes: every step is at another place, and the session is written whole.
-            self.done.remove(0);
+            self.view.done.remove(0);
             return self.journal();
         }
         self.journal_last(&edited);
@@ -1368,7 +1389,7 @@ impl Transaction<'_> {
     pub fn remove(&mut self, path: &Path) -> Result<()> {
         if self.is_dir(path) {
             self.history.trashed += 1;
-            let trash = self.history.dir.join("trash");
+            let trash = self.history.view.dir.join("trash");
             std::fs::create_dir_all(&trash)?;
             let to = trash.join(self.history.trashed.to_string());
             self.change(Change::Rename { from: path.to_path_buf(), to });
@@ -1393,7 +1414,7 @@ impl Transaction<'_> {
             bail!("{}: something is there", to.display());
         }
         self.history.trashed += 1;
-        let trash = self.history.dir.join("trash");
+        let trash = self.history.view.dir.join("trash");
         std::fs::create_dir_all(&trash)?;
         let staged = trash.join(self.history.trashed.to_string());
         copy_all(from, &staged).with_context(|| format!("{} to {}", from.display(), staged.display()))?;
