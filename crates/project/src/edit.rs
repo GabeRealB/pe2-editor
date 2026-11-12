@@ -968,7 +968,7 @@ mod tests {
             self.follows = (read.commit().generation, follows);
             // And the model, brought on by what the refresh says it changed, holds of every file what the index
             // changed in place does.
-            let records = |index: &Index| -> std::collections::HashMap<PathBuf, crate::store::Record> {
+            let records = |index: &Index| -> std::collections::HashMap<PathBuf, crate::model::Record> {
                 index.file_records().map(|(path, record)| (path.to_path_buf(), record.clone())).collect()
             };
             let held = crate::model::files(&read, &self.project.root).unwrap();
@@ -986,7 +986,7 @@ mod tests {
             }
             let fresh = Index::without_store(&Project::load(&self.project.root).unwrap()).unwrap();
             // What one opened afresh reads of the files is what the model holds of them, but when each was read.
-            let unread = |mut records: std::collections::HashMap<PathBuf, crate::store::Record>| {
+            let unread = |mut records: std::collections::HashMap<PathBuf, crate::model::Record>| {
                 for record in records.values_mut() {
                     record.recorded = (0, 0);
                 }

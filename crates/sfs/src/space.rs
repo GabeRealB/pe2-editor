@@ -37,7 +37,11 @@
 //!   takes that back, on disk, before it is made - as does, ahead of it, a process that makes ready to write,
 //!   `ready`). A process that lets go of the space in order has what it wrote on disk, and the last to do so all
 //!   of it, said clean (`rest`). Otherwise it begins empty (`Space::fresh`), for whoever owns what it holds to
-//!   fill again: nothing in it is the only copy of anything.
+//!   fill again: nothing in it is the only copy of anything. What it held is kept beside it meanwhile (`left/`),
+//!   to be read by who can hold what it reads there to something else (`Space::left_behind`): left by processes
+//!   that died it is as its last commit left it, and after a loss of power a page of it that the disk never had
+//!   is found not to be the one pointed to - what is read there is right, of the last commit or one before it,
+//!   or said damaged.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -76,6 +80,8 @@ const LISTS: usize = 1 << 15;
 const PIECE: usize = 1 << 16;
 /// The most pieces a list has: room for more entries than a space has pages.
 const PIECES: usize = 2048;
+/// Where what a space held is kept, in its folder, when it is begun anew for not being trusted.
+const LEFT: &str = "left";
 /// What a page begins with: its kind (1), nothing (3), its own number (4), the generation that wrote it (8).
 pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
@@ -360,6 +366,8 @@ pub struct Space {
     held: List,
     /// It began empty: what it is to hold is put there again by whoever owns it.
     fresh: AtomicBool,
+    /// Where the pages of a space left behind are, with those mapped here: read, never written.
+    left: Option<(PathBuf, Mutex<Vec<memmap2::MmapRaw>>)>,
     #[cfg(test)]
     faults: Mutex<Option<Faults>>,
 }
@@ -513,6 +521,7 @@ impl Space {
             free: List::new("free", 1),
             held: List::new("held", 3),
             fresh: AtomicBool::new(fresh),
+            left: None,
             #[cfg(test)]
             faults: Mutex::default(),
         }
@@ -603,32 +612,70 @@ impl Space {
         made.map(|_| space)
     }
 
-    /// Take a space's pages out of its folder: nothing of it is trusted. Kept aside where it was found damaged, in
-    /// place of what was kept before.
+    /// Take a space's pages out of its folder: nothing of it is trusted. Kept aside - in place of what was kept
+    /// before - where it was found damaged (`damaged/`), and where it is of this format, as the processes that
+    /// had it left it (`left/`, read by `left_behind`).
     fn set_aside(dir: &Path) -> io::Result<()> {
-        let damaged = std::fs::read(dir.join("head")).is_ok_and(|head| number_at(&head, at::DAMAGED) != 0);
-        let aside = dir.join("damaged");
-        if damaged {
-            let _ = std::fs::remove_dir_all(&aside);
-            std::fs::create_dir_all(&aside)?;
+        let head = std::fs::read(dir.join("head")).ok();
+        let damaged = head.as_ref().is_some_and(|head| number_at(head, at::DAMAGED) != 0);
+        let ours = head.as_ref().is_some_and(|head| number_at(head, at::MAGIC) == MAGIC);
+        let aside = if damaged { Some(dir.join("damaged")) } else { ours.then(|| dir.join(LEFT)) };
+        if let Some(aside) = &aside {
+            let _ = std::fs::remove_dir_all(aside);
+            std::fs::create_dir_all(aside)?;
         }
         for entry in std::fs::read_dir(dir)?.flatten() {
             let name = entry.file_name();
             if !name.to_str().is_some_and(of_pages) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 continue;
             }
-            if damaged {
-                std::fs::rename(entry.path(), aside.join(&name))?;
-            } else {
-                std::fs::remove_file(entry.path())?;
+            match &aside {
+                Some(aside) => std::fs::rename(entry.path(), aside.join(&name))?,
+                None => std::fs::remove_file(entry.path())?,
             }
         }
         Ok(())
     }
 
+    /// What a space held when it was last begun anew for not being trusted (`open`), to be read: as the processes
+    /// that had it left it. None where nothing was kept of it, or nothing was ever committed to it. Left by
+    /// processes that died, it is as its last commit left it; after a loss of power, what is read of it is right -
+    /// of the last commit the disk has whole, or the one before - or found damaged, a page not being the one
+    /// pointed to: for who holds what it reads there to something else, as a file's record is held to its file.
+    /// Nothing of it is written, and nothing else reads it.
+    ///
+    /// # Errors
+    /// There is no memory for it, or its files cannot be read.
+    pub fn left_behind(dir: &Path) -> io::Result<Option<Space>> {
+        let left = dir.join(LEFT);
+        let Ok(head) = std::fs::read(left.join("head")) else { return Ok(None) };
+        if head.len() < 3 * PAGE || number_at(&head, at::MAGIC) != MAGIC || number_at(&head, at::DAMAGED) != 0 {
+            return Ok(None);
+        }
+        // The commit it is read at: the last written whole, whatever the header says - that is not checked.
+        let Some(commit) = [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation)
+        else {
+            return Ok(None);
+        };
+        let backing = Backing::Memory { chunks: Mutex::default(), head: Mem::zeroed(3 * PAGE)?, free: Mem::zeroed(LISTS)?, pins: Mem::zeroed(PINNED)? };
+        let mut space = Space::with(backing, 0, false);
+        space.left = Some((left, Mutex::default()));
+        space.atom(at::MAGIC).store(MAGIC, Ordering::Release);
+        space.publish(&commit);
+        Ok(Some(space))
+    }
+
+    /// Let go of what was kept of a space begun anew (`left_behind`): read, or not wanted.
+    pub fn forget_left(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir.join(LEFT));
+    }
+
     /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
     /// so that the first to write does not. For a process that is to write.
     pub fn ready(&self) {
+        if self.left.is_some() {
+            return;
+        }
         let Ok(first) = self.chunk(0, true) else { return };
         // And its first pages, the two a commit is written to and the list of free ones touched: the first write
         // to a page of a file that was given its blocks unwritten is what the system takes its time over. Touched
@@ -918,6 +965,18 @@ impl Space {
                 if !again.is_null() {
                     return Ok(again);
                 }
+                // Of a space left behind: its file, mapped to be read.
+                if let Some((dir, maps)) = &self.left {
+                    let file = match File::open(dir.join(format!("{number:08}.chunk"))) {
+                        Ok(file) if file.metadata()?.len() >= CHUNK as u64 => file,
+                        _ => return Err(self.damaged(format!("a page in chunk {number}, which is not there whole"))),
+                    };
+                    let map = memmap2::MmapOptions::new().len(CHUNK).map_raw_read_only(&file)?;
+                    let first = map.as_mut_ptr();
+                    lock(maps).push(map);
+                    known.store(first, Ordering::Release);
+                    return Ok(first);
+                }
                 if !make {
                     return Err(self.damaged(format!("a page in chunk {number}, which was never made")));
                 }
@@ -1141,6 +1200,9 @@ impl Space {
     /// # Errors
     /// The writer's lock cannot be taken, or the space is damaged.
     pub fn write(&self) -> Result<Txn<'_>> {
+        if self.left.is_some() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "a space left behind is read, never written").into());
+        }
         let writing = lock(&self.writing);
         if let Backing::Files { writer, .. } = &self.backing {
             writer.lock()?;
@@ -1784,8 +1846,8 @@ impl Drop for Txn<'_> {
     }
 }
 
-/// The spaces this process has attached (`shared`), each by its folder.
-static OPEN: Mutex<Vec<(PathBuf, std::sync::Weak<Space>)>> = Mutex::new(Vec::new());
+/// The spaces this process has attached (`shared`), each by its folder: for as long as it runs.
+static OPEN: Mutex<Vec<(PathBuf, Arc<Space>)>> = Mutex::new(Vec::new());
 
 /// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::rest`): what a
 /// process does last as it ends in order - one that ends runs nothing more of its own, and whatever of it still
@@ -1794,11 +1856,13 @@ static OPEN: Mutex<Vec<(PathBuf, std::sync::Weak<Space>)>> = Mutex::new(Vec::new
 /// # Errors
 /// As `Space::rest`, of the first that could not.
 pub fn rest_all() -> io::Result<()> {
-    let attached: Vec<Arc<Space>> = lock(&OPEN).iter().filter_map(|(_, space)| space.upgrade()).collect();
+    let attached: Vec<Arc<Space>> = lock(&OPEN).iter().map(|(_, space)| space.clone()).collect();
     attached.iter().try_for_each(|space| space.rest().map(|_| ()))
 }
 
-/// The spaces this process has attached, one a folder: a second asking for one gets the same.
+/// The space kept in a folder, attached by this process once and for as long as it runs: whoever asks again gets
+/// the same. Attached to and let go of in turn, a space written meanwhile would begin anew at each turn - it is
+/// trusted, attached to alone, only as it was left in order (`Space::rest`, `rest_all` as the process ends).
 ///
 /// # Errors
 /// As `Space::open`.
@@ -1806,11 +1870,10 @@ pub fn shared(dir: &Path) -> io::Result<Arc<Space>> {
     std::fs::create_dir_all(dir)?;
     let dir = dir.canonicalize()?;
     let mut open = lock(&OPEN);
-    open.retain(|(_, space)| space.strong_count() > 0);
-    if let Some(space) = open.iter().find(|(at, _)| *at == dir).and_then(|(_, space)| space.upgrade()) {
-        return Ok(space);
+    if let Some((_, space)) = open.iter().find(|(at, _)| *at == dir) {
+        return Ok(space.clone());
     }
     let space = Arc::new(Space::open(&dir)?);
-    open.push((dir, Arc::downgrade(&space)));
+    open.push((dir, space.clone()));
     Ok(space)
 }

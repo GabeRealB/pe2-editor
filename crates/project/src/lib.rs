@@ -30,7 +30,6 @@ pub mod setup;
 pub mod shared;
 pub mod stack;
 pub mod storage;
-pub mod store;
 pub mod switches;
 pub mod uid;
 pub mod wire;

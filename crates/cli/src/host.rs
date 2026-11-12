@@ -84,6 +84,8 @@ struct Host {
     /// Where it says what it holds - the project's model, what is served, what became of what was due - a
     /// commit a refresh, whether or not a server is fed.
     says: Arc<holder::says::Says>,
+    /// The thread holding the files to what the index took of them as known, until it is done or waited for.
+    verifying: Mutex<Option<std::thread::JoinHandle<()>>>,
     state: Mutex<State>,
     leases: AtomicUsize,
     /// When the last lease ended.
@@ -146,6 +148,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         server: Mutex::new(None),
         files: Mutex::new(None),
         says: Arc::new(holder::says::Says::of(&p)),
+        verifying: Mutex::new(None),
         state: Mutex::new(state),
         leases: AtomicUsize::new(0),
         quiet_since: Mutex::new(Instant::now()),
@@ -156,9 +159,10 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         due_taken: Mutex::default(),
         asked: Mutex::new(Instant::now()),
     });
-    // The project's model, where its processes share it, holds what the index read.
-    if let Some(index) = lock(&host.state).index.as_ref() {
-        host.fill_model(index);
+    // The project's model, where its processes share it, holds what the index read; and the files are held to
+    // what it took of them as known, behind what is asked first.
+    if let Some(index) = lock(&host.state).index.as_mut() {
+        host.took(index);
     }
     // What reading the project freed, given back: it holds on for long.
     project::give_back_memory();
@@ -207,7 +211,8 @@ fn hold(p: &Project, lock: &Lock) -> Result<(Index, History)> {
     if let Some(recovered) = recovered {
         println!("{recovered}");
     }
-    Ok((Index::open(p, &cache)?, history))
+    // Over the files as the project's model has them: held to that behind what is asked first (`Host::took`).
+    Ok((Index::open_behind(p, &cache, &|_, _, _| {})?, history))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -335,12 +340,30 @@ impl Host {
         made.unwrap_or_else(|| mcp::Reply::failed("nothing was asked".into()))
     }
 
-    /// Have the project's model, where its processes share it, hold what an index just opened read: what it says
-    /// first as it takes the project, another having held it since - or nobody - and said what it would.
-    fn fill_model(&self, index: &Index) {
-        self.says.forget();
-        if let Err(e) = self.says.fill(&self.project.root, index) {
+    /// What it does of an index just opened as it takes the project: what the opening read is said in the
+    /// project's model, where its processes share it; and the files, which it took to be as the model has them,
+    /// are held to that on a thread of its own - what differs taken in as a change of files is, before the first
+    /// edit is made (`verified`).
+    fn took(self: &Arc<Self>, index: &mut Index) {
+        if let Err(e) = self.says.took(&self.project.root, index) {
             eprintln!("{e}");
+        }
+        let (verify, host) = (index.verification(), Arc::downgrade(self));
+        let verifying = std::thread::Builder::new().name("verify".into()).spawn(move || {
+            let differing = verify();
+            if let Some(host) = host.upgrade().filter(|_| !differing.is_empty()) {
+                println!("{} files were not as they were known: taken in", differing.len());
+                host.take_in(&differing);
+            }
+        });
+        *lock(&self.verifying) = verifying.ok();
+    }
+
+    /// Wait until the files were held to what the index took of them as known (`took`): what an edit does first.
+    fn verified(&self) {
+        let verifying = lock(&self.verifying).take();
+        if let Some(verifying) = verifying {
+            let _ = verifying.join();
         }
     }
 
@@ -408,6 +431,8 @@ impl Host {
             });
             due.map_or_else(Vec::new, |due| due.iter().copied().zip(became).collect())
         };
+        // Over the files as they are: held first to what the index took of them as known.
+        self.verified();
         let mut state = lock(&self.state);
         let State { index, listing, held, written, reading, .. } = &mut *state;
         let (Some(index), Some(held)) = (index.as_mut(), held) else { return None };
@@ -721,7 +746,7 @@ impl Host {
                 if let Some(recovered) = recovered {
                     println!("{recovered}");
                 }
-                let index = Index::open(&self.project, &cache)?;
+                let index = Index::open_behind(&self.project, &cache, &|_, _, _| {})?;
                 anyhow::Ok((history, index))
             })();
             match held {
@@ -730,7 +755,8 @@ impl Host {
                     if let Err(e) = self.keep_server() {
                         eprintln!("its folder is not served: {e:#}");
                     }
-                    self.fill_model(&index);
+                    let mut index = index;
+                    self.took(&mut index);
                     self.feed_whole(&index, &mut state.listing);
                     state.index = Some(index);
                     state.held = Some(Held { link: None, history, lock: taken });
@@ -753,10 +779,6 @@ impl Host {
             self.forget_reading();
             if looked.elapsed() > Duration::from_secs(1) {
                 looked = Instant::now();
-                // What its index read is written to the cache's store here, between edits, not in one.
-                if let Some(index) = &lock(&self.state).index {
-                    index.tick();
-                }
                 // Started to keep the folder served, it stops where that is stopped.
                 if self.server_gone() && self.serve.is_some() {
                     break;

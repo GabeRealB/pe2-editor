@@ -40,8 +40,8 @@ fn totals_map() -> &'static Mutex<HashMap<String, Total>> {
     TOTALS.get_or_init(Mutex::default)
 }
 
-/// The crates whose spans are kept: the editor's and its tools'. Libraries' own (turso's, per page and instruction:
-/// millions in an extraction) would cost more than what they time.
+/// The crates whose spans are kept: the editor's and its tools'. Libraries' own (one a page or an instruction
+/// they run: millions in an extraction) would cost more than what they time.
 const OURS: [&str; 9] = ["project", "cli", "pe2_cli", "editor", "mcp", "extensions", "pe2_ext", "holder", "vfs"];
 
 /// Install the spans' subscriber for this process: the totals, and Tracy where built with it, of this workspace's

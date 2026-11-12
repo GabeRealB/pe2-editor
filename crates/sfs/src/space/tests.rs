@@ -415,6 +415,17 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             let alone = Space::open(&dir).unwrap();
             assert!(alone.fresh());
             assert_eq!(alone.read().unwrap().root(0), 0);
+            // What it held is kept beside it, as its processes left it: read, it is what the last commit held.
+            let left = Space::left_behind(&dir).unwrap().expect("what the space held is kept");
+            same(&left.read().unwrap(), &model);
+            assert!(left.write().is_err(), "a space left behind was to be written");
+            drop(left);
+            // Begun anew once more, what is kept is what was there then: nothing was committed to it.
+            drop(alone);
+            let alone = Space::open(&dir).unwrap();
+            assert!(alone.fresh() && Space::left_behind(&dir).unwrap().is_none());
+            Space::forget_left(&dir);
+            assert!(!dir.join("left").exists());
             drop(alone);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -657,6 +668,14 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
     space.flush().unwrap();
     let later = pages_of(&dir);
     drop(space);
+    // What the space held at the commits a disk may have whole: when it was had on disk, and the last two.
+    let held_at = |made: u64| {
+        let mut held = Model::new();
+        after("p", made, 100, &mut held);
+        held
+    };
+    let commits = [held_at(80), held_at(299), held_at(300)];
+    let (mut left_right, mut left_said) = (0, 0);
     let (mut anew, mut right, mut said) = (0, 0, 0);
     for seed in 0..48u64 {
         let mut rng = Rng::of("disk", seed);
@@ -682,6 +701,26 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
             }
             std::fs::write(mixed.join(name), bytes).unwrap();
         }
+        // Not said clean, it begins anew, and what the disk kept is read beside it: what one of those commits
+        // held, or it says that a page is not the one pointed to. Never anything else.
+        let unclean = folder(&format!("disk-{seed}-unclean"));
+        std::fs::create_dir_all(&unclean).unwrap();
+        for entry in std::fs::read_dir(&mixed).unwrap().flatten() {
+            std::fs::copy(entry.path(), unclean.join(entry.file_name())).unwrap();
+        }
+        let begun = Space::open(&unclean).unwrap();
+        assert!(begun.fresh());
+        let left = Space::left_behind(&unclean).unwrap().expect("what the disk kept is kept");
+        match left.read().and_then(|read| listed(&read)) {
+            Ok(all) => {
+                assert!(commits.contains(&all), "seed {seed}: read of what was left as something it never held");
+                left_right += 1;
+            }
+            Err(Error::Damaged(_)) => left_said += 1,
+            Err(Error::Io(e)) => panic!("seed {seed}: {e}"),
+        }
+        drop((left, begun));
+        std::fs::remove_dir_all(&unclean).unwrap();
         // And said clean all the same, as it was when that was true.
         std::fs::write(mixed.join("clean"), &before["clean"]).unwrap();
         let space = Space::open(&mixed).unwrap();
@@ -715,6 +754,7 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
         std::fs::remove_dir_all(&mixed).unwrap();
     }
     assert!(anew > 0 && right > 0 && said > 0, "begun anew {anew}, read right {right}, said damaged {said}");
+    assert!(left_right > 0 && left_said > 0, "what was left: read right {left_right}, said damaged {left_said}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

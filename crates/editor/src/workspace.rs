@@ -502,6 +502,8 @@ pub struct Opened {
     files: Option<Arc<crate::files::Files>>,
     /// Where it says what it holds, where the project's processes share it: the take-in worker's, from here on.
     says: Arc<holder::says::Says>,
+    /// What tells which files are not as the index took them to be (`Index::verification`): the worker's first job.
+    verify: crate::takein::Verify,
 }
 
 /// What agents ask of the editor's own state, answered while the imports attach as the user has it then: what it shows,
@@ -576,14 +578,9 @@ impl Drop for Leaving {
         // What may still write: the worker finishes the job it is on, an epoch running is given up.
         self.takein = None;
         self.runner = None;
-        // The index writes through its store alone: closed, the project is whoever takes it next's, while the index
-        // itself is freed after - some tenths of a second for a large project, which a host standing by would wait.
-        // Where something else still has the index, it goes first, as it did.
-        let mut index = self.index.take();
-        match index.as_mut().and_then(Arc::get_mut) {
-            Some(index) => index.let_go_of_store(),
-            None => index = None,
-        }
+        // With nothing left that writes, the project is whoever takes it next's, while the index itself is freed
+        // after - some tenths of a second for a large project, which a host standing by would wait.
+        let index = self.index.take();
         self.lock = None;
         self.files = None;
         self.handing = None;
@@ -684,9 +681,12 @@ impl Workspace {
         // It holds the project to stay: what its first edit would wait for is made ahead of it.
         history.prepare();
         let history = history.journaled();
-        let index = Index::open_reporting(&project, &cache, report)?;
-        // The project's model, where its processes share it, holds what the index read.
-        if let Err(e) = says.fill(&project.root, &index) {
+        // Over the files as the project's model has them: held to that by the worker, behind what shows first and
+        // before the first edit (`TakeIn::verify`).
+        let mut index = Index::open_behind(&project, &cache, report)?;
+        let verify = Box::new(index.verification());
+        // The project's model, where its processes share it, holds what the opening read.
+        if let Err(e) = says.took(&project.root, &mut index) {
             eprintln!("{e}");
         }
         // What is served of it, listed for the server, which has no index: it serves from this first listing on.
@@ -721,6 +721,7 @@ impl Workspace {
             link,
             files,
             says,
+            verify,
         })
     }
 
@@ -742,6 +743,7 @@ impl Workspace {
             link,
             files,
             says,
+            verify,
             ..
         } = opened;
         let (link, link_error) = match link {
@@ -772,7 +774,10 @@ impl Workspace {
             files: files.clone(),
             unsaid: crate::takein::Unsaid::default(),
             shown: None,
+            changed_behind: false,
         });
+        // The files held to what the index took of them as known, first: what an edit waits for.
+        takein.verify(verify);
         let attaching = takein.attach();
         let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
         let mut workspace = Workspace {

@@ -3,13 +3,17 @@
 //! (overrides, moves, deletes). An asset comes with its `node.toml`, its files, which assets' slots reference it,
 //! and what is wrong.
 //!
-//! The index persists in the project cache's store (`store.rs`, `index.db`): for every file it read, its stamp, the
-//! hash of its content, and for an `node.toml` what the index needs of it - its type, variant names and
-//! references - besides its text, which an asset parses only when its fields are asked for. Opening a project stats
-//! every file and reads again only those whose stamp changed; a file the store knows that no layer holds any more is
-//! dropped from it. A file modified no earlier than its record was made is read again whatever its stamp (git's
-//! "racily clean" case). While the project is open, `refresh` takes the paths a watcher reports and scans again only
-//! what they touch; each writes only the rows it changed.
+//! What the index read of each file is kept in the project's model, where its processes share it (`model`): its
+//! stamp, the hash of its content, and for an `node.toml` what the index needs of it - its type, variant names and
+//! references - besides its text, which an asset parses only when its fields are asked for. An index opens over
+//! what the model holds (`model::known`), and whoever holds the project says back what the opening read anew
+//! (`model::took`). Opening stats every file and reads again only those whose stamp changed; a file the model knows
+//! that no layer holds any more is dropped from it. A file modified no earlier than its record was made is read
+//! again whatever its stamp (git's "racily clean" case). Whoever holds a project to stay opens without that
+//! (`open_behind`): the records are taken as the model has them, and the files held to them behind its first
+//! answers (`verification`), what differs taken in as a change of files is. While the project is open, `refresh`
+//! takes the paths a watcher reports and scans again only what they touch, and says what it changed of the model
+//! (`Refreshed::model`).
 //!
 //! Entries a layer holds but its changeset does not list are unlisted: where the layer can be written the index lists
 //! them, a create each with a new uid (an `node.toml`'s own `uid`, as declarations wrote them before changesets, is
@@ -24,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cache::Cache;
 use crate::changeset::{self, Base, Changeset, Op};
 use crate::extract::sha1_hex;
-pub use crate::store::Stamp;
-use crate::store::{Declaration, Record, Store};
+pub use crate::model::Stamp;
+use crate::model::{Declaration, Record};
 use crate::{FILE, Layer, LayerKind, Project, uid};
 
 pub const BUNDLE_SUFFIX: &str = ".node";
@@ -71,7 +75,6 @@ struct Memo {
     sha1: String,
     conflicts: Vec<crate::merge::Conflict>,
 }
-const STORE: &str = "index.db";
 
 /// A file of a bundle, from the layer whose version of the asset wins.
 #[derive(Clone, Debug)]
@@ -1143,8 +1146,9 @@ pub struct Index {
     layers: Vec<LayerState>,
     /// Each file's record, shared with the snapshots made of the index.
     records: Arc<HashMap<PathBuf, Arc<Record>>>,
-    /// Where the records are kept between runs: none while another process has it (`let_go_of_store`).
-    store: Option<Arc<Store>>,
+    /// What its opening read that differs from what it opened over, of the project's model: for whoever holds the
+    /// project to say there (`take_opened`, `model::took`).
+    opened: crate::model::Delta,
     resolved: Arc<BTreeMap<String, Node>>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
@@ -1186,11 +1190,12 @@ impl Index {
         self.layers.iter().find(|l| l.name == layer).is_some_and(|l| l.place.ignores(path))
     }
 
-    /// Index a project's layers, through its cache: only files whose stamp changed are read. Unlisted entries of the
-    /// layers that can be written are listed in their changesets.
+    /// Index a project's layers, over what the project's model holds of their files (`model::known`): only files
+    /// whose stamp changed are read. Unlisted entries of the layers that can be written are listed in their
+    /// changesets. By whoever holds the project, as its cache says.
     ///
     /// # Errors
-    /// A changeset cannot be read or written, or the cache cannot be written.
+    /// A changeset cannot be read or written.
     pub fn open(project: &Project, cache: &Cache) -> Result<Index> {
         Index::open_reporting(project, cache, &|_, _, _| {})
     }
@@ -1199,27 +1204,31 @@ impl Index {
     ///
     /// # Errors
     /// As `open`.
-    pub fn open_reporting(project: &Project, cache: &Cache, report: &Report<'_>) -> Result<Index> {
+    pub fn open_reporting(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
         let _span = tracing::info_span!("index open").entered();
-        report("Reading what the cache knows", 0, 0);
-        Index::over(Some(Arc::new(Store::open(&cache.path(STORE))?)), project, report)
+        report("Reading what is known of the files", 0, 0);
+        Index::over(crate::model::known(&project.root), true, project, report)
     }
 
-    /// Open the index without the cache's store, which another process has: every file read, and its records kept in
-    /// memory alone (until `keep_records`).
+    /// Open the index as `open_reporting` does, but taking the files to be as the model has them: none is looked
+    /// at but those it knows nothing of. For whoever holds the project to stay, who holds the files to their
+    /// records behind its first answers (`verification`) and before its first edit.
+    ///
+    /// # Errors
+    /// As `open`.
+    pub fn open_behind(project: &Project, _cache: &Cache, report: &Report<'_>) -> Result<Index> {
+        let _span = tracing::info_span!("index open").entered();
+        report("Reading what is known of the files", 0, 0);
+        Index::over(crate::model::known(&project.root), false, project, report)
+    }
+
+    /// Open the index over nothing known: every file read. What an index is held to, and what one opens as where
+    /// nothing may be known of the project.
     ///
     /// # Errors
     /// A layer cannot be read.
     pub fn without_store(project: &Project) -> Result<Index> {
-        Index::over(None, project, &|_, _, _| {})
-    }
-
-    /// Write to the cache's store what the index read and has not written there yet, where that has waited a
-    /// moment: asked by whoever holds the index while nothing is asked of it.
-    pub fn tick(&self) {
-        if let Some(store) = &self.store {
-            let _ = store.tick();
-        }
+        Index::over(HashMap::new(), true, project, &|_, _, _| {})
     }
 
     /// The record of every file the layers hold, as it was last read: what the model the project's processes share
@@ -1229,41 +1238,46 @@ impl Index {
         files.filter_map(|file| Some((file.as_path(), &**self.records.get(file)?)))
     }
 
-    /// Stop keeping the records in the cache's store, and close it, for another process to open: what is read from now
-    /// on is kept in memory alone, until `keep_records`.
-    pub fn let_go_of_store(&mut self) {
-        // What it was still to be given is written first: whoever opens it next reads what this one read.
-        if let Some(store) = self.store.take() {
-            let _ = store.flush();
+    /// What its opening read that differs from what it opened over, taken out: said in the project's model by
+    /// whoever holds the project (`model::took`).
+    pub fn take_opened(&mut self) -> crate::model::Delta {
+        std::mem::take(&mut self.opened)
+    }
+
+    /// What tells which files are not as their records say - changed, gone, or read in the moment they were
+    /// changed in - for a thread of its own: what an index opened behind (`open_behind`) is held to. What it
+    /// returns is taken in as a change of those files (`refresh`).
+    pub fn verification(&self) -> impl FnOnce() -> Vec<PathBuf> + Send + 'static {
+        let records = self.records.clone();
+        let files: Vec<PathBuf> = self.layers.iter().flat_map(|layer| layer.scan.all_files().cloned()).collect();
+        move || {
+            let _span = tracing::info_span!("index: the files held to their records").entered();
+            let stale = files.iter().zip(stat_all(&files)).filter(|(file, (size, modified))| match (size, records.get(*file)) {
+                (Some(size), Some(record)) => !(record.size == *size && record.modified == *modified && *modified < record.recorded),
+                (None, None) => false,
+                _ => true,
+            });
+            let mut stale: Vec<PathBuf> = stale.map(|(file, _)| file.clone()).collect();
+            stale.sort();
+            stale.dedup();
+            stale
         }
     }
 
-    /// Keep the records in the cache's store again, opened anew: what it has is the last holder's, and what changes
-    /// from now on is written to it.
-    ///
-    /// # Errors
-    /// The store cannot be opened.
-    pub fn keep_records(&mut self, cache: &Cache) -> Result<()> {
-        self.store = Some(Arc::new(Store::open(&cache.path(STORE))?));
-        Ok(())
-    }
-
-    /// The index of the project as `project.toml` has it now, opened over this one's store, which stays open; this
+    /// The index of the project as `project.toml` has it now, opened over what this one knows of the files; this
     /// one goes on answering until it is let go.
     ///
     /// # Errors
-    /// A layer or the store cannot be read.
+    /// A layer cannot be read.
     pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let mut index = Index::over(self.store.clone(), project, report)?;
+        let known = self.records.iter().map(|(file, record)| (file.clone(), (**record).clone())).collect();
+        let mut index = Index::over(known, true, project, report)?;
         index.set_working(self.working.as_ref().clone());
         Ok(index)
     }
 
-    fn over(store: Option<Arc<Store>>, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let mut known = {
-            let _span = tracing::info_span!("index store load").entered();
-            store.as_ref().map(|s| s.load()).transpose()?.unwrap_or_default()
-        };
+    /// Over what is `known` of the files: each held to its file where `held`, else taken as it is.
+    fn over(mut known: HashMap<PathBuf, Record>, held: bool, project: &Project, report: &Report<'_>) -> Result<Index> {
         // Its records layers, placed through the stack: what their scans and changesets are read from.
         crate::records::Set::open(project)?;
         let mut layers = Vec::new();
@@ -1294,7 +1308,7 @@ impl Index {
             records: Arc::default(),
             merged: project.root.join(crate::cache::DIR).join("merged"),
             objects: crate::chunks::Store::at(&project.root),
-            store,
+            opened: crate::model::Delta::default(),
             resolved: Arc::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -1310,18 +1324,34 @@ impl Index {
         };
         let files: Vec<PathBuf> = index.layers.iter().flat_map(|l| l.scan.all_files().cloned()).collect();
         report("Reading the files that changed", 0, files.len());
-        let read = {
+        let read = if held {
             let _span = tracing::info_span!("index stat and read").entered();
             index.load_records(&files, |path, size, modified| {
                 known.remove(path).filter(|r| r.size == size && r.modified == modified && modified < r.recorded)
             })
+        } else {
+            let _span = tracing::info_span!("index: records taken as known").entered();
+            // As known, each: only those nothing is known of are looked at, and read.
+            let records = Arc::make_mut(&mut index.records);
+            let mut unknown = Vec::new();
+            for file in &files {
+                match known.remove(file) {
+                    Some(record) => drop(records.insert(file.clone(), Arc::new(record))),
+                    // One two layers hold is known once.
+                    None if records.contains_key(file) => {}
+                    None => unknown.push(file.clone()),
+                }
+            }
+            index.load_records(&unknown, |_, _, _| None)
         };
         index.read = read.len();
-        // What is left of what the store knew no layer holds any more.
-        let gone: Vec<&Path> = known.keys().map(PathBuf::as_path).collect();
-        if let Some(store) = &index.store {
-            let _span = tracing::info_span!("index store write").entered();
-            store.write(read.iter().map(|p| (p.as_path(), &*index.records[p])), gone)?;
+        // What it read anew, and what is left of what was known and no layer holds any more: what differs of the
+        // project's model, for whoever holds the project to say there.
+        for file in known.keys() {
+            index.opened.file(&project.root, file, None);
+        }
+        for file in &read {
+            index.opened.file(&project.root, file, index.records.get(file).map(|record| &**record));
         }
         report("Resolving the layers", 0, 0);
         {
@@ -1677,11 +1707,8 @@ impl Index {
         let (read, vanished) = tracing::info_span!("refresh: files looked at and read").in_scope(|| self.reload(&files, &reported));
         gone.extend(vanished);
         self.read = read.len();
-        let records = read.iter().filter_map(|p| Some((p.as_path(), &**self.records.get(p)?)));
-        if let Some(store) = &self.store {
-            store.write_later(records, gone.iter().map(PathBuf::as_path))?;
-        }
-        // And the same of the model the project's processes share: those gone first, one of them may have come back.
+        // What that changed of the model the project's processes share: those gone first, one of them may have
+        // come back.
         for file in &gone {
             refreshed.model.file(&project.root, file, None);
         }
@@ -3268,7 +3295,7 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
-    use super::{Index, Problem, STORE};
+    use super::{Index, Problem};
     use crate::Project;
     use crate::cache::Cache;
     use crate::changeset::{Base, Changeset, Op};
@@ -3332,7 +3359,11 @@ mod tests {
         let project = Project::load(root).unwrap();
         // Held while opening; released for the test's next opening.
         let lock = Lock::try_acquire(root, "a test").unwrap();
-        let index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        let mut index = Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap();
+        // As whoever holds a project does: what the opening read is said in the project's model, and the space
+        // it is in left in order.
+        crate::model::took(root, &mut index).unwrap();
+        crate::shared::space(root).unwrap().rest().unwrap();
         (project, index)
     }
 
@@ -3633,12 +3664,17 @@ mod tests {
     }
 
     #[test]
-    fn wipes_a_foreign_cache() {
+    fn what_is_known_of_the_files_outlasts_a_cache_wiped() {
         let root = project("foreign");
-        open(&root);
-        assert!(root.join(".cache").join(STORE).exists());
-        std::fs::write(root.join(".cache/version"), "schema 0\n").unwrap();
         assert_eq!(open(&root).1.read, 4);
+        assert!(crate::shared::space_at(&root).join("clean").exists());
+        assert_eq!(open(&root).1.read, 0);
+        // A cache another wrote is wiped, but for what the project's processes share - which says its own format,
+        // and of which schema of the cache it is: what is known of the files is known still.
+        std::fs::write(root.join(".cache/version"), "schema 0\n").unwrap();
+        std::fs::write(root.join(".cache/left.before"), "").unwrap();
+        assert_eq!(open(&root).1.read, 0);
+        assert!(!root.join(".cache/left.before").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -55,19 +55,16 @@ impl Says {
         *self.current() = None;
     }
 
-    /// Have the model hold what an index read of the project's files, and nothing else of them: what whoever
-    /// takes a project says first, by what differs from what the space kept.
+    /// Say in the project's model what an index just opened read that differs from what it opened over
+    /// (`project::model::took`), and forget what was said here of what is served - another held the project
+    /// since, or nobody: what whoever takes a project does first.
     ///
     /// # Errors
     /// The space is not there, or cannot be written.
-    pub fn fill(&self, root: &std::path::Path, index: &project::index::Index) -> Result<(), String> {
-        let _span = tracing::info_span!("model: filled with what the index read").entered();
-        let space = self.shared.as_ref().map_err(Clone::clone)?;
-        let filled = space.write().and_then(|mut txn| {
-            project::model::fill_files(&mut txn, root, index.file_records())?;
-            txn.commit()
-        });
-        filled.map_err(|e| format!("the project's model could not be said in the shared space: {e}"))
+    pub fn took(&self, root: &std::path::Path, index: &mut project::index::Index) -> Result<(), String> {
+        self.forget();
+        self.shared.as_ref().map_err(Clone::clone)?;
+        project::model::took(root, index).map_err(|e| format!("the project's model could not be said in the shared space: {e}"))
     }
 
     /// Say, in one commit: what a refresh changed of the model, what is served after it, and what became of what

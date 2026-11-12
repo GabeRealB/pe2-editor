@@ -113,12 +113,7 @@ notify = "8"
 # Ending a served mount cleanly on Ctrl-C (`pe2-cli project mount`).
 ctrlc = { version = "3", features = ["termination"] }
 cpal = "0.15.3"
-# SQLite in Rust, for the project cache's index (no C to build for any target). Pinned: it is pre-1.0. Its default
-# features bring mimalloc (C) and full-text search, which the cache needs neither of.
-turso = { version = "=0.8.3", default-features = false }
 pollster = "0.4"
-# Turso's `branches` takes a path current nightlies removed (core::intrinsics::abort) unless its std feature is on.
-branches = { version = "0.4", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 png = "0.18"
 miniz_oxide = "0.8"

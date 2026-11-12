@@ -50,7 +50,13 @@ pub const SPACE: &str = "space";
 /// # Errors
 /// As `sfs::space::shared`.
 pub fn space(root: &Path) -> std::io::Result<std::sync::Arc<sfs::Space>> {
-    sfs::space::shared(&root.join(crate::cache::DIR).join(crate::cache::STAGING).join(SPACE))
+    sfs::space::shared(&space_at(root))
+}
+
+/// Where a project's shared space is kept.
+#[must_use]
+pub fn space_at(root: &Path) -> PathBuf {
+    root.join(crate::cache::DIR).join(crate::cache::STAGING).join(SPACE)
 }
 
 /// The pages kept of what is read of the files of the project in `root` (`sfs::ring`), of about this many bytes:

@@ -8,7 +8,10 @@
 //! writer's lock. Every value begins with the generation of the commit that put it: what a process keeps of a
 //! value it decoded is told from another by it.
 //!
-//! So far it holds each file's record (`store::Record`), written beside the index's own.
+//! So far it holds each file's record (`Record`): what the index keeps between runs, where it kept a database of
+//! its own. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
+//! because a process died or the power went, over what that space kept beside it, each record held to its file -
+//! and whoever holds the project says back what the opening read anew (`took`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -16,7 +19,35 @@ use std::sync::Arc;
 
 use sfs::space::{Pages, Result, Txn};
 
-use crate::store::{Declaration, Record};
+/// A modification time as seconds and nanoseconds since the epoch.
+pub type Stamp = (u64, u32);
+
+/// What the index needs of an `node.toml` without parsing it again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Declaration {
+    /// What of its stack says what it makes.
+    pub shape: String,
+    /// The uid it names itself, as declarations did before changesets.
+    pub uid: Option<String>,
+    /// Its `variants`' names, in order.
+    pub variants: Vec<String>,
+    /// Its references: (slot or field, uid, target path, the output of the asset it names - empty for the asset).
+    pub references: Vec<(String, String, String, String)>,
+    /// Why it cannot be parsed.
+    pub error: Option<String>,
+    pub text: Arc<str>,
+}
+
+/// What the index knows of a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    pub size: u64,
+    pub modified: Stamp,
+    /// When it was read: a record is trusted only for a file last modified before (git's "racily clean" case).
+    pub recorded: Stamp,
+    pub sha1: String,
+    pub declaration: Option<Declaration>,
+}
 
 /// The tree of what is read: the model's own word of itself, and each file's record and text.
 pub const INPUTS: usize = 4;
@@ -26,7 +57,9 @@ pub const STACK: usize = 6;
 pub const ASSETS: usize = 7;
 pub const LINKS: usize = 12;
 
-/// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again.
+/// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
+/// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
+/// of the files changes.
 const FORMAT: u32 = 1;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text.
@@ -172,12 +205,12 @@ fn key(kind: u8, name: &str) -> Vec<u8> {
     key
 }
 
-fn stamp(out: &mut Out, (secs, nanos): crate::store::Stamp) {
+fn stamp(out: &mut Out, (secs, nanos): Stamp) {
     out.u64(secs);
     out.u32(nanos);
 }
 
-fn stamped(read: &mut In<'_>) -> Option<crate::store::Stamp> {
+fn stamped(read: &mut In<'_>) -> Option<Stamp> {
     Some((read.u64()?, read.u32()?))
 }
 
@@ -233,11 +266,13 @@ fn hex(text: &str) -> Option<[u8; 20]> {
 }
 
 fn hexed(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 15)]));
+    }
+    text
 }
 
 /// A file's record read back, with the name it says where its key could not: its declaration's text is to be
@@ -274,7 +309,7 @@ fn text(text: &str) -> Vec<u8> {
 
 /// What a refresh changes of the model, gathered as it goes and applied whole (`apply`): each key of a tree given
 /// a value, or taken away, in the order it was said.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Delta {
     changes: Vec<(usize, Vec<u8>, Option<Vec<u8>>)>,
 }
@@ -337,7 +372,8 @@ const TREES: [usize; 5] = [INPUTS, RECORDS, STACK, ASSETS, LINKS];
 /// Whether the trees hold a model of this format.
 fn is_begun(pages: &impl Pages) -> Result<bool> {
     let said = sfs::tree::get_in(pages, INPUTS, &[META])?;
-    Ok(said.is_some_and(|said| In::after_stamp(&said).and_then(|mut said| said.u32()) == Some(FORMAT)))
+    let said = said.as_deref().and_then(In::after_stamp).and_then(|mut said| Some((said.u32()?, said.u32()?)));
+    Ok(said == Some((FORMAT, crate::cache::SCHEMA)))
 }
 
 /// Have the trees hold a model of this format: one of another, or what a space keeps of none, is taken away, for
@@ -364,6 +400,7 @@ fn meta(generation: u64) -> Vec<u8> {
     let mut out = Out::new();
     out.0[..8].copy_from_slice(&generation.to_le_bytes());
     out.u32(FORMAT);
+    out.u32(crate::cache::SCHEMA);
     out.0
 }
 
@@ -410,6 +447,43 @@ pub fn fill_files<'a>(txn: &mut Txn<'_>, root: &Path, records: impl Iterator<Ite
     for (key, now) in wanted {
         sfs::tree::put(txn, INPUTS, &key, &now)?;
     }
+    Ok(())
+}
+
+/// The records of the project's files as its processes last left them, for an index to open over: what the model
+/// holds, where the shared space holds one; else what a space that was begun anew - a process died, the power
+/// went - kept beside it (`sfs::Space::left_behind`), where that reads whole; else none. Whoever opens over them
+/// holds each to its file.
+#[must_use]
+pub fn known(root: &Path) -> HashMap<PathBuf, Record> {
+    let _span = tracing::info_span!("model: the files' records read").entered();
+    let Ok(space) = crate::shared::space(root) else { return HashMap::new() };
+    let held = space.read().and_then(|read| is_begun(&read)?.then(|| files(&read, root)).transpose());
+    if let Ok(Some(held)) = held {
+        return held;
+    }
+    let left = sfs::Space::left_behind(&crate::shared::space_at(root)).ok().flatten();
+    left.and_then(|left| files(&left.read().ok()?, root).ok()).unwrap_or_default()
+}
+
+/// Say in the model what an index just opened read: what differs from what it opened over (`Index::take_opened`)
+/// where the model holds that, else all it read. What whoever holds the project does as it takes it.
+///
+/// # Errors
+/// The shared space is not there, or cannot be written.
+pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()> {
+    let _span = tracing::info_span!("model: what the opening read said").entered();
+    let opened = index.take_opened();
+    let space = crate::shared::space(root)?;
+    let mut txn = space.write()?;
+    if is_begun(&txn)? {
+        opened.apply(&mut txn)?;
+    } else {
+        fill_files(&mut txn, root, index.file_records())?;
+    }
+    txn.commit()?;
+    // What a space begun anew kept beside it is no longer what is known of the files.
+    sfs::Space::forget_left(&crate::shared::space_at(root));
     Ok(())
 }
 
@@ -461,10 +535,22 @@ pub fn files(pages: &impl Pages, root: &Path) -> Result<HashMap<PathBuf, Record>
     if let Some(failed) = failed {
         return Err(failed);
     }
+    // The declarations' texts, all of them in one pass over their keys: each by the key its file's name makes.
+    let mut texts: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    sfs::tree::scan_prefix(pages, INPUTS, &[TEXT], &mut |key, value| {
+        match value.get(8..).and_then(|text| std::str::from_utf8(text).ok()) {
+            Some(text) => drop(texts.insert(key.to_vec(), Arc::from(text))),
+            None => failed = Some(invalid("a declaration's text that is none")),
+        }
+        failed.is_none()
+    })?;
+    if let Some(failed) = failed {
+        return Err(failed);
+    }
     let mut read = HashMap::with_capacity(files.len());
     for (path, (name, mut record)) in files {
         if let Some(declaration) = &mut record.declaration {
-            declaration.text = declared(pages, &name)?;
+            declaration.text = texts.remove(&key(TEXT, &name)).ok_or_else(|| invalid("a declaration with no text"))?;
         }
         read.insert(path, record);
     }
@@ -618,6 +704,34 @@ mod tests {
     }
 
     #[test]
+    fn what_processes_that_died_left_of_the_files_is_known_to_who_comes_next() {
+        let root = std::env::temp_dir().join(format!("pe2-model-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let at = crate::shared::space_at(&root);
+        std::fs::create_dir_all(&at).unwrap();
+        let now = files_of(&root, 300);
+        {
+            // As a holder that is killed: its model said, the space never left in order.
+            let space = sfs::Space::open(&at).unwrap();
+            let mut txn = space.write().unwrap();
+            fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+            txn.commit().unwrap();
+        }
+        // Who attaches next finds the space begun anew - and what it held beside it, read whole.
+        assert_eq!(known(&root), now);
+        let space = crate::shared::space(&root).unwrap();
+        assert!(space.fresh() && at.join("left").is_dir());
+        assert!(files(&space.read().unwrap(), &root).unwrap().is_empty());
+        // Said again in the space as it is now, it is known from there, and what was kept beside it goes.
+        let mut txn = space.write().unwrap();
+        fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        txn.commit().unwrap();
+        sfs::Space::forget_left(&at);
+        assert_eq!(known(&root), now);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_file_is_named_by_where_it_is_in_the_project_wherever_that_is() {
         let (here, there) = (Path::new("/home/someone/project"), Path::new("/mnt/other/project"));
         let file = here.join(".layers").join("game").join("a.node").join("node.toml");
@@ -637,6 +751,7 @@ mod tests {
         // As a format before this one left it: its word of itself another, and keys this one knows nothing of.
         let mut said = Out::new();
         said.u32(FORMAT + 1);
+        said.u32(crate::cache::SCHEMA);
         sfs::tree::put(&mut txn, INPUTS, &[META], &said.0).unwrap();
         sfs::tree::put(&mut txn, INPUTS, b"f/old", b"what it held").unwrap();
         sfs::tree::put(&mut txn, ASSETS, b"an asset", b"of then").unwrap();

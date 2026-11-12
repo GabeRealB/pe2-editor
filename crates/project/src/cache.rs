@@ -19,7 +19,7 @@ pub const SOCKET: &str = "editor.sock";
 /// Where what programs write through the filesystem served is staged until it is applied (`vfs::writes`).
 pub const STAGING: &str = "filesystem";
 /// Raised whenever what the cache holds changes shape.
-const SCHEMA: u32 = 2;
+pub(crate) const SCHEMA: u32 = 2;
 
 #[derive(Clone)]
 pub struct Cache {
@@ -124,13 +124,13 @@ mod tests {
         std::fs::write(root.join("project.toml"), "").unwrap();
         let project = crate::Project::load(&root).unwrap();
         let lock = crate::lock::Lock::try_acquire(&root, "a test").unwrap();
-        for name in [super::SOCKET, "index.db"] {
+        for name in [super::SOCKET, "left.before"] {
             std::fs::write(root.join(super::DIR).join(name), "").unwrap();
         }
         // No version, as a cache another wrote: wiped, but for the lock and the socket.
         let cache = super::Cache::open(&project, &lock).unwrap();
         assert!(cache.path(super::SOCKET).exists());
-        assert!(!cache.path("index.db").exists());
+        assert!(!cache.path("left.before").exists());
         drop(lock);
         let _ = std::fs::remove_dir_all(&root);
     }

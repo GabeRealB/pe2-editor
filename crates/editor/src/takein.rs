@@ -38,6 +38,9 @@ enum Job {
     Attach,
     /// The project read again, as this changed; its files too where `whole`, as they are otherwise followed already.
     Reload { why: &'static str, whole: bool },
+    /// The files held to what the index took of them as known when it was opened (`Index::open_behind`): those
+    /// that are not, taken in as paths changed.
+    Verify(Verify),
     /// Edits are about to be made of what was due (`Workspace::take_due`): nothing is said where the project's
     /// processes share it until what became of them is.
     DueBegin,
@@ -48,6 +51,9 @@ enum Job {
     #[cfg(any(test, feature = "tests"))]
     Hold(Receiver<()>),
 }
+
+/// What tells which files are not as an index opened behind took them to be (`Index::verification`).
+pub type Verify = Box<dyn FnOnce() -> Vec<PathBuf> + Send>;
 
 /// What a project read again has that the window takes up (`Workspace::take_up`).
 pub struct Reloaded {
@@ -90,8 +96,6 @@ pub struct Unsaid {
     served: Vec<Served>,
     /// What they changed of the project's model.
     model: project::model::Delta,
-    /// The index was read again whole: the model is held to all it read.
-    read_again: bool,
     /// What became of what was due, and what is done once that is said.
     answers: Vec<(u64, vfs::due::Answer)>,
     then: Vec<holder::files::Then>,
@@ -143,6 +147,8 @@ pub struct Worker {
     pub unsaid: Unsaid,
     /// The index as last handed over.
     pub shown: Option<Arc<Index>>,
+    /// Files were found not to be as the index took them when it was opened: a change of files, as any.
+    pub changed_behind: bool,
 }
 
 impl TakeIn {
@@ -168,7 +174,7 @@ impl TakeIn {
                     });
                     // Nothing was asked but to say what became of what was due: said, and nothing to hand over.
                     let Some(mut snapshot) = snapshot else { continue };
-                    snapshot.files = files;
+                    snapshot.files |= files;
                     if made.send(snapshot).is_err() {
                         return;
                     }
@@ -213,6 +219,12 @@ impl TakeIn {
             Some(jobs) => drop(jobs.send((self.issued, Job::DueEnd { answers, then }))),
             None => then(),
         }
+    }
+
+    /// Hold the files to what the index took of them as known when it was opened, and take in those that are
+    /// not; returns the job's ticket, which an edit waits for as for any.
+    pub fn verify(&mut self, verify: Verify) -> u64 {
+        self.send(Job::Verify(verify))
     }
 
     /// Take these paths in; returns the job's ticket.
@@ -338,15 +350,7 @@ impl Worker {
         use holder::says::Said;
         let _span = tracing::info_span!("take-in worker: what it came to said").entered();
         let unsaid = std::mem::take(&mut self.unsaid);
-        // An index read again whole says all it read: what the take-ins before it changed is part of that.
-        let model = if unsaid.read_again {
-            if let Err(e) = self.says.fill(&self.project.root, &self.index) {
-                eprintln!("{e}");
-            }
-            project::model::Delta::default()
-        } else {
-            unsaid.model
-        };
+        let model = unsaid.model;
         let mut served = unsaid.served;
         let said = match served.pop() {
             None => Said::Unchanged,
@@ -403,6 +407,14 @@ impl Worker {
                 Job::Reload { why, whole: all_of_it } => {
                     reload = Some(why);
                     whole |= all_of_it;
+                }
+                Job::Verify(verify) => {
+                    let differing = verify();
+                    if !differing.is_empty() {
+                        eprintln!("{} files were not as they were known: taken in", differing.len());
+                        self.changed_behind = true;
+                    }
+                    paths.extend(differing);
                 }
                 // Taken out before this (`take_in`).
                 Job::DueBegin | Job::DueEnd { .. } => {}
@@ -561,7 +573,9 @@ impl Worker {
         }
         self.index = loaded.index;
         self.extensions = loaded.extensions;
-        self.unsaid.read_again |= read;
+        // What the index read again that differs from what it knew of the files: said with what the take-in
+        // came to (`say`).
+        self.unsaid.model.and(self.index.take_opened());
         self.attach_all();
         Ok(true)
     }
@@ -603,7 +617,7 @@ impl Worker {
             reloaded: None,
             said: None,
             error,
-            files: false,
+            files: std::mem::take(&mut self.changed_behind),
             served,
         }
     }
