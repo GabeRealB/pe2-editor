@@ -11,7 +11,10 @@
 //! So far it holds each file's record (`Record`), what each layer holds (`Held`, by layer and path: its folders,
 //! plain files and bundles, as a walk of it finds them) and the records of the layers stored as records
 //! (`records::Record`, by layer and uid, each with its file's time and length): what the index keeps between
-//! runs, where it kept a database of its own, walked every layer and read every record's file as it opened. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
+//! runs, where it kept a database of its own, walked every layer and read every record's file as it opened. And
+//! of what the index derives of those, the stack applied (`Stack`: each entry it resolves, by its path, and what
+//! it says of the layers' operations, what does not add up, and what the layers need of each other), which
+//! whoever takes the project takes as it is where nothing it is made of differs. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
@@ -62,7 +65,7 @@ pub const LINKS: usize = 12;
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
 /// of the files changes.
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.
@@ -90,36 +93,41 @@ fn invalid(what: &str) -> sfs::space::Error {
 }
 
 /// A value, written.
-struct Out(Vec<u8>);
+pub(crate) struct Out(pub(crate) Vec<u8>);
 
 impl Out {
     /// A value that begins with the generation of the commit that puts it, said as it is applied.
-    fn new() -> Out {
+    pub(crate) fn new() -> Out {
         Out(vec![0; 8])
     }
 
-    fn u8(&mut self, it: u8) {
+    /// A value's own bytes, with nothing before them: what a change of the model is given, and stamps itself.
+    pub(crate) fn bare() -> Out {
+        Out(Vec::new())
+    }
+
+    pub(crate) fn u8(&mut self, it: u8) {
         self.0.push(it);
     }
 
-    fn u32(&mut self, it: u32) {
+    pub(crate) fn u32(&mut self, it: u32) {
         self.0.extend_from_slice(&it.to_le_bytes());
     }
 
-    fn u64(&mut self, it: u64) {
+    pub(crate) fn u64(&mut self, it: u64) {
         self.0.extend_from_slice(&it.to_le_bytes());
     }
 
-    fn bytes(&mut self, it: &[u8]) {
+    pub(crate) fn bytes(&mut self, it: &[u8]) {
         self.u32(u32::try_from(it.len()).unwrap_or(u32::MAX));
         self.0.extend_from_slice(it);
     }
 
-    fn text(&mut self, it: &str) {
+    pub(crate) fn text(&mut self, it: &str) {
         self.bytes(it.as_bytes());
     }
 
-    fn maybe(&mut self, it: Option<&str>) {
+    pub(crate) fn maybe(&mut self, it: Option<&str>) {
         self.u8(u8::from(it.is_some()));
         if let Some(it) = it {
             self.text(it);
@@ -128,43 +136,43 @@ impl Out {
 }
 
 /// A value, read.
-struct In<'a>(&'a [u8]);
+pub(crate) struct In<'a>(pub(crate) &'a [u8]);
 
 impl<'a> In<'a> {
     /// What a value holds after the generation that put it.
-    fn after_stamp(value: &'a [u8]) -> Option<In<'a>> {
+    pub(crate) fn after_stamp(value: &'a [u8]) -> Option<In<'a>> {
         value.get(8..).map(In)
     }
 
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, len: usize) -> Option<&'a [u8]> {
         let (taken, rest) = self.0.split_at_checked(len)?;
         self.0 = rest;
         Some(taken)
     }
 
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|it| it[0])
     }
 
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         self.take(4).and_then(|it| it.try_into().ok()).map(u32::from_le_bytes)
     }
 
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         self.take(8).and_then(|it| it.try_into().ok()).map(u64::from_le_bytes)
     }
 
-    fn bytes(&mut self) -> Option<&'a [u8]> {
+    pub(crate) fn bytes(&mut self) -> Option<&'a [u8]> {
         let len = usize::try_from(self.u32()?).ok()?;
         self.take(len)
     }
 
-    fn text(&mut self) -> Option<String> {
+    pub(crate) fn text(&mut self) -> Option<String> {
         std::str::from_utf8(self.bytes()?).ok().map(str::to_owned)
     }
 
     /// A text that may be there, read into what is given: none where what is read is no such thing.
-    fn maybe(&mut self, into: &mut Option<String>) -> Option<()> {
+    pub(crate) fn maybe(&mut self, into: &mut Option<String>) -> Option<()> {
         *into = match self.u8()? {
             0 => None,
             _ => Some(self.text()?),
@@ -175,7 +183,7 @@ impl<'a> In<'a> {
 
 /// A file's name in the model: where it is in the project's folder, by its parts - the same whatever the folder is
 /// called on this system, or where it is - or, for one elsewhere (a mount's), its whole path.
-fn name(root: &Path, path: &Path) -> String {
+pub(crate) fn name(root: &Path, path: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(within) => {
             let parts: Vec<_> = within.components().map(|part| part.as_os_str().to_string_lossy()).collect();
@@ -186,7 +194,7 @@ fn name(root: &Path, path: &Path) -> String {
 }
 
 /// The file a name is of.
-fn named(root: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn named(root: &Path, name: &str) -> Option<PathBuf> {
     if let Some(elsewhere) = name.strip_prefix('=') {
         return Some(PathBuf::from(elsewhere));
     }
@@ -330,13 +338,36 @@ pub type Recorded = (Arc<crate::records::Record>, Stamp, u64);
 /// What the model holds of the layers stored as records: each layer's records, by its name and their uids.
 pub type Records = BTreeMap<String, BTreeMap<String, Recorded>>;
 
+/// The stack applied, as the model keeps it: what it was made of besides the files, the layers' listings and
+/// their records (the layers as the project says them); each entry it resolves, by its path; and what else it
+/// says, by name - all as the index writes them, which the model takes as bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stack {
+    pub made_of: String,
+    pub nodes: BTreeMap<String, Vec<u8>>,
+    pub said: BTreeMap<String, Vec<u8>>,
+}
+
 /// What is known of a project, for an index to open over (`known`): each file's record, what each layer holds,
-/// and the records of the layers stored as records.
+/// the records of the layers stored as records, and the stack applied over them.
 #[derive(Default)]
 pub struct Known {
     pub files: HashMap<PathBuf, Record>,
     pub layers: Layers,
     pub records: Records,
+    pub stack: Option<Stack>,
+}
+
+/// What a key of `STACK` begins with: what the stack was made of; an entry it resolves; what else it says.
+const MADE_OF: u8 = b'k';
+const NODE: u8 = b'n';
+const SAID: u8 = b'b';
+
+/// A value's own bytes as the model keeps them: after the generation of the commit that puts them.
+fn after_stamp(bytes: &[u8]) -> Vec<u8> {
+    let mut value = vec![0; 8];
+    value.extend_from_slice(bytes);
+    value
 }
 
 /// What a key of `RECORDS` begins with: a record of a layer stored as records.
@@ -518,6 +549,28 @@ impl Delta {
         self.changes.push((RECORDS, key(RECORD, &name), said));
     }
 
+    /// The stack resolves this at a path now, as the index writes it - or, with none, nothing there any more.
+    pub fn node(&mut self, path: &str, now: Option<&[u8]>) {
+        // A path no key holds is said with what is there.
+        let said = now.map(|now| {
+            let mut out = Out::new();
+            out.maybe((path.len() > NAMED).then_some(path));
+            out.0.extend_from_slice(now);
+            out.0
+        });
+        self.changes.push((STACK, key(NODE, path), said));
+    }
+
+    /// The stack says this under a name now, as the index writes it.
+    pub fn said(&mut self, name: &str, now: &[u8]) {
+        self.changes.push((STACK, key(SAID, name), Some(after_stamp(now))));
+    }
+
+    /// The stack was made of this, besides what the model holds: the layers, as the project says them.
+    pub fn stack_made_of(&mut self, made_of: &str) {
+        self.changes.push((STACK, vec![MADE_OF], Some(after_stamp(made_of.as_bytes()))));
+    }
+
     /// A layer's listing was made by this (its place and the names it leaves out) - or, with none, the layer is
     /// no more.
     pub fn layer(&mut self, layer: &str, made_by: Option<&str>) {
@@ -660,9 +713,10 @@ pub fn known(root: &Path) -> Known {
         let read = &read;
         std::thread::scope(|scope| {
             let (layers, records) = (scope.spawn(|| layers(read, root)), scope.spawn(|| records(read)));
+            let stack = scope.spawn(|| stack(read));
             let files = files(read, root);
-            let (layers, records) = (layers.join().ok()?, records.join().ok()?);
-            Some(Known { files: files.ok()?, layers: layers.ok()?, records: records.ok()? })
+            let (layers, records, stack) = (layers.join().ok()?, records.join().ok()?, stack.join().ok()?);
+            Some(Known { files: files.ok()?, layers: layers.ok()?, records: records.ok()?, stack: stack.ok()? })
         })
     };
     let Ok(space) = crate::shared::space(root) else { return Known::default() };
@@ -671,6 +725,44 @@ pub fn known(root: &Path) -> Known {
     }
     let left = sfs::Space::left_behind(&crate::shared::space_at(root)).ok().flatten();
     left.and_then(|left| all(&left)).unwrap_or_default()
+}
+
+/// The stack applied, as the model holds it; none where it holds none - nothing says what one was made of.
+///
+/// # Errors
+/// The space is damaged, or holds what is none of it.
+pub fn stack(pages: &impl Pages) -> Result<Option<Stack>> {
+    if !is_begun(pages)? {
+        return Ok(None);
+    }
+    let Some(made_of) = sfs::tree::get_in(pages, STACK, &[MADE_OF])? else { return Ok(None) };
+    let made_of = made_of.get(8..).and_then(|text| std::str::from_utf8(text).ok()).ok_or_else(|| invalid("a stack made of nothing said"))?;
+    let mut stack = Stack { made_of: made_of.to_owned(), ..Stack::default() };
+    let mut failed = None;
+    sfs::tree::scan_prefix(pages, STACK, &[NODE], &mut |key, value| {
+        let read = In::after_stamp(value).and_then(|mut read| {
+            let mut long = None;
+            read.maybe(&mut long)?;
+            let path = match long {
+                Some(path) => path,
+                None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
+            };
+            Some((path, read.0.to_vec()))
+        });
+        match read {
+            Some((path, bytes)) => drop(stack.nodes.insert(path, bytes)),
+            None => failed = Some(invalid("an entry of the stack that is none")),
+        }
+        failed.is_none()
+    })?;
+    sfs::tree::scan_prefix(pages, STACK, &[SAID], &mut |key, value| {
+        match std::str::from_utf8(&key[1..]).ok().zip(value.get(8..)) {
+            Some((name, bytes)) => drop(stack.said.insert(name.to_owned(), bytes.to_vec())),
+            None => failed = Some(invalid("what the stack says that is none of it")),
+        }
+        failed.is_none()
+    })?;
+    failed.map_or(Ok(Some(stack)), Err)
 }
 
 /// What the model holds of the layers stored as records: each layer's records by uid.
@@ -754,6 +846,7 @@ pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()>
         fill_files(&mut txn, root, index.file_records())?;
         index.layers_held(root).apply(&mut txn)?;
         index.records_held().apply(&mut txn)?;
+        index.stack_held().apply(&mut txn)?;
     }
     txn.commit()?;
     // What a space begun anew kept beside it is no longer what is known of the files.
@@ -1083,11 +1176,17 @@ mod tests {
             assert!(differing.is_empty(), "{layer}: {} records differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
         }
         assert_eq!(recorded.len(), read_now.len());
+        // And the stack applied, as one applied afresh over them has it.
+        let (kept, applied) = (stack(&space.read().unwrap()).unwrap().expect("the model holds no stack"), index.stack_known());
+        let differing: Vec<_> = kept.nodes.keys().chain(applied.nodes.keys()).filter(|path| kept.nodes.get(*path) != applied.nodes.get(*path)).collect();
+        assert!(differing.is_empty(), "{} entries of the stack differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+        assert!(kept == applied, "what the stack says besides its entries, or what it was made of, differs");
+        let entries = applied.nodes.len();
         let of_records: usize = read_now.values().map(BTreeMap::len).sum();
         let holds: usize = walked.values().map(|(_, holds)| holds.len()).sum();
         let usage = space.usage().unwrap();
         eprintln!(
-            "{} files, what {} layers hold at {holds} paths and {of_records} records, the same in the model as read afresh; the space holds {} pages, {} of them free",
+            "{} files, what {} layers hold at {holds} paths, {of_records} records and the stack's {entries} entries, the same in the model as read afresh; the space holds {} pages, {} of them free",
             read.len(),
             walked.len(),
             usage.pages,

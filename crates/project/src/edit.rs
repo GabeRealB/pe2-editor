@@ -915,6 +915,7 @@ mod tests {
         crate::model::fill_files(&mut txn, &project.root, index.file_records()).unwrap();
         index.layers_held(&project.root).apply(&mut txn).unwrap();
         index.records_held().apply(&mut txn).unwrap();
+        index.stack_held().apply(&mut txn).unwrap();
         txn.commit().unwrap();
         let follows = {
             let read = shared.read().unwrap();
@@ -985,6 +986,14 @@ mod tests {
             // And of every layer stored as records the records the index read.
             let recorded = crate::model::records(&read).unwrap();
             assert_eq!(recorded, self.index.records_known(), "the model's records are not those the index read");
+            // And the stack applied, as the index has it.
+            let stack = crate::model::stack(&read).unwrap().expect("the model holds a stack");
+            let kept = self.index.stack_known();
+            if stack != kept {
+                let differing: Vec<_> = stack.nodes.keys().chain(kept.nodes.keys()).filter(|path| stack.nodes.get(*path) != kept.nodes.get(*path)).collect();
+                let said: Vec<_> = stack.said.keys().chain(kept.said.keys()).filter(|name| stack.said.get(*name) != kept.said.get(*name)).collect();
+                panic!("the model's stack is not the index's: at {differing:?}, of {said:?}, made of the same: {}", stack.made_of == kept.made_of);
+            }
             drop(read);
             // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
             // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and
@@ -1002,11 +1011,35 @@ mod tests {
             };
             assert_eq!(layers, fresh.layers_known(), "what the model has the layers hold is not what a walk of them finds");
             assert_eq!(recorded, fresh.records_known(), "the model's records are not those read afresh");
+            let afresh = fresh.stack_known();
+            if stack != afresh {
+                let differing: Vec<_> = stack.nodes.keys().chain(afresh.nodes.keys()).filter(|path| stack.nodes.get(*path) != afresh.nodes.get(*path)).collect();
+                let said: Vec<_> = stack.said.keys().chain(afresh.said.keys()).filter(|name| stack.said.get(*name) != afresh.said.get(*name)).collect();
+                panic!("the model's stack is not the one applied afresh: at {differing:?}, of {said:?}");
+            }
             let (modeled, read_afresh) = (unread(held), unread(records(&fresh)));
             if modeled != read_afresh {
                 let differing: Vec<_> =
                     modeled.keys().chain(read_afresh.keys()).filter(|path| modeled.get(*path) != read_afresh.get(*path)).collect();
                 panic!("the model's files are not those an index opened afresh reads: {differing:#?}");
+            }
+            // And whoever takes the project next, opening over the model with nothing looked at, has what one
+            // opened afresh has - the stack taken as the model has it, none applied.
+            let read = self.shared.read().unwrap();
+            let known = crate::model::Known {
+                files: crate::model::files(&read, &self.project.root).unwrap(),
+                layers: crate::model::layers(&read, &self.project.root).unwrap(),
+                records: crate::model::records(&read).unwrap(),
+                stack: crate::model::stack(&read).unwrap(),
+            };
+            drop(read);
+            let mut next = Index::open_over(known, &Project::load(&self.project.root).unwrap()).unwrap();
+            assert!(next.took_stack(), "the stack was applied again over a model that holds it");
+            assert!(next.take_opened().is_empty(), "an opening over the model found it otherwise than the model says");
+            let (taken, afresh) = (next.shown_whole(), fresh.shown_whole());
+            if taken != afresh {
+                let differing = taken.lines().zip(afresh.lines()).find(|(a, b)| a != b);
+                panic!("the index opened over the model is not the index opened afresh:\n{differing:#?}");
             }
             let (kept, afresh) = (self.index.shown_whole(), fresh.shown_whole());
             if kept != afresh {

@@ -240,7 +240,7 @@ pub struct Entry {
 }
 
 /// How an operation of a layer applies to the layers below it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OpStatus {
     Applied,
     /// An override made from another version of its entry than the one below now.
@@ -362,7 +362,7 @@ pub struct Reference {
 }
 
 /// Something wrong with the project, found by the index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Problem {
     /// An `node.toml` that cannot be parsed: the asset is listed without its fields.
     Unreadable { asset: String, error: String },
@@ -1116,6 +1116,106 @@ impl Node {
     }
 }
 
+impl Node {
+    /// As the project's model keeps it: its layers by their place in the stack, its files where they are in the
+    /// project's folder.
+    fn written(&self, root: &Path) -> Vec<u8> {
+        use crate::model::{Out, name};
+        let layer = |out: &mut Out, layer: usize| out.u32(u32::try_from(layer).unwrap_or(u32::MAX));
+        let mut out = Out::bare();
+        out.u8(match self.kind {
+            Kind::Asset => 0,
+            Kind::Folder => 1,
+            Kind::File => 2,
+        });
+        out.text(&self.uid);
+        layer(&mut out, self.home);
+        layer(&mut out, self.content.0);
+        out.text(&self.content.1);
+        layer(&mut out, self.overrides.len());
+        for over in &self.overrides {
+            layer(&mut out, *over);
+        }
+        // One past the layer that moved it; 0 for none.
+        layer(&mut out, self.moved.map_or(0, |moved| moved + 1));
+        out.u8(u8::from(self.files.is_some()));
+        for (file, path, held) in self.files.iter().flat_map(|files| files.iter()) {
+            out.u8(1);
+            out.text(file);
+            out.text(&name(root, path));
+            layer(&mut out, *held);
+        }
+        out.u8(0);
+        layer(&mut out, self.inputs.len());
+        for input in self.inputs.iter() {
+            out.text(&name(root, input));
+        }
+        out.0
+    }
+
+    /// As the project's model keeps it, read back; none where what is there is no entry.
+    fn read(root: &Path, bytes: &[u8]) -> Option<Node> {
+        use crate::model::{In, named};
+        let mut read = In(bytes);
+        let layer = |read: &mut In<'_>| read.u32().and_then(|layer| usize::try_from(layer).ok());
+        let kind = [Kind::Asset, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
+        let uid = read.text()?;
+        let home = layer(&mut read)?;
+        let content = (layer(&mut read)?, read.text()?);
+        let overrides = (0..layer(&mut read)?).map(|_| layer(&mut read)).collect::<Option<Vec<usize>>>()?;
+        let moved = layer(&mut read)?.checked_sub(1);
+        let has_files = read.u8()? != 0;
+        let mut files = Vec::new();
+        while read.u8()? != 0 {
+            files.push((read.text()?, named(root, &read.text()?)?, layer(&mut read)?));
+        }
+        let inputs = (0..layer(&mut read)?).map(|_| named(root, &read.text()?)).collect::<Option<Vec<PathBuf>>>()?;
+        let files = has_files.then(|| Arc::new(files));
+        read.0.is_empty().then_some(Node { kind, uid, home, content, overrides, moved, files, inputs: Arc::new(inputs) })
+    }
+}
+
+/// What the stack says besides the entries it resolves, as the project's model keeps it by these names: each
+/// layer's operations with their status, what does not add up, what the layers need of each other.
+const SAID_OPS: &str = "ops";
+const SAID_PROBLEMS: &str = "problems";
+const SAID_DEPENDENCIES: &str = "dependencies";
+
+/// Something the stack says, written as the model keeps it.
+fn said<T: serde::Serialize>(it: &T) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = crate::wire::send(&mut bytes, it);
+    bytes
+}
+
+/// Something the stack says, read back.
+fn said_of<T: serde::de::DeserializeOwned>(mut bytes: &[u8]) -> Option<T> {
+    crate::wire::receive(&mut bytes).ok().flatten()
+}
+
+/// What the stack is made of besides the files, the layers' listings and their records: the layers as the project
+/// says them, in their order. A stack kept of other layers is none of this project's.
+fn stack_made_of(project: &Project) -> String {
+    use std::fmt::Write as _;
+    project.layers.iter().fold(String::new(), |mut made_of, layer| {
+        let _ = writeln!(
+            made_of,
+            "{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{:?}",
+            layer.name,
+            layer.kind,
+            layer.path.display(),
+            layer.at,
+            layer.changeset.display(),
+            layer.read_only,
+            layer.changeset_writable,
+            layer.mounted,
+            layer.fills,
+            layer.storage
+        );
+        made_of
+    })
+}
+
 /// The stack applied: the resolved entries, what is wrong, and each layer's operations with their status and the path
 /// their entry had.
 struct Resolution {
@@ -1259,6 +1359,15 @@ pub struct Index {
     opened: crate::model::Delta,
     /// The project's folder.
     root: PathBuf,
+    /// What does not add up in the stack, as it was last applied: the stack's own among the problems.
+    stack_problems: Vec<Problem>,
+    /// What the stack is made of besides what the model holds (`stack_made_of`), and what it said of its
+    /// operations, its problems and what the layers need of each other when that was last said in the model:
+    /// said again where it differs.
+    made_of: String,
+    stack_said: Arc<[Vec<u8>; 3]>,
+    /// Whether its opening took the stack as the model had it, where it applied none.
+    stack_taken: bool,
     resolved: Arc<BTreeMap<String, Node>>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
@@ -1393,6 +1502,22 @@ impl Index {
         self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect()
     }
 
+    /// Open the index over what is known of the project, taken as it is: what `open_behind` does over what the
+    /// project's model holds, for what holds another model to it.
+    ///
+    /// # Errors
+    /// As `open`.
+    #[cfg(test)]
+    pub(crate) fn open_over(known: crate::model::Known, project: &Project) -> Result<Index> {
+        Index::over(known, false, project, &|_, _, _| {})
+    }
+
+    /// Whether its opening took the stack as the project's model had it, where it applied none.
+    #[must_use]
+    pub fn took_stack(&self) -> bool {
+        self.stack_taken
+    }
+
     /// What its opening read that differs from what it opened over, taken out: said in the project's model by
     /// whoever holds the project (`model::took`).
     pub fn take_opened(&mut self) -> crate::model::Delta {
@@ -1450,7 +1575,7 @@ impl Index {
     pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
         let files = self.records.iter().map(|(file, record)| (file.clone(), (**record).clone())).collect();
         let layers = self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect();
-        let known = crate::model::Known { files, layers, records: self.records_known() };
+        let known = crate::model::Known { files, layers, records: self.records_known(), stack: Some(self.stack_known()) };
         let mut index = Index::over(known, true, project, report)?;
         index.set_working(self.working.as_ref().clone());
         Ok(index)
@@ -1459,7 +1584,7 @@ impl Index {
     /// Over what is `known` of the files: each held to its file where `held`, else taken as it is.
     #[expect(clippy::too_many_lines, reason = "the index's fields, one line each")]
     fn over(known: crate::model::Known, held: bool, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let crate::model::Known { files: mut known, layers: mut known_layers, records: mut known_records } = known;
+        let crate::model::Known { files: mut known, layers: mut known_layers, records: mut known_records, stack: known_stack } = known;
         // What differs of the project's model from what was known, for whoever holds the project to say there.
         let mut opened = crate::model::Delta::default();
         // Its records layers, placed through the stack: what their scans and changesets are read from. Over what
@@ -1529,6 +1654,10 @@ impl Index {
             objects: crate::chunks::Store::at(&project.root),
             opened,
             root: project.root.clone(),
+            stack_problems: vec![],
+            made_of: stack_made_of(project),
+            stack_said: Arc::default(),
+            stack_taken: false,
             resolved: Arc::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -1574,9 +1703,22 @@ impl Index {
             index.opened.file(&project.root, file, index.records.get(file).map(|record| &**record));
         }
         report("Resolving the layers", 0, 0);
-        {
-            let _span = tracing::info_span!("index apply stack").entered();
-            index.apply_stack()?;
+        // The stack as the model has it, where it was made of these layers and nothing it is made of was found
+        // otherwise than known - by an opening that takes what is known as it is; else applied.
+        let taken = !held && index.opened.is_empty() && {
+            let _span = tracing::info_span!("index: the stack taken as known").entered();
+            known_stack.as_ref().is_some_and(|stack| index.take_stack(stack))
+        };
+        index.stack_taken = taken;
+        if !taken {
+            {
+                let _span = tracing::info_span!("index apply stack").entered();
+                index.apply_stack()?;
+            }
+            // And what differs of it from what was known is said.
+            let mut differs = std::mem::take(&mut index.opened);
+            index.stack_differs(known_stack.as_ref(), &mut differs);
+            index.opened = differs;
         }
         report("Assembling the assets", 0, 0);
         let paths: Vec<String> = index.resolved.keys().cloned().collect();
@@ -1802,7 +1944,116 @@ impl Index {
                 _ => crate::chunks::logical(p).unwrap_or_else(|| p.clone()),
             })
             .collect();
-        self.refresh_files(project, &changed)
+        let mut refreshed = self.refresh_files(project, &changed)?;
+        self.say_stack(&mut refreshed);
+        Ok(refreshed)
+    }
+
+    /// What a refresh changed of the stack, said of the project's model: the entries it touched, as they are now,
+    /// and those gone; and what the stack says besides, where that differs from what was last said.
+    fn say_stack(&mut self, refreshed: &mut Refreshed) {
+        for path in &refreshed.touched {
+            let node = self.full.get(path).map(|node| node.written(&self.root));
+            refreshed.model.node(path, node.as_deref());
+        }
+        for path in refreshed.gone.iter().filter(|path| !self.full.contains_key(*path)) {
+            refreshed.model.node(path, None);
+        }
+        let says = self.stack_says();
+        for ((name, now), was) in [SAID_OPS, SAID_PROBLEMS, SAID_DEPENDENCIES].iter().zip(&says).zip(self.stack_said.iter()) {
+            if now != was {
+                refreshed.model.said(name, now);
+            }
+        }
+        if says != *self.stack_said {
+            self.stack_said = Arc::new(says);
+        }
+    }
+
+    /// What the stack says of its operations, its problems and what the layers need of each other, written.
+    fn stack_says(&self) -> [Vec<u8>; 3] {
+        [said(&self.ops), said(&self.stack_problems), said(&self.dependencies)]
+    }
+
+    /// The stack applied, as the project's model keeps it: what the model is held to, and what a model that holds
+    /// none is given.
+    #[must_use]
+    pub fn stack_known(&self) -> crate::model::Stack {
+        let nodes = self.full.iter().map(|(path, node)| (path.clone(), node.written(&self.root)));
+        let says = [SAID_OPS, SAID_PROBLEMS, SAID_DEPENDENCIES].iter().zip(self.stack_says());
+        crate::model::Stack {
+            made_of: self.made_of.clone(),
+            nodes: nodes.collect(),
+            said: says.map(|(name, said)| ((*name).to_string(), said)).collect(),
+        }
+    }
+
+    /// The stack applied, whole, as a change of the project's model: said where the model holds nothing yet
+    /// (`model::took`).
+    #[must_use]
+    pub fn stack_held(&self) -> crate::model::Delta {
+        let mut model = crate::model::Delta::default();
+        self.stack_differs(None, &mut model);
+        model
+    }
+
+    /// What differs between the stack known and the stack as it is, said of the project's model.
+    fn stack_differs(&self, known: Option<&crate::model::Stack>, model: &mut crate::model::Delta) {
+        let now = self.stack_known();
+        let empty = crate::model::Stack::default();
+        let was = known.unwrap_or(&empty);
+        if known.is_none_or(|known| known.made_of != now.made_of) {
+            model.stack_made_of(&now.made_of);
+        }
+        for path in was.nodes.keys().filter(|path| !now.nodes.contains_key(*path)) {
+            model.node(path, None);
+        }
+        for (path, node) in now.nodes.iter().filter(|(path, node)| was.nodes.get(*path) != Some(node)) {
+            model.node(path, Some(node));
+        }
+        for (name, said) in now.said.iter().filter(|(name, said)| was.said.get(*name) != Some(said)) {
+            model.said(name, said);
+        }
+    }
+
+    /// Take the stack as the model has it, where it was made of this project's layers and all of it reads: what
+    /// applying the stack would come to, the files, the layers' listings and their records being as known. False
+    /// where it cannot be taken - nothing is changed then, and the stack is applied.
+    fn take_stack(&mut self, stack: &crate::model::Stack) -> bool {
+        if stack.made_of != self.made_of {
+            return false;
+        }
+        let nodes: Option<BTreeMap<String, Node>> =
+            stack.nodes.iter().map(|(path, bytes)| Some((path.clone(), Node::read(&self.root, bytes)?))).collect();
+        let layers = self.layers.len();
+        let within = |node: &Node| {
+            let layers_of = [node.home, node.content.0].into_iter().chain(node.overrides.iter().copied()).chain(node.moved);
+            layers_of.chain(node.files.iter().flat_map(|files| files.iter().map(|(_, _, held)| *held))).all(|layer| layer < layers)
+        };
+        let Some(nodes) = nodes.filter(|nodes| nodes.values().all(within)) else { return false };
+        let says = [SAID_OPS, SAID_PROBLEMS, SAID_DEPENDENCIES].map(|name| stack.said.get(name));
+        let [Some(ops), Some(problems), Some(dependencies)] = says else { return false };
+        let (Some(ops), Some(problems), Some(dependencies)) =
+            (said_of::<Vec<BTreeMap<String, (OpStatus, Option<String>)>>>(ops), said_of::<Vec<Problem>>(problems), said_of(dependencies))
+        else {
+            return false;
+        };
+        if ops.len() != layers {
+            return false;
+        }
+        self.beneath = Arc::default();
+        self.stack_said = Arc::new([said(&ops), said(&problems), said(&dependencies)]);
+        self.ops = ops;
+        self.stack_problems.clone_from(&problems);
+        self.problems = problems;
+        self.problems.extend(self.properties.iter().cloned());
+        self.dependencies = dependencies;
+        self.full = Arc::new(nodes);
+        self.resolved = self.full.clone();
+        self.remember_hashes();
+        self.winning = Arc::new(self.resolved.iter().map(|(path, node)| (node.content.clone(), path.clone())).collect());
+        self.merge_inputs = Arc::new(self.resolved.values().flat_map(|node| node.inputs.iter().cloned()).collect());
+        true
     }
 
     /// Records changed: the project's are read again, and each records layer as they make it now, rescanned whole.
@@ -2524,6 +2775,7 @@ impl Index {
         self.beneath = Arc::default();
         tracing::info_span!("stack: unlisted").in_scope(|| self.list_unlisted())?;
         let full = tracing::info_span!("stack: resolved").in_scope(|| self.resolve_stack(&HashSet::new()));
+        self.stack_problems.clone_from(&full.problems);
         self.problems = full.problems;
         self.problems.extend(self.properties.iter().cloned());
         self.ops = full.ops;
