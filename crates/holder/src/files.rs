@@ -3,8 +3,9 @@
 //! which the holder starts where none runs, keeps while it has the project and feeds: the holder has the project's
 //! only index, and the server serves what the holder lists of it (`Index::served`), said after each refresh in the
 //! filesystem the project's processes share (`project::shared`) - all of it the first time, then what changed -
-//! and the server told on its lease that it was said, by a thread of its own, so that the holder never waits on
-//! the server. It serves from the first listing on. What programs did through the folder the server says due in
+//! by the thread that refreshed, in the commit that says what the refresh changed of the project's model
+//! (`says::Says`); and the server told on its lease that it was said, by a thread of its own, so that the
+//! holder never waits on the server. It serves from the first listing on. What programs did through the folder the server says due in
 //! that same shared filesystem (`vfs::due`), and whoever holds the project takes it from there - asked to look
 //! (`mcp::Request::Due`), or as it takes the project: the editor makes each an edit between frames, a step of the
 //! session's log (`Workspace::take_due`), a host a step of its history; what became of each is said in the commit
@@ -18,39 +19,32 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use project::server::{FromServer, Lease, Listing, ToServer};
 
+use crate::says::{Said, Says};
+
 /// The server kept serving the project and fed what is served, or why it is not.
 pub struct Files {
     project: project::Project,
     /// What a server started for it is started with, besides what is done with strays.
     args: Vec<String>,
     state: Arc<Mutex<Kept>>,
-    /// What is served, the newest, for the thread sending it.
+    /// Where what is served is said, by whoever calls.
+    says: Arc<Says>,
+    /// That something was said, for the thread telling the server.
     shown: mpsc::Sender<Shown>,
 }
 
-/// What the thread sending what is served is given: what is served now, the files of the layers that changed since
-/// what it was given before, what became of what was due and is said with it, who waits for it to be served
+/// What the thread telling the server is given, once something was said: the files of the layers that changed
+/// since what it was given before, why it could not be said where it could not, who waits for it to be served
 /// (told by this being dropped), and what is done once it is.
 struct Shown {
-    said: Said,
     changed: Vec<std::path::PathBuf>,
-    answers: Vec<(u64, vfs::due::Answer)>,
+    failed: Option<String>,
     served: Option<mpsc::Sender<()>>,
     then: Option<Then>,
 }
 
 /// What is done once something said is served, or will not be: off the thread that asked.
 pub type Then = Box<dyn FnOnce() + Send>;
-
-/// What is served now, as whoever holds the project says it.
-enum Said {
-    /// All of it.
-    Whole(Arc<Listing>),
-    /// What of it differs from what was said before.
-    Changed(project::server::Delta),
-    /// As it was.
-    Unchanged,
-}
 
 /// Who waits for what was said to be served, told as this is dropped: when a pass of the thread saying it ends,
 /// however it does.
@@ -107,19 +101,19 @@ impl Files {
     /// this machine serves nothing and no server serves it already. After the project is taken: what is served is
     /// the holder's to list.
     #[must_use]
-    pub fn keep(project: &project::Project) -> Option<Files> {
+    pub fn keep(project: &project::Project, said: Arc<Says>) -> Option<Files> {
         let machine = extensions::filesystem_defaults().serve;
         let says = vfs::backend::setting(&[project.filesystem.serve.as_deref(), machine.as_deref()]);
         if says == vfs::backend::Setting::None && !project::server::running(&project.root) {
             return None;
         }
-        Some(Files::feed(project, Vec::new()))
+        Some(Files::feed(project, Vec::new(), said))
     }
 
     /// Keep the server serving the project - one started with `args` (after `project server`) where none runs - off
     /// the caller's thread, and feed it what is shown from now on.
     #[must_use]
-    pub fn feed(project: &project::Project, args: Vec<String>) -> Files {
+    pub fn feed(project: &project::Project, args: Vec<String>, says: Arc<Says>) -> Files {
         let state = Arc::new(Mutex::new(Kept::Starting));
         let (kept_project, kept_state, kept_args) = (project.clone(), state.clone(), args.clone());
         std::thread::spawn(move || {
@@ -127,46 +121,67 @@ impl Files {
             *lock(&kept_state) = kept;
         });
         let (shown, newest) = mpsc::channel();
-        let (sending, sent_of) = (state.clone(), project.clone());
-        let send = move || send_shown(&sent_of, &sending, &newest);
+        let (sending, sent_of, said) = (state.clone(), project.clone(), says.clone());
+        let send = move || send_shown(&sent_of, &sending, &newest, &said);
         let _ = std::thread::Builder::new().name("served".into()).spawn(send);
-        Files { project: project.clone(), args, state, shown }
+        Files { project: project.clone(), args, state, says, shown }
     }
 
-    /// What is served now, as the index lists it: sent to the server, after what was sent before.
+    /// What is served now, as the index lists it: said, and the server told.
     pub fn show(&self, listing: Arc<Listing>) {
-        self.show_answering(listing, Vec::new(), None);
+        self.show_answering(listing, &project::model::Delta::default(), &[], None);
     }
 
-    /// As `show`, saying with it what became of what was due (`vfs::due`) - in the same commit, so that each is
-    /// the project's, and known to be, the moment the folder shows it - and doing `then` once the server serves
-    /// it, or will not.
-    pub fn show_answering(&self, listing: Arc<Listing>, answers: Vec<(u64, vfs::due::Answer)>, then: Option<Then>) {
-        let shown = Shown { said: Said::Whole(listing), changed: Vec::new(), answers, served: None, then };
-        Self::sent(self.shown.send(shown));
+    /// As `show`, saying with it what changed of the project's model and what became of what was due
+    /// (`vfs::due`) - in the same commit, so that each is the project's, and known to be, the moment the folder
+    /// shows it - and doing `then` once the server serves it, or will not.
+    pub fn show_answering(
+        &self,
+        listing: Arc<Listing>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
+        then: Option<Then>,
+    ) {
+        self.said(Said::Whole(listing), model, answers, then);
     }
 
-    /// What differs of what is served from what was shown before (`Index::serve_changed`), said with what became
-    /// of what was due, and `then` done once the server serves it, or will not: nobody waits for it here.
+    /// What differs of what is served from what was shown before (`Index::serve_changed`), said with what changed
+    /// of the model and what became of what was due, and `then` done once the server serves it, or will not:
+    /// nobody waits for that here.
     pub fn show_delta_then(
         &self,
         delta: project::server::Delta,
-        answers: Vec<(u64, vfs::due::Answer)>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
         then: Option<Then>,
     ) {
-        let shown = Shown { said: Said::Changed(delta), changed: Vec::new(), answers, served: None, then };
-        Self::sent(self.shown.send(shown));
+        self.said(Said::Changed(delta), model, answers, then);
     }
 
-    /// Say what became of what was due, nothing of what is served having changed for it: `then` done once said.
-    pub fn answer(&self, answers: Vec<(u64, vfs::due::Answer)>, then: Option<Then>) {
-        let shown = Shown { said: Said::Unchanged, changed: Vec::new(), answers, served: None, then };
-        Self::sent(self.shown.send(shown));
+    /// As `show_delta_then`, of what differed after each of several refreshes, in their order: one commit.
+    pub fn show_deltas_then(
+        &self,
+        deltas: Vec<project::server::Delta>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
+        then: Option<Then>,
+    ) {
+        self.said(Said::Changes(deltas), model, answers, then);
     }
 
-    /// What could not be given to the thread saying it - which is gone - is done with here: who waits is told.
-    fn sent(sent: Result<(), mpsc::SendError<Shown>>) {
-        if let Err(mpsc::SendError(Shown { then: Some(then), .. })) = sent {
+    /// Say what changed of the model and what became of what was due, nothing of what is served having changed
+    /// for it: `then` done once the server was told.
+    pub fn answer(&self, model: &project::model::Delta, answers: &crate::says::Answers, then: Option<Then>) {
+        self.said(Said::Unchanged, model, answers, then);
+    }
+
+    /// Say it here, on the thread that asks, and have the server told: `then` done once it serves it, or will not.
+    fn said(&self, said: Said, model: &project::model::Delta, answers: &crate::says::Answers, then: Option<Then>) {
+        let failed = self.says.say(said, model, answers).err();
+        // What could not be given to the thread telling it - which is gone - is done with here.
+        if let Err(mpsc::SendError(Shown { then: Some(then), .. })) =
+            self.shown.send(Shown { changed: Vec::new(), failed, served: None, then })
+        {
             then();
         }
     }
@@ -175,42 +190,41 @@ impl Files {
     /// them is read again before what is listed is served - and, where it serves already, waited for to serve it, so
     /// that who made the change finds it in the folder.
     pub fn show_changed(&self, changed: Vec<std::path::PathBuf>, listing: Arc<Listing>) {
-        self.say(Said::Whole(listing), changed, Vec::new());
+        self.say(Said::Whole(listing), changed, &project::model::Delta::default(), &[]);
     }
 
-    /// As `show_changed` - or, with no listing, what is served as it was - saying with it what became of what was
-    /// due.
+    /// As `show_changed` - or, with no listing, what is served as it was - saying with it what changed of the
+    /// model and what became of what was due.
     pub fn show_changed_answering(
         &self,
         changed: Vec<std::path::PathBuf>,
         listing: Option<Arc<Listing>>,
-        answers: Vec<(u64, vfs::due::Answer)>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
     ) {
-        self.say(listing.map_or(Said::Unchanged, Said::Whole), changed, answers);
+        self.say(listing.map_or(Said::Unchanged, Said::Whole), changed, model, answers);
     }
 
     /// What differs of what is served from what was shown before, after these files of the layers changed
-    /// (`Index::serve_changed`): told and waited for as `show_changed` is, at what the change costs, not what the
-    /// project holds.
-    pub fn show_delta(&self, changed: Vec<std::path::PathBuf>, delta: project::server::Delta) {
-        self.say(Said::Changed(delta), changed, Vec::new());
-    }
-
-    /// As `show_delta`, saying with it what became of what was due.
+    /// (`Index::serve_changed`), said with what changed of the model and what became of what was due: told and
+    /// waited for as `show_changed` is, at what the change costs, not what the project holds.
     pub fn show_delta_answering(
         &self,
         changed: Vec<std::path::PathBuf>,
         delta: project::server::Delta,
-        answers: Vec<(u64, vfs::due::Answer)>,
+        model: &project::model::Delta,
+        answers: &crate::says::Answers,
     ) {
-        self.say(Said::Changed(delta), changed, answers);
+        self.say(Said::Changed(delta), changed, model, answers);
     }
 
-    fn say(&self, said: Said, changed: Vec<std::path::PathBuf>, answers: Vec<(u64, vfs::due::Answer)>) {
+    /// Say it here, on the thread that asks - what became of what was due is said once this returns - and have
+    /// the server told, waited for where it serves already.
+    fn say(&self, said: Said, changed: Vec<std::path::PathBuf>, model: &project::model::Delta, answers: &crate::says::Answers) {
+        let failed = self.says.say(said, model, answers).err();
         let (served, waited) = mpsc::channel();
-        // What became of what was due is waited for wherever it is said: who asked reads it once this returns.
-        let wait = matches!(self.state(), State::Served(..)) || !answers.is_empty();
-        let _ = self.shown.send(Shown { said, changed, answers, served: wait.then_some(served), then: None });
+        let wait = matches!(self.state(), State::Served(..));
+        let _ = self.shown.send(Shown { changed, failed, served: wait.then_some(served), then: None });
         if wait {
             let _ = waited.recv_timeout(PATIENCE);
         }
@@ -288,26 +302,14 @@ fn strays_in(project: &project::Project) -> usize {
     serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
 }
 
-/// Nothing more is said in the shared space from here: it is left as whoever next attaches alone may trust it.
-fn rest(space: &sfs::Space) {
-    if let Err(e) = space.rest() {
-        eprintln!("the shared space is not left to be trusted: {e}");
-    }
-}
-
-/// Say what is served as it changes, and tell the server that it was said: in the filesystem the project's
-/// processes share (`project::shared`), all of it the first time - by what differs from what that holds, which is
-/// little where a holder before this one said it - and after that what changed; the server reads it there. What
-/// the server is not kept for yet waits for it.
-fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>) {
-    use project::server::Delta;
-    let shared = project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
-    // What is served now, as last said; the lease that was told of all of it; and why it could not be said, once
-    // it could not.
-    let mut current: Option<Listing> = None;
+/// Tell the server that what is served was said, as it is: in the filesystem the project's processes share
+/// (`says::Says`, by whoever refreshed) - all of it the first time, and after that what changed; the server reads
+/// it there. What the server is not kept for yet waits for it.
+fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>, says: &Says) {
+    // The lease that was told of all of it; and why it could not be said, once it could not.
     let mut told: Option<Arc<Mutex<Lease>>> = None;
     let mut untold = false;
-    let mut unsaid: Option<String> = shared.as_ref().err().cloned();
+    let mut unsaid: Option<String> = None;
     // The files that changed since the server was last told, and who waits for what is said to be served: let go
     // of - which tells them - once it is, or will not be.
     let (mut changed, mut waiting) = (Vec::new(), Waiting::default());
@@ -315,35 +317,12 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
         let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(shown) => Some(shown),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return shared.iter().for_each(|space| rest(space)),
+            // Nothing more is said here: the space is left as whoever next attaches alone may trust it.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return says.rest(),
         };
         for shown in first.into_iter().chain(newest.try_iter()) {
-            // What became of what was due, said in the commit that says what is served after it.
-            let answers = shown.answers;
-            let mut answering = |txn: &mut sfs::space::Txn<'_>| Ok(vfs::due::answer(txn, &answers)?);
-            let alone = |space: &sfs::Space| Ok(vfs::due::answer_now(space, &answers)?);
-            let said = match (shown.said, &mut current, &shared) {
-                (Said::Whole(listing), Some(before), Ok(space)) => {
-                    let delta = Delta::between(before, &listing);
-                    *before = Arc::unwrap_or_clone(listing);
-                    if delta.is_empty() { alone(space) } else { project::shared::say_with(space, &delta, &mut answering) }
-                }
-                (Said::Whole(listing), None, Ok(space)) => {
-                    let _span = tracing::info_span!("served: said whole in the shared filesystem").entered();
-                    let said = project::shared::say_whole(space, &listing);
-                    current = Some(Arc::unwrap_or_clone(listing));
-                    said.and_then(|()| alone(space))
-                }
-                (Said::Changed(delta), Some(before), Ok(space)) => {
-                    delta.apply(before);
-                    project::shared::say_with(space, &delta, &mut answering)
-                }
-                // Part of nothing: whoever holds the project says all of it first.
-                (Said::Changed(_) | Said::Unchanged, _, Ok(space)) => alone(space),
-                (_, _, Err(_)) => Ok(()),
-            };
-            if let Err(e) = said {
-                unsaid.get_or_insert(format!("what is served could not be said in the shared filesystem: {e}"));
+            if let Some(why) = shown.failed {
+                unsaid.get_or_insert(why);
             }
             untold = true;
             changed.extend(shown.changed);
@@ -364,7 +343,7 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
             }
             continue;
         }
-        if current.is_none() {
+        if !says.said_whole() {
             continue;
         }
         // A new lease (the server started again) was told nothing.

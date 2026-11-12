@@ -213,7 +213,7 @@ pub struct Workspace {
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
     /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
-    pub files: Option<crate::files::Files>,
+    pub files: Option<Arc<crate::files::Files>>,
     /// The host standing by told that the editor is letting go of the project: it takes it the moment this goes.
     handing: Option<project::host::Lease>,
     /// The watcher being started, off the window's thread.
@@ -260,9 +260,6 @@ pub struct Workspace {
     selection_after: Option<(u64, String)>,
     /// Agents' requests waiting for the take-in of what was pending when they came, by its ticket.
     agents_waiting: Vec<(u64, mcp::Request, mpsc::Sender<mcp::Reply>)>,
-    /// What was due and made edits of (`take_due`), waiting for the take-in of what they wrote, by its ticket:
-    /// what became of each, said with what is served after them, and who asked to look, answered then.
-    due_waiting: Vec<DueWaiting>,
     /// What was due and taken, by its number, until it is due no more: taken once.
     due_taken: std::collections::HashSet<u64>,
     /// What the snapshots taken in since the app last asked did.
@@ -502,7 +499,9 @@ pub struct Opened {
     /// Agents' link to it, listening since its lock was taken; or why agents cannot reach it.
     link: std::result::Result<mcp::link::Listener, String>,
     /// The server of its files, kept and fed what is served.
-    files: Option<crate::files::Files>,
+    files: Option<Arc<crate::files::Files>>,
+    /// Where it says what it holds, where the project's processes share it: the take-in worker's, from here on.
+    says: Arc<holder::says::Says>,
 }
 
 /// What agents ask of the editor's own state, answered while the imports attach as the user has it then: what it shows,
@@ -567,7 +566,7 @@ pub struct Leaving {
     index: Option<Arc<Index>>,
     lock: Option<Lock>,
     /// The server kept: let go of once the project is, for whoever holds it next to feed.
-    files: Option<crate::files::Files>,
+    files: Option<Arc<crate::files::Files>>,
     /// The host standing by, told: it takes the project the moment this goes, after the lock.
     handing: Option<project::host::Lease>,
 }
@@ -609,10 +608,6 @@ fn stand_by(root: &Path) {
 
 /// An event asked for: the events, the config, and who waits for what became of it.
 type Signaled = (Vec<String>, Option<project::Config>, Option<mpsc::Sender<mcp::Reply>>);
-/// What was due and made edits of, waiting for a take-in: its ticket, what became of each thing by its number,
-/// and who asked to look.
-type DueWaiting = (u64, Vec<(u64, vfs::due::Answer)>, mpsc::Sender<mcp::Reply>);
-
 /// What is made of a project's `project.toml` and its files, and made again when either changes.
 pub struct Loaded {
     pub project: Project,
@@ -670,7 +665,8 @@ impl Workspace {
         };
         // The server of its files, started where none runs, beside the opening: fed what is served once that is
         // listed.
-        let files = crate::files::Files::keep(&project);
+        let says = Arc::new(holder::says::Says::of(&project));
+        let files = crate::files::Files::keep(&project, says.clone()).map(Arc::new);
         // A host stands by where its files are served: holding nothing while the editor has the project, it takes
         // it once the editor lets go, and feeds the server from then on - closing the window ends no serving.
         if files.is_some() {
@@ -689,6 +685,10 @@ impl Workspace {
         history.prepare();
         let history = history.journaled();
         let index = Index::open_reporting(&project, &cache, report)?;
+        // The project's model, where its processes share it, holds what the index read.
+        if let Err(e) = says.fill(&project.root, &index) {
+            eprintln!("{e}");
+        }
         // What is served of it, listed for the server, which has no index: it serves from this first listing on.
         if let Some(files) = &files {
             files.show(Arc::new(index.served()));
@@ -720,6 +720,7 @@ impl Workspace {
             tree,
             link,
             files,
+            says,
         })
     }
 
@@ -740,6 +741,7 @@ impl Workspace {
             tree,
             link,
             files,
+            says,
             ..
         } = opened;
         let (link, link_error) = match link {
@@ -766,6 +768,10 @@ impl Workspace {
             tree: tree.clone(),
             stage: Arc::default(),
             listing: None,
+            says,
+            files: files.clone(),
+            unsaid: crate::takein::Unsaid::default(),
+            shown: None,
         });
         let attaching = takein.attach();
         let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
@@ -831,7 +837,6 @@ impl Workspace {
             external: (0, 0),
             selection_after: None,
             agents_waiting: Vec::new(),
-            due_waiting: Vec::new(),
             due_taken: std::collections::HashSet::new(),
             outcome: Update::Nothing,
             tree,
@@ -1417,13 +1422,6 @@ impl Workspace {
             if snapshot.files {
                 self.signal(FilesChanged::NAME);
             }
-            // What became of what was due, whose edits this take-in covers, is said with what is served after it.
-            let (answers, then) = self.due_covered(snapshot.ticket);
-            match (&self.files, snapshot.served) {
-                (Some(files), Some(crate::takein::Served::Whole(listing))) => files.show_answering(listing, answers, then),
-                (Some(files), Some(crate::takein::Served::Changed(delta))) => files.show_delta_then(delta, answers, then),
-                (files, _) => Self::answer_due(&self.project, files.as_ref(), answers, then),
-            }
             if let Some(pictures) = &mut self.textures.pictures {
                 if snapshot.all {
                     pictures.clear();
@@ -1904,6 +1902,8 @@ impl Workspace {
             let _ = reply.send(mcp::Reply::Taken { count: 0 });
             return;
         }
+        // What the worker takes in from here on is said once what became of these is: in one commit.
+        self.takein.due_begin();
         let (mut made, _) = self.apply_edits(&ops, None);
         // One not made that is so already was taken before, and said due again: it is as asked. Told of the index
         // with what the others wrote taken in.
@@ -1917,58 +1917,10 @@ impl Workspace {
         }
         let answers: Vec<(u64, vfs::due::Answer)> = numbers.iter().copied().zip(made).collect();
         self.due_taken.extend(numbers);
-        let ticket = self.takein.issued();
-        self.due_waiting.push((ticket, answers, reply.clone()));
-        // Taken in already - nothing was written, or it was waited for: said now, what is served being as it is.
-        if self.takein.covers(ticket) {
-            let (answers, then) = self.due_covered(ticket);
-            Self::answer_due(&self.project, self.files.as_ref(), answers, then);
-        }
-    }
-
-    /// What became of what was due whose edits the take-ins up to `ticket` cover, and the answering of who asked
-    /// to look, to be done once it is said.
-    fn due_covered(&mut self, ticket: u64) -> (Vec<(u64, vfs::due::Answer)>, Option<holder::files::Then>) {
-        let (covered, waiting): (Vec<DueWaiting>, Vec<DueWaiting>) =
-            std::mem::take(&mut self.due_waiting).into_iter().partition(|(asked, ..)| *asked <= ticket);
-        self.due_waiting = waiting;
-        if covered.is_empty() {
-            return (Vec::new(), None);
-        }
-        let (mut answers, mut asked) = (Vec::new(), Vec::new());
-        for (_, became, reply) in covered {
-            asked.push((reply, became.len()));
-            answers.extend(became);
-        }
-        let then = move || {
-            for (reply, count) in asked {
-                let _ = reply.send(mcp::Reply::Taken { count });
-            }
-        };
-        (answers, Some(Box::new(then)))
-    }
-
-    /// Say what became of what was due with what is served as it is: through what feeds the server, after all it
-    /// was given to say before, or in the shared filesystem itself where nothing feeds one.
-    fn answer_due(
-        project: &Project,
-        files: Option<&holder::files::Files>,
-        answers: Vec<(u64, vfs::due::Answer)>,
-        then: Option<holder::files::Then>,
-    ) {
-        if answers.is_empty() && then.is_none() {
-            return;
-        }
-        if let Some(files) = files {
-            return files.answer(answers, then);
-        }
-        let said = project::shared::space(&project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
-        if let Err(e) = said {
-            eprintln!("what became of what was due could not be said: {e}");
-        }
-        if let Some(then) = then {
-            then();
-        }
+        // Said by the worker with what is served after the take-in of what they wrote, and who asked to look
+        // answered then.
+        let (reply, count) = (reply.clone(), answers.len());
+        self.takein.due_end(answers, Box::new(move || drop(reply.send(mcp::Reply::Taken { count }))));
     }
 
     /// Edits made together, each a step of its own, taken in once for all of them - what programs wrote at once

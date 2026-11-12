@@ -23,7 +23,7 @@ const CHECKPOINT_AFTER: usize = 1000;
 pub type Stamp = (u64, u32);
 
 /// What the index needs of an `node.toml` without parsing it again.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declaration {
     /// What of its stack says what it makes.
     pub shape: String,
@@ -39,7 +39,7 @@ pub struct Declaration {
 }
 
 /// What the index knows of a file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub size: u64,
     pub modified: Stamp,

@@ -515,6 +515,9 @@ pub struct Refreshed {
     /// more: what is served of them is all that changed of what is served (`Index::serve_changed`).
     pub touched: BTreeSet<String>,
     pub gone: BTreeSet<String>,
+    /// What it changed of the project's model, where its processes share it (`model`): applied in the commit that
+    /// says what is served after the refresh.
+    pub model: crate::model::Delta,
 }
 
 impl Refreshed {
@@ -528,6 +531,7 @@ impl Refreshed {
         self.gone.extend(later.gone);
         self.project_file |= later.project_file;
         self.restacked |= later.restacked;
+        self.model.and(later.model);
     }
 }
 
@@ -1218,6 +1222,13 @@ impl Index {
         }
     }
 
+    /// The record of every file the layers hold, as it was last read: what the model the project's processes share
+    /// holds of files (`model::fill_files`). A file two layers hold is given twice.
+    pub fn file_records(&self) -> impl Iterator<Item = (&Path, &Record)> {
+        let files = self.layers.iter().flat_map(|layer| layer.scan.all_files());
+        files.filter_map(|file| Some((file.as_path(), &**self.records.get(file)?)))
+    }
+
     /// Stop keeping the records in the cache's store, and close it, for another process to open: what is read from now
     /// on is kept in memory alone, until `keep_records`.
     pub fn let_go_of_store(&mut self) {
@@ -1669,6 +1680,13 @@ impl Index {
         let records = read.iter().filter_map(|p| Some((p.as_path(), &**self.records.get(p)?)));
         if let Some(store) = &self.store {
             store.write_later(records, gone.iter().map(PathBuf::as_path))?;
+        }
+        // And the same of the model the project's processes share: those gone first, one of them may have come back.
+        for file in &gone {
+            refreshed.model.file(&project.root, file, None);
+        }
+        for file in &read {
+            refreshed.model.file(&project.root, file, self.records.get(file).map(|record| &**record));
         }
         drop(rescanning);
         // An override's files are merged as the stack is applied: one of them, or what is below it, changed applies it

@@ -5,4 +5,5 @@
 
 pub mod files;
 pub mod runner;
+pub mod says;
 pub mod watch;

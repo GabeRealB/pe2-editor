@@ -18,6 +18,7 @@ pub mod imports;
 pub mod index;
 pub mod lock;
 pub mod merge;
+pub mod model;
 pub mod pack;
 pub mod plan;
 pub mod profile;

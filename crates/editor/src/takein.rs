@@ -38,6 +38,12 @@ enum Job {
     Attach,
     /// The project read again, as this changed; its files too where `whole`, as they are otherwise followed already.
     Reload { why: &'static str, whole: bool },
+    /// Edits are about to be made of what was due (`Workspace::take_due`): nothing is said where the project's
+    /// processes share it until what became of them is.
+    DueBegin,
+    /// What became of what was due, by its number, and what is done once that is said: said in the commit that
+    /// says what is served after the edits made of it.
+    DueEnd { answers: Vec<(u64, vfs::due::Answer)>, then: holder::files::Then },
     /// Reading until told to stop: a test's way to find it at work.
     #[cfg(any(test, feature = "tests"))]
     Hold(Receiver<()>),
@@ -70,8 +76,27 @@ pub struct Snapshot {
     pub said: Option<String>,
     /// What went wrong taking a change in.
     pub error: Option<String>,
-    /// What is served of the project now, for the server (`Files::show_answering`, `show_delta_then`).
-    pub served: Option<Served>,
+    /// What is served of the project now: said by the worker (`Worker::say`), with what the take-in changed of
+    /// the project's model.
+    served: Option<Served>,
+}
+
+/// What the worker took in and has yet to say where the project's processes share it (`holder::says`): said
+/// after each take-in, but while edits are made of what was due - then once what became of them is known, so
+/// that each is the project's, and known to be, in one commit.
+#[derive(Default)]
+pub struct Unsaid {
+    /// What each take-in it is of says is served after it, in their order.
+    served: Vec<Served>,
+    /// What they changed of the project's model.
+    model: project::model::Delta,
+    /// The index was read again whole: the model is held to all it read.
+    read_again: bool,
+    /// What became of what was due, and what is done once that is said.
+    answers: Vec<(u64, vfs::due::Answer)>,
+    then: Vec<holder::files::Then>,
+    /// How many times edits of what was due were begun and not ended.
+    due: usize,
 }
 
 /// What is served of a project after a take-in.
@@ -111,6 +136,13 @@ pub struct Worker {
     pub stage: Arc<Mutex<String>>,
     /// What is served, as last listed: brought up to what each change of files changed, to say what differs.
     pub listing: Option<project::server::Listing>,
+    /// Where what it takes in is said - the project's model, what is served, what became of what was due - a
+    /// commit a take-in, by this thread; and what tells the server of it, where one is fed.
+    pub says: Arc<holder::says::Says>,
+    pub files: Option<Arc<holder::files::Files>>,
+    pub unsaid: Unsaid,
+    /// The index as last handed over.
+    pub shown: Option<Arc<Index>>,
 }
 
 impl TakeIn {
@@ -130,10 +162,12 @@ impl TakeIn {
                 while let Ok(first) = queued.recv() {
                     let jobs: Vec<(u64, Job)> = std::iter::once(first).chain(queued.try_iter()).collect();
                     let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
-                    let mut snapshot = group.enter(|| {
+                    let snapshot = group.enter(|| {
                         let _span = tracing::info_span!("take-in worker: a take-in").entered();
                         worker.take_in(jobs)
                     });
+                    // Nothing was asked but to say what became of what was due: said, and nothing to hand over.
+                    let Some(mut snapshot) = snapshot else { continue };
                     snapshot.files = files;
                     if made.send(snapshot).is_err() {
                         return;
@@ -162,6 +196,23 @@ impl TakeIn {
             ctx.request_repaint();
         }
         self.issued
+    }
+
+    /// Edits are about to be made of what was due: what the worker takes in from here on is said once what became
+    /// of them is (`due_end`), never before. No job to wait for: it has no ticket of its own.
+    pub fn due_begin(&mut self) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send((self.issued, Job::DueBegin));
+        }
+    }
+
+    /// What became of what was due, said by the worker with what is served after the edits made of it - those
+    /// asked to be taken in so far - and `then` done once it is.
+    pub fn due_end(&mut self, answers: Vec<(u64, vfs::due::Answer)>, then: holder::files::Then) {
+        match &self.jobs {
+            Some(jobs) => drop(jobs.send((self.issued, Job::DueEnd { answers, then }))),
+            None => then(),
+        }
     }
 
     /// Take these paths in; returns the job's ticket.
@@ -254,9 +305,91 @@ impl Drop for TakeIn {
 }
 
 impl Worker {
-    /// Take the jobs in, as one: the layers hidden as the last asks, the paths of all.
-    fn take_in(&mut self, jobs: Vec<(u64, Job)>) -> Snapshot {
+    /// Take the jobs in, as one, and say what that came to where the project's processes share it - unless edits
+    /// are being made of what was due, whose outcome is said with it. None where nothing was asked to be taken in.
+    fn take_in(&mut self, jobs: Vec<(u64, Job)>) -> Option<Snapshot> {
         let ticket = jobs.iter().map(|(t, _)| *t).max().unwrap_or(0);
+        let mut asked = Vec::new();
+        for (at, job) in jobs {
+            match job {
+                Job::DueBegin => self.unsaid.due += 1,
+                Job::DueEnd { answers, then } => {
+                    self.unsaid.due = self.unsaid.due.saturating_sub(1);
+                    self.unsaid.answers.extend(answers);
+                    self.unsaid.then.push(then);
+                }
+                job => asked.push((at, job)),
+            }
+        }
+        let snapshot = (!asked.is_empty()).then(|| {
+            let mut snapshot = self.taken_in(ticket, asked);
+            self.unsaid.served.extend(snapshot.served.take());
+            snapshot
+        });
+        if self.unsaid.due == 0 {
+            self.say();
+        }
+        snapshot
+    }
+
+    /// Say what was taken in and is not said yet, in one commit: what it changed of the project's model, what is
+    /// served after it, what became of what was due - and have the server told, where one is fed.
+    fn say(&mut self) {
+        use holder::says::Said;
+        let _span = tracing::info_span!("take-in worker: what it came to said").entered();
+        let unsaid = std::mem::take(&mut self.unsaid);
+        // An index read again whole says all it read: what the take-ins before it changed is part of that.
+        let model = if unsaid.read_again {
+            if let Err(e) = self.says.fill(&self.project.root, &self.index) {
+                eprintln!("{e}");
+            }
+            project::model::Delta::default()
+        } else {
+            unsaid.model
+        };
+        let mut served = unsaid.served;
+        let said = match served.pop() {
+            None => Said::Unchanged,
+            // All of it as the last take-in left it: what those before it changed is part of that.
+            Some(Served::Whole(listing)) => Said::Whole(listing),
+            Some(Served::Changed(last)) => {
+                let before: Option<Vec<_>> = served.into_iter().map(|served| if let Served::Changed(delta) = served { Some(delta) } else { None }).collect();
+                match before {
+                    Some(before) if before.is_empty() => Said::Changed(last),
+                    // What each of several take-ins changed, in their order.
+                    Some(mut each) => {
+                        each.push(last);
+                        Said::Changes(each)
+                    }
+                    // One of them listed all of it, and this one what changed since: all of it, as it is now.
+                    None => self.listing.as_ref().map_or(Said::Unchanged, |listing| Said::Whole(Arc::new(listing.clone()))),
+                }
+            }
+        };
+        let answers = unsaid.answers;
+        let mut thens = unsaid.then;
+        let then = (!thens.is_empty()).then(|| Box::new(move || thens.drain(..).for_each(|then| then())) as holder::files::Then);
+        let anything = !model.is_empty() || !answers.is_empty() || then.is_some();
+        match (&self.files, said) {
+            (Some(files), Said::Whole(listing)) => files.show_answering(listing, &model, &answers, then),
+            (Some(files), Said::Changed(delta)) => files.show_delta_then(delta, &model, &answers, then),
+            (Some(files), Said::Changes(deltas)) => files.show_deltas_then(deltas, &model, &answers, then),
+            (Some(files), Said::Unchanged) if anything => files.answer(&model, &answers, then),
+            (Some(_), Said::Unchanged) => {}
+            // Nothing feeds a server: what changed of the model and what became of what was due, by themselves.
+            (None, _) => {
+                if anything && let Err(e) = self.says.say(Said::Unchanged, &model, &answers) {
+                    eprintln!("what the take-in came to could not be said: {e}");
+                }
+                if let Some(then) = then {
+                    then();
+                }
+            }
+        }
+    }
+
+    /// Take the jobs in, as one: the layers hidden as the last asks, the paths of all.
+    fn taken_in(&mut self, ticket: u64, jobs: Vec<(u64, Job)>) -> Snapshot {
         let mut paths = Vec::new();
         let mut hidden = None;
         let mut working = None;
@@ -271,6 +404,8 @@ impl Worker {
                     reload = Some(why);
                     whole |= all_of_it;
                 }
+                // Taken out before this (`take_in`).
+                Job::DueBegin | Job::DueEnd { .. } => {}
                 #[cfg(any(test, feature = "tests"))]
                 Job::Hold(wait) => {
                     let _ = wait.recv();
@@ -310,13 +445,15 @@ impl Worker {
                 None => self.snapshot(ticket, edited, all, None, None),
             };
         }
-        let refreshed = match self.index.refresh(&self.project, &paths) {
+        let mut refreshed = match self.index.refresh(&self.project, &paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 let error = format!("the index could not follow a change: {e:#}");
                 return self.snapshot(ticket, BTreeSet::new(), all, Some(error), None);
             }
         };
+        // What it changed of the project's model: said with what is served after it (`say`).
+        self.unsaid.model.and(std::mem::take(&mut refreshed.model));
         if refreshed.project_file {
             return self.reload(ticket, "project.toml changed", whole);
         }
@@ -424,6 +561,7 @@ impl Worker {
         }
         self.index = loaded.index;
         self.extensions = loaded.extensions;
+        self.unsaid.read_again |= read;
         self.attach_all();
         Ok(true)
     }
@@ -442,8 +580,10 @@ impl Worker {
             let _span = tracing::info_span!("take-in worker: the tree built").entered();
             self.tree = Arc::new(Node::build(&self.index, &self.extensions));
         }
-        // What is served: a plain file changed is no asset changed, so it is said at every take-in.
+        // What is served: a plain file changed is no asset changed, so it is said at every take-in - where a
+        // server is fed it.
         let served = served.or_else(|| {
+            self.files.as_ref()?;
             let _span = tracing::info_span!("take-in worker: what is served listed").entered();
             let listing = self.index.served();
             self.listing = Some(listing.clone());
@@ -451,9 +591,11 @@ impl Worker {
         });
         // What the job freed, given back: the worker's threads each keep what they freed otherwise.
         project::give_back_memory();
+        let shown = Arc::new(self.index.clone());
+        self.shown = Some(shown.clone());
         Snapshot {
             ticket,
-            index: Arc::new(self.index.clone()),
+            index: shown,
             tree: self.tree.clone(),
             layers: self.index.layers(),
             changed,

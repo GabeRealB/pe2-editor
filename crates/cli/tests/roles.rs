@@ -203,7 +203,8 @@ impl StandIn {
         let cache = project::cache::Cache::open(&p, &lock).unwrap();
         let (history, _) = project::history::History::open(&cache).unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
-        let files = Arc::new(holder::files::Files::feed(&p, Vec::new()));
+        let says = Arc::new(holder::says::Says::of(&p));
+        let files = Arc::new(holder::files::Files::feed(&p, Vec::new(), says));
         files.show(Arc::new(index.served()));
         let held = Arc::new(Mutex::new((index, history)));
         let made = Arc::new(Mutex::new(Vec::new()));
@@ -241,8 +242,8 @@ impl StandIn {
             let served = Some(Arc::new(index.served()));
             if let Some(numbers) = numbers {
                 let count = numbers.len();
-                let answers = numbers.into_iter().zip(labels).collect();
-                feeding.show_changed_answering(changed, served, answers);
+                let answers: Vec<(u64, vfs::due::Answer)> = numbers.into_iter().zip(labels).collect();
+                feeding.show_changed_answering(changed, served, &project::model::Delta::default(), &answers);
                 return mcp::Reply::Taken { count };
             }
             feeding.show_changed(changed.clone(), Arc::new(index.served()));

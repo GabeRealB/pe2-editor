@@ -92,7 +92,16 @@ fn now() -> u64 {
 /// # Errors
 /// As `show`.
 pub fn say_whole(space: &sfs::Space, listing: &Listing) -> Result<()> {
+    say_whole_with(space, listing, &mut |_| Ok(()))
+}
+
+/// As `say_whole`, with what else its commit says, said first (as `say_with` says it).
+///
+/// # Errors
+/// As `show`, and what `also` could not do.
+pub fn say_whole_with(space: &sfs::Space, listing: &Listing, also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
     let mut txn = space.write()?;
+    also(&mut txn)?;
     show_whole(&mut txn, listing, now())?;
     txn.commit()
 }
@@ -111,11 +120,23 @@ pub fn say(space: &sfs::Space, delta: &Delta) -> Result<()> {
 /// # Errors
 /// As `show`, and what `also` could not do.
 pub fn say_with(space: &sfs::Space, delta: &Delta, also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
+    say_each_with(space, std::slice::from_ref(delta), also)
+}
+
+/// As `say_with`, of several changes one after another, in one commit: what several refreshes changed of what is
+/// served, said once what else is to be said with them is known.
+///
+/// # Errors
+/// As `show`, and what `also` could not do.
+pub fn say_each_with(space: &sfs::Space, deltas: &[Delta], also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
     let mut txn = space.write()?;
     // First: a move the project took is no longer one its paths are read through (`moved`), and what is said
     // here is said of the project with that move made.
     also(&mut txn)?;
-    show(&mut txn, delta, now())?;
+    let now = now();
+    for delta in deltas {
+        show(&mut txn, delta, now)?;
+    }
     txn.commit()
 }
 

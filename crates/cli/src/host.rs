@@ -81,6 +81,9 @@ struct Host {
     /// what is served. Taken after `state`, never before.
     server: Mutex<Option<project::server::Lease>>,
     files: Mutex<Option<holder::files::Files>>,
+    /// Where it says what it holds - the project's model, what is served, what became of what was due - a
+    /// commit a refresh, whether or not a server is fed.
+    says: Arc<holder::says::Says>,
     state: Mutex<State>,
     leases: AtomicUsize,
     /// When the last lease ended.
@@ -142,6 +145,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         serve,
         server: Mutex::new(None),
         files: Mutex::new(None),
+        says: Arc::new(holder::says::Says::of(&p)),
         state: Mutex::new(state),
         leases: AtomicUsize::new(0),
         quiet_since: Mutex::new(Instant::now()),
@@ -152,6 +156,10 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         due_taken: Mutex::default(),
         asked: Mutex::new(Instant::now()),
     });
+    // The project's model, where its processes share it, holds what the index read.
+    if let Some(index) = lock(&host.state).index.as_ref() {
+        host.fill_model(index);
+    }
     // What reading the project freed, given back: it holds on for long.
     project::give_back_memory();
     host.listen_for_edits();
@@ -327,6 +335,15 @@ impl Host {
         made.unwrap_or_else(|| mcp::Reply::failed("nothing was asked".into()))
     }
 
+    /// Have the project's model, where its processes share it, hold what an index just opened read: what it says
+    /// first as it takes the project, another having held it since - or nobody - and said what it would.
+    fn fill_model(&self, index: &Index) {
+        self.says.forget();
+        if let Err(e) = self.says.fill(&self.project.root, index) {
+            eprintln!("{e}");
+        }
+    }
+
     /// Take what is due where the project's processes share it (`vfs::due`) - what programs did through the served
     /// folder - and make edits of it, in its order; what became of each is said there in the commit that says what
     /// is served after them. Declined while it does not hold the project: what is due stays so.
@@ -357,15 +374,15 @@ impl Host {
 
     /// Say what became of what was due with nothing of what is served changed for it: through what feeds the
     /// server, after all it was given to say before, or in the shared filesystem itself where nothing feeds one.
-    fn answer_due(&self, answers: Vec<(u64, vfs::due::Answer)>) {
+    fn answer_due(&self, answers: &[(u64, vfs::due::Answer)]) {
         if answers.is_empty() {
             return;
         }
+        let unchanged = project::model::Delta::default();
         if let Some(files) = lock(&self.files).as_ref() {
-            return files.show_changed_answering(Vec::new(), None, answers);
+            return files.show_changed_answering(Vec::new(), None, &unchanged, answers);
         }
-        let said = project::shared::space(&self.project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
-        if let Err(e) = said {
+        if let Err(e) = self.says.say(holder::says::Said::Unchanged, &unchanged, answers) {
             eprintln!("what became of what was due could not be said: {e}");
         }
     }
@@ -400,7 +417,7 @@ impl Host {
             let replies = failed("no layer of the project can be written".into());
             let answers = answers(&replies);
             drop(state);
-            self.answer_due(answers);
+            self.answer_due(&answers);
             return Some(replies);
         };
         // What the edits wrote that the index has not taken in yet, and all of it.
@@ -453,7 +470,7 @@ impl Host {
         if pending.is_empty() && changed.is_empty() {
             let answers = answers(&replies);
             drop(state);
-            self.answer_due(answers);
+            self.answer_due(&answers);
             return Some(replies);
         }
         let refreshed = {
@@ -467,7 +484,7 @@ impl Host {
                 let replies = failed(format!("{e:#}"));
                 let answers = answers(&replies);
                 drop(state);
-                self.answer_due(answers);
+                self.answer_due(&answers);
                 return Some(replies);
             }
         }
@@ -481,7 +498,7 @@ impl Host {
         for path in &changed {
             written.insert(path.clone(), stamp(path));
         }
-        self.feed(index, listing, &changed, &all, answers(&replies));
+        self.feed(index, listing, &changed, &all, &answers(&replies));
         project::give_back_memory();
         Some(replies)
     }
@@ -510,7 +527,7 @@ impl Host {
         let Some(index) = index.as_mut() else { return };
         match index.refresh(&self.project, &changed) {
             Ok(refreshed) => {
-                self.feed(index, listing, &changed, &refreshed, Vec::new());
+                self.feed(index, listing, &changed, &refreshed, &[]);
                 *reading = None;
                 project::give_back_memory();
             }
@@ -550,7 +567,7 @@ impl Host {
         if lock(&self.server).is_none() {
             return;
         }
-        let files = holder::files::Files::feed(&self.project, self.serve.clone().unwrap_or_default());
+        let files = holder::files::Files::feed(&self.project, self.serve.clone().unwrap_or_default(), self.says.clone());
         *listing = index.served();
         files.show(Arc::new(listing.clone()));
         *lock(&self.files) = Some(files);
@@ -566,23 +583,23 @@ impl Host {
         listing: &mut project::server::Listing,
         changed: &[PathBuf],
         refreshed: &project::index::Refreshed,
-        answers: Vec<(u64, vfs::due::Answer)>,
+        answers: &[(u64, vfs::due::Answer)],
     ) {
         let _span = tracing::info_span!("host served update").entered();
         if let Some(files) = lock(&self.files).as_ref() {
             // `project.toml` changed: the layers themselves may have. All of it, listed again.
             if refreshed.project_file {
                 *listing = index.served();
-                files.show_changed_answering(changed.to_vec(), Some(Arc::new(listing.clone())), answers);
+                files.show_changed_answering(changed.to_vec(), Some(Arc::new(listing.clone())), &refreshed.model, answers);
             } else {
-                files.show_delta_answering(changed.to_vec(), index.serve_changed(listing, refreshed), answers);
+                let delta = index.serve_changed(listing, refreshed);
+                files.show_delta_answering(changed.to_vec(), delta, &refreshed.model, answers);
             }
             return;
         }
-        // Nothing feeds a server: said where it was due, by itself.
-        let said = project::shared::space(&self.project.root).and_then(|space| vfs::due::answer_now(&space, &answers));
-        if let Err(e) = said {
-            eprintln!("what became of what was due could not be said: {e}");
+        // Nothing feeds a server: what changed of the model and what became of what was due, by themselves.
+        if let Err(e) = self.says.say(holder::says::Said::Unchanged, &refreshed.model, answers) {
+            eprintln!("what the change came to could not be said: {e}");
         }
     }
 
@@ -713,6 +730,7 @@ impl Host {
                     if let Err(e) = self.keep_server() {
                         eprintln!("its folder is not served: {e:#}");
                     }
+                    self.fill_model(&index);
                     self.feed_whole(&index, &mut state.listing);
                     state.index = Some(index);
                     state.held = Some(Held { link: None, history, lock: taken });

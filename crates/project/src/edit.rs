@@ -911,6 +911,8 @@ mod tests {
         let shared = sfs::Space::private().unwrap();
         let mut txn = shared.write().unwrap();
         crate::shared::show_whole(&mut txn, &index.served(), 0).unwrap();
+        // And its model, filled with what the index read.
+        crate::model::fill_files(&mut txn, &project.root, index.file_records()).unwrap();
         txn.commit().unwrap();
         let follows = {
             let read = shared.read().unwrap();
@@ -938,6 +940,7 @@ mod tests {
             if refreshed.project_file {
                 let mut txn = self.shared.write().unwrap();
                 crate::shared::show_whole(&mut txn, &self.index.served(), 0).unwrap();
+                refreshed.model.apply(&mut txn).unwrap();
                 txn.commit().unwrap();
             } else {
                 let delta = self.index.serve_changed(&mut listing, &refreshed);
@@ -949,6 +952,7 @@ mod tests {
                 // And the shared filesystem, told the same change, says what is served listed whole.
                 let mut txn = self.shared.write().unwrap();
                 crate::shared::show(&mut txn, &delta, 0).unwrap();
+                refreshed.model.apply(&mut txn).unwrap();
                 txn.commit().unwrap();
                 let said = crate::shared::listed(&self.shared.read().unwrap()).unwrap();
                 assert_eq!(untimed(said), untimed(whole), "what the shared filesystem says is served");
@@ -962,6 +966,17 @@ mod tests {
             }
             assert_eq!(follows, crate::shared::listed(&read).unwrap(), "what is served, followed by change");
             self.follows = (read.commit().generation, follows);
+            // And the model, brought on by what the refresh says it changed, holds of every file what the index
+            // changed in place does.
+            let records = |index: &Index| -> std::collections::HashMap<PathBuf, crate::store::Record> {
+                index.file_records().map(|(path, record)| (path.to_path_buf(), record.clone())).collect()
+            };
+            let held = crate::model::files(&read, &self.project.root).unwrap();
+            let kept = records(&self.index);
+            if held != kept {
+                let differing: Vec<_> = held.keys().chain(kept.keys()).filter(|path| held.get(*path) != kept.get(*path)).collect();
+                panic!("the model's files are not the index's: {differing:#?}");
+            }
             drop(read);
             // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
             // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and
@@ -970,6 +985,19 @@ mod tests {
                 return;
             }
             let fresh = Index::without_store(&Project::load(&self.project.root).unwrap()).unwrap();
+            // What one opened afresh reads of the files is what the model holds of them, but when each was read.
+            let unread = |mut records: std::collections::HashMap<PathBuf, crate::store::Record>| {
+                for record in records.values_mut() {
+                    record.recorded = (0, 0);
+                }
+                records
+            };
+            let (modeled, read_afresh) = (unread(held), unread(records(&fresh)));
+            if modeled != read_afresh {
+                let differing: Vec<_> =
+                    modeled.keys().chain(read_afresh.keys()).filter(|path| modeled.get(*path) != read_afresh.get(*path)).collect();
+                panic!("the model's files are not those an index opened afresh reads: {differing:#?}");
+            }
             let (kept, afresh) = (self.index.shown_whole(), fresh.shown_whole());
             if kept != afresh {
                 let differing = kept.lines().zip(afresh.lines()).find(|(a, b)| a != b);
