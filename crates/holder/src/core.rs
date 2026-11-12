@@ -415,19 +415,7 @@ impl Core {
     /// # Errors
     /// The index could not follow it.
     pub fn take_in(&mut self, changed: &[PathBuf]) -> Result<Option<Taken>, String> {
-        let written = &mut self.written;
-        let changed: Vec<PathBuf> = changed
-            .iter()
-            .filter(|path| {
-                // Written over since, it is forgotten.
-                let taken = written.get(*path).is_some_and(|was| *was == project::storage::stamp(path));
-                if !taken {
-                    written.remove(*path);
-                }
-                !taken
-            })
-            .cloned()
-            .collect();
+        let changed = self.others(changed.to_vec());
         if changed.is_empty() {
             return Ok(None);
         }
@@ -435,6 +423,21 @@ impl Core {
         self.feed(&changed, &refreshed, &[], None);
         project::give_back_memory();
         Ok(Some(Taken { refreshed, wrote: Vec::new() }))
+    }
+
+    /// Of files told changed - by what watches the layers, by a program - those that are another's doing: what
+    /// the holder's own edits wrote, as they wrote it, is taken in already. One written over since is another's,
+    /// and forgotten as its own.
+    pub fn others(&mut self, changed: Vec<PathBuf>) -> Vec<PathBuf> {
+        let written = &mut self.written;
+        let others = changed.into_iter().filter(|path| {
+            let own = written.get(path).is_some_and(|was| *was == project::storage::stamp(path));
+            if !own {
+                written.remove(path);
+            }
+            !own
+        });
+        others.collect()
     }
 
     /// What is served follows what changed, where a server is fed: told which files changed, for what it reads of

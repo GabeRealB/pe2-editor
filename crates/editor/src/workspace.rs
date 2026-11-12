@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::settings::{Preview, Upscale};
-use crate::watch::{Change, Watch};
 
 /// A node of the tree of the resolved project: its children and, where an entry has this path, that entry (its real
 /// path, a bundle's with `.node`) and the asset it is, or that it is a plain file. An image with several variants -
@@ -250,7 +249,7 @@ pub struct Workspace {
     lock: Lock,
     cache_dir: PathBuf,
     /// The watcher on the layers, started with the first frame (it wakes the window).
-    watch: Option<Watch>,
+    watch: Option<notify::RecommendedWatcher>,
     /// Why the layers are not (or no longer fully) watched.
     pub watch_error: Option<String>,
     /// The project served as a filesystem, where this machine says (`project.local.toml`): started with the watcher.
@@ -258,7 +257,7 @@ pub struct Workspace {
     /// The host standing by told that the editor is letting go of the project: it takes it the moment this goes.
     handing: Option<project::host::Lease>,
     /// The watcher being started, off the window's thread.
-    watch_starting: Option<mpsc::Receiver<std::result::Result<Watch, String>>>,
+    watch_starting: Option<mpsc::Receiver<std::result::Result<notify::RecommendedWatcher, String>>>,
     /// The generated layers as their plans say they are.
     pub plans: crate::plans::Plans,
     /// Filling them: the step of the project's onboarding that runs their plans.
@@ -299,11 +298,7 @@ pub struct Workspace {
     revision: u64,
     /// Whether the window had focus at the last frame.
     focused: bool,
-    /// What the editor wrote lately, each path with its stamp then: the watcher's report of it is the editor's own
-    /// change coming back, not another program's.
-    own: Vec<(PathBuf, Option<Stamp>, std::time::Instant)>,
-    /// The last job of other programs' changes, and the last whose snapshot the app was told of.
-    external: (u64, u64),
+
     /// Agents' requests waiting for the take-in of what was pending when they came, by its ticket.
     agents_waiting: Vec<(u64, mcp::Request, mpsc::Sender<mcp::Reply>)>,
     /// What the snapshots taken in since the app last asked did.
@@ -448,15 +443,6 @@ pub fn adding(asset: &Asset, file: &Path) -> std::result::Result<EditRequest, St
         label: format!("Add {name} to {short}"),
         merge: None,
     })
-}
-
-/// A path's size and time of change.
-type Stamp = (u64, std::time::SystemTime);
-
-/// A path's stamp, where it is - as what waits to be written of it will leave it: what the editor wrote is known
-/// again as its own when its file is written, a moment after.
-fn stamp(path: &Path) -> Option<Stamp> {
-    project::storage::stamp(path)
 }
 
 /// How many GPU errors are kept: an extension failing a frame says the same each frame.
@@ -854,6 +840,7 @@ impl Workspace {
             selected: None,
             config: None,
             holding: true,
+            live: false,
         };
         let runner = Arc::new(Mutex::new(crate::runner::Runner::start(project.clone(), extensions.clone())));
         let showing = Arc::new(Mutex::new(showing));
@@ -939,8 +926,6 @@ impl Workspace {
             outcomes: Vec::new(),
             revision: 0,
             focused: true,
-            own: Vec::new(),
-            external: (0, 0),
             agents_waiting: Vec::new(),
             outcome: Update::Nothing,
             tree,
@@ -967,8 +952,9 @@ impl Workspace {
         workspace
     }
 
-    /// Start watching the layers, once: every change on disk is then brought in by `update`. Asked each frame: what
-    /// has started since is told of the window, and an event waits for the project to have what it is about.
+    /// Start watching the layers, once: what other programs change there is given to the worker from then on.
+    /// Asked each frame: what has started since is told of the window, and an event waits for the project to have
+    /// what it is about.
     pub fn watch(&mut self, ctx: &egui::Context) {
         if !self.outputs.wakes() {
             let ctx = ctx.clone();
@@ -998,20 +984,12 @@ impl Workspace {
         if self.watch.is_some() || self.watch_error.is_some() || self.watch_starting.is_some() {
             return;
         }
-        let root = &self.project.root;
-        let roots: Vec<PathBuf> = self.project.layers.iter().map(|l| l.path.clone()).collect();
-        // Each layer's changeset sits beside its directory; project.toml in the project's own.
-        let mut shallow: Vec<PathBuf> =
-            self.project.layers.iter().filter_map(|l| l.changeset.parent().map(Path::to_path_buf)).collect();
-        shallow.push(root.clone());
-        shallow.dedup();
-        // Not the project's: its cache, what its builds write, and what is mounted unmanaged (the discs).
-        let mut ignore = vec![self.cache_dir.clone(), root.join("build")];
-        ignore.extend(self.project.unmanaged.iter().map(|m| m.path.clone()));
-        // Reading every folder of a project to watch it takes more than a frame has.
+        // What changes there is given to the worker as it does, whatever the window is doing. Reading every folder
+        // of a project to watch it takes more than a frame has.
+        let (project, worker) = (self.project.clone(), self.takein.outside());
         let (ctx, (started, starting)) = (ctx.clone(), mpsc::channel());
         let start = move || {
-            let watch = Watch::start(&roots, &shallow, ignore, ctx.clone())
+            let watch = holder::watch::layers(&project, move |change| worker.watched(change))
                 .map_err(|e| format!("the layers are not watched: {e}"));
             let _ = started.send(watch);
             ctx.request_repaint();
@@ -1079,8 +1057,7 @@ impl Workspace {
 
     /// Take in what is at these paths now, as another program wrote it (a plan run). The take-in's ticket.
     pub fn take_in(&mut self, paths: Vec<PathBuf>) -> u64 {
-        self.external.0 = self.takein.paths(paths);
-        self.external.0
+        self.takein.paths(paths)
     }
 
     /// Run a generated layer's plan as the work graph's only work: after the epoch running, before what is asked next.
@@ -1461,20 +1438,9 @@ impl Workspace {
             self.contents.clear();
             self.part_sheets.clear();
         }
-        self.own.retain(|(_, _, at)| at.elapsed() < Duration::from_secs(30));
+        // Whether what other programs change is taken in as it happens (the setting): the worker's to know.
+        self.showing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).live = live;
         self.tell_showing();
-        if let Some(watch) = &self.watch {
-            for change in watch.poll() {
-                match change {
-                    Change::Paths(changed) => {
-                        let theirs: Vec<PathBuf> =
-                            changed.into_iter().filter(|p| !self.is_own(p) && self.concerns(p)).collect();
-                        self.pending().extend(theirs);
-                    }
-                    Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
-                }
-            }
-        }
         let regained = focused && !self.focused;
         self.focused = focused;
         if live || regained {
@@ -1557,26 +1523,11 @@ impl Workspace {
         done.ok_or_else(|| "the thread holding the project is gone: close the project and open it again".to_string())
     }
 
-    /// Whether a path changing concerns the project: in a layer, a layer's changeset, or one of its files at its root.
-    /// What else sits in its folders (exports, a user's notes) does not.
-    fn concerns(&self, path: &Path) -> bool {
-        let root = &self.project.root;
-        let at_root = path.parent() == Some(root.as_path())
-            && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml"))
-            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
-        at_root || self.project.layers.iter().any(|l| path.starts_with(&l.path) || path == l.changeset)
-    }
-
-    /// Whether the watcher's report of a path is of what the editor wrote: as it left it.
-    fn is_own(&self, path: &Path) -> bool {
-        self.own.iter().rev().find(|(p, ..)| p == path).is_some_and(|(_, then, _)| *then == stamp(path))
-    }
-
     /// Take in what other programs changed, now.
     fn take_in_pending(&mut self) {
         let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending()).into_iter().collect();
         if !paths.is_empty() {
-            self.external.0 = self.takein.paths(paths);
+            self.takein.paths(paths);
         }
     }
 
@@ -1603,6 +1554,7 @@ impl Workspace {
                 selected: self.selected.clone(),
                 config: self.config.clone(),
                 holding,
+                live: told.live,
             };
         }
     }
@@ -1639,12 +1591,6 @@ impl Workspace {
             }
             self.history = snapshot.history;
             self.outcomes.extend(snapshot.outcomes);
-            // What the editor's own edits wrote: the watcher's report of it is its own change coming back.
-            let now = std::time::Instant::now();
-            self.own.extend(snapshot.wrote.into_iter().map(|path| {
-                let stamp = stamp(&path);
-                (path, stamp, now)
-            }));
             let before =
                 (std::mem::replace(&mut self.index, snapshot.index), std::mem::replace(&mut self.tree, snapshot.tree));
             self.revision += 1;
@@ -1696,13 +1642,9 @@ impl Workspace {
                 self.navigate(path);
             }
             // Other programs' changes taken in: the app says how many assets they changed.
-            let (asked, told) = self.external;
-            if asked > told && snapshot.ticket >= asked {
-                self.external.1 = asked;
-                if !matches!(self.outcome, Update::Reloaded(_)) && !snapshot.changed.is_empty() {
-                    let before = if let Update::Refreshed(n) = self.outcome { n } else { 0 };
-                    self.outcome = Update::Refreshed(before + snapshot.changed.len());
-                }
+            if snapshot.others && !matches!(self.outcome, Update::Reloaded(_)) && !snapshot.changed.is_empty() {
+                let before = if let Update::Refreshed(n) = self.outcome { n } else { 0 };
+                self.outcome = Update::Refreshed(before + snapshot.changed.len());
             }
         }
         let waiting = std::mem::take(&mut self.agents_waiting);

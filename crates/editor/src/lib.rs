@@ -62,7 +62,6 @@ mod theme;
 mod thumbs;
 mod upscale;
 mod viewer;
-mod watch;
 mod windows;
 mod workspace;
 mod yuv;

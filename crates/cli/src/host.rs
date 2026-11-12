@@ -150,9 +150,12 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     host.listen_for_edits();
     // What changes in its layers by other means than through it, taken in a batch at a time.
     let watched = Arc::downgrade(&host);
-    let _watching = holder::watch::layers(&p, move |batch| {
+    let _watching = holder::watch::layers(&p, move |change| {
         let Some(host) = watched.upgrade() else { return false };
-        host.take_in(batch.to_vec());
+        match change {
+            holder::watch::Change::Paths(batch) => host.take_in(batch),
+            holder::watch::Change::Error(e) => eprintln!("changes in the layers may be missed: {e}"),
+        }
         true
     })?;
     let stopping = host.stopping.clone();

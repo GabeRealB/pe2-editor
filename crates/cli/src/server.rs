@@ -102,9 +102,12 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         reread: Mutex::default(),
     });
     let watched = Arc::downgrade(&server);
-    let _watching = holder::watch::layers(&p, move |batch| {
+    let _watching = holder::watch::layers(&p, move |change| {
         let Some(server) = watched.upgrade() else { return false };
-        server.reread(batch);
+        match change {
+            holder::watch::Change::Paths(batch) => server.reread(&batch),
+            holder::watch::Change::Error(e) => eprintln!("changes in the layers may be missed: {e}"),
+        }
         true
     })?;
     let stopping = server.stopping.clone();

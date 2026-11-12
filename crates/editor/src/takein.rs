@@ -73,6 +73,9 @@ pub struct Showing {
     pub config: Option<project::Config>,
     /// Whether the window holds events back - a plan is filling a layer: they are signaled once it has.
     pub holding: bool,
+    /// Whether what other programs change is taken in as it happens (the setting), not when the window is next
+    /// looked at.
+    pub live: bool,
 }
 
 /// The project as the worker last handed it over, for what reads it off the worker's thread.
@@ -96,6 +99,13 @@ pub struct Outside {
 }
 
 impl Outside {
+    /// What watching the project's layers came to, given to the worker: whether there is one still.
+    pub fn watched(&self, change: holder::watch::Change) -> bool {
+        let Some(queue) = self.queue.upgrade() else { return false };
+        queue.post(move |worker| worker.watched(change));
+        true
+    }
+
     /// Answer what needs no frame drawn for it, on the thread that asks: an edit, what is due of what programs
     /// did through the served folder and an event signaled, by the worker, once all asked before is done; and
     /// what reads the project - a tool, a resource - here, against the project as the worker last handed it
@@ -196,8 +206,8 @@ pub struct Snapshot {
     pub error: Option<String>,
     /// The history as it shows now: its steps, the documents with unsaved changes.
     pub history: Arc<project::history::View>,
-    /// The files the editor's own edits wrote: told of again by what watches the layers, they are its own.
-    pub wrote: Vec<PathBuf>,
+    /// It took in what other programs changed.
+    pub others: bool,
     /// What was selected when a step undone or made again from outside the window was made: shown again.
     pub select: Option<String>,
     /// What the work the window asked for came to (`TakeIn::ask`), by its ticket.
@@ -252,6 +262,8 @@ pub struct Worker {
     select: Option<String>,
     /// What the work the window asked for came to, until it is handed over.
     outcomes: Vec<(u64, Outcome)>,
+    /// What went wrong off a take-in - the layers' watch failing - until it is handed over.
+    failed: Option<String>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -318,6 +330,7 @@ impl TakeIn {
             covered: 0,
             select: None,
             outcomes: Vec::new(),
+            failed: None,
             cache,
             store,
             imports,
@@ -570,6 +583,31 @@ impl Worker {
         self.work();
     }
 
+    /// What watching the layers came to: what other programs changed there - what the editor's own edits wrote,
+    /// as they wrote it, is no change of theirs - waits to be taken in (`pending`), and is, where it is taken in
+    /// as it happens; the window is woken either way, to take it in or to say that it waits.
+    pub fn watched(&mut self, change: holder::watch::Change) {
+        match change {
+            holder::watch::Change::Paths(paths) => {
+                let theirs = self.core.others(paths);
+                if theirs.is_empty() {
+                    return;
+                }
+                self.pending.lock().unwrap_or_else(PoisonError::into_inner).extend(theirs);
+                if self.showing().live {
+                    self.caught_up();
+                } else if let Some(ctx) = self.wake.get() {
+                    ctx.request_repaint();
+                }
+            }
+            holder::watch::Change::Error(e) => {
+                self.failed = Some(format!("changes may be missed: {e}"));
+                self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((0, Job::Held));
+                self.work();
+            }
+        }
+    }
+
     /// What other programs changed, as the window collected it, asked to be taken in.
     fn ask_pending(&mut self) {
         let pending: Vec<PathBuf> =
@@ -686,10 +724,13 @@ impl Worker {
         let ticket = self.covered;
         let mut paths = Vec::new();
         let mut hidden = None;
-        let (mut attach, mut reload, mut whole) = (false, None, false);
+        let (mut attach, mut reload, mut whole, mut others) = (false, None, false, false);
         for (_, job) in jobs {
             match job {
-                Job::Paths(p) => paths.extend(p),
+                Job::Paths(p) => {
+                    others |= !p.is_empty();
+                    paths.extend(p);
+                }
                 Job::Hidden(names) => hidden = Some(names),
                 Job::Viewing(point) => self.viewing = point,
                 Job::Attach => attach = true,
@@ -732,7 +773,7 @@ impl Worker {
         // What changed of the files: what work on the history wrote, taken in already, and what other programs
         // changed.
         let mut taken = std::mem::take(&mut self.taken);
-        let mut error = None;
+        let mut error = self.failed.take();
         if !paths.is_empty() {
             match self.core.take_in(&paths) {
                 Ok(Some(more)) => taken.and(more),
@@ -742,12 +783,14 @@ impl Worker {
         }
         let holder::core::Taken { refreshed, wrote } = taken;
         let files_changed = !paths.is_empty() || !wrote.is_empty();
+        drop(wrote);
+        let files = (files_changed, others);
         if refreshed.project_file {
-            return self.reload(ticket, "project.toml changed", whole, wrote);
+            return self.reload(ticket, "project.toml changed", whole, files);
         }
         // An extension the project holds came, went or changed.
         if files_changed && extensions::found(&self.core.project) != self.found {
-            return self.reload(ticket, "an extension changed", whole, wrote);
+            return self.reload(ticket, "an extension changed", whole, files);
         }
         // The documents follow the disk under them - stale where it changed, saved where it is their working
         // copy - and the index shows them as the history has them.
@@ -761,8 +804,8 @@ impl Worker {
             self.sweep_if_due();
         }
         match reload {
-            Some(why) => self.reload(ticket, why, whole, wrote),
-            None => self.snapshot(ticket, changed, all, error, wrote),
+            Some(why) => self.reload(ticket, why, whole, files),
+            None => self.snapshot(ticket, changed, all, error, files),
         }
     }
 
@@ -809,18 +852,18 @@ impl Worker {
     }
 
     /// The project read again, as `why` changed, and handed over; where it cannot be, it goes on as it was.
-    fn reload(&mut self, ticket: u64, why: &'static str, whole: bool, wrote: Vec<PathBuf>) -> Snapshot {
+    fn reload(&mut self, ticket: u64, why: &'static str, whole: bool, files: (bool, bool)) -> Snapshot {
         self.reporter()("Reading the project", 0, 0);
         let read = self.read_again(whole);
         let snapshot = match read {
             Ok(changed) => {
-                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None, wrote);
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None, files);
                 let (project, extensions, found) = (self.core.project.clone(), self.extensions.clone(), self.found.clone());
                 snapshot.reloaded = Some(Reloaded { project, extensions, found, why });
                 snapshot
             }
             Err(e) => {
-                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), false, None, wrote);
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), false, None, files);
                 snapshot.said = Some(format!("{why}, and the project could not be read again: {e:#}"));
                 snapshot
             }
@@ -858,14 +901,14 @@ impl Worker {
     }
 
     /// The index as it is now, handed over: the tree built again where anything changed, the history as it
-    /// shows.
+    /// shows. `files`: whether files changed, and whether other programs changed some.
     fn snapshot(
         &mut self,
         ticket: u64,
         changed: BTreeSet<String>,
         all: bool,
         error: Option<String>,
-        wrote: Vec<PathBuf>,
+        (files, others): (bool, bool),
     ) -> Snapshot {
         if all || !changed.is_empty() {
             let _span = tracing::info_span!("take-in worker: the tree built").entered();
@@ -890,9 +933,9 @@ impl Worker {
             reloaded: None,
             said: None,
             error,
-            files: std::mem::take(&mut self.changed_behind) || !wrote.is_empty(),
+            files: std::mem::take(&mut self.changed_behind) || files,
             history: self.viewed.1.clone(),
-            wrote,
+            others,
             select: self.select.take(),
             outcomes: std::mem::take(&mut self.outcomes),
         }
