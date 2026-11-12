@@ -15,8 +15,6 @@ pub enum Said {
     Whole(Arc<Listing>),
     /// What of it differs from what was said before.
     Changed(Delta),
-    /// What of it differed after each of several refreshes, in their order.
-    Changes(Vec<Delta>),
     /// As it was.
     Unchanged,
 }
@@ -102,14 +100,8 @@ impl Says {
                 delta.apply(before);
                 project::shared::say_with(space, &delta, &mut also)
             }
-            (Said::Changes(deltas), Some(before)) => {
-                for delta in &deltas {
-                    delta.apply(before);
-                }
-                project::shared::say_each_with(space, &deltas, &mut also)
-            }
             // Part of nothing: whoever holds the project says all of it first.
-            (Said::Changed(_) | Said::Changes(_) | Said::Unchanged, _) => alone(&mut also),
+            (Said::Changed(_) | Said::Unchanged, _) => alone(&mut also),
         };
         said.map_err(|e| format!("what is served could not be said in the shared filesystem: {e}"))
     }

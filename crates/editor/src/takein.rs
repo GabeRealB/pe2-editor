@@ -153,10 +153,12 @@ impl Outside {
             }
             mcp::Request::Due => {
                 let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
-                // Answered once what became of it is said and served: by what tells the server.
+                // Answered once what became of it is said and served, by what tells the server: the worker's
+                // taking in of what the edits wrote, and the snapshot it hands the window, are not waited for.
                 let (said, answered) = mpsc::channel();
                 let then: holder::core::Then = Box::new(move |answer| drop(said.send(answer)));
-                queue.call(move |worker| worker.asked_outside(|worker| worker.asked_due(then)));
+                queue.post(move |worker| worker.asked_outside(|worker| worker.asked_due(then)));
+                drop(queue);
                 Ok(answered.recv().unwrap_or_else(|_| closed()))
             }
             mcp::Request::Signal { events, config } => {
