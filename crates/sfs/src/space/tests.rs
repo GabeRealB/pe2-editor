@@ -605,6 +605,126 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
 }
 
 #[test]
+fn a_tree_loaded_whole_is_what_it_was_given_and_changed_as_any_is() {
+    let space = Space::private().unwrap();
+    let mut rng = Rng::of("load", 0);
+    let mut model = Model::new();
+    for n in 0..3000 {
+        model.insert(key("load", n), value(&mut rng));
+    }
+    let mut txn = space.write().unwrap();
+    tree::load(&mut txn, 0, &mut model.iter().map(|(key, value)| (key.clone(), value.clone()))).unwrap();
+    assert!(tree::load(&mut txn, 0, &mut std::iter::empty()).is_err(), "only a tree that holds nothing");
+    // Nothing given, nothing held; keys out of their order are refused.
+    tree::load(&mut txn, 1, &mut std::iter::empty()).unwrap();
+    assert_eq!(txn.root(1), 0);
+    let unordered = [(b"b".to_vec(), Vec::new()), (b"a".to_vec(), Vec::new())];
+    assert!(tree::load(&mut txn, 2, &mut unordered.into_iter()).is_err());
+    txn.commit().unwrap();
+    let loaded = space.usage().unwrap().pages;
+    {
+        let read = space.read().unwrap();
+        same(&read, &model);
+        // Read where it is: one held in its leaf is lent from the page, a long one put together.
+        for (key, value) in model.iter().step_by(7) {
+            let found = tree::get_in(&read, 0, key).unwrap();
+            assert_eq!(found.as_deref(), Some(value.as_slice()));
+            assert_eq!(matches!(found, Some(std::borrow::Cow::Borrowed(_))), 8 + key.len() + value.len() <= (4096 - 28) / 3);
+        }
+        assert_eq!(tree::get_in(&read, 0, b"load/none").unwrap(), None);
+        // Those of a prefix, and no other.
+        let prefix = b"load/001";
+        let mut listed = Vec::new();
+        tree::scan_prefix(&read, 0, prefix, &mut |key, _| {
+            listed.push(key.to_vec());
+            true
+        })
+        .unwrap();
+        let expected: Vec<Vec<u8>> = model.keys().filter(|key| key.starts_with(prefix)).cloned().collect();
+        assert_eq!(listed.len(), 100);
+        assert_eq!(listed, expected);
+    }
+    // Filled further than the same keys put one by one leave their pages.
+    let one_by_one = Space::private().unwrap();
+    for (key, value) in &model {
+        let mut txn = one_by_one.write().unwrap();
+        tree::put(&mut txn, 0, key, value).unwrap();
+        txn.commit().unwrap();
+    }
+    let put = {
+        // Counted as a loaded one is: what the tree reaches, not what was written on the way.
+        let whole = Space::private().unwrap();
+        let mut txn = whole.write().unwrap();
+        for (key, value) in &model {
+            tree::put(&mut txn, 0, key, value).unwrap();
+        }
+        txn.commit().unwrap();
+        same(&whole.read().unwrap(), &model);
+        whole.usage().unwrap().pages
+    };
+    assert!(loaded < put, "{loaded} pages loaded, {put} put");
+    // And changed as any tree is: what is put after finds room, what no longer fits parts.
+    run(&space, "load", 0..300, 3000, &mut model);
+    same(&space.read().unwrap(), &model);
+}
+
+#[test]
+fn a_leaf_holds_a_value_as_long_as_its_key_leaves_room_for() {
+    let pages_for = |key: &[u8], value: &[u8]| {
+        let space = Space::private().unwrap();
+        let mut txn = space.write().unwrap();
+        tree::put(&mut txn, 0, key, value).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(tree::get(&space.read().unwrap(), 0, key).unwrap().as_deref(), Some(value));
+        space.usage().unwrap().pages
+    };
+    // A short key's value of a kibibyte and more in its leaf; a long key's goes on in a page of its own.
+    assert_eq!(pages_for(b"stack/rooms/patio", &[7; 1300]), 1);
+    assert_eq!(pages_for(b"stack/rooms/patio", &[7; 1400]), 2);
+    assert_eq!(pages_for(&[b'k'; 800], &[7; 540]), 1);
+    assert_eq!(pages_for(&[b'k'; 800], &[7; 560]), 2);
+    // Three of the longest cells in one page, and a fourth parts it.
+    let space = Space::private().unwrap();
+    let mut model = Model::new();
+    for n in 0..40u8 {
+        let mut txn = space.write().unwrap();
+        let key = [&[n][..], &[b'k'; 20]].concat();
+        tree::put(&mut txn, 0, &key, &[n; 1320]).unwrap();
+        txn.commit().unwrap();
+        model.insert(key, vec![n; 1320]);
+    }
+    same(&space.read().unwrap(), &model);
+}
+
+#[test]
+fn a_view_pinned_is_held_by_whoever_holds_it_and_reads_what_it_began_with() {
+    let space = Arc::new(Space::private().unwrap());
+    let mut model = Model::new();
+    run(&space, "pin", 0..60, 200, &mut model);
+    let pinned = space.pinned().unwrap();
+    assert_eq!(pinned.commit().generation, space.read().unwrap().commit().generation);
+    let began = model.clone();
+    // Held again, on another thread, while the tree changes under both.
+    let (again, at_first) = (pinned.clone(), began.clone());
+    let reader = std::thread::spawn(move || {
+        for _ in 0..20 {
+            same(&again, &at_first);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    run(&space, "pin", 60..400, 200, &mut model);
+    same(&pinned, &began);
+    reader.join().unwrap();
+    same(&space.read().unwrap(), &model);
+    // Let go of, nothing holds a page back: the same changes again and again leave the space as large.
+    drop(pinned);
+    run(&space, "pin", 400..800, 200, &mut model);
+    let settled = space.usage().unwrap().pages;
+    run(&space, "pin", 800..1600, 200, &mut model);
+    assert!(space.usage().unwrap().pages <= settled + settled / 4, "{} pages after, {settled} before", space.usage().unwrap().pages);
+}
+
+#[test]
 #[ignore = "a measurement"]
 fn bench_tree() {
     let dir = folder("bench");
@@ -786,6 +906,19 @@ fn bench_model() {
     eprintln!(
         "170,000 keys put in their order: {:.0} ms, {} pages ({:.0}% of them what was put)",
         filled.elapsed().as_secs_f64() * 1e3,
+        usage.pages,
+        bytes as f64 * 100.0 / (usage.pages as f64 * 4096.0)
+    );
+    // And loaded whole.
+    let space = Space::private().unwrap();
+    let loaded = Instant::now();
+    let mut txn = space.write().unwrap();
+    tree::load(&mut txn, 0, &mut keys.iter().map(|key| (key.clone(), vec![7u8; 120]))).unwrap();
+    txn.commit().unwrap();
+    let usage = space.usage().unwrap();
+    eprintln!(
+        "170,000 keys loaded whole: {:.0} ms, {} pages ({:.0}% of them what was put)",
+        loaded.elapsed().as_secs_f64() * 1e3,
         usage.pages,
         bytes as f64 * 100.0 / (usage.pages as f64 * 4096.0)
     );

@@ -7,8 +7,8 @@
 //! from its end. A cell is put into a page of the transaction's own where the room between that list and the
 //! cells takes it, and taken out of the list alone; what that leaves unused between cells is taken back when the
 //! page is next written whole - where a cell no longer fits that room. A
-//! leaf's cell is its key's length (2), its value's (4), the key, and the value - or, for a long one, the page its
-//! bytes go on in (8). A branch's cell is its key's length (2), a child (8), and the key: the child holds the keys
+//! leaf's cell is its key's length (2), its value's (4), the key, and the value - or, for one that would make the
+//! cell longer than a third of a page (`CELL`), the page its bytes go on in (8). A branch's cell is its key's length (2), a child (8), and the key: the child holds the keys
 //! from that one on, the first child those before all of them.
 //!
 //! A page from which keys were taken is not joined with the one beside it: it goes when its last key does, and a
@@ -26,9 +26,13 @@ const MORE: u8 = 3;
 const SLOTS: usize = PAGE_HEAD + 12;
 /// The longest key: a folder's number and the longest name a system has (255 units of UTF-16, as UTF-8) fit.
 pub const KEY: usize = 800;
-/// The longest value a leaf holds itself: a longer one goes on in pages of its own. With the longest key, three
-/// cells fit a page - so a page that no longer fits always parts into two that do (`part`).
-const INLINE: usize = 512;
+/// The longest cell a leaf holds - where it is, its lengths, its key and its value: a value that would make it
+/// longer goes on in pages of its own. Three such cells fit a page, so a page that no longer fits always parts
+/// into two that do (`part`); with a short key a value of 1.3 KiB is held in its leaf, with the longest one of half
+/// a kibibyte.
+const CELL: usize = (PAGE - SLOTS) / 3;
+/// How far a page is filled where a tree is loaded whole (`load`): what is put into it after finds room.
+const FILLED: usize = PAGE - PAGE / 10;
 /// What a page of a long value holds of it, after its head, the next page (8) and how much (4).
 const MORE_DATA: usize = PAGE - PAGE_HEAD - 12;
 /// Marks a value's length as that of a long one.
@@ -183,6 +187,16 @@ fn long(pages: &impl Pages, len: u32, mut at: u64) -> Result<Vec<u8>> {
 /// # Errors
 /// The space is damaged.
 pub fn get(pages: &impl Pages, tree: usize, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(get_in(pages, tree, key)?.map(std::borrow::Cow::into_owned))
+}
+
+/// The value of a key as `get` finds it, read where it is: one held in its leaf is lent from the page, for as
+/// long as what reads the pages is held, and only a long one is put together.
+///
+/// # Errors
+/// The space is damaged.
+pub fn get_in<'p>(pages: &'p impl Pages, tree: usize, key: &[u8]) -> Result<Option<std::borrow::Cow<'p, [u8]>>> {
+    use std::borrow::Cow;
     let mut at = pages.root(tree);
     if at == 0 {
         return Ok(None);
@@ -195,8 +209,8 @@ pub fn get(pages: &impl Pages, tree: usize, key: &[u8]) -> Result<Option<Vec<u8>
         }
         let Ok(i) = find(page, key).ok_or_else(|| torn(pages, page))? else { return Ok(None) };
         return match leaf_cell(page, i).ok_or_else(|| torn(pages, page))?.1 {
-            Value::Here(bytes) => Ok(Some(bytes.to_vec())),
-            Value::Long { len, first } => long(pages, len, first).map(Some),
+            Value::Here(bytes) => Ok(Some(Cow::Borrowed(bytes))),
+            Value::Long { len, first } => long(pages, len, first).map(|value| Some(Cow::Owned(value))),
         };
     }
     Err(pages.damaged("a tree deeper than any is: it leads back into itself".into()))
@@ -212,6 +226,14 @@ pub fn scan(pages: &impl Pages, tree: usize, from: &[u8], each: &mut dyn FnMut(&
         scan_page(pages, root, from, each, 0)?;
     }
     Ok(())
+}
+
+/// Every key that begins with `prefix`, in order, with its value, given to `each` until it says to stop.
+///
+/// # Errors
+/// The space is damaged.
+pub fn scan_prefix(pages: &impl Pages, tree: usize, prefix: &[u8], each: &mut dyn FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
+    scan(pages, tree, prefix, &mut |key, value| key.starts_with(prefix) && each(key, value))
 }
 
 /// Scan a page and what is under it: whether to go on.
@@ -378,9 +400,10 @@ fn let_go_long(txn: &mut Txn<'_>, len: u32, mut at: u64) -> Result<()> {
     Ok(())
 }
 
-/// A value as a leaf is to hold it: itself, or - too long for a leaf - written to pages of its own.
-fn held(txn: &mut Txn<'_>, value: &[u8]) -> Result<Held> {
-    if value.len() <= INLINE {
+/// A value as a leaf is to hold it under a key of this length: itself, or - where its cell would be too long for
+/// a leaf - written to pages of its own.
+fn held(txn: &mut Txn<'_>, key: usize, value: &[u8]) -> Result<Held> {
+    if 8 + key + value.len() <= CELL {
         return Ok(Held::Here(value.to_vec()));
     }
     let Ok(len) = u32::try_from(value.len()) else {
@@ -417,7 +440,7 @@ fn put_under(txn: &mut Txn<'_>, at: u64, key: &[u8], value: &[u8], depth: usize)
             },
             Err(_) => None,
         };
-        let new = held(txn, value)?;
+        let new = held(txn, key.len(), value)?;
         if let Some((len, first)) = was_long {
             let_go_long(txn, len, first)?;
         }
@@ -504,7 +527,7 @@ pub fn put(txn: &mut Txn<'_>, tree: usize, key: &[u8], value: &[u8]) -> Result<(
     }
     let root = txn.root(tree);
     if root == 0 {
-        let new = held(txn, value)?;
+        let new = held(txn, key.len(), value)?;
         let leaf = txn.make(LEAF)?;
         Leaf::write(txn.page_mut(leaf)?, &[(key.to_vec(), new)]);
         txn.set_root(tree, leaf);
@@ -521,6 +544,76 @@ pub fn put(txn: &mut Txn<'_>, tree: usize, key: &[u8], value: &[u8]) -> Result<(
         None => at,
     };
     txn.set_root(tree, root);
+    Ok(())
+}
+
+/// Fill a tree that holds nothing with keys given in their order, each with its value: its pages filled as far as
+/// leaves room for what is put after (`FILLED`), where keys put one by one leave them half full - what a
+/// structure made whole is made by.
+///
+/// # Errors
+/// The tree holds something; a key is not after the one before it, or longer than a tree holds; no room can be
+/// made; or the space is damaged.
+pub fn load(txn: &mut Txn<'_>, tree: usize, cells: &mut dyn Iterator<Item = (Vec<u8>, Vec<u8>)>) -> Result<()> {
+    let invalid = |why: &str| Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_string()));
+    if txn.root(tree) != 0 {
+        return Err(invalid("a tree is loaded whole where it holds nothing"));
+    }
+    // The leaves, each by its first key.
+    let mut level: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut leaf: Vec<(Vec<u8>, Held)> = Vec::new();
+    let mut last: Option<Vec<u8>> = None;
+    for (key, value) in cells {
+        if key.len() > KEY {
+            return Err(invalid("a key longer than a tree holds"));
+        }
+        if last.as_ref().is_some_and(|last| *last >= key) {
+            return Err(invalid("a tree is loaded with its keys in their order"));
+        }
+        let value = held(txn, key.len(), &value)?;
+        let cell = (key, value);
+        if !leaf.is_empty() && Leaf::size(&leaf) + Leaf::cell_size(&cell) > FILLED {
+            let at = txn.make(LEAF)?;
+            Leaf::write(txn.page_mut(at)?, &leaf);
+            level.push((leaf[0].0.clone(), at));
+            leaf.clear();
+        }
+        last = Some(cell.0.clone());
+        leaf.push(cell);
+    }
+    if !leaf.is_empty() {
+        let at = txn.make(LEAF)?;
+        Leaf::write(txn.page_mut(at)?, &leaf);
+        level.push((leaf[0].0.clone(), at));
+    }
+    // The branches over them, a level at a time, until one page is over all.
+    while level.len() > 1 {
+        let mut groups: Vec<Vec<(Vec<u8>, u64)>> = Vec::new();
+        for child in level {
+            let full = groups.last().is_some_and(|group| Branch::size(&group[1..]) + 12 + child.0.len() > FILLED);
+            if full || groups.is_empty() {
+                groups.push(Vec::new());
+            }
+            if let Some(group) = groups.last_mut() {
+                group.push(child);
+            }
+        }
+        // No branch over one child alone: the last takes one from the one before it.
+        if let [.., before, last] = groups.as_mut_slice()
+            && last.len() == 1
+            && let Some(moved) = before.pop()
+        {
+            last.insert(0, moved);
+        }
+        let mut above = Vec::with_capacity(groups.len());
+        for group in groups {
+            let at = txn.make(BRANCH)?;
+            Branch::write(txn.page_mut(at)?, group[0].1, &group[1..]);
+            above.push((group[0].0.clone(), at));
+        }
+        level = above;
+    }
+    txn.set_root(tree, level.first().map_or(0, |(_, at)| *at));
     Ok(())
 }
 

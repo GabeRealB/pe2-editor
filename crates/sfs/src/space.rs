@@ -750,6 +750,21 @@ impl Space {
         }
     }
 
+    /// Read as `read` does, for as long as what this returns is held - by whoever holds it, wherever: a view of
+    /// what the trees hold at one commit, kept by what it is a view for.
+    ///
+    /// # Errors
+    /// The space is damaged.
+    pub fn pinned(self: &Arc<Self>) -> Result<Pinned> {
+        let commit = {
+            let read = self.read()?;
+            // Pinned once more, for what is returned: the reading's own goes as it is dropped.
+            self.pin(read.commit.generation);
+            read.commit
+        };
+        Ok(Pinned { space: self.clone(), commit })
+    }
+
     fn pin(&self, generation: u64) {
         let mut pins = lock(&self.pins);
         *pins.entry(generation).or_default() += 1;
@@ -1013,6 +1028,54 @@ impl Pages for Snapshot<'_> {
 }
 
 impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        self.space.unpin(self.commit.generation);
+    }
+}
+
+/// The trees as one commit left them, read for as long as this is held, by whoever holds it: what a `Snapshot`
+/// is, kept with the space it is of.
+pub struct Pinned {
+    space: Arc<Space>,
+    commit: Commit,
+}
+
+impl Pinned {
+    /// The commit read at.
+    #[must_use]
+    pub fn commit(&self) -> &Commit {
+        &self.commit
+    }
+
+    /// The space read.
+    #[must_use]
+    pub fn space(&self) -> &Arc<Space> {
+        &self.space
+    }
+}
+
+impl Clone for Pinned {
+    fn clone(&self) -> Pinned {
+        self.space.pin(self.commit.generation);
+        Pinned { space: self.space.clone(), commit: self.commit }
+    }
+}
+
+impl Pages for Pinned {
+    fn page_either(&self, pointer: u64, kind: u8, or: u8) -> Result<&[u8]> {
+        checked(&self.space, pointer, [kind, or], self.commit.high)
+    }
+
+    fn root(&self, tree: usize) -> u64 {
+        self.commit.roots[tree]
+    }
+
+    fn damaged(&self, why: String) -> Error {
+        self.space.damaged(why)
+    }
+}
+
+impl Drop for Pinned {
     fn drop(&mut self) {
         self.space.unpin(self.commit.generation);
     }
