@@ -939,6 +939,8 @@ mod tests {
         /// by what the refresh says differs, is what is served listed whole.
         fn refresh(&mut self, paths: &[PathBuf]) {
             let mut listing = self.index.served();
+            // As the project names them, whatever the test joined them of.
+            let paths = &crate::testing::reals(paths);
             let refreshed = self.index.refresh(&self.project, paths).unwrap();
             if refreshed.project_file {
                 let mut txn = self.shared.write().unwrap();
@@ -1432,11 +1434,11 @@ mod tests {
         only_records(&root);
         // Renamed: one record changes, what is inside follows.
         let folder = o.uid("h");
-        let records_before = crate::records::Set::records_of(&root.join(".layers/top")).unwrap();
+        let records_before = crate::records::Set::records_of(&crate::testing::real(&root.join(".layers/top"))).unwrap();
         let paths = rename(&o.project, &o.index, "top", &folder, "k", &mut o.history).unwrap();
         o.refresh(&paths);
         assert!(o.index.assets.contains_key("k/made") && !o.index.assets.contains_key("h/made"));
-        let records_after = crate::records::Set::records_of(&root.join(".layers/top")).unwrap();
+        let records_after = crate::records::Set::records_of(&crate::testing::real(&root.join(".layers/top"))).unwrap();
         let changed = records_after.iter().filter(|(uid, r)| records_before.get(*uid) != Some(*r)).count();
         assert_eq!(changed, 1, "a rename is one record");
         // Deleted, its own and one below.
@@ -1452,7 +1454,7 @@ mod tests {
             let paths = step.paths();
             o.refresh(&paths);
         }
-        assert!(crate::records::Set::records_of(&root.join(".layers/top")).unwrap().is_empty());
+        assert!(crate::records::Set::records_of(&crate::testing::real(&root.join(".layers/top"))).unwrap().is_empty());
         assert_eq!(o.index.assets["g/a"].layers, ["base"]);
         assert!(o.index.entries.contains_key("n") && !o.index.entries.contains_key("h"));
         assert!(o.index.problems.is_empty(), "{:?}", o.index.problems);
@@ -1524,6 +1526,7 @@ mod tests {
         assert_eq!(o.index.assets["g/a"].layers, ["base", "top"]);
         assert_eq!(o.index.assets["g/a"].fields().get("note").and_then(pe2_value::Value::as_str), Some("x"));
         // A continued edit joins the step; undone, the copy goes with it.
+        o.history.merge_whenever();
         let text = b"stack = [{ op = \"t.image\" }]\nnote = \"xy\"\n";
         let paths = super::write_file(
             &o.project,

@@ -257,9 +257,11 @@ mod tests {
             (files.kind, files.fills.as_deref(), files.read_only),
             (crate::LayerKind::Generated, Some("game"), true)
         );
-        assert_eq!(files.plan(), dir.join(".layers/game-files.plan.jsonl"));
-        assert_eq!(made.unmanaged[0].path, dir.join("roms"));
-        assert_eq!(made.resolve("res://roms/a.bin").unwrap(), dir.join("roms/a.bin"));
+        // Each place as the project names it: by the project's real folder, part by part.
+        let at = |path: &str| crate::testing::at(&crate::testing::real(&dir), path);
+        assert_eq!(files.plan(), at(".layers/game-files.plan.jsonl"));
+        assert_eq!(made.unmanaged[0].path, at("roms"));
+        assert_eq!(made.resolve("res://roms/a.bin").unwrap(), at("roms/a.bin"));
         assert_eq!(made.configs[0].release.as_deref(), Some("USA"));
         let declaration: toml::Table = toml::from_str("values = [\"en\", \"fr\"]\ndefault = \"en\"").unwrap();
         super::declare_property(&project(), "language", &declaration, &mut history).unwrap();
@@ -281,8 +283,9 @@ mod tests {
         assert!(ignored.contains("/.layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
         assert!(ignored.contains("/project.local.toml"), "{ignored}");
         // Where the discs are is this machine's.
-        super::locate(&made, "roms", "/elsewhere").unwrap();
-        assert_eq!(project().unmanaged[0].path, std::path::Path::new("/elsewhere"));
+        let elsewhere = dir.with_extension("elsewhere");
+        super::locate(&made, "roms", &elsewhere.to_string_lossy()).unwrap();
+        assert_eq!(project().unmanaged[0].path, elsewhere);
         // So are the links it wants.
         super::add_link(&project(), "../compile_commands.json", "build/compile_commands.json").unwrap();
         assert_eq!(project().links["../compile_commands.json"], "build/compile_commands.json");

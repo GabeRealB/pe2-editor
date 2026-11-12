@@ -4125,13 +4125,13 @@ mod tests {
         let folder = changeset(&root, "base").entries.iter().find(|(_, p)| *p == "g").unwrap().0.clone();
         // A file of a bundle changed: that bundle, its file read again.
         let texels = write(&root, ".layers/base/g/a.node/native.texels", "repainted");
-        let refreshed = index.refresh(&project, &[texels]).unwrap();
+        let refreshed = index.refresh(&project, &crate::testing::reals(&[texels])).unwrap();
         assert_eq!(refreshed.assets.into_iter().collect::<Vec<_>>(), ["g/a"]);
         assert_eq!(index.read, 1);
         // A folder renamed in the layer's folder, by other means than the editor: no edit, a problem - what it holds now
         // is unlisted, what it listed missing - until it is adopted, which follows the move: the uids are kept.
         std::fs::rename(root.join(".layers/base/g"), root.join(".layers/base/h")).unwrap();
-        index.refresh(&project, &[root.join(".layers/base/g"), root.join(".layers/base/h")]).unwrap();
+        index.refresh(&project, &crate::testing::reals(&[root.join(".layers/base/g"), root.join(".layers/base/h")])).unwrap();
         assert!(!index.assets.contains_key("h/a"));
         assert!(index.problems.contains(&Problem::Unlisted { layer: "base".into(), path: "h".into() }));
         let adopted = index.adoption("base", "h").unwrap();
@@ -4140,19 +4140,19 @@ mod tests {
         let mut base = changeset(&root, "base");
         base.entries.extend(adopted);
         base.save(&root.join(".layers/base.toml")).unwrap();
-        index.refresh(&project, &[root.join(".layers/base.toml")]).unwrap();
+        index.refresh(&project, &crate::testing::reals(&[root.join(".layers/base.toml")])).unwrap();
         assert_eq!(index.assets["h/a"].uid.as_deref(), Some("uid://a"));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         // A bundle removed: its entry is missing until it is dropped from the changeset.
         std::fs::remove_dir_all(root.join(".layers/base/f.node")).unwrap();
-        index.refresh(&project, &[root.join(".layers/base/f.node")]).unwrap();
+        index.refresh(&project, &crate::testing::reals(&[root.join(".layers/base/f.node")])).unwrap();
         assert!(!index.assets.contains_key("f"));
         assert!(index.problems.contains(&Problem::Missing {
             layer: "base".into(),
             path: "f.node".into(),
             left_out: false
         }));
-        assert!(index.refresh(&project, &[root.join("project.toml")]).unwrap().project_file);
+        assert!(index.refresh(&project, &crate::testing::reals(&[root.join("project.toml")])).unwrap().project_file);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4180,7 +4180,7 @@ mod tests {
         // What the plan writes again is taken in as the node's.
         let (_, fresh) = open(&root);
         let texels = write(&root, ".layers/base-files/g/a.node/native.texels", "repainted");
-        index.refresh(&project, std::slice::from_ref(&texels)).unwrap();
+        index.refresh(&project, &crate::testing::reals(std::slice::from_ref(&texels))).unwrap();
         assert_ne!(shown(&index), shown(&fresh));
         let (_, again) = open(&root);
         assert_eq!(shown(&index), shown(&again));
@@ -4205,7 +4205,7 @@ mod tests {
         let (project, mut index) = open(&root);
         // Each change refreshed, the stack applied again or not as expected, then held to an opening afresh.
         let check = |index: &mut Index, project: &Project, changed: &[PathBuf], what: &str, restacked: bool| {
-            assert_eq!(index.refresh(project, changed).unwrap().restacked, restacked, "{what}");
+            assert_eq!(index.refresh(project, &crate::testing::reals(changed)).unwrap().restacked, restacked, "{what}");
             let (_, fresh) = open(&root);
             assert_eq!(shown(index), shown(&fresh), "after {what}");
         };
@@ -4268,14 +4268,16 @@ mod tests {
         write(&tree, "x.node/node.toml", "stack = [{ op = \"t.file\" }]\n");
         write(&tree, ".gitignore", "*.o\n");
         let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
-        let mount = format!("[[mount]]\nat = \"code\"\npath = \"{}\"\nread_only = true\n", tree.display());
+        // Its place as it is written on this system, taken as it is: no character of it escapes another.
+        let mount = format!("[[mount]]\nat = \"code\"\npath = '{}'\nread_only = true\n", tree.display());
         std::fs::write(root.join("project.toml"), format!("{text}\n{mount}")).unwrap();
         let (project, index) = open(&root);
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["code", "base", "top"]);
         let mut listed: Vec<String> = changeset(&root, "code").entries.into_values().collect();
         listed.sort();
         assert_eq!(listed, ["code", "code/main.c", "code/x.node", "code/x.node/node.toml"]);
-        assert_eq!(index.entries["code/main.c"].disk, tree.join("main.c"));
+        let real = crate::testing::real;
+        assert_eq!(real(&index.entries["code/main.c"].disk), real(&tree.join("main.c")));
         assert!(!index.assets.contains_key("code/x"));
         assert!(index.problems.is_empty(), "{:?}", index.problems);
         std::fs::remove_dir_all(&root).unwrap();

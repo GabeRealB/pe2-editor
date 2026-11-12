@@ -244,6 +244,8 @@ pub struct View {
 pub struct History {
     /// Its steps, its documents and what it keeps: read through it as of the history itself (`Deref`).
     view: View,
+    /// How long after a step was made an edit continuing it still joins it.
+    merge_within: Duration,
     /// How many times what it shows changed: counted where the session is written, which every change of its
     /// steps and documents does.
     revision: std::cell::Cell<u64>,
@@ -389,6 +391,7 @@ impl History {
         let dir = cache.path(DIR);
         let mut history = History {
             view: View { dir: dir.clone(), ..View::default() },
+            merge_within: MERGE_WITHIN,
             revision: std::cell::Cell::new(0),
             journaled: false,
             appended: std::cell::Cell::new(None),
@@ -452,6 +455,13 @@ impl History {
     /// What the session kept, wiped: it is closing cleanly, and goes with this.
     pub fn wipe(&self) {
         let _ = std::fs::remove_dir_all(&self.view.dir);
+    }
+
+    /// Have an edit continuing a step join it however long after: for a test of what joins, which a slow disk
+    /// under it should not decide.
+    #[cfg(test)]
+    pub(crate) fn merge_whenever(&mut self) {
+        self.merge_within = Duration::MAX;
     }
 
     /// Which of its revisions it is at: another, once what it shows (`view`) changed.
@@ -1106,7 +1116,7 @@ impl History {
         // The documents it edited: written with it.
         let edited: Vec<String> = step.edits.iter().map(|edit| edit.uid.clone()).collect();
         if let (Some(last), Some((key, _))) = (self.view.done.last_mut(), &step.merge)
-            && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < MERGE_WITHIN)
+            && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < self.merge_within)
         {
             // One edit continued: the step keeps where it started from and takes where it ends - the last write of a
             // path continued, a step that wrote a file twice (a copy, then an edit of it) keeping the first.

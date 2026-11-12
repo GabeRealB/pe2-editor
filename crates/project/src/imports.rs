@@ -1110,7 +1110,7 @@ mod attaching {
         // Its first attach is what it learns what each read from.
         imports.attach(&mut index, &extensions);
         write(&root, ".layers/base/s.node/source.txt", "a b c");
-        let refreshed = index.refresh(&project, &[root.join(".layers/base/s.node/source.txt")]).unwrap();
+        let refreshed = index.refresh(&project, &crate::testing::reals(&[root.join(".layers/base/s.node/source.txt")])).unwrap();
         assert!(!refreshed.assets.contains("c"), "c's own files did not change");
         imports.attach_changed(&mut index, &extensions, &refreshed.assets);
         let (fresh, _) = open(&root, &extensions);
@@ -1118,7 +1118,7 @@ mod attaching {
         // What it reads emptied, it fails; filled again, it is made again, though its failure read nothing.
         for (text, fails) in [("", true), ("a", false)] {
             write(&root, ".layers/base/s.node/source.txt", text);
-            let refreshed = index.refresh(&project, &[root.join(".layers/base/s.node/source.txt")]).unwrap();
+            let refreshed = index.refresh(&project, &crate::testing::reals(&[root.join(".layers/base/s.node/source.txt")])).unwrap();
             imports.attach_changed(&mut index, &extensions, &refreshed.assets);
             let failed = index.problems.iter().any(|p| matches!(p, Problem::Import { asset, .. } if asset == "c"));
             assert_eq!(failed, fails, "{text:?}: {:?}", index.problems);
@@ -1701,7 +1701,7 @@ mod attaching {
             ("r.node/node.toml", "one = \"uid://s#cells/a\"\ntwo = \"uid://t#cells/c\"\n"),
         ] {
             write(&root, &format!(".layers/base/{path}"), text);
-            let refreshed = index.refresh(&project, &[base(path)]).unwrap();
+            let refreshed = index.refresh(&project, &crate::testing::reals(&[base(path)])).unwrap();
             imports.attach_changed(&mut index, &extensions, &refreshed.assets);
             let (fresh, _) = open(&root, &extensions);
             assert_eq!(shown(&index), shown(&fresh), "after {path}");

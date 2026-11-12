@@ -805,6 +805,60 @@ impl Project {
     }
 }
 
+/// What tests of a project share.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+
+    /// A path as the project names it once loaded: by its real place, part by part - what a watch of its layers
+    /// tells of, and what a path a test joined together with `/` is not on every system. What of it is not
+    /// there (a file removed) follows what is.
+    pub fn real(path: &Path) -> PathBuf {
+        let mut there = path.to_path_buf();
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(real) = std::fs::canonicalize(&there) {
+                return rest.iter().rev().fold(real, |path, part| path.join(part));
+            }
+            match (there.file_name().map(std::ffi::OsStr::to_os_string), there.parent().map(Path::to_path_buf)) {
+                (Some(name), Some(parent)) => {
+                    rest.push(name);
+                    there = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+
+    /// A path under a folder, part by part: as the system writes it, whatever form the folder is named in.
+    pub fn at(root: &Path, path: &str) -> PathBuf {
+        path.split('/').fold(root.to_path_buf(), |at, part| at.join(part))
+    }
+
+    /// Have a file or a folder say it was last changed then.
+    pub fn set_modified(path: &Path, at: std::time::SystemTime) {
+        let mut options = std::fs::OpenOptions::new();
+        // What changes a time is allowed to: on Windows asked for by itself, of a folder too.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options.write(true).access_mode(0x0100).custom_flags(0x0200_0000);
+        }
+        #[cfg(not(windows))]
+        if path.is_dir() {
+            options.read(true);
+        } else {
+            options.write(true);
+        }
+        options.open(path).unwrap().set_modified(at).unwrap();
+    }
+
+    /// Each of these paths as the project names it (`real`).
+    pub fn reals(paths: &[PathBuf]) -> Vec<PathBuf> {
+        paths.iter().map(|path| real(path)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

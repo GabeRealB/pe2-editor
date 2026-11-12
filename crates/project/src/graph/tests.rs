@@ -1076,7 +1076,7 @@ fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
         let file = std::fs::File::create(dir.join("tmp").join(name)).unwrap();
         file.set_modified(std::time::SystemTime::now() - age).unwrap();
     }
-    std::fs::File::open(dir.join("tmp/old.expand")).unwrap().set_modified(std::time::SystemTime::now() - day).unwrap();
+    crate::testing::set_modified(&dir.join("tmp/old.expand"), std::time::SystemTime::now() - day);
     let _store = Store::at(dir.clone()).unwrap();
     // What a stopped process left goes, a folder of it too; what is being written stays.
     assert_eq!(left_in_tmp(&dir), ["2-0"]);
@@ -1093,7 +1093,7 @@ fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
     store.mark_swept();
     let set = |path: &str, ago: std::time::Duration| {
         let at = std::time::SystemTime::now() - ago;
-        std::fs::File::open(dir.join(path)).unwrap().set_modified(at).unwrap();
+        crate::testing::set_modified(&dir.join(path), at);
     };
     // Swept an hour ago, nothing kept since.
     set("swept", std::time::Duration::from_hours(1));
