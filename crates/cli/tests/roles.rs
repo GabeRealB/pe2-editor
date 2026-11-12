@@ -185,14 +185,15 @@ impl Served {
     }
 }
 
-/// A stand-in for an editor: it takes the project as one does - borrowed from the host - answers the edits sent on
-/// the holder's link as steps of a history of its own, and feeds the server what is served, until dropped.
+/// A stand-in for an editor: it takes the project as one does - borrowed from the host - holds it as any holder
+/// does (`holder::core::Core`), answers the edits sent on the holder's link as steps of a history of its own, and
+/// feeds the server what is served, until dropped.
 struct StandIn {
     _link: mcp::link::Listener,
     files: Arc<holder::files::Files>,
     /// The edits it made, by their labels.
     made: Arc<Mutex<Vec<String>>>,
-    _held: Arc<Mutex<(project::index::Index, project::history::History)>>,
+    _held: Arc<Mutex<(holder::core::Core, project::history::History)>>,
     _lock: project::lock::Lock,
 }
 
@@ -204,53 +205,25 @@ impl StandIn {
         let (history, _) = project::history::History::open(&cache).unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
         let says = Arc::new(holder::says::Says::of(&p));
+        let mut core = holder::core::Core::new(p.clone(), index, says.clone());
+        core.took(|| {});
         let files = Arc::new(holder::files::Files::feed(&p, Vec::new(), says));
-        files.show(Arc::new(index.served()));
-        let held = Arc::new(Mutex::new((index, history)));
+        core.feed_whole(files.clone());
         let made = Arc::new(Mutex::new(Vec::new()));
-        let (holding, feeding, noting) = (held.clone(), files.clone(), made.clone());
-        let space = project::shared::space(root).unwrap();
+        let noting = made.clone();
+        core.made = Box::new(move |label| noting.lock().unwrap().push(label.to_string()));
+        let held = Arc::new(Mutex::new((core, history)));
+        let holding = held.clone();
         let answer = move |request: mcp::Request| {
-            // What is due is taken where it is said; a command's edit comes as it is.
-            let (numbers, ops) = match request {
-                mcp::Request::Edit { op, .. } => (None, vec![op]),
-                mcp::Request::Due => {
-                    let (numbers, ops): (Vec<u64>, Vec<_>) = vfs::due::due(&space.read().unwrap()).unwrap().into_iter().unzip();
-                    (Some(numbers), ops)
-                }
-                _ => return mcp::Reply::Declined,
-            };
             let mut held = holding.lock().unwrap();
-            let (index, history) = &mut *held;
-            let layer = vfs::write::writable_layer(index).unwrap();
-            let (mut labels, mut changed) = (Vec::new(), Vec::new());
-            for op in &ops {
-                labels.push(match vfs::ops::apply(op, &p, index, &layer, history) {
-                    Ok((label, touched)) => {
-                        changed.extend(touched);
-                        changed.extend(history.take_written());
-                        index.refresh(&p, &changed).unwrap();
-                        noting.lock().unwrap().push(label.clone());
-                        Ok(label)
-                    }
-                    Err(e) => {
-                        eprintln!("the stand-in could not make an edit: {e:#}");
-                        Err(format!("{e:#}"))
-                    }
-                });
-            }
-            let served = Some(Arc::new(index.served()));
-            if let Some(numbers) = numbers {
-                let count = numbers.len();
-                let answers: Vec<(u64, vfs::due::Answer)> = numbers.into_iter().zip(labels).collect();
-                feeding.show_changed_answering(changed, served, &project::model::Delta::default(), &answers);
-                return mcp::Reply::Taken { count };
-            }
-            feeding.show_changed(changed.clone(), Arc::new(index.served()));
-            match labels.pop() {
-                Some(Ok(label)) => mcp::Reply::Edited { label, touched: changed },
-                Some(Err(why)) => mcp::Reply::failed(why),
-                None => mcp::Reply::Declined,
+            let (core, history) = &mut *held;
+            match request {
+                // A command's edit comes as it is; what is due is taken where it is said.
+                mcp::Request::Edit { op, layer } => {
+                    core.edits(history, &[op], layer.as_deref(), None).pop().unwrap_or(mcp::Reply::Declined)
+                }
+                mcp::Request::Due => core.take_due(history),
+                _ => mcp::Reply::Declined,
             }
         };
         let link = mcp::link::Listener::start(root, answer).unwrap();
