@@ -1336,8 +1336,9 @@ pub struct Index {
     /// Shared with the snapshots made of the index, copied where one is changed while they hold it.
     pub assets: Arc<BTreeMap<String, Arc<Asset>>>,
     /// The versions overridden assets have below them, by `below:<uid>`, and those below that, by `below:below:<uid>`:
-    /// nodes of their own, read through the graph's `below` operation.
-    versions: Arc<HashMap<String, Arc<Asset>>>,
+    /// nodes of their own, read through the graph's `below` operation - made when first asked for (`version`),
+    /// of the stack as it is then, and let go of whenever an asset is assembled again.
+    versions: Arc<OnceLock<HashMap<String, Arc<Asset>>>>,
     /// Every resolved entry - assets, folders, plain files - by path. This and the maps below are shared with the
     /// snapshots made of the index, copied when a take-in changes them.
     pub entries: Arc<BTreeMap<String, Entry>>,
@@ -1532,9 +1533,20 @@ impl Index {
         let files: Vec<PathBuf> = self.layers.iter().flat_map(|layer| layer.scan.all_files().cloned()).collect();
         let layers: Vec<(Place, Arc<Scan>)> = self.layers.iter().map(|layer| (layer.place.clone(), layer.scan.clone())).collect();
         let set = crate::records::Set::current(&self.root);
+        // What the layer edits go to stands on - the highest that can be written, no mounted tree - made beside it:
+        // the first edit asks for it, and waits for all of this. Kept where this index and every one made of it
+        // finds it.
+        let stands_on = self.layers.iter().rev().find(|layer| layer.writable && !layer.mounted).map(|layer| layer.name.clone());
+        let beneath = stands_on.map(|layer| (self.clone(), layer));
         move || {
             // Each on a thread of its own: an edit waits for all of it.
             let (of_records, walked, mut stale) = std::thread::scope(|scope| {
+                if let Some((index, layer)) = &beneath {
+                    scope.spawn(move || {
+                        let _span = tracing::info_span!("index: what the layer edits go to stands on").entered();
+                        drop(index.below_layer(layer));
+                    });
+                }
                 // The records' files, against what was taken as known of each.
                 let of_records = scope.spawn(|| {
                     let _span = tracing::info_span!("index: the records held to their files").entered();
@@ -3489,7 +3501,7 @@ impl Index {
     /// bundle, its `node.toml`. A path that no longer resolves to an asset loses its asset; `entries` follows the
     /// whole stack.
     fn assemble(&mut self, paths: &[String]) {
-        self.assemble_entries();
+        tracing::info_span!("assemble: entries").in_scope(|| self.assemble_entries());
         self.assemble_assets(paths);
     }
 
@@ -3517,34 +3529,23 @@ impl Index {
     }
 
     /// The assets at these real paths, from the resolved stack and the records; a path that no longer resolves to an
-    /// asset loses its asset.
+    /// asset loses its asset. Many at once - a project opened, the stack applied again - are made on every core:
+    /// each is made of its own entry and files alone.
     fn assemble_assets(&mut self, paths: &[String]) {
-        for path in paths {
-            let Some(node) = self.resolved.get(path).filter(|n| n.kind == Kind::Asset) else {
-                Arc::make_mut(&mut self.assets).remove(asset_of(path));
-                continue;
-            };
-            let layer = &self.layers[node.content.0];
-            let layers = std::iter::once(node.home).chain(node.overrides.iter().copied());
-            let mut asset = Asset {
-                path: asset_of(path).to_string(),
-                uid: Some(node.uid.clone()),
-                shape: Arc::from(""),
-                variants: vec![],
-                files: vec![],
-                layers: layers.map(|l| self.layers[l].name.clone()).collect(),
-                error: None,
-                text: Arc::from(""),
-                generated: None,
-                fields: OnceLock::new(),
-                settings_text: OnceLock::new(),
-                fields_toml: OnceLock::new(),
-                settings_toml: OnceLock::new(),
-                imported: None,
-                disk: None,
-            };
+        // Enough of them to be worth helpers: what an edit changed is made here.
+        const MANY: usize = 64;
+        fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+            if items.len() < MANY { items.iter().map(work).collect() } else { crate::parallel(items, work) }
+        }
+        // What the assets override is made again when next asked for.
+        if !paths.is_empty() {
+            self.versions = Arc::default();
+        }
+        // Each asset's files, and those of them nothing was read of yet: what overrides merged, in the cache.
+        let listing = tracing::info_span!("assemble: the assets' files").entered();
+        let files = each(paths, |path| {
+            let node = self.resolved.get(path).filter(|n| n.kind == Kind::Asset)?;
             let files = self.node_files(node);
-            // What overrides merged, in the cache: recorded as any file is, read once.
             let unread: Vec<Pending> = files
                 .iter()
                 .filter(|(_, file, _)| !self.records.contains_key(file))
@@ -3554,105 +3555,146 @@ impl Index {
                     Some(Pending { path: file.clone(), size, modified: stamp(modified), declaration })
                 })
                 .collect();
+            Some((files, unread))
+        });
+        drop(listing);
+        // Recorded as any file is, read once.
+        let unread: Vec<&Pending> = files.iter().flatten().flat_map(|(_, unread)| unread).collect();
+        if !unread.is_empty() {
+            let unread: Vec<Pending> = unread.into_iter().map(|file| Pending { path: file.path.clone(), ..*file }).collect();
             for (file, record) in unread.iter().zip(read_all(&unread)) {
                 if let Some(record) = record {
                     Arc::make_mut(&mut self.records).insert(file.path.clone(), Arc::new(record));
                 }
             }
-            for (name, file, held) in files {
-                let Some(record) = self.records.get(&file) else { continue };
-                if name == NODE_FILE
-                    && let Some(d) = &record.declaration
-                {
-                    asset.shape = Arc::from(d.shape.as_str());
-                    asset.variants.clone_from(&d.variants);
-                    asset.error.clone_from(&d.error);
-                    asset.text = d.text.clone();
-                }
-                if name == SETTINGS_FILE
-                    && let Some(d) = &record.declaration
-                {
-                    asset.generated = Some(d.text.clone());
-                }
-                asset.files.push(BundleFile {
-                    name: name.clone(),
-                    path: file.clone(),
-                    size: record.size,
-                    modified: record.modified,
-                    layer: self.layers[held].name.clone(),
-                    sha1: record.sha1.clone(),
-                    made_by: None,
-                });
-            }
-            let (uid, top, overridden) = (node.uid.clone(), layer.name.clone(), !node.overrides.is_empty());
-            let at = asset.path.clone();
-            let asset = self.with_working(asset);
+        }
+        let with_files: Vec<_> = paths.iter().zip(files).map(|(path, files)| (path, files.map(|(files, _)| files))).collect();
+        let assets = tracing::info_span!("assemble: the assets made").in_scope(|| {
+            each(&with_files, |(path, files)| {
+                let (node, files) = (self.resolved.get(*path)?, files.as_ref()?);
+                Some(self.with_working(self.asset_made(path, node, files)))
+            })
+        });
+        let _span = tracing::info_span!("assemble: the assets kept").entered();
+        for (path, asset) in paths.iter().zip(assets) {
+            let Some(asset) = asset else {
+                Arc::make_mut(&mut self.assets).remove(asset_of(path));
+                continue;
+            };
             Arc::make_mut(&mut self.assets).insert(asset.path.clone(), Arc::new(asset));
-            // Its versions below, as they were: `below:<uid>`, `below:below:<uid>`, ...
-            let mut version = format!("{BELOW}{uid}");
-            while Arc::make_mut(&mut self.versions).remove(&version).is_some() {
-                version.insert_str(0, BELOW);
-            }
-            if overridden {
-                self.assemble_versions(&at, &uid, top);
-            }
         }
     }
 
-    /// The versions an asset overrides, each below the last, from the layer holding it.
-    fn assemble_versions(&mut self, at: &str, uid: &str, mut layer: String) {
-        let mut name = format!("{BELOW}{uid}");
-        while let Some(below) = self.below(&layer, uid) {
-            let mut asset = Asset {
-                path: at.to_string(),
-                uid: Some(name.clone()),
-                shape: Arc::from(""),
-                variants: vec![],
-                files: vec![],
-                layers: vec![below.layer.clone()],
-                error: None,
-                text: Arc::from(""),
-                generated: None,
-                fields: OnceLock::new(),
-                settings_text: OnceLock::new(),
-                fields_toml: OnceLock::new(),
-                settings_toml: OnceLock::new(),
-                imported: None,
-                disk: None,
-            };
-            for (file_name, file) in &below.files {
-                let Some(record) = self.records.get(file) else { continue };
-                if file_name == NODE_FILE
-                    && let Some(d) = &record.declaration
-                {
-                    asset.shape = Arc::from(d.shape.as_str());
-                    asset.text = d.text.clone();
-                }
-                if file_name == SETTINGS_FILE
-                    && let Some(d) = &record.declaration
-                {
-                    asset.generated = Some(d.text.clone());
-                }
-                asset.files.push(BundleFile {
-                    name: file_name.clone(),
-                    path: file.clone(),
-                    size: record.size,
-                    modified: record.modified,
-                    layer: below.layer.clone(),
-                    sha1: record.sha1.clone(),
-                    made_by: None,
-                });
+    /// The asset an entry of the resolved stack is, of its files as they were read: as it is on disk.
+    fn asset_made(&self, path: &str, node: &Node, files: &[(String, PathBuf, usize)]) -> Asset {
+        let layers = std::iter::once(node.home).chain(node.overrides.iter().copied());
+        let mut asset = Asset {
+            path: asset_of(path).to_string(),
+            uid: Some(node.uid.clone()),
+            shape: Arc::from(""),
+            variants: vec![],
+            files: vec![],
+            layers: layers.map(|l| self.layers[l].name.clone()).collect(),
+            error: None,
+            text: Arc::from(""),
+            generated: None,
+            fields: OnceLock::new(),
+            settings_text: OnceLock::new(),
+            fields_toml: OnceLock::new(),
+            settings_toml: OnceLock::new(),
+            imported: None,
+            disk: None,
+        };
+        for (name, file, held) in files {
+            let Some(record) = self.records.get(file) else { continue };
+            if name == NODE_FILE
+                && let Some(d) = &record.declaration
+            {
+                asset.shape = Arc::from(d.shape.as_str());
+                asset.variants.clone_from(&d.variants);
+                asset.error.clone_from(&d.error);
+                asset.text = d.text.clone();
             }
-            Arc::make_mut(&mut self.versions).insert(name.clone(), Arc::new(asset));
-            name.insert_str(0, BELOW);
-            layer = below.layer;
+            if name == SETTINGS_FILE
+                && let Some(d) = &record.declaration
+            {
+                asset.generated = Some(d.text.clone());
+            }
+            asset.files.push(BundleFile {
+                name: name.clone(),
+                path: file.clone(),
+                size: record.size,
+                modified: record.modified,
+                layer: self.layers[*held].name.clone(),
+                sha1: record.sha1.clone(),
+                made_by: None,
+            });
         }
+        asset
+    }
+
+    /// The versions every overridden asset has below it: `below:<uid>`, `below:below:<uid>`, ..., each below the
+    /// last, from the layer holding the asset.
+    fn versions_made(&self) -> HashMap<String, Arc<Asset>> {
+        let mut versions = HashMap::new();
+        let overridden = self.resolved.iter().filter(|(_, node)| node.kind == Kind::Asset && !node.overrides.is_empty());
+        for (path, node) in overridden {
+            let (at, uid) = (asset_of(path), node.uid.as_str());
+            let mut layer = self.layers[node.content.0].name.clone();
+            let mut name = format!("{BELOW}{uid}");
+            while let Some(below) = self.below(&layer, uid) {
+                let mut asset = Asset {
+                    path: at.to_string(),
+                    uid: Some(name.clone()),
+                    shape: Arc::from(""),
+                    variants: vec![],
+                    files: vec![],
+                    layers: vec![below.layer.clone()],
+                    error: None,
+                    text: Arc::from(""),
+                    generated: None,
+                    fields: OnceLock::new(),
+                    settings_text: OnceLock::new(),
+                    fields_toml: OnceLock::new(),
+                    settings_toml: OnceLock::new(),
+                    imported: None,
+                    disk: None,
+                };
+                for (file_name, file) in &below.files {
+                    let Some(record) = self.records.get(file) else { continue };
+                    if file_name == NODE_FILE
+                        && let Some(d) = &record.declaration
+                    {
+                        asset.shape = Arc::from(d.shape.as_str());
+                        asset.text = d.text.clone();
+                    }
+                    if file_name == SETTINGS_FILE
+                        && let Some(d) = &record.declaration
+                    {
+                        asset.generated = Some(d.text.clone());
+                    }
+                    asset.files.push(BundleFile {
+                        name: file_name.clone(),
+                        path: file.clone(),
+                        size: record.size,
+                        modified: record.modified,
+                        layer: below.layer.clone(),
+                        sha1: record.sha1.clone(),
+                        made_by: None,
+                    });
+                }
+                versions.insert(name.clone(), Arc::new(asset));
+                name.insert_str(0, BELOW);
+                layer = below.layer;
+            }
+        }
+        versions
     }
 
     /// A version an asset overrides, by its name: `below:<uid>`.
     #[must_use]
     pub fn version(&self, name: &str) -> Option<&Asset> {
-        self.versions.get(name).map(Arc::as_ref)
+        self.versions.get_or_init(|| self.versions_made()).get(name).map(Arc::as_ref)
     }
 
     /// Resolve the uids and the references, and add what is wrong with the assets' declarations.
