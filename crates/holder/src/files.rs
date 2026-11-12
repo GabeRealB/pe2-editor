@@ -146,6 +146,18 @@ impl Files {
         Self::sent(self.shown.send(shown));
     }
 
+    /// What differs of what is served from what was shown before (`Index::serve_changed`), said with what became
+    /// of what was due, and `then` done once the server serves it, or will not: nobody waits for it here.
+    pub fn show_delta_then(
+        &self,
+        delta: project::server::Delta,
+        answers: Vec<(u64, vfs::due::Answer)>,
+        then: Option<Then>,
+    ) {
+        let shown = Shown { said: Said::Changed(delta), changed: Vec::new(), answers, served: None, then };
+        Self::sent(self.shown.send(shown));
+    }
+
     /// Say what became of what was due, nothing of what is served having changed for it: `then` done once said.
     pub fn answer(&self, answers: Vec<(u64, vfs::due::Answer)>, then: Option<Then>) {
         let shown = Shown { said: Said::Unchanged, changed: Vec::new(), answers, served: None, then };

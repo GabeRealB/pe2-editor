@@ -70,8 +70,16 @@ pub struct Snapshot {
     pub said: Option<String>,
     /// What went wrong taking a change in.
     pub error: Option<String>,
-    /// What is served of the project now, where anything changed: for the server (`Files::show`).
-    pub served: Option<Arc<project::server::Listing>>,
+    /// What is served of the project now, for the server (`Files::show_answering`, `show_delta_then`).
+    pub served: Option<Served>,
+}
+
+/// What is served of a project after a take-in.
+pub enum Served {
+    /// All of it, listed.
+    Whole(Arc<project::server::Listing>),
+    /// What of it differs from what was served before: what files changing costs, whatever the project holds.
+    Changed(project::server::Delta),
 }
 
 /// The worker, as the UI holds it.
@@ -101,6 +109,8 @@ pub struct Worker {
     pub found: Vec<extensions::Found>,
     pub tree: Arc<Node>,
     pub stage: Arc<Mutex<String>>,
+    /// What is served, as last listed: brought up to what each change of files changed, to say what differs.
+    pub listing: Option<project::server::Listing>,
 }
 
 impl TakeIn {
@@ -120,7 +130,10 @@ impl TakeIn {
                 while let Ok(first) = queued.recv() {
                     let jobs: Vec<(u64, Job)> = std::iter::once(first).chain(queued.try_iter()).collect();
                     let files = jobs.iter().any(|(_, job)| matches!(job, Job::Paths(paths) if !paths.is_empty()));
-                    let mut snapshot = group.enter(|| worker.take_in(jobs));
+                    let mut snapshot = group.enter(|| {
+                        let _span = tracing::info_span!("take-in worker: a take-in").entered();
+                        worker.take_in(jobs)
+                    });
                     snapshot.files = files;
                     if made.send(snapshot).is_err() {
                         return;
@@ -267,6 +280,8 @@ impl Worker {
         }
         paths.sort();
         paths.dedup();
+        // Files changed and nothing else was asked: what is served differs by what they changed.
+        let only_paths = hidden.is_none() && working.is_none() && !attach && reload.is_none();
         let mut all = false;
         if let Some(names) = hidden
             && self.index.set_hidden(&names)
@@ -292,14 +307,14 @@ impl Worker {
         if paths.is_empty() {
             return match reload {
                 Some(why) => self.reload(ticket, why, whole),
-                None => self.snapshot(ticket, edited, all, None),
+                None => self.snapshot(ticket, edited, all, None, None),
             };
         }
         let refreshed = match self.index.refresh(&self.project, &paths) {
             Ok(refreshed) => refreshed,
             Err(e) => {
                 let error = format!("the index could not follow a change: {e:#}");
-                return self.snapshot(ticket, BTreeSet::new(), all, Some(error));
+                return self.snapshot(ticket, BTreeSet::new(), all, Some(error), None);
             }
         };
         if refreshed.project_file {
@@ -312,11 +327,20 @@ impl Worker {
         // The assets the refresh assembled again: their imports attached again; the others keep theirs.
         let _ = self.imports.attach_changed(&mut self.index, &self.extensions, &refreshed.assets);
         self.sweep_if_due();
+        // What is served follows what the refresh changed - the entries it touched, those gone - where it was
+        // listed before and only files changed: listed whole, it costs what the project holds at every change.
+        let served = match self.listing.as_mut().filter(|_| only_paths) {
+            Some(listing) => {
+                let _span = tracing::info_span!("take-in worker: what changed of what is served").entered();
+                Some(Served::Changed(self.index.serve_changed(listing, &refreshed)))
+            }
+            None => None,
+        };
         let mut changed = refreshed.assets;
         changed.extend(edited);
         match reload {
             Some(why) => self.reload(ticket, why, whole),
-            None => self.snapshot(ticket, changed, all, None),
+            None => self.snapshot(ticket, changed, all, None, served),
         }
     }
 
@@ -368,13 +392,13 @@ impl Worker {
         let read = self.read_again(whole);
         let snapshot = match read {
             Ok(changed) => {
-                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None);
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None, None);
                 let (project, extensions, found) = (self.project.clone(), self.extensions.clone(), self.found.clone());
                 snapshot.reloaded = Some(Reloaded { project, extensions, found, why });
                 snapshot
             }
             Err(e) => {
-                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), false, None);
+                let mut snapshot = self.snapshot(ticket, BTreeSet::new(), false, None, None);
                 snapshot.said = Some(format!("{why}, and the project could not be read again: {e:#}"));
                 snapshot
             }
@@ -404,13 +428,27 @@ impl Worker {
         Ok(true)
     }
 
-    /// The index as it is now, handed over: the tree built again where anything changed.
-    fn snapshot(&mut self, ticket: u64, changed: BTreeSet<String>, all: bool, error: Option<String>) -> Snapshot {
+    /// The index as it is now, handed over: the tree built again where anything changed; what is served as
+    /// `served` says it changed, or - where nothing says - listed whole.
+    fn snapshot(
+        &mut self,
+        ticket: u64,
+        changed: BTreeSet<String>,
+        all: bool,
+        error: Option<String>,
+        served: Option<Served>,
+    ) -> Snapshot {
         if all || !changed.is_empty() {
+            let _span = tracing::info_span!("take-in worker: the tree built").entered();
             self.tree = Arc::new(Node::build(&self.index, &self.extensions));
         }
-        // What is served, listed each time: a plain file changed is no asset changed; what is sent is what differs.
-        let served = Some(Arc::new(self.index.served()));
+        // What is served: a plain file changed is no asset changed, so it is said at every take-in.
+        let served = served.or_else(|| {
+            let _span = tracing::info_span!("take-in worker: what is served listed").entered();
+            let listing = self.index.served();
+            self.listing = Some(listing.clone());
+            Some(Served::Whole(Arc::new(listing)))
+        });
         // What the job freed, given back: the worker's threads each keep what they freed otherwise.
         project::give_back_memory();
         Snapshot {

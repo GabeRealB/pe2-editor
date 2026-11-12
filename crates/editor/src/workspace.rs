@@ -765,6 +765,7 @@ impl Workspace {
             found: extensions_found.clone(),
             tree: tree.clone(),
             stage: Arc::default(),
+            listing: None,
         });
         let attaching = takein.attach();
         let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
@@ -1389,13 +1390,17 @@ impl Workspace {
 
     /// Wait for the take-ins asked so far, and swap in what they made: what an edit does before reading the index.
     fn settle(&mut self) {
-        let ready = self.takein.settle();
+        let ready = {
+            let _span = tracing::info_span!("window thread: waiting for a take-in").entered();
+            self.takein.settle()
+        };
         self.apply(ready);
     }
 
     /// Swap in snapshots, oldest first: the index, the tree and the layers; the pictures and views of what changed
     /// forgotten; a selection shown once its step is taken in; agents waiting on them answered.
     fn apply(&mut self, snapshots: Vec<crate::takein::Snapshot>) {
+        let _span = (!snapshots.is_empty()).then(|| tracing::info_span!("window thread: snapshots swapped in").entered());
         for snapshot in snapshots {
             if let Some(error) = snapshot.error {
                 self.watch_error = Some(error);
@@ -1415,7 +1420,8 @@ impl Workspace {
             // What became of what was due, whose edits this take-in covers, is said with what is served after it.
             let (answers, then) = self.due_covered(snapshot.ticket);
             match (&self.files, snapshot.served) {
-                (Some(files), Some(served)) => files.show_answering(served, answers, then),
+                (Some(files), Some(crate::takein::Served::Whole(listing))) => files.show_answering(listing, answers, then),
+                (Some(files), Some(crate::takein::Served::Changed(delta))) => files.show_delta_then(delta, answers, then),
                 (files, _) => Self::answer_due(&self.project, files.as_ref(), answers, then),
             }
             if let Some(pictures) = &mut self.textures.pictures {
@@ -1874,6 +1880,7 @@ impl Workspace {
 
     /// An edit made over the index as it is, as a step of the history: what it wrote is yet to be taken in.
     fn apply_op(&mut self, op: &vfs::ops::Op, layer: &str) -> Result<(String, Vec<std::path::PathBuf>), String> {
+        let _span = tracing::info_span!("window thread: an edit from outside made").entered();
         vfs::ops::apply(op, &self.project, &self.index, layer, &mut self.history).map_err(|e| format!("{e:#}"))
     }
 
@@ -1881,6 +1888,7 @@ impl Workspace {
     /// folder - and make edits of it, in its order. What became of each is said there with what is served after
     /// the take-in of what they wrote, and who asked to look answered then.
     pub(crate) fn take_due(&mut self, reply: &mpsc::Sender<mcp::Reply>) {
+        let _span = tracing::info_span!("window thread: what is due taken").entered();
         let due = project::shared::space(&self.project.root).and_then(|space| vfs::due::due(&space.read()?));
         let due = match due {
             Ok(due) => due,
