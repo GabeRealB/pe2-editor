@@ -3,6 +3,7 @@ name = "pe2-psx"
 description = "pe2.psx, an unsandboxed extension: the PS1 target, which builds packages into the images the game loads"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

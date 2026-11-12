@@ -849,6 +849,7 @@ dependencies = [
  "extensions",
  "holder",
  "interprocess",
+ "licenses",
  "mcp",
  "notify",
  "pe2-ext",
@@ -1512,6 +1513,7 @@ dependencies = [
  "egui_tiles",
  "extensions",
  "holder",
+ "licenses",
  "mcp",
  "notify",
  "pe2-ext",
@@ -3052,6 +3054,16 @@ dependencies = [
  "libc",
  "plain",
  "redox_syscall 0.9.5",
+]
+
+[[package]]
+name = "licenses"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -7282,6 +7294,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codecs",
+ "licenses",
  "pe2-setup",
  "sha2 0.10.9",
  "toml 0.8.23",

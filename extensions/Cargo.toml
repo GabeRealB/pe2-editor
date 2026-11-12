@@ -3,6 +3,7 @@ name = "extensions"
 description = "The extensions the editor ships, loaded for every project"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

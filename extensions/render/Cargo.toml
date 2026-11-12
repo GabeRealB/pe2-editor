@@ -3,6 +3,7 @@ name = "pe2-render"
 description = "pe2.render, a built-in extension: meshes, materials, models and prefabs, and the game's renderer"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

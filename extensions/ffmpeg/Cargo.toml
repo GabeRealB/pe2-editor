@@ -3,6 +3,7 @@ name = "pe2-ffmpeg"
 description = "pe2.ffmpeg, an unsandboxed extension: video files written and read through ffmpeg, offered as the video-container service"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

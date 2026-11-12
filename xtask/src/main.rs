@@ -1,7 +1,8 @@
 //! The editor's own tasks, run as `cargo xtask <task>`:
 //!
 //! - `dist [--tests] [--out <folder>]`: the editor built and laid out as it ships, in
-//!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, and beside them in
+//!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, what they are built
+//!   with and under which license in `LICENSES.txt` (`licenses::Listing::document`, each extension's own in its `licenses/`), and beside them in
 //!   `extensions/` the extensions built apart from the editor, each a folder as one is kept (`<id>.extension/`): its
 //!   component, its manifest and what its crate has to be read (`docs/`, `licenses/`, ...), and what it ships -
 //!   what each fetches onto a machine its manifest says (`[[setup]]`). A project adds them from there by id (`pe2-cli project extension add
@@ -157,11 +158,30 @@ fn dist(options: &Options) -> Result<PathBuf> {
         let file = format!("{program}{}", std::env::consts::EXE_SUFFIX);
         copy(&release.join(&file), &tree.join(&file))?;
     }
+    // What the programs are built with, each license's text with it: what they say themselves (`pe2-cli licenses`).
+    let listing = licenses::listing();
+    let built_for = platform()?;
+    ensure!(listing.target == built_for, "the licenses were gathered for {}, not {built_for}", listing.target);
+    std::fs::write(tree.join(LICENSES), listing.document(None)).with_context(|| tree.join(LICENSES).display().to_string())?;
     let extensions = tree.join(EXTENSIONS);
-    extension(&workspace.join("extensions/psx"), &components.join("pe2_psx.wasm"), &extensions)?;
-    extension(&workspace.join("extensions/ffmpeg"), &components.join("pe2_ffmpeg.wasm"), &extensions)?;
+    for (source, component) in [("extensions/psx", "pe2_psx.wasm"), ("extensions/ffmpeg", "pe2_ffmpeg.wasm")] {
+        let folder = extension(&workspace.join(source), &components.join(component), &extensions)?;
+        // What its component links, beside what its crate says of what it ships and fetches.
+        let name = folder.file_name().context("a folder has a name")?.to_string_lossy().into_owned();
+        let id = name.strip_suffix(".extension").context("an extension's folder")?;
+        ensure!(listing.crates_within(Some(id)).next().is_some(), "no crate is listed as linked into {id}");
+        let file = folder.join("licenses").join(LINKED);
+        std::fs::create_dir_all(folder.join("licenses")).with_context(|| folder.display().to_string())?;
+        std::fs::write(&file, listing.document(Some(id))).with_context(|| file.display().to_string())?;
+    }
     Ok(tree)
 }
+
+/// The file beside the editor saying what it is built with, each license's text with it.
+const LICENSES: &str = "LICENSES.txt";
+
+/// The same of an extension's component, in its folder's `licenses/`.
+const LINKED: &str = "LINKED.txt";
 
 /// The folder beside the editor holding the extensions built apart from it.
 const EXTENSIONS: &str = "extensions";

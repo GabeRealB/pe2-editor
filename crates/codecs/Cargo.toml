@@ -3,6 +3,7 @@ name = "codecs"
 description = "Native forms to editable ones and back, per kind"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

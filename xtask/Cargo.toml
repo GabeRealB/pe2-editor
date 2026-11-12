@@ -3,6 +3,7 @@ name = "xtask"
 description = "The editor's own tasks: `cargo xtask dist` lays the editor and the extensions built apart from it out as they ship, `cargo xtask package` archives each"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]
@@ -14,3 +15,4 @@ anyhow.workspace = true
 sha2.workspace = true
 toml.workspace = true
 pe2-setup.workspace = true
+licenses.workspace = true

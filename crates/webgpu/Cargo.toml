@@ -3,6 +3,7 @@ name = "pe2-webgpu"
 description = "wasi:webgpu for extensions, on the device the editor draws with"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

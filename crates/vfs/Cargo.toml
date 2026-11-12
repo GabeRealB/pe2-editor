@@ -3,6 +3,7 @@ name = "vfs"
 description = "A project's merged layers as a filesystem: one tree, served by the backend suited to the job, and scoped views of it"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

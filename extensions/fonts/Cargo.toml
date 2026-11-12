@@ -3,6 +3,7 @@ name = "pe2-fonts"
 description = "pe2.fonts, a built-in extension: encodings, font faces from UFO 3, and the atlases the game draws them from"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

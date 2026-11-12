@@ -3,6 +3,7 @@ name = "pe2-setup"
 description = "What an unsandboxed extension fetches onto a machine ([[setup]] of its manifest): downloaded, held to its hashes, unpacked, patched and kept; and the hashes found for its author"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

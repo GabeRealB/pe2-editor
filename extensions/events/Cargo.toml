@@ -3,6 +3,7 @@ name = "pe2-events"
 description = "pe2.events, a built-in extension: the events a project defines"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

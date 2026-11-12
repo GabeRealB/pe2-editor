@@ -3,6 +3,7 @@ name = "pe2-formats"
 description = "pe2.formats, a built-in extension: the common file formats other extensions read - PNG, OpenRaster, zip, text"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

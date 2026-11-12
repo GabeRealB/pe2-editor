@@ -44,6 +44,7 @@ mod history_pane;
 mod icons;
 mod inspector;
 mod layers;
+mod licenses_page;
 mod onboarding;
 mod panes;
 mod perf;

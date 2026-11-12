@@ -2351,6 +2351,7 @@ enum SettingsPage {
     Startup,
     Shortcuts,
     Agents,
+    Licenses,
     ProjectGeneral,
     ProjectReleases,
     ProjectLayers,
@@ -2366,6 +2367,7 @@ impl SettingsPage {
             SettingsPage::Startup => "Startup",
             SettingsPage::Shortcuts => "Shortcuts",
             SettingsPage::Agents => "Agents",
+            SettingsPage::Licenses => "Licenses",
             SettingsPage::ProjectGeneral => "General",
             SettingsPage::ProjectReleases => "Releases",
             SettingsPage::ProjectLayers => "Layers and mounts",
@@ -2487,14 +2489,14 @@ fn settings_ui(
     egui::Panel::left("settings categories").resizable(false).exact_size(categories).show(ui, |ui| {
         ui.add_space(4.0);
         ui.label(RichText::new("EDITOR").small().strong().color(theme::weak()));
-        for p in &PAGES[..6] {
+        for p in &PAGES[..EDITOR_PAGES] {
             if ui.selectable_label(page == *p, p.title()).clicked() {
                 page = *p;
             }
         }
         ui.add_space(10.0);
         ui.label(RichText::new("PROJECT").small().strong().color(theme::weak()));
-        for p in &PAGES[6..] {
+        for p in &PAGES[EDITOR_PAGES..] {
             if ui.add_enabled(ws.is_some(), egui::Button::selectable(page == *p, p.title())).clicked() {
                 page = *p;
             }
@@ -2546,25 +2548,8 @@ fn settings_ui(
                             display_server_ui(ui, &mut settings.startup.display_server);
                         }
                     }
-                    (SettingsPage::Agents, _) => {
-                        theme::section(ui, "Agents connected to the project", |ui| {
-                            ui.label(
-                                RichText::new(
-                                    "They read the project, and the editor's window: its widgets and how it looks.",
-                                )
-                                .color(theme::weak()),
-                            );
-                            ui.checkbox(&mut settings.agents.drive, "Let them use the editor: click, type, press keys");
-                            ui.label(
-                                RichText::new(
-                                    "What they edit goes through the history like your own edits, and can be undone. \
-                                     The status bar says when they may, and when one is.",
-                                )
-                                .small()
-                                .color(theme::weak()),
-                            );
-                        });
-                    }
+                    (SettingsPage::Agents, _) => agents_ui(ui, settings),
+                    (SettingsPage::Licenses, _) => crate::licenses_page::ui(ui),
                     (_, Some(ws)) => project_settings_ui(ui, page, ws, &settings.tools, message),
                     (_, None) => {
                         ui.label(RichText::new("No project open").color(theme::weak()));
@@ -2583,13 +2568,38 @@ fn settings_ui(
     });
 }
 
-const PAGES: [SettingsPage; 10] = [
+/// The Agents page: what agents connected to the project may do in the editor.
+fn agents_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
+    theme::section(ui, "Agents connected to the project", |ui| {
+        ui.label(
+            RichText::new(
+                "They read the project, and the editor's window: its widgets and how it looks.",
+            )
+            .color(theme::weak()),
+        );
+        ui.checkbox(&mut settings.agents.drive, "Let them use the editor: click, type, press keys");
+        ui.label(
+            RichText::new(
+                "What they edit goes through the history like your own edits, and can be undone. \
+                 The status bar says when they may, and when one is.",
+            )
+            .small()
+            .color(theme::weak()),
+        );
+    });
+}
+
+/// How many of the pages are the editor's own: the project's follow them.
+const EDITOR_PAGES: usize = 7;
+
+const PAGES: [SettingsPage; 11] = [
     SettingsPage::Appearance,
     SettingsPage::Tools,
     SettingsPage::Files,
     SettingsPage::Startup,
     SettingsPage::Shortcuts,
     SettingsPage::Agents,
+    SettingsPage::Licenses,
     SettingsPage::ProjectGeneral,
     SettingsPage::ProjectReleases,
     SettingsPage::ProjectLayers,

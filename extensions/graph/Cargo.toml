@@ -3,6 +3,7 @@ name = "pe2-graph"
 description = "pe2.graph, a built-in extension: the operations and templates a project defines"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

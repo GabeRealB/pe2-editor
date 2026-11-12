@@ -413,15 +413,21 @@ fn unsandboxed_ui(ui: &mut egui::Ui, ws: &Workspace, p: &Present, message: &mut 
     ui.add_space(6.0);
 }
 
-/// What an extension's folder holds to be read: its guides, what to install first, and the licenses of what it ships,
-/// each opened as it is.
+/// Where an extension's folder says what its component is built with.
+const LINKED: &str = "licenses/LINKED.txt";
+
+/// What an extension's folder holds to be read: its guides, what to install first, the licenses of what it ships and
+/// what its component is built with, each opened as it is.
 fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
     // An archive's are read once it is added and unpacked.
     let Some(folder) = p.origin.folder().filter(|folder| project::pack::is_dir(folder)) else { return };
     let described = &p.described;
     let pages = [("Guides", described.docs.as_deref()), ("Installation", described.install.as_deref())];
     let pages: Vec<(&str, &str)> = pages.into_iter().filter_map(|(label, page)| Some((label, page?))).collect();
-    if pages.is_empty() && described.bundled.is_empty() {
+    // What its component is built with, each license's text with it: written into its folder as it is laid out to
+    // ship (`cargo xtask dist`). A built-in one's is the editor's own (Settings, Licenses).
+    let linked = Some(LINKED).filter(|file| project::pack::is_file(&folder.join(file)));
+    if pages.is_empty() && described.bundled.is_empty() && linked.is_none() {
         return;
     }
     let mut open = |ui: &mut egui::Ui, label: &str, page: &str| {
@@ -445,6 +451,9 @@ fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
         ui.horizontal_wrapped(|ui| {
             for (label, page) in pages {
                 open(ui, label, page);
+            }
+            if let Some(linked) = linked {
+                open(ui, "Built with", linked);
             }
         });
         for bundled in &described.bundled {

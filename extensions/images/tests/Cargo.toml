@@ -3,6 +3,7 @@ name = "pe2-images-tests"
 description = "pe2.images.tests: tests of pe2.images, as an extension beside it that a project holds for testing"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

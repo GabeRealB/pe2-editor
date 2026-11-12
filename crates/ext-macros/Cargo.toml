@@ -3,6 +3,7 @@ name = "pe2-ext-macros"
 description = "The extension SDK's macros: `extension!`, which declares an extension from its manifest, and `#[steps]`"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

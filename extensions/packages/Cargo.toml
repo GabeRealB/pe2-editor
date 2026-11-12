@@ -3,6 +3,7 @@ name = "pe2-packages"
 description = "pe2.packages, a built-in extension: packages, the code the game is built from"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

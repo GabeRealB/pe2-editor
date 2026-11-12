@@ -3,6 +3,7 @@ name = "pe2-dialogue"
 description = "pe2.dialogue, a built-in extension: the rooms' dialogues as their structure, string tables and faces"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

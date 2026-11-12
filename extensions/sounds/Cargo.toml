@@ -3,6 +3,7 @@ name = "pe2-sounds"
 description = "pe2.sounds, a built-in extension: sound - samples, instruments, scripts and the banks that bind them"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

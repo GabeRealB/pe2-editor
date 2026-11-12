@@ -67,6 +67,23 @@ enum Tool {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// What the editor ships, by its license: every crate its programs link, each with its version and license, what
+    /// is bundled that is no crate, and what is used where the system has it - as this program was built
+    Licenses {
+        /// Every license text besides, each once with what is under it
+        #[arg(long)]
+        texts: bool,
+        /// All of it as JSON, the texts with it
+        #[arg(long, conflicts_with = "texts")]
+        json: bool,
+        /// Only what one program links (`pe2-editor`, `pe2-cli`), the extensions inside them (`extensions`), or an
+        /// extension shipped beside them, by its id (`pe2.psx`)
+        #[arg(long = "in")]
+        within: Option<String>,
+        /// A project's directory: what its extensions fetch onto a machine is listed after, with each one's license
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1012,6 +1029,47 @@ fn swept(swept: Option<project::ext::setup::kept::Swept>) {
     for (kept, why) in &failed {
         eprintln!("warning: could not remove {} from the store: {why}", kept.said());
     }
+}
+
+/// `pe2-cli licenses`: what ships, by its license, and what a project's extensions fetch besides.
+fn licenses(texts: bool, json: bool, within: Option<&str>, project: Option<&Path>) -> Result<()> {
+    let listing = licenses::listing();
+    if let Some(within) = within {
+        let known: std::collections::BTreeSet<&str> =
+            listing.crates.iter().flat_map(|c| c.within.iter().map(String::as_str)).collect();
+        let known: Vec<&str> = known.into_iter().collect();
+        anyhow::ensure!(known.contains(&within), "nothing is listed as in {within}: one of {}", known.join(", "));
+    }
+    let said = if json {
+        serde_json::to_string_pretty(listing)? + "\n"
+    } else if texts {
+        listing.document(within)
+    } else {
+        listing.table(within)
+    };
+    // A megabyte of text is read through a pager, or cut short by `head`: what stops reading ends it, quietly.
+    if let Err(e) = std::io::Write::write_all(&mut std::io::stdout().lock(), said.as_bytes()) {
+        anyhow::ensure!(e.kind() == std::io::ErrorKind::BrokenPipe, e);
+        return Ok(());
+    }
+    let Some(project) = project.filter(|_| !json) else { return Ok(()) };
+    // No part of the editor: fetched by an extension the project holds, once it is trusted.
+    let extensions = extensions::for_project(&project::Project::load(project)?);
+    println!("\nNo part of the editor: fetched onto a machine by the project's extensions");
+    let mut any = false;
+    for present in &extensions.present {
+        for setup in &present.setup {
+            any = true;
+            let platform = setup.platform.as_deref().unwrap_or("every platform");
+            println!("  {}: {} ({platform}): {}", present.id, setup.name, setup.license.as_deref().unwrap_or("-"));
+            let rights = [setup.copyright.as_ref().map(|c| format!("(c) {c}")), Some(setup.url.clone())];
+            println!("    {}", rights.into_iter().flatten().collect::<Vec<_>>().join("; "));
+        }
+    }
+    if !any {
+        println!("  nothing");
+    }
+    Ok(())
 }
 
 /// `pe2-cli fetched`: what the store of what extensions fetch holds, and removing from it.
@@ -2046,6 +2104,7 @@ fn run(cli: Cli) -> Result<()> {
             });
         }
         Tool::Fetched { command } => fetched(command)?,
+        Tool::Licenses { texts, json, within, project } => licenses(texts, json, within.as_deref(), project.as_deref())?,
         Tool::Extension { command: AuthorCommand::Pins { manifests } } => {
             let mut gone = Vec::new();
             for manifest in &manifests {

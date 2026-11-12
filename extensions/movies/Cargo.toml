@@ -3,6 +3,7 @@ name = "pe2-movies"
 description = "pe2.movies, a built-in extension: the game's movies - STR clips of MDEC video and XA audio - their extraction, facts and preview"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

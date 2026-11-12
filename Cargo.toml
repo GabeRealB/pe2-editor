@@ -17,6 +17,7 @@ members = [
     "crates/webgpu",
     "crates/mcp",
     "crates/holder",
+    "crates/licenses",
     "crates/cli",
     "crates/editor",
     "xtask",
@@ -41,6 +42,7 @@ members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "CC0-1.0"
 publish = false
 
 # Every warning is an error, Clippy's included; Clippy's pedantic group is on.
@@ -93,6 +95,7 @@ pe2-str = { path = "extensions/str" }
 pe2-sounds = { path = "extensions/sounds" }
 mcp = { path = "crates/mcp" }
 holder = { path = "crates/holder" }
+licenses = { path = "crates/licenses" }
 # The Model Context Protocol's official Rust SDK: the server side over stdio, its tools declared by macros.
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"

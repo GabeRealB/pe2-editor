@@ -1,0 +1,168 @@
+# What the editor ships, by its license: what the build cannot find by itself, written by hand. `crates/licenses`
+# reads this as it builds, lists every crate each program links with its license's text, and fails by name on a
+# crate under a license not allowed here or with no text to show.
+
+# The editor itself.
+[own]
+name = "The PE2 editor"
+license = "CC0-1.0"
+text = "../LICENSE"
+
+# The licenses a linked crate may be under. A crate's expression has to be met by these alone: `MIT OR GPL-2.0-only`
+# is, by MIT. None of them asks anything of what is linked beside it, which a program loading extensions of any
+# license needs - so nothing is added here that does.
+[policy]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# Licenses whose text names no work and no holder: the same for every crate under one. A crate whose package holds
+# no license text, and whose expression these alone meet, is listed with the standard text.
+[standard]
+"Apache-2.0" = "standard/Apache-2.0.txt"
+"Apache-2.0 WITH LLVM-exception" = "standard/Apache-2.0-WITH-LLVM-exception.txt"
+"BSL-1.0" = "standard/BSL-1.0.txt"
+
+# Crates whose package holds no license text, or not all of it: `files` are copies kept here of what their
+# repository holds (`from`), `package` are files of the package the build does not take for license texts by their
+# names.
+[[texts]]
+crates = [
+    "ecolor",
+    "eframe",
+    "egui",
+    "egui-wgpu",
+    "egui-winit",
+    "egui_extras",
+    "egui_glow",
+    "egui_kittest",
+    "emath",
+    "epaint",
+    "epaint_default_fonts",
+]
+from = "https://github.com/emilk/egui/tree/0.37.0"
+files = ["texts/egui/LICENSE-MIT", "texts/egui/LICENSE-APACHE"]
+
+# The fonts egui draws with by default, each with its own license beside it.
+[[texts]]
+crates = ["epaint_default_fonts"]
+package = [
+    "fonts/OFL.txt",
+    "fonts/UFL.txt",
+    "fonts/Hack-Regular.txt",
+    "fonts/emoji-icon-font-mit-license.txt",
+    "fonts/egui-icons.txt",
+]
+
+[[texts]]
+crates = ["egui_tiles"]
+from = "https://github.com/rerun-io/egui_tiles"
+files = ["texts/egui_tiles/LICENSE-MIT", "texts/egui_tiles/LICENSE-APACHE"]
+
+[[texts]]
+crates = [
+    "accesskit",
+    "accesskit_atspi_common",
+    "accesskit_consumer",
+    "accesskit_macos",
+    "accesskit_unix",
+    "accesskit_windows",
+]
+from = "https://github.com/AccessKit/accesskit"
+files = ["texts/accesskit/LICENSE-MIT", "texts/accesskit/LICENSE-APACHE"]
+
+[[texts]]
+crates = ["profiling"]
+from = "https://github.com/aclysma/profiling"
+files = ["texts/profiling/LICENSE-MIT", "texts/profiling/LICENSE-APACHE"]
+
+[[texts]]
+crates = ["dasp_sample"]
+from = "https://github.com/RustAudio/dasp"
+files = ["texts/dasp/LICENSE-MIT", "texts/dasp/LICENSE-APACHE"]
+
+[[texts]]
+crates = ["xml-rs"]
+from = "https://github.com/kornelski/xml-rs"
+files = ["texts/xml-rs/LICENSE"]
+
+# What macOS's windows and drawing go through.
+[[texts]]
+crates = [
+    "block2",
+    "objc-sys",
+    "objc2",
+    "objc2-app-kit",
+    "objc2-core-data",
+    "objc2-core-image",
+    "objc2-encode",
+    "objc2-foundation",
+    "objc2-metal",
+    "objc2-quartz-core",
+]
+from = "https://github.com/madsmtm/objc2"
+files = ["texts/objc2/LICENSE-MIT.txt"]
+
+# Its repository holds no license text: the MIT license's, with its author as its Cargo.toml names him.
+[[texts]]
+crates = ["dispatch"]
+from = "https://github.com/SSheldon/rust-dispatch"
+files = ["texts/dispatch/LICENSE"]
+
+# What ships inside the programs and is no crate.
+[[bundled]]
+name = "Phosphor Icons"
+what = "the font the editor's icons are drawn from"
+license = "MIT"
+from = "https://phosphoricons.com"
+in = ["pe2-editor"]
+texts = ["../crates/editor/assets/Phosphor-LICENSE"]
+
+[[bundled]]
+name = "Dokan Library's header, dokan/dokan.h"
+version = "2.3.1"
+what = """declarations transcribed from it (`crates/vfs/src/dokan.rs`), by which the Dokany a user installed is \
+called; nothing else of Dokany is in the programs"""
+license = "LGPL-3.0-or-later"
+copyright = "Google, Inc.; Adrien J. and Maxime C.; Hiroki Asakawa"
+from = "https://github.com/dokan-dev/dokany"
+in = ["pe2-editor", "pe2-cli"]
+on = ["windows"]
+texts = ["standard/LGPL-3.0.txt", "standard/GPL-3.0.txt"]
+
+# What is no part of the editor and is used where the system has it.
+[[installed]]
+name = "Dokany"
+what = "serves a project as a folder, where the user installed it"
+license = "LGPL-3.0-or-later and MIT, by part, as its own notices say"
+from = "https://github.com/dokan-dev/dokany"
+on = ["windows"]
+
+[[installed]]
+name = "FUSE, with libfuse's fusermount3"
+what = "serves a project as a folder: the kernel's own, mounted through the system's fusermount3"
+license = "GPL-2.0, as their own notices say"
+from = "https://github.com/libfuse/libfuse"
+on = ["linux"]
+
+[[installed]]
+name = "macFUSE"
+what = "serves a project as a folder, where the user installed it"
+license = "its own, as distributed by its author"
+from = "https://macfuse.github.io"
+on = ["macos"]

@@ -3,6 +3,7 @@ name = "cli"
 description = "pe2-cli: every tool crate behind one multi-call binary"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [[bin]]
@@ -20,6 +21,7 @@ project.workspace = true
 sfs.workspace = true
 mcp.workspace = true
 holder.workspace = true
+licenses.workspace = true
 extensions.workspace = true
 png.workspace = true
 anyhow.workspace = true

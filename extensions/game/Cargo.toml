@@ -3,6 +3,7 @@ name = "pe2-game"
 description = "pe2.game, a built-in extension: the types of the game's data besides images - discs, stages, folders, files, streams, movies, scene audio, executables"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]

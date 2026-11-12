@@ -1,0 +1,20 @@
+[package]
+name = "licenses"
+description = "What the editor ships, by its license: every crate its programs link with its license's text, what is bundled that is no crate, and what is used where installed - gathered as it builds, and kept in the programs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+miniz_oxide.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+miniz_oxide.workspace = true
+toml.workspace = true

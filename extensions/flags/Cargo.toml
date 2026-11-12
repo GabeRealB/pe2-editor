@@ -3,6 +3,7 @@ name = "pe2-flags"
 description = "pe2.flags, a built-in extension: the game flag bank's flags by name, in registries"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lib]
