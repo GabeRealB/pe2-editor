@@ -1468,10 +1468,12 @@ fn document_ui(ui: &mut egui::Ui, ws: &mut Workspace, asset: &Asset, message: &m
         Some("keep") => ws.keep_mine(&uid),
         Some("revert") => *message = Some(ws.revert(&uid)),
         Some(_) => {
-            *message = Some(match ws.save(&uid) {
-                Ok(label) => label,
-                Err(e) => format!("{e:#}"),
-            });
+            let said = |editor: &mut crate::app::Editor, saved: anyhow::Result<Vec<String>>| {
+                editor.say(saved.map_or_else(|e| format!("{e:#}"), |saved| saved.join(", ")));
+            };
+            if let Err(e) = ws.save(std::slice::from_ref(&uid), said) {
+                *message = Some(format!("{e:#}"));
+            }
         }
         None => {}
     }

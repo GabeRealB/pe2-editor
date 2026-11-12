@@ -53,6 +53,9 @@ pub enum Job {
     Hold(Receiver<()>),
 }
 
+/// What work asked of the worker came to, for the window to go on with once it is handed over.
+pub type Outcome = Box<dyn std::any::Any + Send>;
+
 /// Why nothing can be edited while a point of the history is shown.
 pub const VIEWING: &str = "an earlier point of the history is shown: back to now to edit";
 
@@ -197,6 +200,8 @@ pub struct Snapshot {
     pub wrote: Vec<PathBuf>,
     /// What was selected when a step undone or made again from outside the window was made: shown again.
     pub select: Option<String>,
+    /// What the work the window asked for came to (`TakeIn::ask`), by its ticket.
+    pub outcomes: Vec<(u64, Outcome)>,
 }
 
 /// The worker, as the UI holds it.
@@ -245,6 +250,8 @@ pub struct Worker {
     attached: bool,
     /// What a step undone from outside the window had selected, until it is handed over.
     select: Option<String>,
+    /// What the work the window asked for came to, until it is handed over.
+    outcomes: Vec<(u64, Outcome)>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -310,6 +317,7 @@ impl TakeIn {
             attached: false,
             covered: 0,
             select: None,
+            outcomes: Vec::new(),
             cache,
             store,
             imports,
@@ -343,7 +351,7 @@ impl TakeIn {
     }
 
     /// Ask this of the worker, under the ticket given: taken in with all that was asked and is not yet.
-    fn ask(&self, ticket: u64, job: Job) {
+    fn ask_job(&self, ticket: u64, job: Job) {
         let Some(queue) = &self.queue else { return };
         self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((ticket, job));
         queue.post(Worker::work);
@@ -351,12 +359,24 @@ impl TakeIn {
 
     fn send(&mut self, job: Job) -> u64 {
         self.issued += 1;
-        self.ask(self.issued, job);
+        self.ask_job(self.issued, job);
         // That it is under way shows.
         if let Some(ctx) = self.ctx.get() {
             ctx.request_repaint();
         }
         self.issued
+    }
+
+    /// Have the worker do this with the history and the index together, once all that was asked before it is
+    /// taken in - nobody waits for it: what it comes to is handed over with the project as it leaves it
+    /// (`Snapshot::outcomes`), under the ticket this returns.
+    pub fn ask(&mut self, work: impl FnOnce(&mut Worker) -> Outcome + Send + 'static) -> u64 {
+        self.issued += 1;
+        let ticket = self.issued;
+        if let Some(queue) = &self.queue {
+            queue.post(move |worker| worker.asked(ticket, work));
+        }
+        ticket
     }
 
     /// Have the worker do this with the history and the index together, once all that was asked before it is
@@ -484,14 +504,35 @@ impl Worker {
             let _span = tracing::info_span!("take-in worker: work on the history").entered();
             work(self)
         };
-        // What the history wrote by other means than the core's own edits: a step undone, a document saved.
+        self.hand_over(ticket);
+        done
+    }
+
+    /// As `held`, with nobody waiting: what it came to is handed over with the project as it leaves it.
+    fn asked(&mut self, ticket: u64, work: impl FnOnce(&mut Worker) -> Outcome) {
+        self.work();
+        let outcome = {
+            let _span = tracing::info_span!("take-in worker: work on the history").entered();
+            work(self)
+        };
+        self.outcomes.push((ticket, outcome));
+        self.hand_over(ticket);
+    }
+
+    /// Take in what the history wrote by other means than the core's own edits - a step undone, a document
+    /// saved: what work that makes several does between them, each reading the index as the one before left it.
+    pub fn take_written(&mut self) {
         match self.core.take_written(&mut self.history) {
             Ok(taken) => self.taken.and(taken),
             Err(e) => eprintln!("the index could not follow what an edit wrote: {e}"),
         }
+    }
+
+    /// Take in what work on the history wrote, and hand over the project as that leaves it, under this ticket.
+    fn hand_over(&mut self, ticket: u64) {
+        self.take_written();
         self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((ticket, Job::Held));
         self.work();
-        done
     }
 
     /// Make edits asked from outside the window - a command's, a program's through the served folder - as
@@ -853,6 +894,7 @@ impl Worker {
             history: self.viewed.1.clone(),
             wrote,
             select: self.select.take(),
+            outcomes: std::mem::take(&mut self.outcomes),
         }
     }
 }

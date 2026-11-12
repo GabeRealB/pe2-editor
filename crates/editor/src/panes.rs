@@ -2682,10 +2682,8 @@ fn project_settings_ui(
     message: &mut Option<String>,
 ) {
     if page == SettingsPage::ProjectConfigurations {
-        if let Some((config, property, to)) = configurations_ui(ui, ws)
-            && let Err(e) = ws.set_property(&config, &property, to.as_ref())
-        {
-            *message = Some(e);
+        if let Some((config, property, to)) = configurations_ui(ui, ws) {
+            ws.set_property(&config, &property, to.as_ref());
         }
         return;
     }

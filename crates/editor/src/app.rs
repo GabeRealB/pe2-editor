@@ -541,24 +541,40 @@ impl Editor {
     /// Undo the last step, or redo - of them all, or of one document; forced over what changed outside the editor.
     /// Blocked by such changes, it asks.
     fn step(&mut self, redo: bool, force: bool, scope: Option<String>) -> bool {
-        let author = self.author();
         let Some(ws) = &mut self.workspace else { return false };
         if let Some(ticket) = ws.reading_until() {
             self.deferred.push((ticket, Deferred::Step { redo, force, scope }));
             return true;
         }
+        self.steps(redo, force, scope.as_deref(), 1)
+    }
+
+    /// As `step`, this many of them: asked of the worker, the window going on - what came of it is said once the
+    /// project as it left it is handed over. Whether it was asked.
+    fn steps(&mut self, redo: bool, force: bool, scope: Option<&str>, count: usize) -> bool {
+        let author = self.author();
+        let Some(ws) = &mut self.workspace else { return false };
         ws.author = author;
         let verb = if redo { "Redo" } else { "Undo" };
-        match ws.step(redo, force, scope.as_deref()) {
+        let asked = scope.map(str::to_string);
+        let said = move |editor: &mut Editor, made: Result<(String, Option<String>), StepError>| match made {
             // Its files taken in by the worker: a `project.toml` changed has the project read again.
-            Ok(label) => {
-                self.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
-                true
+            Ok((label, selection)) => {
+                editor.message = Some(format!("{}: {label}", if redo { "Redone" } else { "Undone" }));
+                // What was selected when the step was made is shown again.
+                if let Some(ws) = &mut editor.workspace
+                    && let Some(path) = selection.filter(|path| ws.exists(path))
+                {
+                    ws.navigate(path);
+                }
             }
             Err(StepError::Changed(paths)) => {
-                self.force = Some((redo, scope, StepError::Changed(paths).to_string()));
-                false
+                editor.force = Some((redo, asked, StepError::Changed(paths).to_string()));
             }
+            Err(e) => editor.message = Some(format!("{verb}: {e}")),
+        };
+        match ws.step((redo, force, count), scope, said) {
+            Ok(()) => true,
             Err(e) => {
                 self.message = Some(format!("{verb}: {e}"));
                 false
@@ -603,10 +619,31 @@ impl Editor {
                 Ok(None) => {}
             }
         }
-        self.message = Some(match ws.edit(request) {
-            Ok(label) => label,
-            Err(e) => format!("{e:#}"),
-        });
+        // Asked of the worker, the window going on: what came of it is said once it is handed over.
+        let said = |editor: &mut Editor, made: anyhow::Result<String>| {
+            editor.message = Some(made.unwrap_or_else(|e| format!("{e:#}")));
+        };
+        if let Err(e) = ws.edit(request, said) {
+            self.message = Some(format!("{e:#}"));
+        }
+    }
+
+    /// Say this in the status bar: what something asked of the worker came to.
+    pub(crate) fn say(&mut self, said: String) {
+        self.message = Some(said);
+    }
+
+    /// The project open, for what goes on once the worker handed over what was asked of it.
+    pub(crate) fn open_workspace(&mut self) -> Option<&mut Workspace> {
+        self.workspace.as_mut()
+    }
+
+    /// Go on with what was asked of the worker and is handed over.
+    fn finish_asked(&mut self) {
+        let done = self.workspace.as_mut().map_or_default(Workspace::take_asked);
+        for then in done {
+            then(self);
+        }
     }
 
     /// Which files layer takes code being overridden: one of those above its own, or a new one (added, the project
@@ -673,11 +710,12 @@ impl Editor {
             self.deferred.push((ticket, Deferred::OverrideInNew { uid, name }));
             return;
         }
-        match ws.add_layer(&name, project::LayerKind::Files) {
-            // The layer has to be there: the project is read again with it first.
-            Ok(ticket) => self.deferred.push((ticket, Deferred::Edit(EditRequest::OverrideIn(uid, name)))),
-            Err(e) => self.message = Some(format!("{e:#}")),
-        }
+        let layer = name.clone();
+        ws.add_layer(&name, project::LayerKind::Files, move |editor, added| match added {
+            // The layer is there by now: the project was read again with it.
+            Ok(()) => editor.edit(&EditRequest::OverrideIn(uid, layer)),
+            Err(e) => editor.message = Some(format!("{e:#}")),
+        });
     }
 
     /// The new name of an entry being renamed: in its folder, a bundle keeping its `.node`.
@@ -1022,7 +1060,7 @@ impl Editor {
             Command::RedoAnywhere => drop(self.step(true, false, None)),
             Command::Save => {
                 if let Some(uid) = self.document_uid() {
-                    self.save(&[uid]);
+                    self.save(&[uid], None);
                 }
             }
             Command::SaveAll => self.save_all(),
@@ -1038,7 +1076,7 @@ impl Editor {
     /// Save every document with unsaved changes.
     fn save_all(&mut self) {
         let all = self.workspace.as_ref().map_or_default(Workspace::unsaved_documents);
-        self.save(&all.into_iter().map(|(uid, _)| uid).collect::<Vec<_>>());
+        self.save(&all.into_iter().map(|(uid, _)| uid).collect::<Vec<_>>(), None);
     }
 
     /// The commands acting on what is selected, the graph in front, the window itself and what extensions offer.
@@ -1353,7 +1391,7 @@ impl Editor {
     fn unsaved_asked(&mut self, asked: Unsaved) {
         match asked {
             Unsaved::SaveAll => self.save_all(),
-            Unsaved::Save(uid) => drop(self.save(&[uid])),
+            Unsaved::Save(uid) => self.save(&[uid], None),
             Unsaved::Revert(uid) => self.revert(&uid),
             Unsaved::Show(path) => {
                 if let Some(ws) = &mut self.workspace {
@@ -1364,27 +1402,28 @@ impl Editor {
         }
     }
 
-    /// Save documents; the first that cannot be stops it, said.
-    fn save(&mut self, uids: &[String]) -> bool {
+    /// Save documents; the first that cannot be stops it, said. What waited on them (`after`) is done once all
+    /// are saved.
+    fn save(&mut self, uids: &[String], after: Option<(Closing, egui::Context)>) {
         let author = self.author();
-        let Some(ws) = &mut self.workspace else { return false };
+        let Some(ws) = &mut self.workspace else { return };
         ws.author = author;
-        let mut saved = vec![];
-        for uid in uids {
-            match ws.save(uid) {
-                Ok(label) => saved.push(label),
-                Err(e) => {
-                    self.error = Some(format!("{e:#}"));
-                    return false;
+        let then = move |editor: &mut Editor, saved: anyhow::Result<Vec<String>>| match saved {
+            Ok(saved) => {
+                editor.message = match saved.as_slice() {
+                    [] => None,
+                    [one] => Some(one.clone()),
+                    many => Some(format!("Saved {} documents", many.len())),
+                };
+                if let Some((closing, ctx)) = after {
+                    editor.go_on(closing, &ctx);
                 }
             }
-        }
-        self.message = match saved.as_slice() {
-            [] => None,
-            [one] => Some(one.clone()),
-            many => Some(format!("Saved {} documents", many.len())),
+            Err(e) => editor.error = Some(format!("{e:#}")),
         };
-        true
+        if let Err(e) = ws.save(uids, then) {
+            self.error = Some(format!("{e:#}"));
+        }
     }
 
     /// Put a document back as on disk: its unsaved changes undone, or - stale - the disk's taken.
@@ -1473,9 +1512,7 @@ impl Editor {
         if save {
             self.closing = None;
             let uids: Vec<String> = documents.into_iter().map(|(uid, _)| uid).collect();
-            if self.save(&uids) {
-                self.go_on(closing, ctx);
-            }
+            self.save(&uids, Some((closing, ctx.clone())));
         } else if discard {
             self.closing = None;
             match &closing {
@@ -2080,19 +2117,17 @@ impl Editor {
         ws.author = author;
         match ask {
             HistoryAsk::View(viewing) => ws.view(viewing),
-            HistoryAsk::Restore => self.message = Some(ws.restore_viewed()),
-            HistoryAsk::Revert(at) => match ws.revert_step(at) {
-                Ok(label) => self.message = Some(label),
-                Err(why) => self.message = Some(why),
-            },
-            HistoryAsk::Checkpoint(name) => ws.checkpoint(name),
-            HistoryAsk::Steps(redo, count) => {
-                for _ in 0..count {
-                    if !self.step(redo, false, None) {
-                        break;
-                    }
+            HistoryAsk::Restore => ws.restore_viewed(Editor::say),
+            HistoryAsk::Revert(at) => {
+                let said = |editor: &mut Editor, made: Result<String, String>| {
+                    editor.message = Some(made.unwrap_or_else(|why| why));
+                };
+                if let Err(why) = ws.revert_step(at, said) {
+                    self.message = Some(why);
                 }
             }
+            HistoryAsk::Checkpoint(name) => ws.checkpoint(name),
+            HistoryAsk::Steps(redo, count) => drop(self.steps(redo, false, None, count)),
         }
     }
 
@@ -2140,15 +2175,24 @@ impl Editor {
         let in_use = self.document_path();
         let Some(ws) = &mut self.workspace else { return };
         let folder = ws.new_node_folder(in_use.as_deref());
-        match ws.new_node(template, file, &folder) {
+        let place = if folder.is_empty() { "the project".to_string() } else { folder.clone() };
+        let then = move |editor: &mut Editor, made: Result<crate::workspace::NewNode, String>| match made {
             Ok(made) => {
-                let place = if folder.is_empty() { "the project".to_string() } else { folder };
-                self.message = Some(format!("New {} in {place}", made.label.to_lowercase()));
+                editor.message = Some(format!("New {} in {place}", made.label.to_lowercase()));
+                // Taken in by now: shown, and named.
+                if let Some(ws) = &mut editor.workspace
+                    && ws.exists(&made.path)
+                {
+                    ws.navigate(made.path.clone());
+                }
                 let name = made.path.rsplit('/').next().unwrap_or(&made.path).to_string();
                 let real = format!("{}{}", made.path, project::index::BUNDLE_SUFFIX);
-                self.renaming = Some((made.uid, real, name));
+                editor.renaming = Some((made.uid, real, name));
             }
-            Err(why) => self.error = Some(why),
+            Err(why) => editor.error = Some(why),
+        };
+        if let Err(why) = ws.new_node(template, file, &folder, then) {
+            self.error = Some(why);
         }
     }
 
@@ -2931,6 +2975,7 @@ impl eframe::App for Editor {
         self.capture(&ctx);
         self.opened();
         self.follow_disk(&ctx);
+        self.finish_asked();
         self.do_deferred();
         // The window is the agents' from the first frame, whatever is still being read.
         self.answer_while_opening(&ctx);

@@ -34,11 +34,11 @@ pub(super) fn details_ui(
         cards.card(ui, |ui| theme::section(ui, "Outside the sandbox", |ui| unsandboxed_ui(ui, ws, p, message)));
     }
     if switch_shown(ws, present, p) {
-        cards.card(ui, |ui| theme::section(ui, "In this project", |ui| switch_ui(ui, ws, present, p, state, message)));
+        cards.card(ui, |ui| theme::section(ui, "In this project", |ui| switch_ui(ui, ws, present, p, state)));
     }
     cards.card(ui, |ui| fetches_ui(ui, ws, p, state, message));
     cards.card(ui, |ui| about_ui(ui, ws, all, p));
-    cards.card(ui, |ui| settings_ui(ui, ws, p, user, message));
+    cards.card(ui, |ui| settings_ui(ui, ws, p, user));
     cards.card(ui, |ui| requires_ui(ui, p, present, state));
     cards.card(ui, |ui| required_by_ui(ui, p, present, state));
     cards.card(ui, |ui| documents_ui(ui, p, message));
@@ -222,13 +222,7 @@ fn required_by_ui(ui: &mut egui::Ui, p: &Present, present: &[Present], state: &m
 
 /// Its settings, each edited the way its default's type is, where it is kept said: the project's written to
 /// `project.toml` as a step of the history, the user's to the editor's settings. Either way it is loaded again.
-fn settings_ui(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    p: &Present,
-    user: &mut UserSettings,
-    message: &mut Option<String>,
-) {
+fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut UserSettings) {
     let declared = ws.extensions.settings.get(&p.id).cloned().unwrap_or_default();
     if declared.is_empty() {
         return;
@@ -274,12 +268,14 @@ fn settings_ui(
                     match setting.scope {
                         Scope::Project => {
                             let (id, key, said) = (p.id.clone(), setting.key.clone(), format!("Set {label} to {said}"));
-                            let written = ws.held(move |w| {
+                            let work = move |w: &mut crate::takein::Worker| {
                                 project::switches::set_setting(&w.core.project, &id, &key, next.as_ref(), &mut w.history, said)
+                            };
+                            ws.ask(work, |editor, written: anyhow::Result<()>| {
+                                if let Err(e) = written {
+                                    editor.say(format!("project.toml: {e:#}"));
+                                }
                             });
-                            if let Err(e) = written.map_err(anyhow::Error::msg).flatten() {
-                                *message = Some(format!("project.toml: {e:#}"));
-                            }
                         }
                         Scope::User => {
                             let table = user.entry(p.id.clone()).or_default();
@@ -555,17 +551,20 @@ pub(super) fn fetch_state_ui(
 
 /// Adding an extension kept apart to the project, updating the one it holds from there, or removing it: whether there
 /// is nothing more to say of it.
-fn adding_ui(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    present: &[Present],
-    p: &Present,
-    message: &mut Option<String>,
-) -> bool {
+fn adding_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present) -> bool {
     let held = matches!(p.origin, Origin::Project(_));
     // One of its id may be in effect - held, or a built-in - and one kept apart to take its place.
     let kept = present.iter().find(|q| q.id == p.id && q.status == Status::Available);
-    let mut change = None;
+    // What changes what the project holds is asked of the worker, the window going on: said once it is done.
+    let said = |id: String, verb: &'static str| {
+        move |editor: &mut crate::app::Editor, written: anyhow::Result<bool>| {
+            editor.say(match written {
+                Ok(false) => format!("{id}: {verb}"),
+                Ok(true) => format!("{id}: {verb}; what it needs on this machine is in its Installation"),
+                Err(e) => format!("{id}: {e:#}"),
+            });
+        }
+    };
     if let Some((kept, folder)) = kept.and_then(|kept| Some((kept, kept.origin.folder()?))) {
         if p.status != Status::Available {
             let said = format!("{} {} is kept: {}", kept.id, kept.version, origin_text(&kept.origin));
@@ -575,22 +574,16 @@ fn adding_ui(
         let clicked = ui.button(label).on_hover_text("Copied into the project, for everyone on it").clicked();
         if clicked {
             let to = format!("{} {}", if held { "Update" } else { "Add" }, p.id);
-            // An archive is unpacked first, and copied in as its folder.
-            let unpacked = extensions::archive::is_archive(folder).then(|| extensions::archive::unpack(folder));
-            let added = match unpacked {
-                Some(Err(e)) => Err(e),
-                Some(Ok(unpacked)) => ws
-                    .held(move |w| project::switches::add_extension(&w.core.project, &unpacked.folder, None, &mut w.history, to))
-                    .map_err(anyhow::Error::msg)
-                    .flatten(),
-                None => {
-                    let folder = folder.to_path_buf();
-                    ws.held(move |w| project::switches::add_extension(&w.core.project, &folder, None, &mut w.history, to))
-                        .map_err(anyhow::Error::msg)
-                        .flatten()
-                }
+            let folder = folder.to_path_buf();
+            let work = move |w: &mut crate::takein::Worker| {
+                // An archive is unpacked first, and copied in as its folder.
+                let unpacked = extensions::archive::is_archive(&folder).then(|| extensions::archive::unpack(&folder));
+                let unpacked = unpacked.transpose()?;
+                let from = unpacked.as_ref().map_or(folder.as_path(), |unpacked| unpacked.folder.as_path());
+                let about = project::switches::add_extension(&w.core.project, from, None, &mut w.history, to)?;
+                Ok(about.described.install.is_some())
             };
-            change = Some((verb, added.map(|about| about.described.install.is_some())));
+            ws.ask(work, said(p.id.clone(), verb));
         }
     }
     if held
@@ -599,34 +592,19 @@ fn adding_ui(
             .on_hover_text("Its folder goes, and what the project requires of it")
             .clicked()
     {
-        let (id, said) = (p.id.clone(), format!("Remove {}", p.id));
-        let removed = ws
-            .held(move |w| project::switches::remove_extension(&w.core.project, &id, &mut w.history, said))
-            .map_err(anyhow::Error::msg)
-            .flatten();
-        change = Some(("removed", removed.map(|()| false)));
-    }
-    if let Some((verb, written)) = change {
-        *message = Some(match written {
-            Ok(false) => format!("{}: {verb}", p.id),
-            Ok(true) => format!("{}: {verb}; what it needs on this machine is in its Installation", p.id),
-            Err(e) => format!("{}: {e:#}", p.id),
-        });
+        let (id, label) = (p.id.clone(), format!("Remove {}", p.id));
+        let work = move |w: &mut crate::takein::Worker| {
+            project::switches::remove_extension(&w.core.project, &id, &mut w.history, label).map(|()| false)
+        };
+        ws.ask(work, said(p.id.clone(), "removed"));
     }
     p.status == Status::Available
 }
 
 /// The switch: on or off for the project, saying first what goes with it.
-fn switch_ui(
-    ui: &mut egui::Ui,
-    ws: &mut Workspace,
-    present: &[Present],
-    p: &Present,
-    state: &mut State,
-    message: &mut Option<String>,
-) {
+fn switch_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Present, state: &mut State) {
     // Kept apart, it is only to be added; not enabled, it is not this project's to turn on.
-    if adding_ui(ui, ws, present, p, message) || matches!(p.status, Status::NotEnabled { .. }) {
+    if adding_ui(ui, ws, present, p) || matches!(p.status, Status::NotEnabled { .. }) {
         return;
     }
     let disabled: BTreeSet<String> = ws.project.disabled_extensions.iter().cloned().collect();
@@ -660,13 +638,12 @@ fn switch_ui(
                 }
                 let next: Vec<String> = next.into_iter().collect();
                 let label = format!("Turn {asked} {verb}");
-                let written = ws
-                    .held(move |w| project::switches::set_disabled(&w.core.project, &next, &mut w.history, label))
-                    .map_err(anyhow::Error::msg)
-                    .flatten();
-                *message = Some(match written {
-                    Ok(()) => format!("{asked} turned {verb}"),
-                    Err(e) => format!("project.toml: {e:#}"),
+                let work = move |w: &mut crate::takein::Worker| {
+                    project::switches::set_disabled(&w.core.project, &next, &mut w.history, label)
+                };
+                let turned = format!("{asked} turned {verb}");
+                ws.ask(work, move |editor, written: anyhow::Result<()>| {
+                    editor.say(written.map_or_else(|e| format!("project.toml: {e:#}"), |()| turned));
                 });
                 state.asked = None;
             }

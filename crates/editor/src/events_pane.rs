@@ -72,7 +72,12 @@ pub fn events_ui(ui: &mut egui::Ui, ws: &mut Workspace, nav: &mut Option<String>
                 if (ui.add_enabled(!name.is_empty(), egui::Button::new("Add")).clicked() || submitted)
                     && !name.is_empty()
                 {
-                    match ws.new_event(&name) {
+                    let failed = |editor: &mut crate::app::Editor, made: Result<(), String>| {
+                        if let Err(why) = made {
+                            editor.say(why);
+                        }
+                    };
+                    match ws.new_event(&name, failed) {
                         Ok(()) => ws.new_event_name.clear(),
                         Err(why) => *message = Some(why),
                     }

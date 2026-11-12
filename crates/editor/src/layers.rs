@@ -62,6 +62,12 @@ enum Action {
 impl Action {
     /// Do it; what to say in the status bar.
     fn apply(self, ws: &mut Workspace, state: &mut LayersState) -> Option<String> {
+        // What changes the stack is asked of the worker, the window going on: said once the project has it.
+        let said = |done: String| {
+            move |editor: &mut crate::app::Editor, made: anyhow::Result<()>| {
+                editor.say(made.map_or_else(|e| format!("{e:#}"), |()| done));
+            }
+        };
         let result = match self {
             Action::Eye(name) => ws.toggle_eye(&name).map(|()| None),
             Action::Solo(name) => ws.solo(&name).map(|()| None),
@@ -72,17 +78,18 @@ impl Action {
                 order.retain(|n| *n != layer);
                 let at = order.iter().position(|n| *n == target).map_or(order.len(), |i| if above { i + 1 } else { i });
                 order.insert(at, layer.clone());
-                ws.reorder(&order).map(|()| Some(format!("{layer} moved")))
+                ws.reorder(&order, said(format!("{layer} moved")));
+                Ok(None)
             }
             Action::Add(name, files) => {
                 let kind = if files { project::LayerKind::Files } else { project::LayerKind::Assets };
-                ws.add_layer(&name, kind).map(|_| {
-                    state.new_layer = None;
-                    Some(format!("{name} added at the top of the stack"))
-                })
+                ws.add_layer(&name, kind, said(format!("{name} added at the top of the stack")));
+                state.new_layer = None;
+                Ok(None)
             }
             Action::Remove(name) => {
-                ws.remove_layer(&name).map(|()| Some(format!("{name} taken out of the stack; its files are kept")))
+                ws.remove_layer(&name, said(format!("{name} taken out of the stack; its files are kept")));
+                Ok(None)
             }
         };
         result.unwrap_or_else(|e| Some(format!("{e:#}")))

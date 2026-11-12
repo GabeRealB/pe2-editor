@@ -291,6 +291,10 @@ pub struct Workspace {
     pending: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// What the window shows that an edit asked from outside it depends on, as the worker was last told.
     showing: Arc<Mutex<crate::takein::Showing>>,
+    /// What the window goes on with once work it asked of the worker is handed over, by its ticket; and what
+    /// was handed over since the app last went on.
+    asking: Vec<(u64, Then)>,
+    outcomes: Vec<(u64, crate::takein::Outcome)>,
     /// How many times changes were taken in: what a view read of plain files may be out of date once it moves.
     revision: u64,
     /// Whether the window had focus at the last frame.
@@ -347,6 +351,23 @@ pub struct Workspace {
     /// An asset's declaration being edited in the inspector, as text: the asset, the text.
     pub declaration_draft: Option<(String, String)>,
 }
+
+/// What the window does with what work it asked of the worker came to, once that is handed over: on its own
+/// thread, with all it has.
+type Then = Box<dyn FnOnce(&mut crate::app::Editor, crate::takein::Outcome)>;
+
+/// What the window goes on with, of what was handed over.
+pub(crate) type Next = Box<dyn FnOnce(&mut crate::app::Editor)>;
+
+/// Work for the worker that makes a step of the history, and what it says of it: its label, or why not.
+type Edit = Box<dyn FnOnce(&mut crate::takein::Worker) -> anyhow::Result<String> + Send>;
+
+/// Work for the worker that makes something of the project, or says why not.
+type Made = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(), String> + Send>;
+
+/// Work for the worker that takes steps back or makes them again: the last one's label and what was selected
+/// when it was made, or why not.
+type Steps = Box<dyn FnOnce(&mut crate::takein::Worker) -> Result<(String, Option<String>), StepError> + Send>;
 
 /// An edit asked for in a pane, of the entry with this uid, made in the active layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -914,6 +935,8 @@ impl Workspace {
             takein,
             pending,
             showing,
+            asking: Vec::new(),
+            outcomes: Vec::new(),
             revision: 0,
             focused: true,
             own: Vec::new(),
@@ -1134,7 +1157,11 @@ impl Workspace {
     ///
     /// # Errors
     /// No layer takes it, or it cannot be written.
-    pub fn new_event(&mut self, name: &str) -> Result<(), String> {
+    pub fn new_event(
+        &mut self,
+        name: &str,
+        then: impl FnOnce(&mut crate::app::Editor, Result<(), String>) + 'static,
+    ) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
             .map_err(|e| e.to_string())?;
@@ -1144,18 +1171,47 @@ impl Workspace {
         let quoted = toml::Value::String(name.to_string());
         let declaration = format!("uid = \"{uid}\"\n\n[[stack]]\nop = \"pe2.events@event\"\nlabel = {quoted}\n");
         let path = format!("events/{slug}");
-        self.held(move |w| {
+        let work = move |w: &mut crate::takein::Worker| {
             project::edit::create(&w.core.project, &w.core.index, &layer, &uid, &path, (&declaration, &[]), &mut w.history)
                 .map(drop)
                 .map_err(|e| format!("{e:#}"))
-        })?
+        };
+        self.ask(work, then);
+        Ok(())
     }
 
     /// Make a node of a template in the folder shown, of the active layer: with this file in it, where it takes one.
     ///
     /// # Errors
     /// No layer takes it, the template does not stamp, the file cannot be read or the node cannot be written.
-    pub fn new_node(&mut self, template: &str, file: Option<&Path>, folder: &str) -> Result<NewNode, String> {
+    pub fn new_node(
+        &mut self,
+        template: &str,
+        file: Option<&Path>,
+        folder: &str,
+        then: impl FnOnce(&mut crate::app::Editor, Result<NewNode, String>) + 'static,
+    ) -> Result<(), String> {
+        let (node, work) = self.new_node_work(template, file, folder)?;
+        self.ask(work, move |editor, made: Result<(), String>| then(editor, made.map(|()| node)));
+        Ok(())
+    }
+
+    /// As `new_node`, waited for: what a test asks.
+    ///
+    /// # Errors
+    /// As `new_node`, or the node cannot be written.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn new_node_now(&mut self, template: &str, file: Option<&Path>, folder: &str) -> Result<NewNode, String> {
+        let (node, work) = self.new_node_work(template, file, folder)?;
+        self.held(work)??;
+        if self.exists(&node.path) {
+            self.navigate(node.path.clone());
+        }
+        Ok(node)
+    }
+
+    /// The node a template makes, and the work that makes it.
+    fn new_node_work(&self, template: &str, file: Option<&Path>, folder: &str) -> Result<(NewNode, Made), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let found = self.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
         let name =
@@ -1180,19 +1236,14 @@ impl Workspace {
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
         let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
         let (made_uid, made_at) = (uid.clone(), path.clone());
-        self.held(move |w| {
+        let work: Made = Box::new(move |w| {
             let files: Vec<(&str, &[u8])> = bytes.as_deref().map(|bytes| (name.as_str(), bytes)).into_iter().collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, &made_uid, &made_at, node, &mut w.history)
                 .map(drop)
                 .map_err(|e| format!("{e:#}"))
-        })??;
-        // Taken in by now: shown.
-        let label = found.label.clone();
-        if self.exists(&path) {
-            self.navigate(path.clone());
-        }
-        Ok(NewNode { uid, path, label })
+        });
+        Ok((NewNode { uid, path, label: found.label.clone() }, work))
     }
 
     /// The folder new nodes go in: the one the asset in use is in, else the one the browser shows.
@@ -1240,23 +1291,32 @@ impl Workspace {
         }
         let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
         let text = document.to_string();
-        self.held(move |w| {
+        let work = move |w: &mut crate::takein::Worker| {
             let mut step = w.history.begin(label);
             step.write(&file, text.as_bytes()).map_err(|e| format!("{e:#}"))?;
             step.commit().map(drop).map_err(|e| format!("{e:#}"))
-        })?
+        };
+        self.ask(work, |editor, written: Result<(), String>| {
+            if let (Err(why), Some(ws)) = (written, editor.open_workspace()) {
+                ws.watch_error = Some(why);
+            }
+        });
+        Ok(())
     }
 
-    /// Set a config's property, or leave it to its default (`None`): written in `project.toml`, as a step.
-    ///
-    /// # Errors
-    /// The value is not as the project declares it, or it cannot be written.
-    pub fn set_property(&mut self, config: &str, property: &str, to: Option<&toml::Value>) -> Result<(), String> {
+    /// Set a config's property, or leave it to its default (`None`): written in `project.toml`, as a step. Why it
+    /// could not be - the value is not as the project declares it, or it cannot be written - is said.
+    pub fn set_property(&mut self, config: &str, property: &str, to: Option<&toml::Value>) {
         let (config, property, to) = (config.to_string(), property.to_string(), to.cloned());
-        self.held(move |w| {
+        let work = move |w: &mut crate::takein::Worker| {
             project::setup::set_property(&w.core.project, &config, &property, to.as_ref(), &mut w.history)
                 .map_err(|e| format!("{e:#}"))
-        })?
+        };
+        self.ask(work, |editor, written: Result<(), String>| {
+            if let Err(why) = written {
+                editor.say(why);
+            }
+        });
     }
 
     /// Stop the epoch running.
@@ -1437,6 +1497,44 @@ impl Workspace {
     }
 
     /// Have the worker holding the project do this with the history and the index together, once all that was
+    /// asked before is taken in - the window goes on meanwhile; `then` is done with what it came to once the
+    /// project as it left it is handed over, before the frame that shows it is drawn.
+    pub(crate) fn ask<R: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&mut crate::takein::Worker) -> R + Send + 'static,
+        then: impl FnOnce(&mut crate::app::Editor, R) + 'static,
+    ) {
+        let author = self.author;
+        let ticket = self.takein.ask(move |worker| {
+            worker.history.set_author(author);
+            Box::new(work(worker))
+        });
+        let then: Then = Box::new(move |editor, outcome| {
+            if let Ok(outcome) = outcome.downcast::<R>() {
+                then(editor, *outcome);
+            }
+        });
+        self.asking.push((ticket, then));
+    }
+
+    /// Ask the worker for this, with nothing done after.
+    fn post(&mut self, work: impl FnOnce(&mut crate::takein::Worker) + Send + 'static) {
+        self.ask(work, |_, ()| {});
+    }
+
+    /// What was asked of the worker and is handed over: each as what the window goes on with.
+    pub(crate) fn take_asked(&mut self) -> Vec<Next> {
+        let mut done: Vec<Next> = Vec::new();
+        for (ticket, outcome) in std::mem::take(&mut self.outcomes) {
+            if let Some(at) = self.asking.iter().position(|(asked, _)| *asked == ticket) {
+                let (_, then) = self.asking.remove(at);
+                done.push(Box::new(move |editor| then(editor, outcome)));
+            }
+        }
+        done
+    }
+
+    /// Have the worker holding the project do this with the history and the index together, once all that was
     /// asked before is taken in, and wait for it: what it wrote is taken in and what it came to swapped in by
     /// the time this returns.
     ///
@@ -1540,6 +1638,7 @@ impl Workspace {
                 self.outcome = Update::Said(said);
             }
             self.history = snapshot.history;
+            self.outcomes.extend(snapshot.outcomes);
             // What the editor's own edits wrote: the watcher's report of it is its own change coming back.
             let now = std::time::Instant::now();
             self.own.extend(snapshot.wrote.into_iter().map(|path| {
@@ -1648,32 +1747,46 @@ impl Workspace {
         self.signal(ProjectOpened::NAME);
     }
 
-    /// Undo the last step, or redo the one undone last - of them all, or the last editing one document (`scope`);
-    /// forced, over what changed since outside the editor. What it changed is taken in, and what was selected when the
-    /// step was made is shown again once it is. Returns the step's label.
+    /// Undo the last steps, or redo those undone last - of them all, or the last editing one document (`scope`);
+    /// forced, over what changed since outside the editor - `count` of them, stopping at the first that cannot
+    /// be. `then` is given the last step's label and what was selected when it was made, or why it stopped,
+    /// once what they changed is taken in.
     ///
     /// # Errors
-    /// Nothing to undo or redo, files changed outside the editor (unless forced), or a file not written.
-    pub fn step(&mut self, redo: bool, force: bool, scope: Option<&str>) -> Result<String, StepError> {
-        let _span = tracing::info_span!("window thread: a step undone or made again").entered();
+    /// A point of the history is shown: nothing was asked.
+    pub fn step(
+        &mut self,
+        (redo, force, count): (bool, bool, usize),
+        scope: Option<&str>,
+        then: impl FnOnce(&mut crate::app::Editor, Result<(String, Option<String>), StepError>) + 'static,
+    ) -> Result<(), StepError> {
+        let work = self.steps(redo, force, scope, count)?;
+        self.ask(work, then);
+        Ok(())
+    }
+
+    /// The work that takes steps back or makes them again.
+    fn steps(&self, redo: bool, force: bool, scope: Option<&str>, count: usize) -> Result<Steps, StepError> {
         if let Some(why) = self.read_only() {
             return Err(StepError::Io(anyhow::anyhow!(why)));
         }
         let scope = scope.map(str::to_string);
-        let made = self.held(move |w| {
-            let step = if redo {
-                w.history.redo(&w.core.index, scope.as_deref(), force)?
-            } else {
-                w.history.undo(&w.core.index, scope.as_deref(), force)?
-            };
-            Ok::<_, StepError>((step.label.clone(), step.selection.clone()))
-        });
-        let (label, selection) = made.map_err(|gone| StepError::Io(anyhow::anyhow!(gone)))??;
-        // What it changed is taken in by now: what was selected when the step was made is shown again.
-        if let Some(path) = selection.filter(|path| self.exists(path)) {
-            self.navigate(path);
-        }
-        Ok(label)
+        Ok(Box::new(move |w| {
+            let mut last = None;
+            for _ in 0..count.max(1) {
+                let stepped = if redo {
+                    w.history.redo(&w.core.index, scope.as_deref(), force)
+                } else {
+                    w.history.undo(&w.core.index, scope.as_deref(), force)
+                };
+                match stepped {
+                    Ok(step) => last = Some((step.label.clone(), step.selection.clone())),
+                    // The first that cannot be: what those before it did stands, and is said.
+                    Err(e) => return last.ok_or(e),
+                }
+            }
+            last.ok_or_else(|| StepError::Io(anyhow::anyhow!("nothing was asked")))
+        }))
     }
 
     /// Why the project is open without a lock: its file system cannot lock files (a WSL folder opened from Windows).
@@ -1912,10 +2025,10 @@ impl Workspace {
     }
 
     /// Put the documents back as at the point viewed, as a new step, and show now. Returns what was done.
-    pub fn restore_viewed(&mut self) -> String {
-        let Some(viewing) = self.viewing.take() else { return String::new() };
+    pub fn restore_viewed(&mut self, then: impl FnOnce(&mut crate::app::Editor, String) + 'static) {
+        let Some(viewing) = self.viewing.take() else { return };
         let selected = self.selected.clone();
-        let made = self.held(move |w| {
+        let work = move |w: &mut crate::takein::Worker| {
             // Now is shown again.
             w.show_now();
             let at = viewing.point.checked_sub(1).and_then(|i| w.history.done().get(i));
@@ -1925,36 +2038,39 @@ impl Workspace {
             if changed {
                 w.history.note_selection(selected);
             }
-            (label, changed)
-        });
-        match made {
-            Ok((label, true)) => label,
-            Ok((_, false)) => "Nothing to restore: the documents are as they were".into(),
-            Err(gone) => gone,
-        }
+            if changed { label } else { "Nothing to restore: the documents are as they were".into() }
+        };
+        self.ask(work, then);
     }
 
-    /// Take back one step's edits, as a new step. Returns what was done.
+    /// Take back one step's edits, as a new step: `then` is given what was done, or why it could not be - it is
+    /// no edit, or what it edited was edited since.
     ///
     /// # Errors
-    /// It cannot be: a point is viewed, it is no edit, or what it edited was edited since.
-    pub fn revert_step(&mut self, at: usize) -> Result<String, String> {
+    /// A point of the history is viewed: nothing was asked.
+    pub fn revert_step(
+        &mut self,
+        at: usize,
+        then: impl FnOnce(&mut crate::app::Editor, Result<String, String>) + 'static,
+    ) -> Result<(), String> {
         if let Some(why) = self.read_only() {
             return Err(why.into());
         }
         let selected = self.selected.clone();
-        self.held(move |w| {
+        let work = move |w: &mut crate::takein::Worker| {
             let label = format!("Take back {}", w.history.done().get(at).map_or("", |s| s.label.as_str()));
             if w.history.revert_step(&w.core.index, at, label.clone())? {
                 w.history.note_selection(selected);
             }
             Ok(label)
-        })?
+        };
+        self.ask(work, then);
+        Ok(())
     }
 
     /// Name the point the history is at.
     pub fn checkpoint(&mut self, name: String) {
-        let _ = self.held(move |w| w.history.checkpoint(name));
+        self.post(move |w| w.history.checkpoint(name));
     }
 
     /// Make an edit asked from outside the window - the command line's, a program's through the served folder - in a
@@ -1987,36 +2103,52 @@ impl Workspace {
         let _ = self.held(move |w| w.asked_due(Box::new(move |answer| drop(reply.send(answer)))));
     }
 
-    pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {
-        let _span = tracing::info_span!("window thread: a document saved").entered();
+    /// Save documents, each as a step: `then` is given their labels, or why the first that could not be saved
+    /// stopped it.
+    ///
+    /// # Errors
+    /// Nothing can be edited now, or one of them cannot be saved where edits go: nothing was asked.
+    pub fn save(
+        &mut self,
+        uids: &[String],
+        then: impl FnOnce(&mut crate::app::Editor, anyhow::Result<Vec<String>>) + 'static,
+    ) -> anyhow::Result<()> {
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
         }
-        let Some(document) = self.history.document(uid) else { return Ok(String::new()) };
-        let path = document.path.clone();
-        let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
-        if let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)? {
-            anyhow::bail!(
-                "code is overridden in a files layer ({})",
-                if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
-            );
-        }
-        let label = format!("Save {}", path.rsplit('/').next().unwrap_or(&path));
-        let (uid, said) = (uid.to_string(), label.clone());
-        let saved = self.held(move |w| {
-            let files = w.history.to_save(&uid)?;
-            if !files.is_empty() {
-                project::edit::save(&w.core.project, &w.core.index, &layer, &uid, &files, said, &mut w.history)?;
+        let mut saving = Vec::new();
+        for uid in uids {
+            let Some(document) = self.history.document(uid) else { continue };
+            let path = document.path.clone();
+            let layer = self.editable_layer().map_err(anyhow::Error::msg)?.name.clone();
+            if let Some(choices) = self.override_choice(uid).map_err(anyhow::Error::msg)? {
+                anyhow::bail!(
+                    "code is overridden in a files layer ({})",
+                    if choices.is_empty() { "none yet".into() } else { choices.join(", ") }
+                );
             }
-            w.history.saved(&uid);
-            anyhow::Ok(())
-        });
-        saved.map_err(anyhow::Error::msg)??;
-        Ok(label)
+            saving.push((uid.clone(), layer, format!("Save {}", path.rsplit('/').next().unwrap_or(&path))));
+        }
+        let work = move |w: &mut crate::takein::Worker| {
+            let mut saved = Vec::new();
+            for (uid, layer, label) in saving {
+                let files = w.history.to_save(&uid)?;
+                if !files.is_empty() {
+                    project::edit::save(&w.core.project, &w.core.index, &layer, &uid, &files, label.clone(), &mut w.history)?;
+                }
+                w.history.saved(&uid);
+                // The next reads the index as this one left it.
+                w.take_written();
+                saved.push(label);
+            }
+            anyhow::Ok(saved)
+        };
+        self.ask(work, then);
+        Ok(())
     }
 
     /// Put a document back as on disk, a step undo takes back: its unsaved changes undone - or, stale, the disk's
-    /// taken. Returns what was done.
+    /// taken. Returns what is being done.
     pub fn revert(&mut self, uid: &str) -> String {
         if let Some(why) = self.read_only() {
             return why.into();
@@ -2025,22 +2157,22 @@ impl Workspace {
         let name = document.path.rsplit('/').next().unwrap_or(&document.path).to_string();
         let label = if document.stale.is_some() { format!("Take {name} as on disk") } else { format!("Revert {name}") };
         let (uid, said, selected) = (uid.to_string(), label.clone(), self.selected.clone());
-        let reverted = self.held(move |w| {
+        self.post(move |w| {
             w.history.revert(&uid, said);
             w.history.note_selection(selected);
         });
-        reverted.map_or_else(|gone| gone, |()| label)
+        label
     }
 
     /// Keep a stale document's working copy: what is on disk now is what saving it overwrites.
     pub fn keep_mine(&mut self, uid: &str) {
         let uid = uid.to_string();
-        let _ = self.held(move |w| w.history.keep_mine(&uid));
+        self.post(move |w| w.history.keep_mine(&uid));
     }
 
     /// Let every unsaved change go (the project is closing without saving).
     pub fn discard_unsaved(&mut self) {
-        let _ = self.held(|w| w.history.discard_documents());
+        self.post(|w| w.history.discard_documents());
     }
 
     /// The session a crash ended, where one was left and is not taken up or let go yet: how many steps and unsaved
@@ -2051,7 +2183,7 @@ impl Workspace {
 
     /// Take up the session a crash ended, or let it go.
     pub fn resume_left(&mut self, resume: bool) {
-        let _ = self.held(move |w| if resume { w.history.resume() } else { w.history.discard_left() });
+        self.post(move |w| if resume { w.history.resume() } else { w.history.discard_left() });
     }
 
     /// Make an edit: of a document, its working copy changed; anything else, made in the active layer at once. A step of
@@ -2059,9 +2191,30 @@ impl Workspace {
     ///
     /// # Errors
     /// The active layer cannot be written, the edit does not apply, or files cannot be written.
-    pub fn edit(&mut self, request: &EditRequest) -> anyhow::Result<String> {
+    pub fn edit(
+        &mut self,
+        request: &EditRequest,
+        then: impl FnOnce(&mut crate::app::Editor, anyhow::Result<String>) + 'static,
+    ) -> anyhow::Result<()> {
+        let work = self.edit_work(request)?;
+        self.ask(work, then);
+        Ok(())
+    }
+
+    /// As `edit`, waited for: what a test asks.
+    ///
+    /// # Errors
+    /// As `edit`, and what the edit itself fails on.
+    #[cfg(any(test, feature = "tests"))]
+    pub fn edit_now(&mut self, request: &EditRequest) -> anyhow::Result<String> {
+        let work = self.edit_work(request)?;
+        self.held(work).map_err(anyhow::Error::msg)?
+    }
+
+    /// The work that makes an edit, once the window has checked what it can of it: that something can be edited
+    /// now, and which layer takes it.
+    fn edit_work(&self, request: &EditRequest) -> anyhow::Result<Edit> {
         use project::edit;
-        let _span = tracing::info_span!("window thread: an edit made").entered();
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
         }
@@ -2095,16 +2248,15 @@ impl Workspace {
                     anyhow::bail!("{layer} cannot be written");
                 }
                 let (layer, path) = (layer.clone(), path.clone());
-                let made = self.held(move |w| {
+                return Ok(Box::new(move |w| {
                     let (project, index, history) = (&w.core.project, &w.core.index, &mut w.history);
                     if removing {
                         edit::remove_unlisted(project, index, &layer, &path, history)?;
                     } else {
                         edit::adopt(project, index, &layer, &path, history)?;
                     }
-                    anyhow::Ok(history.done().last().map_or_default(|s| s.label.clone()))
-                });
-                return made.map_err(anyhow::Error::msg)?;
+                    Ok(history.done().last().map_or_default(|s| s.label.clone()))
+                }));
             }
             _ => self.editable_layer().map_err(anyhow::Error::msg)?.name.clone(),
         };
@@ -2121,7 +2273,7 @@ impl Workspace {
             | EditRequest::Refused(_)
             | EditRequest::Adopt(..)
             | EditRequest::RemoveUnlisted(..) => {
-                return Ok(String::new());
+                return Ok(Box::new(|_| Ok(String::new())));
             }
         };
         // Code goes to a files layer: an override of it in an asset layer is asked of the user first
@@ -2136,7 +2288,7 @@ impl Workspace {
         }
         let (request, selected) = (request.clone(), self.selected.clone());
         // An edit reads the index (a layer's changeset): made by the worker, once what was asked before is taken in.
-        let made = self.held(move |w| {
+        Ok(Box::new(move |w| {
             let (project, index, history) = (&w.core.project, &w.core.index, &mut w.history);
             match &request {
                 EditRequest::Override(uid) | EditRequest::OverrideIn(uid, _) => {
@@ -2162,9 +2314,8 @@ impl Workspace {
                 | EditRequest::RemoveUnlisted(..) => return Ok(String::new()),
             };
             history.note_selection(selected);
-            anyhow::Ok(history.done().last().map_or_default(|s| s.label.clone()))
-        });
-        made.map_err(anyhow::Error::msg)?
+            Ok(history.done().last().map_or_default(|s| s.label.clone()))
+        }))
     }
 
     /// The stack's own layers (not the mounts), bottom to top.
@@ -2173,25 +2324,23 @@ impl Workspace {
     }
 
     /// Put the stack's own layers in this order (bottom to top), if it keeps what each needs: written to
-    /// `project.toml`, which the watcher sees and the project is read again.
-    ///
-    /// # Errors
-    /// Why the order cannot be: a layer it would put below one it needs, or `project.toml` not written.
-    pub fn reorder(&mut self, order: &[String]) -> Result<()> {
+    /// `project.toml`, and the project read again. `then` is given why it could not be, where it could not: a
+    /// layer it would put below one it needs, or `project.toml` not written.
+    pub fn reorder(&mut self, order: &[String], then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
         let (layers, order) = (self.layers.clone(), order.to_vec());
-        self.held(move |w| project::stack::reorder(&w.core.project, &layers, &order, &mut w.history))
-            .map_err(anyhow::Error::msg)?
+        self.ask(move |w| project::stack::reorder(&w.core.project, &layers, &order, &mut w.history), then);
     }
 
-    /// Add a new, empty layer of a type at the top of the stack.
-    ///
-    /// # Errors
-    /// The name is not one a layer may take, or it cannot be written.
-    pub fn add_layer(&mut self, name: &str, kind: project::LayerKind) -> Result<u64> {
+    /// Add a new, empty layer of a type at the top of the stack: `then` is done once the project was read again
+    /// with it - or given why it could not be: the name is not one a layer may take, or it cannot be written.
+    pub fn add_layer(
+        &mut self,
+        name: &str,
+        kind: project::LayerKind,
+        then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static,
+    ) {
         let name = name.to_string();
-        self.held(move |w| project::stack::add(&w.core.project, &name, kind, &mut w.history)).map_err(anyhow::Error::msg)??;
-        // Taken in by now.
-        Ok(self.takein.issued())
+        self.ask(move |w| project::stack::add(&w.core.project, &name, kind, &mut w.history), then);
     }
 
     /// Where an override of an entry (by uid) goes: the active layer (none), or - code (an entry of a files layer)
@@ -2221,14 +2370,12 @@ impl Workspace {
         Ok(Some(candidates))
     }
 
-    /// Take a layer out of the stack; its files stay on disk.
-    ///
-    /// # Errors
-    /// Another layer needs it, a generated layer fills it, it is a mount, or `project.toml` cannot be rewritten.
-    pub fn remove_layer(&mut self, name: &str) -> Result<()> {
+    /// Take a layer out of the stack; its files stay on disk. `then` is given why it could not be, where it could
+    /// not: another layer needs it, a generated layer fills it, it is a mount, or `project.toml` cannot be
+    /// rewritten.
+    pub fn remove_layer(&mut self, name: &str, then: impl FnOnce(&mut crate::app::Editor, Result<()>) + 'static) {
         let (layers, name) = (self.layers.clone(), name.to_string());
-        self.held(move |w| project::stack::remove(&w.core.project, &layers, &name, &mut w.history))
-            .map_err(anyhow::Error::msg)?
+        self.ask(move |w| project::stack::remove(&w.core.project, &layers, &name, &mut w.history), then);
     }
 
     /// Run an extension's tool for a command, with no arguments; what it answers, briefly.

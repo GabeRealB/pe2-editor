@@ -72,7 +72,7 @@ fn undo_takes_back_the_document_in_use_and_no_other() {
         label: "Edit notes".into(),
         merge: None,
     };
-    editor.workspace().edit(&request).expect("an edit");
+    editor.workspace().edit_now(&request).expect("an edit");
     editor.settle();
     // The skeleton in use: its edit is undone, the notes' stays, though it was made last.
     editor.show("rig/skeleton");
@@ -123,7 +123,7 @@ fn a_point_of_the_history_is_shown_read_only_and_restored() {
     editor.expect("Restore here");
     assert_eq!(pelvis(&editor.working("rig/skeleton")), [0, -900, 0]);
     let uid = editor.workspace().index.assets["rig/skeleton"].uid.clone().expect("a uid");
-    let refused = editor.workspace().edit(&EditRequest::Write {
+    let refused = editor.workspace().edit_now(&EditRequest::Write {
         uid,
         file: "node.toml".into(),
         bytes: b"x = 1".to_vec(),
