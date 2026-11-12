@@ -1,0 +1,4 @@
+# Line endings. Every text file is checked out with LF on every platform, whatever core.autocrlf says: Git for
+# Windows turns it on by default, and a CRLF checkout changes what is held to a hash - an extension's patches are
+# checked against their SHA-256 before they are applied - and what the build embeds.
+* text=auto eol=lf
