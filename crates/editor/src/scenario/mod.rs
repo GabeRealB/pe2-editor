@@ -457,7 +457,7 @@ impl Scenario {
     /// What another program changed taken in, as going back to the window does: it waits for that until then.
     #[track_caller]
     pub fn take_in_outside_changes(&mut self) {
-        self.until("the change to be seen", |editor| editor.workspace().pending() > 0);
+        self.until("the change to be seen", |editor| editor.workspace().pending_changes() > 0);
         self.harness.input_mut().focused = false;
         self.harness.step();
         self.settle();

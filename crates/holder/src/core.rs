@@ -31,7 +31,7 @@ enum Work<S> {
 /// A thread that owns something and does what it is given with it, in the order it was given.
 pub struct Queue<S> {
     work: mpsc::Sender<Work<S>>,
-    thread: Option<JoinHandle<()>>,
+    thread: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl<S: Send + 'static> Queue<S> {
@@ -46,7 +46,7 @@ impl<S: Send + 'static> Queue<S> {
                 work(&mut state);
             }
         })?;
-        Ok(Queue { work, thread: Some(thread) })
+        Ok(Queue { work, thread: std::sync::Mutex::new(Some(thread)) })
     }
 
     /// Have this done after all that was given before it; nobody waits for it.
@@ -64,15 +64,24 @@ impl<S: Send + 'static> Queue<S> {
     }
 }
 
-impl<S> Drop for Queue<S> {
-    /// What was given is done, and the thread ends: waited for, but where it is the one letting go.
-    fn drop(&mut self) {
+impl<S> Queue<S> {
+    /// What was given so far is done, and the thread ends: waited for, but where it is the one asking. What is
+    /// given after this is done no more, and what is asked answered with nothing - whoever else still has the
+    /// queue finds it so.
+    pub fn end(&self) {
         let _ = self.work.send(Work::End);
-        if let Some(thread) = self.thread.take()
+        let thread = self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        if let Some(thread) = thread
             && thread.thread().id() != std::thread::current().id()
         {
             let _ = thread.join();
         }
+    }
+}
+
+impl<S> Drop for Queue<S> {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -512,6 +521,23 @@ mod tests {
         let gone: Option<()> = queue.call(|()| panic!("what it was doing failed"));
         assert_eq!(gone, None);
         assert_eq!(queue.call(|()| 1), None, "and nothing after it");
+    }
+
+    #[test]
+    fn ended_it_does_what_it_was_given_before_and_nothing_after() {
+        let queue = Queue::start("queue", 0u32).unwrap();
+        for _ in 0..10 {
+            queue.post(|done| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                *done += 1;
+            });
+        }
+        let last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = last.clone();
+        queue.post(move |done| seen.store(*done, std::sync::atomic::Ordering::Relaxed));
+        queue.end();
+        assert_eq!(last.load(std::sync::atomic::Ordering::Relaxed), 10, "all of it, by the time it has ended");
+        assert_eq!(queue.call(|done| *done), None);
     }
 
     #[test]

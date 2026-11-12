@@ -77,3 +77,40 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     editor.workspace().take_due(&reply);
     assert!(matches!(answered.try_recv(), Ok(mcp::Reply::Taken { count: 0 })));
 }
+
+#[test]
+fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
+    let mut editor = Scenario::open(Fixture::notes_under_records());
+    let root = editor.workspace().project.root.clone();
+    let space = project::shared::space(&root).expect("the shared space");
+    let outside = editor.workspace().outside();
+    let folder = |path: &str| vfs::ops::Op::Folder { path: path.into() };
+    let edit = |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
+    // An edit, and one over the project as the first left it: made by the worker, answered here - no frame is
+    // drawn meanwhile.
+    assert!(matches!(edit(folder("made")), mcp::Reply::Edited { .. }));
+    let inside = edit(folder("made/inside"));
+    assert!(matches!(&inside, mcp::Reply::Edited { label, .. } if label.contains("inside")), "{inside:?}");
+    // What is due of what programs did through the served folder, taken and answered the same way.
+    let numbers = vfs::due::put(&space, &[folder("due")]).expect("said due");
+    let taken = outside.answer(mcp::Request::Due).expect("the worker's to answer");
+    assert!(matches!(taken, mcp::Reply::Taken { count: 1 }), "{taken:?}");
+    assert!(!vfs::due::any(&space.read().unwrap()));
+    assert!(matches!(&vfs::due::settle(&space, &numbers, false).expect("read")[..], [Some(Ok(_))]));
+    // The last step taken back, as the History pane's undo does.
+    let undone = edit(vfs::ops::Op::Undo);
+    assert!(matches!(&undone, mcp::Reply::Edited { label, .. } if label.starts_with("Undid")), "{undone:?}");
+    // What needs the window is the window's.
+    assert!(outside.answer(mcp::Request::Hello).is_err());
+    // The window shows all of it once it draws again.
+    editor.until("the window to show it", |e| {
+        let entries = &e.workspace().index.entries;
+        entries.contains_key("made/inside") && !entries.contains_key("due")
+    });
+    assert_eq!(editor.workspace().history.done().len(), 2, "two steps left of the three made");
+    // While a point of the history is shown, nothing is edited from outside either.
+    editor.workspace().view(Some(crate::workspace::Viewing { point: 1, scope: None, now: false }));
+    editor.frame();
+    let refused = edit(folder("later"));
+    assert!(refused.told().is_err_and(|why| why.contains("an earlier point of the history")), "{refused:?}");
+}

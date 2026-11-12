@@ -762,7 +762,7 @@ impl Editor {
     /// F5: what other programs changed taken in now.
     fn refresh(&mut self) {
         let Some(ws) = &mut self.workspace else { return };
-        let pending = ws.pending();
+        let pending = ws.pending_changes();
         ws.refresh_now();
         self.message = Some(match pending {
             0 => "Nothing changed on disk".to_string(),
@@ -2436,8 +2436,8 @@ impl Editor {
                     ui.label(RichText::new(working).small().color(theme::weak()));
                     ui.add(egui::Spinner::new().size(10.0));
                     ui.separator();
-                } else if ws.pending() > 0 {
-                    let n = ws.pending();
+                } else if ws.pending_changes() > 0 {
+                    let n = ws.pending_changes();
                     let text = format!("{n} change{} on disk", if n == 1 { "" } else { "s" });
                     ui.label(RichText::new(text).small().color(theme::weak())).on_hover_text(
                         "Made by other programs: taken in when the editor regains focus, or now with F5",

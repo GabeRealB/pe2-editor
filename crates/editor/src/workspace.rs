@@ -13,7 +13,7 @@ use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::settings::{Preview, Upscale};
@@ -136,6 +136,44 @@ pub struct LayerView {
 }
 
 impl LayerView {
+    /// Whether a layer cannot be edited now: locked by nature, by hand, or because another is shown alone.
+    #[must_use]
+    pub fn is_locked(&self, layer: &LayerInfo) -> bool {
+        Workspace::locked_by_nature(layer) || self.locked.contains(&layer.name) || self.locked_by_solo(layer)
+    }
+
+    /// Locked because another layer is shown alone.
+    #[must_use]
+    pub fn locked_by_solo(&self, layer: &LayerInfo) -> bool {
+        self.solo.as_ref().is_some_and(|solo| *solo != layer.name)
+    }
+
+    /// The active layer: the one shown alone, else the user's choice, else the topmost asset layer not locked by
+    /// nature.
+    #[must_use]
+    pub fn active<'l>(&self, layers: &'l [LayerInfo]) -> Option<&'l LayerInfo> {
+        let chosen = self.solo.as_ref().or(self.active.as_ref());
+        let chosen = chosen.and_then(|a| layers.iter().find(|l| l.name == *a));
+        chosen.or_else(|| layers.iter().rev().find(|l| !l.mounted && !Workspace::locked_by_nature(l)))
+    }
+
+    /// The layer edits go to: the active one, if it can be written now.
+    ///
+    /// # Errors
+    /// Why it cannot: nothing can be edited now (`read_only`), none is active, or it is locked (by nature, by
+    /// hand, by a solo).
+    pub fn editable<'l>(&self, layers: &'l [LayerInfo], read_only: Option<&str>) -> Result<&'l LayerInfo, String> {
+        if let Some(why) = read_only {
+            return Err(why.to_string());
+        }
+        let layer = self.active(layers).ok_or("no layer is active")?;
+        if self.is_locked(layer) {
+            let why = if self.locked_by_solo(layer) { "while another layer is soloed" } else { "it is locked" };
+            return Err(format!("{} cannot be edited: {why}", layer.name));
+        }
+        Ok(layer)
+    }
+
     /// The layers hidden from the view: the eyes', or, while a layer is shown alone, the layers above it.
     fn hidden(&self, layers: &[LayerInfo]) -> BTreeSet<String> {
         match &self.solo {
@@ -236,7 +274,7 @@ pub struct Workspace {
     /// The take-in worker: it owns the index and the imports, and hands snapshots back.
     takein: crate::takein::TakeIn,
     /// Runs what events set off.
-    runner: crate::runner::Runner,
+    runner: Arc<Mutex<crate::runner::Runner>>,
     /// The config in use.
     pub config: Option<project::Config>,
     /// The config the extensions were told, and which extensions were: told again once they are read again.
@@ -248,8 +286,11 @@ pub struct Workspace {
     /// What the GPU said of what extensions gave it, first first.
     pub gpu_errors: Vec<String>,
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
-    /// setting), before an agent is answered, or on View > Refresh.
-    pending: BTreeSet<PathBuf>,
+    /// setting), before an agent is answered, or on View > Refresh. The worker takes them in itself before
+    /// what is asked of it from outside the window.
+    pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// What the window shows that an edit asked from outside it depends on, as the worker was last told.
+    showing: Arc<Mutex<crate::takein::Showing>>,
     /// How many times changes were taken in: what a view read of plain files may be out of date once it moves.
     revision: u64,
     /// Whether the window had focus at the last frame.
@@ -504,6 +545,9 @@ pub struct Opened {
     says: Arc<holder::says::Says>,
     /// What tells which files are not as the index took them to be (`Index::verification`): the worker's first job.
     verify: crate::takein::Verify,
+    /// Where the agents' link finds the worker, once there is one: what it asks of the project is then asked of
+    /// the worker, with no frame drawn for it.
+    outside: Arc<std::sync::OnceLock<crate::takein::Outside>>,
 }
 
 /// What agents ask of the editor's own state, answered while the imports attach as the user has it then: what it shows,
@@ -548,9 +592,19 @@ fn listen(
     root: &Path,
     to_frames: mpsc::Sender<AgentRequest>,
     ctx: egui::Context,
+    outside: Arc<std::sync::OnceLock<crate::takein::Outside>>,
 ) -> std::result::Result<mcp::link::Listener, String> {
     mcp::link::Listener::start(root, move |request| {
         arrived();
+        // An edit, and what is due of what programs did through the served folder, are the worker's: asked of
+        // it here, on the link's thread, whatever the window is doing.
+        let request = match outside.get() {
+            Some(outside) => match outside.answer(request) {
+                Ok(reply) => return reply,
+                Err(request) => request,
+            },
+            None => request,
+        };
         let (reply, answered) = mpsc::channel();
         let delivered = to_frames.send((request, reply)).is_ok();
         ctx.request_repaint();
@@ -564,7 +618,7 @@ fn listen(
 /// last - and only then what merely takes time: the index's memory, which nobody waits for.
 pub struct Leaving {
     takein: Option<crate::takein::TakeIn>,
-    runner: Option<crate::runner::Runner>,
+    runner: Option<Arc<Mutex<crate::runner::Runner>>>,
     index: Option<Arc<Index>>,
     lock: Option<Lock>,
     /// The server kept: let go of once the project is, for whoever holds it next to feed.
@@ -670,7 +724,8 @@ impl Workspace {
             stand_by(&project.root);
         }
         // Agents reach it from now on: what they ask of the window is answered as it opens.
-        let link = listen(&project.root, agents.0, agents.1);
+        let outside: Arc<std::sync::OnceLock<crate::takein::Outside>> = Arc::default();
+        let link = listen(&project.root, agents.0, agents.1, outside.clone());
         if link.is_ok() {
             await_agent(report);
         }
@@ -725,6 +780,7 @@ impl Workspace {
             listing,
             says,
             verify,
+            outside,
         })
     }
 
@@ -748,6 +804,7 @@ impl Workspace {
             listing,
             says,
             verify,
+            outside,
             ..
         } = opened;
         let (link, link_error) = match link {
@@ -769,9 +826,22 @@ impl Workspace {
         // An edit goes on at once: nobody waits for its files, or for the folder served to show it.
         core.waits = false;
         let viewed = Arc::new(history.view());
+        let showing = crate::takein::Showing {
+            layers: layer_view.clone(),
+            viewing: false,
+            author: "user",
+            config: None,
+            holding: true,
+        };
+        let runner = Arc::new(Mutex::new(crate::runner::Runner::start(project.clone(), extensions.clone())));
+        let showing = Arc::new(Mutex::new(showing));
+        let pending: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::default();
         let mut takein = crate::takein::TakeIn::start(crate::takein::Start {
             core,
             history,
+            showing: showing.clone(),
+            pending: pending.clone(),
+            runner: runner.clone(),
             cache,
             store: store.clone(),
             imports,
@@ -782,7 +852,8 @@ impl Workspace {
         // The files held to what the index took of them as known, first: what an edit waits for.
         takein.verify(verify);
         let attaching = takein.attach();
-        let runner = crate::runner::Runner::start(project.clone(), extensions.clone());
+        // The agents' link asks the worker from here on.
+        let _ = outside.set(takein.outside());
         let mut workspace = Workspace {
             runner,
             config: None,
@@ -839,7 +910,8 @@ impl Workspace {
             extensions_found,
             extensions_checked: std::time::Instant::now(),
             takein,
-            pending: BTreeSet::new(),
+            pending,
+            showing,
             revision: 0,
             focused: true,
             own: Vec::new(),
@@ -879,7 +951,7 @@ impl Workspace {
         }
         self.takein.wake(ctx);
         let window = ctx.clone();
-        self.runner.wake(move || window.request_repaint());
+        self.runner().wake(move || window.request_repaint());
         self.plans.update(&self.project, &self.extensions, ctx);
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
@@ -988,7 +1060,18 @@ impl Workspace {
 
     /// Run a generated layer's plan as the work graph's only work: after the epoch running, before what is asked next.
     pub fn extract(&mut self, extraction: crate::runner::Extraction) {
-        self.runner.extract(extraction);
+        self.runner().extract(extraction);
+    }
+
+    /// What runs the epochs events set off: the worker's too, for what is signaled on the agents' link.
+    fn runner(&self) -> std::sync::MutexGuard<'_, crate::runner::Runner> {
+        self.runner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The worker, as the agents' link asks it.
+    #[cfg(test)]
+    pub fn outside(&self) -> crate::takein::Outside {
+        self.takein.outside()
     }
 
     /// Whether events wait to be signaled: the project is not attached yet, or a plan is filling a layer.
@@ -1176,12 +1259,12 @@ impl Workspace {
 
     /// Stop the epoch running.
     pub fn cancel_epoch(&self) {
-        self.runner.cancel();
+        self.runner().cancel();
     }
 
     /// An epoch is running or waiting.
     pub fn in_epoch(&self) -> bool {
-        self.runner.busy()
+        self.runner().busy()
     }
 
     /// A file of the project's cache, by name.
@@ -1191,7 +1274,7 @@ impl Workspace {
 
     /// What the epoch running does, as the status bar says it: by the events it was signaled by.
     pub fn epoch_doing(&self) -> String {
-        let roots = self.runner.running();
+        let roots = self.runner().running();
         let said: Vec<String> = roots
             .iter()
             .map(|root| match root.as_str() {
@@ -1221,7 +1304,7 @@ impl Workspace {
             }
             return;
         };
-        self.runner.run(crate::runner::Job { roots, index: self.index.clone(), config, reply });
+        self.runner().run(crate::runner::Job { roots, index: self.index.clone(), config, reply });
     }
 
     /// Answer the agents' requests that arrived since the last frame, against the index and the selection as shown. A
@@ -1317,13 +1400,14 @@ impl Workspace {
             self.part_sheets.clear();
         }
         self.own.retain(|(_, _, at)| at.elapsed() < Duration::from_secs(30));
+        self.tell_showing();
         if let Some(watch) = &self.watch {
             for change in watch.poll() {
                 match change {
                     Change::Paths(changed) => {
                         let theirs: Vec<PathBuf> =
                             changed.into_iter().filter(|p| !self.is_own(p) && self.concerns(p)).collect();
-                        self.pending.extend(theirs);
+                        self.pending().extend(theirs);
                     }
                     Change::Error(e) => self.watch_error = Some(format!("changes may be missed: {e}")),
                 }
@@ -1338,7 +1422,8 @@ impl Workspace {
         self.apply(ready);
         self.gpu_errors.extend(pe2_webgpu::take_errors());
         self.gpu_errors.truncate(MOST_GPU_ERRORS);
-        for ended in self.runner.poll() {
+        let ended = self.runner().poll();
+        for ended in ended {
             if matches!(self.outcome, Update::Nothing)
                 && let Some(said) = ended.said()
             {
@@ -1389,23 +1474,49 @@ impl Workspace {
 
     /// Take in what other programs changed, now.
     fn take_in_pending(&mut self) {
-        if !self.pending.is_empty() {
-            let paths = std::mem::take(&mut self.pending).into_iter().collect();
+        let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending()).into_iter().collect();
+        if !paths.is_empty() {
             self.external.0 = self.takein.paths(paths);
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeSet<PathBuf>> {
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Tell the worker what the window shows that an edit asked from outside it depends on, where it changed.
+    fn tell_showing(&mut self) {
+        let holding = self.holding_events();
+        let mut told = self.showing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let viewing = self.viewing.is_some();
+        let same = told.layers == self.layer_view
+            && told.viewing == viewing
+            && told.author == self.author
+            && told.config == self.config
+            && told.holding == holding;
+        if !same {
+            *told = crate::takein::Showing {
+                layers: self.layer_view.clone(),
+                viewing,
+                author: self.author,
+                config: self.config.clone(),
+                holding,
+            };
         }
     }
 
     /// View > Refresh: what other programs changed taken in; where the watcher failed, every layer scanned again.
     pub fn refresh_now(&mut self) {
         if self.watch_error.is_some() {
-            self.pending.extend(self.project.layers.iter().map(|l| l.path.clone()));
+            let layers = self.project.layers.iter().map(|l| l.path.clone());
+            self.pending().extend(layers);
         }
         self.take_in_pending();
     }
 
     /// Changes other programs made, not taken in yet.
-    pub fn pending(&self) -> usize {
-        self.pending.len()
+    pub fn pending_changes(&self) -> usize {
+        self.pending().len()
     }
 
     /// A take-in is running.
@@ -1478,6 +1589,9 @@ impl Workspace {
                 self.outputs.forget(&|asset| reached.contains(asset));
             }
             self.drop_lost_selection();
+            if let Some(path) = snapshot.select.filter(|path| self.exists(path)) {
+                self.navigate(path);
+            }
             // Other programs' changes taken in: the app says how many assets they changed.
             let (asked, told) = self.external;
             if asked > told && snapshot.ticket >= asked {
@@ -1506,7 +1620,7 @@ impl Workspace {
         if places(&project) != places(&self.project) {
             self.watch = None;
         }
-        self.runner.restart(project.clone(), extensions.clone());
+        self.runner().restart(project.clone(), extensions.clone());
         self.project = project;
         self.plans.again();
 
@@ -1615,12 +1729,12 @@ impl Workspace {
     }
 
     pub fn is_locked(&self, layer: &LayerInfo) -> bool {
-        Self::locked_by_nature(layer) || self.layer_view.locked.contains(&layer.name) || self.locked_by_solo(layer)
+        self.layer_view.is_locked(layer)
     }
 
     /// Locked because another layer is shown alone.
     pub fn locked_by_solo(&self, layer: &LayerInfo) -> bool {
-        self.layer_view.solo.as_ref().is_some_and(|solo| *solo != layer.name)
+        self.layer_view.locked_by_solo(layer)
     }
 
     /// Hidden from the view: by its eye, or because a layer below it is shown alone.
@@ -1631,9 +1745,7 @@ impl Workspace {
     /// The active layer: the one shown alone, else the user's choice, else the topmost asset layer not locked by
     /// nature.
     pub fn active_layer(&self) -> Option<&LayerInfo> {
-        let chosen = self.layer_view.solo.as_ref().or(self.layer_view.active.as_ref());
-        let chosen = chosen.and_then(|a| self.layers.iter().find(|l| l.name == *a));
-        chosen.or_else(|| self.layers.iter().rev().find(|l| !l.mounted && !Self::locked_by_nature(l)))
+        self.layer_view.active(&self.layers)
     }
 
     /// What the layer panel shows for an entry beside its name: the layer that overrode or moved it, or the one of the
@@ -1754,15 +1866,7 @@ impl Workspace {
     /// # Errors
     /// Why it cannot: none is active, it is locked (by nature, by hand, by a solo), or a point of the history is shown.
     pub fn editable_layer(&self) -> Result<&LayerInfo, String> {
-        if let Some(why) = self.read_only() {
-            return Err(why.to_string());
-        }
-        let layer = self.active_layer().ok_or("no layer is active")?;
-        if self.is_locked(layer) {
-            let why = if self.locked_by_solo(layer) { "while another layer is soloed" } else { "it is locked" };
-            return Err(format!("{} cannot be edited: {why}", layer.name));
-        }
-        Ok(layer)
+        self.layer_view.editable(&self.layers, self.read_only())
     }
 
     // --- documents ------------------------------------------------------------------------------------------------
@@ -1792,7 +1896,7 @@ impl Workspace {
 
     /// Why nothing can be edited now: a point of the history is viewed.
     fn read_only(&self) -> Option<&'static str> {
-        self.viewing.as_ref().map(|_| "an earlier point of the history is shown: back to now to edit")
+        self.viewing.as_ref().map(|_| crate::takein::VIEWING)
     }
 
     /// Show a point of the history, read-only - or now again.
@@ -1860,36 +1964,11 @@ impl Workspace {
         op: &vfs::ops::Op,
         layer: Option<&str>,
     ) -> Result<(String, Vec<std::path::PathBuf>), String> {
-        if let vfs::ops::Op::Undo | vfs::ops::Op::Redo = op {
-            let redo = matches!(op, vfs::ops::Op::Redo);
-            let touched = {
-                let steps = if redo { self.history.undone() } else { self.history.done() };
-                steps.iter().rev().find(|s| s.undoable() || redo).map_or_else(Vec::new, project::history::Step::paths)
-            };
-            let verb = if redo { "Redid" } else { "Undid" };
-            return self
-                .step(redo, false, None)
-                .map(|label| (format!("{verb} {label}"), touched))
-                .map_err(|e| e.to_string());
-        }
-        let layer = match layer {
-            Some(name) => {
-                let info = self.layers.iter().find(|l| l.name == name).ok_or(format!("no layer {name}"))?;
-                if let Some(why) = self.read_only() {
-                    return Err(why.to_string());
-                }
-                if self.is_locked(info) {
-                    return Err(format!("{name} cannot be edited: it is locked"));
-                }
-                name.to_string()
-            }
-            None => self.editable_layer()?.name.clone(),
-        };
-        let op = op.clone();
-        match self.held(move |w| w.edits(&[op], &layer).pop())? {
-            Some(mcp::Reply::Edited { label, touched }) => Ok((label, touched)),
-            Some(other) => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
-            None => Err("nothing was asked".into()),
+        self.tell_showing();
+        let (op, layer) = (op.clone(), layer.map(str::to_string));
+        match self.held(move |w| w.asked_edit(&op, layer.as_deref()))? {
+            mcp::Reply::Edited { label, touched } => Ok((label, touched)),
+            other => Err(other.told().err().unwrap_or_else(|| "it answered with something else".into())),
         }
     }
 
@@ -1898,13 +1977,10 @@ impl Workspace {
     /// with what is served after them, and who asked to look answered once that is served.
     pub(crate) fn take_due(&mut self, reply: &mpsc::Sender<mcp::Reply>) {
         let _span = tracing::info_span!("window thread: what is due taken").entered();
-        let layer = self.editable_layer().map(|layer| layer.name.clone());
+        self.tell_showing();
         let reply = reply.clone();
         // Where the worker is gone, nobody answers: who asked finds its asking let go of.
-        let _ = self.held(move |w| {
-            let layer = layer.as_deref().map_err(String::as_str);
-            w.take_due(layer, Box::new(move |answer| drop(reply.send(answer))));
-        });
+        let _ = self.held(move |w| w.asked_due(Box::new(move |answer| drop(reply.send(answer)))));
     }
 
     pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {

@@ -26,9 +26,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
-use crate::workspace::{Loaded, Node};
+use crate::workspace::{LayerView, Loaded, Node};
 
 /// What the worker is asked.
 pub enum Job {
@@ -51,6 +51,66 @@ pub enum Job {
     /// Reading until told to stop: a test's way to find it at work.
     #[cfg(any(test, feature = "tests"))]
     Hold(Receiver<()>),
+}
+
+/// Why nothing can be edited while a point of the history is shown.
+pub const VIEWING: &str = "an earlier point of the history is shown: back to now to edit";
+
+/// What the window shows that an edit asked from outside it depends on, told by the window as it changes: the
+/// user's view of the layers - which is active, which are locked - whether a point of the history is shown, and
+/// who makes the steps asked now.
+#[derive(Clone)]
+pub struct Showing {
+    pub layers: LayerView,
+    pub viewing: bool,
+    pub author: &'static str,
+    /// The config in use: what an event signaled with none named is for.
+    pub config: Option<project::Config>,
+    /// Whether the window holds events back - a plan is filling a layer: they are signaled once it has.
+    pub holding: bool,
+}
+
+/// The worker, for what is asked of the project from outside the window: on the agents' link, by its threads.
+#[derive(Clone)]
+pub struct Outside(Weak<Queue<Worker>>);
+
+impl Outside {
+    /// Answer what is the worker's to answer with no frame drawn for it - an edit, what is due of what programs
+    /// did through the served folder - once all asked before it is done. Anything else is given back: the
+    /// window's to answer.
+    ///
+    /// # Errors
+    /// The request is not the worker's.
+    pub fn answer(&self, request: mcp::Request) -> Result<mcp::Reply, mcp::Request> {
+        let closed = || mcp::Reply::Error("the editor closed the project".into());
+        match request {
+            mcp::Request::Edit { op, layer } => {
+                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                let made = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_edit(&op, layer.as_deref())));
+                Ok(made.unwrap_or_else(closed))
+            }
+            mcp::Request::Due => {
+                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                // Answered once what became of it is said and served: by what tells the server.
+                let (said, answered) = mpsc::channel();
+                let then: holder::core::Then = Box::new(move |answer| drop(said.send(answer)));
+                queue.call(move |worker| worker.asked_outside(|worker| worker.asked_due(then)));
+                Ok(answered.recv().unwrap_or_else(|_| closed()))
+            }
+            mcp::Request::Signal { events, config } => {
+                let Some(queue) = self.0.upgrade() else { return Ok(closed()) };
+                let asked = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_signal(events, config)));
+                drop(queue);
+                match asked {
+                    // Answered by what runs the epoch, once it has ended.
+                    Some(Ok(answered)) => Ok(answered.recv().unwrap_or_else(|_| closed())),
+                    Some(Err((events, config))) => Err(mcp::Request::Signal { events, config }),
+                    None => Ok(closed()),
+                }
+            }
+            other => Err(other),
+        }
+    }
 }
 
 /// What tells which files are not as an index opened behind took them to be (`Index::verification`).
@@ -87,12 +147,14 @@ pub struct Snapshot {
     pub history: Arc<project::history::View>,
     /// The files the editor's own edits wrote: told of again by what watches the layers, they are its own.
     pub wrote: Vec<PathBuf>,
+    /// What was selected when a step undone or made again from outside the window was made: shown again.
+    pub select: Option<String>,
 }
 
 /// The worker, as the UI holds it.
 pub struct TakeIn {
     /// The thread holding the project, with what it owns; none once it was told to end.
-    queue: Option<Queue<Worker>>,
+    queue: Option<Arc<Queue<Worker>>>,
     /// What was asked and is not taken in yet: taken together by the thread, whichever asking wakes it.
     asked: Arc<Mutex<Vec<(u64, Job)>>>,
     snapshots: Receiver<Snapshot>,
@@ -119,6 +181,18 @@ pub struct Worker {
     viewing: Option<(usize, Option<String>)>,
     /// What work on the history and the index came to and is not handed over yet.
     taken: holder::core::Taken,
+    /// What the window shows that edits asked from outside it depend on.
+    showing: Arc<Mutex<Showing>>,
+    /// What other programs changed, as the window collected it and has yet to have taken in.
+    pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// The last ticket of what it took in.
+    covered: u64,
+    /// What runs the epochs events set off: the window's.
+    runner: Arc<Mutex<holder::runner::Runner>>,
+    /// Whether what the importers made is attached: an epoch works from the project with it.
+    attached: bool,
+    /// What a step undone from outside the window had selected, until it is handed over.
+    select: Option<String>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -142,6 +216,9 @@ pub struct Worker {
 pub struct Start {
     pub core: Core,
     pub history: History,
+    pub showing: Arc<Mutex<Showing>>,
+    pub pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    pub runner: Arc<Mutex<holder::runner::Runner>>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -158,13 +235,19 @@ impl TakeIn {
         let ctx: Arc<OnceLock<eframe::egui::Context>> = Arc::default();
         let stage: Arc<Mutex<String>> = Arc::default();
         let stop = start.imports.stopper();
-        let Start { core, history, cache, store, imports, extensions, found, tree } = start;
+        let Start { core, history, showing, pending, runner, cache, store, imports, extensions, found, tree } = start;
         let worker = Worker {
             core,
             viewed: (history.revision(), Arc::new(history.view())),
             history,
             viewing: None,
             taken: holder::core::Taken::default(),
+            showing,
+            pending,
+            runner,
+            attached: false,
+            covered: 0,
+            select: None,
             cache,
             store,
             imports,
@@ -180,7 +263,13 @@ impl TakeIn {
             group: project::schedule::Group::new(project::schedule::Class::Background, "take-in"),
         };
         let queue = Queue::start("take-in", worker).map_err(|e| eprintln!("no thread takes changes in: {e}")).ok();
+        let queue = queue.map(Arc::new);
         TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop }
+    }
+
+    /// The worker, for the agents' link to ask without the window.
+    pub fn outside(&self) -> Outside {
+        Outside(self.queue.as_ref().map_or_else(Weak::new, Arc::downgrade))
     }
 
     /// The window to wake when a snapshot is ready.
@@ -292,8 +381,11 @@ impl Drop for TakeIn {
     /// gives up where it is: what it would come to is for a window that is going.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Waited for: what it was given before this is done first.
-        self.queue = None;
+        // Waited for: what it was given before this is done first - whoever else has it still, on the agents'
+        // link, is answered nothing from here on.
+        if let Some(queue) = self.queue.take() {
+            queue.end();
+        }
     }
 }
 
@@ -358,6 +450,106 @@ impl Worker {
         self.viewing = None;
     }
 
+    /// Do what is asked from outside the window as work on the history (`held`), once what other programs
+    /// changed and the window has collected is taken in: an agent reads what it just wrote.
+    pub fn asked_outside<R>(&mut self, work: impl FnOnce(&mut Worker) -> R) -> R {
+        let pending: Vec<PathBuf> =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner)).into_iter().collect();
+        if !pending.is_empty() {
+            self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((0, Job::Paths(pending)));
+        }
+        self.held(0, work)
+    }
+
+    fn showing(&self) -> Showing {
+        self.showing.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Make an edit asked from outside the window - a command's, an agent's - as the window shows the project
+    /// now: in the layer named, or the one edits go to, as a step of the session's log; or the last step taken
+    /// back or made again, as the History pane's undo and redo do.
+    pub fn asked_edit(&mut self, op: &vfs::ops::Op, layer: Option<&str>) -> mcp::Reply {
+        let showing = self.showing();
+        self.history.set_author(showing.author);
+        let read_only = showing.viewing.then_some(VIEWING);
+        if let vfs::ops::Op::Undo | vfs::ops::Op::Redo = op {
+            let redo = matches!(op, vfs::ops::Op::Redo);
+            if let Some(why) = read_only {
+                return mcp::Reply::failed(why.to_string());
+            }
+            let touched = {
+                let steps = if redo { self.history.undone() } else { self.history.done() };
+                steps.iter().rev().find(|s| s.undoable() || redo).map_or_else(Vec::new, project::history::Step::paths)
+            };
+            let index = &self.core.index;
+            let stepped = if redo { self.history.redo(index, None, false) } else { self.history.undo(index, None, false) };
+            return match stepped {
+                Ok(step) => {
+                    self.select.clone_from(&step.selection);
+                    let label = format!("{} {}", if redo { "Redid" } else { "Undid" }, step.label);
+                    mcp::Reply::Edited { label, touched }
+                }
+                Err(e) => mcp::Reply::failed(e.to_string()),
+            };
+        }
+        let layers = self.core.index.layers();
+        let layer = match layer {
+            Some(name) => match layers.iter().find(|l| l.name == name) {
+                None => Err(format!("no layer {name}")),
+                Some(_) if read_only.is_some() => Err(VIEWING.to_string()),
+                Some(info) if showing.layers.is_locked(info) => Err(format!("{name} cannot be edited: it is locked")),
+                Some(_) => Ok(name.to_string()),
+            },
+            None => showing.layers.editable(&layers, read_only).map(|layer| layer.name.clone()),
+        };
+        match layer {
+            Ok(layer) => {
+                let made = self.edits(std::slice::from_ref(op), &layer).pop();
+                made.unwrap_or_else(|| mcp::Reply::failed("nothing was asked".into()))
+            }
+            Err(why) => mcp::Reply::failed(why),
+        }
+    }
+
+    /// Signal events asked for from outside the window: an epoch begins, on the project as last handed over,
+    /// for the config named or the one in use; what it comes to is said to who asked by what runs it, once it
+    /// has ended.
+    ///
+    /// # Errors
+    /// The window holds events back - the project is not attached yet, or a plan is filling a layer: it is the
+    /// window's to signal, once it does not.
+    pub fn asked_signal(
+        &mut self,
+        events: Vec<String>,
+        config: Option<String>,
+    ) -> Result<mpsc::Receiver<mcp::Reply>, (Vec<String>, Option<String>)> {
+        let showing = self.showing();
+        if !self.attached || showing.holding {
+            return Err((events, config));
+        }
+        let named = config.as_ref().and_then(|name| self.core.project.configs.iter().find(|c| c.name == *name));
+        let (reply, answered) = mpsc::channel();
+        let Some(config) = named.cloned().or(showing.config) else {
+            let _ = reply.send(mcp::Reply::failed("the project has no config".to_string()));
+            return Ok(answered);
+        };
+        let index = self.shown.clone().unwrap_or_else(|| Arc::new(self.core.index.clone()));
+        let runner = self.runner.lock().unwrap_or_else(PoisonError::into_inner);
+        runner.run(holder::runner::Job { roots: events, index, config, reply: Some(reply) });
+        Ok(answered)
+    }
+
+    /// Take what is due of what programs did through the served folder, in the layer edits go to as the window
+    /// shows the project now - or none of it, where none can be edited: `then` given what was answered once
+    /// that is said and served.
+    pub fn asked_due(&mut self, then: holder::core::Then) {
+        let showing = self.showing();
+        self.history.set_author(showing.author);
+        let layers = self.core.index.layers();
+        let layer = showing.layers.editable(&layers, showing.viewing.then_some(VIEWING)).map(|layer| layer.name.clone());
+        self.take_due(layer.as_deref().map_err(String::as_str), then);
+    }
+
     /// The working copies the index shows: the documents' as they are now, or as at the point of the history
     /// shown.
     fn working(&self) -> HashMap<String, Working> {
@@ -371,7 +563,9 @@ impl Worker {
     /// history came to since the last, and hand over the project as that leaves it. What changed of its files
     /// is said, where the project's processes share it, as it is taken in (`Core`).
     fn take_in(&mut self, jobs: Vec<(u64, Job)>) -> Snapshot {
-        let ticket = jobs.iter().map(|(t, _)| *t).max().unwrap_or(0);
+        // What was asked with no ticket of its own - from outside the window - covers what was covered already.
+        self.covered = jobs.iter().map(|(t, _)| *t).max().unwrap_or(0).max(self.covered);
+        let ticket = self.covered;
         let mut paths = Vec::new();
         let mut hidden = None;
         let (mut attach, mut reload, mut whole) = (false, None, false);
@@ -416,6 +610,7 @@ impl Worker {
             self.reporter()("", 0, 0);
             all = true;
         }
+        self.attached |= attach;
         // What changed of the files: what work on the history wrote, taken in already, and what other programs
         // changed.
         let mut taken = std::mem::take(&mut self.taken);
@@ -577,6 +772,7 @@ impl Worker {
             files: std::mem::take(&mut self.changed_behind) || !wrote.is_empty(),
             history: self.viewed.1.clone(),
             wrote,
+            select: self.select.take(),
         }
     }
 }
