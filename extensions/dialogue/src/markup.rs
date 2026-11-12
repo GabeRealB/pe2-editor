@@ -1,4 +1,4 @@
-//! A text stream as text (`doc/CAP_FORMAT.md` §3): its glyphs as the characters they draw, its controls as tokens in
+//! A dialogue's text stream as text (`formats::cap`): its glyphs as the characters they draw, its controls as tokens in
 //! braces. Palette and reveal delay are states, written where they change.
 //!
 //! - a character, or `{glyph <token>}` for a glyph whose token is no single character (or a brace);

@@ -117,7 +117,7 @@ sha256 = "7369f7a35f261222a6ac8b3a87c1c88eeebee8af945d85346202591a64038dd3"
 take = { "python" = { to = "python", sha256 = "d021c45a51816f4841e60cbe4e32e08d10df3ecf8688e75070699c6fdb1aaaea" } }
 
 [[setup]]
-name = "maspsx, with the decomp's patches"
+name = "maspsx, with this extension's patches"
 license = "MIT"
 copyright = "Mark Street and its contributors"
 url = "https://github.com/mkst/maspsx/archive/4ffa8b5106f9780d5d4aa7609f184949433ddbbc.tar.gz"

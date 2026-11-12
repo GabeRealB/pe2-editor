@@ -5,7 +5,7 @@
 //! video only. A video sector's data is a 32-byte header - magic `0x80010160`, the chunk's index and the frame's
 //! count of chunks, the frame's number and size in bytes, its width and height, then the frame's own BS header - and
 //! 2016 bytes of the frame; a frame is its chunks joined, cut to its size. An audio sector (submode bit 2) holds XA
-//! ADPCM in its data's first 2304 bytes. (After `tools/peassets/str_codec.py`.)
+//! ADPCM in its data's first 2304 bytes.
 
 use std::collections::BTreeMap;
 

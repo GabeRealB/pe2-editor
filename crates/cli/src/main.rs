@@ -233,7 +233,7 @@ enum LayerCommand {
         project: PathBuf,
     },
     /// Make a layer's records those of a tree of files and its changeset (`<folder>.toml` beside it), in place of all it
-    /// had: what a tool writes as files (`tools/editor_project/init.py`)
+    /// had: what a tool writes as files
     Import {
         name: String,
         /// The tree

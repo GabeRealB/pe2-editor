@@ -71,7 +71,7 @@ impl Cache {
 }
 
 /// Make the project's cache directory, ignoring itself, if it is missing: whoever makes it first - the cache, the
-/// project lock, the Python tools' lock (`tools/project_lock.py`) - writes its `.gitignore`, so nothing in it is ever
+/// project lock, another program taking the lock - writes its `.gitignore`, so nothing in it is ever
 /// seen by git.
 ///
 /// # Errors

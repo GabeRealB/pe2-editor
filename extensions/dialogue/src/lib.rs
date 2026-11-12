@@ -1,4 +1,4 @@
-//! pe2.dialogue: the rooms' dialogues - CAP files (`doc/CAP_FORMAT.md`), a room's script of lines and scene steps - as
+//! pe2.dialogue: the rooms' dialogues - CAP files (`formats::cap`), a room's script of lines and scene steps - as
 //! their structure, their text and their faces.
 //!
 //! - A `dialogue` is a data node: its commands and their records (`dialogue.rs`), each record's text a key of the

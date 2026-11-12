@@ -1,4 +1,4 @@
-//! CAP dialogue (`CAP2`, `doc/CAP_FORMAT.md`): a room's script of lines and scene steps, the data resource of its bundle.
+//! CAP dialogue (`CAP2`): a room's script of lines and scene steps, the data resource of its bundle.
 //!
 //! A file is its header, its glyph cells, a text stream for each record (and, in about half the retail files, an
 //! unused empty one after them), the sequence table - each command's slot, its records' slots and a terminator - and

@@ -1289,7 +1289,7 @@ fn records_of_tree(
 }
 
 /// Make a layer's records those of a tree of files and its changeset (`<folder>.toml`, beside it) - what a tool writes
-/// as a tree (`tools/editor_project/init.py`) - in place of all it had but the extensions it holds: a records layer from
+/// as a tree - in place of all it had but the extensions it holds: a records layer from
 /// now on, its tree, where it was one, gone. How many records it holds.
 ///
 /// # Errors

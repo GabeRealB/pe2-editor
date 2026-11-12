@@ -1,4 +1,4 @@
-//! Resource bundles, the payload of an opcode-4 chunk (`doc/BUNDLE_FORMAT.md`): fifty 16-byte directory entries - kind
+//! Resource bundles, the payload of an opcode-4 chunk: fifty 16-byte directory entries - kind
 //! (0 empty, 2 image, 3 data), sectors, length and RAM destination - then the resources, laid out as they are in RAM,
 //! the first at 0x7F0. An image resource is byte for byte a palette chunk's payload.
 //!

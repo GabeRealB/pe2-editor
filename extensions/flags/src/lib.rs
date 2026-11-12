@@ -1,6 +1,6 @@
-//! pe2.flags: the game flag bank's flags by name. The game keeps 504 four-bit values, read and written by ID
-//! (`gameFlagGetNibble`, `packages/engine/include/event_flags.h`); a flag registry names some of them, each with what it
-//! is and what its values mean, so that whatever reads a flag - a dialogue's command, an event, a package - names it.
+//! pe2.flags: the game flag bank's flags by name. The game keeps 504 four-bit values, read and written by ID; a flag
+//! registry names some of them, each with what it is and what its values mean, so that whatever reads a flag - a
+//! dialogue's command, an event, a package - names it.
 //!
 //! A registry is a data node, written by hand, as many as are convenient (the game's own mechanisms, a stage's): its
 //! `flag` table holds each flag by name - its `id`, its `kind` (`marker`, `state`, `counter`, `bits`, `packed` two IDs

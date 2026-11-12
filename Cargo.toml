@@ -1,4 +1,4 @@
-# Tier 2: the editor and its tools, one library crate a tool, linked into `pe2-cli` and the editor.
+# The PE2 editor and its tools: one library crate a tool, linked into `pe2-cli` and the editor.
 
 [workspace]
 resolver = "2"

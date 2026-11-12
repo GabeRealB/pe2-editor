@@ -1,5 +1,5 @@
-//! A sound script played as the game plays it: the engine's interpreter (`src/engine/sndscript.c`) and its voice
-//! upkeep (`src/engine/spu.c`) over the SPU's voices (`spu`), one audio update at a time - 60 a second, as on NTSC,
+//! A sound script played as the game plays it: a port of the game's own sound script interpreter and of its voice
+//! upkeep, over the SPU's voices (`spu`), one audio update at a time - 60 a second, as on NTSC,
 //! each:
 //!
 //! 1. voices whose envelope has ended are let go, their script's voice detached - a voice keyed on whose envelope is

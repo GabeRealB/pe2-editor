@@ -78,8 +78,9 @@ mod tests {
     }
 
     #[test]
-    fn what_python_says_is_read() {
-        // `tools/project_lock.py`'s frame of `{"say": "lend", "who": "x"}`, and what it reads back.
+    fn a_frame_another_program_writes_is_read() {
+        // A frame of `{"say": "lend", "who": "x"}` as a program written apart from these writes it, and what it reads
+        // back.
         let frame: Vec<u8> = (0..40)
             .step_by(2)
             .map(|i| u8::from_str_radix(&"10000000a263736179646c656e646377686f6178"[i..i + 2], 16).unwrap())

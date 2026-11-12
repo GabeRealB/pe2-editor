@@ -5,7 +5,7 @@
 //! strips: LZSS streams of 64 x 32 words, eight to a 256-row column, column after column in one run from the first
 //! entry's offset. A column is a texture page. A single-column image's height can differ: 64 rows when `term_y` is
 //! `0xFFFF`, `term_y & 0x7FFF` when its top bit is set. A palette chunk is a 16-byte header (VRAM x, y, rows, width)
-//! and one LZSS stream of ABGR1555 colors, a palette a row. (`tools/peassets/image_codec.py`, `doc/ASSET_FORMATS.md`.)
+//! and one LZSS stream of ABGR1555 colors, a palette a row.
 
 use formats::lzss;
 use std::fmt;
@@ -111,7 +111,7 @@ pub fn palette(data: &[u8]) -> Result<Palette, Error> {
     Ok(Palette { x, y, width, rows })
 }
 
-/// An ABGR1555 color as RGBA, one to one (`tools/peassets/texture/color.py`): each five bits `v << 3 | v >> 2`;
+/// An ABGR1555 color as RGBA, one to one: each five bits `v << 3 | v >> 2`;
 /// `0x0000` transparent (alpha 0), a color with bit 15 set semi-transparent where the primitive blends (128), any
 /// other opaque (255) - `0x8000` is black that draws.
 #[must_use]

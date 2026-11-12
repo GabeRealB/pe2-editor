@@ -3,8 +3,8 @@
 //! read from bytes 4 to 11 - and 112 bytes of 4-bit samples, unit `i`'s `j`th in byte `16 + i / 2 + j * 4`'s low or
 //! high nibble. Each sample is its nibble shifted up by `12 - shift`, plus the filter's prediction from the channel's
 //! two previous samples (`(s1 * f0 + s2 * f1 + 32) >> 6`), clamped to 16 bits. Stereo puts the even units on the left,
-//! the odd on the right; mono plays them in order. The state runs on from sector to sector of a stream. (After
-//! `tools/peassets/xa_codec.py`, which follows `FFmpeg`'s `xa_decode`.)
+//! the odd on the right; mono plays them in order. The state runs on from sector to sector of a stream. (As
+//! `FFmpeg`'s `xa_decode`.)
 
 /// The filters' coefficients, in 1/64.
 const FILTERS: [(i32, i32); 5] = [(0, 0), (60, 0), (115, -52), (98, -55), (122, -60)];

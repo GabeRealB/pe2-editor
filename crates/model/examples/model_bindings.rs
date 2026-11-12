@@ -2,7 +2,7 @@
 //! in it the model is and where it loads), one line of JSON with its slots' placements, its materials, its effect and
 //! whether it reflects. What declarations of a model's materials are made from.
 //!
-//! `cargo run -p pe2-model --example model_bindings -- assets/USA/pe2pkg/m93r.pe2pkg 760 1504 2148652216`
+//! `cargo run -p pe2-model --example model_bindings -- <an inflated package> 760 1504 2148652216`
 
 use pe2_model::model::decode;
 

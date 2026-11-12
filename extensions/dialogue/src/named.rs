@@ -1,4 +1,4 @@
-//! Every byte of a command and of a record by name (`CapCommand`, `CapSequenceRecord`: `packages/gameplay/include/cap.h`).
+//! Every byte of a command and of a record by name, as the game's code reads them (`formats::cap`'s 12-byte slots).
 //! What a command's opcode or a record's type does not read is kept apart, under `unread`, where it differs from what
 //! the game's tool usually left there; zero bytes and false flags are left out, and what the layout implies is not
 //! written at all.

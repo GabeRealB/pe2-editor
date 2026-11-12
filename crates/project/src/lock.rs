@@ -5,7 +5,7 @@
 //!
 //! A process holding the lock passes it to the processes it starts: `PE2_PROJECT_LOCKED` names the project, and a
 //! process finding its project named there works under its parent's lock instead of waiting for it
-//! (`tools/project_lock.py` takes the same lock for the Python tools).
+//! (another program of the project's takes the same lock by the same file and frames, `wire`).
 //!
 //! A project a host holds (`host.rs`) is borrowed from it: the host lets go of the lock when asked, and
 //! takes it back when the borrower lets go - the lease is held with the lock, and ends after it.

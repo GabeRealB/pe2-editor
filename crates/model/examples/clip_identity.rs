@@ -2,7 +2,7 @@
 //! stores them) decoded, written as USD and read back, and encoded again, which has to give its bytes back. A clip's address is its lowest pointer:
 //! its first bank, or its records where it has none.
 //!
-//! `cargo run --release -p pe2-model --example clip_identity -- assets/USA/raw/clip`
+//! `cargo run --release -p pe2-model --example clip_identity -- <a folder of clips>`
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,7 @@ fn address(bytes: &[u8]) -> Option<u32> {
 }
 
 fn main() {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| "assets/USA/raw/clip".to_string());
+    let dir = std::env::args().nth(1).expect("a folder of clips");
     let mut all = Vec::new();
     files(Path::new(&dir), &mut all);
     all.sort();

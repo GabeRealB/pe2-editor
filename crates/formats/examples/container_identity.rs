@@ -1,6 +1,6 @@
 //! Whether `cdf::pack_stage0`, `pack_folder` and `pack_stage` make the discs' stage containers byte for byte.
 //!
-//! `cargo run --release -p formats --example container_identity -- <rom/USA>`
+//! `cargo run --release -p formats --example container_identity -- <the folder of a release's discs>`
 //!
 //! Each container is made again from what it holds as stored - each file's bytes, its stream records, a folder's
 //! stored streams after its files - and compared with the disc's: STAGE0.HED and STAGE0.CDF, and every STAGE<N>.CDF.
@@ -33,7 +33,7 @@ fn places<'a>(files: &[cdf::FileEntry], owned: &'a [(u32, Vec<u8>)]) -> Vec<(u32
 }
 
 fn main() {
-    let roms = std::env::args().nth(1).unwrap_or_else(|| "../rom/USA".into());
+    let roms = std::env::args().nth(1).expect("the folder of a release's discs");
     let mut failed = false;
     for disc in ["disk1", "disk2"] {
         let dir = Path::new(&roms).join(disc);

@@ -9,8 +9,7 @@
 //! cosine table; macroblocks fill the picture column by column. Version 3 codes each DC as a difference from the
 //! previous block's of its channel (Cr, Cb, and the four lumas sharing one), times 4. A frame decodes to its YCbCr
 //! planes - luma at its size, chroma at half - which an export carries and an import compares, and to RGB to show.
-//! BS is lossy; decoding is deterministic. (After `tools/peassets/bs_codec.py`, which follows jPSXdec, and the public
-//! `PlayStation` STR documentation.)
+//! BS is lossy; decoding is deterministic. (As jPSXdec, and the public `PlayStation` STR documentation.)
 
 use std::collections::HashMap;
 use std::fmt;

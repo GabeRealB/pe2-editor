@@ -1,6 +1,6 @@
 //! Whether `lzss::encode` makes the discs' LZSS streams byte for byte.
 //!
-//! `cargo run --release -p formats --example lzss_identity -- <rom/USA>`
+//! `cargo run --release -p formats --example lzss_identity -- <the folder of a release's discs>`
 //!
 //! Every stream of both discs' stage containers - a package chunk's payload, each strip of an image chunk (after its
 //! work table, zero bytes between strips), a palette chunk's payload after its 16-byte header - is taken as stored
@@ -100,7 +100,7 @@ fn streams(roms: &Path) -> Vec<Stream> {
 }
 
 fn main() {
-    let roms = std::env::args().nth(1).unwrap_or_else(|| "../rom/USA".into());
+    let roms = std::env::args().nth(1).expect("the folder of a release's discs");
     let streams = streams(Path::new(&roms));
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let per = streams.len().div_ceil(threads).max(1);

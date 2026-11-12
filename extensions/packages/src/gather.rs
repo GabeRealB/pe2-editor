@@ -151,7 +151,7 @@ struct Gathering<'a> {
 
 /// Every package's name, by its path: what others include it by (`<engine/fs.h>`) and its objects are named by - its folder's name,
 /// after the name of the nearest package whose folder holds it. A package nests in packages, not in folders: `packages/a/aya` and
-/// `packages/b/aya` are both `aya`, and `packages/aya/akropolis` is `aya/akropolis`. (`declarations.py`'s `Declarations.names`.)
+/// `packages/b/aya` are both `aya`, and `packages/aya/akropolis` is `aya/akropolis`.
 fn package_names(paths: &[String]) -> HashMap<String, String> {
     let mut sorted: Vec<&String> = paths.iter().collect();
     sorted.sort();
@@ -276,8 +276,7 @@ fn linked(packages: &HashMap<String, Package>, own: &str) -> (Vec<String>, Vec<S
     (objects, images)
 }
 
-/// The file an include in a file of `owner` names, by the rules both builds hold every package's files to (`declarations.py`'s
-/// `Package.resolved`): in quotes, a file of the same package - of the same public folder, from a public header - or one the build
+/// The file an include in a file of `owner` names, by the rules every build of a package holds its files to: in quotes, a file of the same package - of the same public folder, from a public header - or one the build
 /// makes (`pe2_options.h`); in angle brackets, a public file of a package its declaration names. With whose it is. A file not there is
 /// the compiler's to say: it knows which branch of a conditional is taken.
 fn resolved(

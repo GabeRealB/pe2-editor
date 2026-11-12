@@ -1,4 +1,4 @@
-//! A dialogue's cells and atlas from its text (`doc/CAP_FORMAT.md` §9): glyph cells are numbered from 25 - from
+//! A dialogue's cells and atlas from its text (the page its glyph cells are read from): glyph cells are numbered from 25 - from
 //! `first_glyph` for the other layout tool - in the order the text first uses each character, a speaker plate's cell is
 //! its speaker's number, and the atlas places every item in that first-use order, a plate after the glyphs of the first
 //! line shown with it: left to right, a new 14-texel row where one would pass x = 256.

@@ -1,6 +1,6 @@
 //! Whether the UI fonts' page and glyph tables are made again, byte for byte, from what they are read into.
 //!
-//! `cargo run --release -p pe2-fonts --example ui_identity -- <assets/USA> <rom/USA/disk1/SLUS_010.42>`
+//! `cargo run --release -p pe2-fonts --example ui_identity -- <an extraction's folder> <a release's executable>`
 //!
 //! The page (stage 0 file 20162's font image) and Medium's, Large's and Small's tables (the executable's
 //! `_gFontGlyphs*`) are read into the faces' glyphs and the atlas's layout, made again from them, and compared.

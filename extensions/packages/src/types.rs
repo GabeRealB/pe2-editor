@@ -1,5 +1,5 @@
-//! The types a package registers with the build (`PE2_TYPE`), and the values of options of them, as
-//! `tools/buildsteps/option_types.py` has them: the same rules, the same text.
+//! The types a package registers with the build (`PE2_TYPE`), and the values of options of them: as every build of a
+//! package has them, the same rules and the same text.
 //!
 //! A registered type is an alias of an integer primitive (`typedef s16 Angle;`), or a struct whose fields are integer primitives,
 //! registered types, or fixed arrays of either, one field to a declaration; never a pointer. A primitive is one of core's fixed-size

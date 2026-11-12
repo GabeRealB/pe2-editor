@@ -54,7 +54,7 @@ fn load_address(elf: &[u8]) -> Result<u32> {
 
 /// The executable: its header, every field of which follows from the link or this target - the entry point (the ELF's),
 /// where the image loads and how much of it, padded to whole sectors, the stack, the region's license string - then the
-/// image, padded. `tools/buildsteps/psx_exe.py` writes the same bytes.
+/// image, padded.
 fn exe_header(image: &[u8], elf: &[u8], address: u32, release: &str) -> Result<Vec<u8>> {
     if elf.get(..6) != Some(b"\x7fELF\x01\x01".as_slice()) {
         bail!("the linked image is no 32-bit little-endian ELF");
@@ -76,8 +76,8 @@ fn exe_header(image: &[u8], elf: &[u8], address: u32, release: &str) -> Result<V
     Ok(out)
 }
 
-/// The preprocessor: GCC 14.2.0's `cc1`, which the extension ships for each platform at this path, run without a driver
-/// (`tools/<os>/cpp/README.md`). A package is preprocessed with `-Werror`, so a macro defined twice stops it.
+/// The preprocessor: a modern GCC's `cc1`, which the extension's setup places at this path for each platform, run
+/// without a driver. A package is preprocessed with `-Werror`, so a macro defined twice stops it.
 const PREPROCESSOR: &str = "cpp/libexec/gcc/host/14.2.0/cc1";
 const CPP: [&str; 9] =
     ["-E", "-quiet", "-undef", "-Wall", "-Werror", "-nostdinc", "-D_LANGUAGE_C", "-DUSE_INCLUDE_ASM", "-DVER_USA"];

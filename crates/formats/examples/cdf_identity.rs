@@ -1,6 +1,6 @@
 //! Whether `cdf::pack_chunk` makes the discs' file chunks byte for byte.
 //!
-//! `cargo run --release -p formats --example cdf_identity -- <rom/USA>`
+//! `cargo run --release -p formats --example cdf_identity -- <the folder of a release's discs>`
 //!
 //! Every chunk of both discs' stage containers is made again - an LZSS chunk from what it decodes to (a package's
 //! image, a palette's colors after its 16-byte header, an image's column table and strips), any other from its
@@ -73,7 +73,7 @@ fn payload_of(s: &Stored) -> Vec<u8> {
 }
 
 fn main() {
-    let roms = std::env::args().nth(1).unwrap_or_else(|| "../rom/USA".into());
+    let roms = std::env::args().nth(1).expect("the folder of a release's discs");
     let all = stored(Path::new(&roms));
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let per = all.len().div_ceil(threads).max(1);
