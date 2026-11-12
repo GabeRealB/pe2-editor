@@ -8,8 +8,9 @@
 //! writer's lock. Every value begins with the generation of the commit that put it: what a process keeps of a
 //! value it decoded is told from another by it.
 //!
-//! So far it holds each file's record (`Record`): what the index keeps between runs, where it kept a database of
-//! its own. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
+//! So far it holds each file's record (`Record`) and what each layer holds (`Held`, by layer and path: its
+//! folders, plain files and bundles, as a walk of it finds them): what the index keeps between runs, where it
+//! kept a database of its own and walked every layer as it opened. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
@@ -60,12 +61,15 @@ pub const LINKS: usize = 12;
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
 /// of the files changes.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
-/// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text.
+/// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
+/// with what its listing depends on; something a layer holds.
 const META: u8 = b'm';
 const FILE: u8 = b'f';
 const TEXT: u8 = b't';
+const LAYER: u8 = b'l';
+const HELD: u8 = b's';
 
 /// The longest name a key holds itself: a longer one is in the key as its hash, and in the value whole.
 const NAMED: usize = 700;
@@ -307,6 +311,73 @@ fn text(text: &str) -> Vec<u8> {
     out.0
 }
 
+/// Something a layer holds at a path, as a walk of it finds it: a folder; a plain file, with where it is; a bundle,
+/// with its files by name and where each is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    Folder,
+    File(PathBuf),
+    Bundle(BTreeMap<String, PathBuf>),
+}
+
+/// What the model holds of the layers: each by its name, with what its listing was made by (its place and the
+/// names it leaves out, as the index says them) and what it holds by path.
+pub type Layers = BTreeMap<String, (String, BTreeMap<String, Held>)>;
+
+/// What is known of a project, for an index to open over (`known`): each file's record, and what each layer holds.
+#[derive(Default)]
+pub struct Known {
+    pub files: HashMap<PathBuf, Record>,
+    pub layers: Layers,
+}
+
+/// The name of what a layer holds at a path.
+fn held_name(layer: &str, path: &str) -> String {
+    format!("{layer}\u{0}{path}")
+}
+
+/// Something a layer holds, as the model keeps it under its name.
+fn held(root: &Path, held_name: &str, held: &Held) -> Vec<u8> {
+    let mut out = Out::new();
+    let long = if held_name.len() > NAMED { says::NAMED } else { 0 };
+    match held {
+        Held::Folder => out.u8(long),
+        Held::File(path) => {
+            out.u8(long | 4);
+            out.text(&name(root, path));
+        }
+        Held::Bundle(files) => {
+            out.u8(long | 8);
+            out.u32(u32::try_from(files.len()).unwrap_or(u32::MAX));
+            for (file, path) in files {
+                out.text(file);
+                out.text(&name(root, path));
+            }
+        }
+    }
+    if long != 0 {
+        out.text(held_name);
+    }
+    out.0
+}
+
+/// Something a layer holds read back, with the name it says where its key could not.
+fn held_of(root: &Path, value: &[u8]) -> Option<(Held, Option<String>)> {
+    let mut read = In::after_stamp(value)?;
+    let said = read.u8()?;
+    let held = match said & !says::NAMED {
+        0 => Held::Folder,
+        4 => Held::File(named(root, &read.text()?)?),
+        8 => {
+            let files = (0..read.u32()?).map(|_| Some((read.text()?, named(root, &read.text()?)?))).collect::<Option<_>>()?;
+            Held::Bundle(files)
+        }
+        _ => return None,
+    };
+    let name = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
+    read.0.is_empty().then_some((held, name))
+}
+
 /// What a refresh changes of the model, gathered as it goes and applied whole (`apply`): each key of a tree given
 /// a value, or taken away, in the order it was said.
 #[derive(Clone, Debug, Default)]
@@ -333,6 +404,23 @@ impl Delta {
         self.changes.push((INPUTS, of_record, now.map(|now| record(&name, now))));
         let declared = now.and_then(|now| now.declaration.as_ref());
         self.changes.push((INPUTS, of_text, declared.map(|declared| text(&declared.text))));
+    }
+
+    /// A layer holds this at a path now - or, with none, nothing there any more.
+    pub fn held(&mut self, root: &Path, layer: &str, path: &str, now: Option<&Held>) {
+        let name = held_name(layer, path);
+        self.changes.push((INPUTS, key(HELD, &name), now.map(|now| held(root, &name, now))));
+    }
+
+    /// A layer's listing was made by this (its place and the names it leaves out) - or, with none, the layer is
+    /// no more.
+    pub fn layer(&mut self, layer: &str, made_by: Option<&str>) {
+        let said = made_by.map(|made_by| {
+            let mut out = Out::new();
+            out.text(made_by);
+            out.0
+        });
+        self.changes.push((INPUTS, key(LAYER, layer), said));
     }
 
     /// This, and what a later refresh changed.
@@ -450,20 +538,67 @@ pub fn fill_files<'a>(txn: &mut Txn<'_>, root: &Path, records: impl Iterator<Ite
     Ok(())
 }
 
-/// The records of the project's files as its processes last left them, for an index to open over: what the model
-/// holds, where the shared space holds one; else what a space that was begun anew - a process died, the power
-/// went - kept beside it (`sfs::Space::left_behind`), where that reads whole; else none. Whoever opens over them
-/// holds each to its file.
+/// What the project's processes last left known of it, for an index to open over - the files' records, and what
+/// each layer holds: what the model holds, where the shared space holds one; else what a space that was begun
+/// anew - a process died, the power went - kept beside it (`sfs::Space::left_behind`), where that reads whole;
+/// else nothing. Whoever opens over it holds it to the files.
 #[must_use]
-pub fn known(root: &Path) -> HashMap<PathBuf, Record> {
-    let _span = tracing::info_span!("model: the files' records read").entered();
-    let Ok(space) = crate::shared::space(root) else { return HashMap::new() };
-    let held = space.read().and_then(|read| is_begun(&read)?.then(|| files(&read, root)).transpose());
-    if let Ok(Some(held)) = held {
+pub fn known(root: &Path) -> Known {
+    let _span = tracing::info_span!("model: what is known of the files read").entered();
+    let all = |pages: &dyn Fn() -> Result<Option<Known>>| pages().ok().flatten();
+    let Ok(space) = crate::shared::space(root) else { return Known::default() };
+    let held = all(&|| {
+        let read = space.read()?;
+        is_begun(&read)?.then(|| Ok(Known { files: files(&read, root)?, layers: layers(&read, root)? })).transpose()
+    });
+    if let Some(held) = held {
         return held;
     }
     let left = sfs::Space::left_behind(&crate::shared::space_at(root)).ok().flatten();
-    left.and_then(|left| files(&left.read().ok()?, root).ok()).unwrap_or_default()
+    let left = left.and_then(|left| {
+        all(&|| {
+            let read = left.read()?;
+            is_begun(&read)?.then(|| Ok(Known { files: files(&read, root)?, layers: layers(&read, root)? })).transpose()
+        })
+    });
+    left.unwrap_or_default()
+}
+
+/// What the model holds of the layers: each with what its listing was made by, and what it holds.
+///
+/// # Errors
+/// The space is damaged, or holds what is none of that.
+pub fn layers(pages: &impl Pages, root: &Path) -> Result<Layers> {
+    let mut layers = Layers::new();
+    if !is_begun(pages)? {
+        return Ok(layers);
+    }
+    let mut failed = None;
+    sfs::tree::scan_prefix(pages, INPUTS, &[LAYER], &mut |key, value| {
+        let read = std::str::from_utf8(&key[1..]).ok().zip(In::after_stamp(value).and_then(|mut said| said.text()));
+        match read {
+            Some((layer, made_by)) => drop(layers.insert(layer.to_owned(), (made_by, BTreeMap::new()))),
+            None => failed = Some(invalid("a layer that is none")),
+        }
+        failed.is_none()
+    })?;
+    sfs::tree::scan_prefix(pages, INPUTS, &[HELD], &mut |key, value| {
+        let read = held_of(root, value).and_then(|(held, long)| {
+            let name = match long {
+                Some(name) => name,
+                None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
+            };
+            let (layer, path) = name.split_once('\u{0}')?;
+            Some((layer.to_owned(), path.to_owned(), held))
+        });
+        match read {
+            // What is held by a layer the model does not name is nothing it holds.
+            Some((layer, path, held)) => drop(layers.get_mut(&layer).map(|(_, holds)| holds.insert(path, held))),
+            None => failed = Some(invalid("what a layer holds that is none of it")),
+        }
+        failed.is_none()
+    })?;
+    failed.map_or(Ok(layers), Err)
 }
 
 /// Say in the model what an index just opened read: what differs from what it opened over (`Index::take_opened`)
@@ -480,6 +615,7 @@ pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()>
         opened.apply(&mut txn)?;
     } else {
         fill_files(&mut txn, root, index.file_records())?;
+        index.layers_held(root).apply(&mut txn)?;
     }
     txn.commit()?;
     // What a space begun anew kept beside it is no longer what is known of the files.
@@ -584,6 +720,65 @@ mod tests {
         files
     }
 
+    /// What two layers hold, as a walk of them finds it: folders, plain files, bundles - one of a name no key holds.
+    fn held_by(root: &Path) -> Layers {
+        let game = root.join(".layers/game");
+        let bundle = |n: u64| -> BTreeMap<String, PathBuf> {
+            let folder = game.join(format!("rooms/r{n}.node"));
+            (0..=n % 3).map(|f| (format!("file{f}.bin"), folder.join(format!("file{f}.bin")))).collect()
+        };
+        let mut holds: BTreeMap<String, Held> = (0..200u64).map(|n| (format!("rooms/r{n}.node"), Held::Bundle(bundle(n)))).collect();
+        holds.insert("rooms".into(), Held::Folder);
+        holds.insert("rooms/notes.txt".into(), Held::File(game.join("rooms/notes.txt")));
+        holds.insert(format!("deep/{}", "long/".repeat(200)), Held::Folder);
+        let code: BTreeMap<String, Held> = [("src".to_string(), Held::Folder), ("src/a.c".to_string(), Held::File(PathBuf::from("/elsewhere/src/a.c")))].into();
+        [("game".to_string(), ("made by this".to_string(), holds)), ("code".to_string(), ("and that".to_string(), code))].into()
+    }
+
+    /// What `held_by` holds, said as a change of the model.
+    fn holds(root: &Path) -> Delta {
+        let mut delta = Delta::default();
+        for (layer, (made_by, holds)) in held_by(root) {
+            delta.layer(&layer, Some(&made_by));
+            for (path, held) in &holds {
+                delta.held(root, &layer, path, Some(held));
+            }
+        }
+        delta
+    }
+
+    #[test]
+    fn what_the_model_holds_of_layers_is_what_was_said_of_them() {
+        let root = Path::new("/a project");
+        let space = sfs::Space::private().unwrap();
+        let mut txn = space.write().unwrap();
+        fill_files(&mut txn, root, std::iter::empty()).unwrap();
+        holds(root).apply(&mut txn).unwrap();
+        txn.commit().unwrap();
+        let mut now = held_by(root);
+        assert_eq!(layers(&space.read().unwrap(), root).unwrap(), now);
+        // A bundle's files change, a folder goes, a layer's listing is made by something else, and a layer is no more.
+        let mut delta = Delta::default();
+        let changed = Held::Bundle([("only.bin".to_string(), root.join(".layers/game/rooms/r7.node/only.bin"))].into());
+        delta.held(root, "game", "rooms/r7.node", Some(&changed));
+        delta.held(root, "game", &format!("deep/{}", "long/".repeat(200)), None);
+        delta.layer("game", Some("made by another"));
+        delta.held(root, "code", "src", None);
+        delta.held(root, "code", "src/a.c", None);
+        delta.layer("code", None);
+        let mut txn = space.write().unwrap();
+        delta.apply(&mut txn).unwrap();
+        txn.commit().unwrap();
+        now.remove("code");
+        let game = now.get_mut("game").unwrap();
+        game.0 = "made by another".into();
+        game.1.insert("rooms/r7.node".into(), changed);
+        game.1.remove(&format!("deep/{}", "long/".repeat(200)));
+        assert_eq!(layers(&space.read().unwrap(), root).unwrap(), now);
+        // And the files' records are apart from all of it.
+        assert!(files(&space.read().unwrap(), root).unwrap().is_empty());
+    }
+
     #[test]
     fn what_the_model_holds_of_files_is_what_it_was_given_and_what_changed_of_it() {
         let root = Path::new("/a project");
@@ -667,8 +862,24 @@ mod tests {
         let read = unread(index.file_records().map(|(path, record)| (path.to_path_buf(), record.clone())).collect());
         let differing: Vec<_> = held.keys().chain(read.keys()).filter(|path| held.get(*path) != read.get(*path)).collect();
         assert!(differing.is_empty(), "{} of {} files differ: {:#?}", differing.len(), read.len(), &differing[..differing.len().min(10)]);
+        // And of every layer what a walk of it finds.
+        let (held_by, walked) = (layers(&space.read().unwrap(), &project.root).unwrap(), index.layers_known());
+        for (layer, (made_by, holds)) in &walked {
+            let (was_made_by, held) = held_by.get(layer).unwrap_or_else(|| panic!("the model knows nothing of the layer {layer}"));
+            assert_eq!(was_made_by, made_by, "{layer}: what its listing was made by");
+            let differing: Vec<_> = held.keys().chain(holds.keys()).filter(|path| held.get(*path) != holds.get(*path)).collect();
+            assert!(differing.is_empty(), "{layer}: {} paths differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+        }
+        assert_eq!(held_by.len(), walked.len());
+        let holds: usize = walked.values().map(|(_, holds)| holds.len()).sum();
         let usage = space.usage().unwrap();
-        eprintln!("{} files, the same in the model as read afresh; the space holds {} pages, {} of them free", read.len(), usage.pages, usage.free);
+        eprintln!(
+            "{} files and what {} layers hold at {holds} paths, the same in the model as read afresh; the space holds {} pages, {} of them free",
+            read.len(),
+            walked.len(),
+            usage.pages,
+            usage.free
+        );
     }
 
     #[test]
@@ -715,10 +926,13 @@ mod tests {
             let space = sfs::Space::open(&at).unwrap();
             let mut txn = space.write().unwrap();
             fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+            holds(&root).apply(&mut txn).unwrap();
             txn.commit().unwrap();
         }
         // Who attaches next finds the space begun anew - and what it held beside it, read whole.
-        assert_eq!(known(&root), now);
+        let left = known(&root);
+        assert_eq!(left.files, now);
+        assert_eq!(left.layers, held_by(&root));
         let space = crate::shared::space(&root).unwrap();
         assert!(space.fresh() && at.join("left").is_dir());
         assert!(files(&space.read().unwrap(), &root).unwrap().is_empty());
@@ -727,7 +941,9 @@ mod tests {
         fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
         txn.commit().unwrap();
         sfs::Space::forget_left(&at);
-        assert_eq!(known(&root), now);
+        let said = known(&root);
+        assert_eq!(said.files, now);
+        assert!(said.layers.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

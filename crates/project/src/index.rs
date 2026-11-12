@@ -664,6 +664,13 @@ struct Place {
 }
 
 impl Place {
+    /// What a listing of the layer depends on besides what is on disk: where it is, where it appears, whether it
+    /// holds assets, and the names it leaves out. A listing kept is one of the layer as it is where this is the
+    /// same.
+    fn made_by(&self) -> String {
+        format!("{}\n{}\n{}\n{}", self.root.display(), self.at, self.assets, self.ignore.join("\n"))
+    }
+
     /// A resolved path's place on disk.
     fn disk(&self, path: &str) -> PathBuf {
         if self.at.is_empty() {
@@ -780,6 +787,75 @@ impl Scan {
                 self.files.insert(child, path);
             }
         }
+    }
+
+    /// What it holds, by path, as the project's model keeps it.
+    fn held(&self) -> BTreeMap<String, crate::model::Held> {
+        use crate::model::Held;
+        let bundles = self.bundles.iter().map(|(path, files)| (path.clone(), Held::Bundle(files.clone())));
+        let folders = self.folders.iter().map(|path| (path.clone(), Held::Folder));
+        let files = self.files.iter().map(|(path, file)| (path.clone(), Held::File(file.clone())));
+        bundles.chain(folders).chain(files).collect()
+    }
+
+    /// What the project's model keeps of a layer, as a scan of it.
+    fn of_held(held: BTreeMap<String, crate::model::Held>) -> Scan {
+        use crate::model::Held;
+        let mut scan = Scan::default();
+        for (path, held) in held {
+            match held {
+                Held::Folder => drop(scan.folders.insert(path)),
+                Held::File(file) => drop(scan.files.insert(path, file)),
+                Held::Bundle(files) => drop(scan.bundles.insert(path, files)),
+            }
+        }
+        scan
+    }
+
+    /// What differs between what a layer held and what it holds now, said of the project's model.
+    fn differs(before: &Scan, now: &Scan, root: &Path, layer: &str, model: &mut crate::model::Delta) {
+        let (before, now) = (before.held(), now.held());
+        for path in before.keys().filter(|path| !now.contains_key(*path)) {
+            model.held(root, layer, path, None);
+        }
+        for (path, held) in now.iter().filter(|(path, held)| before.get(*path) != Some(held)) {
+            model.held(root, layer, path, Some(held));
+        }
+    }
+
+    /// The places on disk where it differs from another scan of the same layer: what is at a path in one and not
+    /// the other, or otherwise in each.
+    fn differing(&self, other: &Scan, place: &Place) -> Vec<PathBuf> {
+        let (mine, theirs) = (self.held(), other.held());
+        let paths = mine.keys().chain(theirs.keys()).filter(|path| mine.get(*path) != theirs.get(*path));
+        paths.map(|path| place.disk(path)).collect()
+    }
+
+    /// Bring the folders above a path to what the layer has there now, as a walk of all of it would find them:
+    /// each there where it is a folder the layer does not leave out, and not where it is none - what scanning a
+    /// path again leaves be, which the first thing put in a folder, and the last taken out of one that goes with
+    /// it, change. Those that came or went, with whether they are there.
+    fn folders_above(&mut self, place: &Place, rel: &str) -> Vec<(String, bool)> {
+        let mut changed = Vec::new();
+        let mut above = rel;
+        while let Some((folder, _)) = above.rsplit_once('/') {
+            above = folder;
+            if folder == place.at {
+                break;
+            }
+            let name = folder.rsplit('/').next().unwrap_or(folder);
+            let there = !name.starts_with('.') && !place.ignores(folder) && crate::pack::is_dir(&place.disk(folder));
+            let was = self.folders.contains(folder);
+            if there && !was {
+                self.folders.insert(folder.to_string());
+            } else if !there && was {
+                self.folders.remove(folder);
+            }
+            if there != was {
+                changed.push((folder.to_string(), there));
+            }
+        }
+        changed
     }
 
     fn kind(&self, path: &str) -> Option<Kind> {
@@ -906,7 +982,10 @@ struct LayerState {
 }
 
 impl LayerState {
-    fn new(layer: &Layer) -> Result<LayerState> {
+    /// A layer as the project has it. What it holds is as `known` says - what the project's model kept of it -
+    /// where that is to be `taken` so and was made by the same place and names left out; else as a walk of it
+    /// finds it now, and what was known is given back with it, to tell what differs.
+    fn new(layer: &Layer, known: Option<(String, Scan)>, taken: bool) -> Result<(LayerState, Option<Scan>)> {
         let records = crate::records::is_records(&layer.path);
         let changeset = LayerState::changeset_of(layer)?;
         let tree_ignore = if layer.mounted { tree_ignores(&layer.path) } else { vec![] };
@@ -914,9 +993,15 @@ impl LayerState {
         ignore.extend(tree_ignore.iter().cloned());
         let assets = layer.kind != LayerKind::Files;
         let place = Place { root: layer.path.clone(), at: layer.at.clone(), ignore, assets };
-        let mut scan = Scan::default();
-        scan.rescan(&place, "");
-        Ok(LayerState {
+        let (scan, walked) = match known {
+            Some((made_by, scan)) if taken && made_by == place.made_by() => (scan, None),
+            known => {
+                let mut scan = Scan::default();
+                scan.rescan(&place, "");
+                (scan, Some(known.map_or_default(|(_, was)| was)))
+            }
+        };
+        let state = LayerState {
             name: layer.name.clone(),
             kind: layer.kind,
             place,
@@ -935,7 +1020,8 @@ impl LayerState {
             },
             fills: layer.fills.clone(),
             scan: Arc::new(scan),
-        })
+        };
+        Ok((state, walked))
     }
 
     /// A layer's changeset: as its file says, or, for a records layer, as its records say (`records::Set::changeset`).
@@ -1228,7 +1314,7 @@ impl Index {
     /// # Errors
     /// A layer cannot be read.
     pub fn without_store(project: &Project) -> Result<Index> {
-        Index::over(HashMap::new(), true, project, &|_, _, _| {})
+        Index::over(crate::model::Known::default(), true, project, &|_, _, _| {})
     }
 
     /// The record of every file the layers hold, as it was last read: what the model the project's processes share
@@ -1236,6 +1322,24 @@ impl Index {
     pub fn file_records(&self) -> impl Iterator<Item = (&Path, &Record)> {
         let files = self.layers.iter().flat_map(|layer| layer.scan.all_files());
         files.filter_map(|file| Some((file.as_path(), &**self.records.get(file)?)))
+    }
+
+    /// All the layers hold, and what each one's listing was made by, as a change of the project's model: said
+    /// where the model holds nothing yet (`model::took`).
+    #[must_use]
+    pub fn layers_held(&self, root: &Path) -> crate::model::Delta {
+        let mut model = crate::model::Delta::default();
+        for layer in &self.layers {
+            model.layer(&layer.name, Some(&layer.place.made_by()));
+            Scan::differs(&Scan::default(), &layer.scan, root, &layer.name, &mut model);
+        }
+        model
+    }
+
+    /// What the layers hold, as the project's model keeps it: what the model is held to.
+    #[must_use]
+    pub fn layers_known(&self) -> crate::model::Layers {
+        self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect()
     }
 
     /// What its opening read that differs from what it opened over, taken out: said in the project's model by
@@ -1250,7 +1354,18 @@ impl Index {
     pub fn verification(&self) -> impl FnOnce() -> Vec<PathBuf> + Send + 'static {
         let records = self.records.clone();
         let files: Vec<PathBuf> = self.layers.iter().flat_map(|layer| layer.scan.all_files().cloned()).collect();
+        let layers: Vec<(Place, Arc<Scan>)> = self.layers.iter().map(|layer| (layer.place.clone(), layer.scan.clone())).collect();
         move || {
+            // What each layer holds, walked now, against what was taken as known of it: where they differ.
+            let mut walked = {
+                let _span = tracing::info_span!("index: the layers held to what was known of them").entered();
+                let differing = layers.iter().flat_map(|(place, known)| {
+                    let mut now = Scan::default();
+                    now.rescan(place, "");
+                    now.differing(known, place)
+                });
+                differing.collect::<Vec<PathBuf>>()
+            };
             let _span = tracing::info_span!("index: the files held to their records").entered();
             let stale = files.iter().zip(stat_all(&files)).filter(|(file, (size, modified))| match (size, records.get(*file)) {
                 (Some(size), Some(record)) => !(record.size == *size && record.modified == *modified && *modified < record.recorded),
@@ -1258,6 +1373,7 @@ impl Index {
                 _ => true,
             });
             let mut stale: Vec<PathBuf> = stale.map(|(file, _)| file.clone()).collect();
+            stale.append(&mut walked);
             stale.sort();
             stale.dedup();
             stale
@@ -1270,21 +1386,44 @@ impl Index {
     /// # Errors
     /// A layer cannot be read.
     pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let known = self.records.iter().map(|(file, record)| (file.clone(), (**record).clone())).collect();
-        let mut index = Index::over(known, true, project, report)?;
+        let files = self.records.iter().map(|(file, record)| (file.clone(), (**record).clone())).collect();
+        let layers = self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect();
+        let mut index = Index::over(crate::model::Known { files, layers }, true, project, report)?;
         index.set_working(self.working.as_ref().clone());
         Ok(index)
     }
 
     /// Over what is `known` of the files: each held to its file where `held`, else taken as it is.
-    fn over(mut known: HashMap<PathBuf, Record>, held: bool, project: &Project, report: &Report<'_>) -> Result<Index> {
+    #[expect(clippy::too_many_lines, reason = "the index's fields, one line each")]
+    fn over(known: crate::model::Known, held: bool, project: &Project, report: &Report<'_>) -> Result<Index> {
+        let crate::model::Known { files: mut known, layers: mut known_layers } = known;
         // Its records layers, placed through the stack: what their scans and changesets are read from.
         crate::records::Set::open(project)?;
         let mut layers = Vec::new();
+        // What differs of the project's model from what was known, for whoever holds the project to say there.
+        let mut opened = crate::model::Delta::default();
         for (i, layer) in project.layers.iter().enumerate() {
             report(&format!("Scanning {}", layer.name), i, project.layers.len());
             let _span = tracing::info_span!("layer scan").entered();
-            layers.push(LayerState::new(layer)?);
+            let was = known_layers.remove(&layer.name).map(|(made_by, holds)| (made_by, Scan::of_held(holds)));
+            let was_made_by = was.as_ref().map(|(made_by, _)| made_by.clone());
+            // Held to the layer, it is walked whatever is known of it; else what is known is what it holds.
+            let (state, walked) = LayerState::new(layer, was, !held)?;
+            let made_by = state.place.made_by();
+            if was_made_by.as_deref() != Some(made_by.as_str()) {
+                opened.layer(&layer.name, Some(&made_by));
+            }
+            if let Some(before) = walked {
+                Scan::differs(&before, &state.scan, &project.root, &layer.name, &mut opened);
+            }
+            layers.push(state);
+        }
+        // What was known of layers the project has no more.
+        for (layer, (_, holds)) in known_layers {
+            for path in holds.keys() {
+                opened.held(&project.root, &layer, path, None);
+            }
+            opened.layer(&layer, None);
         }
         let mut index = Index {
             assets: Arc::default(),
@@ -1308,7 +1447,7 @@ impl Index {
             records: Arc::default(),
             merged: project.root.join(crate::cache::DIR).join("merged"),
             objects: crate::chunks::Store::at(&project.root),
-            opened: crate::model::Delta::default(),
+            opened,
             resolved: Arc::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -1690,6 +1829,12 @@ impl Index {
             let before = layer.scan.under(at);
             Arc::make_mut(&mut layer.scan).rescan(&layer.place, at);
             let after = layer.scan.under(at);
+            Scan::differs(&before, &after, &project.root, &layer.name, &mut refreshed.model);
+            // And the folders above it, which what came or went there may have made or taken away.
+            for (folder, there) in Arc::make_mut(&mut layer.scan).folders_above(&layer.place, at) {
+                refreshed.model.held(&project.root, &layer.name, &folder, there.then_some(&crate::model::Held::Folder));
+                paths_same = false;
+            }
             paths_same &= before.same_paths(&after);
             let now: HashSet<&PathBuf> = after.all_files().collect();
             for file in before.all_files().filter(|f| !now.contains(f)) {
