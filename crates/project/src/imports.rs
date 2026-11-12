@@ -219,8 +219,10 @@ impl Imports {
     /// removed by the next full attach.
     pub fn attach_changed(&self, index: &mut Index, extensions: &Extensions, changed: &BTreeSet<String>) -> Attached {
         let mut changed = changed.clone();
+        let depending = tracing::info_span!("attach: what depends on what changed").entered();
         changed.extend(extensions.dependents(index, &changed));
         changed.extend(self.readers(index, &changed));
+        drop(depending);
         // What failed may have failed for what another made, which it did not get to say it read: it is tried again.
         let failed = index.problems.iter().filter_map(|p| match p {
             Problem::Import { asset, .. } => Some(asset.clone()),
@@ -262,9 +264,9 @@ impl Imports {
         let mut attached = Attached::default();
         let of = |path: &str| only.is_none_or(|o| o.contains(path));
         // What the project defines, for the stacks laying it in.
-        let defined = extensions.take_definitions(index);
+        let defined = tracing::info_span!("attach: definitions taken").in_scope(|| extensions.take_definitions(index));
         // What earlier imports made goes first: an asset may import otherwise now, or not at all.
-        forget_imports(index, &of);
+        tracing::info_span!("attach: earlier imports forgotten").in_scope(|| forget_imports(index, &of));
         let engine = self.engine(extensions);
         let mut known = self.known.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let assets: Vec<&Asset> = match only {
@@ -277,9 +279,11 @@ impl Imports {
         let reach = graph::exec::Reach { engine: &engine, world: &world };
         // Each asset's by itself, at the same time, as all of it only reads.
         let held = &*known;
-        let looked =
-            crate::parallel(&assets, |asset| (!self.stopping()).then(|| self.look(asset, extensions, reach, held)));
-        let mut made = self.make(&world, &assets, &looked, extensions, reach, report);
+        let looked = tracing::info_span!("attach: each asset looked at").in_scope(|| {
+            crate::parallel(&assets, |asset| (!self.stopping()).then(|| self.look(asset, extensions, reach, held)))
+        });
+        let mut made =
+            tracing::info_span!("attach: imports made").in_scope(|| self.make(&world, &assets, &looked, extensions, reach, report));
         let mut found: Vec<(String, String, Arc<Known>)> = Vec::new();
         let mut stacks: Vec<Problem> = Vec::new();
         let mut new: Vec<(String, (Reads, Arc<Known>))> = Vec::new();
@@ -343,8 +347,8 @@ impl Imports {
             .map(|(asset, error)| Problem::Import { asset: asset.clone(), error: error.clone() })
             .collect();
         problems.extend(stacks);
-        problems.extend(self.give(index, found));
-        problems.extend(self.missing_outputs(index, extensions, only));
+        problems.extend(tracing::info_span!("attach: given to the assets").in_scope(|| self.give(index, found)));
+        problems.extend(tracing::info_span!("attach: outputs referred to looked for").in_scope(|| self.missing_outputs(index, extensions, only)));
         problems.extend(extension_problems(extensions));
         index.problems.retain(|p| match p {
             Problem::Import { asset, .. }

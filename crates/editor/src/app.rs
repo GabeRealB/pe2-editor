@@ -492,11 +492,12 @@ impl Editor {
         let Some(ws) = &mut self.workspace else { return };
         // The config in use, as what events set off reads it, and what is made reads it.
         ws.set_config(active_config(&self.settings, &ws.project));
-        ws.watch(ctx);
+        tracing::info_span!("window thread: the watch and the plans looked at").in_scope(|| ws.watch(ctx));
         ws.answer_agents();
         let focused = ctx.input(|i| i.focused);
         let live = self.settings.changes.take_in == crate::settings::TakeIn::AsTheyHappen;
-        match ws.update(focused, live) {
+        let updated = tracing::info_span!("window thread: what changed followed").in_scope(|| ws.update(focused, live));
+        match updated {
             Update::Nothing => {}
             Update::Refreshed(n) => {
                 self.message = Some(format!("{n} asset{} changed on disk", if n == 1 { "" } else { "s" }));

@@ -25,6 +25,8 @@ pub struct Sample {
     pub frames_per_second: u32,
     /// What a frame took on the window's thread, its copy to the screen included, the wait for the display not.
     pub frame_ms: f32,
+    /// The longest a frame took in the last ten seconds: what a stutter is.
+    pub longest_frame_ms: f32,
     /// Of one core, this process: 100 is one core's whole time.
     pub cpu_percent: Option<f32>,
     /// Of all of them, the machine.
@@ -46,6 +48,8 @@ pub struct Sample {
 struct Shared {
     frames: AtomicU64,
     busy_micros: AtomicU64,
+    /// The longest frame since the last sample, in microseconds.
+    longest_micros: AtomicU64,
     /// Whether the GPU is worth asking about: the overlay on.
     shown: AtomicBool,
     /// The adapter drawing's PCI vendor: which of a machine's GPUs to read.
@@ -60,6 +64,7 @@ fn shared() -> &'static Arc<Shared> {
         let shared = Arc::new(Shared {
             frames: AtomicU64::new(0),
             busy_micros: AtomicU64::new(0),
+            longest_micros: AtomicU64::new(0),
             shown: AtomicBool::new(false),
             vendor: AtomicU32::new(0),
             asked: Mutex::new(None),
@@ -79,7 +84,9 @@ pub fn frame(seconds: Option<f32>, pixels: [u32; 2]) {
     let shared = shared();
     shared.frames.fetch_add(1, Ordering::Relaxed);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "microseconds of a frame")]
-    shared.busy_micros.fetch_add((seconds.unwrap_or(0.0) * 1e6) as u64, Ordering::Relaxed);
+    let micros = (seconds.unwrap_or(0.0) * 1e6) as u64;
+    shared.busy_micros.fetch_add(micros, Ordering::Relaxed);
+    shared.longest_micros.fetch_max(micros, Ordering::Relaxed);
     shared.sample.lock().unwrap_or_else(PoisonError::into_inner).window = Some(pixels);
 }
 
@@ -107,7 +114,9 @@ pub fn read() -> serde_json::Value {
 fn spans() -> serde_json::Value {
     let millis = |d: Duration| (d.as_secs_f64() * 1e4).round() / 10.0;
     let totals = project::profile::totals();
-    let rows = totals.iter().take(SPANS).map(|t| {
+    // The costliest, and whatever the window's thread does of the project's work, however little it cost.
+    let shown = totals.iter().enumerate().filter(|(i, t)| *i < SPANS || t.name.starts_with("window thread:") || t.name == "frame");
+    let rows = shown.map(|(_, t)| {
         let mean = t.total.as_secs_f64() / f64::from(u32::try_from(t.count.max(1)).unwrap_or(u32::MAX));
         serde_json::json!({
             "span": t.name,
@@ -127,12 +136,18 @@ fn sample_forever(shared: &Shared) {
     let mut gpu = crate::gpu_stats::Gpu::new();
     let mut gpu_at: Option<Instant> = None;
     let mut last = Instant::now();
+    let mut longest = std::collections::VecDeque::new();
     loop {
         std::thread::sleep(SECOND);
         let elapsed = last.elapsed().as_secs_f32();
         last = Instant::now();
         let frames = shared.frames.swap(0, Ordering::Relaxed);
         let busy = shared.busy_micros.swap(0, Ordering::Relaxed);
+        // The longest of each of the last ten seconds.
+        longest.push_back(shared.longest_micros.swap(0, Ordering::Relaxed));
+        if longest.len() > 10 {
+            longest.pop_front();
+        }
         if let Some(system) = &mut system {
             system.refresh_cpu_usage();
             if let Some(own) = own {
@@ -158,6 +173,7 @@ fn sample_forever(shared: &Shared) {
         )]
         {
             sample.frames_per_second = (frames as f32 / elapsed).round() as u32;
+            sample.longest_frame_ms = longest.iter().copied().max().unwrap_or(0) as f32 / 1000.0;
             sample.frame_ms = if frames == 0 { 0.0 } else { busy as f32 / frames as f32 / 1000.0 };
             sample.memory_mib = process.map(|process| process.memory() as f32 / (1024.0 * 1024.0));
         }

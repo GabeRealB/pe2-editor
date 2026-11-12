@@ -1225,6 +1225,7 @@ impl Workspace {
     pub fn answer_agents(&mut self) {
         let Some(requests) = &self.requests else { return };
         let arrived: Vec<_> = requests.try_iter().collect();
+        let _span = (!arrived.is_empty()).then(|| tracing::info_span!("window thread: agents answered").entered());
         for (request, reply) in arrived {
             if let mcp::Request::Signal { events, config } = &request {
                 let config =
@@ -1296,6 +1297,7 @@ impl Workspace {
         // The project's extensions, and where they are kept to be added, looked at each second: none is in the index.
         if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
             self.extensions_checked = std::time::Instant::now();
+            let _span = tracing::info_span!("window thread: extensions looked for").entered();
             let found = extensions::found(&self.project);
             if found != self.extensions_found {
                 // Asked once: what it is taken for is what was found then, read again or not.
@@ -1476,7 +1478,8 @@ impl Workspace {
             }
         }
         // The documents follow the disk under them: stale where it changed, saved where it is their working copy.
-        if self.history.reconcile(&self.index) {
+        let reconciled = tracing::info_span!("window thread: documents held to the disk").in_scope(|| self.history.reconcile(&self.index));
+        if reconciled {
             self.send_working();
         }
         if let Some((ticket, path)) = self.selection_after.take() {
@@ -1535,6 +1538,7 @@ impl Workspace {
     /// # Errors
     /// Nothing to undo or redo, files changed outside the editor (unless forced), or a file not written.
     pub fn step(&mut self, redo: bool, force: bool, scope: Option<&str>) -> Result<String, StepError> {
+        let _span = tracing::info_span!("window thread: a step undone or made again").entered();
         if let Some(why) = self.read_only() {
             return Err(StepError::Io(anyhow::anyhow!(why)));
         }
@@ -1985,6 +1989,7 @@ impl Workspace {
     }
 
     pub fn save(&mut self, uid: &str) -> anyhow::Result<String> {
+        let _span = tracing::info_span!("window thread: a document saved").entered();
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
         }
@@ -2060,6 +2065,7 @@ impl Workspace {
     /// The active layer cannot be written, the edit does not apply, or files cannot be written.
     pub fn edit(&mut self, request: &EditRequest) -> anyhow::Result<String> {
         use project::edit;
+        let _span = tracing::info_span!("window thread: an edit made").entered();
         if let Some(why) = self.read_only() {
             anyhow::bail!(why);
         }

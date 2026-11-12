@@ -106,6 +106,28 @@ enum Asked {
     Remove { number: u64, said: Option<u64> },
 }
 
+impl State {
+    /// Something is said due, now.
+    fn ask(&mut self, due: u64, asked: Asked) {
+        self.asked.insert(due, asked);
+        self.asked_at.insert(due, Instant::now());
+    }
+
+    /// What was said due under a number is answered: how long that took is kept.
+    fn answered(&mut self, due: u64) -> Option<Asked> {
+        if let Some(at) = self.asked_at.remove(&due) {
+            self.waited.push(u32::try_from(at.elapsed().as_micros()).unwrap_or(u32::MAX));
+        }
+        self.asked.remove(&due)
+    }
+
+    /// What was said due under a number is due no more, with no answer to it.
+    fn asked_no_more(&mut self, due: u64) -> Option<Asked> {
+        self.asked_at.remove(&due);
+        self.asked.remove(&due)
+    }
+}
+
 impl Asked {
     fn said(&self) -> Option<u64> {
         match self {
@@ -129,6 +151,10 @@ struct State {
     removals: HashMap<u64, u64>,
     /// What was said due and not answered yet, by the number it is due by: in the order it was said.
     asked: BTreeMap<u64, Asked>,
+    /// When each of those was said due, and how long each one answered waited for it, in microseconds: what the
+    /// project's taking of what programs do costs them, said as serving ends.
+    asked_at: HashMap<u64, Instant>,
+    waited: Vec<u32>,
     /// When whoever holds the project is asked to look again, after nobody took what is due; and whether that was
     /// said.
     again: Option<Instant>,
@@ -519,7 +545,7 @@ impl Writes {
                 if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content)) {
                     staged.dirty = reading(&content).changes() != given.changes;
                 }
-                state.asked.insert(due, Asked::Write { number, content, given });
+                state.ask(due, Asked::Write { number, content, given });
             }
         }
         let behind: Vec<(u64, Arc<RwLock<sfs::Content>>)> = {
@@ -797,7 +823,7 @@ impl Writes {
         fs::remove(&mut txn, SERVED, number, SERVER)?;
         txn.commit()?;
         if let Some(due) = due {
-            state.asked.insert(due, Asked::Remove { number, said });
+            state.ask(due, Asked::Remove { number, said });
             self.wake_now();
         }
         Ok(())
@@ -1045,7 +1071,7 @@ impl Writes {
         let number = Self::make_in(&mut txn, path, true, 0)?;
         let due = crate::due::put_in(&mut txn, &Op::Folder { path: path.to_string() }, None)?;
         txn.commit()?;
-        self.lock().asked.insert(due, Asked::Folder { number, said });
+        self.lock().ask(due, Asked::Folder { number, said });
         self.wake_now();
         Ok(())
     }
@@ -1172,7 +1198,7 @@ impl Writes {
         txn.commit()?;
         self.0.served.moved_there(from, to, node.folder, replaced);
         let mut state = self.lock();
-        state.asked.insert(due, Asked::Rename { number, from: from.to_string(), to: to.to_string(), said, moved });
+        state.ask(due, Asked::Rename { number, from: from.to_string(), to: to.to_string(), said, moved });
         // What was written to it and is not the project's yet goes on to its new name.
         if state.staged.get(&number).is_some_and(|staged| staged.dirty) && !state.open(number) {
             state.new.insert(number, Instant::now());
@@ -1394,13 +1420,13 @@ impl Writes {
                 staged.dirty = reading(&content).changes() != given.changes;
                 staged.asked = Some(due);
             }
-            state.asked.insert(due, Asked::Write { number, content, given });
+            state.ask(due, Asked::Write { number, content, given });
         }
         for ((_, number), due) in removed.into_iter().zip(removals_due) {
             let Some(due) = due else { continue };
             state.removed.insert(number, None);
             let said = state.removals.remove(&number);
-            state.asked.insert(due, Asked::Remove { number, said });
+            state.ask(due, Asked::Remove { number, said });
         }
     }
 
@@ -1454,7 +1480,7 @@ impl Writes {
         let mut answered = 0;
         for (due, answer) in numbers.into_iter().zip(became) {
             let Some(answer) = answer else { continue };
-            let Some(asked) = self.lock().asked.remove(&due) else { continue };
+            let Some(asked) = self.lock().answered(due) else { continue };
             answered += 1;
             self.became_of(due, asked, answer);
         }
@@ -1664,7 +1690,10 @@ impl Writes {
         if let Ok(became) = crate::due::settle(&self.0.space, &numbers, true) {
             for (due, answer) in numbers.into_iter().zip(became) {
                 // Taken back, or answered: either way it is asked no more.
-                let asked = self.lock().asked.remove(&due);
+                let asked = match answer {
+                    Some(_) => self.lock().answered(due),
+                    None => self.lock().asked_no_more(due),
+                };
                 if let (Some(answer), Some(asked)) = (answer, asked) {
                     self.became_of(due, asked, answer);
                 }
@@ -1692,6 +1721,9 @@ impl Writes {
         // Ended with nothing in transit that is not its owner's now: what the log holds is nobody's to take up,
         // and what is served is the project's alone.
         let _ordered = self.ordered();
+        if let Some(said) = self.said_of_waiting() {
+            println!("{said}");
+        }
         {
             let mut state = self.lock();
             let next = state.next;
@@ -1702,6 +1734,25 @@ impl Writes {
             self.0.log.header().set_transit(None);
             self.0.log.keep();
         }
+    }
+
+    /// How long what was said due waited for whoever holds the project to say what became of it, over this
+    /// serving: none where nothing was answered.
+    #[must_use]
+    pub fn said_of_waiting(&self) -> Option<String> {
+        let mut waited = self.lock().waited.clone();
+        if waited.is_empty() {
+            return None;
+        }
+        waited.sort_unstable();
+        let millis = |micros: u32| f64::from(micros) / 1000.0;
+        Some(format!(
+            "what was due: {} answered, {:.1} ms in the middle, {:.1} ms for nine in ten, {:.1} ms at most, from said due to answered",
+            waited.len(),
+            millis(waited[waited.len() / 2]),
+            millis(waited[waited.len() * 9 / 10]),
+            millis(waited[waited.len() - 1])
+        ))
     }
 
     /// Take up what the log holds from an earlier serving that ended with no word of it - its process gone, the
@@ -1825,7 +1876,7 @@ impl Writes {
     fn became(&self, of: u64, refused: bool) {
         let mut state = self.lock();
         let due = state.asked.iter().find(|(_, asked)| asked.said() == Some(of)).map(|(due, _)| *due);
-        if let Some(asked) = due.and_then(|due| state.asked.remove(&due)) {
+        if let Some(asked) = due.and_then(|due| state.asked_no_more(due)) {
             drop(state);
             let _ = crate::due::settle(&self.0.space, &due.into_iter().collect::<Vec<_>>(), true);
             match (asked, refused) {
