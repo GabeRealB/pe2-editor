@@ -33,15 +33,16 @@ pub struct Plans {
     /// The plans' and records' stamps they were worked out from.
     stamps: Vec<Option<SystemTime>>,
     working: Option<mpsc::Receiver<BTreeMap<String, Planned>>>,
-    /// When the stamps were last looked at: once a second.
-    checked: Option<std::time::Instant>,
+    /// Whether they were worked out at all.
+    worked: bool,
     /// Worked out again at the next look, whatever the stamps: the project was read again.
     again: bool,
     /// The discs looked for, whatever the layers' states.
     discs_wanted: bool,
 }
 
-fn watched(project: &Project) -> Vec<PathBuf> {
+/// The files a project's plans are worked out from: each generated layer's plan and its record.
+pub fn watched(project: &Project) -> Vec<PathBuf> {
     project.generated().flat_map(|l| [l.plan(), l.path.join(project::plan::RECORD)]).collect()
 }
 
@@ -59,24 +60,27 @@ impl Plans {
         }
     }
 
-    /// Take what was worked out, and work it out again where a plan or a record changed since. Asked each frame.
-    pub fn update(&mut self, project: &Project, extensions: &Arc<Extensions>, ctx: &egui::Context) {
+    /// Take what was worked out, and work it out again where a plan or a record changed since - by when each
+    /// last changed, as the worker last looked (`stamps`; none: not yet). Asked each frame.
+    pub fn update(
+        &mut self,
+        project: &Project,
+        extensions: &Arc<Extensions>,
+        ctx: &egui::Context,
+        stamps: Option<Vec<Option<SystemTime>>>,
+    ) {
         if let Some(working) = &self.working
             && let Ok(layers) = working.try_recv()
         {
             self.layers = layers;
             self.working = None;
         }
-        if self.working.is_some() || self.checked.is_some_and(|at| at.elapsed().as_secs() < 1 && !self.again) {
-            return;
-        }
-        self.checked = Some(std::time::Instant::now());
-        let stamps: Vec<_> =
-            watched(project).iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect();
-        if stamps == self.stamps && !std::mem::take(&mut self.again) && !self.stamps.is_empty() {
+        let Some(stamps) = stamps.filter(|_| self.working.is_none()) else { return };
+        if stamps == self.stamps && !std::mem::take(&mut self.again) && self.worked {
             return;
         }
         self.stamps = stamps;
+        self.worked = true;
         if project.generated().next().is_none() {
             self.layers.clear();
             return;

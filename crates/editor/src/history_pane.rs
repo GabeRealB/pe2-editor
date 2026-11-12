@@ -8,7 +8,7 @@
 use eframe::egui::{self, RichText};
 use project::history::{Kind, Step};
 
-use crate::workspace::{Viewing, Workspace};
+use crate::workspace::{Kept, Viewing, Workspace};
 use crate::{icons, theme};
 
 /// What the History pane asks.
@@ -228,11 +228,10 @@ fn changes_ui(ui: &mut egui::Ui, ws: &Workspace, step: &Step) {
             for edit in &step.edits {
                 let name = edit.path.rsplit('/').next().unwrap_or(&edit.path);
                 ui.label(RichText::new(format!("{name} · {}", edit.file)).small().strong());
-                let text = |sha1: &Option<String>| {
-                    sha1.as_deref().and_then(|s| ws.history.content(s).ok()).map(String::from_utf8)
-                };
-                match (text(&edit.before), text(&edit.after)) {
-                    (Some(Ok(before)), Some(Ok(after)))
+                // Each content read once, and kept: what a step changed is drawn every frame it shows.
+                let kept = |sha1: &Option<String>| sha1.as_deref().map(|s| ws.kept(s));
+                match (kept(&edit.before), kept(&edit.after)) {
+                    (Some(Kept::Text(before)), Some(Kept::Text(after)))
                         if std::path::Path::new(&edit.file)
                             .extension()
                             .is_some_and(|e| e.eq_ignore_ascii_case("toml")) =>
@@ -248,16 +247,13 @@ fn changes_ui(ui: &mut egui::Ui, ws: &Workspace, step: &Step) {
                         }
                     }
                     (before, after) => {
-                        let size =
-                            |text: Option<Result<String, std::string::FromUtf8Error>>, sha1: &Option<String>| match (
-                                text, sha1,
-                            ) {
-                                (_, None) => "absent".to_string(),
-                                (Some(Ok(text)), _) => format!("{} bytes", text.len()),
-                                (Some(Err(e)), _) => format!("{} bytes", e.into_bytes().len()),
-                                (None, Some(_)) => "not kept".to_string(),
-                            };
-                        let (before, after) = (size(before, &edit.before), size(after, &edit.after));
+                        let size = |kept: Option<Kept>| match kept {
+                            None => "absent".to_string(),
+                            Some(Kept::Text(text)) => format!("{} bytes", text.len()),
+                            Some(Kept::Bytes(long)) => format!("{long} bytes"),
+                            Some(Kept::Gone) => "not kept".to_string(),
+                        };
+                        let (before, after) = (size(before), size(after));
                         ui.label(RichText::new(format!("{before} → {after}")).small().color(theme::weak()));
                     }
                 }

@@ -184,6 +184,18 @@ impl LayerView {
 
 const LAYER_VIEW: &str = "editor/layers.toml";
 
+/// How many of the history's kept contents are held as the History pane showed them.
+const KEPT: usize = 512;
+
+/// A content the history keeps, as the History pane shows it: its text, how long it is where it is none, or
+/// that it is kept no more.
+#[derive(Clone)]
+pub enum Kept {
+    Text(Arc<str>),
+    Bytes(usize),
+    Gone,
+}
+
 pub struct Workspace {
     pub project: Project,
     /// The project as the last take-in left it: a snapshot of the worker's index, swapped in when another arrives.
@@ -290,6 +302,8 @@ pub struct Workspace {
     pending: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// What the window shows that an edit asked from outside it depends on, as the worker was last told.
     showing: Arc<Mutex<crate::takein::Showing>>,
+    /// The contents the history keeps, as the History pane showed them: each read once, by its hash.
+    kept: std::cell::RefCell<HashMap<String, Kept>>,
     /// What the window goes on with once work it asked of the worker is handed over, by its ticket; and what
     /// was handed over since the app last went on.
     asking: Vec<(u64, Then)>,
@@ -305,10 +319,8 @@ pub struct Workspace {
     outcome: Update,
     /// Why agents cannot reach the editor.
     pub link_error: Option<String>,
-    /// The components found beside the built-ins when the project was read: another finding has it read again.
-    extensions_found: Vec<extensions::Found>,
-    /// When the project's extensions and where they are kept were last looked at, which no watcher follows.
-    extensions_checked: std::time::Instant,
+    /// When the worker was last asked to look at what no watch follows: the project's extensions, its plans.
+    looked: std::time::Instant,
     pub tree: Arc<Node>,
     /// The tree's paths (an asset's without `.node`) that can be modified, and the folders holding one: the rest is
     /// drawn dimmed.
@@ -632,10 +644,17 @@ pub struct Leaving {
     files: Option<Arc<crate::files::Files>>,
     /// The host standing by, told: it takes the project the moment this goes, after the lock.
     handing: Option<project::host::Lease>,
+    /// The project's folder.
+    root: PathBuf,
 }
 
 impl Drop for Leaving {
     fn drop(&mut self) {
+        // The project is about to be let go of: the host standing by is told, once, and takes it the moment the
+        // editor has let go, without looking for it.
+        if self.handing.is_none() && self.files.is_some() {
+            self.handing = project::host::leaving(&self.root, "pe2-editor");
+        }
         // What may still write: the worker finishes the job it is on, an epoch running is given up.
         self.takein = None;
         self.runner = None;
@@ -917,11 +936,11 @@ impl Workspace {
             window_requests: Vec::new(),
             fetcher: crate::fetcher::Fetcher::default(),
             link_error,
-            extensions_found,
-            extensions_checked: std::time::Instant::now(),
+            looked: std::time::Instant::now(),
             takein,
             pending,
             showing,
+            kept: std::cell::RefCell::default(),
             asking: Vec::new(),
             outcomes: Vec::new(),
             revision: 0,
@@ -963,7 +982,7 @@ impl Workspace {
         self.takein.wake(ctx);
         let window = ctx.clone();
         self.runner().wake(move || window.request_repaint());
-        self.plans.update(&self.project, &self.extensions, ctx);
+        self.plans.update(&self.project, &self.extensions, ctx, self.takein.plan_stamps());
         if let Some(pictures) = &self.textures.pictures {
             pictures.wake(ctx);
         }
@@ -1090,8 +1109,7 @@ impl Workspace {
 
     /// Leave the project. What takes a moment to finish - what the worker is on, an epoch, letting go of the index - is
     /// handed back, to finish away from the window.
-    pub fn leave(mut self) -> Leaving {
-        self.leaving();
+    pub fn leave(self) -> Leaving {
         // The extensions outlive a project in what is loaded: what it was asked should not.
         self.extensions.serve_requests(None);
         // Closed cleanly, its session goes with the worker - unless documents are unsaved still: the next opening
@@ -1103,14 +1121,7 @@ impl Workspace {
             lock: Some(self.lock),
             files: self.files,
             handing: self.handing,
-        }
-    }
-
-    /// The project is about to be let go of: the host standing by is told, once, and takes it the moment the editor
-    /// has let go, without looking for it.
-    fn leaving(&mut self) {
-        if self.handing.is_none() && self.files.is_some() {
-            self.handing = project::host::leaving(&self.project.root, "pe2-editor");
+            root: self.project.root,
         }
     }
 
@@ -1211,9 +1222,10 @@ impl Workspace {
             .map_err(|e| e.to_string())?;
         let uid = project::uid::text(id);
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
-        let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
+        let file = file.map(Path::to_path_buf);
         let (made_uid, made_at) = (uid.clone(), path.clone());
         let work: Made = Box::new(move |w| {
+            let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
             let files: Vec<(&str, &[u8])> = bytes.as_deref().map(|bytes| (name.as_str(), bytes)).into_iter().collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, &made_uid, &made_at, node, &mut w.history)
@@ -1257,20 +1269,21 @@ impl Workspace {
     pub fn set_disabled(&mut self, path: &str, disabled: bool) -> Result<(), String> {
         let config = self.config.as_ref().ok_or("the project has no config")?.name.clone();
         let file = self.project.root.join(project::FILE);
-        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-        let mut document: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
-        let section = document["config"][config.as_str()].as_table_mut().ok_or("no such config in project.toml")?;
-        let list = section.entry("disabled").or_insert(toml_edit::value(toml_edit::Array::new()));
-        let list = list.as_array_mut().ok_or("its `disabled` is no list")?;
-        list.retain(|item| item.as_str() != Some(path));
-        if disabled {
-            list.push(path);
-        }
-        let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
-        let text = document.to_string();
+        let path = path.to_string();
         let work = move |w: &mut crate::takein::Worker| {
+            let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
             let mut step = w.history.begin(label);
-            step.write(&file, text.as_bytes()).map_err(|e| format!("{e:#}"))?;
+            let text = step.read(&file).map_err(|e| format!("{e:#}"))?.ok_or("project.toml is gone")?;
+            let text = String::from_utf8(text).map_err(|e| e.to_string())?;
+            let mut document: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+            let section = document["config"][config.as_str()].as_table_mut().ok_or("no such config in project.toml")?;
+            let list = section.entry("disabled").or_insert(toml_edit::value(toml_edit::Array::new()));
+            let list = list.as_array_mut().ok_or("its `disabled` is no list")?;
+            list.retain(|item| item.as_str() != Some(path.as_str()));
+            if disabled {
+                list.push(path.as_str());
+            }
+            step.write(&file, document.to_string().as_bytes()).map_err(|e| format!("{e:#}"))?;
             step.commit().map(drop).map_err(|e| format!("{e:#}"))
         };
         self.ask(work, |editor, written: Result<(), String>| {
@@ -1420,16 +1433,11 @@ impl Workspace {
     /// Bring in what changed: other programs' changes collected from the watcher, taken in as they happen (`live`) or
     /// when the window regains focus; and the snapshots the worker made since, swapped in. Returns what they did.
     pub fn update(&mut self, focused: bool, live: bool) -> Update {
-        // The project's extensions, and where they are kept to be added, looked at each second: none is in the index.
-        if self.extensions_checked.elapsed() >= Duration::from_secs(1) {
-            self.extensions_checked = std::time::Instant::now();
-            let _span = tracing::info_span!("window thread: extensions looked for").entered();
-            let found = extensions::found(&self.project);
-            if found != self.extensions_found {
-                // Asked once: what it is taken for is what was found then, read again or not.
-                self.extensions_found = found;
-                self.takein.reload("an extension changed", false);
-            }
+        // The project's extensions and where they are kept to be added, and its plans, looked at each second by
+        // the worker: none is in the index, and no watch follows them.
+        if self.looked.elapsed() >= Duration::from_secs(1) {
+            self.looked = std::time::Instant::now();
+            self.takein.look();
         }
         // What said it was waiting for an output is out of date once that is there.
         let answered = self.outputs.finished();
@@ -1660,7 +1668,7 @@ impl Workspace {
     /// Go on with the project as it was read again: what works for the extensions starts anew with the new ones, and what
     /// was showing is shown by them.
     fn take_up(&mut self, reloaded: crate::takein::Reloaded, all: bool) {
-        let crate::takein::Reloaded { project, extensions, found, why } = reloaded;
+        let crate::takein::Reloaded { project, extensions, why } = reloaded;
         let places = |project: &Project| project.layers.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
         if places(&project) != places(&self.project) {
             self.watch = None;
@@ -1669,7 +1677,6 @@ impl Workspace {
         self.project = project;
         self.plans.again();
 
-        self.extensions_found = found;
         self.outcome = Update::Reloaded(why);
         // What came of it is what was showing: it goes on.
         if Arc::ptr_eq(&extensions, &self.extensions) && !all {
@@ -1821,12 +1828,18 @@ impl Workspace {
         (!home.mounted && !Self::locked_by_nature(home)).then(|| entry.home.clone())
     }
 
+    /// The user's view of the layers kept, in the project's cache: written by the worker's thread, aside.
     fn save_layer_view(&self) -> Result<()> {
         let path = self.cache_dir.join(LAYER_VIEW);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        project::cache::write_atomic(&path, toml::to_string(&self.layer_view)?.as_bytes())
+        let text = toml::to_string(&self.layer_view)?;
+        self.takein.aside(move || {
+            let written = path.parent().map_or(Ok(()), std::fs::create_dir_all);
+            let written = written.map_err(anyhow::Error::from).and_then(|()| project::cache::write_atomic(&path, text.as_bytes()));
+            if let Err(e) = written {
+                eprintln!("the view of the layers is not kept: {e:#}");
+            }
+        });
+        Ok(())
     }
 
     /// Show the view as the eyes say: the index's resolved entries, the tree and the pictures follow.
@@ -1939,6 +1952,25 @@ impl Workspace {
     /// Whether an asset has unsaved changes.
     pub fn unsaved(&self, path: &str) -> bool {
         self.document(path).is_some()
+    }
+
+    /// A content the history keeps, by its hash, as the History pane shows it: read once, and kept.
+    pub fn kept(&self, sha1: &str) -> Kept {
+        let mut kept = self.kept.borrow_mut();
+        if let Some(known) = kept.get(sha1) {
+            return known.clone();
+        }
+        // What a long session showed of its steps is let go of, to be read again.
+        if kept.len() >= KEPT {
+            kept.clear();
+        }
+        let read = match self.history.content(sha1).map(String::from_utf8) {
+            Ok(Ok(text)) => Kept::Text(Arc::from(text)),
+            Ok(Err(bytes)) => Kept::Bytes(bytes.into_bytes().len()),
+            Err(_) => Kept::Gone,
+        };
+        kept.insert(sha1.to_string(), read.clone());
+        read
     }
 
     /// The documents with unsaved changes: their uids and paths.

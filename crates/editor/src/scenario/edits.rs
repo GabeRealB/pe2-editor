@@ -120,3 +120,12 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     let refused = edit(folder("later"));
     assert!(refused.told().is_err_and(|why| why.contains("an earlier point of the history")), "{refused:?}");
 }
+
+#[test]
+fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
+    let mut editor = Scenario::open(Fixture::notes_under_records());
+    let kept = editor.workspace().cache_path("editor/layers.toml");
+    editor.workspace().toggle_lock("top").expect("locked");
+    // Written by the worker's thread, aside: there a moment after, with no frame waited for.
+    editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
+}

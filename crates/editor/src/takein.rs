@@ -181,7 +181,6 @@ pub type Verify = Box<dyn FnOnce() -> Vec<PathBuf> + Send>;
 pub struct Reloaded {
     pub project: Project,
     pub extensions: Arc<Extensions>,
-    pub found: Vec<extensions::Found>,
     /// What changed.
     pub why: &'static str,
 }
@@ -234,6 +233,8 @@ pub struct TakeIn {
     /// shows.
     last: Arc<Mutex<Option<Reading>>>,
     showing: Arc<Mutex<Showing>>,
+    /// When each generated layer's plan and record last changed, as the worker last looked (`look`).
+    plans: Arc<Mutex<Option<Vec<Option<std::time::SystemTime>>>>>,
 }
 
 /// What the worker owns.
@@ -264,6 +265,11 @@ pub struct Worker {
     outcomes: Vec<(u64, Outcome)>,
     /// What went wrong off a take-in - the layers' watch failing - until it is handed over.
     failed: Option<String>,
+    /// The extensions as last found by looking (`look`): one finding has the project read again once.
+    looked: Vec<extensions::Found>,
+    /// When each generated layer's plan and record last changed, as last looked at: what the window works its
+    /// plans out from.
+    plans: Arc<Mutex<Option<Vec<Option<std::time::SystemTime>>>>>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
     pub imports: Imports,
@@ -317,6 +323,7 @@ impl TakeIn {
         let reading = Reading { project: project_shown.clone(), index: shown.clone(), extensions: extensions.clone() };
         let last = Arc::new(Mutex::new(Some(reading)));
         let window = showing.clone();
+        let plans: Arc<Mutex<Option<Vec<Option<std::time::SystemTime>>>>> = Arc::default();
         let worker = Worker {
             core,
             viewed: (history.revision(), Arc::new(history.view())),
@@ -331,6 +338,8 @@ impl TakeIn {
             select: None,
             outcomes: Vec::new(),
             failed: None,
+            looked: found.clone(),
+            plans: plans.clone(),
             cache,
             store,
             imports,
@@ -349,7 +358,28 @@ impl TakeIn {
         };
         let queue = Queue::start("take-in", worker).map_err(|e| eprintln!("no thread takes changes in: {e}")).ok();
         let queue = queue.map(Arc::new);
-        TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop, last, showing: window }
+        TakeIn { queue, asked, snapshots, issued: 0, covered: 0, ctx, stage, stop, last, showing: window, plans }
+    }
+
+    /// Have the worker look at what no watch follows - the extensions the project finds, the generated layers'
+    /// plans: asked once a second, nothing waited for.
+    pub fn look(&self) {
+        if let Some(queue) = &self.queue {
+            queue.post(Worker::look);
+        }
+    }
+
+    /// When each generated layer's plan and record last changed, as the worker last looked: none until it has.
+    pub fn plan_stamps(&self) -> Option<Vec<Option<std::time::SystemTime>>> {
+        self.plans.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Have the worker's thread do this aside from the project's work - a small file of the editor's own
+    /// written: nothing is handed over for it.
+    pub fn aside(&self, work: impl FnOnce() + Send + 'static) {
+        if let Some(queue) = &self.queue {
+            queue.post(move |_| work());
+        }
     }
 
     /// The worker, for the agents' link to ask without the window.
@@ -581,6 +611,24 @@ impl Worker {
     pub fn caught_up(&mut self) {
         self.ask_pending();
         self.work();
+    }
+
+    /// Look at what no watch follows: the project's extensions and where they are kept to be added - found
+    /// otherwise than the project was read with, it is read again, once for each finding - and when the
+    /// generated layers' plans and records last changed, for the window to work its plans out from.
+    fn look(&mut self) {
+        let stamps: Vec<Option<std::time::SystemTime>> = crate::plans::watched(&self.core.project)
+            .iter()
+            .map(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+            .collect();
+        *self.plans.lock().unwrap_or_else(PoisonError::into_inner) = Some(stamps);
+        let found = extensions::found(&self.core.project);
+        if found != self.found && found != self.looked {
+            self.looked = found;
+            let again = Job::Reload { why: "an extension changed", whole: false };
+            self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((0, again));
+            self.work();
+        }
     }
 
     /// What watching the layers came to: what other programs changed there - what the editor's own edits wrote,
@@ -858,8 +906,8 @@ impl Worker {
         let snapshot = match read {
             Ok(changed) => {
                 let mut snapshot = self.snapshot(ticket, BTreeSet::new(), changed, None, files);
-                let (project, extensions, found) = (self.core.project.clone(), self.extensions.clone(), self.found.clone());
-                snapshot.reloaded = Some(Reloaded { project, extensions, found, why });
+                let (project, extensions) = (self.core.project.clone(), self.extensions.clone());
+                snapshot.reloaded = Some(Reloaded { project, extensions, why });
                 snapshot
             }
             Err(e) => {

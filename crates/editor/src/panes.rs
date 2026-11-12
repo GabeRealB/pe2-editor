@@ -2695,8 +2695,6 @@ fn project_settings_ui(
         }
         theme::short(ui, RichText::new(file.display().to_string()).small().color(theme::weak()));
     });
-    let raw: toml::Table =
-        std::fs::read_to_string(&file).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
     let grid = |ui: &mut egui::Ui, id: &str, rows: Vec<(String, String)>| {
         // Each value beside its name, in the font of the name so the two share a line; a path too long for the pane
         // cut short, the whole of it on hover.
@@ -2763,7 +2761,7 @@ fn project_settings_ui(
                     .map(|m| {
                         let access = if m.read_only { "  (read only)" } else { "" };
                         // Where it is, as the layers above name theirs: resolved, not as project.toml reaches it.
-                        let path = std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone());
+                        let path = resolved(&m.path);
                         (format!("res://{}", m.at), format!("{}{access}", path.display()))
                     })
                     .collect();
@@ -2772,7 +2770,19 @@ fn project_settings_ui(
         }
         _ => {}
     }
-    let _ = raw;
+}
+
+/// A path with what it steps back over taken out (`a/../b`: `b`), by its text alone: how a place is shown.
+fn resolved(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir if out.file_name().is_some() => drop(out.pop()),
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// A config's property set to a value, or to its default (`None`).
