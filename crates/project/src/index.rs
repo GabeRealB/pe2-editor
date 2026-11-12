@@ -538,6 +538,28 @@ impl Refreshed {
     }
 }
 
+/// What differs between the records known of a layer stored as records and those read of it now, said of the
+/// project's model.
+fn records_differ(
+    was: &BTreeMap<String, crate::model::Recorded>,
+    now: &BTreeMap<String, crate::records::Recorded>,
+    layer: &str,
+    model: &mut crate::model::Delta,
+) {
+    for uid in was.keys().filter(|uid| !now.contains_key(*uid)) {
+        model.record(layer, uid, None);
+    }
+    for (uid, (record, modified, len)) in now {
+        let modified = crate::model::stamp_of(*modified);
+        let same = was.get(uid).is_some_and(|(known, at, of)| {
+            *at == modified && of == len && (Arc::ptr_eq(known, record) || known == record)
+        });
+        if !same {
+            model.record(layer, uid, Some(&(record.clone(), modified, *len)));
+        }
+    }
+}
+
 /// Whether an entry's content - where its layer holds it, or the layer filling that one does - or a file its
 /// overrides made lies in what was scanned again: the regions, by layer and path there, and where those are on disk.
 fn in_rescanned(node: &Node, regions: &[(usize, String)], disks: &[PathBuf], filled: &[Option<usize>]) -> bool {
@@ -1235,6 +1257,8 @@ pub struct Index {
     /// What its opening read that differs from what it opened over, of the project's model: for whoever holds the
     /// project to say there (`take_opened`, `model::took`).
     opened: crate::model::Delta,
+    /// The project's folder.
+    root: PathBuf,
     resolved: Arc<BTreeMap<String, Node>>,
     /// What the whole stack resolves, hidden layers too: what is served as files (`served`). The same as `resolved`
     /// where nothing is hidden.
@@ -1336,6 +1360,33 @@ impl Index {
         model
     }
 
+    /// The records of the layers stored as records, as they were last read, by the layers' names: what the
+    /// project's model keeps of them, and is held to.
+    #[must_use]
+    pub fn records_known(&self) -> crate::model::Records {
+        let Some(set) = crate::records::Set::current(&self.root) else { return crate::model::Records::new() };
+        let of_layers = self.layers.iter().filter_map(|layer| {
+            let read = set.records_read(&layer.place.root)?;
+            let read = read.into_iter().map(|(uid, (record, modified, len))| (uid, (record, crate::model::stamp_of(modified), len)));
+            // A layer with no record is none the model knows of.
+            Some((layer.name.clone(), read.collect::<BTreeMap<_, _>>())).filter(|(_, read)| !read.is_empty())
+        });
+        of_layers.collect()
+    }
+
+    /// All the records of the layers stored as records, as a change of the project's model: said where the model
+    /// holds nothing yet (`model::took`).
+    #[must_use]
+    pub fn records_held(&self) -> crate::model::Delta {
+        let mut model = crate::model::Delta::default();
+        for (layer, records) in self.records_known() {
+            for (uid, recorded) in &records {
+                model.record(&layer, uid, Some(recorded));
+            }
+        }
+        model
+    }
+
     /// What the layers hold, as the project's model keeps it: what the model is held to.
     #[must_use]
     pub fn layers_known(&self) -> crate::model::Layers {
@@ -1355,25 +1406,36 @@ impl Index {
         let records = self.records.clone();
         let files: Vec<PathBuf> = self.layers.iter().flat_map(|layer| layer.scan.all_files().cloned()).collect();
         let layers: Vec<(Place, Arc<Scan>)> = self.layers.iter().map(|layer| (layer.place.clone(), layer.scan.clone())).collect();
+        let set = crate::records::Set::current(&self.root);
         move || {
-            // What each layer holds, walked now, against what was taken as known of it: where they differ.
-            let mut walked = {
-                let _span = tracing::info_span!("index: the layers held to what was known of them").entered();
-                let differing = layers.iter().flat_map(|(place, known)| {
-                    let mut now = Scan::default();
-                    now.rescan(place, "");
-                    now.differing(known, place)
+            // Each on a thread of its own: an edit waits for all of it.
+            let (of_records, walked, mut stale) = std::thread::scope(|scope| {
+                // The records' files, against what was taken as known of each.
+                let of_records = scope.spawn(|| {
+                    let _span = tracing::info_span!("index: the records held to their files").entered();
+                    set.map_or_else(Vec::new, |set| set.differing())
                 });
-                differing.collect::<Vec<PathBuf>>()
-            };
-            let _span = tracing::info_span!("index: the files held to their records").entered();
-            let stale = files.iter().zip(stat_all(&files)).filter(|(file, (size, modified))| match (size, records.get(*file)) {
-                (Some(size), Some(record)) => !(record.size == *size && record.modified == *modified && *modified < record.recorded),
-                (None, None) => false,
-                _ => true,
+                // What each layer holds, walked now, against what was taken as known of it: where they differ.
+                let walked = scope.spawn(|| {
+                    let _span = tracing::info_span!("index: the layers held to what was known of them").entered();
+                    let differing = layers.iter().flat_map(|(place, known)| {
+                        let mut now = Scan::default();
+                        now.rescan(place, "");
+                        now.differing(known, place)
+                    });
+                    differing.collect::<Vec<PathBuf>>()
+                });
+                let _span = tracing::info_span!("index: the files held to their records").entered();
+                let stale = files.iter().zip(stat_all(&files)).filter(|(file, (size, modified))| match (size, records.get(*file)) {
+                    (Some(size), Some(record)) => !(record.size == *size && record.modified == *modified && *modified < record.recorded),
+                    (None, None) => false,
+                    _ => true,
+                });
+                let stale: Vec<PathBuf> = stale.map(|(file, _)| file.clone()).collect();
+                (of_records.join().unwrap_or_default(), walked.join().unwrap_or_default(), stale)
             });
-            let mut stale: Vec<PathBuf> = stale.map(|(file, _)| file.clone()).collect();
-            stale.append(&mut walked);
+            stale.extend(walked);
+            stale.extend(of_records);
             stale.sort();
             stale.dedup();
             stale
@@ -1388,7 +1450,8 @@ impl Index {
     pub fn again(&self, project: &Project, report: &Report<'_>) -> Result<Index> {
         let files = self.records.iter().map(|(file, record)| (file.clone(), (**record).clone())).collect();
         let layers = self.layers.iter().map(|layer| (layer.name.clone(), (layer.place.made_by(), layer.scan.held()))).collect();
-        let mut index = Index::over(crate::model::Known { files, layers }, true, project, report)?;
+        let known = crate::model::Known { files, layers, records: self.records_known() };
+        let mut index = Index::over(known, true, project, report)?;
         index.set_working(self.working.as_ref().clone());
         Ok(index)
     }
@@ -1396,12 +1459,29 @@ impl Index {
     /// Over what is `known` of the files: each held to its file where `held`, else taken as it is.
     #[expect(clippy::too_many_lines, reason = "the index's fields, one line each")]
     fn over(known: crate::model::Known, held: bool, project: &Project, report: &Report<'_>) -> Result<Index> {
-        let crate::model::Known { files: mut known, layers: mut known_layers } = known;
-        // Its records layers, placed through the stack: what their scans and changesets are read from.
-        crate::records::Set::open(project)?;
-        let mut layers = Vec::new();
+        let crate::model::Known { files: mut known, layers: mut known_layers, records: mut known_records } = known;
         // What differs of the project's model from what was known, for whoever holds the project to say there.
         let mut opened = crate::model::Delta::default();
+        // Its records layers, placed through the stack: what their scans and changesets are read from. Over what
+        // is known of their records - held to their files, or taken as it is.
+        let of_layers = project.layers.iter().filter_map(|layer| {
+            let known = known_records.get(&layer.name)?;
+            let read = known.iter().map(|(uid, (record, modified, len))| (uid.clone(), (record.clone(), crate::model::time_of(*modified), *len)));
+            Some((layer.path.clone(), read.collect()))
+        });
+        let set = crate::records::Set::open_over(project, of_layers.collect(), !held)?;
+        for layer in &project.layers {
+            let was = known_records.remove(&layer.name).unwrap_or_default();
+            if let Some(now) = set.records_read(&layer.path) {
+                records_differ(&was, &now, &layer.name, &mut opened);
+            }
+        }
+        for (layer, gone) in known_records {
+            for uid in gone.keys() {
+                opened.record(&layer, uid, None);
+            }
+        }
+        let mut layers = Vec::new();
         for (i, layer) in project.layers.iter().enumerate() {
             report(&format!("Scanning {}", layer.name), i, project.layers.len());
             let _span = tracing::info_span!("layer scan").entered();
@@ -1448,6 +1528,7 @@ impl Index {
             merged: project.root.join(crate::cache::DIR).join("merged"),
             objects: crate::chunks::Store::at(&project.root),
             opened,
+            root: project.root.clone(),
             resolved: Arc::default(),
             hidden: HashSet::new(),
             ops: vec![],
@@ -1736,11 +1817,19 @@ impl Index {
         changed: &[PathBuf],
         wanted: &mut Vec<(usize, String)>,
         were: &mut Vec<(usize, Changeset)>,
+        model: &mut crate::model::Delta,
     ) -> Result<bool> {
         let before = crate::records::Set::current(&project.root);
         let now = crate::records::Set::open_after(project, changed)?;
         let differences = tracing::info_span!("refresh: the records compared")
             .in_scope(|| crate::records::Set::differences(before.as_deref(), &now));
+        // What that changed of the project's model: each record that came, went or changed, as it is now.
+        for (dir, uid) in &differences.records {
+            if let Some(layer) = project.layers.iter().find(|layer| layer.path == *dir) {
+                let recorded = now.recorded(dir, uid).map(|(record, modified, len)| (record, crate::model::stamp_of(modified), len));
+                model.record(&layer.name, uid, recorded.as_ref());
+            }
+        }
         let _span = tracing::info_span!("refresh: the changesets made again").entered();
         let (changed, placed) = (&differences.paths, differences.placed);
         // An override changed merges again as the stack is applied.
@@ -1779,7 +1868,7 @@ impl Index {
         // The records layers whose changesets changed, with what each said before.
         let mut were: Vec<(usize, Changeset)> = Vec::new();
         if changed.iter().any(|p| in_records(p) && !of_extensions(p)) {
-            changesets |= self.take_in_records(project, changed, &mut wanted, &mut were)?;
+            changesets |= self.take_in_records(project, changed, &mut wanted, &mut were, &mut refreshed.model)?;
         }
         for path in changed {
             // `project.toml` is read again whole, records with their layers (above).

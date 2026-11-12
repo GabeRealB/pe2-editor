@@ -914,6 +914,7 @@ mod tests {
         // And its model, filled with what the index read.
         crate::model::fill_files(&mut txn, &project.root, index.file_records()).unwrap();
         index.layers_held(&project.root).apply(&mut txn).unwrap();
+        index.records_held().apply(&mut txn).unwrap();
         txn.commit().unwrap();
         let follows = {
             let read = shared.read().unwrap();
@@ -981,6 +982,9 @@ mod tests {
             // And of every layer what the index has it hold.
             let layers = crate::model::layers(&read, &self.project.root).unwrap();
             assert_eq!(layers, self.index.layers_known(), "what the model has the layers hold is not what the index has");
+            // And of every layer stored as records the records the index read.
+            let recorded = crate::model::records(&read).unwrap();
+            assert_eq!(recorded, self.index.records_known(), "the model's records are not those the index read");
             drop(read);
             // And all the index derives, changed in place, is what one opened afresh derives - but where a layer
             // holds something unlisted: a layer's folder indexed for the first time lists what it holds, and
@@ -997,6 +1001,7 @@ mod tests {
                 records
             };
             assert_eq!(layers, fresh.layers_known(), "what the model has the layers hold is not what a walk of them finds");
+            assert_eq!(recorded, fresh.records_known(), "the model's records are not those read afresh");
             let (modeled, read_afresh) = (unread(held), unread(records(&fresh)));
             if modeled != read_afresh {
                 let differing: Vec<_> =

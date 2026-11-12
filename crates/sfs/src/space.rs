@@ -1278,6 +1278,20 @@ impl Space {
     /// # Errors
     /// As `sync`.
     pub fn rest(&self) -> io::Result<bool> {
+        self.rested(false)
+    }
+
+    /// `rest`, by a process that is ending and will use the space no more: where another has it attached still, this
+    /// one no longer counts as having - so that of two that end at once, each finding the other there, the one
+    /// that asks second is the last, and has all of it on disk. Nothing of the space is used after.
+    ///
+    /// # Errors
+    /// As `rest`.
+    pub fn leave(&self) -> io::Result<bool> {
+        self.rested(true)
+    }
+
+    fn rested(&self, leaving: bool) -> io::Result<bool> {
         let Backing::Files { attached, .. } = &self.backing else { return Ok(true) };
         if self.atom(at::CLEAN).load(Ordering::SeqCst) != 0 {
             return Ok(true);
@@ -1293,7 +1307,10 @@ impl Space {
         if alone {
             attached.unlock()?;
         }
-        attached.lock_shared()?;
+        // Attached still - but for one that leaves beside another: it is gone to whoever asks next.
+        if alone || !leaving {
+            attached.lock_shared()?;
+        }
         if alone { self.synced(&held) } else { Ok(false) }
     }
 
@@ -1849,15 +1866,15 @@ impl Drop for Txn<'_> {
 /// The spaces this process has attached (`shared`), each by its folder: for as long as it runs.
 static OPEN: Mutex<Vec<(PathBuf, Arc<Space>)>> = Mutex::new(Vec::new());
 
-/// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::rest`): what a
+/// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::leave`): what a
 /// process does last as it ends in order - one that ends runs nothing more of its own, and whatever of it still
 /// holds a space then never lets go of it.
 ///
 /// # Errors
-/// As `Space::rest`, of the first that could not.
+/// As `Space::leave`, of the first that could not.
 pub fn rest_all() -> io::Result<()> {
     let attached: Vec<Arc<Space>> = lock(&OPEN).iter().map(|(_, space)| space.clone()).collect();
-    attached.iter().try_for_each(|space| space.rest().map(|_| ()))
+    attached.iter().try_for_each(|space| space.leave().map(|_| ()))
 }
 
 /// The space kept in a folder, attached by this process once and for as long as it runs: whoever asks again gets

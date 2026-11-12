@@ -634,6 +634,21 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
         assert!(space.rest().unwrap());
     }
     {
+        // Two that end at once, each finding the other there as it leaves: the second to ask is the last, and
+        // has all of it on disk - where each would have left that to the other.
+        let (first, second) = (Space::open(&dir).unwrap(), Space::open(&dir).unwrap());
+        run(&first, "p", 400..420, 100, &mut model);
+        run(&second, "p", 420..440, 100, &mut model);
+        assert!(!first.leave().unwrap());
+        assert!(second.leave().unwrap(), "of two that leave at once neither had it on disk");
+        assert!(dir.join("clean").exists());
+        drop((first, second));
+        let space = Space::open(&dir).unwrap();
+        assert!(!space.fresh());
+        same(&space.read().unwrap(), &model);
+        assert!(space.rest().unwrap());
+    }
+    {
         // One that makes ready to write says so ahead of its first change - and ends without resting.
         let space = Space::open(&dir).unwrap();
         assert!(!space.fresh() && dir.join("clean").exists());

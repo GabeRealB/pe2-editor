@@ -198,6 +198,17 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     if host.inherited && lock(&host.server).is_some() {
         let _ = project::server::stop(&p.root);
     }
+    // Ending in order, what it holds of the project is let go of as where it lends it: its history closed - what
+    // its edits wrote had on disk, and the log needed for it no longer - before its lock is. A process that ends
+    // lets go of nothing by itself, and whoever took the project next wrote its last edits again from the log.
+    host.verified();
+    let held = lock(&host.state).held.take();
+    if let Some(Held { link, history, lock: held }) = held {
+        *lock(&host.files) = None;
+        drop(link);
+        history.let_go();
+        drop(held);
+    }
     println!("stopped");
     Ok(())
 }

@@ -549,9 +549,18 @@ impl View {
     }
 }
 
+/// What is known of a project's records layers, for a set to open over (`Set::open_over`): each layer's records by
+/// uid, each with its file's time and length, by the layer's folder.
+pub type Known = std::collections::HashMap<PathBuf, BTreeMap<String, Recorded>>;
+/// A record as it was read, with its file's time and length.
+pub type Recorded = (std::sync::Arc<Record>, std::time::SystemTime, u64);
+
 /// What differs between two readings of a project's records layers (`Set::differences`).
 #[derive(Clone, Debug, Default)]
 pub struct Differences {
+    /// The records that came, went, changed, or whose file is of another time or length, by layer (its folder)
+    /// and uid: what the project's model is told of.
+    pub records: Vec<(PathBuf, String)>,
     /// For each layer (by folder), where the entries whose records came, went or changed were, and are.
     pub paths: Vec<(PathBuf, BTreeSet<String>)>,
     /// Any of them is placed otherwise.
@@ -794,7 +803,18 @@ impl Set {
     /// # Errors
     /// A records layer cannot be read, or is of a format this program does not know.
     pub fn open(project: &crate::Project) -> Result<std::sync::Arc<Set>> {
-        Set::opened(project, None)
+        Set::opened(project, None, None)
+    }
+
+    /// Read a project's records layers as `open` does, over what is known of them (the project's model's,
+    /// `model::known`): a record whose file is as it was known is not read again - or, where what is known is
+    /// `taken` as it is, no record's file is looked at, and whoever opens so holds the files to it after
+    /// (`differing`).
+    ///
+    /// # Errors
+    /// As `open`.
+    pub fn open_over(project: &crate::Project, known: Known, taken: bool) -> Result<std::sync::Arc<Set>> {
+        Set::opened(project, None, Some((known, taken)))
     }
 
     /// Read a project's records layers again after these files changed, as `open` does - but a layer none of them is
@@ -804,10 +824,11 @@ impl Set {
     /// # Errors
     /// As `open`.
     pub fn open_after(project: &crate::Project, changed: &[PathBuf]) -> Result<std::sync::Arc<Set>> {
-        Set::opened(project, Some(changed))
+        Set::opened(project, Some(changed), None)
     }
 
-    fn opened(project: &crate::Project, changed: Option<&[PathBuf]>) -> Result<std::sync::Arc<Set>> {
+    fn opened(project: &crate::Project, changed: Option<&[PathBuf]>, known: Option<(Known, bool)>) -> Result<std::sync::Arc<Set>> {
+        let (mut known, taken) = known.unwrap_or_default();
         let _span = tracing::info_span!("records open").entered();
         // What was read of it before: a record whose file is as it was is not read again.
         let previous = Set::current(&project.root);
@@ -834,9 +855,17 @@ impl Set {
             let settings = settings(&layer.path)?;
             // The records that changed read again, where the paths say which; else all of them looked at.
             let after = before.zip(changed).and_then(|(view, paths)| read_changed(&layer.path, &view.records, paths));
-            let records = match after {
-                Some(records) => records?,
-                None => read_records(&layer.path, before.map(|v| &v.records))?,
+            // What is known of the layer, as records read: what was read here before, where nothing else is.
+            let known: Option<Read> = known.remove(&layer.path).map(|known| {
+                let held = known.into_iter().map(|(uid, (record, modified, len))| (uid, Held { record, modified, len }));
+                held.collect()
+            });
+            let records = match (after, known) {
+                (Some(records), _) => records?,
+                // As known, each: no file is looked at.
+                (None, Some(known)) if taken => known,
+                (None, Some(known)) => read_records(&layer.path, Some(&known))?,
+                (None, None) => read_records(&layer.path, before.map(|v| &v.records))?,
             };
             let mut view = View { dir: layer.path.clone(), settings, ..View::default() };
             let mut named = std::collections::HashMap::new();
@@ -920,6 +949,7 @@ impl Set {
     #[must_use]
     pub fn differences(before: Option<&Set>, now: &Set) -> Differences {
         let mut out = Vec::new();
+        let mut records = Vec::new();
         let (mut placed, mut overrides) = (false, false);
         let mut same = BTreeSet::new();
         for view in &now.views {
@@ -938,8 +968,13 @@ impl Set {
                 if let (Some(was), Some(is)) = (was, is)
                     && std::sync::Arc::ptr_eq(&was.record, &is.record)
                 {
+                    // The same record, in a file of another time or length: told to the model, and nothing else.
+                    if was.modified != is.modified || was.len != is.len {
+                        records.push((view.dir.clone(), uid.clone()));
+                    }
                     continue;
                 }
+                records.push((view.dir.clone(), uid.clone()));
                 overrides |= [was, is].into_iter().flatten().any(|held| held.record.op == Op::Override);
                 let at_before = old.and_then(|o| o.placed.get(uid));
                 let at_now = view.placed.get(uid);
@@ -968,7 +1003,48 @@ impl Set {
         if let Some(before) = before {
             placed |= before.views.iter().any(|o| !now.views.iter().any(|v| v.dir == o.dir));
         }
-        Differences { paths: out, placed, overrides, same }
+        Differences { records, paths: out, placed, overrides, same }
+    }
+
+    /// A layer's record as it was read, by the layer's folder and its uid.
+    #[must_use]
+    pub fn recorded(&self, layer: &Path, uid: &str) -> Option<Recorded> {
+        let view = self.views.iter().find(|view| view.dir == layer)?;
+        view.records.get(uid).map(|held| (held.record.clone(), held.modified, held.len))
+    }
+
+    /// Every record of a layer as it was read, by the layer's folder; none where it is no records layer.
+    #[must_use]
+    pub fn records_read(&self, layer: &Path) -> Option<BTreeMap<String, Recorded>> {
+        let view = self.views.iter().find(|view| view.dir == layer)?;
+        Some(view.records.iter().map(|(uid, held)| (uid.clone(), (held.record.clone(), held.modified, held.len))).collect())
+    }
+
+    /// The records' files that are not as they were read - of another time or length, gone, or there with nothing
+    /// read of them: what a set opened over what was known, with no file looked at (`open_over`), is held to, on
+    /// a thread of its own. Taken in as a change of those files, each is read again.
+    #[must_use]
+    pub fn differing(&self) -> Vec<PathBuf> {
+        let mut differing = Vec::new();
+        for view in &self.views {
+            let mut found = BTreeSet::new();
+            let shards = std::fs::read_dir(view.dir.join(DIR)).into_iter().flatten().flatten();
+            for shard in shards.filter(|shard| shard.file_type().is_ok_and(|t| t.is_dir()) && shard.file_name().len() == 2) {
+                for file in std::fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+                    let path = file.path();
+                    let Some(uid) = uid_of(&path) else { continue };
+                    let stamp = file.metadata().ok().and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+                    let same = view.records.get(&uid).zip(stamp).is_some_and(|(held, (modified, len))| held.modified == modified && held.len == len);
+                    if !same {
+                        differing.push(path);
+                    }
+                    found.insert(uid);
+                }
+            }
+            let gone = view.records.keys().filter(|uid| !found.contains(*uid));
+            differing.extend(gone.map(|uid| path_of(&view.dir, uid)));
+        }
+        differing
     }
 
     /// The records layer a path is in, and the path within it.

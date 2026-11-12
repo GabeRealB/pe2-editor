@@ -8,9 +8,10 @@
 //! writer's lock. Every value begins with the generation of the commit that put it: what a process keeps of a
 //! value it decoded is told from another by it.
 //!
-//! So far it holds each file's record (`Record`) and what each layer holds (`Held`, by layer and path: its
-//! folders, plain files and bundles, as a walk of it finds them): what the index keeps between runs, where it
-//! kept a database of its own and walked every layer as it opened. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
+//! So far it holds each file's record (`Record`), what each layer holds (`Held`, by layer and path: its folders,
+//! plain files and bundles, as a walk of it finds them) and the records of the layers stored as records
+//! (`records::Record`, by layer and uid, each with its file's time and length): what the index keeps between
+//! runs, where it kept a database of its own, walked every layer and read every record's file as it opened. An index opens over what the model holds of the files (`known`) - or, where the space was begun anew
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
@@ -61,7 +62,7 @@ pub const LINKS: usize = 12;
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
 /// of the files changes.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.
@@ -324,11 +325,108 @@ pub enum Held {
 /// names it leaves out, as the index says them) and what it holds by path.
 pub type Layers = BTreeMap<String, (String, BTreeMap<String, Held>)>;
 
-/// What is known of a project, for an index to open over (`known`): each file's record, and what each layer holds.
+/// A record of a layer stored as records, with its file's time and length as it was read.
+pub type Recorded = (Arc<crate::records::Record>, Stamp, u64);
+/// What the model holds of the layers stored as records: each layer's records, by its name and their uids.
+pub type Records = BTreeMap<String, BTreeMap<String, Recorded>>;
+
+/// What is known of a project, for an index to open over (`known`): each file's record, what each layer holds,
+/// and the records of the layers stored as records.
 #[derive(Default)]
 pub struct Known {
     pub files: HashMap<PathBuf, Record>,
     pub layers: Layers,
+    pub records: Records,
+}
+
+/// What a key of `RECORDS` begins with: a record of a layer stored as records.
+const RECORD: u8 = b'r';
+
+/// A time as the model keeps it.
+#[must_use]
+pub fn stamp_of(time: std::time::SystemTime) -> Stamp {
+    let since = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    (since.as_secs(), since.subsec_nanos())
+}
+
+/// The time a stamp is of.
+#[must_use]
+pub fn time_of((secs, nanos): Stamp) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+}
+
+/// A layer's record as the model keeps it, with its file's time and length.
+fn layer_record(name: &str, record: &crate::records::Record, modified: Stamp, len: u64) -> Vec<u8> {
+    use crate::records::{Content, Kind, Op};
+    let mut out = Out::new();
+    let long = name.len() > NAMED;
+    out.u8(if long { says::NAMED } else { 0 });
+    stamp(&mut out, modified);
+    out.u64(len);
+    out.u8(match record.op {
+        Op::Create => 0,
+        Op::Override => 1,
+        Op::Move => 2,
+        Op::Delete => 3,
+    });
+    out.u8(match record.kind {
+        Kind::Node => 0,
+        Kind::Folder => 1,
+        Kind::File => 2,
+    });
+    out.maybe(record.parent.as_deref());
+    out.maybe(record.name.as_deref());
+    out.u32(u32::try_from(record.files.len()).unwrap_or(u32::MAX));
+    for (file, held) in &record.files {
+        out.text(file);
+        match &held.content {
+            None => out.u8(0),
+            Some(Content::Text(text)) => {
+                out.u8(1);
+                out.text(text);
+            }
+            Some(Content::Stored { sha1, size }) => {
+                out.u8(2);
+                out.text(sha1);
+                out.u64(*size);
+            }
+        }
+        out.maybe(held.was.as_deref());
+    }
+    if long {
+        out.text(name);
+    }
+    out.0
+}
+
+/// A layer's record read back, with its file's time and length and the name it says where its key could not.
+fn layer_recorded(value: &[u8]) -> Option<(Recorded, Option<String>)> {
+    use crate::records::{Content, File, Kind, Op, Record};
+    let mut read = In::after_stamp(value)?;
+    let said = read.u8()?;
+    let modified = stamped(&mut read)?;
+    let len = read.u64()?;
+    let op = [Op::Create, Op::Override, Op::Move, Op::Delete].get(usize::from(read.u8()?)).copied()?;
+    let kind = [Kind::Node, Kind::Folder, Kind::File].get(usize::from(read.u8()?)).copied()?;
+    let (mut parent, mut name) = (None, None);
+    read.maybe(&mut parent)?;
+    read.maybe(&mut name)?;
+    let mut files = BTreeMap::new();
+    for _ in 0..read.u32()? {
+        let file = read.text()?;
+        let content = match read.u8()? {
+            0 => None,
+            1 => Some(Content::Text(read.text()?)),
+            2 => Some(Content::Stored { sha1: read.text()?, size: read.u64()? }),
+            _ => return None,
+        };
+        let mut was = None;
+        read.maybe(&mut was)?;
+        files.insert(file, File { content, was });
+    }
+    let long = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
+    let record = Record { op, kind, parent, name, files };
+    read.0.is_empty().then_some(((Arc::new(record), modified, len), long))
 }
 
 /// The name of what a layer holds at a path.
@@ -410,6 +508,14 @@ impl Delta {
     pub fn held(&mut self, root: &Path, layer: &str, path: &str, now: Option<&Held>) {
         let name = held_name(layer, path);
         self.changes.push((INPUTS, key(HELD, &name), now.map(|now| held(root, &name, now))));
+    }
+
+    /// A record of a layer stored as records is this now, in a file of this time and length - or, with none, is
+    /// no more.
+    pub fn record(&mut self, layer: &str, uid: &str, now: Option<&Recorded>) {
+        let name = held_name(layer, uid);
+        let said = now.map(|(record, modified, len)| layer_record(&name, record, *modified, *len));
+        self.changes.push((RECORDS, key(RECORD, &name), said));
     }
 
     /// A layer's listing was made by this (its place and the names it leaves out) - or, with none, the layer is
@@ -545,23 +651,54 @@ pub fn fill_files<'a>(txn: &mut Txn<'_>, root: &Path, records: impl Iterator<Ite
 #[must_use]
 pub fn known(root: &Path) -> Known {
     let _span = tracing::info_span!("model: what is known of the files read").entered();
-    let all = |pages: &dyn Fn() -> Result<Option<Known>>| pages().ok().flatten();
+    // All of it at one commit, each part read on a thread of its own.
+    let all = |space: &sfs::Space| -> Option<Known> {
+        let read = space.read().ok()?;
+        if !is_begun(&read).ok()? {
+            return None;
+        }
+        let read = &read;
+        std::thread::scope(|scope| {
+            let (layers, records) = (scope.spawn(|| layers(read, root)), scope.spawn(|| records(read)));
+            let files = files(read, root);
+            let (layers, records) = (layers.join().ok()?, records.join().ok()?);
+            Some(Known { files: files.ok()?, layers: layers.ok()?, records: records.ok()? })
+        })
+    };
     let Ok(space) = crate::shared::space(root) else { return Known::default() };
-    let held = all(&|| {
-        let read = space.read()?;
-        is_begun(&read)?.then(|| Ok(Known { files: files(&read, root)?, layers: layers(&read, root)? })).transpose()
-    });
-    if let Some(held) = held {
+    if let Some(held) = all(&space) {
         return held;
     }
     let left = sfs::Space::left_behind(&crate::shared::space_at(root)).ok().flatten();
-    let left = left.and_then(|left| {
-        all(&|| {
-            let read = left.read()?;
-            is_begun(&read)?.then(|| Ok(Known { files: files(&read, root)?, layers: layers(&read, root)? })).transpose()
-        })
-    });
-    left.unwrap_or_default()
+    left.and_then(|left| all(&left)).unwrap_or_default()
+}
+
+/// What the model holds of the layers stored as records: each layer's records by uid.
+///
+/// # Errors
+/// The space is damaged, or holds what is no record.
+pub fn records(pages: &impl Pages) -> Result<Records> {
+    let mut records = Records::new();
+    if !is_begun(pages)? {
+        return Ok(records);
+    }
+    let mut failed = None;
+    sfs::tree::scan_prefix(pages, RECORDS, &[RECORD], &mut |key, value| {
+        let read = layer_recorded(value).and_then(|(recorded, long)| {
+            let name = match long {
+                Some(name) => name,
+                None => std::str::from_utf8(&key[1..]).ok()?.to_owned(),
+            };
+            let (layer, uid) = name.split_once('\u{0}')?;
+            Some((layer.to_owned(), uid.to_owned(), recorded))
+        });
+        match read {
+            Some((layer, uid, recorded)) => drop(records.entry(layer).or_default().insert(uid, recorded)),
+            None => failed = Some(invalid("a layer's record that is none")),
+        }
+        failed.is_none()
+    })?;
+    failed.map_or(Ok(records), Err)
 }
 
 /// What the model holds of the layers: each with what its listing was made by, and what it holds.
@@ -616,6 +753,7 @@ pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()>
     } else {
         fill_files(&mut txn, root, index.file_records())?;
         index.layers_held(root).apply(&mut txn)?;
+        index.records_held().apply(&mut txn)?;
     }
     txn.commit()?;
     // What a space begun anew kept beside it is no longer what is known of the files.
@@ -642,6 +780,20 @@ fn declared(pages: &impl Pages, name: &str) -> Result<Arc<str>> {
     let value = sfs::tree::get_in(pages, INPUTS, &key(TEXT, name))?.ok_or_else(|| invalid("a declaration with no text"))?;
     let text = value.get(8..).and_then(|text| std::str::from_utf8(text).ok());
     text.map(Arc::from).ok_or_else(|| invalid("a declaration's text that is none"))
+}
+
+/// The declarations' texts, all of them in one pass over their keys: each by the key its file's name makes.
+fn texts(pages: &impl Pages) -> Result<HashMap<Vec<u8>, Arc<str>>> {
+    let mut texts: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
+    let mut failed = None;
+    sfs::tree::scan_prefix(pages, INPUTS, &[TEXT], &mut |key, value| {
+        match value.get(8..).and_then(|text| std::str::from_utf8(text).ok()) {
+            Some(text) => drop(texts.insert(key.to_vec(), Arc::from(text))),
+            None => failed = Some(invalid("a declaration's text that is none")),
+        }
+        failed.is_none()
+    })?;
+    failed.map_or(Ok(texts), Err)
 }
 
 /// Every file's record the model holds, by the file.
@@ -671,18 +823,7 @@ pub fn files(pages: &impl Pages, root: &Path) -> Result<HashMap<PathBuf, Record>
     if let Some(failed) = failed {
         return Err(failed);
     }
-    // The declarations' texts, all of them in one pass over their keys: each by the key its file's name makes.
-    let mut texts: HashMap<Vec<u8>, Arc<str>> = HashMap::new();
-    sfs::tree::scan_prefix(pages, INPUTS, &[TEXT], &mut |key, value| {
-        match value.get(8..).and_then(|text| std::str::from_utf8(text).ok()) {
-            Some(text) => drop(texts.insert(key.to_vec(), Arc::from(text))),
-            None => failed = Some(invalid("a declaration's text that is none")),
-        }
-        failed.is_none()
-    })?;
-    if let Some(failed) = failed {
-        return Err(failed);
-    }
+    let mut texts = texts(pages)?;
     let mut read = HashMap::with_capacity(files.len());
     for (path, (name, mut record)) in files {
         if let Some(declaration) = &mut record.declaration {
@@ -779,6 +920,69 @@ mod tests {
         assert!(files(&space.read().unwrap(), root).unwrap().is_empty());
     }
 
+    /// The records of two layers stored as records: creates, an override with what it was made from and a file
+    /// it removes, a move, a delete; texts long and short, a file kept in the store.
+    fn recorded() -> Records {
+        use crate::records::{Content, File, Kind, Op, Record};
+        let record = |n: u64| {
+            let (op, kind) = match n % 5 {
+                0 => (Op::Create, Kind::Node),
+                1 => (Op::Override, Kind::Node),
+                2 => (Op::Move, Kind::Folder),
+                3 => (Op::Delete, Kind::File),
+                _ => (Op::Create, Kind::File),
+            };
+            let mut files = BTreeMap::new();
+            if kind == Kind::Node {
+                let text = format!("type = \"data\"\n# {}\n", "y".repeat(usize::try_from(n * 131 % 4000).unwrap()));
+                files.insert("node.toml".to_string(), File { content: Some(Content::Text(text)), was: (op == Op::Override).then(|| "3f2a".repeat(10)) });
+                files.insert("native.bin".to_string(), File { content: Some(Content::Stored { sha1: "9c1e".repeat(10), size: n * 1000 }), was: None });
+                files.insert("gone.bin".to_string(), File { content: None, was: Some("77aa".repeat(10)) });
+            } else if op == Op::Create {
+                files.insert(String::new(), File { content: Some(Content::Text(String::new())), was: None });
+            }
+            let placed = matches!(op, Op::Create | Op::Move);
+            let record = Record { op, kind, parent: (placed && n % 2 == 0).then(|| format!("uid://parent{n}")), name: placed.then(|| format!("name {n}")), files };
+            (format!("uid://{n:012}"), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
+        };
+        [("game".to_string(), (0..300).map(record).collect()), ("project".to_string(), (300..320).map(record).collect())].into()
+    }
+
+    #[test]
+    fn what_the_model_holds_of_the_layers_records_is_what_was_said_of_them() {
+        let space = sfs::Space::private().unwrap();
+        let mut now = recorded();
+        let mut delta = Delta::default();
+        for (layer, records) in &now {
+            for (uid, recorded) in records {
+                delta.record(layer, uid, Some(recorded));
+            }
+        }
+        let mut txn = space.write().unwrap();
+        fill_files(&mut txn, Path::new("/a project"), std::iter::empty()).unwrap();
+        delta.apply(&mut txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(records(&space.read().unwrap()).unwrap(), now);
+        // One changed, one in a file of another time, one gone, and a layer's last.
+        let mut delta = Delta::default();
+        let game = now.get_mut("game").unwrap();
+        let changed = (game["uid://000000000001"].0.clone(), (1_800_000_000, 0), 5);
+        delta.record("game", "uid://000000000001", Some(&changed));
+        game.insert("uid://000000000001".into(), changed);
+        delta.record("game", "uid://000000000002", None);
+        game.remove("uid://000000000002");
+        for uid in now.remove("project").unwrap().keys() {
+            delta.record("project", uid, None);
+        }
+        let mut txn = space.write().unwrap();
+        delta.apply(&mut txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(records(&space.read().unwrap()).unwrap(), now);
+        // A time is kept to what a file has of it.
+        let time = std::time::UNIX_EPOCH + std::time::Duration::new(1_794_000_000, 123_456_700);
+        assert_eq!(time_of(stamp_of(time)), time);
+    }
+
     #[test]
     fn what_the_model_holds_of_files_is_what_it_was_given_and_what_changed_of_it() {
         let root = Path::new("/a project");
@@ -871,10 +1075,19 @@ mod tests {
             assert!(differing.is_empty(), "{layer}: {} paths differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
         }
         assert_eq!(held_by.len(), walked.len());
+        // And of every layer stored as records the records an index built afresh reads.
+        let (recorded, read_now) = (records(&space.read().unwrap()).unwrap(), index.records_known());
+        for (layer, now) in &read_now {
+            let was = recorded.get(layer).unwrap_or_else(|| panic!("the model has no record of the layer {layer}"));
+            let differing: Vec<_> = was.keys().chain(now.keys()).filter(|uid| was.get(*uid) != now.get(*uid)).collect();
+            assert!(differing.is_empty(), "{layer}: {} records differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+        }
+        assert_eq!(recorded.len(), read_now.len());
+        let of_records: usize = read_now.values().map(BTreeMap::len).sum();
         let holds: usize = walked.values().map(|(_, holds)| holds.len()).sum();
         let usage = space.usage().unwrap();
         eprintln!(
-            "{} files and what {} layers hold at {holds} paths, the same in the model as read afresh; the space holds {} pages, {} of them free",
+            "{} files, what {} layers hold at {holds} paths and {of_records} records, the same in the model as read afresh; the space holds {} pages, {} of them free",
             read.len(),
             walked.len(),
             usage.pages,
