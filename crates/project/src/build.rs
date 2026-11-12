@@ -194,13 +194,17 @@ impl Site<'_> {
         let events = &plan.outputs[at].events;
         let key = self.engine.key(&plan, found, at, None);
         let before = self.engine.store().and_then(|store| store.trace(&key)).map(|trace| trace.value);
-        let made = self.extensions.output(&self.engine, self.index, found, output, true);
+        let made = {
+            let _span = tracing::info_span!("pull: the output made or found kept").entered();
+            self.extensions.output(&self.engine, self.index, found, output, true)
+        };
         let deployed = made.and_then(|given| {
             let value = given.value.as_deref().context("no value")?;
             if let Value::Typed(typed) = value {
                 outcome.notes.clone_from(&typed.notes);
             }
             if !events.deploy.is_empty() {
+                let _span = tracing::info_span!("pull: deployed").entered();
                 self.deploy(&events.deploy, value)?;
             }
             Ok((given.kept, given.hash))

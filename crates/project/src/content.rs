@@ -384,6 +384,35 @@ pub fn sha1(path: &Path) -> io::Result<String> {
     }
 }
 
+/// A file's content's hash as `sha1` gives it, remembered by what tells one version of the file from another -
+/// when it changed and how long it is - so that asking again of a file that did not change reads nothing of it:
+/// what holding a kept output to the files it read costs, at every change of any file. A file that had changed
+/// less than a second before it was read is read again the next time: changed once more in the same moment, to
+/// the same length, it would bear the same time.
+///
+/// # Errors
+/// It cannot be read.
+pub fn sha1_known(path: &Path) -> io::Result<String> {
+    use std::time::{Duration, SystemTime};
+    /// A file's time and length, when it was read, and what it hashed to.
+    type Known = std::collections::HashMap<std::path::PathBuf, ((SystemTime, u64), SystemTime, String)>;
+    static KNOWN: std::sync::LazyLock<std::sync::Mutex<Known>> = std::sync::LazyLock::new(Default::default);
+    // No file of that very path - a chunked or packed one, an object: its hash is read from what says it.
+    let Some(stamp) = std::fs::metadata(path).ok().and_then(|meta| Some((meta.modified().ok()?, meta.len()))) else {
+        return sha1(path);
+    };
+    let known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned();
+    let settled = |read: SystemTime| read.duration_since(stamp.0).is_ok_and(|since| since > Duration::from_secs(1));
+    if let Some((_, _, hash)) = known.filter(|(at, read, _)| *at == stamp && settled(*read)) {
+        return Ok(hash);
+    }
+    let read = SystemTime::now();
+    let hash = sha1(path)?;
+    let mut known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    known.insert(path.to_path_buf(), (stamp, read, hash.clone()));
+    Ok(hash)
+}
+
 /// What a content is stored as at a path in a layer: a manifest's text where it is to be chunked (its chunks put in the
 /// store now), else none - the content itself.
 ///
@@ -671,6 +700,31 @@ pub fn materialize(path: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{exists, head, len, read, read_range, remove, sha1, stored, write};
+
+    #[test]
+    fn a_files_hash_is_remembered_and_read_again_where_the_file_changed() {
+        let dir = std::env::temp_dir().join(format!("pe2-content-known-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.c");
+        let hash = |text: &str| crate::extract::sha1_hex(text.as_bytes());
+        std::fs::write(&file, "one").unwrap();
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("one"));
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("one"));
+        // Changed in the moment it was read in, to the same length - its time may be the same: read again.
+        std::fs::write(&file, "two").unwrap();
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("two"));
+        // Changed long after it was written and read: told by its time.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(long_ago).unwrap();
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("two"));
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("two"), "remembered, as it was read long after it changed");
+        std::fs::write(&file, "six").unwrap();
+        assert_eq!(super::sha1_known(&file).unwrap(), hash("six"));
+        // And where no file of that path is, what `sha1` says.
+        assert!(super::sha1_known(&dir.join("none")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_content_reads_whole_and_by_range() {

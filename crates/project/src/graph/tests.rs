@@ -780,6 +780,60 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Nodes as `Nodes`, counting how often one is asked for.
+struct Counted<'a>(&'a Nodes, &'static str, std::sync::atomic::AtomicUsize);
+
+impl super::exec::World for Counted<'_> {
+    fn node(&self, reference: &toml::Value) -> Option<(&dyn Node, Plan)> {
+        if reference.as_str() == Some(self.1) {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.0.node(reference)
+    }
+}
+
+#[test]
+fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() {
+    let dir = std::env::temp_dir().join(format!("pe2-graph-run-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // An engine for one run: an epoch's.
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap())).for_a_run();
+    let named = |path: &'static str, declared: &str, files: &[(&str, &str)]| {
+        let mut node = Bundle::new(declared, files);
+        node.path = path;
+        node
+    };
+    let both = joining("\"test/a\", \"test/b\"");
+    let nodes = Nodes(
+        vec![
+            named("test/a", PART, &[("part.bin", "head-")]),
+            named("test/b", PART, &[("part.bin", "tail")]),
+            named("test/one", &both, &[]),
+            named("test/two", &both, &[]),
+        ],
+        engine.ops.clone(),
+    );
+    let world = Counted(&nodes, "test/a", std::sync::atomic::AtomicUsize::new(0));
+    let reach = super::exec::Reach { engine: &engine, world: &world };
+    let make = |path: &str| {
+        let (node, plan) = super::exec::World::node(&world, &toml::Value::String(path.into())).unwrap();
+        engine.output_in(Some(reach), &plan, node, "native", None, false).unwrap()
+    };
+    assert!(!make("test/one").kept && !make("test/two").kept);
+    // Both found kept: what they share is held to what it read for the first, and not again for the second.
+    world.2.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(make("test/one").kept && make("test/two").kept);
+    assert_eq!(world.2.load(std::sync::atomic::Ordering::Relaxed), 1, "asked for once, whoever reads it");
+    // Something is made in the run - the part itself, changed: what was found before it is found again, and
+    // what read the part is made again.
+    nodes.0[0].files.lock().unwrap().insert("part.bin".into(), b"HEAD-".to_vec());
+    assert!(!make("test/a").kept);
+    assert!(!make("test/one").kept, "held again to what it read, which changed");
+    assert!(!make("test/two").kept);
+    assert!(make("test/one").kept && make("test/two").kept);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn marks_are_kept_as_they_are() {
     let dir = std::env::temp_dir().join(format!("pe2-graph-marks-{}", std::process::id()));

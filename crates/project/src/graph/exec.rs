@@ -307,21 +307,34 @@ impl<'a> Reach<'a> {
     /// The hash a project's file or folder has now, by how a trace names it (a folder's with a `/`).
     fn entry_hash(&self, read: &str) -> Option<String> {
         if let Some(node_type) = read.strip_prefix(TYPE_READ) {
-            return Some(type_hash(&self.world.assets_of(node_type)));
+            // Every node of the project looked at: once a run, while nothing is made in it.
+            if let Some(hash) = self.engine.found(read) {
+                return Some(hash);
+            }
+            let made = self.engine.made();
+            let hash = type_hash(&self.world.assets_of(node_type));
+            self.engine.find(read.to_string(), made, &hash);
+            return Some(hash);
         }
         match read.strip_suffix('/') {
             Some(folder) => Some(list_hash(&self.world.entries(folder))),
-            None => crate::content::sha1(&self.world.entry(read)?).ok(),
+            None => crate::content::sha1_known(&self.world.entry(read)?).ok(),
         }
     }
 
     /// The hash another node's output has now, by how a trace names it (`<node>#<address>`): its trace's, where that
     /// still holds - its value neither read nor made, though it is not kept (`Engine::traced`) - else made now.
     fn hash(&self, read: &str) -> Option<String> {
+        // Held to what it read once a run, while nothing is made in it, whoever reads it.
+        if let Some(hash) = self.engine.found(read) {
+            return Some(hash);
+        }
+        let made = self.engine.made();
         let (node, address) = read.rsplit_once('#')?;
         let (found, plan) = self.world.node(&toml::Value::String(node.to_string()))?;
         let (output, parameter) = plan.output(address)?;
         if let Some(trace) = self.engine.traced(Some(*self), &plan, found, output, parameter.as_deref()) {
+            self.engine.find(read.to_string(), made, &trace.value);
             return Some(trace.value);
         }
         let read = format!("{}#{address}", id(found));
@@ -1779,6 +1792,21 @@ pub struct Engine {
     pub config: Option<pe2_ext::data::BuildConfig>,
     /// What is made for a run alone, where this is one, by its key: the value, its hash and what it read.
     run: Option<Mutex<HashMap<String, Remembered>>>,
+    /// What a run found holding kept outputs to what they read, where this is one.
+    checked: Option<Checked>,
+}
+
+/// What a run found when it held kept outputs to what they read - the hash another output has, its trace holding;
+/// the hash of all the nodes of a type - for as long as nothing is made in the run: an epoch asks the same of what
+/// its outputs share for each of them, and of each of those for all that read it, which with nothing remembered
+/// is every package's dependencies held again for every package. What is made changes what others read of it, so
+/// what was found before it is found again.
+#[derive(Default)]
+struct Checked {
+    /// How many outputs the run made.
+    made: std::sync::atomic::AtomicU64,
+    /// What was found, and after how many outputs made.
+    found: Mutex<(u64, HashMap<String, String>)>,
 }
 
 /// An output as the engine gives it: its value, where it was made or read now, its hash, and what it read - by which
@@ -1795,7 +1823,7 @@ impl Engine {
     /// An engine keeping retained outputs in a store; none keeps nothing.
     #[must_use]
     pub fn new(ops: Ops, store: Option<Store>) -> Engine {
-        Engine { ops, store, config: None, run: None }
+        Engine { ops, store, config: None, run: None, checked: None }
     }
 
     /// This engine for one run, an epoch or an attach, and dropped with it: what is transient lasts it, so that those reading
@@ -1803,7 +1831,38 @@ impl Engine {
     #[must_use]
     pub fn for_a_run(mut self) -> Engine {
         self.run = Some(Mutex::default());
+        self.checked = Some(Checked::default());
         self
+    }
+
+    /// How many outputs this run made: what is found now is remembered only if it is still as many (`find`).
+    fn made(&self) -> u64 {
+        self.checked.as_ref().map_or(0, |checked| checked.made.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// What this run found of something before, where nothing was made in it since.
+    fn found(&self, what: &str) -> Option<String> {
+        let checked = self.checked.as_ref()?;
+        let made = checked.made.load(std::sync::atomic::Ordering::Acquire);
+        let mut found = checked.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if found.0 != made {
+            *found = (made, HashMap::new());
+        }
+        found.1.get(what).cloned()
+    }
+
+    /// Remember what this run found of something, looked at after `made` outputs were made: only where no other
+    /// was made meanwhile.
+    fn find(&self, what: String, made: u64, hash: &str) {
+        let Some(checked) = &self.checked else { return };
+        let mut found = checked.found.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.made.load(std::sync::atomic::Ordering::Acquire) != made {
+            return;
+        }
+        if found.0 != made {
+            *found = (made, HashMap::new());
+        }
+        found.1.insert(what, hash.to_string());
     }
 
     #[must_use]
@@ -1931,6 +1990,10 @@ impl Engine {
         let known = self.known(reach, plan, node, output);
         let (mut made, reads) =
             evaluate(plan, &self.ops, node, &[(output, parameter)], &known, (self.store.as_ref(), reach));
+        // Made, or tried: what the run found of what others read is found again from here.
+        if let Some(checked) = &self.checked {
+            checked.made.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         let value = made.pop().unwrap_or_else(|| Err("not made".into())).map_err(|e| anyhow!("{e}"))?;
         let hash = super::hash(&value);
         if let Some((run, key)) = remembered {
