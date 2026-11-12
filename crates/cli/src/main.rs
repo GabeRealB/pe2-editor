@@ -1354,6 +1354,8 @@ fn main() -> Result<()> {
     let profile = cli.profile.then(std::time::Instant::now);
     // What the command line asks is a command: its work weighed as one, over the host's own.
     let done = project::schedule::Group::new(project::schedule::Class::Commanded, "pe2-cli").enter(|| run(cli));
+    // Ending in order: what it shares with the project's other processes is left as the next may trust it.
+    project::shared::rest_all();
     if let Some(started) = profile {
         eprintln!("\n{}", project::profile::table(&project::profile::totals()));
         eprintln!("{:.2} s in all", started.elapsed().as_secs_f64());

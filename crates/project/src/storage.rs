@@ -704,6 +704,12 @@ impl Drop for Storage {
             Some(syncing) => drop(syncing.join()),
             None => self.shared.checkpoint(),
         }
+        // The shared space, where it was attached here, is left as whoever next attaches alone may trust it.
+        if let Some(space) = self.shared.space.get().and_then(Option::as_ref)
+            && let Err(e) = space.rest()
+        {
+            eprintln!("{}: the shared space is not left to be trusted: {e}", self.shared.root.display());
+        }
     }
 }
 

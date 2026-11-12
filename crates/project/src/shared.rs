@@ -74,6 +74,14 @@ pub fn ring(root: &Path, space: &sfs::Space, bytes: u64) -> std::io::Result<sfs:
     Ok(ring)
 }
 
+/// Leave what this process shares with the others of its projects as whoever comes next, alone, may trust it
+/// (`sfs::space::rest_all`): what a process does last as it ends in order.
+pub fn rest_all() {
+    if let Err(e) = sfs::space::rest_all() {
+        eprintln!("the shared space is not left to be trusted: {e}");
+    }
+}
+
 fn now() -> u64 {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)

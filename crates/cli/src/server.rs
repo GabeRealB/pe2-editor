@@ -131,6 +131,11 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     if let Some(ring) = &ring {
         ring.let_go();
     }
+    // And the space the project's processes share is left as whoever next attaches alone may trust it: what was
+    // written of it here on disk, and all of it where nothing else has it attached.
+    if let Err(e) = server.shared.rest() {
+        eprintln!("the shared space is not left to be trusted: {e}");
+    }
     println!("stopped");
     Ok(())
 }

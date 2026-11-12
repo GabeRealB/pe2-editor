@@ -288,6 +288,13 @@ fn strays_in(project: &project::Project) -> usize {
     serving.filter(|b| b.can().folder).map_or(0, |b| vfs::strays::strays(at, b).len())
 }
 
+/// Nothing more is said in the shared space from here: it is left as whoever next attaches alone may trust it.
+fn rest(space: &sfs::Space) {
+    if let Err(e) = space.rest() {
+        eprintln!("the shared space is not left to be trusted: {e}");
+    }
+}
+
 /// Say what is served as it changes, and tell the server that it was said: in the filesystem the project's
 /// processes share (`project::shared`), all of it the first time - by what differs from what that holds, which is
 /// little where a holder before this one said it - and after that what changed; the server reads it there. What
@@ -308,7 +315,7 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
         let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(shown) => Some(shown),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return shared.iter().for_each(|space| rest(space)),
         };
         for shown in first.into_iter().chain(newest.try_iter()) {
             // What became of what was due, said in the commit that says what is served after it.

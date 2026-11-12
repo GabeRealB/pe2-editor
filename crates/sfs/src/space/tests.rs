@@ -270,6 +270,8 @@ fn the_second_writer() {
     let Ok(dir) = std::env::var("PE2_SFS_SPACE_SECOND") else { return };
     let space = Space::open(Path::new(&dir)).unwrap();
     run_beside(&space, "second", 400, 200);
+    // Leaving in order, beside the one that goes on: what it wrote is on disk, and nothing is said clean.
+    assert!(!space.rest().unwrap());
 }
 
 /// A prefix's transactions, the tree held every few of them to what they left of that prefix's keys - whoever else
@@ -296,6 +298,14 @@ fn two_processes_write_one_space() {
     assert!(second.wait().unwrap().success());
     after("second", 400, 200, &mut model);
     same(&space.read().unwrap(), &model);
+    assert!(!dir.join("clean").exists(), "said clean by one that left beside another");
+    // The last to leave in order has all of it on disk: whoever attaches next, alone, has it as both left it.
+    assert!(space.rest().unwrap());
+    drop(space);
+    let space = Space::open(&dir).unwrap();
+    assert!(!space.fresh());
+    same(&space.read().unwrap(), &model);
+    lists_hold(&space, &[]);
     drop(space);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -574,6 +584,54 @@ fn attached_to_alone_it_is_trusted_only_as_it_was_had_on_disk() {
     let space = Space::open(&dir).unwrap();
     assert!(space.fresh());
     same(&space.read().unwrap(), &Model::new());
+    drop(space);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
+    let dir = folder("rest");
+    let mut model = Model::new();
+    {
+        let (first, second) = (Arc::new(Space::open(&dir).unwrap()), Space::open(&dir).unwrap());
+        run(&first, "p", 0..40, 100, &mut model);
+        run(&second, "p", 40..80, 100, &mut model);
+        // A view held as it is left holds nothing back for who comes after.
+        let view = first.pinned().unwrap();
+        run(&second, "p", 80..120, 100, &mut model);
+        assert!(!first.rest().unwrap(), "said clean beside another that has it attached");
+        assert!(!dir.join("clean").exists());
+        drop((view, first));
+        assert!(second.rest().unwrap());
+        assert!(dir.join("clean").exists());
+        // Rested again with nothing changed, nothing is done; changed, it is said clean no more until it rests.
+        assert!(second.rest().unwrap());
+        run(&second, "p", 120..121, 100, &mut model);
+        assert!(!dir.join("clean").exists(), "said clean after a change");
+        assert!(second.rest().unwrap());
+    }
+    {
+        let space = Space::open(&dir).unwrap();
+        assert!(!space.fresh());
+        same(&space.read().unwrap(), &model);
+        lists_hold(&space, &[]);
+        // Written on from there, what the view held is free: the space is as large after as before.
+        let before = space.usage().unwrap();
+        run(&space, "p", 121..400, 100, &mut model);
+        let after = space.usage().unwrap();
+        assert!(after.held == 0 && after.pages <= before.pages + 64, "{before:?}, {after:?}");
+        assert!(space.rest().unwrap());
+    }
+    {
+        // One that makes ready to write says so ahead of its first change - and ends without resting.
+        let space = Space::open(&dir).unwrap();
+        assert!(!space.fresh() && dir.join("clean").exists());
+        space.ready();
+        assert!(!dir.join("clean").exists(), "said clean by one that is to write");
+        same(&space.read().unwrap(), &model);
+    }
+    let space = Space::open(&dir).unwrap();
+    assert!(space.fresh(), "trusted, and nobody left it in order");
     drop(space);
     std::fs::remove_dir_all(&dir).unwrap();
 }

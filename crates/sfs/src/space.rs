@@ -34,8 +34,10 @@
 //!   are kept aside (`damaged/`) by the next to attach alone.
 //! - **Trusted** where another process has it attached - it is as its last commit left it - or, attached to alone,
 //!   where it was had on disk at its current generation (`sync`, which says so in `clean`; the first change after
-//!   takes that back, on disk, before it is made). Otherwise it begins empty (`Space::fresh`), for whoever owns
-//!   what it holds to fill again: nothing in it is the only copy of anything.
+//!   takes that back, on disk, before it is made - as does, ahead of it, a process that makes ready to write,
+//!   `ready`). A process that lets go of the space in order has what it wrote on disk, and the last to do so all
+//!   of it, said clean (`rest`). Otherwise it begins empty (`Space::fresh`), for whoever owns what it holds to
+//!   fill again: nothing in it is the only copy of anything.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -260,7 +262,7 @@ enum Backing {
         pins: memmap2::MmapRaw,
         writer: File,
         /// Held shared while the space is attached here; and this process's slot, held alone.
-        _attached: File,
+        attached: File,
         _reader: File,
     },
     Memory {
@@ -576,7 +578,7 @@ impl Space {
             }
         };
         let backing =
-            Backing::Files { dir: dir.to_path_buf(), maps: Mutex::default(), head, free, pins, writer, _attached: attached, _reader: reader };
+            Backing::Files { dir: dir.to_path_buf(), maps: Mutex::default(), head, free, pins, writer, attached, _reader: reader };
         let space = Space::with(backing, slot, false);
         let made = match space.atom(at::MAGIC).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(true),
@@ -625,7 +627,7 @@ impl Space {
     }
 
     /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
-    /// so that the first to write does not.
+    /// so that the first to write does not. For a process that is to write.
     pub fn ready(&self) {
         let Ok(first) = self.chunk(0, true) else { return };
         // And its first pages, the two a commit is written to and the list of free ones touched: the first write
@@ -663,6 +665,12 @@ impl Space {
         for page in 0..PINNED / PAGE {
             // SAFETY: within what the readers say.
             touch(unsafe { self.pinned_at().add(page * PAGE) });
+        }
+        // And said, on disk, to be as it was had there no more: what the first change after would do, and wait for.
+        if self.atom(at::CLEAN).load(Ordering::SeqCst) != 0
+            && let Ok(mut held) = self.write()
+        {
+            let _ = held.touch();
         }
     }
 
@@ -1195,9 +1203,41 @@ impl Space {
     /// # Errors
     /// It cannot be flushed, or the saying written; or it is damaged.
     pub fn sync(&self) -> io::Result<bool> {
-        let Backing::Files { dir, .. } = &self.backing else { return Ok(true) };
         // Under the writer's lock: what is flushed is one commit, whole.
         let held = self.write()?;
+        self.synced(&held)
+    }
+
+    /// Leave the space as whoever next attaches alone may trust it: have on disk what this process wrote of it
+    /// and, where no other has it attached, all of it, said clean (`sync`) - what each process does as it lets
+    /// go of the space in order, so that the last to go leaves it whole. One that ends without leaves it to begin
+    /// empty. Whether it is said clean; nothing is done where it is already.
+    ///
+    /// # Errors
+    /// As `sync`.
+    pub fn rest(&self) -> io::Result<bool> {
+        let Backing::Files { attached, .. } = &self.backing else { return Ok(true) };
+        if self.atom(at::CLEAN).load(Ordering::SeqCst) != 0 {
+            return Ok(true);
+        }
+        // Under the writer's lock: nobody attaches meanwhile - who does takes it first - and nobody else rests.
+        let held = self.write()?;
+        if self.atom(at::WROTE + self.slot * 8).load(Ordering::SeqCst) != 0 {
+            self.flush()?;
+        }
+        // Whether any other has it attached: asked by holding alone what each holds shared, for a moment.
+        attached.unlock()?;
+        let alone = attached.try_lock().is_ok();
+        if alone {
+            attached.unlock()?;
+        }
+        attached.lock_shared()?;
+        if alone { self.synced(&held) } else { Ok(false) }
+    }
+
+    /// `sync`, by who has the writer's lock.
+    fn synced(&self, held: &Txn<'_>) -> io::Result<bool> {
+        let Backing::Files { dir, .. } = &self.backing else { return Ok(true) };
         self.flush()?;
         for slot in 0..READERS {
             if slot == self.slot || self.atom(at::WROTE + slot * 8).load(Ordering::SeqCst) == 0 {
@@ -1231,7 +1271,6 @@ impl Space {
             File::open(dir)?.sync_all()?;
         }
         self.atom(at::CLEAN).store(1, Ordering::SeqCst);
-        drop(held);
         Ok(true)
     }
 
@@ -1745,12 +1784,25 @@ impl Drop for Txn<'_> {
     }
 }
 
+/// The spaces this process has attached (`shared`), each by its folder.
+static OPEN: Mutex<Vec<(PathBuf, std::sync::Weak<Space>)>> = Mutex::new(Vec::new());
+
+/// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::rest`): what a
+/// process does last as it ends in order - one that ends runs nothing more of its own, and whatever of it still
+/// holds a space then never lets go of it.
+///
+/// # Errors
+/// As `Space::rest`, of the first that could not.
+pub fn rest_all() -> io::Result<()> {
+    let attached: Vec<Arc<Space>> = lock(&OPEN).iter().filter_map(|(_, space)| space.upgrade()).collect();
+    attached.iter().try_for_each(|space| space.rest().map(|_| ()))
+}
+
 /// The spaces this process has attached, one a folder: a second asking for one gets the same.
 ///
 /// # Errors
 /// As `Space::open`.
 pub fn shared(dir: &Path) -> io::Result<Arc<Space>> {
-    static OPEN: Mutex<Vec<(PathBuf, std::sync::Weak<Space>)>> = Mutex::new(Vec::new());
     std::fs::create_dir_all(dir)?;
     let dir = dir.canonicalize()?;
     let mut open = lock(&OPEN);
