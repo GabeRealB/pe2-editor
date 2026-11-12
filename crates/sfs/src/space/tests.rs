@@ -672,3 +672,121 @@ fn bench_tree() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// What keeping a project's model in trees would cost, before any of it is built: a commit of as many puts as an
+/// edit changes keys, over as many trees as the model is in; what a reader pinned for long costs the space; and
+/// what filling the trees whole takes.
+#[test]
+#[ignore = "a measurement"]
+#[expect(clippy::cast_precision_loss, clippy::too_many_lines, reason = "a measurement, said as it is taken")]
+fn bench_model() {
+    use std::fmt::Write as _;
+    // Keys as a model's are: a kind, then a path; values as long as a node of the stack, or an asset.
+    let key = |n: u64| format!("p/stages/{:03}/rooms/{:04}/props/item-{:06}", n % 17, n % 1009, n).into_bytes();
+    let fill = |space: &Space, trees: usize, each: u64, value: &[u8]| {
+        for tree in 0..trees {
+            for batch in 0..each / 1000 {
+                let mut txn = space.write().unwrap();
+                for n in batch * 1000..batch * 1000 + 1000 {
+                    tree::put(&mut txn, tree, &key(n), value).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+        }
+    };
+    let median = |mut took: Vec<Duration>| {
+        took.sort_unstable();
+        (took[took.len() / 2].as_secs_f64() * 1e6, took[took.len() * 99 / 100].as_secs_f64() * 1e6)
+    };
+    let dir = folder("bench-model");
+    for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
+        for trees in [4usize, 12] {
+            // 40,000 keys a tree, of 120 bytes each: what the stack of a project of that many entries is.
+            let filled = Instant::now();
+            fill(&space, trees, 40_000, &[7u8; 120]);
+            let filled = filled.elapsed();
+            let usage = space.usage().unwrap();
+            let mut said = format!(
+                "{name}, {trees} trees of 40,000: filled {:.2} us a put, {} pages;",
+                filled.as_secs_f64() * 1e6 / (trees as f64 * 40_000.0),
+                usage.pages
+            );
+            let mut rng = Rng::of("model", trees as u64);
+            for puts in [8usize, 15, 30] {
+                let took: Vec<Duration> = (0..3000)
+                    .map(|_| {
+                        let started = Instant::now();
+                        let mut txn = space.write().unwrap();
+                        for put in 0..puts {
+                            tree::put(&mut txn, put % trees, &key(rng.below(40_000)), &[9u8; 120]).unwrap();
+                        }
+                        txn.commit().unwrap();
+                        started.elapsed()
+                    })
+                    .collect();
+                let (middle, most) = median(took);
+                let _ = write!(said, " a commit of {puts} puts {middle:.1} us (99th {most:.1});");
+            }
+            eprintln!("{said}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    // A reader pinned through many commits: what the space grows by while it is, and after it let go.
+    for commits in [1_000u64, 10_000] {
+        let space = Space::private().unwrap();
+        fill(&space, 4, 40_000, &[7u8; 120]);
+        let mut rng = Rng::of("pinned", commits);
+        let mut edit = |space: &Space| {
+            let mut txn = space.write().unwrap();
+            for put in 0..8 {
+                tree::put(&mut txn, put % 4, &key(rng.below(40_000)), &[9u8; 120]).unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        let before = space.usage().unwrap();
+        for _ in 0..commits {
+            edit(&space);
+        }
+        let unpinned = space.usage().unwrap();
+        let pin = space.read().unwrap();
+        for _ in 0..commits {
+            edit(&space);
+        }
+        let pinned = space.usage().unwrap();
+        drop(pin);
+        for _ in 0..commits {
+            edit(&space);
+        }
+        let after = space.usage().unwrap();
+        eprintln!(
+            "{commits} commits of 8 puts: {} pages before; +{} with nothing pinned; +{} with a reader pinned throughout \
+             ({:.1} a commit); +{} more once it let go ({} listed free)",
+            before.pages,
+            unpinned.pages - before.pages,
+            pinned.pages - unpinned.pages,
+            (pinned.pages - unpinned.pages) as f64 / commits as f64,
+            after.pages - pinned.pages,
+            after.free
+        );
+    }
+    // A model filled whole, in the order of its keys: 170,000 of them, a thousand a commit.
+    let space = Space::private().unwrap();
+    let mut keys: Vec<Vec<u8>> = (0..170_000u64).map(key).collect();
+    keys.sort();
+    let filled = Instant::now();
+    for batch in keys.chunks(1000) {
+        let mut txn = space.write().unwrap();
+        for key in batch {
+            tree::put(&mut txn, 0, key, &[7u8; 120]).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let usage = space.usage().unwrap();
+    let bytes: usize = keys.iter().map(|key| key.len() + 120).sum();
+    eprintln!(
+        "170,000 keys put in their order: {:.0} ms, {} pages ({:.0}% of them what was put)",
+        filled.elapsed().as_secs_f64() * 1e3,
+        usage.pages,
+        bytes as f64 * 100.0 / (usage.pages as f64 * 4096.0)
+    );
+}
