@@ -1,8 +1,9 @@
 //! The editor's own tasks, run as `cargo xtask <task>`:
 //!
 //! - `dist [--tests] [--out <folder>]`: the editor built and laid out as it ships, in
-//!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, what they are built
-//!   with and under which license in `LICENSES.txt` (`licenses::Listing::document`, each extension's own in its `licenses/`), and beside them in
+//!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, what a user reads
+//!   of them in `docs/` (the workspace's `docs/`), what they are built with and under which license in
+//!   `LICENSES.txt` (`licenses::Listing::document`, each extension's own in its `licenses/`), and beside them in
 //!   `extensions/` the extensions built apart from the editor, each a folder as one is kept (`<id>.extension/`): its
 //!   component, its manifest and what its crate has to be read (`docs/`, `licenses/`, ...), and what it ships -
 //!   what each fetches onto a machine its manifest says (`[[setup]]`). A project adds them from there by id (`pe2-cli project extension add
@@ -158,6 +159,8 @@ fn dist(options: &Options) -> Result<PathBuf> {
         let file = format!("{program}{}", std::env::consts::EXE_SUFFIX);
         copy(&release.join(&file), &tree.join(&file))?;
     }
+    // What a user reads of the editor, as an extension ships its own.
+    copy(&workspace.join(DOCS), &tree.join(DOCS))?;
     // What the programs are built with, each license's text with it: what they say themselves (`pe2-cli licenses`).
     let listing = licenses::listing();
     let built_for = platform()?;
@@ -176,6 +179,9 @@ fn dist(options: &Options) -> Result<PathBuf> {
     }
     Ok(tree)
 }
+
+/// The folder of what a user reads of the editor: the workspace's, and the one beside the editor.
+const DOCS: &str = "docs";
 
 /// The file beside the editor saying what it is built with, each license's text with it.
 const LICENSES: &str = "LICENSES.txt";
