@@ -14,7 +14,7 @@ On other machines, or to use your own, install GNU binutils built for `mips-linu
 
 ## macOS
 
-Everything is fetched for Apple silicon: there is nothing to install.
+Everything is fetched for Apple silicon: there is nothing to install. What is fetched runs on macOS 15 or newer.
 
 On Intel Macs nothing is fetched yet: pe2.psx does not build there.
 

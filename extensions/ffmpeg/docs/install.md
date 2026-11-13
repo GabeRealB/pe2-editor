@@ -1,9 +1,11 @@
 # Installing ffmpeg
 
-Nothing: pe2.ffmpeg fetches `ffmpeg` and `ffprobe` 9.0.2, built with libx264, once you trust it - for Linux on x86_64
-from BtbN's static FFmpeg-Builds (glibc 2.28 or newer), for Windows from gyan.dev's builds, for macOS on Apple silicon
-(macOS 12 or newer) from Martin Riedl's builds.
-Each is held to its hashes, and kept for every project on this computer.
+Nothing: pe2.ffmpeg fetches `ffmpeg` and `ffprobe` 9.0.2 once you trust it, built by the editor's project from FFmpeg's
+sources with the codec, format, subtitle and graphics card libraries common builds of it have - libx264 among them -
+and published with the editor: for Linux on
+x86_64 (glibc 2.28 or newer), Windows on x86_64, and macOS on Apple silicon (macOS 15 or newer). Each is held to its
+hashes, and kept for every project on this computer. Each release holds the licenses of everything built into it and
+every source it was built from.
 
 Elsewhere - an Intel Mac, Linux on ARM - nothing is fetched, and the system's are run, which have to be on the search
 path and have libx264 for the lossless encoding pe2.ffmpeg writes by default:

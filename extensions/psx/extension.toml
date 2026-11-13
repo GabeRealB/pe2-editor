@@ -5,7 +5,7 @@ provides = ["package-target@1.0.0"]
 unsandboxed = true
 description = "The PlayStation target: builds packages into the images the game loads, with the compilers it fetches."
 license = "CC0-1.0"
-repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"
+repository = "https://github.com/GabeRealB/pe2-editor"
 docs = "docs/index.md"
 install = "docs/install.md"
 

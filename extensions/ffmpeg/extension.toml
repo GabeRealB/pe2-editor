@@ -4,52 +4,35 @@ provides = ["video-container@1.0.0"]
 unsandboxed = true
 description = "Video files written and read through ffmpeg, offered as the video-container service."
 license = "CC0-1.0"
-repository = "https://github.com/GabeRealB/parasite-eve-2-decomp"
+repository = "https://github.com/GabeRealB/pe2-editor"
 docs = "docs/index.md"
 install = "docs/install.md"
 
-# ffmpeg 9.0.2 with libx264, the same release everywhere: BtbN's static build for Linux (a month's last build, kept for
-# two years), gyan.dev's for Windows (a release each version) and Martin Riedl's for Apple silicon (every build kept).
+# FFmpeg 9.0.2, built by the editor from its sources with the libraries it is released with (libx264 among them), for
+# each platform alike: a release of the editor's repository (`cargo xtask packages`, `packages/ffmpeg`).
 [[setup]]
-name = "FFmpeg 9.0.2, from BtbN's FFmpeg-Builds"
+name = "FFmpeg 9.0.2, built by the PE2 editor"
 license = "GPL-3.0-or-later"
-copyright = "the FFmpeg developers and its libraries' authors; built by BtbN's FFmpeg-Builds"
+copyright = "the FFmpeg developers; each library's authors, as its license in licenses/ says"
 platform = "linux-x86_64"
-url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0.tar.xz"
-sha256 = "73e29a56974ae5a651133a04584c7483b21afe941e17dc91d79814a758b608d3"
-
-[setup.take]
-"ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0/bin/ffmpeg" = { to = "ffmpeg", sha256 = "384742b75419584d065bbf372613f9f7e8ccf22525b421c16a2ee679a78ee748" }
-"ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0/bin/ffprobe" = { to = "ffprobe", sha256 = "ae9051af68f52e7ad5706b442577689c74c02da618ca1590caf1ac7199f2931c" }
-"ffmpeg-n9.0.2-39-g7adfbe40dc-linux64-gpl-9.0/LICENSE.txt" = { to = "ffmpeg-license/LICENSE.txt", sha256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903" }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/ffmpeg-9.0.2-1/ffmpeg-9.0.2-linux-x86_64.zip"
+sha256 = "6c69e15d146018c53f18de8ebd0be37c9aa0135bd02f6d36f926bb8b736146d8"
+take = { "ffmpeg" = { to = "ffmpeg", sha256 = "f5cfca1ec22a3bb43bd1260531c190eae2620e87852d91c4579ab00f5cfbc115" }, "ffprobe" = { to = "ffprobe", sha256 = "62f53ec4334f28a535703f9356283059f4a8e7abe8974a499f43ef3dad474f12" } }
 
 [[setup]]
-name = "FFmpeg 9.0.2, from gyan.dev's builds"
+name = "FFmpeg 9.0.2, built by the PE2 editor"
 license = "GPL-3.0-or-later"
-copyright = "the FFmpeg developers and its libraries' authors; built by Gyan Doshi (gyan.dev)"
+copyright = "the FFmpeg developers; each library's authors, as its license in licenses/ says"
+platform = "macos-aarch64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/ffmpeg-9.0.2-1/ffmpeg-9.0.2-macos-aarch64.zip"
+sha256 = "760b50b155a71ca9e989034466444b66af6bf49b98a1eedfd0badbaf686d392a"
+take = { "ffmpeg" = { to = "ffmpeg", sha256 = "ec774e2bb32173aefa31f9f12d95e89873a162d11e0af3f5503ef69a47166ed8" }, "ffprobe" = { to = "ffprobe", sha256 = "688ed33755088376302427589c5008a85570ad17a1a9582bd08affb4d7fea3ee" } }
+
+[[setup]]
+name = "FFmpeg 9.0.2, built by the PE2 editor"
+license = "GPL-3.0-or-later"
+copyright = "the FFmpeg developers; each library's authors, as its license in licenses/ says"
 platform = "windows-x86_64"
-url = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip"
-sha256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
-
-[setup.take]
-"ffmpeg-9.0.2-essentials_build/bin/ffmpeg.exe" = { to = "ffmpeg.exe", sha256 = "3256173f3f8bffd7df12227c68adf68025edb1832273a9530688a7bb1ed8edec" }
-"ffmpeg-9.0.2-essentials_build/bin/ffprobe.exe" = { to = "ffprobe.exe", sha256 = "f0d36ecbbdd3bcfac3efa078c96c7271c2e68b3810595552ac3b7f17e9a65c52" }
-"ffmpeg-9.0.2-essentials_build/LICENSE" = { to = "ffmpeg-license/LICENSE.txt", sha256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903" }
-
-[[setup]]
-name = "FFmpeg 9.0.2, from Martin Riedl's builds"
-license = "GPL-3.0-or-later"
-copyright = "the FFmpeg developers and its libraries' authors; built by Martin Riedl"
-platform = "macos-aarch64"
-url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
-sha256 = "c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
-take = { "ffmpeg" = { to = "ffmpeg", sha256 = "2e11c6f90993cdb79fff84d3f90044d28316b310e75b3e030cfc9a54f2c9d384" } }
-
-[[setup]]
-name = "FFprobe 9.0.2, from Martin Riedl's builds"
-license = "GPL-3.0-or-later"
-copyright = "the FFmpeg developers and its libraries' authors; built by Martin Riedl"
-platform = "macos-aarch64"
-url = "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffprobe.zip"
-sha256 = "fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6"
-take = { "ffprobe" = { to = "ffprobe", sha256 = "2738aa46a7f9acbc8ab09a6715554c90f7de603171ac403726765685df6a0059" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/ffmpeg-9.0.2-1/ffmpeg-9.0.2-windows-x86_64.zip"
+sha256 = "cc4317524a17135af039e7aeb3fe1bd06215eb912a5ecde13dfa493c6e84b2e6"
+take = { "ffmpeg.exe" = { to = "ffmpeg.exe", sha256 = "b10b7c027e831c1429b2704f19607f63870f10482b24bc3da5e244bc0a2cf061" }, "ffprobe.exe" = { to = "ffprobe.exe", sha256 = "e80b55e6adcadb26bda271567cbab111469ef6ac4aedf9b1597c94a984b28a11" } }
