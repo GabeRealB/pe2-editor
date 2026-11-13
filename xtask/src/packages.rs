@@ -920,17 +920,27 @@ fn setup(config: &Config, name: &str, tag: &str, built: &[Archive]) -> Result<St
     Ok(out)
 }
 
-/// Every file of the release with its SHA-256, as `sha256sum` writes them, by its path within it.
+/// Every file the release serves with its SHA-256, as `sha256sum` writes them: each asset by its name, as the
+/// repository serves them all in one folder, so that `sha256sum -c` checks a release downloaded as it is; not
+/// `NOTES.md`, which is the release's page.
 fn sums(release: &Path) -> Result<String> {
     let mut files = Vec::new();
     crate::gather(release, "", &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = String::new();
-    for (name, bytes, _) in files {
-        let name = name.trim_start_matches('/');
-        if name != "SHA256SUMS" {
-            let _ = writeln!(out, "{}  {name}", hex(&Sha256::digest(&bytes)));
+    let mut named: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (path, bytes, _) in files {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        if name == "SHA256SUMS" || name == "NOTES.md" {
+            continue;
         }
+        ensure!(
+            named.insert(name.clone(), bytes).is_none(),
+            "{name} twice in {}: the release serves one",
+            release.display()
+        );
+    }
+    let mut out = String::new();
+    for (name, bytes) in named {
+        let _ = writeln!(out, "{}  {name}", hex(&Sha256::digest(&bytes)));
     }
     Ok(out)
 }
