@@ -96,8 +96,8 @@ license = "PSF-2.0"
 copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "linux-x86_64"
 url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-linux-x86_64.zip"
-sha256 = "f344590f5634d9d9c5a6aea8b0c29e659685c095bbc7203b4007614bb3a49c96"
-take = { "bin/python3" = { to = "python/bin/python3", sha256 = "29b9f06739118377d755e54ccd7b79c4dc27bf144ceeebd98815308c0986213b" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
+sha256 = "5d5c3a8908d8d8cca02b82772246dfec374983ba9f2c73ce2f6ff05eb8b4f506"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "474b916b5f30dbf1982e6ab41ebce57e9f9dd5c7718742dfe8d5389ff7a125bf" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
 
 [[setup]]
 name = "Python 3.14.10, built by the PE2 editor"
@@ -105,8 +105,8 @@ license = "PSF-2.0"
 copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "macos-aarch64"
 url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-macos-aarch64.zip"
-sha256 = "1ddc3b36a134ea997dc28fe7b9e7b29cfd1890632103ba950f14b3284e2bc2a0"
-take = { "bin/python3" = { to = "python/bin/python3", sha256 = "d31732194ea4c88cb1082c443e13329b38fdcd249c1c2670e854a393f459f432" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
+sha256 = "1c58f7b7581a7f014968b7180def6b60ff8a3555ef6ef952a849b445275e73e0"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "526289ce9c20f0c856c3f6713c7a7823b39ac125bb91cd099adeeb6ed4ebb4df" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
 
 [[setup]]
 name = "Python 3.14.10, built by the PE2 editor"
@@ -114,8 +114,8 @@ license = "PSF-2.0"
 copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "windows-x86_64"
 url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-windows-x86_64.zip"
-sha256 = "54969dc9475a7618d84a968daaf945de5c677a2e3fde186982b7b1322eafdba6"
-take = { "bin/python3.exe" = { to = "python/bin/python3.exe", sha256 = "526d54c2b139a2a05fa1ef8b783a5b2ea102dca966520d02c2eee09ed7740173" }, "lib" = { to = "python/lib", sha256 = "aeee01c469104f15b35fe8c09fbea24f05c35d4dcfc2b4374231e6d3eca98a46" } }
+sha256 = "0c10b39888e06e98d914c60420f5cfe3d645033054e08c3bc0f0fd17a92342a2"
+take = { "bin/python3.exe" = { to = "python/bin/python3.exe", sha256 = "c23ad2fd4d4549ec22fcc0a60a01bc96661bc6d02fd7bfb2a43c2cf3e3a2c6f2" }, "lib" = { to = "python/lib", sha256 = "aeee01c469104f15b35fe8c09fbea24f05c35d4dcfc2b4374231e6d3eca98a46" } }
 
 [[setup]]
 name = "maspsx, with this extension's patches"
