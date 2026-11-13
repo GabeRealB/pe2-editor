@@ -8,8 +8,10 @@
 //! grammar - lists, `&&` and `||`, pipelines, subshells and groups, `if`, `for`, `case`, `while` and `until`,
 //! functions, here-documents and redirections - parameters and their expansions (`${x-y}`, `${x:+y}`, `${#x}` and the
 //! like), command substitution and field splitting, without pathname expansion or jobs; and as builtins the commands
-//! those scripts run: `.`, `:`, `cat`, `cmp`, `echo`, `eval`, `exit`, `export`, `false`, `mkdir`, `printf` (`%s` only),
-//! `return`, `rm`, `sed`, `set`, `shift`, `test` and `[`, `true`, `unset`. Anything else fails by name. A pipeline runs
+//! those scripts run: `.`, `:`, `cat`, `cd`, `cmp`, `echo`, `eval`, `exit`, `export`, `false`, `mkdir`, `printf` (`%s`
+//! only), `return`, `rm`, `sed`, `set`, `shift`, `test` and `[`, `true`, `unset`; `PWD` is the folder it is in, as an
+//! absolute path, so that a build can give it relative paths and have them made absolute here, where they do not
+//! reach what the build hashes. Anything else fails by name. A pipeline runs
 //! its commands one after the other, each given what the one before wrote.
 
 const std = @import("std");
@@ -36,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
         shell.dir = Io.Dir.cwd().openDir(io, a[1], .{}) catch |e| std.process.fatal("{s}: {t}", .{ a[1], e });
         a = a[2..];
     }
+    shell.setPwd() catch |e| std.process.fatal("sh: the folder's path: {t}", .{e});
     if (a.len == 0) std.process.fatal("sh: no script", .{});
     var source: []const u8 = undefined;
     var rest: []const []const u8 = undefined;
@@ -704,6 +707,13 @@ const Shell = struct {
         return process_stdin.?;
     }
 
+    /// `PWD` made the folder relative paths are found in.
+    fn setPwd(sh: *Shell) !void {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try sh.dir.realPath(sh.io, &buffer);
+        try sh.variables.put(sh.arena, "PWD", try sh.arena.dupe(u8, buffer[0..n]));
+    }
+
     fn fail(sh: *Shell, comptime format: []const u8, args: anytype) RunError {
         sh.why = std.fmt.allocPrint(sh.arena, format, args) catch "?";
         return error.Failed;
@@ -1001,6 +1011,10 @@ const Shell = struct {
                 if (a.len > 0 and a[0] == '-') continue;
                 sh.dir.deleteFile(sh.io, a) catch {};
             }
+        } else if (eq(u8, name, "cd")) {
+            if (args.len != 1) return sh.fail("cd: one folder", .{});
+            sh.dir = sh.dir.openDir(sh.io, args[0], .{}) catch return sh.fail("cd: {s}", .{args[0]});
+            sh.setPwd() catch return sh.fail("cd: the path of {s}", .{args[0]});
         } else if (eq(u8, name, "mkdir")) {
             for (args) |a| {
                 if (a.len > 0 and a[0] == '-') continue;

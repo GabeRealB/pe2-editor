@@ -236,17 +236,24 @@ pub fn build(b: *std.Build) void {
         libpath.appendSlice(b.allocator, e) catch @panic("OOM");
     }
     for (emulations) |e| {
+        // Run in the folder it writes into, given the script and ld's sources there as paths the shell makes
+        // absolute. The emulation's source starts with the name it has in binutils' own build (`#line`), which its
+        // assertions say: the folder it is written into is named by a hash of the step, which zig makes of where the
+        // files it reads are, and would name ld after where the project is.
         const run = b.addRunArtifact(sh);
-        run.addArg("-C");
-        const out = run.addOutputDirectoryArg2(b.fmt("e{s}", .{e}), .{ .make_absolute = true });
-        run.addArgs(&.{ "-c", "mkdir ldscripts; s=$1; shift; . \"$s\" \"$@\"", "sh" });
-        run.addFileArg2(upstream.path("ld/genscripts.sh"), .{ .make_absolute = true });
-        run.addDirectoryArg2(upstream.path("ld"), .{ .make_absolute = true });
+        run.addArgs(&.{ "-c", b.fmt(
+            "o=$1; s=$PWD/$2; d=$PWD/$3; shift 3; cd \"$o\" && mkdir ldscripts && ( . \"$s\" \"$d\" \"$@\" ) && " ++
+                "{{ echo '#line 1 \"e{s}.c\"'; cat e{s}.c; }} > e{s}.named.c",
+            .{ e, e, e },
+        ), "sh" });
+        const out = run.addOutputDirectoryArg(b.fmt("e{s}", .{e}));
+        run.addFileArg(upstream.path("ld/genscripts.sh"));
+        run.addDirectoryArg(upstream.path("ld"));
         // libdir, prefix, exec_prefix, host, target, its alias, the dependency folder (none), the library path (none
         // given), the emulations with library paths, the native library folders, a sysroot (none), init/fini arrays.
         run.addArgs(&.{ prefix ++ "/lib", prefix, prefix, "build", target_canonical, target_alias, "", "", libpath.items, "/usr/local/lib /lib /usr/lib", "no", "yes", e, target_alias });
         run.expectExitCode(0);
-        ld.root_module.addCSourceFile(.{ .file = out.path(b, b.fmt("e{s}.c", .{e})), .flags = &ld_flags });
+        ld.root_module.addCSourceFile(.{ .file = out.path(b, b.fmt("e{s}.named.c", .{e})), .flags = &ld_flags });
     }
 
     // nm and objcopy.

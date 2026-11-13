@@ -8,7 +8,9 @@
 //!    `target/packages/zig/`.
 //! 2. For each package asked for (all, where none is), its project built for each platform, into
 //!    `target/packages/build/<package>/<platform>/`, with nothing it fetched before: what it fetches then is exactly
-//!    what it is built from. On the platform it runs on, the preprocessor built is held to clang's (`check_cpp`).
+//!    what it is built from. On the platform it runs on, the preprocessor built is held to clang's (`check_cpp`). The
+//!    projects are built in a copy of `packages/` (`target/packages/projects/`, `mirror`), where zig makes what it
+//!    makes in a project's folder.
 //! 3. What it fetched resolved to its components (`packages/components.toml`), by the hashes its manifests declare:
 //!    a source no entry describes, or an entry whose URL does not name its version, fails the task by name.
 //! 4. Each platform's build packed into `<package>-<version>-<platform>.zip`, deterministically - entries sorted, no
@@ -35,7 +37,8 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 
-pub const USAGE: &str = "cargo xtask packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]";
+pub const USAGE: &str =
+    "cargo xtask packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]";
 
 /// What is asked of the task.
 struct Options {
@@ -155,7 +158,8 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
         config.platforms.iter().map(|(p, t)| (p.clone(), t.clone())).collect()
     } else {
         let named = options.platforms.iter().map(|p| {
-            let triple = config.platforms.get(p).with_context(|| format!("packages.toml builds for no platform {p}"))?;
+            let triple =
+                config.platforms.get(p).with_context(|| format!("packages.toml builds for no platform {p}"))?;
             Ok((p.clone(), triple.clone()))
         });
         named.collect::<Result<_>>()?
@@ -172,10 +176,13 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
         (zig, Some(tarball))
     };
     let here = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let copy = work.join("projects");
+    mirror(&packages, &copy)?;
+    let date = commit_time(&packages)?;
     for name in &names {
         let package = &config.packages[name];
         let tag = package.tag(name);
-        let project = packages.join(name);
+        let project = copy.join(name);
         ensure!(project.join("build.zig").is_file(), "no project of {name} ({})", project.display());
         // What zig fetched for the project, made again by this build alone: what it keeps there is what the package
         // is built from.
@@ -190,7 +197,7 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
         std::fs::create_dir_all(release.join("sources")).with_context(|| release.display().to_string())?;
         let mut built = Vec::new();
         for (platform, triple) in &platforms {
-            let out = build(&zig, &project, &work, name, platform, triple)?;
+            let out = build(&zig, &project, &work, &date, name, platform, triple)?;
             if name == "aro-cpp" && *platform == here {
                 let cpp = out.join(format!("cpp{}", std::env::consts::EXE_SUFFIX));
                 check_cpp(&zig, &cpp, &project.join("tests"), &work.join("cpp-check"))?;
@@ -199,7 +206,7 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
             built.push(Archive { platform: platform.clone(), path, built: out });
         }
         let zig_dir = zig.parent().context("zig is in a folder")?;
-        let used = resolve(&components, &packages, &project, zig_dir)?;
+        let used = resolve(&components, &copy, &project, zig_dir)?;
         for archive in &built {
             pack(name, archive, &used)?;
         }
@@ -232,10 +239,14 @@ fn publish(config: &Config, tag: &str, release: &Path) -> Result<()> {
         .stderr(std::process::Stdio::null())
         .status()
         .context("gh does not run")?;
-    ensure!(!published.success(), "{tag} is published already: a package built anew is a new `release` of it in packages.toml");
+    ensure!(
+        !published.success(),
+        "{tag} is published already: a package built anew is a new `release` of it in packages.toml"
+    );
     let mut files = Vec::new();
     crate::gather(release, "", &mut files)?;
-    let mut assets: Vec<PathBuf> = files.iter().map(|(name, _, _)| release.join(name.trim_start_matches('/'))).collect();
+    let mut assets: Vec<PathBuf> =
+        files.iter().map(|(name, _, _)| release.join(name.trim_start_matches('/'))).collect();
     assets.retain(|asset| asset.file_name().is_some_and(|name| name != "NOTES.md"));
     assets.sort();
     let status = Command::new("gh")
@@ -438,8 +449,16 @@ fn seed() -> u64 {
     nanos ^ (u64::from(std::process::id()) << 32)
 }
 
-/// A package's project built for one platform: the folder it was installed into.
-fn build(zig: &Path, project: &Path, work: &Path, package: &str, platform: &str, triple: &str) -> Result<PathBuf> {
+/// A package's project built for one platform, dated `date` (`commit_time`): the folder it was installed into.
+fn build(
+    zig: &Path,
+    project: &Path,
+    work: &Path,
+    date: &str,
+    package: &str,
+    platform: &str,
+    triple: &str,
+) -> Result<PathBuf> {
     let out = work.join("build").join(package).join(platform);
     if out.exists() {
         std::fs::remove_dir_all(&out).with_context(|| out.display().to_string())?;
@@ -455,23 +474,41 @@ fn build(zig: &Path, project: &Path, work: &Path, package: &str, platform: &str,
         .arg("--prefix")
         .arg(&out)
         // Zig's global cache, where the release's sources are read from: it keeps every package fetched. Its local
-        // cache stays the project's own (`packages/<package>/.zig-cache`), so that what is generated there is compiled
-        // by a path relative to the project, as the sources are, and no path of this machine's reaches what is built.
+        // cache stays the project's own (`<project>/.zig-cache`, in the copy), so that what is generated there is
+        // compiled by a path relative to the project, as the sources are, and no path of this machine's reaches what
+        // is built.
         .env("ZIG_GLOBAL_CACHE_DIR", work.join("global"))
         // The date a source reads (`__DATE__`, `__TIME__`: SVT-AV1 prints its build's) is the commit's, which clang
         // takes from here: the same build of a commit, whenever it is made.
-        .env("SOURCE_DATE_EPOCH", commit_time(project)?)
+        .env("SOURCE_DATE_EPOCH", date)
         .status()
         .with_context(|| format!("{} does not run", zig.display()))?;
     ensure!(status.success(), "{package} does not build for {platform}");
+    names_no_build_path(&out, work)?;
     Ok(out)
+}
+
+/// What is built names no place it was built in: no folder of zig's cache, named by a hash zig makes of where the
+/// files a step reads are (a generated source's path, which an assertion's message carries), and no path of the
+/// folders the packages are built in - either would make what anyone else builds differ from what is released.
+fn names_no_build_path(out: &Path, work: &Path) -> Result<()> {
+    let work = std::fs::canonicalize(work).with_context(|| work.display().to_string())?;
+    let needles = [".zig-cache/".to_owned(), work.to_string_lossy().into_owned()];
+    let mut files = Vec::new();
+    crate::gather(out, "", &mut files)?;
+    for (name, bytes, _) in &files {
+        for needle in &needles {
+            let found = bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+            ensure!(!found, "{}{name} names {needle}, a place it was built in", out.display());
+        }
+    }
+    Ok(())
 }
 
 /// When the last commit changing `packages/` was made, in seconds since 1970, as `SOURCE_DATE_EPOCH` gives it: what the
 /// packages are built from, and not what is committed beside them - the extensions' manifests holding the archives'
 /// hashes, which would otherwise change the date, and the archives, with each commit of them.
-fn commit_time(project: &Path) -> Result<String> {
-    let packages = project.parent().context("a package's project is in packages/")?;
+fn commit_time(packages: &Path) -> Result<String> {
     let output = Command::new("git")
         .current_dir(packages)
         .args(["log", "-1", "--format=%ct", "--", "."])
@@ -514,9 +551,15 @@ fn check_cpp(zig: &Path, cpp: &Path, tests: &Path, scratch: &Path) -> Result<()>
         let ours = std::fs::read_to_string(&ours)?;
         let theirs = std::fs::read_to_string(&theirs)?;
         let (a, b) = (c_tokens(&ours), c_tokens(&theirs));
-        if let Some(at) = a.iter().zip(&b).position(|(x, y)| x != y).or((a.len() != b.len()).then(|| a.len().min(b.len()))) {
+        if let Some(at) =
+            a.iter().zip(&b).position(|(x, y)| x != y).or((a.len() != b.len()).then(|| a.len().min(b.len())))
+        {
             let around = |t: &[&str]| t[at.saturating_sub(5)..(at + 5).min(t.len())].join(" ");
-            bail!("{name}: the preprocessor built and clang part at token {at}:\n  ours:  {}\n  clang: {}", around(&a), around(&b));
+            bail!(
+                "{name}: the preprocessor built and clang part at token {at}:\n  ours:  {}\n  clang: {}",
+                around(&a),
+                around(&b)
+            );
         }
     }
     Ok(())
@@ -579,7 +622,8 @@ fn pack(package: &str, archive: &Archive, used: &[Used]) -> Result<()> {
     for used in used.iter().filter(|u| u.component.linked_into(package, &archive.platform)) {
         for file in &used.component.license_files {
             let path = used.unpacked.join(file);
-            let bytes = std::fs::read(&path).with_context(|| format!("{}'s license: {}", used.component.name, path.display()))?;
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("{}'s license: {}", used.component.name, path.display()))?;
             files.push((format!("licenses/{}/{file}", used.component.name), bytes, 0o644));
         }
     }
@@ -598,18 +642,25 @@ fn write_zip(mut files: Vec<(String, Vec<u8>, u32)>, to: &Path) -> Result<()> {
 fn read_components(path: &Path) -> Result<Vec<Component>> {
     let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
     let table: toml::Table = text.parse().with_context(|| path.display().to_string())?;
-    let entries = table.get("component").and_then(toml::Value::as_array).context("components.toml: no [[component]]")?;
+    let entries =
+        table.get("component").and_then(toml::Value::as_array).context("components.toml: no [[component]]")?;
     let strings = |entry: &toml::Table, key: &str| -> Option<Result<Vec<String>>> {
         entry.get(key).map(|v| {
             let list = v.as_array().with_context(|| format!("`{key}` is no list"))?;
-            list.iter().map(|x| x.as_str().map(str::to_string).with_context(|| format!("`{key}` holds no text"))).collect()
+            list.iter()
+                .map(|x| x.as_str().map(str::to_string).with_context(|| format!("`{key}` holds no text")))
+                .collect()
         })
     };
     let mut components = Vec::new();
     for entry in entries {
         let entry = entry.as_table().context("a [[component]] is no table")?;
         let text = |key: &str| -> Result<String> {
-            Ok(entry.get(key).and_then(toml::Value::as_str).with_context(|| format!("a component has no `{key}`"))?.to_string())
+            Ok(entry
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .with_context(|| format!("a component has no `{key}`"))?
+                .to_string())
         };
         let zig = entry.get("zig").and_then(toml::Value::as_bool).unwrap_or(false);
         let component = Component {
@@ -628,7 +679,12 @@ fn read_components(path: &Path) -> Result<Vec<Component>> {
             packages: strings(entry, "packages").transpose()?,
         };
         if let Some(url) = &component.url {
-            ensure!(names_version(url, &component.version), "{url} does not name {}'s version, {}", component.name, component.version);
+            ensure!(
+                names_version(url, &component.version),
+                "{url} does not name {}'s version, {}",
+                component.name,
+                component.version
+            );
         }
         components.push(component);
     }
@@ -656,6 +712,64 @@ fn declared(manifest: &str) -> Vec<(String, String)> {
         }
     }
     pairs
+}
+
+/// What zig makes in a project's folder: what it fetched for the project, its cache, and its default prefix.
+const MADE: [&str; 3] = ["zig-pkg", ".zig-cache", "zig-out"];
+
+/// `from` (`packages/`) copied to `to`, where the packages are built. zig fetches a project's dependencies into its
+/// folder and keeps its cache there, and compiles every source by a path relative to the folder - a path that reaches
+/// what is built, as an assertion's file name - so the copy keeps `packages/` free of what zig makes while what is
+/// built names its sources as it would there. The copy is kept from one run to the next, zig's cache in it with it,
+/// and made to hold what `from` does: a file changed is written again, one gone removed, what zig made left.
+fn mirror(from: &Path, to: &Path) -> Result<()> {
+    fn copy(from: &Path, to: &Path, rel: &Path, wanted: &mut std::collections::BTreeSet<PathBuf>) -> Result<()> {
+        let folder = from.join(rel);
+        for entry in std::fs::read_dir(&folder).with_context(|| folder.display().to_string())? {
+            let entry = entry?;
+            if MADE.iter().any(|m| entry.file_name() == *m) {
+                continue;
+            }
+            let rel = rel.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy(from, to, &rel, wanted)?;
+                continue;
+            }
+            let (source, dest) = (from.join(&rel), to.join(&rel));
+            let bytes = std::fs::read(&source).with_context(|| source.display().to_string())?;
+            if std::fs::read(&dest).ok().as_deref() != Some(&bytes[..]) {
+                let parent = dest.parent().context("a file is in a folder")?;
+                std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+                std::fs::write(&dest, &bytes).with_context(|| dest.display().to_string())?;
+            }
+            let permissions = std::fs::metadata(&source).with_context(|| source.display().to_string())?.permissions();
+            std::fs::set_permissions(&dest, permissions).with_context(|| dest.display().to_string())?;
+            wanted.insert(rel);
+        }
+        Ok(())
+    }
+    fn prune(to: &Path, rel: &Path, wanted: &std::collections::BTreeSet<PathBuf>) -> Result<()> {
+        let folder = to.join(rel);
+        for entry in std::fs::read_dir(&folder).with_context(|| folder.display().to_string())? {
+            let entry = entry?;
+            if MADE.iter().any(|m| entry.file_name() == *m) {
+                continue;
+            }
+            let rel = rel.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                prune(to, &rel, wanted)?;
+                if std::fs::read_dir(to.join(&rel))?.next().is_none() {
+                    std::fs::remove_dir(to.join(&rel)).with_context(|| rel.display().to_string())?;
+                }
+            } else if !wanted.contains(&rel) {
+                std::fs::remove_file(to.join(&rel)).with_context(|| rel.display().to_string())?;
+            }
+        }
+        Ok(())
+    }
+    let mut wanted = std::collections::BTreeSet::new();
+    copy(from, to, Path::new(""), &mut wanted)?;
+    prune(to, Path::new(""), &wanted)
 }
 
 /// What a package's project fetched, each folder of its `zig-pkg/` the component its URL is - the URL a manifest
@@ -709,8 +823,7 @@ fn sources(packages: &Path, global: &Path, zig: Option<&Path>, used: &[Used], to
     // The folder as it is: what builds the packages and what made their tables, without what zig makes in it.
     let mut files = Vec::new();
     crate::gather(packages, "packages", &mut files)?;
-    let made = ["zig-pkg", ".zig-cache", "zig-out"];
-    files.retain(|(name, _, _)| !name.split('/').any(|part| made.contains(&part)));
+    files.retain(|(name, _, _)| !name.split('/').any(|part| MADE.contains(&part)));
     write_zip(files, &to.join("pe2-editor-packages.zip"))?;
     if let Some(zig) = zig {
         let name = zig.file_name().context("zig's tarball has a name")?;
@@ -728,7 +841,11 @@ fn notes(config: &Config, name: &str, tag: &str, built: &[Archive], used: &[Used
     if zig.is_none() {
         let _ = writeln!(out, "**Built with a zig other than the pinned one: not for publishing.**\n");
     }
-    let _ = writeln!(out, "License: {}. Copyright: {}. Upstream: {}.\n", package.license, package.copyright, package.upstream);
+    let _ = writeln!(
+        out,
+        "License: {}. Copyright: {}. Upstream: {}.\n",
+        package.license, package.copyright, package.upstream
+    );
     let _ = writeln!(out, "## Files\n");
     for archive in built {
         if let Some(file) = archive.path.file_name() {
@@ -756,7 +873,11 @@ fn notes(config: &Config, name: &str, tag: &str, built: &[Archive], used: &[Used
             Some(hash) => (format!("{}-{}.tar.gz", c.name, c.version), format!("`{hash}`")),
             None => (zig.unwrap_or("(not the pinned zig)").to_string(), String::new()),
         };
-        let _ = writeln!(out, "| {} | {} | {} | {role} | `{source}` | {} | {hash} |", c.name, c.version, c.license, c.upstream);
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {role} | `{source}` | {} | {hash} |",
+            c.name, c.version, c.license, c.upstream
+        );
     }
     let _ = writeln!(
         out,
@@ -770,7 +891,8 @@ fn notes(config: &Config, name: &str, tag: &str, built: &[Archive], used: &[Used
 /// takes of it, by the hash `pe2_setup` holds it to.
 fn setup(config: &Config, name: &str, tag: &str, built: &[Archive]) -> Result<String> {
     let package = &config.packages[name];
-    let mut out = String::from("# The `[[setup]]` entries of this release's archives, for the extensions' manifests.\n");
+    let mut out =
+        String::from("# The `[[setup]]` entries of this release's archives, for the extensions' manifests.\n");
     for archive in built {
         let file = archive.path.file_name().context("an archive has a name")?.to_string_lossy();
         let bytes = std::fs::read(&archive.path).with_context(|| archive.path.display().to_string())?;
@@ -822,7 +944,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Component, c_tokens, check, declared, names_version, shuffle, signed_file};
+    use super::{Component, c_tokens, check, declared, mirror, names_version, shuffle, signed_file};
 
     #[test]
     fn tokens_are_the_same_however_spaced() {
@@ -917,5 +1039,29 @@ mod tests {
         let mut sorted = before;
         sorted.sort();
         assert_eq!(lines, sorted);
+    }
+
+    #[test]
+    fn the_copy_holds_what_packages_holds_and_what_zig_made() {
+        let root = std::env::temp_dir().join(format!("xtask-mirror-{}", std::process::id()));
+        let (from, to) = (root.join("packages"), root.join("projects"));
+        let write = |path: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(from.join("ffmpeg/build.zig"), "new");
+        write(from.join("ports/x264/build.zig.zon"), "kept");
+        write(from.join("ffmpeg/zig-pkg/fetched"), "never copied");
+        write(to.join("ffmpeg/build.zig"), "old");
+        write(to.join("gone/build.zig"), "removed");
+        write(to.join("ffmpeg/.zig-cache/o/object"), "left");
+        mirror(&from, &to).unwrap();
+        let read = |path: &str| std::fs::read_to_string(to.join(path)).ok();
+        assert_eq!(read("ffmpeg/build.zig").as_deref(), Some("new"));
+        assert_eq!(read("ports/x264/build.zig.zon").as_deref(), Some("kept"));
+        assert_eq!(read("ffmpeg/.zig-cache/o/object").as_deref(), Some("left"));
+        assert!(!to.join("gone").exists());
+        assert!(!to.join("ffmpeg/zig-pkg").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

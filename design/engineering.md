@@ -42,11 +42,20 @@ zig that built them (what the licenses ask of whoever ships the result); notes l
 `<package>-<version>-<release>` (`release` in `packages.toml` counts its builds), so packages change apart; `--publish`
 makes it a release of the editor's repository, never over one published already.
 
-The same bytes from two runs ask one thing of the ports: no library holds two objects of one name. zig writes an
-archive's members ordered by their names alone, keeping those of one name in the order they happened to be compiled
-in, and on macOS what links the archive follows that order. A port adds its sources through `harvested`'s `Archives`,
-which compiles a source whose name its library has already into a further library, made alike and linked by the first
-(FFmpeg's `parser.c` of several of its libraries, x264's sources compiled once for each depth).
+The projects are built in a copy of `packages/` (`target/packages/projects/`, kept between runs with zig's cache in
+it), so that nothing zig makes - what it fetches for a project, its cache - is made in `packages/`; what is built
+names its sources by paths relative to its project, the same in the copy as anywhere.
+
+The same bytes from every build, wherever it is made, ask two things of the ports. No library holds two objects of
+one name: zig writes an archive's members ordered by their names alone, keeping those of one name in the order they
+happened to be compiled in, and on macOS what links the archive follows that order. A port adds its sources through
+`harvested`'s `Archives`, which compiles a source whose name its library has already into a further library, made
+alike and linked by the first (FFmpeg's `parser.c` of several of its libraries, x264's sources compiled once for each
+depth). And no source is compiled from a folder a step wrote: zig names it by a hash of the step, which takes the
+files it reads by their absolute paths, and an assertion's message carries a source's path into the program. What a
+step writes is compiled as the source it was made from where it can be (CPython's `Python/` outside the one file
+patched), and otherwise names itself with `#line` (ld's emulations). The task fails on what is built naming zig's
+cache or the folders it is built in.
 
 A package replaces what an extension downloaded only once it builds the same: GCC 2.8.1's `cc1` compiles every C file
 of a project to the same assembly as the build it replaced, on each platform that can run it; FFmpeg encodes the same

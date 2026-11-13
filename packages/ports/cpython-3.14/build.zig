@@ -200,12 +200,24 @@ const Options = struct {
     optimize: std.builtin.OptimizeMode,
     host: Host,
     src: std.Build.LazyPath,
+    /// `Python/` as patched; only the files patched are compiled from it (`pythonFile`).
     python_dir: std.Build.LazyPath,
     config: std.Build.LazyPath,
     module_table: std.Build.LazyPath,
     /// Whether it holds the frozen modules (`_freeze_module`, which makes them, does not).
     frozen: bool,
 };
+
+/// The files of `Python/` the port's patches change (`patches/`).
+const patched = [_][]const u8{"pylifecycle.c"};
+
+/// A file of `Python/`: from the patched copy if a patch changes it, else from the sources. A patched copy's folder is
+/// named by a hash of where the project is - zig hashes the files a step reads by their absolute paths - and a source's
+/// path reaches the program (an assertion's message), so only what has to be is compiled from there.
+fn pythonFile(b: *std.Build, o: Options, name: []const u8) std.Build.LazyPath {
+    for (patched) |p| if (std.mem.eql(u8, p, name)) return o.python_dir.path(b, name);
+    return o.src.path(b, b.fmt("Python/{s}", .{name}));
+}
 
 /// CPython's core and its built-in modules, compiled for a host: the program, its entry still to add.
 fn program(b: *std.Build, o: Options) *std.Build.Step.Compile {
@@ -298,9 +310,8 @@ fn program(b: *std.Build, o: Options) *std.Build.Step.Compile {
             objects.set(source.group, obj);
             break :object obj;
         }).root_module;
-        // Python/ may be a patched copy (macOS): its sources are compiled from there.
         if (std.mem.startsWith(u8, source.path, "Python/")) {
-            into.addCSourceFile(.{ .file = o.python_dir.path(b, source.path["Python/".len..]), .flags = flags });
+            into.addCSourceFile(.{ .file = pythonFile(b, o, source.path["Python/".len..]), .flags = flags });
         } else {
             into.addCSourceFile(.{ .file = s.path(b, source.path), .flags = flags });
         }
@@ -312,12 +323,12 @@ fn program(b: *std.Build, o: Options) *std.Build.Step.Compile {
         .windows => &.{"-DVPATH=\"\""},
         .linux => &.{},
     } }) catch @panic("OOM");
-    m.addCSourceFile(.{ .file = o.python_dir.path(b, "sysmodule.c"), .flags = sysmodule });
+    m.addCSourceFile(.{ .file = pythonFile(b, o, "sysmodule.c"), .flags = sysmodule });
     if (o.host == .windows) {
-        m.addCSourceFile(.{ .file = o.python_dir.path(b, "dynload_win.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ core, &.{ "-DPYD_PLATFORM_TAG=\"mingw_x86_64_ucrt_llvm\"", "-DPY3_DLLNAME=L\"\"" } }) catch @panic("OOM") });
+        m.addCSourceFile(.{ .file = pythonFile(b, o, "dynload_win.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ core, &.{ "-DPYD_PLATFORM_TAG=\"mingw_x86_64_ucrt_llvm\"", "-DPY3_DLLNAME=L\"\"" } }) catch @panic("OOM") });
     } else {
         const soabi = if (o.host == .macos) "-DSOABI=\"cpython-314-darwin\"" else "-DSOABI=\"cpython-314\"";
-        m.addCSourceFile(.{ .file = o.python_dir.path(b, "dynload_shlib.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ core, &.{soabi} }) catch @panic("OOM") });
+        m.addCSourceFile(.{ .file = pythonFile(b, o, "dynload_shlib.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ core, &.{soabi} }) catch @panic("OOM") });
     }
     m.addCSourceFile(.{ .file = o.module_table, .flags = core });
     return exe;

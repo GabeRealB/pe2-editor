@@ -13,6 +13,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("{s}.zig", .{name})),
                 .target = host,
                 .optimize = .ReleaseSafe,
+                // Without debug information, which names the sources by where they are: a step running the program
+                // is hashed with it, and would be named after where the project is.
+                .strip = true,
             }),
         });
         b.installArtifact(program);
