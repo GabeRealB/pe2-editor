@@ -1,0 +1,47 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "openjp2",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DMUTEX_pthread",
+                        "-O3",
+                        "-DNDEBUG",
+                    },
+                    .include = .{
+                        "build:src/lib/openjp2",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:src/lib/openjp2/thread.c",
+                        "src:src/lib/openjp2/bio.c",
+                        "src:src/lib/openjp2/cio.c",
+                        "src:src/lib/openjp2/dwt.c",
+                        "src:src/lib/openjp2/event.c",
+                        "src:src/lib/openjp2/ht_dec.c",
+                        "src:src/lib/openjp2/image.c",
+                        "src:src/lib/openjp2/invert.c",
+                        "src:src/lib/openjp2/j2k.c",
+                        "src:src/lib/openjp2/jp2.c",
+                        "src:src/lib/openjp2/mct.c",
+                        "src:src/lib/openjp2/mqc.c",
+                        "src:src/lib/openjp2/openjpeg.c",
+                        "src:src/lib/openjp2/opj_clock.c",
+                        "src:src/lib/openjp2/pi.c",
+                        "src:src/lib/openjp2/t1.c",
+                        "src:src/lib/openjp2/t2.c",
+                        "src:src/lib/openjp2/tcd.c",
+                        "src:src/lib/openjp2/tgt.c",
+                        "src:src/lib/openjp2/function_list.c",
+                        "src:src/lib/openjp2/opj_malloc.c",
+                        "src:src/lib/openjp2/sparse_array.c",
+                    },
+                },
+            },
+        },
+    },
+}

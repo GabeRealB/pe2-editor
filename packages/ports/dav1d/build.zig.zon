@@ -1,0 +1,14 @@
+.{
+    .name = .dav1d,
+    .fingerprint = 0xf5f400e709a55691,
+    .version = "1.5.4",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .dav1d = .{
+            .url = "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz",
+            .hash = "N-V-__8AAMa2uADFWkkzECjkNT3uIozVdICt7NhKQ0IdLju9",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

@@ -16,6 +16,9 @@
 //!   as `pe2-cli extension hash` finds them - which a manifest of the workspace's needs before the workspace builds.
 //! - `pins [<manifest>...]`: whether every source each `[[setup]]` entry names still answers - every extension of the
 //!   workspace's where none is named - failing where an entry has none left: run now and then, before users find one gone.
+//! - `packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]`: the packages the
+//!   extensions download, built from their sources by the zig projects in `packages/` and laid out as their releases,
+//!   one a package version - published with `--publish` (`packages.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,10 +26,13 @@ use std::process::Command;
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
+mod packages;
+
 const USAGE: &str = "cargo xtask dist [--tests] [--out <folder>]\n\
                      cargo xtask package [--out <folder>]\n\
                      cargo xtask hash <manifest> [--write]\n\
-                     cargo xtask pins [<manifest>...]";
+                     cargo xtask pins [<manifest>...]\n\
+                     cargo xtask packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]";
 
 /// What a task is asked to do.
 #[derive(Default)]
@@ -46,6 +52,10 @@ fn main() -> Result<()> {
             Some(other) => bail!("no option {other}\n{USAGE}"),
         };
         return pe2_setup::hash_manifest(Path::new(&manifest), write);
+    }
+    if task == "packages" {
+        let (workspace, target) = places()?;
+        return packages::run(args, &workspace, &target);
     }
     if task == "pins" {
         let named: Vec<PathBuf> = args.map(PathBuf::from).collect();

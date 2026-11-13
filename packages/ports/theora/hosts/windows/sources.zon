@@ -1,0 +1,84 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "theoradec",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DHAVE_CONFIG_H",
+                        "-O",
+                        "-O2",
+                    },
+                    .include = .{
+                        "build:lib",
+                        "src:lib",
+                        "build:",
+                        "src:include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:lib/apiwrapper.c",
+                        "src:lib/bitpack.c",
+                        "src:lib/decapiwrapper.c",
+                        "src:lib/decinfo.c",
+                        "src:lib/decode.c",
+                        "src:lib/dequant.c",
+                        "src:lib/fragment.c",
+                        "src:lib/huffdec.c",
+                        "src:lib/idct.c",
+                        "src:lib/info.c",
+                        "src:lib/internal.c",
+                        "src:lib/quant.c",
+                        "src:lib/state.c",
+                    },
+                },
+            },
+        },
+        .{
+            .name = "theoraenc",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DHAVE_CONFIG_H",
+                        "-O",
+                        "-O2",
+                    },
+                    .include = .{
+                        "build:lib",
+                        "src:lib",
+                        "build:",
+                        "src:include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:lib/apiwrapper.c",
+                        "src:lib/bitpack.c",
+                        "src:lib/dequant.c",
+                        "src:lib/fragment.c",
+                        "src:lib/idct.c",
+                        "src:lib/info.c",
+                        "src:lib/internal.c",
+                        "src:lib/state.c",
+                        "src:lib/quant.c",
+                        "src:lib/analyze.c",
+                        "src:lib/fdct.c",
+                        "src:lib/encfrag.c",
+                        "src:lib/encapiwrapper.c",
+                        "src:lib/encinfo.c",
+                        "src:lib/encode.c",
+                        "src:lib/enquant.c",
+                        "src:lib/huffenc.c",
+                        "src:lib/mathops.c",
+                        "src:lib/mcenc.c",
+                        "src:lib/rate.c",
+                        "src:lib/tokenize.c",
+                    },
+                },
+            },
+        },
+    },
+}

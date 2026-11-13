@@ -1,0 +1,15 @@
+.{
+    .name = .theora,
+    .fingerprint = 0xe0fc136e49968eab,
+    .version = "1.2.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .ogg = .{ .path = "../ogg" },
+        .theora = .{
+            .url = "https://downloads.xiph.org/releases/theora/libtheora-1.2.0.tar.xz",
+            .hash = "N-V-__8AAOTZdABGlQygxN35pzo_tmICBdAGWV17GmFtkDpH",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

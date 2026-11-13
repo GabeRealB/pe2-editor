@@ -1,0 +1,27 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "ogg",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                    },
+                    .include = .{
+                        "src:include",
+                        "build:include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:src/bitwise.c",
+                        "src:src/framing.c",
+                    },
+                },
+            },
+        },
+    },
+}

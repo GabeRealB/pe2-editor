@@ -1,0 +1,10 @@
+.{
+    .name = .ffmpeg,
+    .version = "0.0.0",
+    .fingerprint = 0x2ffce39ee644ee12,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .ffmpeg = .{ .path = "../ports/ffmpeg-9.0.2" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

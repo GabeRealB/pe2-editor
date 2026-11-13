@@ -1,0 +1,18 @@
+.{
+    .name = .gcc_psx,
+    .version = "2.8.1",
+    .fingerprint = 0x1edc79e38bbb43ef,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .tools = .{ .path = "../../tools" },
+        .gcc = .{
+            .url = "https://ftp.gnu.org/gnu/gcc/gcc-2.8.1.tar.gz",
+            .hash = "N-V-__8AAOUy9QEHUWIFebabe3heaVdtSsXEwRiup6hkRtyt",
+        },
+        .old_gcc = .{
+            .url = "https://github.com/decompals/old-gcc/archive/refs/tags/0.17.tar.gz",
+            .hash = "N-V-__8AAGh-AQCGxIPhKnXYC8hpth5hq1kNSDiyBFYUb4-d",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "patches" },
+}

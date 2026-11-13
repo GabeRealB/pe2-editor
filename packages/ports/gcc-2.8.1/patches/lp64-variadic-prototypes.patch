@@ -1,0 +1,69 @@
+Prototypes for the functions of a variable number of arguments that GCC 2.8.1 calls where they are not declared:
+its diagnostics and emit_library_call. Calling such a function undeclared is undefined; on a host that passes those
+arguments apart from the others (Apple's arm64) the function reads them from the wrong place, and an error message
+about the code being compiled is garbage or crashes cc1. config/mips/mips.c's own declarations of three of them,
+without prototypes, go, as C allows no such declaration beside a prototype.
+
+--- a/config/mips/mips.c
++++ b/config/mips/mips.c
+@@ -78,11 +78,8 @@
+  
+ extern rtx    adj_offsettable_operand ();
+ extern rtx    copy_to_reg ();
+-extern void   error ();
+-extern void   fatal ();
+ extern tree   lookup_name ();
+ extern void   pfatal_with_name ();
+-extern void   warning ();
+ 
+ extern FILE  *asm_out_file;
+ 
+--- a/regclass.c
++++ b/regclass.c
+@@ -24,6 +24,10 @@
+    and a function init_reg_sets to initialize the tables.  */
+ 
+ #include "config.h"
++
++/* Takes a variable number of arguments: declared, so that a host passing those
++   apart from the others (Apple's arm64) is given them where it reads them.  */
++extern void warning (char *, ...);
+ #include <stdio.h>
+ #include "rtl.h"
+ #include "hard-reg-set.h"
+--- a/rtl.h
++++ b/rtl.h
+@@ -1002,3 +1002,11 @@
+ 
+ extern int computed_jump_p	PROTO((rtx));
+ 
++/* The diagnostics about an insn and emit_library_call take a variable number of arguments, and are called from
++   files that do not otherwise declare them.  Calling a function of a variable
++   number of arguments that is not declared is undefined, and on a host that
++   passes those arguments apart from the others (Apple's arm64) it reads
++   them from the wrong place: declared here, where their callers see them.  */
++extern void error_for_asm (struct rtx_def *, char *, ...);
++extern void warning_for_asm (struct rtx_def *, char *, ...);
++extern void emit_library_call (struct rtx_def *, int, enum machine_mode, int, ...);
+--- a/tree.h
++++ b/tree.h
+@@ -1891,3 +1891,19 @@
+ 
+ /* Pop the obstack selection stack.  */
+ extern void pop_obstacks PROTO((void));
++
++/* The diagnostics take a variable number of arguments, and are called from
++   files that do not otherwise declare them.  Calling a function of a variable
++   number of arguments that is not declared is undefined, and on a host that
++   passes those arguments apart from the others (Apple's arm64) it reads
++   them from the wrong place: declared here, where their callers see them.  */
++extern void error (char *, ...);
++extern void warning (char *, ...);
++extern void pedwarn (char *, ...);
++extern void fatal (char *, ...);
++extern void error_with_decl (union tree_node *, char *, ...);
++extern void warning_with_decl (union tree_node *, char *, ...);
++extern void pedwarn_with_decl (union tree_node *, char *, ...);
++extern void error_with_file_and_line (char *, int, char *, ...);
++extern void warning_with_file_and_line (char *, int, char *, ...);
++extern void pedwarn_with_file_and_line (char *, int, char *, ...);

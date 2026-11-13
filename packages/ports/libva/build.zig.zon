@@ -1,0 +1,15 @@
+.{
+    .name = .libva,
+    .fingerprint = 0xd44d45280dd274b4,
+    .version = "2.24.1",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .libdrm = .{ .path = "../libdrm" },
+        .libva = .{
+            .url = "https://github.com/intel/libva/archive/refs/tags/2.24.1.tar.gz",
+            .hash = "N-V-__8AAMo4GADIXvJ0jQmOFAAy29xEdjN-hGP5Rx8uq_-o",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

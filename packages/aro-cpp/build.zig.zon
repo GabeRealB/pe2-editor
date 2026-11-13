@@ -1,0 +1,8 @@
+.{
+    .name = .aro_cpp,
+    .version = "0.0.1",
+    .fingerprint = 0x4be0b63ec78e1441,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "cpp.zig" },
+}

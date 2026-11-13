@@ -1,1 +1,9 @@
 /target/
+# What zig makes in the packages project: its fetched packages, its cache, its output.
+/packages/zig-pkg/
+/packages/.zig-cache/
+/packages/zig-out/
+# The same of a port built by itself.
+/packages/**/zig-pkg/
+/packages/**/.zig-cache/
+/packages/**/zig-out/

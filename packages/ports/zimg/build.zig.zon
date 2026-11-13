@@ -1,0 +1,14 @@
+.{
+    .name = .zimg,
+    .fingerprint = 0x61458e5a30ded6f7,
+    .version = "3.0.6",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .zimg = .{
+            .url = "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.6.tar.gz",
+            .hash = "N-V-__8AAMjwGgDgi8Si4X4eVFiPPlBUm_Tf-8vBUjfcvFXo",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

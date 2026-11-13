@@ -1,0 +1,10 @@
+.{
+    .name = .gcc_psx,
+    .version = "0.0.0",
+    .fingerprint = 0x1edc79e358d2ecaa,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .gcc = .{ .path = "../ports/gcc-2.8.1" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

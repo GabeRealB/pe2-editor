@@ -1,0 +1,66 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "vorbis",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                    },
+                    .include = .{
+                        "src:include",
+                        "src:lib",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:lib/mdct.c",
+                        "src:lib/smallft.c",
+                        "src:lib/block.c",
+                        "src:lib/envelope.c",
+                        "src:lib/window.c",
+                        "src:lib/lsp.c",
+                        "src:lib/lpc.c",
+                        "src:lib/analysis.c",
+                        "src:lib/synthesis.c",
+                        "src:lib/psy.c",
+                        "src:lib/info.c",
+                        "src:lib/floor1.c",
+                        "src:lib/floor0.c",
+                        "src:lib/res0.c",
+                        "src:lib/mapping0.c",
+                        "src:lib/registry.c",
+                        "src:lib/codebook.c",
+                        "src:lib/sharedbook.c",
+                        "src:lib/lookup.c",
+                        "src:lib/bitrate.c",
+                        "src:lib/vorbisenc.c",
+                    },
+                },
+            },
+        },
+        .{
+            .name = "vorbisenc",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                    },
+                    .include = .{
+                        "src:include",
+                        "src:lib",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:lib/vorbisenc.c",
+                    },
+                },
+            },
+        },
+    },
+}

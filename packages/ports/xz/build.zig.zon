@@ -1,0 +1,14 @@
+.{
+    .name = .xz,
+    .fingerprint = 0x16ef79232bfeaf57,
+    .version = "5.8.4",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .xz = .{
+            .url = "https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.xz",
+            .hash = "N-V-__8AABBPtgBB9ZTt4a63xmsTIKUlJTpQfhKPFwxRnhDc",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

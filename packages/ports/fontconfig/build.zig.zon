@@ -1,0 +1,19 @@
+.{
+    .name = .fontconfig,
+    .fingerprint = 0x4a79a5a05df6120,
+    .version = "2.18.3",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .freetype = .{ .path = "../freetype" },
+        .fontconfig = .{
+            .url = "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz",
+            .hash = "N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ",
+        },
+        .libexpat = .{
+            .url = "git+https://github.com/allyourcodebase/libexpat#bc1c381c6c175e2e506b6a1c3c23e01d0795fb66",
+            .hash = "libexpat-2.9.0-y_akI39BAABNZVf6gspukf37qEjDz6qKMmV15ca9YMfg",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

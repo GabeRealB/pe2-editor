@@ -1,0 +1,14 @@
+.{
+    .name = .openjpeg,
+    .fingerprint = 0x358cfebe0797cf5f,
+    .version = "2.5.4",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .openjpeg = .{
+            .url = "https://github.com/uclouvain/openjpeg/archive/refs/tags/v2.5.4.tar.gz",
+            .hash = "N-V-__8AAHiEmgBjTa5rTtwbWMR9ZJJkN2_1NPJOZy6sURMC",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

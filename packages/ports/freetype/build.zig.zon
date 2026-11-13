@@ -1,0 +1,14 @@
+.{
+    .name = .freetype,
+    .fingerprint = 0xac2059b6ea448652,
+    .version = "2.14.3",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .freetype = .{
+            .url = "https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/freetype-2.14.3.tar.xz",
+            .hash = "N-V-__8AAJo-LAHFNfa0p0oMQqmwlBEAZMOeo03azXgrKLTT",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

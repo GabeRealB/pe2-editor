@@ -1,0 +1,15 @@
+.{
+    .name = .vorbis,
+    .fingerprint = 0x808d28d2ac5b3cda,
+    .version = "1.3.7",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .ogg = .{ .path = "../ogg" },
+        .vorbis = .{
+            .url = "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz",
+            .hash = "N-V-__8AAIUHYQBni_Cdm8Nx7vX9qaqBKXKy6QUAooC-OoBc",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

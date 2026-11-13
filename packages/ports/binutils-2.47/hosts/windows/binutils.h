@@ -1,0 +1,137 @@
+/* binutils/config.h for Windows, with MinGW-w64: what binutils 2.47's configure decided for that host (`--target=mipsel-linux-gnu`,
+   without NLS, plugins, zstd or libctf), run with zig's C compiler for x86_64-windows-gnu. */
+
+#if defined(__GLIBC__) && !defined(__FreeBSD_kernel__) && !defined(__CONFIG_H__)
+#  error config.h must be #included before system headers
+#endif
+#define __CONFIG_H__ 1
+
+#define DEFAULT_AR_DETERMINISTIC 0
+
+#define DEFAULT_FOR_COLORED_DISASSEMBLY 0
+
+#define DEFAULT_FOR_FOLLOW_LINKS 1
+
+#define DEFAULT_F_FOR_IFUNC_SYMBOLS 0
+
+#define DEFAULT_STRINGS_ALL 1
+
+#define ENABLE_CHECKING 1
+
+#define EXECUTABLE_SUFFIX ".exe"
+
+#define HAVE_DECL_ENVIRON 1
+
+#define HAVE_DECL_GETC_UNLOCKED 0
+
+#define HAVE_DECL_GETOPT 1
+
+#define HAVE_DECL_STPCPY 0
+
+#define HAVE_DECL_STRNLEN 1
+
+#define HAVE_EXECUTABLE_SUFFIX 1
+
+#define HAVE_FCNTL_H 1
+
+#define HAVE_FSEEKO 1
+
+#define HAVE_FSEEKO64 1
+
+#define HAVE_GOOD_UTIME_H 1
+
+#define HAVE_INTTYPES_H 1
+
+#define HAVE_MBSTATE_T 1
+
+#define HAVE_MEMORY_H 1
+
+#define HAVE_MKDTEMP 1
+
+#define HAVE_MKSTEMP 1
+
+#define HAVE_STDINT_H 1
+
+#define HAVE_STDLIB_H 1
+
+#define HAVE_STRINGS_H 1
+
+#define HAVE_STRING_H 1
+
+#define HAVE_SYS_FILE_H 1
+
+#define HAVE_SYS_PARAM_H 1
+
+#define HAVE_SYS_STAT_H 1
+
+#define HAVE_SYS_TIME_H 1
+
+#define HAVE_SYS_TYPES_H 1
+
+#define HAVE_UNISTD_H 1
+
+#define HAVE_WINDOWS_H 1
+
+#define ICONV_CONST
+
+#define LT_OBJDIR ".libs/"
+
+#define PACKAGE "binutils"
+
+#define PACKAGE_BUGREPORT ""
+
+#define PACKAGE_NAME "binutils"
+
+#define PACKAGE_STRING "binutils 2.47"
+
+#define PACKAGE_TARNAME "binutils"
+
+#define PACKAGE_URL ""
+
+#define PACKAGE_VERSION "2.47"
+
+#define STDC_HEADERS 1
+
+#define TARGET "mipsel-unknown-linux-gnu"
+
+#define TARGET_PREPENDS_UNDERSCORE 0
+
+#define USE_BINARY_FOPEN 1
+
+#ifndef _ALL_SOURCE
+# define _ALL_SOURCE 1
+#endif
+
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1
+#endif
+
+#ifndef _POSIX_PTHREAD_SEMANTICS
+# define _POSIX_PTHREAD_SEMANTICS 1
+#endif
+
+#ifndef _TANDEM_SOURCE
+# define _TANDEM_SOURCE 1
+#endif
+
+#ifndef __EXTENSIONS__
+# define __EXTENSIONS__ 1
+#endif
+
+#define VERSION "2.47"
+
+#if defined AC_APPLE_UNIVERSAL_BUILD
+# if defined __BIG_ENDIAN__
+#  define WORDS_BIGENDIAN 1
+# endif
+#else
+# ifndef WORDS_BIGENDIAN
+
+# endif
+#endif
+
+#ifndef _DARWIN_USE_64_BIT_INODE
+# define _DARWIN_USE_64_BIT_INODE 1
+#endif
+
+#define _FILE_OFFSET_BITS 64

@@ -9,6 +9,45 @@ target the extensions are built for. A normal `cargo build` builds the editor, t
 Every warning is an error, Clippy's pedantic group included (`[workspace.lints]`). `cargo xtask` lays out and
 archives releases, and helps extension authors pin their downloads (see the README).
 
+## The packages the extensions download
+
+What the game's extensions download - compilers, assemblers, Python, FFmpeg - is built from its sources, not taken
+from whoever built it, so that it lasts as long as the editor does. Each package is a zig project of its own,
+`packages/<package>/` (gcc-psx, binutils-mipsel, aro-cpp, python, ffmpeg), whose `build.zig.zon` pins what it is built from
+- by URL and content hash - and whose `build.zig` installs what the package holds. What has no zig build upstream is
+ported in `packages/ports/`: a build of its own, with what the library's own build decides of each host written down,
+and patches where the source needs them. What a source generates with scripts is generated with the programs in
+`packages/tools/` (a patch tool, and a small POSIX shell with sed, enough for binutils' scripts), so that building needs
+nothing of the machine but zig.
+
+Most of FFmpeg's libraries are ported by harvesting: `packages/harvest/harvest.sh` runs each library's own build -
+configure, CMake or meson - for each host, with zig's compilers behind wrappers that record every compile, and writes
+the port's `hosts/<host>/`: `sources.zon`, the library's sources in groups compiled alike, and `build/`, the files its
+build generated that the sources read; the `harvested` port builds a library from them. A recipe a library
+(`harvest/recipes/`) says how its own build is run. binutils' and CPython's ports keep what their own builds decide of
+each host the same way, from recipes of their own (their parts' configure; a reference build of CPython for each). Harvesting again, after a library's version changes, writes its
+tables anew; it runs on Linux, with the tools it sets up for itself (nasm, meson, the autotools) in
+`target/packages/harvest`.
+
+`packages/components.toml` describes every source the packages are built from, by the exact URL a manifest fetches it
+from: its name and version, its license and the files carrying it, whether it is linked into what ships or only used to
+build it, and on which platforms. `cargo xtask packages` fetches the pinned zig (from a community mirror, its signature
+checked, as ziglang.org asks of tools) and, for each package, cross-builds it for every platform from one machine with
+nothing fetched before, so that what its project fetched is what it is built from. Every fetched source must be a
+component (a URL changed and not described fails the task by name), and a release is laid out of it: an archive a
+platform, packed deterministically - two runs give the same bytes - with `licenses/`, the license of every component
+linked into it there; `sources/`, each component's source named by its name and version, the `packages/` folder and the
+zig that built them (what the licenses ask of whoever ships the result); notes listing what it is made of;
+`SHA256SUMS`; and the `[[setup]]` entries the extensions' manifests take. A release is a package version,
+`<package>-<version>-<release>` (`release` in `packages.toml` counts its builds), so packages change apart; `--publish`
+makes it a release of the editor's repository, never over one published already.
+
+A package replaces what an extension downloaded only once it builds the same: GCC 2.8.1's `cc1` compiles every C file
+of a project to the same assembly as the build it replaced, on each platform that can run it; FFmpeg encodes the same
+bytes as FFmpeg's own build of the same configuration. The preprocessor is aro's, as zig carries it, behind the
+arguments of GCC's; each release of aro-cpp holds it to clang's on `packages/aro-cpp/tests`, so that a zig whose aro
+changed does not ship unnoticed.
+
 ## Testing
 
 ```

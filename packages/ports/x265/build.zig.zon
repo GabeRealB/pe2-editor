@@ -1,0 +1,14 @@
+.{
+    .name = .x265,
+    .fingerprint = 0x778f33c72c0b8943,
+    .version = "4.2.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .x265 = .{
+            .url = "https://download.videolan.org/videolan/x265/x265_4.2.tar.gz",
+            .hash = "N-V-__8AAHQk5wAVCV67Vyuvi5VSB1ePcley_qMQHrkNB12N",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

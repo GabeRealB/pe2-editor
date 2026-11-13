@@ -1,0 +1,14 @@
+.{
+    .name = .libdrm,
+    .fingerprint = 0xaa2d215b91237abf,
+    .version = "2.4.134",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .libdrm = .{
+            .url = "https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz",
+            .hash = "N-V-__8AANjyLAAD6mSYXt_uTwOF3uQieo212HQcTcIZdXMi",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

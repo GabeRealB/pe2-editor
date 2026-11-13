@@ -1,0 +1,14 @@
+.{
+    .name = .opus,
+    .fingerprint = 0x8db4fd2cd8bb0559,
+    .version = "1.6.1",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .opus = .{
+            .url = "https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz",
+            .hash = "N-V-__8AAAmivwH7RvCrZo25NNu0lx2Sw-ogZhmqGXvorlHg",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

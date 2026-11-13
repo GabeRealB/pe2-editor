@@ -1,0 +1,14 @@
+.{
+    .name = .lcms2,
+    .fingerprint = 0x3fb9167a500456ea,
+    .version = "2.20.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .lcms2 = .{
+            .url = "https://github.com/mm2/Little-CMS/releases/download/lcms2.20/lcms2-2.20.tar.gz",
+            .hash = "N-V-__8AAEePqwAFbFEKnVaPJ6ixi1j6Hv67MiD49dQbDF2u",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

@@ -10,12 +10,15 @@ A config builds for it by naming it as its target (`target = "psx"` in `[config.
 
 | Program | What for | Where it comes from |
 |---|---|---|
-| `cpp/libexec/gcc/host/14.2.0/cc1` | preprocessing, as a modern GCC's `cc1 -E` | fetched: musl-cross's GCC 16.2.0 on Linux, macos-cross-toolchains' GCC 15.2.0 on macOS, PCSX-Redux's GCC 16.2.0 on Windows |
-| `cc1` | compiling, as GCC 2.8.1 for the PlayStation | fetched: old-gcc 0.17 on Linux and macOS, SN Systems' build from the Psy-Q SDK 4.4 on Windows |
-| `maspsx` | the compiler's assembly made what the original assembler made | fetched: maspsx at commit `4ffa8b5`, with three patches of this extension's (`patches/`), run by Python 3.13 from python-build-standalone, fetched too |
-| `mips-linux-gnu-as`, `-ld`, `-nm`, `-objcopy` | assembling, linking, reading symbols, making images | fetched: musl-cross's binutils 2.47 on Linux, macos-cross-toolchains' 2.45 on macOS, PCSX-Redux's 2.47 on Windows |
+| `cpp` | preprocessing, taking what a GCC's `cc1 -E` takes | fetched: the C preprocessor of aro, the C front end zig carries |
+| `cc1` | compiling, as GCC 2.8.1 for the PlayStation | fetched: GCC 2.8.1 with old-gcc's patches for the PlayStation |
+| `maspsx` | the compiler's assembly made what the original assembler made | fetched: maspsx at commit `4ffa8b5`, with three patches of this extension's (`patches/`), run by Python 3.14, fetched too |
+| `mips-linux-gnu-as`, `-ld`, `-nm`, `-objcopy` | assembling, linking, reading symbols, making images | fetched: GNU binutils 2.47 for `mipsel` |
 
-Each compiler and the binutils for Linux and Windows were checked: built with them, every package's image is the game's own, byte for byte. Those for macOS have not been run yet; binutils 2.45 built for Linux matched too.
+The preprocessor, the compiler, the binutils and Python are built from their sources by the editor's own releases, for
+Linux on x86_64, macOS on Apple silicon and Windows; maspsx is fetched from its own repository. Those for Linux and
+Windows were checked: built with them, every package's image is the game's own, byte for byte. Those for macOS have not
+been run yet.
 
 What it fetches is downloaded once a machine, from where its manifest says and checked against the hashes it gives:
 trusting it consents to that, and the editor fetches it once it runs (`pe2-cli project extension setup pe2.psx` does so

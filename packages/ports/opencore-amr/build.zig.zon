@@ -1,0 +1,14 @@
+.{
+    .name = .opencore_amr,
+    .fingerprint = 0xfcdf865dd9bb1bcc,
+    .version = "0.1.6",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .opencore_amr = .{
+            .url = "https://downloads.sourceforge.net/project/opencore-amr/opencore-amr/opencore-amr-0.1.6.tar.gz",
+            .hash = "N-V-__8AAOuCVACMZtpdmr3peGqe7GBgiTOyw5rPyux1-Mod",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

@@ -1,0 +1,14 @@
+.{
+    .name = .openh264,
+    .fingerprint = 0x8f6f6142449a888b,
+    .version = "2.7.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .openh264 = .{
+            .url = "https://github.com/cisco/openh264/archive/refs/tags/v2.7.0.tar.gz",
+            .hash = "N-V-__8AAIjmVQTSxU5cUDPnrlh0HdBJFovAcNnfwjDzJaXA",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

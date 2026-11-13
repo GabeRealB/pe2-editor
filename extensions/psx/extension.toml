@@ -10,111 +10,112 @@ docs = "docs/index.md"
 install = "docs/install.md"
 
 [[setup]]
-name = "GCC 2.8.1 for the PlayStation, from old-gcc"
+name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
-copyright = "Free Software Foundation; built by the decompals old-gcc project"
+copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "linux-x86_64"
-url = "https://github.com/decompals/old-gcc/releases/download/0.17/gcc-2.8.1-psx.tar.gz"
-sha256 = "f6f6e883942d4d3289d048236c672e71ed410e546aaae8ff655952f1567e1be0"
-take = { "cc1" = { to = "cc1", sha256 = "1a48ec5ac87a146a074a9d66d7a67734a4d1ad56553d02d91e8b71c7fecc2d52" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-linux-x86_64.zip"
+sha256 = "4987655eb857692518f9165593f137ff98490d7c40fa5a66cd62fdb20493f925"
+take = { "cc1" = { to = "cc1", sha256 = "e8f052df62c1f7f495eb24d616654aaebaeb74d5554ad50412db73f2216dd93d" } }
 
 [[setup]]
-name = "MIPS binutils 2.47 and GCC 16.2.0's C preprocessor, from musl-cross"
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
 license = "GPL-3.0-or-later"
-copyright = "Free Software Foundation; built by the cross-tools musl-cross project"
+copyright = "Free Software Foundation, Inc."
 platform = "linux-x86_64"
-url = "https://github.com/cross-tools/musl-cross/releases/download/20261001/mipsel-unknown-linux-musl.tar.xz"
-sha256 = "55e2e2ffbe9fefb81c0cf3b03acf937f2ad000efb3ceaf70041e6052c89ca31b"
-
-[setup.take]
-"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-as" = { to = "mips-linux-gnu-as", sha256 = "9a0403d0a285b377480ba9dc4fddda348f80aa5634b3eed5f2a62680e4643c24" }
-"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-ld.bfd" = { to = "mips-linux-gnu-ld", sha256 = "a73245649583a25f7ca326302ed2a134accdb750bcb35e659ddd23de3b835f48" }
-"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-nm" = { to = "mips-linux-gnu-nm", sha256 = "d8abb9f1501c31fe1db08206c9a7834d3d4e5b0286789788bf42545423e0d77f" }
-"mipsel-unknown-linux-musl/bin/mipsel-unknown-linux-musl-objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "ec58b0794248c0da33a23ba3deec3aa13ec649135f4d78deb6f221dd7c427ac4" }
-"mipsel-unknown-linux-musl/libexec/gcc/mipsel-unknown-linux-musl/16.2.0/cc1" = { to = "cpp/libexec/gcc/host/14.2.0/cc1", sha256 = "34b3650fc213ef6b706a129a740876188c313c09da9546bdd55b128dc71ece9d" }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-linux-x86_64.zip"
+sha256 = "4311adc86bfb14258cde53a78df00857a896bbad8550fc58a3b85c7b9be9cd2b"
+take = { "as" = { to = "mips-linux-gnu-as", sha256 = "ba2dbbbdfee7571d17af0d24dfda700f6d4a02ad98fbd524d0b31d83dfc078a6" }, "ld" = { to = "mips-linux-gnu-ld", sha256 = "6a6b59ba8679e8da132b5d7abce54c1f1877e1709bd5d6f9398c651e7208dba0" }, "nm" = { to = "mips-linux-gnu-nm", sha256 = "ae9e992d7eb48d91f72da8d161b423745f1e236027eee9be879634949864e06f" }, "objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "51bab827506f273fe8ce271f4c6e26cc8a435acf000644a945388af4afa63d5b" } }
 
 [[setup]]
-name = "GCC 2.8.1 for the PlayStation, from old-gcc"
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "linux-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-linux-x86_64.zip"
+sha256 = "a2398e60a70480099c5c602f54c1b23d0e97dfedbd169c44283e3663e1bb9fce"
+take = { "cpp" = { to = "cpp", sha256 = "a33b65d17c0fbf14d31b1de4fed4d0a593146afe6f12d1f1c3545a234945139b" } }
+
+[[setup]]
+name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
-copyright = "Free Software Foundation; built by the decompals old-gcc project"
+copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "macos-aarch64"
-url = "https://github.com/decompals/old-gcc/releases/download/0.17/gcc-2.8.1-psx-macos.tar.gz"
-sha256 = "bab0c6ea1f394573d5aabbdd7b37e36aceeb83c522141d946a87a9f58c199ea0"
-take = { "cc1" = { to = "cc1", sha256 = "6895b71b99b7648f44d3aa9adf2119febe9fdfb1cd6da399cfb9a684b2db6d77" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-macos-aarch64.zip"
+sha256 = "4b08d88e7258223f85f142cdf5e60a567d42f4fedec09001bf5f9b2abda6c5e4"
+take = { "cc1" = { to = "cc1", sha256 = "30c2c9b359ec8c0fac64c04beae72c69a7a4cf8ba4b5aa08b94537cf8cc206c4" } }
 
 [[setup]]
-name = "MIPS binutils 2.45 and GCC 15.2.0's C preprocessor, from macos-cross-toolchains"
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
 license = "GPL-3.0-or-later"
-copyright = "Free Software Foundation; built by messense's macos-cross-toolchains"
+copyright = "Free Software Foundation, Inc."
 platform = "macos-aarch64"
-url = "https://github.com/messense/homebrew-macos-cross-toolchains/releases/download/v15.2.0/mipsel-unknown-linux-gnu-aarch64-darwin.tar.gz"
-sha256 = "e3134121655af3995be0c59751b52cfd7a153c6874f745d2bdeca01b4a15d33e"
-
-[setup.take]
-"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-as" = { to = "mips-linux-gnu-as", sha256 = "940b0516aa5a491e38524f9792d9612fee3e210506156f499beccfb5a0e1b800" }
-"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-ld.bfd" = { to = "mips-linux-gnu-ld", sha256 = "68b97e8145b84e429af301f1c045c5191239e3cbff2e91d56e46badacabf7b55" }
-"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-nm" = { to = "mips-linux-gnu-nm", sha256 = "f01ef7d21d054187d6ca95f6ef67281c949379cc1c4d769549bc7cdf3090aaee" }
-"mipsel-unknown-linux-gnu/bin/mipsel-unknown-linux-gnu-objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "90fd80c99dcee90c207244bd443260e3764ea0acb92e29fd4af8415250bd7465" }
-"mipsel-unknown-linux-gnu/libexec/gcc/mipsel-unknown-linux-gnu/15.2.0/cc1" = { to = "cpp/libexec/gcc/host/14.2.0/cc1", sha256 = "8e498b73d756d0460159110ea7525e838f4e2157d2884f9e9dc1218640c100d8" }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-macos-aarch64.zip"
+sha256 = "d03c0d9bbf722b42322b25df89b40029a59c32c940591025862adabfb3b141af"
+take = { "as" = { to = "mips-linux-gnu-as", sha256 = "5e5c48be56a35d66ced0a5084273a143ef946ac22353bfa09df5181538398d97" }, "ld" = { to = "mips-linux-gnu-ld", sha256 = "001e9ccdd67db06f7292ae9b8ce10b871e9cc43337cccc2e033e71c1e6ed9d03" }, "nm" = { to = "mips-linux-gnu-nm", sha256 = "224102801bd69fee19b3793a9860d198464f934b0a48c75480cde435e41c6853" }, "objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "39f8c4b9726aa67152b354ae1b43872c2d11a553407633f0989ebcf6b7fe05ac" } }
 
 [[setup]]
-name = "GCC 2.8.1 for the PlayStation, from Psy-Q 4.4"
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "macos-aarch64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-macos-aarch64.zip"
+sha256 = "3859072b2e80990046e495f4bf0d4a56e4ea07f578f2b5581fca01e91a072d2c"
+take = { "cpp" = { to = "cpp", sha256 = "cdd4156ca6f33d0d1dd28eaf9a5833a7435415974bdd26e627e63334fb9154f4" } }
+
+[[setup]]
+name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
-copyright = "Free Software Foundation; modified and built by SN Systems, now Sony Interactive Entertainment, and distributed in Sony's PlayStation Psy-Q SDK 4.4 - fetched from a copy of it"
+copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "windows-x86_64"
-url = "https://raw.githubusercontent.com/FoxdieTeam/psyq_sdk/c2ef6aec5823c6ca3a2ceef4ee370495e92fa4d2/psyq_4.4/bin/cc1psx.exe"
-sha256 = "26eb8259fa3e077d1980eb1e0c942006752135953dd03173200bf99ef6f5b6c9"
-take = { file = "cc1.exe", sha256 = "26eb8259fa3e077d1980eb1e0c942006752135953dd03173200bf99ef6f5b6c9" }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-windows-x86_64.zip"
+sha256 = "69c43bb7f77bb6296f674520278a418111c5e5376bb415959c65ae47cb79ab2f"
+take = { "cc1.exe" = { to = "cc1.exe", sha256 = "7e23e26ffe4dfb624c8cfe5716e6c6b4818bf299caaf7366b899323002569f40" } }
 
 [[setup]]
-name = "MIPS binutils 2.47 and GCC 16.2.0's C preprocessor, from PCSX-Redux"
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
 license = "GPL-3.0-or-later"
-copyright = "Free Software Foundation; built by the PCSX-Redux project, its libraries each under its own license"
+copyright = "Free Software Foundation, Inc."
 platform = "windows-x86_64"
-url = "https://distrib.app/storage/assets/8e9/e3f/f17/4e702ee45f3f1447662f057e9a4909c371f0bb2acb6baf3d0cef71e/g++-mipsel-none-elf-16.2.0.zip"
-sha256 = "cf84960f5624829d44b866c5f194094c21c63b30f7cbb8cf3030f1abebd52b75"
-
-[setup.take]
-"bin/mipsel-none-elf-as.exe" = { to = "mips-linux-gnu-as.exe", sha256 = "5323da334c1fcb1ddc3f9ec57c44d3cde550b42496f8dd4ae3ab805ab0e2764f" }
-"bin/mipsel-none-elf-ld.exe" = { to = "mips-linux-gnu-ld.exe", sha256 = "a8c02038fa4e8594b716bce991b6648f333a2855210e9e407219fdc20f53c77e" }
-"bin/mipsel-none-elf-nm.exe" = { to = "mips-linux-gnu-nm.exe", sha256 = "04683ad6421d5b209de09bcc218934d5f3c2f8a0dc309684ae305b25d11ca1b1" }
-"bin/mipsel-none-elf-objcopy.exe" = { to = "mips-linux-gnu-objcopy.exe", sha256 = "8c27a076de0ccb32520ddec445c059fa268cb42c73d173925c1a32449da109ce" }
-"bin/libzstd.dll" = { to = "libzstd.dll", sha256 = "b95c223a9548a9ecf51377c962e0bc8f0c51eb0c6f67a296dbc885996f0dd40d" }
-"libexec/gcc/mipsel-none-elf/16.2.0/cc1.exe" = { to = "cpp/libexec/gcc/host/14.2.0/cc1.exe", sha256 = "3e1d35397cdc8420dd5567711f8771c419ef55647f1f236d0048b29df8ed7e06" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libgcc_s_seh-1.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libgcc_s_seh-1.dll", sha256 = "36ab53dec1027d923b0fce1a6154f193446073739d4365884e5215f1dd63bacc" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libgmp-10.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libgmp-10.dll", sha256 = "37248cda33845e7c5c35a574e57da762dd0a8268f0270d179f30a33746809681" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libiconv-2.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libiconv-2.dll", sha256 = "7a282a854e01be726c6cccfe46f548c716aa45b3014818468253aaa4efbcd067" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libmpc-3.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libmpc-3.dll", sha256 = "3a1d4c692c7a2af929ae043a2c88903304b84917bd84ca46bf75bb5389b11be8" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libmpfr-6.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libmpfr-6.dll", sha256 = "ed5f7bdf777f0f6af00ba193ce4b04e12efa787245a946a631db736e49c0bb1a" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libwinpthread-1.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libwinpthread-1.dll", sha256 = "bd22c23d4ce580c07f183d2bdf2b8edfb255ae1260fa8ae1a8e64dedc7e10575" }
-"libexec/gcc/mipsel-none-elf/16.2.0/libzstd.dll" = { to = "cpp/libexec/gcc/host/14.2.0/libzstd.dll", sha256 = "b95c223a9548a9ecf51377c962e0bc8f0c51eb0c6f67a296dbc885996f0dd40d" }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-windows-x86_64.zip"
+sha256 = "30b33f4475876fa4909b95b34c1b5e08d754f42c9466a120cbcc3ed6240125dc"
+take = { "as.exe" = { to = "mips-linux-gnu-as.exe", sha256 = "5478e7b1e7f510e203a9d66adfa68d37de06ab2d0fd187436fe7434c09658480" }, "ld.exe" = { to = "mips-linux-gnu-ld.exe", sha256 = "b494181db39c66dd931ddf4695c1cd5c2c6a9c9b3ff7d8fc5159d6c1d74b611f" }, "nm.exe" = { to = "mips-linux-gnu-nm.exe", sha256 = "0cf54e637610358392c0db6670d20d733f96bf08982cc09cca1b778a1377ebe8" }, "objcopy.exe" = { to = "mips-linux-gnu-objcopy.exe", sha256 = "7706d6bc9e79de4bdf360ba38febfa7b9d43b811a1723f94c7c40df4cebef713" } }
 
 [[setup]]
-name = "Python 3.13.18, from python-build-standalone"
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "windows-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-windows-x86_64.zip"
+sha256 = "e480cd5facad0a84f5977b009a5ca8ec8ebcf7036b729d195b16e9e6f0fff201"
+take = { "cpp.exe" = { to = "cpp.exe", sha256 = "d2a227d0388b023baebe02eda2cf30df8356fdc643b45eef070787ab0da247c3" } }
+
+[[setup]]
+name = "Python 3.14.10, built by the PE2 editor"
 license = "PSF-2.0"
-copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "linux-x86_64"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
-sha256 = "df15fe60d3ff55bf9dcf25824b5572756bb8816ff93865a273d3301d7066a8b7"
-take = { "python/bin/python3.13" = { to = "python/bin/python3.13", sha256 = "e314bd43fc9c17769c3bd276ca7aafa1462af1b2364a7c908a6cf82e60a92281" }, "python/lib" = { to = "python/lib", sha256 = "e9fecdf59b276495d8a0f0176a59079d5159bbb79b39900d38dd6c72e98e14f8" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-linux-x86_64.zip"
+sha256 = "f344590f5634d9d9c5a6aea8b0c29e659685c095bbc7203b4007614bb3a49c96"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "29b9f06739118377d755e54ccd7b79c4dc27bf144ceeebd98815308c0986213b" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
 
 [[setup]]
-name = "Python 3.13.18, from python-build-standalone"
+name = "Python 3.14.10, built by the PE2 editor"
 license = "PSF-2.0"
-copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "macos-aarch64"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-aarch64-apple-darwin-install_only_stripped.tar.gz"
-sha256 = "8392b6ea51d94391befb2c31ebe75463f045d0b69dfcf5e1bb3234e1f5fa3405"
-take = { "python/bin/python3.13" = { to = "python/bin/python3.13", sha256 = "747ca8797fea0949368e9e39d0f75b1eeadbae6c24edadda792ae22299e47a01" }, "python/lib" = { to = "python/lib", sha256 = "0a3ddba94223435399519631f6fdb73a7569219ad49e2968873a37ce0df002f1" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-macos-aarch64.zip"
+sha256 = "1ddc3b36a134ea997dc28fe7b9e7b29cfd1890632103ba950f14b3284e2bc2a0"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "d31732194ea4c88cb1082c443e13329b38fdcd249c1c2670e854a393f459f432" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
 
 [[setup]]
-name = "Python 3.13.18, from python-build-standalone"
+name = "Python 3.14.10, built by the PE2 editor"
 license = "PSF-2.0"
-copyright = "Python Software Foundation; built by Astral's python-build-standalone, its libraries each under its own license"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
 platform = "windows-x86_64"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.13.18%2B20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
-sha256 = "7369f7a35f261222a6ac8b3a87c1c88eeebee8af945d85346202591a64038dd3"
-take = { "python" = { to = "python", sha256 = "d021c45a51816f4841e60cbe4e32e08d10df3ecf8688e75070699c6fdb1aaaea" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-windows-x86_64.zip"
+sha256 = "54969dc9475a7618d84a968daaf945de5c677a2e3fde186982b7b1322eafdba6"
+take = { "bin/python3.exe" = { to = "python/bin/python3.exe", sha256 = "526d54c2b139a2a05fa1ef8b783a5b2ea102dca966520d02c2eee09ed7740173" }, "lib" = { to = "python/lib", sha256 = "aeee01c469104f15b35fe8c09fbea24f05c35d4dcfc2b4374231e6d3eca98a46" } }
 
 [[setup]]
 name = "maspsx, with this extension's patches"
@@ -137,17 +138,17 @@ patches = [
 [[launch]]
 name = "maspsx"
 platform = "linux-x86_64"
-program = "python/bin/python3.13"
+program = "python/bin/python3"
 args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as"]
 
 [[launch]]
 name = "maspsx"
 platform = "macos-aarch64"
-program = "python/bin/python3.13"
+program = "python/bin/python3"
 args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as"]
 
 [[launch]]
 name = "maspsx"
 platform = "windows-x86_64"
-program = "python/python.exe"
+program = "python/bin/python3.exe"
 args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@mips-linux-gnu-as.exe"]

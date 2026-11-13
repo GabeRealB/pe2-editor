@@ -1,0 +1,98 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "brotlicommon",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                        "-fPIC",
+                    },
+                    .include = .{
+                        "src:c/include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:c/common/constants.c",
+                        "src:c/common/context.c",
+                        "src:c/common/dictionary.c",
+                        "src:c/common/platform.c",
+                        "src:c/common/shared_dictionary.c",
+                        "src:c/common/transform.c",
+                    },
+                },
+            },
+        },
+        .{
+            .name = "brotlidec",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                        "-fPIC",
+                    },
+                    .include = .{
+                        "src:c/include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:c/dec/bit_reader.c",
+                        "src:c/dec/decode.c",
+                        "src:c/dec/huffman.c",
+                        "src:c/dec/prefix.c",
+                        "src:c/dec/state.c",
+                        "src:c/dec/static_init.c",
+                    },
+                },
+            },
+        },
+        .{
+            .name = "brotlienc",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-O3",
+                        "-DNDEBUG",
+                        "-fPIC",
+                    },
+                    .include = .{
+                        "src:c/include",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:c/enc/backward_references.c",
+                        "src:c/enc/backward_references_hq.c",
+                        "src:c/enc/bit_cost.c",
+                        "src:c/enc/block_splitter.c",
+                        "src:c/enc/brotli_bit_stream.c",
+                        "src:c/enc/cluster.c",
+                        "src:c/enc/command.c",
+                        "src:c/enc/compound_dictionary.c",
+                        "src:c/enc/compress_fragment.c",
+                        "src:c/enc/compress_fragment_two_pass.c",
+                        "src:c/enc/dictionary_hash.c",
+                        "src:c/enc/encode.c",
+                        "src:c/enc/encoder_dict.c",
+                        "src:c/enc/entropy_encode.c",
+                        "src:c/enc/fast_log.c",
+                        "src:c/enc/histogram.c",
+                        "src:c/enc/literal_cost.c",
+                        "src:c/enc/memory.c",
+                        "src:c/enc/metablock.c",
+                        "src:c/enc/static_dict.c",
+                        "src:c/enc/static_dict_lut.c",
+                        "src:c/enc/static_init.c",
+                        "src:c/enc/utf8_util.c",
+                    },
+                },
+            },
+        },
+    },
+}

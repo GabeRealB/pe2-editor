@@ -1,0 +1,14 @@
+.{
+    .name = .speex,
+    .fingerprint = 0x1b27a2b96c1254cf,
+    .version = "1.2.1",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .speex = .{
+            .url = "https://downloads.xiph.org/releases/speex/speex-1.2.1.tar.gz",
+            .hash = "N-V-__8AABvVNACiMt2Ksl5U25kCVaMgJsQaZe-QrajaitVN",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

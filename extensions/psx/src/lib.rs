@@ -76,9 +76,9 @@ fn exe_header(image: &[u8], elf: &[u8], address: u32, release: &str) -> Result<V
     Ok(out)
 }
 
-/// The preprocessor: a modern GCC's `cc1`, which the extension's setup places at this path for each platform, run
-/// without a driver. A package is preprocessed with `-Werror`, so a macro defined twice stops it.
-const PREPROCESSOR: &str = "cpp/libexec/gcc/host/14.2.0/cc1";
+/// The preprocessor: aro's, which takes the arguments of a GCC's `cc1 -E` and gives the same tokens. A package is
+/// preprocessed with `-Werror`, so a macro defined twice stops it.
+const PREPROCESSOR: &str = "cpp";
 const CPP: [&str; 9] =
     ["-E", "-quiet", "-undef", "-Wall", "-Werror", "-nostdinc", "-D_LANGUAGE_C", "-DUSE_INCLUDE_ASM", "-DVER_USA"];
 const CC1: [&str; 16] = [

@@ -1,0 +1,50 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "fribidi",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-fvisibility=hidden",
+                        "-DNDEBUG",
+                        "-O3",
+                        "-DHAVE_CONFIG_H",
+                    },
+                    .include = .{
+                        "build:lib/libfribidi.a.p",
+                        "build:lib",
+                        "src:lib",
+                        "build:",
+                        "src:",
+                        "build:gen.tab",
+                        "src:gen.tab",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:lib/fribidi.c",
+                        "src:lib/fribidi-arabic.c",
+                        "src:lib/fribidi-bidi.c",
+                        "src:lib/fribidi-bidi-types.c",
+                        "src:lib/fribidi-char-sets.c",
+                        "src:lib/fribidi-char-sets-cap-rtl.c",
+                        "src:lib/fribidi-char-sets-cp1255.c",
+                        "src:lib/fribidi-char-sets-cp1256.c",
+                        "src:lib/fribidi-char-sets-iso8859-6.c",
+                        "src:lib/fribidi-char-sets-iso8859-8.c",
+                        "src:lib/fribidi-char-sets-utf8.c",
+                        "src:lib/fribidi-deprecated.c",
+                        "src:lib/fribidi-joining.c",
+                        "src:lib/fribidi-joining-types.c",
+                        "src:lib/fribidi-mirroring.c",
+                        "src:lib/fribidi-brackets.c",
+                        "src:lib/fribidi-run.c",
+                        "src:lib/fribidi-shape.c",
+                    },
+                },
+            },
+        },
+    },
+}

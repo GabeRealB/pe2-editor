@@ -1,0 +1,108 @@
+A CONST_DOUBLE's words copied into and out of its fields one HOST_WIDE_INT a field, where GCC 2.8.1 copied them as
+one block. The block holds only where an rtx's field is as wide as a HOST_WIDE_INT; on a host whose pointers are wider
+than int (LP64) a field is wider, and every floating-point constant cc1 compiles loses its high word.
+
+--- a/emit-rtl.c
++++ b/emit-rtl.c
+@@ -3406,7 +3406,7 @@
+ 	  bzero ((char *) &u, sizeof u);  /* Zero any holes in a structure.  */
+ 	  u.d = i == 0 ? dconst0 : i == 1 ? dconst1 : dconst2;
+ 
+-	  bcopy ((char *) &u, (char *) &CONST_DOUBLE_LOW (tem), sizeof u);
++	  CONST_DOUBLE_FROM_EXTRACT (tem, u);
+ 	  CONST_DOUBLE_MEM (tem) = cc0_rtx;
+ 	  PUT_MODE (tem, mode);
+ 
+--- a/real.h
++++ b/real.h
+@@ -407,6 +407,23 @@
+   HOST_WIDE_INT i[sizeof (REAL_VALUE_TYPE) / sizeof (HOST_WIDE_INT)];
+ };
+ 
++/* The words of a union real_extract U put into the fields of the CONST_DOUBLE R
++   from CONST_DOUBLE_LOW on, and taken out of them, one HOST_WIDE_INT a field.
++   They were copied as one block, which holds only where an rtx's field is as
++   wide as a HOST_WIDE_INT: on a host whose pointers are wider than int (LP64)
++   each field is wider, and a block copy loses every word after the first.  */
++#define REAL_EXTRACT_WORDS(u) (sizeof (u).i / sizeof (HOST_WIDE_INT))
++#define CONST_DOUBLE_FROM_EXTRACT(r, u)					\
++do { int w_;								\
++     for (w_ = 0; w_ < REAL_EXTRACT_WORDS (u); w_++)			\
++       XWINT ((r), 2 + w_) = (u).i[w_];					\
++   } while (0)
++#define CONST_DOUBLE_TO_EXTRACT(u, r)					\
++do { int w_;								\
++     for (w_ = 0; w_ < REAL_EXTRACT_WORDS (u); w_++)			\
++       (u).i[w_] = XWINT ((r), 2 + w_);					\
++   } while (0)
++
+ /* For a CONST_DOUBLE:
+    The usual two ints that hold the value.
+    For a DImode, that is all there are;
+@@ -432,7 +449,7 @@
+ 
+ #define REAL_VALUE_FROM_CONST_DOUBLE(to, from)		\
+ do { union real_extract u;				\
+-     bcopy ((char *) &CONST_DOUBLE_LOW ((from)), (char *) &u, sizeof u); \
++     CONST_DOUBLE_TO_EXTRACT (u, (from));			\
+      to = u.d; } while (0)
+ 
+ /* Return a CONST_DOUBLE with value R and mode M.  */
+--- a/rtl.c
++++ b/rtl.c
+@@ -808,7 +808,7 @@
+      since tree.h is not included.  But the default dfn as `double'
+      would do no harm.  */
+ #ifdef REAL_VALUE_TYPE
+-  i = sizeof (REAL_VALUE_TYPE) / sizeof (rtunion) + 2;
++  i = sizeof (REAL_VALUE_TYPE) / sizeof (HOST_WIDE_INT) + 2;
+   if (rtx_length[(int) CONST_DOUBLE] < i)
+     {
+       char *s = (char *) xmalloc (i + 1);
+--- a/varasm.c
++++ b/varasm.c
+@@ -2265,9 +2265,13 @@
+      If one is found, return it.  */
+ 
+   for (r = const_double_chain; r; r = CONST_DOUBLE_CHAIN (r))
+-    if (! bcmp ((char *) &CONST_DOUBLE_LOW (r), (char *) &u, sizeof u)
+-	&& GET_MODE (r) == mode)
+-      return r;
++    {
++      union real_extract v;
++
++      CONST_DOUBLE_TO_EXTRACT (v, r);
++      if (! bcmp ((char *) &v, (char *) &u, sizeof u) && GET_MODE (r) == mode)
++	return r;
++    }
+ 
+   /* No; make a new one and add it to the chain.
+ 
+@@ -2281,7 +2285,7 @@
+   rtl_in_saveable_obstack ();
+   r = rtx_alloc (CONST_DOUBLE);
+   PUT_MODE (r, mode);
+-  bcopy ((char *) &u, (char *) &CONST_DOUBLE_LOW (r), sizeof u);
++  CONST_DOUBLE_FROM_EXTRACT (r, u);
+   pop_obstacks ();
+ 
+   /* Don't touch const_double_chain in nested function; see force_const_mem.
+@@ -3418,8 +3422,7 @@
+       if (GET_MODE (x) != VOIDmode)
+ 	{
+ 	  value->mode = GET_MODE (x);
+-	  bcopy ((char *) &CONST_DOUBLE_LOW (x),
+-		 (char *) &value->un.du, sizeof value->un.du);
++	  CONST_DOUBLE_TO_EXTRACT (value->un.du, x);
+ 	}
+       else
+ 	{
+@@ -3838,7 +3841,7 @@
+ 	  if (GET_CODE (x) != CONST_DOUBLE)
+ 	    abort ();
+ 
+-	  bcopy ((char *) &CONST_DOUBLE_LOW (x), (char *) &u, sizeof u);
++	  CONST_DOUBLE_TO_EXTRACT (u, x);
+ 	  assemble_real (u.d, pool->mode);
+ 	  break;
+ 

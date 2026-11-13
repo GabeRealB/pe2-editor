@@ -1,0 +1,14 @@
+.{
+    .name = .webp,
+    .fingerprint = 0x9e7e36eb08b9c105,
+    .version = "1.6.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .webp = .{
+            .url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz",
+            .hash = "N-V-__8AAGkrewARcKiSyLfJKsaW0ZoqHh4hzi4mTGwekxjk",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

@@ -1,0 +1,22 @@
+Apple's system log used only where its header is: a build for macOS with the C library's headers alone - zig's -
+has no <os/log.h>, and CPython would not build. Where Apple's SDK is, nothing changes.
+
+--- a/Python/pylifecycle.c
++++ b/Python/pylifecycle.c
+@@ -61,8 +61,14 @@
+ #    define HAS_APPLE_SYSTEM_LOG 0
+ #  endif
+ 
+-#  if HAS_APPLE_SYSTEM_LOG
+-#    include <os/log.h>
++#  if HAS_APPLE_SYSTEM_LOG && defined(__has_include)
++#    if __has_include(<os/log.h>)
++#      include <os/log.h>
++#    else
++       // Built with the C library's headers alone, not Apple's SDK: no system log to write to.
++#      undef HAS_APPLE_SYSTEM_LOG
++#      define HAS_APPLE_SYSTEM_LOG 0
++#    endif
+ #  endif
+ #endif
+ 

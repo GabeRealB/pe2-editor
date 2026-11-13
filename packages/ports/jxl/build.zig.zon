@@ -1,0 +1,19 @@
+.{
+    .name = .jxl,
+    .fingerprint = 0x19e349698016fbe8,
+    .version = "0.13.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .highway = .{ .path = "../highway" },
+        .brotli = .{ .path = "../brotli" },
+        .brotli = .{ .path = "../brotli" },
+        .brotli = .{ .path = "../brotli" },
+        .lcms2 = .{ .path = "../lcms2" },
+        .jxl = .{
+            .url = "https://github.com/libjxl/libjxl/archive/refs/tags/v0.13.0.tar.gz",
+            .hash = "N-V-__8AABLhZgAIs57NSpPgvFgglWeyUGBHyqgdt1LG-aIF",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

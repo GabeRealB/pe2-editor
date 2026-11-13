@@ -1,0 +1,8 @@
+.{
+    .name = .pe2_tools,
+    .version = "0.0.1",
+    .fingerprint = 0x605d5e97df65bffe,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "patch.zig", "sh.zig", "sed.zig" },
+}

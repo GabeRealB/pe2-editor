@@ -1,0 +1,14 @@
+.{
+    .name = .fribidi,
+    .fingerprint = 0x4414a72fe5b6abc2,
+    .version = "1.0.18",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .fribidi = .{
+            .url = "https://github.com/fribidi/fribidi/releases/download/v1.0.18/fribidi-1.0.18.tar.xz",
+            .hash = "N-V-__8AAKRlNgGwP2pRrFBYWgjxTwp0tIIFFq59asf5dovu",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

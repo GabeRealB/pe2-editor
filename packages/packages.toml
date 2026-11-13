@@ -1,0 +1,95 @@
+# What `cargo xtask packages` builds and publishes: the zig that builds it, and each package's facts for the release
+# notes and the extensions' `[[setup]]` entries. The sources themselves are dependencies in `build.zig.zon`.
+
+# The zig every package is built with, fetched as ziglang.org asks of automation: from a community mirror (the list
+# at `mirrors`, a copy kept in `zig-mirrors.txt` for when it cannot be read), its minisign signature verified with
+# `public_key` and its signed file name checked, then held to the SHA-256 here. ziglang.org itself is tried last.
+[zig]
+version = "0.17.1"
+mirrors = "https://ziglang.org/download/community-mirrors.txt"
+public_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+# The tool's name, as mirrors ask to be told (`?source=`).
+source = "pe2-editor"
+
+# The zig for each machine the packages can be built on, by `<os>-<arch>` as the release names platforms.
+[zig.host.linux-x86_64]
+file = "zig-x86_64-linux-0.17.1.tar.xz"
+sha256 = "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+
+[zig.host.linux-aarch64]
+file = "zig-aarch64-linux-0.17.1.tar.xz"
+sha256 = "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"
+
+[zig.host.macos-aarch64]
+file = "zig-aarch64-macos-0.17.1.tar.xz"
+sha256 = "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d"
+
+[zig.host.macos-x86_64]
+file = "zig-x86_64-macos-0.17.1.tar.xz"
+sha256 = "9af07b20319fbd0c92ee46ad23e81d6a782b1aaea2cfb8dcbff35f1d2c7ddbb7"
+
+# The repository whose releases hold the archives, which their `[[setup]]` entries download from.
+[release]
+repository = "https://github.com/GabeRealB/pe2-editor"
+
+# The platforms the packages are built for, each by the target zig builds for.
+[platform]
+linux-x86_64 = "x86_64-linux-musl"
+windows-x86_64 = "x86_64-windows-gnu"
+macos-aarch64 = "aarch64-macos"
+
+# Each package, by its project's folder (`packages/<package>/`): its `version` and `release` - which build of that version,
+# bumped when it is built anew - name its release (`<package>-<version>-<release>`); `name`, `license` and `copyright` are
+# for its `[[setup]]` entries, whose `take` is the programs listed here (`.exe` added on Windows), or a table of each and
+# the name it is placed under. What each is made of is `components.toml`'s.
+[package.gcc-psx]
+version = "2.8.1"
+release = 1
+name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
+description = "GCC 2.8.1's C compiler (cc1) for the PlayStation, with old-gcc's patches and the editor's for 64-bit hosts"
+license = "GPL-2.0-or-later"
+copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
+upstream = "https://gcc.gnu.org"
+take = ["cc1"]
+
+[package.binutils-mipsel]
+version = "2.47"
+release = 1
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
+description = "GNU binutils 2.47's as, ld, nm and objcopy for mipsel"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation, Inc."
+upstream = "https://www.gnu.org/software/binutils/"
+# Placed under the names pe2.psx runs, which are also those a system's binutils for MIPS have.
+take = { as = "mips-linux-gnu-as", ld = "mips-linux-gnu-ld", nm = "mips-linux-gnu-nm", objcopy = "mips-linux-gnu-objcopy" }
+
+[package.aro-cpp]
+version = "0.17.1"
+release = 1
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+description = "a C preprocessor taking GCC's cc1 -E arguments, made of aro, the C front end in zig"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+upstream = "https://github.com/Vexu/arocc"
+take = ["cpp"]
+
+[package.python]
+version = "3.14.10"
+release = 1
+name = "Python 3.14.10, built by the PE2 editor"
+description = "CPython 3.14.10, every module of its standard library that needs nothing outside CPython built in (MSYS2's CPython for MinGW on Windows)"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
+upstream = "https://www.python.org"
+# The program and its standard library, placed as pe2.psx runs them (`.exe` added to the program on Windows).
+take = { "bin/python3" = "python/bin/python3", lib = "python/lib" }
+
+[package.ffmpeg]
+version = "9.0.2"
+release = 1
+name = "FFmpeg 9.0.2, built by the PE2 editor"
+description = "FFmpeg 9.0.2's ffmpeg and ffprobe, with the codec, format, subtitle and graphics card libraries listed in its release"
+license = "GPL-3.0-or-later"
+copyright = "the FFmpeg developers; each library's authors, as its license in licenses/ says"
+upstream = "https://ffmpeg.org"
+take = ["ffmpeg", "ffprobe"]

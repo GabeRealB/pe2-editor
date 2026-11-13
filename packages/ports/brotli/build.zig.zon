@@ -1,0 +1,14 @@
+.{
+    .name = .brotli,
+    .fingerprint = 0xba7766d3eaecc151,
+    .version = "1.2.1",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz",
+            .hash = "N-V-__8AAHajKgD1oXsbBWLJka_y0ZSKZnQaTc6L-KURx6-j",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

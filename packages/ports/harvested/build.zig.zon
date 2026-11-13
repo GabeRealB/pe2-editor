@@ -1,0 +1,13 @@
+.{
+    .name = .harvested,
+    .version = "0.0.1",
+    .fingerprint = 0x928ab589de34b290,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .nasm = .{
+            .url = "git+https://github.com/allyourcodebase/nasm#f11aa6ed5a7eb339259b3439b3e47d58dba998cc",
+            .hash = "nasm-3.0.1-B_NnpSJUAABp8P_x6B1dPmYEcBVlfF06ZpyWcCvl461C",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

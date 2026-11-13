@@ -1,0 +1,14 @@
+.{
+    .name = .vpx,
+    .fingerprint = 0xdedc4d085bf8690d,
+    .version = "1.17.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .vpx = .{
+            .url = "https://github.com/webmproject/libvpx/archive/refs/tags/v1.17.0.tar.gz",
+            .hash = "N-V-__8AAEtYegGVP8gLL8F_b5_8upw0x45Q6TdpJMiVICMt",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

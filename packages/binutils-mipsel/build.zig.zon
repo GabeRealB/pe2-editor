@@ -1,0 +1,10 @@
+.{
+    .name = .binutils_mipsel,
+    .version = "0.0.0",
+    .fingerprint = 0x384e191c53daa86e,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .binutils = .{ .path = "../ports/binutils-2.47" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

@@ -1,0 +1,14 @@
+.{
+    .name = .highway,
+    .fingerprint = 0xdbcf1a740d555fcf,
+    .version = "1.4.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .highway = .{
+            .url = "https://github.com/google/highway/releases/download/1.4.0/highway-1.4.0.tar.gz",
+            .hash = "N-V-__8AAD_MkACxo3rELIYCI7ap_7GsxHN1WH6AsMLDYp6L",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

@@ -1,0 +1,18 @@
+.{
+    .name = .libass,
+    .fingerprint = 0x4ff2ef92ca922df6,
+    .version = "0.17.5",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .freetype = .{ .path = "../freetype" },
+        .fribidi = .{ .path = "../fribidi" },
+        .harfbuzz = .{ .path = "../harfbuzz" },
+        .fontconfig = .{ .path = "../fontconfig" },
+        .libass = .{
+            .url = "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz",
+            .hash = "N-V-__8AANzmKQBUsuvDhTdsAlqL-jj_-s4R72gJUhw0AcgI",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

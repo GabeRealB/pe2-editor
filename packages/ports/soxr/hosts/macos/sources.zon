@@ -1,0 +1,38 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "soxr",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DSOXR_LIB",
+                        "-O3",
+                        "-DNDEBUG",
+                        "-pedantic",
+                        "-std=gnu89",
+                    },
+                    .include = .{
+                        "build:",
+                        "src:src",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:src/soxr.c",
+                        "src:src/data-io.c",
+                        "src:src/dbesi0.c",
+                        "src:src/filter.c",
+                        "src:src/fft4g64.c",
+                        "src:src/cr.c",
+                        "src:src/cr32.c",
+                        "src:src/fft4g32.c",
+                        "src:src/cr64.c",
+                        "src:src/vr32.c",
+                    },
+                },
+            },
+        },
+    },
+}

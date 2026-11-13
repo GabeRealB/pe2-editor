@@ -1,0 +1,14 @@
+.{
+    .name = .xvid,
+    .fingerprint = 0x215336225e9b5177,
+    .version = "1.3.7",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .xvid = .{
+            .url = "https://downloads.xvid.com/downloads/xvidcore-1.3.7.zip",
+            .hash = "N-V-__8AAIeOOADEJPs01Z2d8S5iHeCz8R-Zq3huW8jUn9Gb",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

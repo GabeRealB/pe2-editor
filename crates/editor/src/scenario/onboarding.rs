@@ -87,7 +87,7 @@ fn trusting_shows_what_it_downloads_and_asks_nothing_more() {
     let mut editor = Scenario::open(Fixture::untrusted(false));
     editor.expect("pe2.psx downloads:");
     editor.expect("GCC 2.8.1 for the PlayStation");
-    editor.expect("https://github.com/decompals/old-gcc");
+    editor.expect("https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1");
     editor.expect("sha256");
     editor.click_label("Trust the whole project");
     editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);

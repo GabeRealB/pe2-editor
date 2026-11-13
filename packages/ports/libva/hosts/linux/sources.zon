@@ -1,0 +1,65 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "va",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DNDEBUG",
+                        "-D_FILE_OFFSET_BITS=64",
+                        "-O3",
+                        "-DHAVE_SECURE_GETENV",
+                        "-fPIC",
+                        "-DSYSCONFDIR=\"/etc\"",
+                        "-DVA_DRIVERS_PATH=\"/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/local/lib/dri\"",
+                    },
+                    .include = .{
+                        "build:va/libva.a.p",
+                        "build:va",
+                        "src:va",
+                        "build:",
+                        "src:",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:va/va.c",
+                        "src:va/va_compat.c",
+                        "src:va/va_str.c",
+                        "src:va/va_trace.c",
+                    },
+                },
+            },
+        },
+        .{
+            .name = "va-drm",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-DNDEBUG",
+                        "-D_FILE_OFFSET_BITS=64",
+                        "-O3",
+                        "-DHAVE_SECURE_GETENV",
+                        "-fPIC",
+                    },
+                    .include = .{
+                        "build:va/libva-drm.a.p",
+                        "build:va",
+                        "src:va",
+                        "build:",
+                        "src:",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:va/drm/va_drm.c",
+                        "src:va/drm/va_drm_auth.c",
+                        "src:va/drm/va_drm_utils.c",
+                    },
+                },
+            },
+        },
+    },
+}

@@ -1,0 +1,10 @@
+.{
+    .name = .python,
+    .version = "0.0.0",
+    .fingerprint = 0xa4d4b8b86f7b95e9,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .cpython = .{ .path = "../ports/cpython-3.14" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

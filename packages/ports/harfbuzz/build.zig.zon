@@ -1,0 +1,15 @@
+.{
+    .name = .harfbuzz,
+    .fingerprint = 0xbd60917ca6525d4e,
+    .version = "15.1.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .freetype = .{ .path = "../freetype" },
+        .harfbuzz = .{
+            .url = "https://github.com/harfbuzz/harfbuzz/releases/download/15.1.0/harfbuzz-15.1.0.tar.xz",
+            .hash = "N-V-__8AABCJSwZ_b-_pzs_bdrf6CKkC58JNxsp0b1FfvNqV",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

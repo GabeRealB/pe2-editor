@@ -54,7 +54,9 @@ Most extensions are built in. The two that run programs on your machine, `pe2.ps
 `pe2.ffmpeg` (video), ship beside the editor and run only if you trust them. See [extensions](docs/extending/extensions.md).
 
 For extension authors: `cargo xtask hash <manifest> --write` fills in the checksums of what a manifest downloads,
-and `cargo xtask pins` checks that every pinned download is still there.
+and `cargo xtask pins` checks that every pinned download is still there. What `pe2.psx` and `pe2.ffmpeg` download is
+built from source by `cargo xtask packages` (the zig projects in `packages/`) and published as this repository's
+releases, one a package version.
 
 ## Working on the editor
 
@@ -88,7 +90,8 @@ crates/
   webgpu/         WebGPU for extensions
   licenses/       what the programs are built with, gathered as they build
 extensions/       the extensions, built in and shipped apart
-xtask/            dist, package, hash, pins
+xtask/            dist, package, hash, pins, packages
+packages/         what the extensions download, built from source with zig
 docs/             the user documentation
 design/           how each part is built, for whoever changes it
 licenses/         license policy, and license texts no package ships

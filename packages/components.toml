@@ -1,0 +1,548 @@
+# Every source the packages are built from, as `cargo xtask packages` names it in a release and licenses it in an
+# archive: the sources zig fetches (each by the exact URL a manifest fetches it from - a URL changed is a component no
+# entry here describes, which fails the task by name), and the zig they are built with.
+#
+# - `name`, `version`: what its source archive in a release is named (`<name>-<version>.tar.gz`); the URL must name the
+#   version.
+# - `license`: SPDX's expression of it where it has one; `license_files`: the files of its source carrying it, which an
+#   archive it is linked into holds as `licenses/<name>/<file>`; `upstream`: where it comes from.
+# - `role`: `linked` - its code is in what ships - or `tool`, used only to build (nasm, allyourcodebase's build scripts);
+#   `platforms`, where it is linked when not on every platform (elsewhere it is a tool or not used); `packages`, which
+#   packages it is linked into when not every one that fetches it.
+
+# The zig every package is built with: its compiler-rt and, as a target needs them, the C and C++ runtimes it carries
+# (musl, MinGW-w64's, glibc's stubs, libc++, libc++abi, libunwind) are linked into what ships; aro-cpp is made of aro, which it
+# carries.
+[[component]]
+zig = true
+name = "zig"
+version = "0.17.1"
+license = "MIT AND Apache-2.0 WITH LLVM-exception AND (see each runtime's file)"
+license_files = ["LICENSE", "lib/libc/musl/COPYRIGHT", "lib/libc/mingw/COPYING", "lib/libc/glibc/LICENSES", "lib/libcxx/LICENSE.TXT", "lib/libcxxabi/LICENSE.TXT", "lib/libunwind/LICENSE.TXT"]
+upstream = "https://ziglang.org"
+role = "linked"
+
+# gcc-psx.
+[[component]]
+url = "https://ftp.gnu.org/gnu/gcc/gcc-2.8.1.tar.gz"
+name = "gcc"
+version = "2.8.1"
+license = "GPL-2.0-or-later"
+license_files = ["COPYING"]
+upstream = "https://gcc.gnu.org"
+role = "linked"
+
+[[component]]
+url = "https://github.com/decompals/old-gcc/archive/refs/tags/0.17.tar.gz"
+name = "old-gcc"
+version = "0.17"
+# Patches to GCC, applied to its source, stating no license of their own.
+license = "NOASSERTION"
+license_files = []
+upstream = "https://github.com/decompals/old-gcc"
+role = "linked"
+
+# binutils-mipsel.
+[[component]]
+url = "https://sourceware.org/pub/binutils/releases/binutils-2.47.tar.xz"
+name = "binutils"
+version = "2.47"
+license = "GPL-3.0-or-later"
+license_files = ["COPYING3", "COPYING3.LIB"]
+upstream = "https://www.gnu.org/software/binutils/"
+role = "linked"
+
+# python.
+[[component]]
+url = "https://www.python.org/ftp/python/3.14.10/Python-3.14.10.tar.xz"
+name = "cpython"
+version = "3.14.10"
+license = "PSF-2.0"
+license_files = ["LICENSE"]
+upstream = "https://www.python.org"
+role = "linked"
+# Windows' is MSYS2's; CPython's builds the tool freezing its modules there.
+platforms = ["linux-x86_64", "macos-aarch64"]
+
+[[component]]
+url = "https://github.com/msys2-contrib/cpython-mingw/archive/a80cc14bd48e798bb422b4a81e523033834f8d90.tar.gz"
+name = "cpython-mingw"
+version = "a80cc14"
+license = "PSF-2.0"
+license_files = ["LICENSE"]
+upstream = "https://github.com/msys2-contrib/cpython-mingw"
+role = "linked"
+platforms = ["windows-x86_64"]
+
+[[component]]
+url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.2.tar.gz"
+name = "zlib"
+version = "1.3.2"
+license = "Zlib"
+license_files = ["LICENSE"]
+upstream = "https://zlib.net"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/zlib#d3b5519d3b73616a6bfece0712f080029d2a9244"
+name = "zig-zlib"
+version = "d3b5519"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/zlib"
+role = "tool"
+
+# ffmpeg.
+[[component]]
+url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"
+name = "ffmpeg"
+version = "9.0.2"
+# Built with --enable-gpl --enable-version3.
+license = "GPL-3.0-or-later"
+license_files = ["COPYING.GPLv3", "LICENSE.md"]
+upstream = "https://ffmpeg.org"
+role = "linked"
+
+[[component]]
+url = "git+https://code.videolan.org/videolan/x264.git#b35605ace3ddf7c1a5d67a2eb553f034aef41d55"
+name = "x264"
+version = "b35605a"
+license = "GPL-2.0-or-later"
+license_files = ["COPYING"]
+upstream = "https://www.videolan.org/developers/x264.html"
+role = "linked"
+
+[[component]]
+url = "https://download.videolan.org/videolan/x265/x265_4.2.tar.gz"
+name = "x265"
+version = "4.2"
+license = "GPL-2.0-or-later"
+license_files = ["COPYING"]
+upstream = "https://www.x265.org"
+role = "linked"
+
+[[component]]
+url = "git+https://aomedia.googlesource.com/aom?ref=v3.15.3#b141d9c45db236335351c8a4b2a14b3ade27c937"
+name = "aom"
+version = "3.15.3"
+license = "BSD-2-Clause"
+license_files = ["LICENSE", "PATENTS"]
+upstream = "https://aomedia.googlesource.com/aom"
+role = "linked"
+
+[[component]]
+url = "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz"
+name = "dav1d"
+version = "1.5.4"
+license = "BSD-2-Clause"
+license_files = ["COPYING"]
+upstream = "https://code.videolan.org/videolan/dav1d"
+role = "linked"
+
+[[component]]
+url = "https://github.com/AOMediaCodec/SVT-AV1/archive/refs/tags/v4.3.0.tar.gz"
+name = "svt-av1"
+version = "4.3.0"
+license = "BSD-3-Clause-Clear AND BSD-2-Clause"
+license_files = ["LICENSE.md", "LICENSE-BSD2.md", "PATENTS.md"]
+upstream = "https://gitlab.com/AOMediaCodec/SVT-AV1"
+role = "linked"
+
+[[component]]
+url = "https://github.com/webmproject/libvpx/archive/refs/tags/v1.17.0.tar.gz"
+name = "libvpx"
+version = "1.17.0"
+license = "BSD-3-Clause"
+license_files = ["LICENSE", "PATENTS"]
+upstream = "https://chromium.googlesource.com/webm/libvpx"
+role = "linked"
+
+[[component]]
+url = "https://github.com/cisco/openh264/archive/refs/tags/v2.7.0.tar.gz"
+name = "openh264"
+version = "2.7.0"
+license = "BSD-2-Clause"
+license_files = ["LICENSE"]
+upstream = "https://www.openh264.org"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xvid.com/downloads/xvidcore-1.3.7.zip"
+name = "xvidcore"
+version = "1.3.7"
+license = "GPL-2.0-or-later"
+license_files = ["LICENSE"]
+upstream = "https://www.xvid.com"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xiph.org/releases/theora/libtheora-1.2.0.tar.xz"
+name = "libtheora"
+version = "1.2.0"
+license = "BSD-3-Clause"
+license_files = ["COPYING", "LICENSE"]
+upstream = "https://www.theora.org"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xiph.org/releases/ogg/libogg-1.3.6.tar.xz"
+name = "libogg"
+version = "1.3.6"
+license = "BSD-3-Clause"
+license_files = ["COPYING"]
+upstream = "https://www.xiph.org/ogg/"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz"
+name = "libvorbis"
+version = "1.3.7"
+license = "BSD-3-Clause"
+license_files = ["COPYING"]
+upstream = "https://www.xiph.org/vorbis/"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz"
+name = "opus"
+version = "1.6.1"
+license = "BSD-3-Clause"
+license_files = ["COPYING"]
+upstream = "https://opus-codec.org"
+role = "linked"
+
+[[component]]
+url = "https://downloads.xiph.org/releases/speex/speex-1.2.1.tar.gz"
+name = "speex"
+version = "1.2.1"
+license = "BSD-3-Clause"
+license_files = ["COPYING"]
+upstream = "https://www.speex.org"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/libmp3lame#b2322045e93dc0361006fdc736b9617522b00cd6"
+name = "lame"
+# allyourcodebase's port of LAME 3.100: its source and its build in one.
+version = "b232204"
+license = "LGPL-2.0-or-later"
+license_files = ["COPYING"]
+upstream = "https://lame.sourceforge.io"
+role = "linked"
+
+[[component]]
+url = "https://deb.debian.org/debian/pool/main/libg/libgsm/libgsm_1.0.24.orig.tar.gz"
+name = "libgsm"
+version = "1.0.24"
+license = "TU-Berlin-2.0"
+license_files = ["COPYRIGHT"]
+upstream = "https://www.quut.com/gsm/"
+role = "linked"
+
+[[component]]
+url = "https://downloads.sourceforge.net/project/opencore-amr/opencore-amr/opencore-amr-0.1.6.tar.gz"
+name = "opencore-amr"
+version = "0.1.6"
+license = "Apache-2.0"
+license_files = ["LICENSE"]
+upstream = "https://opencore-amr.sourceforge.io"
+role = "linked"
+
+[[component]]
+url = "https://downloads.sourceforge.net/project/opencore-amr/vo-amrwbenc/vo-amrwbenc-0.1.3.tar.gz"
+name = "vo-amrwbenc"
+version = "0.1.3"
+license = "Apache-2.0"
+license_files = ["COPYING", "NOTICE"]
+upstream = "https://opencore-amr.sourceforge.io"
+role = "linked"
+
+[[component]]
+url = "https://github.com/uclouvain/openjpeg/archive/refs/tags/v2.5.4.tar.gz"
+name = "openjpeg"
+version = "2.5.4"
+license = "BSD-2-Clause"
+license_files = ["LICENSE"]
+upstream = "https://www.openjpeg.org"
+role = "linked"
+
+[[component]]
+url = "https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz"
+name = "libwebp"
+version = "1.6.0"
+license = "BSD-3-Clause"
+license_files = ["COPYING", "PATENTS"]
+upstream = "https://developers.google.com/speed/webp"
+role = "linked"
+
+[[component]]
+url = "https://github.com/libjxl/libjxl/archive/refs/tags/v0.13.0.tar.gz"
+name = "libjxl"
+version = "0.13.0"
+license = "BSD-3-Clause"
+license_files = ["LICENSE", "PATENTS"]
+upstream = "https://github.com/libjxl/libjxl"
+role = "linked"
+
+[[component]]
+url = "https://github.com/google/highway/releases/download/1.4.0/highway-1.4.0.tar.gz"
+name = "highway"
+version = "1.4.0"
+license = "Apache-2.0 OR BSD-3-Clause"
+license_files = ["LICENSE"]
+upstream = "https://github.com/google/highway"
+role = "linked"
+
+[[component]]
+url = "https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz"
+name = "brotli"
+version = "1.2.1"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/google/brotli"
+role = "linked"
+
+[[component]]
+url = "https://github.com/mm2/Little-CMS/releases/download/lcms2.20/lcms2-2.20.tar.gz"
+name = "lcms2"
+version = "2.20"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://www.littlecms.com"
+role = "linked"
+
+[[component]]
+url = "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.6.tar.gz"
+name = "zimg"
+version = "3.0.6"
+license = "WTFPL"
+license_files = ["COPYING"]
+upstream = "https://github.com/sekrit-twc/zimg"
+role = "linked"
+
+[[component]]
+url = "https://downloads.sourceforge.net/project/soxr/soxr-0.1.3-Source.tar.xz"
+name = "soxr"
+version = "0.1.3"
+license = "LGPL-2.1-or-later"
+license_files = ["LICENCE", "COPYING.LGPL"]
+upstream = "https://sourceforge.net/projects/soxr/"
+role = "linked"
+
+[[component]]
+url = "https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.xz"
+name = "xz"
+version = "5.8.4"
+# liblzma, which is what is linked.
+license = "0BSD"
+license_files = ["COPYING", "COPYING.0BSD"]
+upstream = "https://tukaani.org/xz/"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/libarchive/bzip2#bzip2-1.0.8"
+name = "bzip2"
+version = "1.0.8"
+license = "bzip2-1.0.6"
+license_files = ["LICENSE"]
+upstream = "https://sourceware.org/bzip2/"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/bzip2#d7668d5ee5eb55489c35632ecf0b0107c7a77569"
+name = "zig-bzip2"
+version = "d7668d5"
+license = "NOASSERTION"
+license_files = []
+upstream = "https://github.com/allyourcodebase/bzip2"
+role = "tool"
+
+[[component]]
+url = "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz"
+name = "libxml2"
+version = "2.15.4"
+license = "MIT"
+license_files = ["Copyright"]
+upstream = "https://gitlab.gnome.org/GNOME/libxml2"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/libxml2#5df5e2832f9427aa3e587247fc9b1891549e8022"
+name = "zig-libxml2"
+version = "5df5e28"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/libxml2"
+role = "tool"
+
+[[component]]
+url = "https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/freetype-2.14.3.tar.xz"
+name = "freetype"
+version = "2.14.3"
+license = "FTL OR GPL-2.0-or-later"
+license_files = ["LICENSE.TXT", "docs/FTL.TXT", "docs/GPLv2.TXT"]
+upstream = "https://freetype.org"
+role = "linked"
+
+[[component]]
+url = "https://github.com/harfbuzz/harfbuzz/releases/download/15.1.0/harfbuzz-15.1.0.tar.xz"
+name = "harfbuzz"
+version = "15.1.0"
+license = "MIT"
+license_files = ["COPYING"]
+upstream = "https://harfbuzz.github.io"
+role = "linked"
+
+[[component]]
+url = "https://github.com/fribidi/fribidi/releases/download/v1.0.18/fribidi-1.0.18.tar.xz"
+name = "fribidi"
+version = "1.0.18"
+license = "LGPL-2.1-or-later"
+license_files = ["COPYING"]
+upstream = "https://github.com/fribidi/fribidi"
+role = "linked"
+
+[[component]]
+url = "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz"
+name = "fontconfig"
+version = "2.18.3"
+license = "HPND-sell-variant"
+license_files = ["COPYING"]
+upstream = "https://www.freedesktop.org/wiki/Software/fontconfig/"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/libexpat/libexpat.git?ref=R_2_9_0#a76b1174c1ea52abb639a4c69d52b630a8a106a2"
+name = "expat"
+version = "2.9.0"
+license = "MIT"
+license_files = ["expat/COPYING"]
+upstream = "https://libexpat.github.io"
+role = "linked"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/libexpat#bc1c381c6c175e2e506b6a1c3c23e01d0795fb66"
+name = "zig-libexpat"
+version = "bc1c381"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/libexpat"
+role = "tool"
+
+[[component]]
+url = "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz"
+name = "libass"
+version = "0.17.5"
+license = "ISC"
+license_files = ["COPYING"]
+upstream = "https://github.com/libass/libass"
+role = "linked"
+
+[[component]]
+url = "https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz"
+name = "libdrm"
+version = "2.4.134"
+# Stated in each file: its main header's.
+license = "MIT"
+license_files = ["xf86drm.h"]
+upstream = "https://gitlab.freedesktop.org/mesa/drm"
+role = "linked"
+platforms = ["linux-x86_64"]
+
+[[component]]
+url = "https://github.com/intel/libva/archive/refs/tags/2.24.1.tar.gz"
+name = "libva"
+version = "2.24.1"
+license = "MIT"
+license_files = ["COPYING"]
+upstream = "https://github.com/intel/libva"
+role = "linked"
+platforms = ["linux-x86_64"]
+
+[[component]]
+url = "https://github.com/FFmpeg/nv-codec-headers/releases/download/n13.1.15.0/nv-codec-headers-13.1.15.0.tar.gz"
+name = "nv-codec-headers"
+version = "13.1.15.0"
+# Stated in each header.
+license = "MIT"
+license_files = ["include/ffnvcodec/nvEncodeAPI.h"]
+upstream = "https://github.com/FFmpeg/nv-codec-headers"
+role = "linked"
+platforms = ["linux-x86_64", "windows-x86_64"]
+
+[[component]]
+url = "https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz"
+name = "amf-headers"
+version = "1.5.3"
+# Stated in each header.
+license = "MIT"
+license_files = ["AMF/core/Factory.h"]
+upstream = "https://github.com/GPUOpen-LibrariesAndSDKs/AMF"
+role = "linked"
+platforms = ["linux-x86_64", "windows-x86_64"]
+
+[[component]]
+url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz"
+name = "vulkan-headers"
+version = "1.4.363.0"
+license = "Apache-2.0 OR MIT"
+license_files = ["LICENSE.md"]
+upstream = "https://github.com/KhronosGroup/Vulkan-Headers"
+role = "linked"
+platforms = ["linux-x86_64", "windows-x86_64"]
+
+# Tools: nasm, which assembles x86 code, and what it is built with; iconv for Windows, which allyourcodebase's libxml2
+# fetches and the packages build it without.
+[[component]]
+url = "git+https://github.com/allyourcodebase/nasm#f11aa6ed5a7eb339259b3439b3e47d58dba998cc"
+name = "zig-nasm"
+version = "f11aa6e"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/nasm"
+role = "tool"
+
+[[component]]
+url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/nasm-3.01.tar.gz"
+name = "nasm"
+version = "3.01"
+license = "BSD-2-Clause"
+license_files = ["LICENSE"]
+upstream = "https://www.nasm.us"
+role = "tool"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/zlib.git#c5115f4b69ef660f72a835c6638f80508ef284c7"
+name = "zig-zlib"
+version = "c5115f4"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/zlib"
+role = "tool"
+
+[[component]]
+url = "https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz"
+name = "zlib"
+version = "1.3.1"
+license = "Zlib"
+license_files = ["LICENSE"]
+upstream = "https://zlib.net"
+role = "tool"
+
+[[component]]
+url = "git+https://github.com/allyourcodebase/win-iconv.git#341e958b33f1cd1142f00a561510d83e6556f1fd"
+name = "zig-win-iconv"
+version = "341e958"
+license = "MIT"
+license_files = ["LICENSE"]
+upstream = "https://github.com/allyourcodebase/win-iconv"
+role = "tool"
+
+[[component]]
+url = "git+https://github.com/win-iconv/win-iconv#82f00fbc1b1156530a0bbd003b93b3942743ed27"
+name = "win-iconv"
+version = "82f00fb"
+license = "LicenseRef-public-domain"
+license_files = []
+upstream = "https://github.com/win-iconv/win-iconv"
+role = "tool"

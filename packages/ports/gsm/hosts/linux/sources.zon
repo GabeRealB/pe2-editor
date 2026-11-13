@@ -1,0 +1,46 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "gsm",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-ansi",
+                        "-pedantic",
+                        "-O2",
+                        "-DNeedFunctionPrototypes=1",
+                        "-DSASR",
+                        "-DWAV49",
+                    },
+                    .include = .{
+                        "src:inc",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:src/add.c",
+                        "src:src/code.c",
+                        "src:src/debug.c",
+                        "src:src/decode.c",
+                        "src:src/long_term.c",
+                        "src:src/lpc.c",
+                        "src:src/preprocess.c",
+                        "src:src/rpe.c",
+                        "src:src/gsm_destroy.c",
+                        "src:src/gsm_decode.c",
+                        "src:src/gsm_encode.c",
+                        "src:src/gsm_explode.c",
+                        "src:src/gsm_implode.c",
+                        "src:src/gsm_create.c",
+                        "src:src/gsm_print.c",
+                        "src:src/gsm_option.c",
+                        "src:src/short_term.c",
+                        "src:src/table.c",
+                    },
+                },
+            },
+        },
+    },
+}

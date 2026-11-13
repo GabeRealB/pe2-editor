@@ -1,0 +1,14 @@
+.{
+    .name = .gsm,
+    .fingerprint = 0x85c8336782dbbfaa,
+    .version = "1.0.24",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .gsm = .{
+            .url = "https://deb.debian.org/debian/pool/main/libg/libgsm/libgsm_1.0.24.orig.tar.gz",
+            .hash = "N-V-__8AADOsBADIXaoNDsdkRPL4uOZHUVwWmaeE_pyNuKNm",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

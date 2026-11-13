@@ -1,0 +1,14 @@
+.{
+    .name = .aom,
+    .fingerprint = 0x673212889c728d98,
+    .version = "3.15.3",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
+        .aom = .{
+            .url = "git+https://aomedia.googlesource.com/aom?ref=v3.15.3#b141d9c45db236335351c8a4b2a14b3ade27c937",
+            .hash = "N-V-__8AALOdTwKNPLG-3TLRMRIuWzIbfy11uW-u6XSDYjrZ",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts" },
+}

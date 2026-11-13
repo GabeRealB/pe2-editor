@@ -1,0 +1,56 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "drm",
+            .groups = .{
+                .{
+                    .kind = .c,
+                    .flags = .{
+                        "-fvisibility=hidden",
+                        "-DNDEBUG",
+                        "-D_FILE_OFFSET_BITS=64",
+                        "-std=c11",
+                        "-O3",
+                        "-DHAVE_ALLOCA_H=1",
+                        "-DHAVE_CAIRO=0",
+                        "-DHAVE_EXYNOS=0",
+                        "-DHAVE_FREEDRENO_KGSL=0",
+                        "-DHAVE_INTEL=0",
+                        "-DHAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
+                        "-DHAVE_LIB_ATOMIC_OPS=0",
+                        "-DHAVE_NOUVEAU=0",
+                        "-DHAVE_OPEN_MEMSTREAM=1",
+                        "-DHAVE_RADEON=0",
+                        "-DHAVE_SECURE_GETENV=1",
+                        "-DHAVE_SYS_SELECT_H=1",
+                        "-DHAVE_SYS_SYSCTL_H=0",
+                        "-DHAVE_VALGRIND=0",
+                        "-DHAVE_VC4=0",
+                        "-DHAVE_VISIBILITY=1",
+                        "-DHAVE_VMWGFX=0",
+                        "-DMAJOR_IN_SYSMACROS=1",
+                        "-DUDEV=0",
+                        "-D_GNU_SOURCE=1",
+                        "-fPIC",
+                    },
+                    .include = .{
+                        "build:libdrm.a.p",
+                        "build:",
+                        "src:",
+                        "src:include/drm",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:xf86drm.c",
+                        "src:xf86drmHash.c",
+                        "src:xf86drmRandom.c",
+                        "src:xf86drmSL.c",
+                        "src:xf86drmMode.c",
+                    },
+                },
+            },
+        },
+    },
+}

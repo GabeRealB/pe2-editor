@@ -1,0 +1,26 @@
+// The modules built into the program, by the hosts that build them: what each reference build's module table (Modules/config.c)
+// holds, those of every host first. Written by the harvest (packages/harvest/recipes/cpython.sh).
+.{
+    .all = .{
+        "array", "_asyncio", "_bisect", "_csv", "_heapq", "_json", "_lsprof", "_pickle",
+        "_queue", "_random", "_struct", "_interpreters", "_interpchannels", "_interpqueues", "_zoneinfo", "math",
+        "cmath", "_statistics", "_decimal", "binascii", "_md5", "_sha1", "_sha2", "_sha3",
+        "_blake2", "_hmac", "pyexpat", "_elementtree", "_codecs_cn", "_codecs_hk", "_codecs_iso2022", "_codecs_jp",
+        "_codecs_kr", "_codecs_tw", "_multibytecodec", "unicodedata", "mmap", "select", "_socket", "_multiprocessing",
+        "atexit", "faulthandler", "_signal", "_tracemalloc", "_suggestions", "_datetime", "_codecs", "_collections",
+        "errno", "_io", "itertools", "_sre", "_sysconfig", "_thread", "time", "_types",
+        "_typing", "_weakref", "_abc", "_functools", "_locale", "_opcode", "_operator", "_stat",
+        "_symtable",
+    },
+    .linux = .{
+        "fcntl", "grp", "_posixsubprocess", "resource", "syslog", "termios", "_posixshmem", "posix",
+        "pwd",
+    },
+    .macos = .{
+        "fcntl", "grp", "_posixsubprocess", "resource", "syslog", "termios", "_uuid", "posix",
+        "pwd",
+    },
+    .windows = .{
+        "_uuid", "_overlapped", "winsound", "nt", "winreg", "msvcrt", "_winapi",
+    },
+}

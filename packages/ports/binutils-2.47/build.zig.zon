@@ -1,0 +1,14 @@
+.{
+    .name = .binutils,
+    .version = "2.47.0",
+    .fingerprint = 0x4911b3450532cc6c,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .tools = .{ .path = "../../tools" },
+        .binutils = .{
+            .url = "https://sourceware.org/pub/binutils/releases/binutils-2.47.tar.xz",
+            .hash = "N-V-__8AAHYefBJP-4AugNJfSqhfG7PPz-pj4uLFi5Sc9zUK",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "hosts", "patches" },
+}

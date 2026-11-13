@@ -1,0 +1,49 @@
+// What the library's own build compiled for this host, harvested from it: each library's sources, in groups
+// compiled alike. `src:` names a file of the sources, `build:` one its build generated (in `build/` here).
+.{
+    .libraries = .{
+        .{
+            .name = "hwy",
+            .groups = .{
+                .{
+                    .kind = .cpp,
+                    .flags = .{
+                        "-DHWY_STATIC_DEFINE",
+                        "-DTOOLCHAIN_MISS_ASM_HWCAP_H",
+                        "-DTOOLCHAIN_MISS_SYS_AUXV_H",
+                        "-O3",
+                        "-DNDEBUG",
+                        "-std=c++17",
+                        "-fPIC",
+                        "-fvisibility=hidden",
+                        "-fvisibility-inlines-hidden",
+                        "-D__DATE__=\"redacted\"",
+                        "-D__TIMESTAMP__=\"redacted\"",
+                        "-D__TIME__=\"redacted\"",
+                        "-fmerge-all-constants",
+                        "-fno-cxx-exceptions",
+                        "-fno-slp-vectorize",
+                        "-fno-vectorize",
+                        "-fmath-errno",
+                        "-fno-exceptions",
+                    },
+                    .include = .{
+                        "src:",
+                    },
+                    .path_flags = .{},
+                    .files = .{
+                        "src:hwy/abort.cc",
+                        "src:hwy/aligned_allocator.cc",
+                        "src:hwy/nanobenchmark.cc",
+                        "src:hwy/per_target.cc",
+                        "src:hwy/perf_counters.cc",
+                        "src:hwy/print.cc",
+                        "src:hwy/profiler.cc",
+                        "src:hwy/targets.cc",
+                        "src:hwy/timer.cc",
+                    },
+                },
+            },
+        },
+    },
+}

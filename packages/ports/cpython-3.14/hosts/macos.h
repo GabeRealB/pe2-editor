@@ -1,0 +1,434 @@
+/* pyconfig.h for macOS: what CPython 3.14.10's configure decided for that host, run with zig's C compiler for aarch64-macos
+   (`--disable-shared --without-mimalloc --without-remote-debug --with-pkg-config=no`). openpty, login_tty,
+   forkpty and sendfile are marked absent: they link, but the C library headers zig carries for macOS declare none. */
+
+#ifndef Py_PYCONFIG_H
+#define Py_PYCONFIG_H
+#define ALIGNOF_LONG 8
+#define ALIGNOF_MAX_ALIGN_T 8
+#define ALIGNOF_SIZE_T 8
+#define DOUBLE_IS_LITTLE_ENDIAN_IEEE754 1
+#define ENABLE_IPV6 1
+#define HAVE_ACCEPT 1
+#define HAVE_ACOSH 1
+#define HAVE_ADDRINFO 1
+#define HAVE_ALARM 1
+#define HAVE_ALIGNED_REQUIRED 1
+#define HAVE_ALLOCA_H 1
+#define HAVE_ASINH 1
+#define HAVE_ATANH 1
+#define HAVE_BACKTRACE 1
+#define HAVE_BIND 1
+#define HAVE_BROKEN_SEM_GETVALUE 1
+#define HAVE_BUILTIN_ATOMIC 1
+#define HAVE_CHFLAGS 1
+#define HAVE_CHMOD 1
+#define HAVE_CHOWN 1
+#define HAVE_CLOCK 1
+#define HAVE_CLOCK_GETRES 1
+#define HAVE_CLOCK_GETTIME 1
+#define HAVE_CLOCK_SETTIME 1
+#define HAVE_CLOCK_T 1
+#define HAVE_CONFSTR 1
+#define HAVE_CONNECT 1
+#define HAVE_CTERMID 1
+#define HAVE_CTERMID_R 1
+#define HAVE_DB_H 1
+#define HAVE_DECL_RTLD_DEEPBIND 0
+#define HAVE_DECL_RTLD_GLOBAL 1
+#define HAVE_DECL_RTLD_LAZY 1
+#define HAVE_DECL_RTLD_LOCAL 1
+#define HAVE_DECL_RTLD_MEMBER 0
+#define HAVE_DECL_RTLD_NODELETE 1
+#define HAVE_DECL_RTLD_NOLOAD 1
+#define HAVE_DECL_RTLD_NOW 1
+#define HAVE_DECL_UT_NAMESIZE 0
+#define HAVE_DEVICE_MACROS 1
+#define HAVE_DIRENT_H 1
+#define HAVE_DIRFD 1
+#define HAVE_DLADDR 1
+#define HAVE_DLFCN_H 1
+#define HAVE_DLOPEN 1
+#define HAVE_DUP 1
+#define HAVE_DUP2 1
+#define HAVE_DYLD_SHARED_CACHE_CONTAINS_PATH 1
+#define HAVE_DYNAMIC_LOADING 1
+#define HAVE_ERF 1
+#define HAVE_ERFC 1
+#define HAVE_ERRNO_H 1
+#define HAVE_EXECINFO_H 1
+#define HAVE_EXECV 1
+#define HAVE_EXPM1 1
+#define HAVE_FACCESSAT 1
+#define HAVE_FCHDIR 1
+#define HAVE_FCHMOD 1
+#define HAVE_FCHMODAT 1
+#define HAVE_FCHOWN 1
+#define HAVE_FCHOWNAT 1
+#define HAVE_FCNTL_H 1
+#define HAVE_FDOPENDIR 1
+#define HAVE_FLOCK 1
+#define HAVE_FORK 1
+#define HAVE_FPATHCONF 1
+#define HAVE_FSEEKO 1
+#define HAVE_FSTATAT 1
+#define HAVE_FSTATVFS 1
+#define HAVE_FSYNC 1
+#define HAVE_FTELLO 1
+#define HAVE_FTIME 1
+#define HAVE_FTRUNCATE 1
+#define HAVE_FUTIMENS 1
+#define HAVE_FUTIMES 1
+#define HAVE_GAI_STRERROR 1
+#define HAVE_GCC_UINT128_T 1
+#define HAVE_GETADDRINFO 1
+#define HAVE_GETC_UNLOCKED 1
+#define HAVE_GETEGID 1
+#define HAVE_GETENTROPY 1
+#define HAVE_GETEUID 1
+#define HAVE_GETGID 1
+#define HAVE_GETGRENT 1
+#define HAVE_GETGRGID 1
+#define HAVE_GETGRGID_R 1
+#define HAVE_GETGRNAM_R 1
+#define HAVE_GETGROUPLIST 1
+#define HAVE_GETGROUPS 1
+#define HAVE_GETHOSTBYADDR 1
+#define HAVE_GETHOSTBYNAME 1
+#define HAVE_GETHOSTNAME 1
+#define HAVE_GETITIMER 1
+#define HAVE_GETLOADAVG 1
+#define HAVE_GETLOGIN 1
+#define HAVE_GETLOGIN_R 1
+#define HAVE_GETNAMEINFO 1
+#define HAVE_GETPEERNAME 1
+#define HAVE_GETPGID 1
+#define HAVE_GETPGRP 1
+#define HAVE_GETPID 1
+#define HAVE_GETPPID 1
+#define HAVE_GETPRIORITY 1
+#define HAVE_GETPROTOBYNAME 1
+#define HAVE_GETPWENT 1
+#define HAVE_GETPWNAM_R 1
+#define HAVE_GETPWUID 1
+#define HAVE_GETPWUID_R 1
+#define HAVE_GETRUSAGE 1
+#define HAVE_GETSERVBYNAME 1
+#define HAVE_GETSERVBYPORT 1
+#define HAVE_GETSID 1
+#define HAVE_GETSOCKNAME 1
+#define HAVE_GETUID 1
+#define HAVE_GETWD 1
+#define HAVE_GRANTPT 1
+#define HAVE_GRP_H 1
+#define HAVE_HSTRERROR 1
+#define HAVE_IF_NAMEINDEX 1
+#define HAVE_INET_ATON 1
+#define HAVE_INET_NTOA 1
+#define HAVE_INET_PTON 1
+#define HAVE_INITGROUPS 1
+#define HAVE_INTTYPES_H 1
+#define HAVE_KILL 1
+#define HAVE_KILLPG 1
+#define HAVE_KQUEUE 1
+#define HAVE_LANGINFO_H 1
+#define HAVE_LCHFLAGS 1
+#define HAVE_LCHMOD 1
+#define HAVE_LCHOWN 1
+#define HAVE_LIBDL 1
+#define HAVE_LINK 1
+#define HAVE_LINKAT 1
+#define HAVE_LISTEN 1
+#define HAVE_LOCKF 1
+#define HAVE_LOG1P 1
+#define HAVE_LOG2 1
+#define HAVE_LONG_DOUBLE 1
+#define HAVE_LSTAT 1
+#define HAVE_LUTIMES 1
+#define HAVE_MADVISE 1
+#define HAVE_MAKEDEV 1
+#define HAVE_MAXLOGNAME 1
+#define HAVE_MBRTOWC 1
+#define HAVE_MKDIRAT 1
+#define HAVE_MKFIFO 1
+#define HAVE_MKFIFOAT 1
+#define HAVE_MKNOD 1
+#define HAVE_MKNODAT 1
+#define HAVE_MKTIME 1
+#define HAVE_MMAP 1
+#define HAVE_NANOSLEEP 1
+#define HAVE_NDBM_H 1
+#define HAVE_NETDB_H 1
+#define HAVE_NETINET_IN_H 1
+#define HAVE_NET_ETHERNET_H 1
+#define HAVE_NET_IF_H 1
+#define HAVE_NICE 1
+#define HAVE_OPENAT 1
+#define HAVE_OPENDIR 1
+#define HAVE_PATHCONF 1
+#define HAVE_PAUSE 1
+#define HAVE_PIPE 1
+#define HAVE_POLL 1
+#define HAVE_POLL_H 1
+#define HAVE_POSIX_OPENPT 1
+#define HAVE_POSIX_SPAWN 1
+#define HAVE_POSIX_SPAWNP 1
+#define HAVE_PREAD 1
+#define HAVE_PREADV 1
+#define HAVE_PROTOTYPES 1
+#define HAVE_PTHREAD_COND_TIMEDWAIT_RELATIVE_NP 1
+#define HAVE_PTHREAD_GETNAME_NP 1
+#define HAVE_PTHREAD_H 1
+#define HAVE_PTHREAD_KILL 1
+#define HAVE_PTHREAD_SETNAME_NP 1
+#define HAVE_PTHREAD_SIGMASK 1
+#define HAVE_PTSNAME 1
+#define HAVE_PTSNAME_R 1
+#define HAVE_PWRITE 1
+#define HAVE_PWRITEV 1
+#define HAVE_READLINK 1
+#define HAVE_READLINKAT 1
+#define HAVE_READV 1
+#define HAVE_REALPATH 1
+#define HAVE_RECVFROM 1
+#define HAVE_RENAMEAT 1
+#define HAVE_SCHED_GET_PRIORITY_MAX 1
+#define HAVE_SCHED_H 1
+#define HAVE_SEM_GETVALUE 1
+#define HAVE_SEM_OPEN 1
+#define HAVE_SEM_UNLINK 1
+#define HAVE_SENDTO 1
+#define HAVE_SETEGID 1
+#define HAVE_SETEUID 1
+#define HAVE_SETGID 1
+#define HAVE_SETGROUPS 1
+#define HAVE_SETHOSTNAME 1
+#define HAVE_SETITIMER 1
+#define HAVE_SETJMP_H 1
+#define HAVE_SETLOCALE 1
+#define HAVE_SETPGID 1
+#define HAVE_SETPGRP 1
+#define HAVE_SETPRIORITY 1
+#define HAVE_SETREGID 1
+#define HAVE_SETREUID 1
+#define HAVE_SETSID 1
+#define HAVE_SETSOCKOPT 1
+#define HAVE_SETUID 1
+#define HAVE_SETVBUF 1
+#define HAVE_SHUTDOWN 1
+#define HAVE_SIGACTION 1
+#define HAVE_SIGALTSTACK 1
+#define HAVE_SIGFILLSET 1
+#define HAVE_SIGINFO_T_SI_BAND 1
+#define HAVE_SIGINTERRUPT 1
+#define HAVE_SIGNAL_H 1
+#define HAVE_SIGPENDING 1
+#define HAVE_SIGRELSE 1
+#define HAVE_SIGWAIT 1
+#define HAVE_SNPRINTF 1
+#define HAVE_SOCKADDR_SA_LEN 1
+#define HAVE_SOCKADDR_STORAGE 1
+#define HAVE_SOCKET 1
+#define HAVE_SOCKETPAIR 1
+#define HAVE_SOCKLEN_T 1
+#define HAVE_SPAWN_H 1
+#define HAVE_SSIZE_T 1
+#define HAVE_STATVFS 1
+#define HAVE_STAT_TV_NSEC2 1
+#define HAVE_STDINT_H 1
+#define HAVE_STDIO_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STD_ATOMIC 1
+#define HAVE_STRFTIME 1
+#define HAVE_STRINGS_H 1
+#define HAVE_STRING_H 1
+#define HAVE_STRLCPY 1
+#define HAVE_STRSIGNAL 1
+#define HAVE_STRUCT_PASSWD_PW_GECOS 1
+#define HAVE_STRUCT_PASSWD_PW_PASSWD 1
+#define HAVE_STRUCT_STAT_ST_BIRTHTIME 1
+#define HAVE_STRUCT_STAT_ST_BLKSIZE 1
+#define HAVE_STRUCT_STAT_ST_BLOCKS 1
+#define HAVE_STRUCT_STAT_ST_FLAGS 1
+#define HAVE_STRUCT_STAT_ST_GEN 1
+#define HAVE_STRUCT_STAT_ST_RDEV 1
+#define HAVE_STRUCT_TM_TM_ZONE 1
+#define HAVE_SYMLINK 1
+#define HAVE_SYMLINKAT 1
+#define HAVE_SYNC 1
+#define HAVE_SYSCONF 1
+#define HAVE_SYSCTLBYNAME 1
+#define HAVE_SYSEXITS_H 1
+#define HAVE_SYSLOG_H 1
+#define HAVE_SYSTEM 1
+#define HAVE_SYS_EVENT_H 1
+#define HAVE_SYS_FILE_H 1
+#define HAVE_SYS_IOCTL_H 1
+#define HAVE_SYS_KERN_CONTROL_H 1
+#define HAVE_SYS_LOCK_H 1
+#define HAVE_SYS_MMAN_H 1
+#define HAVE_SYS_PARAM_H 1
+#define HAVE_SYS_POLL_H 1
+#define HAVE_SYS_RANDOM_H 1
+#define HAVE_SYS_RESOURCE_H 1
+#define HAVE_SYS_SELECT_H 1
+#define HAVE_SYS_SOCKET_H 1
+#define HAVE_SYS_STATVFS_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_SYSCTL_H 1
+#define HAVE_SYS_TIMES_H 1
+#define HAVE_SYS_TIME_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_SYS_UIO_H 1
+#define HAVE_SYS_UN_H 1
+#define HAVE_SYS_UTSNAME_H 1
+#define HAVE_SYS_WAIT_H 1
+#define HAVE_TCGETPGRP 1
+#define HAVE_TCSETPGRP 1
+#define HAVE_TEMPNAM 1
+#define HAVE_TERMIOS_H 1
+#define HAVE_TIMEGM 1
+#define HAVE_TIMES 1
+#define HAVE_TMPFILE 1
+#define HAVE_TMPNAM 1
+#define HAVE_TM_ZONE 1
+#define HAVE_TRUNCATE 1
+#define HAVE_TTYNAME_R 1
+#define HAVE_UMASK 1
+#define HAVE_UNAME 1
+#define HAVE_UNISTD_H 1
+#define HAVE_UNLINKAT 1
+#define HAVE_UNLOCKPT 1
+#define HAVE_UTIMENSAT 1
+#define HAVE_UTIMES 1
+#define HAVE_UTIME_H 1
+#define HAVE_UUID_UUID_H 1
+#define HAVE_VFORK 1
+#define HAVE_WAIT 1
+#define HAVE_WAIT3 1
+#define HAVE_WAIT4 1
+#define HAVE_WAITID 1
+#define HAVE_WAITPID 1
+#define HAVE_WCHAR_H 1
+#define HAVE_WCSCOLL 1
+#define HAVE_WCSFTIME 1
+#define HAVE_WCSXFRM 1
+#define HAVE_WMEMCMP 1
+#define HAVE_WRITEV 1
+#define HAVE_ZLIB_H 1
+#define HAVE___UINT128_T 1
+#define PY_BUILTIN_HASHLIB_HASHES "md5,sha1,sha2,sha3,blake2"
+#define PY_COERCE_C_LOCALE 1
+#define PY_SSL_DEFAULT_CIPHERS 1
+#define PY_SUPPORT_TIER 1
+#define RETSIGTYPE void
+#define SIZEOF_DOUBLE 8
+#define SIZEOF_FLOAT 4
+#define SIZEOF_FPOS_T 8
+#define SIZEOF_INT 4
+#define SIZEOF_LONG 8
+#define SIZEOF_LONG_DOUBLE 8
+#define SIZEOF_LONG_LONG 8
+#define SIZEOF_OFF_T 8
+#define SIZEOF_PID_T 4
+#define SIZEOF_PTHREAD_KEY_T 8
+#define SIZEOF_PTHREAD_T 8
+#define SIZEOF_SHORT 2
+#define SIZEOF_SIZE_T 8
+#define SIZEOF_TIME_T 8
+#define SIZEOF_UINTPTR_T 8
+#define SIZEOF_VOID_P 8
+#define SIZEOF_WCHAR_T 4
+#define SIZEOF__BOOL 1
+#define STDC_HEADERS 1
+#define SYS_SELECT_WITH_SYS_TIME 1
+#define THREAD_STACK_SIZE 0x1000000
+#ifndef _ALL_SOURCE
+# define _ALL_SOURCE 1
+#endif
+#ifndef _DARWIN_C_SOURCE
+# define _DARWIN_C_SOURCE 1
+#endif
+#ifndef __EXTENSIONS__
+# define __EXTENSIONS__ 1
+#endif
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1
+#endif
+#ifndef _HPUX_ALT_XOPEN_SOCKET_API
+# define _HPUX_ALT_XOPEN_SOCKET_API 1
+#endif
+#ifndef _MINIX
+#endif
+#ifndef _NETBSD_SOURCE
+# define _NETBSD_SOURCE 1
+#endif
+#ifndef _OPENBSD_SOURCE
+# define _OPENBSD_SOURCE 1
+#endif
+#ifndef _POSIX_SOURCE
+#endif
+#ifndef _POSIX_1_SOURCE
+#endif
+#ifndef _POSIX_PTHREAD_SEMANTICS
+# define _POSIX_PTHREAD_SEMANTICS 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_ATTRIBS_EXT__
+# define __STDC_WANT_IEC_60559_ATTRIBS_EXT__ 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_BFP_EXT__
+# define __STDC_WANT_IEC_60559_BFP_EXT__ 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_DFP_EXT__
+# define __STDC_WANT_IEC_60559_DFP_EXT__ 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_EXT__
+# define __STDC_WANT_IEC_60559_EXT__ 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_FUNCS_EXT__
+# define __STDC_WANT_IEC_60559_FUNCS_EXT__ 1
+#endif
+#ifndef __STDC_WANT_IEC_60559_TYPES_EXT__
+# define __STDC_WANT_IEC_60559_TYPES_EXT__ 1
+#endif
+#ifndef __STDC_WANT_LIB_EXT2__
+# define __STDC_WANT_LIB_EXT2__ 1
+#endif
+#ifndef __STDC_WANT_MATH_SPEC_FUNCS__
+# define __STDC_WANT_MATH_SPEC_FUNCS__ 1
+#endif
+#ifndef _TANDEM_SOURCE
+# define _TANDEM_SOURCE 1
+#endif
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 700
+#endif
+#define WITH_DECIMAL_CONTEXTVAR 1
+#define WITH_DOC_STRINGS 1
+#define WITH_DYLD 1
+#define WITH_PYMALLOC 1
+#if defined AC_APPLE_UNIVERSAL_BUILD
+# if defined __BIG_ENDIAN__
+#  define WORDS_BIGENDIAN 1
+# endif
+#else
+# ifndef WORDS_BIGENDIAN
+# endif
+#endif
+#define _DARWIN_C_SOURCE 1
+#define _FILE_OFFSET_BITS 64
+#define _LARGEFILE_SOURCE 1
+#define _NETBSD_SOURCE 1
+#define _POSIX_C_SOURCE 200809L
+#define _PYTHONFRAMEWORK ""
+#define _PYTHREAD_NAME_MAXLEN 63
+#define _Py_HAVE_STRERROR_R 1
+#define _Py_STACK_GROWS_DOWN 1
+#define _REENTRANT 1
+#define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE_EXTENDED 1
+#define __BSD_VISIBLE 1
+#if defined(__USLC__) && defined(__SCO_VERSION__)
+#define STRICT_SYSV_CURSES
+#endif
+#endif
