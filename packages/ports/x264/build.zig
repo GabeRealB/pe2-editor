@@ -4,6 +4,7 @@
 //! build compiled them.
 
 const std = @import("std");
+const harvested = @import("harvested");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -35,6 +36,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const m = lib.root_module;
+    // Its per-depth sources twice, and `set.c`, `cabac.c` and `macroblock.c` both in `common/` and `encoder/`: an
+    // archive holds one object of a name.
+    const archives = harvested.Archives.create(b, lib);
     m.addIncludePath(config.getDirectory());
     m.addIncludePath(src);
 
@@ -43,8 +47,8 @@ pub fn build(b: *std.Build) void {
     if (x86) cflags.append(b.allocator, "-mstack-alignment=64") catch @panic("OOM");
     if (t.os.tag == .windows) cflags.append(b.allocator, "-D_POSIX_C_SOURCE=200112L") catch @panic("OOM");
 
-    m.addCSourceFiles(.{ .root = src, .files = &shared, .flags = cflags.items });
-    if (t.os.tag == .windows) m.addCSourceFiles(.{ .root = src, .files = &.{"common/win32thread.c"}, .flags = cflags.items });
+    addAll(archives, m, src, &shared, cflags.items);
+    if (t.os.tag == .windows) addAll(archives, m, src, &.{"common/win32thread.c"}, cflags.items);
 
     const nasm = if (x86) b.dependency("nasm", .{ .target = b.graph.host, .optimize = .ReleaseFast }).artifact("nasm") else null;
     if (nasm) |n| m.addObjectFile(assemble(b, n, src, t, "common/x86/cpu-a.asm", &.{}));
@@ -53,25 +57,31 @@ pub fn build(b: *std.Build) void {
         const high = if (std.mem.eql(u8, depth, "8")) "0" else "1";
         const defines = [_][]const u8{ b.fmt("-DHIGH_BIT_DEPTH={s}", .{high}), b.fmt("-DBIT_DEPTH={s}", .{depth}) };
         const flags = std.mem.concat(b.allocator, []const u8, &.{ cflags.items, &defines }) catch @panic("OOM");
-        m.addCSourceFiles(.{ .root = src, .files = &per_depth, .flags = flags });
+        addAll(archives, m, src, &per_depth, flags);
         if (nasm) |n| {
-            m.addCSourceFiles(.{ .root = src, .files = &.{ "common/x86/mc-c.c", "common/x86/predict-c.c" }, .flags = flags });
+            addAll(archives, m, src, &.{ "common/x86/mc-c.c", "common/x86/predict-c.c" }, flags);
             const asm_defines = [_][]const u8{ b.fmt("-DBIT_DEPTH={s}", .{depth}), b.fmt("-Dprivate_prefix=x264_{s}", .{depth}) };
             for (x86_asm) |file| m.addObjectFile(assemble(b, n, src, t, file, &asm_defines));
             m.addObjectFile(assemble(b, n, src, t, if (std.mem.eql(u8, depth, "8")) "common/x86/sad-a.asm" else "common/x86/sad16-a.asm", &asm_defines));
         } else {
-            m.addCSourceFiles(.{ .root = src, .files = &.{ "common/aarch64/asm-offsets.c", "common/aarch64/mc-c.c", "common/aarch64/predict-c.c" }, .flags = flags });
+            addAll(archives, m, src, &.{ "common/aarch64/asm-offsets.c", "common/aarch64/mc-c.c", "common/aarch64/predict-c.c" }, flags);
             const asm_flags = std.mem.concat(b.allocator, []const u8, &.{
                 if (t.os.tag == .macos) &.{"-DPREFIX"} else &.{},
                 &.{ "-DPIC", "-DSTACK_ALIGNMENT=16" },
                 &defines,
             }) catch @panic("OOM");
-            m.addCSourceFiles(.{ .root = src, .files = &aarch64_asm, .flags = asm_flags });
+            addAll(archives, m, src, &aarch64_asm, asm_flags);
         }
     }
+    archives.finish();
     lib.installHeader(src.path(b, "x264.h"), "x264.h");
     lib.installHeader(x264_config, "x264_config.h");
-    b.installArtifact(lib);
+    // With the further libraries, for whatever links what is installed.
+    for (archives.libraries()) |l| b.installArtifact(l);
+}
+
+fn addAll(archives: *harvested.Archives, m: *std.Build.Module, src: std.Build.LazyPath, files: []const []const u8, flags: []const []const u8) void {
+    for (files) |file| archives.addCSourceFile(m, file, .{ .file = src.path(m.owner, file), .flags = flags });
 }
 
 /// One x86 assembly file assembled by nasm, as x264's Makefile assembles it: the object made.

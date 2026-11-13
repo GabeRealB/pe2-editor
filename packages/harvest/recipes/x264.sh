@@ -13,7 +13,9 @@ run() {
       { printf '/* %s for %s: what x264'"'"'s configure decided for that host (`--enable-static --enable-pic --disable-cli --disable-opencl`, all bit\n   depths), run with zig'"'"'s C compiler. */\n' $f $host; cat "$b/$f"; } > "$PACKAGES/ports/x264/hosts/$host-$f"
     done
     zig_install "$PACKAGES/ports/x264" "$b/port" || exit 1
-    cp -r "$b/port/include/." "$SYS/include/"; sys_library "$(ls "$b"/port/lib/*x264*)" x264
+    # Its libraries as one, as configure links it (the port's further libraries hold sources of a name it has).
+    cp -r "$b/port/include/." "$SYS/include/"
+    { echo "create $SYS/lib/libx264.a"; for l in "$b"/port/lib/*x264*; do echo "addlib $l"; done; echo save; echo end; } | "$ZIG" ar -M
     sys_pc x264 0.165 -lx264 "$( [ $host = linux ] && echo '-lpthread -lm' || { [ $host = macos ] && echo -lm; } )"
     echo "  $host: hosts/$host-config.h, hosts/$host-x264_config.h"
   done

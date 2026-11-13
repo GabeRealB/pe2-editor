@@ -11,6 +11,7 @@
 //! prints graphs with (`bin2c`, FFmpeg's too, on the stylesheet made one line by `minify.zig`).
 
 const std = @import("std");
+const harvested = @import("harvested");
 
 const Host = enum { linux, macos, windows };
 
@@ -175,11 +176,13 @@ pub fn build(b: *std.Build) void {
     });
     const lm = libraries.root_module;
     includes(lm, s, src, config, build_dir);
-    lm.addCSourceFiles(.{ .root = src, .files = s.library, .flags = library_flags });
-    lm.addCSourceFiles(.{ .root = src, .files = s.assembly, .flags = assembly_flags });
+    // Sources of one name in several of the libraries (`parser.c`, `input.c`): an archive holds one object of a name.
+    const archives = harvested.Archives.create(b, libraries);
+    for (s.library) |file| archives.addCSourceFile(lm, file, .{ .file = src.path(b, file), .flags = library_flags });
+    for (s.assembly) |file| archives.addCSourceFile(lm, file, .{ .file = src.path(b, file), .flags = assembly_flags });
     for (s.generated) |file| {
         const flags_of = if (std.mem.endsWith(u8, file, ".S")) assembly_flags else library_flags;
-        lm.addCSourceFile(.{ .file = build_dir.path(b, file), .flags = flags_of });
+        archives.addCSourceFile(lm, file, .{ .file = build_dir.path(b, file), .flags = flags_of });
     }
     if (x86) {
         const nasm = b.dependency("nasm", .{ .target = host_target, .optimize = .ReleaseFast }).artifact("nasm");
@@ -192,7 +195,7 @@ pub fn build(b: *std.Build) void {
             run.addPrefixedDirectoryArg("-I", src.path(b, std.fs.path.dirname(file).?));
             run.addPrefixedFileArg("-P", config.path(b, "config.asm"));
             run.addArg("-o");
-            lm.addObjectFile(run.addOutputFileArg(b.fmt("{s}.o", .{std.fs.path.stem(file)})));
+            lm.addObjectFile(run.addOutputFileArg(b.fmt("{s}.o", .{archives.objectName(std.fs.path.stem(file))})));
             run.addFileArg(src.path(b, file));
         }
     }
@@ -207,6 +210,7 @@ pub fn build(b: *std.Build) void {
         lm.linkLibrary(dependency.artifact(p[2]));
     }
     if (host != .macos) for (headers) |h| lm.addIncludePath(b.dependency(h[0], .{}).path(h[1]));
+    archives.finish();
 
     // The programs.
     for ([_]struct { []const u8, []const []const u8 }{ .{ "ffmpeg", s.ffmpeg }, .{ "ffprobe", s.ffprobe } }) |p| {

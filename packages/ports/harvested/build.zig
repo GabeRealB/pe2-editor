@@ -81,6 +81,9 @@ pub fn libraries(b: *std.Build, options: Options) []*std.Build.Step.Compile {
         });
         const m = lib.root_module;
         for (options.links) |l| m.linkLibrary(l);
+        const archives = Archives.create(b, lib);
+        var finishing: std.ArrayList(*Archives) = .empty;
+        finishing.append(b.allocator, archives) catch @panic("OOM");
         var modules: std.ArrayList(Sub) = .empty;
         for (library.groups, 0..) |group, g| {
             if (group.kind == .cpp) m.link_libcpp = true;
@@ -108,7 +111,7 @@ pub fn libraries(b: *std.Build, options: Options) []*std.Build.Step.Compile {
                         run.addFileArg(place(b, options.src, generated, group.path_flags[i + 1]));
                     }
                     run.addArg("-o");
-                    lib.root_module.addObjectFile(run.addOutputFileArg(b.fmt("{d}-{s}.o", .{ g, std.fs.path.stem(file) })));
+                    lib.root_module.addObjectFile(run.addOutputFileArg(b.fmt("{s}.o", .{archives.objectName(b.fmt("{d}-{s}", .{ g, std.fs.path.stem(file) }))})));
                     run.addFileArg(place(b, options.src, generated, file));
                 }
                 continue;
@@ -147,6 +150,7 @@ pub fn libraries(b: *std.Build, options: Options) []*std.Build.Step.Compile {
                     if (!options.target.result.cpu.features.isEnabled(feature)) features.addFeature(feature);
                 } else kept.append(b.allocator, flag) catch @panic("OOM");
             }
+            var group_archives = archives;
             const gm = if (!features.isEmpty()) simd: {
                 var query = options.target.query;
                 query.cpu_features_add.addFeatureSet(features);
@@ -165,6 +169,8 @@ pub fn libraries(b: *std.Build, options: Options) []*std.Build.Step.Compile {
                 for (options.links) |l| sub.root_module.linkLibrary(l);
                 for (dirs.items) |dir| sub.root_module.addIncludePath(place(b, options.src, generated, dir));
                 m.linkLibrary(sub);
+                group_archives = Archives.create(b, sub);
+                finishing.append(b.allocator, group_archives) catch @panic("OOM");
                 break :simd sub.root_module;
             } else moduleFor(b, m, &modules, dirs.items) orelse made: {
                 const module = modules.items[modules.items.len - 1].module;
@@ -181,17 +187,146 @@ pub fn libraries(b: *std.Build, options: Options) []*std.Build.Step.Compile {
                 .assembly => .assembly_with_preprocessor,
                 .nasm => unreachable,
             };
-            for (group.files) |file| gm.addCSourceFile(.{ .file = place(b, options.src, generated, file), .flags = kept.items, .language = language });
+            for (group.files) |file| group_archives.addCSourceFile(gm, file, .{ .file = place(b, options.src, generated, file), .flags = kept.items, .language = language });
         }
+        for (finishing.items) |a| a.finish();
         out.* = lib;
     }
     return built;
 }
 
+/// The archives a library's objects go into, one member of a name in each. zig writes an archive with its members
+/// ordered by name alone, and keeps those of one name in the order they happened to be compiled in, so that two of
+/// one name (FFmpeg's `parser.o`, x264's per-depth objects) would make the archive - and on macOS what links it -
+/// differ from one build to the next. A source is compiled, through `addCSourceFile`, in the module given where the
+/// library has no object of its name yet, and otherwise in that module's likeness in a further library
+/// (`<name>-again<k>`) which the library links; an object made by another program is named, through `objectName`,
+/// by its name and how many the library has of it. The likenesses take their modules' include folders, libraries
+/// and settings when the library is finished (`finish`), after everything is added to it.
+pub const Archives = struct {
+    b: *std.Build,
+    levels: std.ArrayList(Level) = .empty,
+
+    const Level = struct {
+        lib: *std.Build.Step.Compile,
+        names: std.StringHashMapUnmanaged(void) = .empty,
+        /// The first library's modules and their likenesses in this one.
+        likenesses: std.AutoArrayHashMapUnmanaged(*std.Build.Module, *std.Build.Module) = .empty,
+    };
+
+    pub fn create(b: *std.Build, lib: *std.Build.Step.Compile) *Archives {
+        const self = b.allocator.create(Archives) catch @panic("OOM");
+        self.* = .{ .b = b };
+        self.levels.append(b.allocator, .{ .lib = lib }) catch @panic("OOM");
+        return self;
+    }
+
+    /// Compiles `source`, whose path is `path`, as `module` (the library's root module or one it imports) would.
+    pub fn addCSourceFile(self: *Archives, module: *std.Build.Module, path: []const u8, source: std.Build.Module.CSourceFile) void {
+        const name = std.fs.path.stem(path);
+        for (self.levels.items, 0..) |*level, k| {
+            if (level.names.contains(name)) continue;
+            level.names.put(self.b.allocator, name, {}) catch @panic("OOM");
+            return self.likeness(k, module).addCSourceFile(source);
+        }
+        self.levels.append(self.b.allocator, .{ .lib = self.further() }) catch @panic("OOM");
+        self.addCSourceFile(module, path, source);
+    }
+
+    /// The library and the further ones, as they are made.
+    pub fn libraries(self: *Archives) []*std.Build.Step.Compile {
+        const out = self.b.allocator.alloc(*std.Build.Step.Compile, self.levels.items.len) catch @panic("OOM");
+        for (self.levels.items, out) |level, *lib| lib.* = level.lib;
+        return out;
+    }
+
+    /// The name, without `.o`, of an object another program makes for the library from a file named `stem`.
+    pub fn objectName(self: *Archives, stem: []const u8) []const u8 {
+        const names = &self.levels.items[0].names;
+        var name = stem;
+        var k: usize = 1;
+        while (names.contains(name)) : (k += 1) name = self.b.fmt("{s}-{d}", .{ stem, k });
+        names.put(self.b.allocator, name, {}) catch @panic("OOM");
+        return name;
+    }
+
+    /// Gives every likeness what its module has: include folders, libraries, defines and settings.
+    pub fn finish(self: *Archives) void {
+        for (self.levels.items[1..]) |level| {
+            var it = level.likenesses.iterator();
+            while (it.next()) |entry| {
+                const from = entry.key_ptr.*;
+                const to = entry.value_ptr.*;
+                const arena = self.b.allocator;
+                for (from.include_dirs.items) |dir| switch (dir) {
+                    .other_step => {},
+                    else => to.include_dirs.append(arena, dir) catch @panic("OOM"),
+                };
+                for (from.link_objects.items) |object| switch (object) {
+                    // Not the further libraries, which the first links.
+                    .other_step => |lib| if (!self.isLevel(lib)) to.linkLibrary(lib),
+                    else => {},
+                };
+                to.c_macros.appendSlice(arena, from.c_macros.items) catch @panic("OOM");
+                to.link_libc = from.link_libc;
+                to.link_libcpp = from.link_libcpp;
+                to.strip = from.strip;
+                to.sanitize_c = from.sanitize_c;
+                to.pic = from.pic;
+                to.omit_frame_pointer = from.omit_frame_pointer;
+            }
+        }
+    }
+
+    fn isLevel(self: *Archives, lib: *std.Build.Step.Compile) bool {
+        for (self.levels.items) |level| if (level.lib == lib) return true;
+        return false;
+    }
+
+    /// `module`'s likeness in the library of level `k`: the module itself in the first, imported by its root module
+    /// once it has a source, as a module with none is not one zig compiles.
+    fn likeness(self: *Archives, k: usize, module: *std.Build.Module) *std.Build.Module {
+        const level = &self.levels.items[k];
+        const first = self.levels.items[0].lib.root_module;
+        if (k == 0) {
+            if (module != first and !level.likenesses.contains(module)) {
+                first.addImport(self.b.fmt("sources{d}", .{level.likenesses.count()}), module);
+                level.likenesses.put(self.b.allocator, module, module) catch @panic("OOM");
+            }
+            return module;
+        }
+        if (module == first) {
+            level.likenesses.put(self.b.allocator, first, level.lib.root_module) catch @panic("OOM");
+            return level.lib.root_module;
+        }
+        if (level.likenesses.get(module)) |m| return m;
+        const m = self.b.createModule(.{ .target = module.resolved_target, .optimize = module.optimize });
+        level.lib.root_module.addImport(self.b.fmt("sources{d}", .{level.likenesses.count()}), m);
+        level.likenesses.put(self.b.allocator, module, m) catch @panic("OOM");
+        return m;
+    }
+
+    /// A further library, linked by the first.
+    fn further(self: *Archives) *std.Build.Step.Compile {
+        const first = self.levels.items[0].lib;
+        const lib = self.b.addLibrary(.{
+            .name = self.b.fmt("{s}-again{d}", .{ first.name, self.levels.items.len }),
+            .linkage = .static,
+            .root_module = self.b.createModule(.{
+                .target = first.root_module.resolved_target,
+                .optimize = first.root_module.optimize,
+            }),
+        });
+        first.root_module.linkLibrary(lib);
+        return lib;
+    }
+};
+
 /// A module of a library's, compiling the sources whose include folders are `dirs`.
 const Sub = struct { dirs: []const []const u8, module: *std.Build.Module };
 
-/// The module of these folders if there is one, else null and a new one, last of `modules`, given no folders yet.
+/// The module of these folders if there is one, else null and a new one, last of `modules`, given no folders yet;
+/// the library imports it through its archives.
 fn moduleFor(b: *std.Build, root: *std.Build.Module, modules: *std.ArrayList(Sub), dirs: []const []const u8) ?*std.Build.Module {
     for (modules.items) |sub| {
         if (sub.dirs.len != dirs.len) continue;
@@ -206,7 +341,6 @@ fn moduleFor(b: *std.Build, root: *std.Build.Module, modules: *std.ArrayList(Sub
         .strip = true,
         .sanitize_c = .off,
     });
-    root.addImport(b.fmt("sources{d}", .{modules.items.len}), module);
     modules.append(b.allocator, .{ .dirs = b.allocator.dupe([]const u8, dirs) catch @panic("OOM"), .module = module }) catch @panic("OOM");
     return null;
 }

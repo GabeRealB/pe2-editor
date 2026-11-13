@@ -4,6 +4,7 @@
     .fingerprint = 0x8803517670e94f,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
         .nasm = .{
             .url = "git+https://github.com/allyourcodebase/nasm#f11aa6ed5a7eb339259b3439b3e47d58dba998cc",
             .hash = "nasm-3.0.1-B_NnpSJUAABp8P_x6B1dPmYEcBVlfF06ZpyWcCvl461C",

@@ -4,6 +4,7 @@
     .fingerprint = 0x2ffce39eff2d333a,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
+        .harvested = .{ .path = "../harvested" },
         .x264 = .{ .path = "../x264" },
         .ogg = .{ .path = "../ogg" },
         .vorbis = .{ .path = "../vorbis" },

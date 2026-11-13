@@ -42,6 +42,12 @@ zig that built them (what the licenses ask of whoever ships the result); notes l
 `<package>-<version>-<release>` (`release` in `packages.toml` counts its builds), so packages change apart; `--publish`
 makes it a release of the editor's repository, never over one published already.
 
+The same bytes from two runs ask one thing of the ports: no library holds two objects of one name. zig writes an
+archive's members ordered by their names alone, keeping those of one name in the order they happened to be compiled
+in, and on macOS what links the archive follows that order. A port adds its sources through `harvested`'s `Archives`,
+which compiles a source whose name its library has already into a further library, made alike and linked by the first
+(FFmpeg's `parser.c` of several of its libraries, x264's sources compiled once for each depth).
+
 A package replaces what an extension downloaded only once it builds the same: GCC 2.8.1's `cc1` compiles every C file
 of a project to the same assembly as the build it replaced, on each platform that can run it; FFmpeg encodes the same
 bytes as FFmpeg's own build of the same configuration. The preprocessor is aro's, as zig carries it, behind the
