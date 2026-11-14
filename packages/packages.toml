@@ -44,7 +44,7 @@ macos-aarch64 = "aarch64-macos"
 # the name it is placed under. What each is made of is `components.toml`'s.
 [package.gcc-psx]
 version = "2.8.1"
-release = 1
+release = 2
 name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 description = "GCC 2.8.1's C compiler (cc1) for the PlayStation, with old-gcc's patches and the editor's for 64-bit hosts"
 license = "GPL-2.0-or-later"

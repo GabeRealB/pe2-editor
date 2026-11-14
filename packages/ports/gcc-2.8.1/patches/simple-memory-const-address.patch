@@ -1,0 +1,22 @@
+A memory operand at a constant address never taken for one instruction, as GCC 2.8.1 never took it where it was built.
+`simple_memory_operand` asks `SMALL_INT (op)` of the MEM rather than of its address: what it tests is the MEM's first
+field, the pointer to the address, read as a HOST_WIDE_INT. Where pointers are as wide as that (the 32-bit hosts GCC
+2.8.1 knew), a heap pointer is never within 32 KiB of 0 and the answer was always no. On a host whose pointers are
+wider than int (LP64) it reads their low 32 bits, which an allocator placing memory at random leaves within that range
+about once in 65,536: a store to a constant address (the scratchpad's, `0x1F8003FC`) is then taken for one
+instruction, put in a branch's delay slot, and the compiler's output depends on where its heap happened to be.
+
+--- a/config/mips/mips.c
++++ b/config/mips/mips.c
+@@ -595,7 +595,10 @@
+       return TRUE;
+ 
+     case CONST_INT:
+-      return SMALL_INT (op);
++      /* SMALL_INT (op) tested the MEM, a pointer, which on the hosts GCC 2.8.1 was built for was never within
++	 32 KiB of 0: a constant address is not one instruction, whatever the heap's address (an LP64 host reads a
++	 pointer's low 32 bits, which are).  */
++      return FALSE;
+ 
+     case PLUS:
+       plus0 = XEXP (addr, 0);

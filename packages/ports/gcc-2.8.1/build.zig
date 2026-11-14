@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     patching.addPrefixedFileArg("file:obstack.h=", old_gcc.path("patches/obstack-2.8.1.h.patch"));
     patching.addPrefixedFileArg("file:config/mips/mips.h=", old_gcc.path("patches/mips.patch"));
     patching.addPrefixedFileArg("tree:", old_gcc.path("patches/psx.patch"));
-    for ([_][]const u8{ "lp64-declarations", "lp64-const-double", "lp64-variadic-prototypes" }) |name| {
+    for ([_][]const u8{ "lp64-declarations", "lp64-const-double", "lp64-variadic-prototypes", "simple-memory-const-address" }) |name| {
         patching.addPrefixedFileArg("tree:", b.path(b.fmt("patches/{s}.patch", .{name})));
     }
 
