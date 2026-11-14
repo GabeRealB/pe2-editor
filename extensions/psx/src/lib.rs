@@ -364,9 +364,7 @@ fn expand(call: &mut Call) -> Result<Typed> {
     fs::create_dir_all(&scratch)?;
     let made = with_tree(call, &sources, &path, |tree| {
         let mut made = vec![];
-        for (_, unit) in
-            units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit))
-        {
+        for (_, unit) in units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit)) {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
             args.extend(searched(call, &sources, tree));
@@ -507,7 +505,8 @@ fn linked_in(listed: &str, kind: &str) -> Vec<String> {
 
 /// The package's own link script, from the gathered tree.
 fn script_of(sources: &Typed, tree: &Path, name: &str) -> Result<PathBuf> {
-    only_in(sources, tree, &format!("target/{TARGET}/{name}/link_script")).map_err(|_| anyhow!("{name} has no link_script"))
+    only_in(sources, tree, &format!("target/{TARGET}/{name}/link_script"))
+        .map_err(|_| anyhow!("{name} has no link_script"))
 }
 
 /// What an image exports: its layout alone, its references left open - a jump to 0 does not reach, which ld says and goes
@@ -672,9 +671,7 @@ fn first_pass(call: &mut Call) -> Result<Typed> {
     let path = call.host.path().to_string();
     let made = with_tree(call, &sources, &path, |tree| {
         let mut made = vec![];
-        for (_, unit) in
-            units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit))
-        {
+        for (_, unit) in units_of(&text_in(call, &sources, "units")?).iter().filter(|(_, unit)| !is_assembly(unit)) {
             let expanded = scratch.join("expanded.i");
             let mut args: Vec<String> = CPP.iter().map(ToString::to_string).collect();
             args.extend(searched(call, &sources, tree));
@@ -730,7 +727,6 @@ fn searched(call: &Call, sources: &Typed, tree: &Path) -> Vec<String> {
     }
     args
 }
-
 
 fn text(path: &Path) -> String {
     path.display().to_string()
