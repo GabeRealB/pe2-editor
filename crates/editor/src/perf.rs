@@ -115,7 +115,10 @@ fn spans() -> serde_json::Value {
     let millis = |d: Duration| (d.as_secs_f64() * 1e4).round() / 10.0;
     let totals = project::profile::totals();
     // The costliest, and whatever the window's thread does of the project's work, however little it cost.
-    let shown = totals.iter().enumerate().filter(|(i, t)| *i < SPANS || t.name.starts_with("window thread:") || t.name == "frame");
+    let shown = totals
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| *i < SPANS || t.name.starts_with("window thread:") || t.name == "frame");
     let rows = shown.map(|(_, t)| {
         let mean = t.total.as_secs_f64() / f64::from(u32::try_from(t.count.max(1)).unwrap_or(u32::MAX));
         serde_json::json!({

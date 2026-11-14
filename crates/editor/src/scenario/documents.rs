@@ -1,5 +1,6 @@
 //! Documents: an asset edited is unsaved until it is saved, its working copy shown everywhere; the disk changing under
 //! it makes it stale; undo follows the document in use.
+use pe2_path::testing::At as _;
 
 use eframe::egui;
 
@@ -43,7 +44,7 @@ fn an_edit_is_unsaved_until_it_is_saved() {
 fn a_change_on_disk_under_unsaved_work_is_asked_about() {
     let mut editor = Scenario::open(Fixture::rig());
     move_pelvis(&mut editor, "-900");
-    let file = editor.node_folder("rig/skeleton").join("node.toml");
+    let file = editor.node_folder("rig/skeleton").at("node.toml");
     let text = std::fs::read_to_string(&file).expect("its declaration");
     std::fs::write(&file, text.replace("-927", "-800")).expect("written");
     editor.take_in_outside_changes();
@@ -148,7 +149,7 @@ fn a_sound_is_exported_as_a_wav_file() {
     editor.expect("Export beep");
     editor.click_label("WAV file, as played  (.wav)");
     editor.click_label("Export");
-    let file = editor.workspace().project.root.join("exports/beep.wav");
+    let file = editor.workspace().project.root.at("exports/beep.wav");
     editor.until("the WAV file to be written", |_| file.exists());
     let bytes = std::fs::read(&file).expect("the file");
     assert_eq!(&bytes[..4], b"RIFF");

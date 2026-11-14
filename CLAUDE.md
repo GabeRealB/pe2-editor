@@ -73,15 +73,33 @@ What holds whatever is being changed:
   `licenses/licenses.toml` does not allow, or with no license text to show. Nothing whose license asks anything of
   what is loaded beside it is allowed: the editor loads extensions of any license. A crate only another platform
   links is checked from this one with `PE2_LICENSES_FOR=<target triple> cargo check -p licenses`.
-- **A test names a project's files as the project does** (`project::testing::real`): by its real folder, part by
-  part, not a folder joined with `a/b`. Every edit the project crate's tests make is held to an index opened
-  afresh and to the project's model; an edit added goes through the same harness.
+- **No text is a path.** A path is one of `pe2-path`'s types, made by a checked constructor where it comes in - an
+  argument, a setting, a file read, a frame from another process, what the system or an extension says: `HostPath`
+  for a place on disk (absolute, links resolved, in the plain form, so two of one place are equal), `Name` and
+  `RelPath` for names within one, `Uid` and `ResourcePath` for what a reference names. A disk path is joined only by
+  checked names (`HostPath::join`), never by text: `Path::join`, `PathBuf::push` and `canonicalize` are refused by
+  the build (`clippy.toml`) but in `pe2-path`, build scripts and `xtask`. Text goes back to a path's form only where it
+  leaves - a message, a file written, a program's argument (`HostPath::argument`: the path within with `/`, as a
+  program's patterns are written).
+- **A path that fails its check is refused, never replaced or passed over.** A conversion says why it failed
+  (`PathError`, `NotWithin`: elsewhere, or within by a name no path takes), and its caller decides on each answer:
+  it refuses the operation, or says the problem (`Problem::Refused`), or - only where nothing is lost by it - goes
+  on. It never substitutes another place (a layer's folder for a path that is none) and never drops what it cannot
+  name with `.ok()`, `filter_map` or `else { continue }` unsaid. What a walk finds by a name no path takes is a
+  problem of the project's; what a program asks of one in the served folder is refused as the system refuses an
+  invalid name.
+- **A growable container only where it grows.** `String` and `Vec<T>` hold what is being built; what is kept once
+  made is `Box<str>` or `Box<[T]>`, or `Arc<str>` or `Arc<[T]>` where it is shared or cloned.
+- **A test makes its folders as the program does** (`pe2_path::testing`: `scratch` for a folder of its own, `At`
+  for a place in one written as text, `root.at("a/b")`). Every edit the project crate's tests make is held to an
+  index opened afresh and to the project's model; an edit added goes through the same harness.
 - **A test or an example takes what it reads from what it is given**, never from a place outside the workspace:
   an example that needs a release's discs or an extraction takes its folder as an argument.
 
 ## Checking
 
 ```bash
+cargo xtask prepare        # once, and when prepare.toml changes: on Windows, the build fails until it is done
 cargo clippy --workspace --all-targets
 cargo test --workspace
 ```

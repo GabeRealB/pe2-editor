@@ -5,6 +5,7 @@
 //!
 //! Work goes on off the window's thread, so that a harness with no repaint to make has not finished: `settle` waits until
 //! the editor says it has nothing going on.
+use pe2_path::testing::At as _;
 
 // What only the scenarios here use is left over in a build for running a project's tests.
 #[cfg(test)]
@@ -34,6 +35,7 @@ mod taking_in;
 #[cfg(all(test, unix))]
 mod tests_pane;
 
+use pe2_path::HostPath;
 use std::fmt::Write as _;
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -55,8 +57,8 @@ const STEADY_FRAMES: usize = 60;
 const QUIET: u32 = 3;
 
 /// What scenarios write goes under this, emptied by the next run: work off the window's thread can outlast one.
-fn folder() -> std::path::PathBuf {
-    std::env::temp_dir().join("pe2-scenarios")
+fn folder() -> HostPath {
+    HostPath::new(&std::env::temp_dir()).expect("the system's temporary folder").at("pe2-scenarios")
 }
 
 /// The process's data folder, one for every scenario, as nothing reaches it from the user's.
@@ -64,7 +66,7 @@ fn isolate() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = std::fs::remove_dir_all(folder());
-        let data = folder().join("data");
+        let data = folder().at("data");
         std::fs::create_dir_all(&data).expect("a data folder");
         extensions::use_data_folder(data);
         extensions::test_mode(host::extension);
@@ -85,7 +87,7 @@ fn from_hex(text: &str) -> Result<Vec<u8>, String> {
 
 /// A file dropped on the window.
 #[derive(Debug)]
-struct Dropped(std::path::PathBuf);
+struct Dropped(HostPath);
 
 impl egui::DroppedFile for Dropped {
     fn path(&self) -> &std::path::Path {
@@ -100,9 +102,9 @@ impl egui::DroppedFile for Dropped {
 /// Run the tests of the extensions a project has, those whose names hold one of `filters`, in the project: whether they passed.
 /// What a test changes is undone after it.
 #[must_use]
-pub fn run(root: &std::path::Path, filters: &[String]) -> bool {
+pub fn run(root: &HostPath, filters: &[String]) -> bool {
     isolate();
-    if !root.join(project::FILE).is_file() {
+    if !root.join(&project::FILE).is_file() {
         eprintln!("{}: no project", root.display());
         return false;
     }
@@ -139,17 +141,19 @@ pub fn main() -> i32 {
     let mut out = suite::Out::default();
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--project") => project = args.next().map(std::path::PathBuf::from),
+            Some("--project") => project = args.next().and_then(|at| HostPath::new(std::path::Path::new(&at)).ok()),
             Some("--built") => built = true,
             Some("--suites") => {
                 while let Some(folder) = args.next_if(|arg| !arg.to_string_lossy().starts_with("--")) {
-                    folders.push(std::path::PathBuf::from(folder));
+                    folders.extend(HostPath::new(std::path::Path::new(&folder)).ok());
                 }
             }
             Some("--filter") => filters.extend(args.next().map(|text| text.to_string_lossy().into_owned())),
             Some("--list") => out.list = true,
             Some("--json") => out.json = true,
-            Some("--artifacts") => out.artifacts = args.next().map(std::path::PathBuf::from),
+            Some("--artifacts") => {
+                out.artifacts = args.next().and_then(|at| HostPath::new(std::path::Path::new(&at)).ok());
+            }
             Some("--trust-everything") => extensions::trust::trust_everything(),
             _ => {
                 eprintln!("{}: not something this takes", arg.to_string_lossy());
@@ -220,9 +224,14 @@ impl Scenario {
         static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         // A scenario that failed says so itself: the next has nothing to do with it.
         let alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = fixture.root().to_path_buf();
+        let root = fixture.root().clone();
         let show = show.map(str::to_string);
-        let harness = Harness::builder().with_size(size).wgpu().build_eframe(move |cc| {
+        // kittest's setup - a software rasterizer where there is one - with the editor's shader compiler.
+        let mut setup = egui_kittest::wgpu::default_wgpu_setup();
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(new) = &mut setup {
+            crate::shader_compiler(new);
+        }
+        let harness = Harness::builder().with_size(size).wgpu_setup(setup).build_eframe(move |cc| {
             if let Some(state) = &cc.wgpu_render_state {
                 crate::install_gpu(state);
             }
@@ -587,21 +596,17 @@ impl Scenario {
     }
 
     /// What the window showed, kept where it can be looked at: a file of what it said, and a picture where one can be made.
-    fn keep_failure(
-        &mut self,
-        folder: &std::path::Path,
-        test: &str,
-    ) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    fn keep_failure(&mut self, folder: &HostPath, test: &str) -> (Option<HostPath>, Option<HostPath>) {
         let name: String = test.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
         if std::fs::create_dir_all(folder).is_err() {
             return (None, None);
         }
-        let said = folder.join(format!("{name}.txt"));
+        let said = folder.at(&format!("{name}.txt"));
         let said = std::fs::write(&said, self.shown().join("\n")).is_ok().then_some(said);
         let picture = self.harness.render().ok().and_then(|image| {
             let png =
                 codecs::texture::rgba_png(image.width() as usize, image.height() as usize, image.as_raw()).ok()?;
-            let file = folder.join(format!("{name}.png"));
+            let file = folder.at(&format!("{name}.png"));
             std::fs::write(&file, png).is_ok().then_some(file)
         });
         (said, picture)
@@ -612,8 +617,8 @@ impl Scenario {
         let id = test.split('@').next().unwrap_or_default();
         let present = self.workspace().extensions.present.iter().find(|present| present.id == id).cloned();
         let at = match present.map(|present| present.origin) {
-            Some(project::ext::Origin::Project(folder)) => folder.join("data").join(name),
-            Some(project::ext::Origin::Component(file)) => file.with_file_name("data").join(name),
+            Some(project::ext::Origin::Project(folder)) => folder.at("data").at(name),
+            Some(project::ext::Origin::Component(file)) => file.parent().expect("in a folder").at("data").at(name),
             _ => return Err(format!("{id} has no folder")),
         };
         project::content::read(&at).map_err(|e| format!("{}: {e}", at.display()))
@@ -693,7 +698,7 @@ impl Scenario {
     /// What the project's `project.toml` says.
     #[must_use]
     pub fn project_file(&self) -> String {
-        std::fs::read_to_string(self.fixture.root().join(project::FILE)).expect("a project file")
+        std::fs::read_to_string(self.fixture.root().join(&project::FILE)).expect("a project file")
     }
 
     /// The assets the project has, by path.
@@ -784,8 +789,8 @@ impl Scenario {
     }
 
     /// Drop a file on the window.
-    pub fn drop_file(&mut self, file: &std::path::Path) {
-        self.harness.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(file.to_path_buf())));
+    pub fn drop_file(&mut self, file: &HostPath) {
+        self.harness.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(file.clone())));
         self.settle();
     }
 
@@ -817,13 +822,13 @@ impl Scenario {
         text.parse().unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
-    fn written(&self, path: &str) -> std::path::PathBuf {
+    fn written(&self, path: &str) -> HostPath {
         self.fixture.node_file(path)
     }
 
     /// A file with nothing to do with the project, as one to drop on the window is.
-    pub fn file_elsewhere(&self, name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let file = self.fixture.root().with_extension("files").join(name);
+    pub fn file_elsewhere(&self, name: &str, bytes: &[u8]) -> HostPath {
+        let file = self.fixture.root().with_suffix(&pe2_path::Name::constant(".files")).at(name);
         std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder");
         std::fs::write(&file, bytes).expect("a file");
         file
@@ -831,8 +836,8 @@ impl Scenario {
 
     /// The folder holding a node.
     #[must_use]
-    pub fn node_folder(&self, path: &str) -> std::path::PathBuf {
-        self.written(path).parent().expect("a bundle").to_path_buf()
+    pub fn node_folder(&self, path: &str) -> HostPath {
+        self.written(path).parent().expect("a bundle").clone()
     }
 
     /// What is wrong with the project, in a line each.

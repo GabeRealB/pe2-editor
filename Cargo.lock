@@ -853,6 +853,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-path",
  "png",
  "project",
  "serde_json",
@@ -1517,11 +1518,13 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-path",
  "pe2-webgpu",
  "png",
  "project",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo",
  "toml 0.8.23",
  "toml_edit 0.22.27",
@@ -1894,6 +1897,7 @@ dependencies = [
  "pe2-images",
  "pe2-movies",
  "pe2-packages",
+ "pe2-path",
  "pe2-render",
  "pe2-sounds",
  "pe2-str",
@@ -2040,6 +2044,9 @@ dependencies = [
 [[package]]
 name = "formats"
 version = "0.1.0"
+dependencies = [
+ "pe2-path",
+]
 
 [[package]]
 name = "fuser"
@@ -2484,6 +2491,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-path",
  "project",
  "sfs",
  "tracing",
@@ -3177,6 +3185,7 @@ dependencies = [
  "extensions",
  "interprocess",
  "pe2-ext",
+ "pe2-path",
  "project",
  "rmcp",
  "schemars",
@@ -4003,6 +4012,7 @@ dependencies = [
  "codecs",
  "formats",
  "pe2-ext",
+ "pe2-path",
  "serde_json",
  "sha1",
  "toml 0.8.23",
@@ -4033,9 +4043,10 @@ dependencies = [
 name = "pe2-ext-macros"
 version = "0.1.0"
 dependencies = [
+ "pe2-manifest",
+ "pe2-path",
  "proc-macro2",
  "quote",
- "sha2 0.10.9",
  "syn 2.0.119",
  "toml 0.8.23",
 ]
@@ -4061,6 +4072,7 @@ dependencies = [
  "codecs",
  "formats",
  "pe2-ext",
+ "pe2-path",
  "png",
  "serde",
  "sha1",
@@ -4113,6 +4125,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-manifest"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "pe2-model"
 version = "0.1.0"
 dependencies = [
@@ -4137,6 +4157,14 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "pe2-path"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4172,6 +4200,7 @@ dependencies = [
  "codecs",
  "flate2",
  "lzma-rust2",
+ "pe2-path",
  "serde",
  "sha2 0.10.9",
  "tar",
@@ -4492,6 +4521,8 @@ dependencies = [
  "interprocess",
  "memmap2",
  "pe2-ext",
+ "pe2-manifest",
+ "pe2-path",
  "pe2-setup",
  "pe2-value",
  "png",
@@ -5079,6 +5110,7 @@ dependencies = [
  "crc32fast",
  "libc",
  "memmap2",
+ "pe2-path",
  "windows-sys 0.61.2",
 ]
 
@@ -5889,6 +5921,7 @@ dependencies = [
  "libc",
  "libloading",
  "nt-time",
+ "pe2-path",
  "project",
  "serde",
  "serde_json",
@@ -7303,7 +7336,9 @@ dependencies = [
  "licenses",
  "lzma-rust2",
  "minisign-verify",
+ "pe2-path",
  "pe2-setup",
+ "serde",
  "sha2 0.10.9",
  "tar",
  "toml 0.8.23",

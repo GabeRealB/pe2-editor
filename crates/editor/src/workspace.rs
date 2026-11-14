@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use eframe::egui;
 use pe2_ext::events::{Build, Clean, Event, FilesChanged, ProjectOpened};
+use pe2_path::HostPath;
 use project::Project;
 use project::cache::Cache;
 use project::ext::{Extensions, Lens};
@@ -12,7 +13,6 @@ use project::history::{History, StepError};
 use project::index::{Asset, Index, Kind, LayerInfo};
 use project::lock::Lock;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -182,7 +182,7 @@ impl LayerView {
     }
 }
 
-const LAYER_VIEW: &str = "editor/layers.toml";
+const LAYER_VIEW: pe2_path::RelPath = pe2_path::RelPath::constant("editor/layers.toml");
 
 /// How many of the history's kept contents are held as the History pane showed them.
 const KEPT: usize = 512;
@@ -259,7 +259,7 @@ pub struct Workspace {
     pub layer_view: LayerView,
     /// The project's lock, held while the workspace is open: no other process works on the project meanwhile.
     lock: Lock,
-    cache_dir: PathBuf,
+    cache_dir: HostPath,
     /// The watcher on the layers, started with the first frame (it wakes the window).
     watch: Option<notify::RecommendedWatcher>,
     /// Why the layers are not (or no longer fully) watched.
@@ -299,7 +299,7 @@ pub struct Workspace {
     /// Changes other programs made, waiting to be taken in: when the editor regains focus, as they happen (the
     /// setting), before an agent is answered, or on View > Refresh. The worker takes them in itself before
     /// what is asked of it from outside the window.
-    pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    pending: Arc<Mutex<BTreeSet<HostPath>>>,
     /// What the window shows that an edit asked from outside it depends on, as the worker was last told.
     showing: Arc<Mutex<crate::takein::Showing>>,
     /// The contents the history keeps, as the History pane showed them: each read once, by its hash.
@@ -444,7 +444,7 @@ pub enum GraphAsk {
 ///
 /// # Errors
 /// It cannot be read.
-pub fn adding(asset: &Asset, file: &Path) -> std::result::Result<EditRequest, String> {
+pub fn adding(asset: &Asset, file: &HostPath) -> std::result::Result<EditRequest, String> {
     let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
     let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let short = asset.path.rsplit('/').next().unwrap_or(&asset.path);
@@ -610,7 +610,7 @@ pub type AgentRequest = (mcp::Request, mpsc::Sender<mcp::Reply>);
 /// (`to_frames`), which wake for it, and its answer awaited. Started as the project's lock is taken, before the rest
 /// of opening it, so that an agent reaches the editor - its window, and what it says of the project - all along.
 fn listen(
-    root: &Path,
+    root: &HostPath,
     to_frames: mpsc::Sender<AgentRequest>,
     ctx: egui::Context,
     outside: Arc<std::sync::OnceLock<crate::takein::Outside>>,
@@ -647,7 +647,7 @@ pub struct Leaving {
     /// The host standing by, told: it takes the project the moment this goes, after the lock.
     handing: Option<project::host::Lease>,
     /// The project's folder.
-    root: PathBuf,
+    root: HostPath,
 }
 
 impl Drop for Leaving {
@@ -672,15 +672,16 @@ impl Drop for Leaving {
 
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
 /// one running, or `pe2-cli` beside the editor started as one. Where that is not there, none does.
-fn stand_by(root: &Path) {
-    let Ok(program) = std::env::current_exe().map(|exe| project::host::cli_beside(&exe)) else { return };
+fn stand_by(root: &HostPath) {
+    let Some(program) = std::env::current_exe().ok().and_then(|exe| HostPath::new(&exe).ok()) else { return };
+    let program = project::host::cli_beside(&program);
     if !program.is_file() {
         return;
     }
-    let root = root.to_path_buf();
+    let root = root.clone();
     let _ = std::thread::Builder::new().name("standby".into()).spawn(move || {
         if let Err(e) = project::host::stand_by(&root, &program) {
-            eprintln!("no host stands by for {}: {e:#}", project::host::shown(&root));
+            eprintln!("no host stands by for {root}: {e:#}");
         }
     });
 }
@@ -711,7 +712,7 @@ impl Loaded {
         let extensions = extensions::for_project(&project);
         // What they are asked in passing reads and keeps what the project's store holds.
         extensions.keep_in(store.clone());
-        let layer_view: LayerView = std::fs::read_to_string(cache.path(LAYER_VIEW))
+        let layer_view: LayerView = std::fs::read_to_string(cache.dir.join(&LAYER_VIEW))
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
@@ -728,7 +729,7 @@ impl Workspace {
     /// # Errors
     /// Its `project.toml` or its assets cannot be read, or another holds it.
     pub fn prepare(
-        dir: &Path,
+        dir: &HostPath,
         report: &project::index::Report<'_>,
         agents: (mpsc::Sender<AgentRequest>, egui::Context),
     ) -> Result<Opened> {
@@ -780,7 +781,7 @@ impl Workspace {
         });
         // The work graph's store (what was kept as artifacts before it, gone); attaching the imports sweeps it.
         let store = project::graph::store::Store::open(&cache)?;
-        let old = cache.path("artifacts");
+        let old = cache.path(&pe2_path::Name::constant("artifacts"));
         if old.exists() {
             std::fs::remove_dir_all(&old).with_context(|| old.display().to_string())?;
         }
@@ -870,7 +871,7 @@ impl Workspace {
         };
         let runner = Arc::new(Mutex::new(crate::runner::Runner::start(project.clone(), extensions.clone())));
         let showing = Arc::new(Mutex::new(showing));
-        let pending: Arc<Mutex<BTreeSet<PathBuf>>> = Arc::default();
+        let pending: Arc<Mutex<BTreeSet<HostPath>>> = Arc::default();
         let mut takein = crate::takein::TakeIn::start(crate::takein::Start {
             core,
             shown: shown.clone(),
@@ -1082,7 +1083,7 @@ impl Workspace {
     }
 
     /// Take in what is at these paths now, as another program wrote it (a plan run). The take-in's ticket.
-    pub fn take_in(&mut self, paths: Vec<PathBuf>) -> u64 {
+    pub fn take_in(&mut self, paths: Vec<HostPath>) -> u64 {
         self.takein.paths(paths)
     }
 
@@ -1158,18 +1159,26 @@ impl Workspace {
         then: impl FnOnce(&mut crate::app::Editor, Result<(), String>) + 'static,
     ) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
-        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
-            .map_err(|e| e.to_string())?;
-        let uid = project::uid::text(id);
+        let uid = project::uid::new(|uid| self.index.by_uid.contains_key(&uid.to_string()))
+            .map_err(|e| e.to_string())?
+            .to_string();
         let slug: String =
             name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let quoted = toml::Value::String(name.to_string());
         let declaration = format!("uid = \"{uid}\"\n\n[[stack]]\nop = \"pe2.events@event\"\nlabel = {quoted}\n");
         let path = format!("events/{slug}");
         let work = move |w: &mut crate::takein::Worker| {
-            project::edit::create(&w.core.project, &w.core.index, &layer, &uid, &path, (&declaration, &[]), &mut w.history)
-                .map(drop)
-                .map_err(|e| format!("{e:#}"))
+            project::edit::create(
+                &w.core.project,
+                &w.core.index,
+                &layer,
+                &uid,
+                &path,
+                (&declaration, &[]),
+                &mut w.history,
+            )
+            .map(drop)
+            .map_err(|e| format!("{e:#}"))
         };
         self.ask(work, then);
         Ok(())
@@ -1182,7 +1191,7 @@ impl Workspace {
     pub fn new_node(
         &mut self,
         template: &str,
-        file: Option<&Path>,
+        file: Option<&HostPath>,
         folder: &str,
         then: impl FnOnce(&mut crate::app::Editor, Result<NewNode, String>) + 'static,
     ) -> Result<(), String> {
@@ -1196,7 +1205,7 @@ impl Workspace {
     /// # Errors
     /// As `new_node`, or the node cannot be written.
     #[cfg(any(test, feature = "tests"))]
-    pub fn new_node_now(&mut self, template: &str, file: Option<&Path>, folder: &str) -> Result<NewNode, String> {
+    pub fn new_node_now(&mut self, template: &str, file: Option<&HostPath>, folder: &str) -> Result<NewNode, String> {
         let (node, work) = self.new_node_work(template, file, folder)?;
         self.held(work)??;
         if self.exists(&node.path) {
@@ -1206,7 +1215,7 @@ impl Workspace {
     }
 
     /// The node a template makes, and the work that makes it.
-    fn new_node_work(&self, template: &str, file: Option<&Path>, folder: &str) -> Result<(NewNode, Made), String> {
+    fn new_node_work(&self, template: &str, file: Option<&HostPath>, folder: &str) -> Result<(NewNode, Made), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let found = self.extensions.template(template).ok_or_else(|| format!("no template {template}"))?;
         let name =
@@ -1225,11 +1234,11 @@ impl Workspace {
         let stack = self.extensions.stamp(&found, &name)?;
         // A stack naming its own file has the file under that name.
         let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
-        let id = project::uid::new(|id| self.index.by_uid.contains_key(&project::uid::text(id)))
-            .map_err(|e| e.to_string())?;
-        let uid = project::uid::text(id);
+        let uid = project::uid::new(|uid| self.index.by_uid.contains_key(&uid.to_string()))
+            .map_err(|e| e.to_string())?
+            .to_string();
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
-        let file = file.map(Path::to_path_buf);
+        let file = file.cloned();
         let (made_uid, made_at) = (uid.clone(), path.clone());
         let work: Made = Box::new(move |w| {
             let bytes = file.map(std::fs::read).transpose().map_err(|e| e.to_string())?;
@@ -1259,9 +1268,11 @@ impl Workspace {
     pub fn make_node(&mut self, uid: &str, path: &str, node: (&str, &[(&str, &[u8])])) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
         let (uid, path, declaration) = (uid.to_string(), path.to_string(), node.0.to_string());
-        let files: Vec<(String, Vec<u8>)> = node.1.iter().map(|(name, bytes)| ((*name).to_string(), bytes.to_vec())).collect();
+        let files: Vec<(String, Vec<u8>)> =
+            node.1.iter().map(|(name, bytes)| ((*name).to_string(), bytes.to_vec())).collect();
         self.held(move |w| {
-            let files: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+            let files: Vec<(&str, &[u8])> =
+                files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
             let node = (declaration.as_str(), files.as_slice());
             project::edit::create(&w.core.project, &w.core.index, &layer, &uid, &path, node, &mut w.history)
                 .map(drop)
@@ -1275,7 +1286,7 @@ impl Workspace {
     /// The project has no config, or it cannot be written.
     pub fn set_disabled(&mut self, path: &str, disabled: bool) -> Result<(), String> {
         let config = self.config.as_ref().ok_or("the project has no config")?.name.clone();
-        let file = self.project.root.join(project::FILE);
+        let file = self.project.root.join(&project::FILE);
         let path = path.to_string();
         let work = move |w: &mut crate::takein::Worker| {
             let label = format!("{} {path} in {config}", if disabled { "Disable" } else { "Enable" });
@@ -1327,8 +1338,8 @@ impl Workspace {
     }
 
     /// A file of the project's cache, by name.
-    pub fn cache_path(&self, name: &str) -> PathBuf {
-        self.cache_dir.join(name)
+    pub fn cache_path(&self, within: &pe2_path::RelPath) -> HostPath {
+        self.cache_dir.join(within)
     }
 
     /// What the epoch running does, as the status bar says it: by the events it was signaled by.
@@ -1540,13 +1551,13 @@ impl Workspace {
 
     /// Take in what other programs changed, now.
     fn take_in_pending(&mut self) {
-        let paths: Vec<PathBuf> = std::mem::take(&mut *self.pending()).into_iter().collect();
+        let paths: Vec<HostPath> = std::mem::take(&mut *self.pending()).into_iter().collect();
         if !paths.is_empty() {
             self.takein.paths(paths);
         }
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeSet<PathBuf>> {
+    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeSet<HostPath>> {
         self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
@@ -1590,7 +1601,7 @@ impl Workspace {
 
     /// The changes other programs made that wait to be taken in.
     #[cfg(test)]
-    pub fn pending_paths(&self) -> Vec<PathBuf> {
+    pub fn pending_paths(&self) -> Vec<HostPath> {
         self.pending().iter().cloned().collect()
     }
 
@@ -1602,7 +1613,8 @@ impl Workspace {
     /// Swap in snapshots, oldest first: the index, the tree and the layers; the pictures and views of what changed
     /// forgotten; a selection shown once its step is taken in; agents waiting on them answered.
     fn apply(&mut self, snapshots: Vec<crate::takein::Snapshot>) {
-        let _span = (!snapshots.is_empty()).then(|| tracing::info_span!("window thread: snapshots swapped in").entered());
+        let _span =
+            (!snapshots.is_empty()).then(|| tracing::info_span!("window thread: snapshots swapped in").entered());
         for snapshot in snapshots {
             if let Some(error) = snapshot.error {
                 self.watch_error = Some(error);
@@ -1843,11 +1855,13 @@ impl Workspace {
 
     /// The user's view of the layers kept, in the project's cache: written by the worker's thread, aside.
     fn save_layer_view(&self) -> Result<()> {
-        let path = self.cache_dir.join(LAYER_VIEW);
+        let path = self.cache_dir.join(&LAYER_VIEW);
         let text = toml::to_string(&self.layer_view)?;
         self.takein.aside(move || {
             let written = path.parent().map_or(Ok(()), std::fs::create_dir_all);
-            let written = written.map_err(anyhow::Error::from).and_then(|()| project::cache::write_atomic(&path, text.as_bytes()));
+            let written = written
+                .map_err(anyhow::Error::from)
+                .and_then(|()| project::cache::write_atomic(&path, text.as_bytes()));
             if let Err(e) = written {
                 eprintln!("the view of the layers is not kept: {e:#}");
             }
@@ -2019,8 +2033,10 @@ impl Workspace {
             // Now is shown again.
             w.show_now();
             let at = viewing.point.checked_sub(1).and_then(|i| w.history.done().get(i));
-            let label =
-                at.map_or_else(|| "Restore to the start".to_string(), |step| format!("Restore to after \"{}\"", step.label));
+            let label = at.map_or_else(
+                || "Restore to the start".to_string(),
+                |step| format!("Restore to after \"{}\"", step.label),
+            );
             let changed = w.history.restore(&w.core.index, viewing.point, viewing.scope.as_deref(), label.clone());
             if changed {
                 w.history.note_selection(selected);
@@ -2066,11 +2082,7 @@ impl Workspace {
     ///
     /// # Errors
     /// The layer cannot be edited, or the edit cannot be made.
-    pub fn apply_edit(
-        &mut self,
-        op: &vfs::ops::Op,
-        layer: Option<&str>,
-    ) -> Result<(String, Vec<std::path::PathBuf>), String> {
+    pub fn apply_edit(&mut self, op: &vfs::ops::Op, layer: Option<&str>) -> Result<(String, Vec<HostPath>), String> {
         self.tell_showing();
         let (op, layer) = (op.clone(), layer.map(str::to_string));
         match self.held(move |w| w.asked_edit(&op, layer.as_deref()))? {
@@ -2121,7 +2133,15 @@ impl Workspace {
             for (uid, layer, label) in saving {
                 let files = w.history.to_save(&uid)?;
                 if !files.is_empty() {
-                    project::edit::save(&w.core.project, &w.core.index, &layer, &uid, &files, label.clone(), &mut w.history)?;
+                    project::edit::save(
+                        &w.core.project,
+                        &w.core.index,
+                        &layer,
+                        &uid,
+                        &files,
+                        label.clone(),
+                        &mut w.history,
+                    )?;
                 }
                 w.history.saved(&uid);
                 // The next reads the index as this one left it.
@@ -2284,7 +2304,9 @@ impl Workspace {
                 EditRequest::Delete(uid) => edit::delete(project, index, &name, uid, history)?,
                 EditRequest::Forget(_, uid) => edit::forget(project, index, &name, uid, history)?,
                 EditRequest::RenameTo(uid, to) => edit::rename(project, index, &name, uid, to, history)?,
-                EditRequest::Resolve(uid, resolution) => edit::resolve(project, index, &name, uid, *resolution, history)?,
+                EditRequest::Resolve(uid, resolution) => {
+                    edit::resolve(project, index, &name, uid, *resolution, history)?
+                }
                 // An edit of a document: its working copy changes, saving writes it.
                 EditRequest::Write { uid, file, bytes, label, merge } => {
                     let path = index.by_uid.get(uid).cloned().unwrap_or_default();
@@ -2488,7 +2510,7 @@ impl Workspace {
     ///
     /// # Errors
     /// Nothing makes this file of this asset, or it cannot be read.
-    pub fn replacing(&self, asset: &Asset, file: &Path) -> std::result::Result<Vec<EditRequest>, String> {
+    pub fn replacing(&self, asset: &Asset, file: &HostPath) -> std::result::Result<Vec<EditRequest>, String> {
         let name = file.file_name().and_then(|n| n.to_str()).ok_or("It has no name")?;
         let stack = self.extensions.stack_for(asset, name).ok_or("Nothing imports it over this")??;
         let uid = asset.uid.clone().ok_or("It has no uid")?;
@@ -2503,7 +2525,7 @@ impl Workspace {
             label: label.clone(),
             merge: merge.clone(),
         };
-        Ok(vec![write(name, bytes), write(project::index::NODE_FILE, declaration.into_bytes())])
+        Ok(vec![write(name, bytes), write(project::index::NODE_FILE.as_str(), declaration.into_bytes())])
     }
 
     /// Whether an entry opens as a document: an asset, a container folder among them, or a plain file; a filesystem

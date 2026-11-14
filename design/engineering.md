@@ -9,6 +9,14 @@ target the extensions are built for. A normal `cargo build` builds the editor, t
 Every warning is an error, Clippy's pedantic group included (`[workspace.lints]`). `cargo xtask` lays out and
 archives releases, and helps extension authors pin their downloads (see the README).
 
+What a build needs that is no crate is pinned in `prepare.toml`, as an extension's `[[setup]]` entries are, and fetched
+by `cargo xtask prepare` into `prepared/<platform>/`; the editor crate's build script fails by name until it is there
+and as pinned, then puts it beside the programs the build makes (`target/<profile>/`), as a release has it beside them
+(`cargo xtask dist`): where the editor looks. Tests, which cargo runs from folders of its own, are given where it was
+prepared, which only a test build reads. On Windows that is the DirectX Shader Compiler, which wgpu is given by that place for Direct3D 12's shaders (`shader_compiler` in the editor crate): never
+one found on the PATH - the Vulkan SDK's, for one, makes shaders Direct3D refuses, which wgpu says as a lost device -
+and where there is none, Direct3D 12 is left out and another backend serves.
+
 ## The packages the extensions download
 
 What the game's extensions download - compilers, assemblers, Python, FFmpeg - is built from its sources, not taken
@@ -77,7 +85,7 @@ on Linux and on Windows. Three kinds of test matter most:
 - **The edit harness** (the tests of `project::edit`). Every edit a test makes is checked against the truth: the
   served tree updated by delta against the whole, the shared filesystem against a follower of its commits, the model
   against the index, and the index changed in place against one opened afresh. Every new kind of edit goes through
-  it. A test names project files as the project does, by their real folder (`project::testing::real`).
+  it. A test makes its folders as the program does, as `HostPath`s (`pe2_path::testing`).
 - **Editor scenarios** (`crates/editor/src/scenario`). The real editor, driven headlessly through its accessibility
   tree with real pointer and keys, asserting on what is written, the problems and the labels - never on pixels. Each
   scenario runs in a project and data folder of its own, with no network.

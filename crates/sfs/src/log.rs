@@ -13,18 +13,18 @@
 //! log ends is found, by the first process to open it, by checking records from that position on, never taken from
 //! the header: after a power loss it ends where the last whole record does.
 
+use pe2_path::{HostPath, Name};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use crate::Header;
 
 /// The folder of the segments, in the library's folder.
-pub const DIR: &str = "log";
+pub const DIR: Name = Name::constant("log");
 /// The file each process holds a shared lock on while it has the log open: who finds nobody has, checks the log.
-const ATTACHED: &str = "attached";
+const ATTACHED: Name = Name::constant("attached");
 
 /// A record's head: its body's length, its kind, its own position, a checksum of all three and the body.
 pub(crate) const HEAD: u64 = 24;
@@ -54,7 +54,7 @@ impl Default for Config {
 
 /// The log of the project whose library folder this is given.
 pub struct Log {
-    dir: PathBuf,
+    dir: HostPath,
     header: Header,
     config: Config,
     /// One of this process's threads appends at a time; with it, the segments it has open to write.
@@ -156,15 +156,19 @@ impl Log {
     ///
     /// # Errors
     /// Its folder, header or segments cannot be made, opened or read.
-    pub fn open(dir: &Path, config: Config) -> io::Result<Log> {
+    pub fn open(dir: &HostPath, config: Config) -> io::Result<Log> {
         let header = Header::open(dir)?;
         // Laid out as it was made: every process reads the segments at the same size.
         let config = Config { segment: header.segment_or(config.segment), ..config };
-        std::fs::create_dir_all(dir.join(DIR))?;
-        let attached =
-            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(ATTACHED))?;
+        std::fs::create_dir_all(dir.join(&DIR))?;
+        let attached = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(&ATTACHED))?;
         let log = Log {
-            dir: dir.to_path_buf(),
+            dir: dir.clone(),
             header,
             config,
             appending: Mutex::default(),
@@ -200,10 +204,10 @@ impl Log {
     ///
     /// # Errors
     /// As `open`.
-    pub fn shared(dir: &Path, config: Config) -> io::Result<Arc<Log>> {
-        static OPEN: Mutex<Vec<(PathBuf, Weak<Log>)>> = Mutex::new(Vec::new());
+    pub fn shared(dir: &pe2_path::HostPath, config: Config) -> io::Result<Arc<Log>> {
+        static OPEN: Mutex<Vec<(pe2_path::HostPath, Weak<Log>)>> = Mutex::new(Vec::new());
         std::fs::create_dir_all(dir)?;
-        let dir = dir.canonicalize()?;
+        let dir = dir.clone();
         let mut open = lock(&OPEN);
         open.retain(|(_, log)| log.strong_count() > 0);
         if let Some(log) = open.iter().find(|(at, _)| *at == dir).and_then(|(_, log)| log.upgrade()) {
@@ -216,7 +220,7 @@ impl Log {
 
     /// The folder it is kept in.
     #[must_use]
-    pub fn dir(&self) -> &Path {
+    pub fn dir(&self) -> &HostPath {
         &self.dir
     }
 
@@ -231,16 +235,17 @@ impl Log {
         self.config
     }
 
-    fn segment_path(&self, number: u64) -> PathBuf {
-        self.dir.join(DIR).join(format!("{number:016x}.seg"))
+    fn segment_path(&self, number: u64) -> HostPath {
+        let segment = Name::new(&format!("{number:016x}.seg")).expect("a number's digits and `.seg` are a name");
+        self.dir.join(&DIR).join(&segment)
     }
 
     /// The segments there are, by number, lowest first.
     fn segments(&self) -> Vec<u64> {
-        let names = std::fs::read_dir(self.dir.join(DIR)).into_iter().flatten().flatten().map(|entry| entry.file_name());
-        let mut found: Vec<u64> = names
-            .filter_map(|name| u64::from_str_radix(name.to_str()?.strip_suffix(".seg")?, 16).ok())
-            .collect();
+        let names =
+            std::fs::read_dir(self.dir.join(&DIR)).into_iter().flatten().flatten().map(|entry| entry.file_name());
+        let mut found: Vec<u64> =
+            names.filter_map(|name| u64::from_str_radix(name.to_str()?.strip_suffix(".seg")?, 16).ok()).collect();
         found.sort_unstable();
         found
     }
@@ -494,12 +499,13 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::{Config, HEAD, Log};
-    use std::path::PathBuf;
+    use pe2_path::HostPath;
+    use pe2_path::testing::At as _;
 
     const SMALL: Config = Config { segment: 4096, budget: 1 << 20 };
 
-    fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pe2-sfs-{name}-{}", std::process::id()));
+    fn folder(name: &str) -> HostPath {
+        let dir = pe2_path::testing::scratch(&format!("sfs-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -581,7 +587,7 @@ mod tests {
         let after = log.read(second).unwrap().unwrap().next;
         drop(log);
         // The second record's body half written, and what a segment held before after it.
-        let segment = dir.join("log").join(format!("{:016x}.seg", 0));
+        let segment = dir.at("log").at(&format!("{:016x}.seg", 0));
         let mut bytes = std::fs::read(&segment).unwrap();
         let at = usize::try_from(second + HEAD).unwrap();
         bytes[at + 3] ^= 0xff;
@@ -631,7 +637,11 @@ mod tests {
     #[ignore = "run by two_processes_append_to_one_log, as its second process"]
     fn the_second_process() {
         let Ok(dir) = std::env::var("PE2_SFS_SECOND") else { return };
-        let log = Log::open(std::path::Path::new(&dir), Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
+        let log = Log::open(
+            &HostPath::new(std::path::Path::new(&dir)).unwrap(),
+            Config { segment: 1 << 16, budget: 1 << 30 },
+        )
+        .unwrap();
         for n in 0..2000u32 {
             log.append(2, &[&n.to_le_bytes(), b" from the second process"]).unwrap();
         }
@@ -643,7 +653,7 @@ mod tests {
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 30 }).unwrap();
         let mut second = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "log::tests::the_second_process"])
-            .env("PE2_SFS_SECOND", &dir)
+            .env("PE2_SFS_SECOND", dir.as_os_str())
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();

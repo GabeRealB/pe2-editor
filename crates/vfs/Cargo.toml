@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 project.workspace = true
+pe2-path.workspace = true
 sfs.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -42,3 +43,6 @@ windows = { version = "0.62", features = [
 libloading = "0.8"
 nt-time = "0.15"
 windows-core = "0.62"
+
+[dev-dependencies]
+pe2-path = { workspace = true, features = ["testing"] }

@@ -71,8 +71,8 @@ pe2-cli project extension add path/to/me.notes.extension
 - [Packaging and sharing](packaging.md): the folder and archive, docs and licenses
 - [Testing](testing.md): tests that drive the editor
 
-The built-in extensions are good examples: a small one such as the flags or formats extension, and, outside the
-sandbox, `pe2.ffmpeg` and `pe2.psx`.
+The built-in extensions are good examples: a small one such as the flags or formats extension; outside the sandbox,
+`pe2.ffmpeg`; and, as a manifest alone offering programs, the tools (`pe2.gcc-psx`, `pe2.binutils-mipsel`).
 
 ## Versions
 

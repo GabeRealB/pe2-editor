@@ -1,0 +1,25 @@
+# What a build of the editor needs that is no crate: fetched by `cargo xtask prepare` into `prepared/<platform>/`, each
+# entry as an extension's `[[setup]]` is and held to its hashes (`cargo xtask hash prepare.toml --write` finds them). A
+# build for a platform an entry is for fails until it is prepared, and puts it beside the programs it makes
+# (`crates/editor/build.rs`); `cargo xtask dist` prepares first, and ships it beside the programs.
+
+# The DirectX Shader Compiler: what Direct3D 12's shaders are compiled with, given to wgpu by its place beside the
+# editor - never one found on the system's PATH, which may make shaders Direct3D refuses. It signs what it compiles with
+# its own validator: no dxil.dll. NCSA, as its release notes say of every file but d3d12shader.h.
+[[setup]]
+name = "DirectX Shader Compiler 1.9.2609"
+license = "NCSA"
+copyright = "University of Illinois at Urbana-Champaign; Microsoft Corporation"
+platform = "windows-x86_64"
+url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip"
+sha256 = "ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1"
+take = { "bin/x64/dxcompiler.dll" = { to = "dxcompiler.dll", sha256 = "0689e2fee0a1c9df8662a59680469f24e2a3ad7ce6bbbcc9284f7a83172bfc59" } }
+
+[[setup]]
+name = "DirectX Shader Compiler 1.9.2609"
+license = "NCSA"
+copyright = "University of Illinois at Urbana-Champaign; Microsoft Corporation"
+platform = "windows-aarch64"
+url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip"
+sha256 = "ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1"
+take = { "bin/arm64/dxcompiler.dll" = { to = "dxcompiler.dll", sha256 = "ec234595c270a908da183eb04f1f5a1a667d3ce81e69f5bc55370503dab48373" } }

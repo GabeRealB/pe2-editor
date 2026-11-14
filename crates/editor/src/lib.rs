@@ -36,6 +36,7 @@ mod extensions_pane;
 mod external;
 mod fetcher;
 use holder::files;
+use pe2_path::HostPath;
 mod fill;
 mod gpu_stats;
 mod gpu_view;
@@ -69,9 +70,43 @@ mod yuv;
 
 use eframe::egui;
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
-use std::path::PathBuf;
 use std::sync::Arc;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+
+/// The DirectX Shader Compiler: what Direct3D 12's shaders are compiled with, given to wgpu by its place - beside the
+/// program, as a release ships it (`cargo xtask dist`) and a build puts it (`build.rs`); a test, which cargo runs from a
+/// folder of its own, where it was prepared. Never one found on the PATH - another program's, which may make shaders
+/// Direct3D refuses, which wgpu says as a device lost - nor wgpu's own choice (`Auto`, which looks there). Where there is
+/// none, Direct3D 12 is left out, said once, and another backend serves.
+pub(crate) fn shader_compiler(setup: &mut eframe::egui_wgpu::WgpuSetupCreateNew) {
+    const DXC: pe2_path::Name = pe2_path::Name::constant("dxcompiler.dll");
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if !cfg!(windows) {
+        return;
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|program| pe2_path::HostPath::new(&program).ok())
+        .and_then(|program| program.parent());
+    // Only a test build reads where it was prepared: no program anyone runs carries the path of the machine it was
+    // built on.
+    #[cfg(test)]
+    let prepared =
+        option_env!("PE2_PREPARED").and_then(|folder| pe2_path::HostPath::new(std::path::Path::new(folder)).ok());
+    #[cfg(not(test))]
+    let prepared = None;
+    let places: Vec<pe2_path::HostPath> = beside.into_iter().chain(prepared).map(|folder| folder.join(&DXC)).collect();
+    if let Some(dxc) = places.iter().find(|dxc| dxc.is_file()) {
+        setup.instance_descriptor.backend_options.dx12.shader_compiler =
+            wgpu::Dx12Compiler::DynamicDxc { dxc_path: dxc.to_string() };
+        return;
+    }
+    SAID.call_once(|| {
+        let looked: Vec<String> = places.iter().map(ToString::to_string).collect();
+        eprintln!("no DirectX Shader Compiler at {}: Direct3D 12 is left out", looked.join(" or "));
+    });
+    setup.instance_descriptor.backends.remove(wgpu::Backends::DX12);
+}
 
 /// eframe's wgpu setup, but with the adapter's own texture size limit: eframe asks for 8192, and a window surface
 /// beyond the device's limit is a panic in `Surface::configure`.
@@ -80,6 +115,7 @@ fn wgpu_options(x11: bool) -> WgpuConfiguration {
     let mut config =
         WgpuConfiguration { surface: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY, ..WgpuConfiguration::default() };
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        shader_compiler(setup);
         // wgpu hides drivers that are not conformant, and Mesa's Dozen, the Vulkan of WSL, is not. It is the fastest way
         // to Wayland there, and the slowest to X11, where OpenGL is left to be chosen.
         if cfg!(target_os = "linux") && !x11 {
@@ -197,7 +233,9 @@ pub fn run() -> Result {
         let machine = extensions::filesystem_defaults();
         vfs::scoped::Machine { scopes: machine.scopes, copies: machine.copies }
     });
-    vfs::backend::keep_apart_by(|| extensions::filesystem_defaults().cache.map(PathBuf::from));
+    vfs::backend::keep_apart_by(|| {
+        extensions::filesystem_defaults().cache.and_then(|cache| HostPath::new(std::path::Path::new(&cache)).ok())
+    });
     // Ended by a signal, the editor drops nothing: what it mounted would be left with no one serving it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let _ = ctrlc::set_handler(|| {
@@ -212,16 +250,18 @@ pub fn run() -> Result {
         match arg.to_str() {
             Some("--select") => select = args.next().map(|a| a.to_string_lossy().into_owned()),
             Some("--show") => show = args.next().map(|a| a.to_string_lossy().into_owned()),
-            Some("--screenshot") => screenshot = args.next().map(PathBuf::from),
+            Some("--screenshot") => {
+                screenshot = args.next().and_then(|to| HostPath::new(std::path::Path::new(&to)).ok());
+            }
             Some("--agents-drive") => agents_drive = true,
             Some("--wait-for-agent") => workspace::wait_for_agent(),
             Some("--trust-everything") => extensions::trust::trust_everything(),
-            _ => project = Some(PathBuf::from(arg)),
+            _ => project = HostPath::new(std::path::Path::new(&arg)).ok(),
         }
     }
     let project = project.or_else(|| {
-        let cwd = std::env::current_dir().ok()?;
-        cwd.join(project::FILE).is_file().then_some(cwd)
+        let cwd = HostPath::new(&std::env::current_dir().ok()?).ok()?;
+        cwd.join(&project::FILE).is_file().then_some(cwd)
     });
     // Kept here rather than by eframe: under WSLg it would read back a place a decoration off, and a window closed filling the
     // screen would come back that size.

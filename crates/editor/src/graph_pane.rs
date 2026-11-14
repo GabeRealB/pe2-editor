@@ -637,7 +637,9 @@ impl Canvas<'_> {
         let mut outs: HashMap<String, (Pos2, Option<Type>)> = self
             .nodes
             .iter()
-            .flat_map(|n| n.outs.iter().enumerate().map(move |(i, (name, ty))| (n.source(name), (n.output(i), ty.clone()))))
+            .flat_map(|n| {
+                n.outs.iter().enumerate().map(move |(i, (name, ty))| (n.source(name), (n.output(i), ty.clone())))
+            })
             .collect();
         for (n, (id, _, ty)) in self.sources.iter().enumerate() {
             outs.insert(id.clone(), (source(n), Some(ty.clone())));

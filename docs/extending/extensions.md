@@ -1,8 +1,10 @@
 # Extensions
 
 Everything the editor knows about a kind of asset - how to show it, edit it, import, export and build it - comes
-from an extension. Most are built into the editor. Others ship beside it, such as `pe2.psx`, which compiles the
-game's code, and `pe2.ffmpeg`, which writes video files; and you can [write your own](writing/index.md).
+from an extension. Most are built into the editor. Others ship beside it, such as `pe2.psx`, which makes the images
+the PlayStation loads, `pe2.ffmpeg`, which writes video files, and the tools - a compiler, a set of binutils, an
+interpreter - each an extension offering its programs to the project's builds; and you can
+[write your own](writing/index.md).
 
 ## The extensions a project uses
 

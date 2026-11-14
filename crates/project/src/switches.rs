@@ -7,7 +7,7 @@
 //! (`records::EXTENSIONS`): one is added from wherever it is kept - and updated the same way - and removed, each as one
 //! step with what the project requires of it (`[[extension]]`).
 
-use std::path::Path;
+use pe2_path::HostPath;
 
 use anyhow::{Context, Result, bail};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
@@ -68,14 +68,19 @@ fn held_in(layer: &crate::Layer, id: &str) -> Option<Says> {
 /// `project.toml` written. Held as it is already, and required so, it is no step.
 pub fn add_extension(
     project: &Project,
-    from: &Path,
+    from: &HostPath,
     into: Option<&str>,
     history: &mut History,
     label: String,
 ) -> Result<About> {
-    let component = from.join(EXTENSION_COMPONENT);
-    let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
-    let about = folder::checked(from, &bytes).with_context(|| from.display().to_string())?;
+    // One that is only its manifest - programs and what they are fetched from - is checked as loading checks it.
+    let about = if folder::alone(from) {
+        folder::checked_alone(from).with_context(|| from.display().to_string())?
+    } else {
+        let component = from.join(&EXTENSION_COMPONENT);
+        let bytes = std::fs::read(&component).with_context(|| component.display().to_string())?;
+        folder::checked(from, &bytes).with_context(|| from.display().to_string())?
+    };
     let holding =
         || project.layers.iter().rev().find(|l| !l.mounted && matches!(held_in(l, &about.id), Some(Says::Holds(_))));
     let layer = match into {
@@ -104,7 +109,7 @@ pub fn add_extension(
         let record = crate::records::extension_path(&layer.path, &about.id);
         tx.write(&record, crate::records::extension_record(Some(&tree)).as_bytes())?;
     }
-    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit()?;
     Ok(about)
 }
@@ -141,7 +146,7 @@ pub fn remove_extension(project: &Project, id: &str, history: &mut History, labe
         tx.write(&crate::records::extension_path(&layer.path, id), crate::records::extension_record(None).as_bytes())?;
     }
     if required {
-        tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+        tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     }
     tx.commit().map(drop)
 }
@@ -227,14 +232,16 @@ mod tests {
     use crate::cache::Cache;
     use crate::history::History;
     use crate::lock::Lock;
+    use crate::testing::At as _;
+    use pe2_path::HostPath;
 
     #[test]
     fn writes_what_the_project_says_of_its_extensions_in_place() {
-        let root = std::env::temp_dir().join(format!("pe2-switches-{}", std::process::id()));
+        let root = crate::testing::scratch("switches");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let text = "# the project\n[[layer]]\nname = \"game\"\n";
-        std::fs::write(root.join("project.toml"), text).unwrap();
+        std::fs::write(root.at("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
@@ -242,7 +249,7 @@ mod tests {
         let depth = toml::Value::Integer(8);
         set_setting(&project, "pe2.images", "depth", Some(&depth), &mut history, "depth".into()).unwrap();
         set_disabled(&project, &["pe2.game".to_string()], &mut history, "off".into()).unwrap();
-        let written = std::fs::read_to_string(root.join("project.toml")).unwrap();
+        let written = std::fs::read_to_string(root.at("project.toml")).unwrap();
         // Its own header, the comment kept.
         assert!(
             written.starts_with("# the project\n") && written.contains("[extensions.\"pe2.images\"]\ndepth = 8"),
@@ -257,35 +264,35 @@ mod tests {
         for _ in 0..3 {
             history.undo(&index, None, false).unwrap();
         }
-        assert_eq!(std::fs::read_to_string(root.join("project.toml")).unwrap(), text);
+        assert_eq!(std::fs::read_to_string(root.at("project.toml")).unwrap(), text);
         drop(lock);
         crate::cache::remove_all(&root);
     }
 
     /// A folder the way an extension is kept, its manifest beside a component carrying another: what the check
     /// refuses.
-    fn kept(at: &std::path::Path, id: &str) {
-        std::fs::create_dir_all(at.join("linux-x86_64")).unwrap();
-        std::fs::write(at.join("extension.toml"), format!("id = \"{id}\"\nversion = \"0.2.1\"\n")).unwrap();
-        std::fs::write(at.join("extension.wasm"), b"\0asm").unwrap();
-        std::fs::write(at.join("linux-x86_64/tool"), b"a tool").unwrap();
+    fn kept(at: &HostPath, id: &str) {
+        std::fs::create_dir_all(at.at("linux-x86_64")).unwrap();
+        std::fs::write(at.at("extension.toml"), format!("id = \"{id}\"\nversion = \"0.2.1\"\n")).unwrap();
+        std::fs::write(at.at("extension.wasm"), b"\0asm").unwrap();
+        std::fs::write(at.at("linux-x86_64/tool"), b"a tool").unwrap();
     }
 
     #[test]
     fn an_extension_is_added_only_as_what_it_says_it_is() {
-        let root = std::env::temp_dir().join(format!("pe2-add-{}", std::process::id()));
+        let root = crate::testing::scratch("add");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("project.toml"), "[[layer]]\nname = \"base\"\n").unwrap();
+        std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"base\"\n").unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
-        let source = root.join("kept/my.tool.extension");
+        let source = root.at("kept/my.tool.extension");
         kept(&source, "my.tool");
         // Its component carries no manifest: nothing is copied, nothing required.
         let refused = add_extension(&project, &source, None, &mut history, "add".into()).unwrap_err();
         assert!(format!("{refused:#}").contains("carries no manifest"), "{refused:#}");
-        assert!(!root.join(".layers/base/extensions").exists());
+        assert!(!root.at(".layers/base/extensions").exists());
         assert_eq!(Project::load(&root).unwrap().requires, []);
         // Neither held nor required, it cannot go.
         assert!(remove_extension(&project, "my.tool", &mut history, "remove".into()).is_err());

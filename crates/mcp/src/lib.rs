@@ -18,6 +18,7 @@ pub mod presence;
 pub mod server;
 mod tools;
 
+use pe2_path::HostPath;
 use rmcp::model::{CallToolResult, ReadResourceResult};
 use serde::{Deserialize, Serialize};
 
@@ -56,9 +57,9 @@ pub enum Request {
 pub struct Holder {
     pub editor: bool,
     pub pid: u32,
-    pub program: String,
+    pub program: Option<HostPath>,
     pub built: Option<u64>,
-    pub data: Option<std::path::PathBuf>,
+    pub data: Option<HostPath>,
     pub trusts_everything: bool,
 }
 
@@ -83,8 +84,11 @@ impl Holder {
     pub fn differs(&self) -> Option<String> {
         let mine = Holder::this(false);
         let (my_program, now) = presence::this_program();
-        if !presence::same(std::path::Path::new(&self.program), std::path::Path::new(&my_program)) {
-            return Some(format!("it runs {}, not {my_program}", self.program));
+        if self.program != my_program {
+            let shown = |program: Option<&HostPath>| {
+                program.map_or_else(|| "a program of no place".into(), ToString::to_string)
+            };
+            return Some(format!("it runs {}, not {}", shown(self.program.as_ref()), shown(my_program.as_ref())));
         }
         if self.built != now {
             return Some("its program was built again since it started".into());
@@ -107,12 +111,14 @@ pub enum Reply {
     /// An edit made: the step's label, and the paths it touched, for a process serving the layers to take in.
     Edited {
         label: String,
-        touched: Vec<std::path::PathBuf>,
+        touched: Vec<HostPath>,
     },
     /// Not answered by this holder (the host answers edits alone): whoever asked takes the project for it.
     Declined,
     /// What was due was taken (`Request::Due`), this many things, and what became of each said where it was due.
-    Taken { count: usize },
+    Taken {
+        count: usize,
+    },
     Hello(Holder),
     Tools(Vec<rmcp::model::Tool>),
 }

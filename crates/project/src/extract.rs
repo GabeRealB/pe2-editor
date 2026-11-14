@@ -3,12 +3,12 @@
 //! bundles were given into what a container assembled from them is (`assembled_sha1`: a disc's movie file).
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{HostPath, RelPath};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 
 use crate::changeset::Changeset;
 use crate::ext::Extensions;
@@ -25,7 +25,7 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
     hex(&Sha1::digest(bytes))
 }
 
-pub(crate) fn sha1_file(path: &Path) -> Result<String> {
+pub(crate) fn sha1_file(path: &HostPath) -> Result<String> {
     let mut f = fs::File::open(path)?;
     let (mut h, mut buf) = (Sha1::new(), vec![0; 1 << 22]);
     loop {
@@ -123,7 +123,7 @@ impl Sourcing<'_> {
         match content {
             crate::graph::Content::Inline(bytes) => Ok(bytes.clone()),
             crate::graph::Content::Stored { sha1, .. } => {
-                let path = self.engine.store().context("no store")?.blob_path(sha1);
+                let path = self.engine.store().context("no store")?.blob_path(sha1)?;
                 std::fs::read(&path).with_context(|| path.display().to_string())
             }
         }
@@ -234,16 +234,17 @@ struct Written {
     path: String,
     uid: String,
     /// The bundle's folder in the layer of its node, and in the layer of its files.
-    dirs: [PathBuf; 2],
+    dirs: [HostPath; 2],
     declaration: String,
     fields: toml::Table,
     sha1s: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Written {
-    fn open(layers: [&Path; 2], path: &str, uid: &str) -> Result<Written> {
-        let dirs = layers.map(|layer| layer.join(format!("{path}{}", crate::index::BUNDLE_SUFFIX)));
-        let declaration = crate::content::read_to_string(&dirs[0].join("node.toml"))
+    fn open(layers: [&HostPath; 2], path: &str, uid: &str) -> Result<Written> {
+        let bundle = RelPath::new(&format!("{path}{}", crate::index::BUNDLE_SUFFIX))?;
+        let dirs = layers.map(|layer| layer.join(&bundle));
+        let declaration = crate::content::read_to_string(&dirs[0].join(&crate::index::NODE_FILE))
             .with_context(|| format!("{path}: its node.toml"))?;
         let fields =
             crate::graph::with_settings(&declaration.parse().with_context(|| format!("{path}: its node.toml"))?);
@@ -258,9 +259,11 @@ impl Written {
     }
 
     /// A file's place: in the layer of its files, else beside the node.
-    fn at(&self, name: &str) -> PathBuf {
-        let filled = self.dirs[1].join(name);
-        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(name) }
+    fn at(&self, name: &str) -> HostPath {
+        // A file of the node is named as its node names it: one that is no path is the node's folder, which no file is.
+        let Ok(name) = RelPath::new(name) else { return self.dirs[0].clone() };
+        let filled = self.dirs[1].join(&name);
+        if crate::content::exists(&filled) { filled } else { self.dirs[0].join(&name) }
     }
 }
 
@@ -297,7 +300,9 @@ impl crate::graph::exec::Node for Written {
     }
 
     fn file_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).into_keys()).collect();
+        // What a bundle holds by a name no path takes is none of its files: the index says so (`Problem::Refused`).
+        let mut names: Vec<String> =
+            self.dirs.iter().flat_map(|d| crate::index::bundle_files(d).0.into_keys()).collect();
         names.sort();
         names.dedup();
         names
@@ -311,7 +316,7 @@ impl crate::graph::exec::Node for Written {
         crate::content::head(&self.at(name), len)
     }
 
-    fn content_path(&self, sha1: &str) -> Option<PathBuf> {
+    fn content_path(&self, sha1: &str) -> Option<HostPath> {
         let sha1s = self.sha1s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         sha1s.iter().find(|(_, s)| *s == sha1).map(|(name, _)| self.at(name))
     }
@@ -320,7 +325,7 @@ impl crate::graph::exec::Node for Written {
 /// The layer's bundles as the work graph reaches them, by uid or path: each read from disk when first asked for.
 struct Layer<'a> {
     /// The layer of the nodes, and the layer of their files.
-    roots: [&'a Path; 2],
+    roots: [&'a HostPath; 2],
     extensions: &'a Extensions,
     uids: HashMap<String, String>,
     /// By path: its uid, and the node once read.
@@ -331,7 +336,7 @@ struct Layer<'a> {
 impl<'a> Layer<'a> {
     /// The layer's nodes, each by its path and uid.
     fn of(
-        roots: [&'a Path; 2],
+        roots: [&'a HostPath; 2],
         all: Vec<(String, String)>,
         ops: &'a crate::graph::Ops,
         extensions: &'a Extensions,
@@ -367,7 +372,7 @@ impl crate::graph::exec::World for Layer<'_> {
 /// # Errors
 /// The changeset cannot be read, the node is not there, or its stack cannot join what it joins.
 pub(crate) fn assembled_sha1(
-    layers: [&Path; 2],
+    layers: [&HostPath; 2],
     node: &str,
     engine: &crate::graph::exec::Engine,
     extensions: &Extensions,
@@ -375,7 +380,7 @@ pub(crate) fn assembled_sha1(
     // A records layer's changeset is what its records say.
     let changeset = match crate::records::Set::changeset(layers[0]) {
         Some(changeset) => changeset,
-        None => Changeset::load(&layers[0].with_extension("toml"))?,
+        None => Changeset::load(&layers[0].with_suffix(&crate::CHANGESET_SUFFIX))?,
     };
     let all = changeset
         .entries

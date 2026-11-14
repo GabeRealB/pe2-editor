@@ -83,7 +83,8 @@ fn linked_ui(ui: &mut egui::Ui, listing: &Listing, state: &mut State) {
             programs.sort();
             programs.dedup();
             let all = "every program";
-            let combo = egui::ComboBox::from_id_salt("linked into").selected_text(state.within.as_deref().unwrap_or(all));
+            let combo =
+                egui::ComboBox::from_id_salt("linked into").selected_text(state.within.as_deref().unwrap_or(all));
             combo.show_ui(ui, |ui| {
                 if ui.selectable_label(state.within.is_none(), all).clicked() {
                     state.within = None;

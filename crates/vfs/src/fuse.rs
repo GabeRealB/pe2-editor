@@ -2,6 +2,7 @@
 //! that moment and, where it can be written, what programs wrote over it (`writes::Writes`). A mount lasts as long as
 //! its `Mounted`; dropping it unmounts.
 
+use pe2_path::HostPath;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -153,7 +154,8 @@ impl Filesystem for Fuse {
         // lists until told the folder changed (`tell_kernel`), as it keeps a file's content.
         self.folders_unasked = config.add_capabilities(fuser::InitFlags::FUSE_NO_OPENDIR_SUPPORT).is_ok();
         // A folder listed with what each entry is, where the kernel asks so (`readdirplus`).
-        let _ = config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS | fuser::InitFlags::FUSE_READDIRPLUS_AUTO);
+        let _ =
+            config.add_capabilities(fuser::InitFlags::FUSE_DO_READDIRPLUS | fuser::InitFlags::FUSE_READDIRPLUS_AUTO);
         Ok(())
     }
 
@@ -286,7 +288,12 @@ impl Filesystem for Fuse {
         if flags.acc_mode() == OpenAccMode::O_RDONLY {
             self.served.opened();
             self.served.seen(&path, crate::Seen::Read);
-            *self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(u64::from(ino)).or_default() += 1;
+            *self
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(u64::from(ino))
+                .or_default() += 1;
             // What the tree alone says the kernel may keep, across opens too: read again, it is not asked for. What
             // is staged is read here each time.
             let kept = if self.settled(&path) { FopenFlags::FOPEN_KEEP_CACHE } else { FopenFlags::FOPEN_DIRECT_IO };
@@ -383,7 +390,11 @@ impl Filesystem for Fuse {
         match self.writes().map(|w| w.write(u64::from(fh), offset, data)) {
             Ok(Ok(n)) => {
                 // Read by another meanwhile, through what the kernel kept of it: let go of again.
-                let read = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&u64::from(ino));
+                let read = self
+                    .readers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&u64::from(ino));
                 if read {
                     self.let_go(u64::from(ino));
                 }
@@ -439,7 +450,9 @@ impl Filesystem for Fuse {
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         let Some(path) = self.path(ino) else { return reply.error(Errno::ENOENT) };
         let Some(listed) = self.listed(ino, &path) else { return reply.error(Errno::ENOTDIR) };
-        for (at, (child, folder, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
+        for (at, (child, folder, name)) in
+            listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        {
             let kind = if folder { FileType::Directory } else { FileType::RegularFile };
             if reply.add(INodeNo(child), (at + 1) as u64, kind, &name) {
                 break;
@@ -460,7 +473,8 @@ impl Filesystem for Fuse {
     ) {
         let Some(path) = self.path(ino) else { return reply.error(Errno::ENOENT) };
         let Some(listed) = self.listed(ino, &path) else { return reply.error(Errno::ENOTDIR) };
-        for (at, (child, _, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
+        for (at, (child, _, name)) in listed.into_iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        {
             // The folder itself and the one it is in are no entries of it to look up: told by their numbers alone.
             let of = match name.as_str() {
                 "." => path.clone(),
@@ -501,7 +515,7 @@ impl Fuse {
 /// A mount: unmounted when dropped.
 pub struct Mounted {
     _session: fuser::BackgroundSession,
-    at: std::path::PathBuf,
+    at: HostPath,
     told: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -520,12 +534,13 @@ impl Drop for Mounted {
 fn tell_kernel(
     served: &Served,
     notifier: &fuser::Notifier,
-    at: &Path,
+    at: &HostPath,
     stale: &std::sync::mpsc::Receiver<u64>,
     stop: &std::sync::atomic::AtomicBool,
 ) {
     let touch = |path: &str, time: SystemTime| {
-        if let Ok(file) = std::fs::File::open(at.join(path)) {
+        let Ok(path) = pe2_path::RelPath::new(path) else { return };
+        if let Ok(file) = std::fs::File::open(at.join(&path)) {
             let _ = file.set_modified(time);
         }
     };
@@ -545,7 +560,9 @@ fn tell_kernel(
         }
         // What the kernel did itself (a program's write through the mount) it knows: what it is told again it ignores.
         let Some(changes) = served.changes_since(&mut from) else {
-            eprintln!("more changed of what is served than is kept to tell of: the kernel may show some of it as it was for a while");
+            eprintln!(
+                "more changed of what is served than is kept to tell of: the kernel may show some of it as it was for a while"
+            );
             continue;
         };
         if changes.is_empty() {
@@ -566,7 +583,8 @@ fn tell_kernel(
                 let above = parent_of(&gone);
                 let number = |path: &str| changes.numbers.get(path).copied().or_else(|| served.known(path));
                 if let Some(parent) = number(&above) {
-                    let told = number(&gone).map(|ino| notifier.delete(INodeNo(parent), INodeNo(ino), OsStr::new(&name_of(&gone))));
+                    let told = number(&gone)
+                        .map(|ino| notifier.delete(INodeNo(parent), INodeNo(ino), OsStr::new(&name_of(&gone))));
                     if told.is_none_or(|told| told.is_err()) {
                         let _ = notifier.inval_entry(INodeNo(parent), OsStr::new(&name_of(&gone)));
                     }
@@ -606,7 +624,7 @@ fn tell_kernel(
 }
 
 /// The folders this process has mounted on, for `unmount_all`.
-static MOUNTED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+static MOUNTED: std::sync::Mutex<Vec<HostPath>> = std::sync::Mutex::new(Vec::new());
 
 /// Unmount everything this process mounted, as it is about to end without dropping its mounts (a signal): otherwise
 /// each is left mounted with no one serving it, which every access fails.
@@ -618,13 +636,13 @@ pub fn unmount_all() {
 }
 
 /// Unmount a folder, lazily: what has it open keeps it until it lets go.
-fn unmount(at: &Path) {
+fn unmount(at: &HostPath) {
     #[cfg(target_os = "linux")]
     let tries: &[(&str, &[&str])] = &[("fusermount3", &["-uz"]), ("fusermount", &["-uz"])];
     #[cfg(target_os = "macos")]
     let tries: &[(&str, &[&str])] = &[("umount", &["-f"])];
     for (program, args) in tries {
-        let done = std::process::Command::new(program).args(*args).arg(at).status();
+        let done = std::process::Command::new(program).args(*args).arg(at.as_os_str()).status();
         if done.is_ok_and(|s| s.success()) {
             return;
         }
@@ -635,7 +653,7 @@ fn unmount(at: &Path) {
 ///
 /// # Errors
 /// The folder cannot be mounted on: FUSE is missing, or the folder is not an empty one.
-pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> std::io::Result<Mounted> {
+pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str) -> std::io::Result<Mounted> {
     clear_stale(at);
     // SAFETY: getuid and getgid cannot fail and touch no memory.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -667,12 +685,12 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
     };
     let session = fuser::spawn_mount(fuse, at, &config)?;
     let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (notifier, stop, watched, root) = (session.notifier(), told.clone(), served.clone(), at.to_path_buf());
+    let (notifier, stop, watched, root) = (session.notifier(), told.clone(), served.clone(), at.clone());
     std::thread::Builder::new()
         .name("fuse-notify".into())
         .spawn(move || tell_kernel(&watched, &notifier, &root, &stales, &stop))?;
-    MOUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(at.to_path_buf());
-    Ok(Mounted { _session: session, at: at.to_path_buf(), told })
+    MOUNTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(at.clone());
+    Ok(Mounted { _session: session, at: at.clone(), told })
 }
 
 /// Why Windows programs cannot open a mount made here, where they cannot: under WSL, Windows reaches Linux files through
@@ -698,7 +716,7 @@ fn users_may_allow_others() -> bool {
 
 /// Unmount what a process that ended without unmounting left at a folder: a mount no one serves, which every access
 /// fails as not connected.
-pub fn clear_stale(at: &Path) {
+pub fn clear_stale(at: &HostPath) {
     if std::fs::metadata(at).is_err_and(|e| e.raw_os_error() == Some(libc::ENOTCONN)) {
         unmount(at);
     }
@@ -723,7 +741,7 @@ impl crate::backend::Backend for AsBackend {
         crate::backend::Can { write: true, folder: true }
     }
 
-    fn available(&self, _at: &Path) -> Result<(), String> {
+    fn available(&self, _at: &HostPath) -> Result<(), String> {
         // macOS has no device to look for: a mount that fails says why.
         if cfg!(target_os = "linux") && !Path::new("/dev/fuse").exists() {
             return Err("there is no FUSE here (/dev/fuse)".into());
@@ -740,18 +758,18 @@ impl crate::backend::Backend for AsBackend {
         Ok(crate::backend::Finishing::of(mount(job.served, writes.clone(), job.at, job.name)?, writes))
     }
 
-    fn clear(&self, at: &Path, _name: &str) {
+    fn clear(&self, at: &HostPath, _name: &str) {
         clear_stale(at);
     }
 
-    fn retire(&self, at: &Path, _name: &str) {
+    fn retire(&self, at: &HostPath, _name: &str) {
         clear_stale(at);
     }
 }
 
 impl crate::backend::Mount for Mounted {
     fn shown(&self) -> String {
-        project::host::shown(&self.at)
+        self.at.to_string()
     }
 
     fn note(&self) -> Option<String> {

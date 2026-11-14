@@ -2,8 +2,8 @@
 //! holds is answered by a host started for it - one, which the next command finds, with the history the last one
 //! left; its folder is served by a server of its own, which whoever holds the project feeds, and which serves on
 //! as the project changes hands.
-
-use std::path::{Path, PathBuf};
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,22 +13,22 @@ use project::server::{FromServer, ToServer};
 
 /// A project of its own, with a data folder of its own for what runs on it; its host stopped when dropped.
 struct Tried {
-    root: PathBuf,
+    root: HostPath,
 }
 
 impl Tried {
     fn new(name: &str) -> Tried {
-        let root = std::env::temp_dir().join(format!("pe2-roles-{name}-{}", std::process::id()));
+        let root = pe2_path::testing::scratch(&format!("roles-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.at("data")).unwrap();
         let tried = Tried { root };
         let (made, said) = tried.run(&["project", "new", &tried.project().to_string_lossy()]);
         assert!(made, "{said}");
         tried
     }
 
-    fn project(&self) -> PathBuf {
-        self.root.join("project")
+    fn project(&self) -> HostPath {
+        self.root.at("project")
     }
 
     /// Run the program on the project: whether it succeeded, and what it said.
@@ -38,10 +38,14 @@ impl Tried {
 
     /// Run the program with a data folder of this name, of the project's own.
     fn run_with(&self, data: &str, args: &[&str]) -> (bool, String) {
-        let data = self.root.join(data);
+        let data = self.root.at(data);
         let ran = Command::new(env!("CARGO_BIN_EXE_pe2-cli"))
             .args(args)
-            .envs([("XDG_DATA_HOME", &data), ("APPDATA", &data), ("LOCALAPPDATA", &data)])
+            .envs([
+                ("XDG_DATA_HOME", data.as_os_str()),
+                ("APPDATA", data.as_os_str()),
+                ("LOCALAPPDATA", data.as_os_str()),
+            ])
             .env_remove("PE2_PROJECT_LOCKED")
             .output()
             .expect("the program runs");
@@ -90,14 +94,14 @@ impl Tried {
     /// What the server and the host said, in their logs.
     fn said(&self) -> (String, String) {
         let log = |role: &project::role::Role| {
-            std::fs::read_to_string(self.project().join(project::cache::DIR).join(role.log)).unwrap_or_default()
+            std::fs::read_to_string(self.project().join(&project::cache::DIR).join(&role.log)).unwrap_or_default()
         };
         (log(&project::server::ROLE), log(&project::host::ROLE))
     }
 
     /// Whether the host said this of what it did, in its log.
     fn host_said(&self, what: &str) -> bool {
-        let log = self.project().join(project::cache::DIR).join(project::host::ROLE.log);
+        let log = self.project().join(&project::cache::DIR).join(&project::host::ROLE.log);
         std::fs::read_to_string(log).is_ok_and(|said| said.lines().any(|line| line == what))
     }
 
@@ -105,11 +109,15 @@ impl Tried {
     /// this returns is dropped: nothing is mounted, and what programs do there is asked over HTTP.
     fn serve(&self) -> Served {
         use std::io::BufRead as _;
-        let data = self.root.join("data");
+        let data = self.root.at("data");
         let mut keeping = Command::new(env!("CARGO_BIN_EXE_pe2-cli"))
             .args(["project", "serve", "--backend", "webdav", "--address", "127.0.0.1:0", "--project"])
-            .arg(self.project())
-            .envs([("XDG_DATA_HOME", &data), ("APPDATA", &data), ("LOCALAPPDATA", &data)])
+            .arg(self.project().as_os_str())
+            .envs([
+                ("XDG_DATA_HOME", data.as_os_str()),
+                ("APPDATA", data.as_os_str()),
+                ("LOCALAPPDATA", data.as_os_str()),
+            ])
             .env_remove("PE2_PROJECT_LOCKED")
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -198,7 +206,7 @@ struct StandIn {
 }
 
 impl StandIn {
-    fn take(root: &Path) -> StandIn {
+    fn take(root: &HostPath) -> StandIn {
         let p = project::Project::load(root).unwrap();
         let lock = project::lock::Lock::acquire_within(root, "a stand-in", Duration::from_secs(20)).unwrap();
         let cache = project::cache::Cache::open(&p, &lock).unwrap();
@@ -256,7 +264,7 @@ fn within(long: Duration, holds: impl Fn() -> bool) -> bool {
     holds()
 }
 
-fn written(at: &Path, text: &str) -> String {
+fn written(at: &HostPath, text: &str) -> String {
     std::fs::write(at, text).unwrap();
     at.to_string_lossy().into_owned()
 }
@@ -264,13 +272,13 @@ fn written(at: &Path, text: &str) -> String {
 #[test]
 fn what_commands_ask_is_answered_by_one_host_started_for_it() {
     let tried = Tried::new("one-host");
-    let from = written(&tried.root.join("from.txt"), "one");
+    let from = written(&tried.root.at("from.txt"), "one");
     assert!(!project::host::running(&tried.project()), "nothing hosts a project nothing was asked of");
     // The first edit starts a host, which holds the project and serves its folder nowhere.
     let (made, said) = tried.ask(&["write", "notes/a.txt", "--from", &from]);
     assert!(made, "{said}");
     let host = tried.host().expect("a host was started");
-    assert!(!tried.project().join(project::SERVED).exists(), "its folder is served nowhere");
+    assert!(!tried.project().join(&project::SERVED).exists(), "its folder is served nowhere");
     // The next finds it: the same one, with the history the first left - so what the first did is taken back.
     let (made, said) = tried.ask(&["write", "notes/b.txt", "--from", &from]);
     assert!(made, "{said}");
@@ -288,7 +296,7 @@ fn what_commands_ask_is_answered_by_one_host_started_for_it() {
 #[test]
 fn a_host_started_under_other_settings_is_replaced_by_who_asks_next() {
     let tried = Tried::new("identity");
-    let from = written(&tried.root.join("from.txt"), "one");
+    let from = written(&tried.root.at("from.txt"), "one");
     let (made, said) = tried.ask(&["write", "a.txt", "--from", &from]);
     assert!(made, "{said}");
     let first = tried.host().expect("a host was started");
@@ -296,7 +304,7 @@ fn a_host_started_under_other_settings_is_replaced_by_who_asks_next() {
     let (made, said) = tried.ask(&["write", "b.txt", "--from", &from]);
     assert!(made && tried.host() == Some(first), "{said}");
     // Asked with another data folder - other settings, other trust: that host is stopped, and another answers.
-    std::fs::create_dir_all(tried.root.join("other")).unwrap();
+    std::fs::create_dir_all(tried.root.at("other")).unwrap();
     let (made, said) = tried.ask_with("other", &["write", "c.txt", "--from", &from]);
     assert!(made && said.contains("was stopped"), "{said}");
     let second = tried.host().expect("another host was started");
@@ -308,7 +316,7 @@ fn what_events_set_off_is_run_by_the_host_which_lends_the_project_after() {
     let tried = Tried::new("epochs");
     let (configured, said) = tried.ask(&["config", "add", "test"]);
     assert!(configured, "{said}");
-    let from = written(&tried.root.join("from.txt"), "one");
+    let from = written(&tried.root.at("from.txt"), "one");
     let (made, said) = tried.ask(&["write", "a.txt", "--from", &from]);
     assert!(made, "{said}");
     let host = tried.host().expect("a host was started");
@@ -326,7 +334,7 @@ fn what_events_set_off_is_run_by_the_host_which_lends_the_project_after() {
 #[test]
 fn a_folder_served_is_a_servers_which_the_host_feeds() {
     let tried = Tried::new("served");
-    let from = written(&tried.root.join("from.txt"), "one");
+    let from = written(&tried.root.at("from.txt"), "one");
     let folder = tried.serve();
     // Two processes: the host holding the project, and the server serving its folder, which the host feeds.
     let host = tried.host().expect("a host holds it");
@@ -347,7 +355,12 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
     // And the filesystem the project's processes share says the same of what is served, to whoever attaches.
     let shared = project::shared::space(&tried.project()).expect("the shared space");
     let said = project::shared::listed(&shared.read().expect("read")).expect("listed");
-    assert!(matches!(said.get("notes/a.txt"), Some(project::server::Shown::File { size: 3, .. })), "{:?}\n{:?}", said.keys(), tried.said());
+    assert!(
+        matches!(said.get("notes/a.txt"), Some(project::server::Shown::File { size: 3, .. })),
+        "{:?}\n{:?}",
+        said.keys(),
+        tried.said()
+    );
     assert!(matches!(said.get("notes"), Some(project::server::Shown::Folder)) && !said.contains_key("b.txt"));
     drop(shared);
     // One feeder at a time: what another process lists while the host feeds it is not taken.
@@ -365,7 +378,7 @@ fn a_folder_served_is_a_servers_which_the_host_feeds() {
 #[test]
 fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     let tried = Tried::new("hands");
-    let from = written(&tried.root.join("from.txt"), "one");
+    let from = written(&tried.root.at("from.txt"), "one");
     let folder = tried.serve();
     let (server, _) = tried.server().expect("a server serves it");
     let (made, said) = tried.ask(&["write", "a.txt", "--from", &from]);
@@ -391,7 +404,8 @@ fn the_project_changes_hands_and_its_folder_is_served_throughout() {
     drop(handing);
     assert!(tried.host_said("a stand-in is letting go of the project"));
     let back = || {
-        tried.holder().as_deref() == Some("the host") && tried.server().is_some_and(|(_, by)| by.as_deref() == Some("pe2-cli"))
+        tried.holder().as_deref() == Some("the host")
+            && tried.server().is_some_and(|(_, by)| by.as_deref() == Some("pe2-cli"))
     };
     assert!(within(Duration::from_secs(20), back), "the host takes the project back, and feeds the server");
     assert_eq!(folder.read("c.txt").as_deref(), Some("three"));
@@ -413,7 +427,12 @@ fn what_is_written_while_nothing_holds_the_project_starts_a_host() {
     // What a program writes now has a host started to hold the project, which feeds the server from then on.
     folder.write("e.txt", "five");
     let made = within(Duration::from_secs(30), || tried.host_said("New e.txt"));
-    assert!(made, "a host is started, and makes it; the server said:\n{}\nthe host said:\n{}", tried.said().0, tried.said().1);
+    assert!(
+        made,
+        "a host is started, and makes it; the server said:\n{}\nthe host said:\n{}",
+        tried.said().0,
+        tried.said().1
+    );
     assert_ne!(tried.host(), Some(host), "another host");
     assert_eq!(folder.read("e.txt").as_deref(), Some("five"));
 }

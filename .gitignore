@@ -1,4 +1,6 @@
 /target/
+# What a build needs that is no crate, fetched by `cargo xtask prepare` (`prepare.toml`).
+/prepared/
 # What zig makes in the packages project: its fetched packages, its cache, its output.
 /packages/zig-pkg/
 /packages/.zig-cache/

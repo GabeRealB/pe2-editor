@@ -4,6 +4,7 @@
 
 use eframe::egui::{self, RichText};
 use pe2_ext::{Scope, Setting};
+use pe2_path::HostPath;
 use project::ext::{Dependency, Origin, Present, Status};
 use std::collections::BTreeSet;
 
@@ -269,7 +270,14 @@ fn settings_ui(ui: &mut egui::Ui, ws: &mut Workspace, p: &Present, user: &mut Us
                         Scope::Project => {
                             let (id, key, said) = (p.id.clone(), setting.key.clone(), format!("Set {label} to {said}"));
                             let work = move |w: &mut crate::takein::Worker| {
-                                project::switches::set_setting(&w.core.project, &id, &key, next.as_ref(), &mut w.history, said)
+                                project::switches::set_setting(
+                                    &w.core.project,
+                                    &id,
+                                    &key,
+                                    next.as_ref(),
+                                    &mut w.history,
+                                    said,
+                                )
                             };
                             ws.ask(work, |editor, written: anyhow::Result<()>| {
                                 if let Err(e) = written {
@@ -426,12 +434,13 @@ fn documents_ui(ui: &mut egui::Ui, p: &Present, message: &mut Option<String>) {
     let pages: Vec<(&str, &str)> = pages.into_iter().filter_map(|(label, page)| Some((label, page?))).collect();
     // What its component is built with, each license's text with it: written into its folder as it is laid out to
     // ship (`cargo xtask dist`). A built-in one's is the editor's own (Settings, Licenses).
-    let linked = Some(LINKED).filter(|file| project::pack::is_file(&folder.join(file)));
+    let linked = Some(LINKED).filter(|file| project::pack::is_file(&folder.join(&pe2_path::RelPath::constant(file))));
     if pages.is_empty() && described.bundled.is_empty() && linked.is_none() {
         return;
     }
     let mut open = |ui: &mut egui::Ui, label: &str, page: &str| {
-        let file = folder.join(page);
+        let Ok(page) = pe2_path::RelPath::new(page) else { return };
+        let file = folder.join(&page);
         if ui.link(label).on_hover_text(file.display().to_string()).clicked() {
             // Handed to a program as a file: one a project holds, through the filesystem it is served as.
             let opened = project::content::for_program(&file).map_err(|e| format!("{}: {e}", file.display()));
@@ -501,7 +510,7 @@ pub(super) fn fetch_state_ui(
     ws: &mut Workspace,
     p: &Present,
     setup: &project::ext::setup::Setup,
-    store: &std::path::Path,
+    store: &HostPath,
     runs: bool,
     message: &mut Option<String>,
 ) {
@@ -583,12 +592,12 @@ fn adding_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
         let clicked = ui.button(label).on_hover_text("Copied into the project, for everyone on it").clicked();
         if clicked {
             let to = format!("{} {}", if held { "Update" } else { "Add" }, p.id);
-            let folder = folder.to_path_buf();
+            let folder = folder.clone();
             let work = move |w: &mut crate::takein::Worker| {
                 // An archive is unpacked first, and copied in as its folder.
                 let unpacked = extensions::archive::is_archive(&folder).then(|| extensions::archive::unpack(&folder));
                 let unpacked = unpacked.transpose()?;
-                let from = unpacked.as_ref().map_or(folder.as_path(), |unpacked| unpacked.folder.as_path());
+                let from = unpacked.as_ref().map_or(&folder, |unpacked| &unpacked.folder);
                 let about = project::switches::add_extension(&w.core.project, from, None, &mut w.history, to)?;
                 Ok(about.described.install.is_some())
             };

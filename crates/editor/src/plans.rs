@@ -4,8 +4,8 @@
 //! or that is asked (`want_discs`), its discs are looked for too, each image of a disc's size hashed.
 
 use eframe::egui;
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::SystemTime;
 
@@ -42,8 +42,8 @@ pub struct Plans {
 }
 
 /// The files a project's plans are worked out from: each generated layer's plan and its record.
-pub fn watched(project: &Project) -> Vec<PathBuf> {
-    project.generated().flat_map(|l| [l.plan(), l.path.join(project::plan::RECORD)]).collect()
+pub fn watched(project: &Project) -> Vec<HostPath> {
+    project.generated().flat_map(|l| [l.plan(), l.path.join(&project::plan::RECORD)]).collect()
 }
 
 impl Plans {

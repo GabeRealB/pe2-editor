@@ -7,22 +7,22 @@
 //! are neither reordered nor removed here.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use pe2_path::HostPath;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
 use crate::index::LayerInfo;
 use crate::{FILE, LAYERS, LayerKind, Project};
 
-pub(crate) fn read(root: &Path) -> Result<DocumentMut> {
-    let path = root.join(FILE);
+pub(crate) fn read(root: &HostPath) -> Result<DocumentMut> {
+    let path = root.join(&FILE);
     let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
     text.parse().with_context(|| format!("{}", path.display()))
 }
 
-pub(crate) fn write(root: &Path, document: &DocumentMut, history: &mut History, label: String) -> Result<()> {
+pub(crate) fn write(root: &HostPath, document: &DocumentMut, history: &mut History, label: String) -> Result<()> {
     let mut tx = history.begin(label);
-    tx.write(&root.join(FILE), document.to_string().as_bytes())?;
+    tx.write(&root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)
 }
 
@@ -139,14 +139,15 @@ pub fn add_at(project: &Project, name: &str, kind: LayerKind, bottom: bool, hist
         tables.push(table);
     }
     let mut tx = history.begin(format!("Add the layer {name}"));
-    let folder = project.root.join(LAYERS).join(name);
+    let folder =
+        project.root.join(&LAYERS).join(&pe2_path::Name::new(name).with_context(|| format!("the layer {name}"))?);
     tx.make_dir(&folder)?;
     // An assets layer is records (`records`); code is a tree, worked on with its own tools.
     if kind == LayerKind::Assets {
-        let marker = folder.join(crate::records::DIR).join(crate::records::MARKER);
+        let marker = folder.join(&crate::records::DIR).join(&crate::records::MARKER);
         tx.write(&marker, format!("format = {}\n", crate::records::FORMAT).as_bytes())?;
     }
-    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     tx.commit().map(drop)
 }
 
@@ -183,6 +184,7 @@ mod tests {
     use crate::history::History;
     use crate::index::{Dependency, LayerInfo};
     use crate::lock::Lock;
+    use crate::testing::At as _;
     use crate::{LayerKind, stack};
 
     fn info(name: &str, below: &[&str]) -> LayerInfo {
@@ -205,12 +207,12 @@ mod tests {
 
     #[test]
     fn edits_the_stack_in_place() {
-        let root = std::env::temp_dir().join(format!("pe2-stack-{}", std::process::id()));
+        let root = crate::testing::scratch("stack");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let text = "# the stack\n[[layer]]\nname = \"game\"\n\
                     \n# mine\n[[layer]]\nname = \"mod\"\n";
-        std::fs::write(root.join("project.toml"), text).unwrap();
+        std::fs::write(root.at("project.toml"), text).unwrap();
         let project = Project::load(&root).unwrap();
         let lock = Lock::try_acquire(&root, "a test").unwrap();
         let (mut history, _) = History::open(&Cache::open(&project, &lock).unwrap()).unwrap();
@@ -234,20 +236,20 @@ mod tests {
         stack::reorder(&project, &layers, &order, history).unwrap();
         let project = Project::load(&root).unwrap();
         assert_eq!(project.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["game", "fixes", "mod"]);
-        assert!(root.join(".layers/fixes").is_dir());
+        assert!(root.at(".layers/fixes").is_dir());
         // Comments travel with their tables.
-        let text = std::fs::read_to_string(root.join("project.toml")).unwrap();
+        let text = std::fs::read_to_string(root.at("project.toml")).unwrap();
         assert!(text.starts_with("# the stack\n") && text.contains("# mine\n[[layer]]\nname = \"mod\""), "{text}");
         assert!(stack::remove(&project, &layers, "game", history).is_err());
         stack::remove(&project, &layers, "fixes", history).unwrap();
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
-        assert!(root.join(".layers/fixes").is_dir());
+        assert!(root.at(".layers/fixes").is_dir());
         // Undone: taken out, reordered, added - back to the two layers, and the new layer's folder gone.
         for _ in 0..3 {
             history.undo(&index, None, false).unwrap();
         }
         assert_eq!(Project::load(&root).unwrap().layers.len(), 2);
-        assert!(!root.join(".layers/fixes").exists());
+        assert!(!root.at(".layers/fixes").exists());
         drop(lock);
         crate::cache::remove_all(&root);
     }

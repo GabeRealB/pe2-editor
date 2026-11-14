@@ -10,9 +10,9 @@
 //! one whose file changed is emptied, to be read again; one gone is removed; one changed here and not applied yet is
 //! left alone.
 
+use pe2_path::{HostPath, Name, NotWithin, PathError, Why};
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -33,7 +33,6 @@ mod windows_error {
     pub type Error = windows_core::Error;
 }
 
-use crate::backend::plain;
 use crate::write::{Change, Owner, is_junk};
 use crate::{Node, Served, Tree, What};
 
@@ -68,8 +67,8 @@ impl Drop for Cloud {
 /// A sync root's id: this provider's, the user's, and the folder's - its name as served, for a person to know it by,
 /// and what tells its place from every other: two projects in folders of one name (`project`, mostly) are two sync
 /// roots, and letting go of one's leaves the other's.
-fn id_of(name: &str, at: &Path) -> io::Result<SyncRootId> {
-    let place = project::extract::sha1_hex(plain(at).to_string_lossy().to_lowercase().as_bytes());
+fn id_of(name: &str, at: &HostPath) -> io::Result<SyncRootId> {
+    let place = project::extract::sha1_hex(at.clone().to_string_lossy().to_lowercase().as_bytes());
     let named = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' });
     let account: String = named.chain("_".chars()).chain(place.chars().take(12)).collect();
     let user = SecurityId::current_user().map_err(|e| io::Error::other(format!("the user: {e}")))?;
@@ -84,12 +83,12 @@ fn id_of(name: &str, at: &Path) -> io::Result<SyncRootId> {
 pub fn serve(
     served: &Served,
     owner: Option<Arc<dyn Owner>>,
-    at: &Path,
-    staging: &Path,
+    at: &HostPath,
+    staging: &HostPath,
     name: &str,
 ) -> io::Result<Cloud> {
     // Windows names the folder plainly - `D:\...` - in what it asks and registers; not as canonicalized (`\\?\D:\...`).
-    let at = &plain(at);
+    let at = &at.clone();
     std::fs::create_dir_all(at)?;
     std::fs::create_dir_all(staging)?;
     let step = |what: &'static str| move |e: windows_error::Error| io::Error::other(format!("{what}: {e}"));
@@ -110,7 +109,7 @@ pub fn serve(
     let filter = Filter { served: served.clone(), owner: owner.clone(), root: at.clone(), pending: pending.clone() };
     let connection = Session::new().connect(at, filter).map_err(step("connecting to it"))?;
     let stopped = Arc::new(AtomicBool::new(false));
-    let worker = Worker { served: served.clone(), owner, root: at.clone(), staging: staging.to_path_buf(), pending };
+    let worker = Worker { served: served.clone(), owner, root: at.clone(), staging: staging.clone(), pending };
     let stopping = stopped.clone();
     let worker = std::thread::Builder::new().name("cloud".into()).spawn(move || worker.run(&stopping))?;
     // Woken when the tree changes: the folder is brought in step at once, not when the worker next looks.
@@ -122,14 +121,15 @@ pub fn serve(
 /// Make the placeholders of what is at a path of the tree, all under it and the folders leading to it, where Windows
 /// has not: what a program opens by its path finds it, before anything lists the folders it is in - which is when
 /// Windows asks for them (`fetch_placeholders`).
-pub fn place(served: &Served, root: &Path, at: &str, read_only: bool) {
+pub fn place(served: &Served, root: &HostPath, at: &str, read_only: bool) {
     let tree = served.tree();
-    let mut dir = plain(root);
+    let mut dir = root.clone();
     let mut walked = String::new();
     for step in at.split('/').filter(|step| !step.is_empty()) {
         walked = if walked.is_empty() { step.to_string() } else { format!("{walked}/{step}") };
         let Some((_, node)) = tree.at(&walked) else { return };
-        let next = dir.join(step);
+        let Some(name) = tree_name(step) else { return };
+        let next = dir.join(&name);
         if std::fs::symlink_metadata(&next).is_err() {
             let _ = placeholder(step, &node, read_only).create(&dir);
         }
@@ -139,10 +139,11 @@ pub fn place(served: &Served, root: &Path, at: &str, read_only: bool) {
 }
 
 /// The placeholders of all under a folder of the tree, where they are not.
-fn fill(tree: &Tree, dir: &Path, at: &str, read_only: bool) {
+fn fill(tree: &Tree, dir: &HostPath, at: &str, read_only: bool) {
     let Some(children) = tree.entries(at) else { return };
     for (name, _, node) in &children {
-        let path = dir.join(name);
+        let Some(named) = tree_name(name) else { continue };
+        let path = dir.join(&named);
         if std::fs::symlink_metadata(&path).is_err() {
             let _ = placeholder(name, node, read_only).create(dir);
         }
@@ -159,7 +160,7 @@ fn fill(tree: &Tree, dir: &Path, at: &str, read_only: bool) {
 ///
 /// # Errors
 /// It cannot be unregistered.
-pub fn forget(at: &Path, name: &str) -> io::Result<()> {
+pub fn forget(at: &HostPath, name: &str) -> io::Result<()> {
     const NOT_FOUND: i32 = 0x8007_0490_u32.cast_signed();
     match id_of(name, at)?.unregister() {
         Err(e) if e.code().0 != NOT_FOUND => Err(e.into()),
@@ -170,19 +171,18 @@ pub fn forget(at: &Path, name: &str) -> io::Result<()> {
 /// What waits to be applied: files seen changed, and removals, each by when it was last touched.
 #[derive(Default)]
 struct Pending {
-    changed: HashMap<PathBuf, Instant>,
+    changed: HashMap<HostPath, Instant>,
     removed: HashMap<String, Instant>,
 }
 
 /// Remove what serving left at a path the tree no longer has: a file in sync, a folder's files in sync and the
 /// folder once it is empty. What a program put there since - in no state, or changed - stays, a stray of its own.
-fn remove_in_sync(path: &Path) {
+fn remove_in_sync(path: &HostPath) {
     if !path.is_dir() {
         let _ = std::fs::remove_file(path);
         return;
     }
-    for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-        let inner = entry.path();
+    for inner in path.entries() {
         if inner.is_dir() || in_sync(&inner) {
             remove_in_sync(&inner);
         }
@@ -191,10 +191,36 @@ fn remove_in_sync(path: &Path) {
 }
 
 /// A path of the tree for a path in the folder: its steps joined by `/`.
-fn rel(root: &Path, path: &Path) -> Option<String> {
-    let inside = path.strip_prefix(root).ok()?;
-    let steps: Option<Vec<&str>> = inside.components().map(|c| c.as_os_str().to_str()).collect();
-    Some(steps?.join("/"))
+///
+/// # Errors
+/// It is not in the folder, or it is by a name no path takes - which the folder can hold (a program made it) and the
+/// project cannot: two answers every caller tells apart.
+fn rel(root: &HostPath, path: &HostPath) -> Result<String, NotWithin> {
+    Ok(path.within(root)?.as_str().to_owned())
+}
+
+/// A place Windows says something of, as the system names it: plainly, or resolved where it said it otherwise. One
+/// that names no place is refused by that.
+fn placed(path: &std::path::Path) -> Result<HostPath, NotWithin> {
+    HostPath::from_plain(path.to_path_buf()).map_or_else(
+        || {
+            HostPath::new(path).map_err(|why| {
+                NotWithin::Refused(PathError { text: format!("{} ({why})", path.display()).into(), why: Why::NotText })
+            })
+        },
+        Ok,
+    )
+}
+
+/// What Windows asks of a path, as a path of the tree.
+fn asked_of(root: &HostPath, path: &std::path::Path) -> Result<String, NotWithin> {
+    rel(root, &placed(path)?)
+}
+
+/// A name of the tree as a name a file can have here. The tree holds names the project took in as they were given;
+/// one no file can have is said - it is not in the folder - and left out.
+fn tree_name(name: &str) -> Option<Name> {
+    Name::new(name).inspect_err(|why| eprintln!("{why}: the project has it, and the folder cannot show it")).ok()
 }
 
 fn time(at: SystemTime) -> FileTime {
@@ -225,7 +251,7 @@ fn placeholder(name: &str, node: &Node, read_only: bool) -> PlaceholderCreateInf
 struct Filter {
     served: Served,
     owner: Option<Arc<dyn Owner>>,
-    root: PathBuf,
+    root: HostPath,
     pending: Arc<Mutex<Pending>>,
 }
 
@@ -237,7 +263,8 @@ impl Filter {
 
 impl SyncFilter for Filter {
     fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) -> CResult<()> {
-        let path = rel(&self.root, &request.path()).ok_or(CloudErrorKind::InvalidRequest)?;
+        // Only what the tree has is read in: no placeholder is of a name no path takes.
+        let path = asked_of(&self.root, &request.path()).map_err(|_| CloudErrorKind::InvalidRequest)?;
         // Being read in: what serving waits for before it stops.
         let _open = self.served.opening();
         let tree = self.served.tree();
@@ -266,7 +293,7 @@ impl SyncFilter for Filter {
         ticket: ticket::FetchPlaceholders,
         _info: info::FetchPlaceholders,
     ) -> CResult<()> {
-        let path = rel(&self.root, &request.path()).ok_or(CloudErrorKind::InvalidRequest)?;
+        let path = asked_of(&self.root, &request.path()).map_err(|_| CloudErrorKind::InvalidRequest)?;
         let tree = self.served.tree();
         let Some(children) = tree.entries(&path) else {
             return Ok(());
@@ -280,34 +307,49 @@ impl SyncFilter for Filter {
     }
 
     fn delete(&self, request: Request, ticket: ticket::Delete, _info: info::Delete) -> CResult<()> {
-        if self.owner.is_none() || rel(&self.root, &request.path()).is_none() {
+        // What is named so no path takes it is no project's: a program's own, removed as it likes.
+        let outside = matches!(asked_of(&self.root, &request.path()), Err(NotWithin::Outside));
+        if self.owner.is_none() || outside {
             return Err(CloudErrorKind::AccessDenied);
         }
         ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful)
     }
 
     fn deleted(&self, request: Request, _info: info::Deleted) {
-        if let Some(path) = rel(&self.root, &request.path()) {
+        // One named so no path takes it was never taken in: its removal is nothing to the project.
+        if let Ok(path) = asked_of(&self.root, &request.path()) {
             self.pending().removed.insert(path, Instant::now());
         }
     }
 
-    fn rename(&self, request: Request, ticket: ticket::Rename, _info: info::Rename) -> CResult<()> {
-        if self.owner.is_none() || rel(&self.root, &request.path()).is_none() {
+    fn rename(&self, request: Request, ticket: ticket::Rename, info: info::Rename) -> CResult<()> {
+        if self.owner.is_none() || matches!(asked_of(&self.root, &request.path()), Err(NotWithin::Outside)) {
             return Err(CloudErrorKind::AccessDenied);
+        }
+        // Renamed to what no path takes, it would be none of the project's: refused, as a name Windows refuses is - the
+        // program is told, and nothing changes.
+        if let Err(NotWithin::Refused(why)) = asked_of(&self.root, &info.target_path()) {
+            eprintln!("{why}: a rename to it is refused");
+            return Err(CloudErrorKind::InvalidRequest);
         }
         ticket.pass().map_err(|_| CloudErrorKind::Unsuccessful)
     }
 
     fn renamed(&self, request: Request, info: info::Renamed) {
-        let (to, from) = (rel(&self.root, &request.path()), rel(&self.root, &info.source_path()));
+        let (to, from) = (asked_of(&self.root, &request.path()), asked_of(&self.root, &info.source_path()));
         let Some(owner) = &self.owner else { return };
         let change = match (from, to) {
-            (Some(from), Some(to)) => Change::Rename { from, to },
+            (Ok(from), Ok(to)) => Change::Rename { from, to },
             // Moved out: gone from the project.
-            (Some(from), None) => Change::Remove { path: from },
-            // Moved in: a new file, which the watcher sees.
-            _ => return,
+            (Ok(from), Err(NotWithin::Outside)) => Change::Remove { path: from },
+            // Renamed to a name no path takes, which `rename` refuses ahead: where Windows did not ask, the project
+            // keeps it as it was, and the file is a stray of the folder's - never removed from the project.
+            (Ok(from), Err(NotWithin::Refused(why))) => {
+                eprintln!("{why}: {from} was renamed to it; the project keeps it as {from}");
+                return;
+            }
+            // Moved in, or a stray renamed: a new file, which the watcher sees.
+            (Err(_), _) => return,
         };
         if let Err(why) = owner.change(change) {
             eprintln!("{why}");
@@ -318,7 +360,10 @@ impl SyncFilter for Filter {
         let StateWatchEvent::Changed(paths) = event else { return };
         let mut pending = self.pending();
         for path in paths {
-            pending.changed.insert(path, Instant::now());
+            match placed(&path) {
+                Ok(path) => drop(pending.changed.insert(path, Instant::now())),
+                Err(why) => eprintln!("{why}: changed, and not taken into the project"),
+            }
         }
     }
 }
@@ -332,7 +377,7 @@ const SHARE_ALL: u32 = 0x7;
 
 /// A file or folder opened to change its placeholder: a plain handle that may write (a folder's with backup semantics,
 /// as Windows opens one), which reads nothing in.
-fn writable(path: &Path, folder: bool) -> io::Result<Placeholder> {
+fn writable(path: &HostPath, folder: bool) -> io::Result<Placeholder> {
     use std::os::windows::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
     let flags = if folder { FILE_FLAG_BACKUP_SEMANTICS } else { 0 };
@@ -343,7 +388,7 @@ fn writable(path: &Path, folder: bool) -> io::Result<Placeholder> {
 /// A file or folder opened to be asked what it is as a placeholder, and for nothing else: for its attributes alone.
 /// Opened as the Cloud Files API opens one (`CfOpenFileWithOplock`), Windows fetches a file whole whose content was
 /// let go of, so walking a folder to ask would read back in all a collector freed.
-fn asked(path: &Path) -> io::Result<Placeholder> {
+fn asked(path: &HostPath) -> io::Result<Placeholder> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     let mut options = std::fs::OpenOptions::new();
@@ -359,18 +404,18 @@ fn asked(path: &Path) -> io::Result<Placeholder> {
 ///
 /// # Errors
 /// It cannot be opened or asked: which says nothing of its state.
-fn state(path: &Path) -> io::Result<Option<PlaceholderInfo>> {
+fn state(path: &HostPath) -> io::Result<Option<PlaceholderInfo>> {
     asked(path)?.info().map_err(io::Error::other)
 }
 
 /// Whether a file is a placeholder in sync: one serving made and nothing changed since.
 #[must_use]
-pub fn in_sync(path: &Path) -> bool {
+pub fn in_sync(path: &HostPath) -> bool {
     state(path).ok().flatten().is_some_and(|state| state.is_in_sync())
 }
 
 /// Mark what is on disk in sync with the project: a placeholder updated, anything else made one.
-fn mark_in_sync(path: &Path, placeholder: bool, folder: bool) -> io::Result<()> {
+fn mark_in_sync(path: &HostPath, placeholder: bool, folder: bool) -> io::Result<()> {
     let mut opened = writable(path, folder)?;
     if placeholder {
         opened.update(UpdateOptions::default().mark_in_sync(), None)?;
@@ -384,8 +429,8 @@ fn mark_in_sync(path: &Path, placeholder: bool, folder: bool) -> io::Result<()> 
 struct Worker {
     served: Served,
     owner: Option<Arc<dyn Owner>>,
-    root: PathBuf,
-    staging: PathBuf,
+    root: HostPath,
+    staging: HostPath,
     pending: Arc<Mutex<Pending>>,
 }
 
@@ -426,7 +471,7 @@ impl Worker {
             let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let removed: Vec<String> =
                 pending.removed.iter().filter(|(_, at)| due(at)).map(|(p, _)| p.clone()).collect();
-            let changed: Vec<PathBuf> =
+            let changed: Vec<HostPath> =
                 pending.changed.iter().filter(|(_, at)| due(at)).map(|(p, _)| p.clone()).collect();
             for path in &removed {
                 pending.removed.remove(path);
@@ -439,9 +484,10 @@ impl Worker {
         let Some(owner) = &self.owner else { return };
         // What changed and is no longer there was removed. Windows tells of the removal of a placeholder alone
         // (`deleted`): what a program made a moment ago, and the project was given before it was one, goes without.
-        let (gone, mut changed): (Vec<PathBuf>, Vec<PathBuf>) =
+        let (gone, mut changed): (Vec<HostPath>, Vec<HostPath>) =
             changed.into_iter().partition(|path| std::fs::symlink_metadata(path).is_err());
-        removed.extend(gone.iter().filter_map(|path| rel(&self.root, path)).filter(|path| !path.is_empty()));
+        // What was named so no path takes it was never taken in: its going is nothing to the project.
+        removed.extend(gone.iter().filter_map(|path| rel(&self.root, path).ok()).filter(|path| !path.is_empty()));
         removed.sort();
         removed.dedup();
         // A removal inside one made with it, or still waiting, goes with that one.
@@ -477,25 +523,37 @@ impl Worker {
     }
 
     /// Whether a file waits for the `node.toml` beside it to make its folder a node.
-    fn waits_for_its_node(&self, path: &Path) -> bool {
+    fn waits_for_its_node(&self, path: &HostPath) -> bool {
         let Some(folder) = path.parent() else { return false };
         if path.file_name().is_some_and(|n| n == project::index::NODE_FILE)
-            || !folder.join(project::index::NODE_FILE).is_file()
+            || !folder.join(&project::index::NODE_FILE).is_file()
         {
             return false;
         }
         let tree = self.served.tree();
-        rel(&self.root, folder).is_some_and(|at| !tree.at(&at).is_some_and(|(_, n)| n.asset))
+        rel(&self.root, &folder).is_ok_and(|at| !tree.at(&at).is_some_and(|(_, n)| n.asset))
     }
 
     /// A path seen changed: applied where it is a new folder, or a file new or changed here, then marked in sync.
-    fn take_in(&self, owner: &dyn Owner, path: &Path) -> io::Result<()> {
-        let Some(tree_path) = rel(&self.root, path).filter(|p| !p.is_empty() && !is_junk(p)) else { return Ok(()) };
+    fn take_in(&self, owner: &dyn Owner, path: &HostPath) -> io::Result<()> {
+        let tree_path = match rel(&self.root, path) {
+            Ok(tree_path) if !tree_path.is_empty() && !is_junk(&tree_path) => tree_path,
+            Ok(_) | Err(NotWithin::Outside) => return Ok(()),
+            // Written here by a name no path takes: it stays a file of the folder's, and the project is not given it.
+            Err(NotWithin::Refused(why)) => {
+                eprintln!("{why}: written in the folder, and not taken into the project until it is renamed");
+                return Ok(());
+            }
+        };
         let Ok(meta) = std::fs::metadata(path) else { return Ok(()) };
         // Only a placeholder has a placeholder's state. Where it cannot be asked, nothing is known of the file - it
         // is not taken for changed, which would read it whole and write it to the project: asked again shortly.
         let Ok(state) = state(path) else {
-            self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).changed.insert(path.into(), Instant::now());
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .changed
+                .insert(path.clone(), Instant::now());
             return Ok(());
         };
         if state.as_ref().is_some_and(PlaceholderInfo::is_in_sync) {
@@ -508,7 +566,8 @@ impl Worker {
             }
             Change::Folder { path: tree_path }
         } else {
-            let staged = self.staging.join(format!("cloud-{}", std::process::id()));
+            let staged =
+                self.staging.join(&Name::new(&format!("cloud-{}", std::process::id())).map_err(io::Error::other)?);
             std::fs::copy(path, &staged)?;
             Change::Write { path: tree_path, staged: staged.into() }
         };
@@ -518,7 +577,7 @@ impl Worker {
 
     /// Whether something changed here at a path - or in it, or above it - that the project has yet to be told: a
     /// file written or renamed, a removal waiting to settle.
-    fn waits(&self, path: &Path, path_in_tree: &str) -> bool {
+    fn waits(&self, path: &HostPath, path_in_tree: &str) -> bool {
         let pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let within = |inner: &str, outer: &str| inner == outer || inner.starts_with(&format!("{outer}/"));
         pending.changed.keys().any(|changed| changed.starts_with(path) || path.starts_with(changed))
@@ -529,14 +588,14 @@ impl Worker {
     /// read again; one no longer in the tree removed; a folder recursed into, and given placeholders of the nodes new
     /// in it where Windows filled it already (one it has not is filled when read, as the tree is then). What changed
     /// here, and is not applied yet, is left as it is.
-    fn sync(&self, tree: &Tree, dir: &Path, at: &str) {
+    fn sync(&self, tree: &Tree, dir: &HostPath, at: &str) {
         let read_only = self.owner.is_none();
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let mut here: Vec<String> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path_in_tree = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
-            let path = entry.path();
+            let path = dir.entry(&entry.file_name());
             here.push(name);
             let in_sync = in_sync(&path);
             let Some((_, node)) = tree.at(&path_in_tree) else {
@@ -554,8 +613,7 @@ impl Worker {
             }
             let stale = std::fs::metadata(&path).is_ok_and(|m| m.len() != node.size);
             if in_sync && stale {
-                let options =
-                    UpdateOptions::default().metadata(metadata(&node, read_only)).dehydrate().mark_in_sync();
+                let options = UpdateOptions::default().metadata(metadata(&node, read_only)).dehydrate().mark_in_sync();
                 if let Ok(mut placeholder) = writable(&path, false) {
                     let _ = placeholder.update(options, None);
                 }
@@ -569,7 +627,7 @@ impl Worker {
                 // What a program removed or renamed away here a moment ago is not put back: the tree has it until
                 // the project is told.
                 let path_in_tree = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
-                if self.waits(&dir.join(name), &path_in_tree) {
+                if tree_name(name).is_none_or(|named| self.waits(&dir.join(&named), &path_in_tree)) {
                     continue;
                 }
                 let _ = placeholder(name, node, read_only).create(dir);
@@ -606,7 +664,7 @@ impl crate::backend::Backend for AsBackend {
         true
     }
 
-    fn available(&self, at: &Path) -> Result<(), String> {
+    fn available(&self, at: &HostPath) -> Result<(), String> {
         match crate::backend::volume_filesystem(at) {
             Some(filesystem) if !filesystem.eq_ignore_ascii_case("NTFS") => {
                 Err(format!("the Cloud Files API serves on NTFS volumes, and this one is {filesystem}"))
@@ -618,16 +676,16 @@ impl crate::backend::Backend for AsBackend {
     fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
         let read_only = job.owner.is_none();
         let cloud = serve(job.served, job.owner.clone(), job.at, job.staging, job.name)?;
-        Ok(Box::new(Kept { _cloud: cloud, root: plain(job.at), shown: plain(job.at), read_only }))
+        Ok(Box::new(Kept { _cloud: cloud, root: job.at.clone(), shown: job.at.clone(), read_only }))
     }
 
-    fn clear(&self, at: &Path, name: &str) {
+    fn clear(&self, at: &HostPath, name: &str) {
         // Unregistered first, or Windows keeps what was not read of it from being removed.
         let _ = forget(at, name);
         let _ = std::fs::remove_dir_all(at);
     }
 
-    fn retire(&self, at: &Path, name: &str) {
+    fn retire(&self, at: &HostPath, name: &str) {
         // Told apart while Windows still knows the folder as a sync root - what is in sync is what it left, and can be
         // read again; anything else was put or changed there - then no longer one, which takes with it the placeholders
         // never read. Each file is opened to be asked: some seconds for a project listed whole, once, as another
@@ -644,14 +702,22 @@ impl crate::backend::Backend for AsBackend {
         }
     }
 
-    fn collect(&self, at: &Path, record: &crate::access::Access, budget: u64) {
-        let root = plain(at);
+    fn collect(&self, at: &HostPath, record: &crate::access::Access, budget: u64) {
+        let root = at.clone();
         let mut kept = record.kept_in_all();
         for (path, bytes) in record.oldest() {
             if kept <= budget {
                 break;
             }
-            let file = root.join(&path);
+            // Kept by its path in the tree, which holds checked names; one that is none is said, and left kept.
+            let within = match pe2_path::RelPath::new(&path) {
+                Ok(within) => within,
+                Err(why) => {
+                    eprintln!("{why}: kept, and not let go of");
+                    continue;
+                }
+            };
+            let file = root.join(&within);
             // Only what is as serving left it: what was changed there is someone's work, and stays.
             if in_sync(&file) {
                 let let_go = writable(&file, false).is_ok_and(|mut placeholder| {
@@ -668,11 +734,11 @@ impl crate::backend::Backend for AsBackend {
         }
     }
 
-    fn forget(&self, at: &Path, name: &str) -> io::Result<()> {
+    fn forget(&self, at: &HostPath, name: &str) -> io::Result<()> {
         forget(at, name)
     }
 
-    fn left_as_served(&self, file: &Path) -> bool {
+    fn left_as_served(&self, file: &HostPath) -> bool {
         in_sync(file)
     }
 }
@@ -687,40 +753,36 @@ struct Apart;
 pub const APART: &dyn crate::backend::Backend = &Apart;
 
 /// Beside a tree kept apart, what says whose it is: the folder it is served at, then the name it is served by.
-const WHOSE: &str = "project";
+const WHOSE: Name = Name::constant("project");
 /// The tree kept apart, in the folder that is its own.
-const TREE: &str = "tree";
+const TREE: Name = Name::constant("tree");
 
 /// The folder of what is kept apart of a folder served: its own, by the place of the one served.
-fn apart(at: &Path) -> Option<PathBuf> {
-    let place = project::extract::sha1_hex(plain(at).to_string_lossy().to_lowercase().as_bytes());
-    Some(crate::backend::apart_for(at)?.join(&place[..16]))
+fn apart(at: &HostPath) -> Option<HostPath> {
+    let place = project::extract::sha1_hex(at.to_string().to_lowercase().as_bytes());
+    Some(crate::backend::apart_for(at)?.join(&Name::new(&place[..16]).ok()?))
 }
 
 /// Whether two paths name one folder, as Windows compares them.
-fn same(a: &Path, b: &Path) -> bool {
-    let written = |path: &Path| plain(path).to_string_lossy().trim_end_matches('\\').to_lowercase();
+fn same(a: &HostPath, b: &HostPath) -> bool {
+    let written = |path: &HostPath| path.to_string().trim_end_matches('\\').to_lowercase();
     written(a) == written(b)
 }
 
 /// The tree a folder leads to, where that is the one kept apart for it.
-fn apart_tree(at: &Path) -> Option<PathBuf> {
-    let (to, tree) = (crate::backend::joined_to(at)?, apart(at)?.join(TREE));
+fn apart_tree(at: &HostPath) -> Option<HostPath> {
+    let (to, tree) = (crate::backend::joined_to(at)?, apart(at)?.join(&TREE));
     same(&to, &tree).then_some(tree)
 }
 
 /// Whether a folder holds a file, anywhere in it.
-fn holds_files(dir: &Path) -> bool {
-    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
-    entries.into_iter().any(|entry| {
-        let folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        !folder || holds_files(&entry.path())
-    })
+fn holds_files(dir: &HostPath) -> bool {
+    dir.entries().any(|entry| !entry.is_dir() || holds_files(&entry))
 }
 
 /// Make a folder the junction to its tree kept apart. One that leads elsewhere is made again - another project's
 /// tree, where this project is a copy of that one; a folder of its own has to hold no file.
-fn link(at: &Path, tree: &Path) -> io::Result<()> {
+fn link(at: &HostPath, tree: &HostPath) -> io::Result<()> {
     if crate::backend::joined_to(at).is_some_and(|to| same(&to, tree)) {
         return Ok(());
     }
@@ -736,14 +798,14 @@ fn link(at: &Path, tree: &Path) -> io::Result<()> {
 
 /// Let go of the trees kept apart, beside this one, whose folder no longer leads to them: a project removed, moved,
 /// or served otherwise since.
-fn sweep_apart(all: &Path, but: &Path) {
-    for entry in std::fs::read_dir(all).into_iter().flatten().flatten() {
-        let kept = entry.path();
-        let Ok(whose) = std::fs::read_to_string(kept.join(WHOSE)) else { continue };
+fn sweep_apart(all: &HostPath, but: &HostPath) {
+    for kept in all.entries() {
+        let Ok(whose) = std::fs::read_to_string(kept.join(&WHOSE)) else { continue };
         let mut said = whose.lines();
         let (Some(at), Some(name)) = (said.next(), said.next()) else { continue };
-        let tree = kept.join(TREE);
-        if same(&kept, but) || crate::backend::joined_to(Path::new(at)).is_some_and(|to| same(&to, &tree)) {
+        let tree = kept.join(&TREE);
+        let led = placed(std::path::Path::new(at)).ok().and_then(|at| crate::backend::joined_to(&at));
+        if same(&kept, but) || led.is_some_and(|to| same(&to, &tree)) {
             continue;
         }
         let _ = forget(&tree, name);
@@ -752,9 +814,9 @@ fn sweep_apart(all: &Path, but: &Path) {
 }
 
 /// Move what a folder holds into another, folder by folder: a move where it can be one, else a copy (another volume).
-fn move_into(from: &Path, to: &Path) {
+fn move_into(from: &HostPath, to: &HostPath) {
     for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
-        let (path, into) = (entry.path(), to.join(entry.file_name()));
+        let (path, into) = (from.entry(&entry.file_name()), to.entry(&entry.file_name()));
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             if std::fs::create_dir_all(&into).is_ok() {
                 move_into(&path, &into);
@@ -786,7 +848,7 @@ impl crate::backend::Backend for Apart {
         true
     }
 
-    fn available(&self, at: &Path) -> Result<(), String> {
+    fn available(&self, at: &HostPath) -> Result<(), String> {
         let Some(kept) = apart(at) else {
             return Err("where to keep it apart is not known: `[filesystem] cache` says".into());
         };
@@ -806,24 +868,24 @@ impl crate::backend::Backend for Apart {
     }
 
     fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
-        let at = plain(job.at);
+        let at = job.at.clone();
         let kept = apart(&at).ok_or_else(|| io::Error::other("where to keep it apart is not known"))?;
-        let tree = kept.join(TREE);
+        let tree = kept.join(&TREE);
         std::fs::create_dir_all(&tree)?;
         if let Some(all) = kept.parent() {
-            sweep_apart(all, &kept);
+            sweep_apart(&all, &kept);
         }
         link(&at, &tree)?;
         // Said once the folder leads to it: one that says so and is led to by nothing is swept.
-        std::fs::write(kept.join(WHOSE), format!("{}\n{}\n", at.display(), job.name))?;
+        std::fs::write(kept.join(&WHOSE), format!("{}\n{}\n", at.display(), job.name))?;
         let read_only = job.owner.is_none();
         let cloud = serve(job.served, job.owner.clone(), &tree, job.staging, job.name)?;
         Ok(Box::new(Kept { _cloud: cloud, root: tree, shown: at, read_only }))
     }
 
-    fn clear(&self, at: &Path, name: &str) {
+    fn clear(&self, at: &HostPath, name: &str) {
         let Some(kept) = apart(at) else { return };
-        let tree = kept.join(TREE);
+        let tree = kept.join(&TREE);
         // Unregistered first, or Windows keeps what was not read of it from being removed.
         let _ = forget(&tree, name);
         let _ = std::fs::remove_dir_all(&kept);
@@ -832,7 +894,7 @@ impl crate::backend::Backend for Apart {
         }
     }
 
-    fn retire(&self, at: &Path, name: &str) {
+    fn retire(&self, at: &HostPath, name: &str) {
         let Some(tree) = apart_tree(at) else { return };
         // As the API serving in place retires: what is in sync is what it left, and goes; anything else was put or
         // changed there, and stays - in the folder itself, which is one of its own again.
@@ -850,25 +912,25 @@ impl crate::backend::Backend for Apart {
         }
     }
 
-    fn collect(&self, at: &Path, record: &crate::access::Access, budget: u64) {
+    fn collect(&self, at: &HostPath, record: &crate::access::Access, budget: u64) {
         // By the folder served: what is opened through it is in the tree kept apart.
         AsBackend.collect(at, record, budget);
     }
 
-    fn forget(&self, at: &Path, name: &str) -> io::Result<()> {
-        apart(at).map_or(Ok(()), |kept| forget(&kept.join(TREE), name))
+    fn forget(&self, at: &HostPath, name: &str) -> io::Result<()> {
+        apart(at).map_or(Ok(()), |kept| forget(&kept.join(&TREE), name))
     }
 
-    fn left_as_served(&self, file: &Path) -> bool {
+    fn left_as_served(&self, file: &HostPath) -> bool {
         in_sync(file)
     }
 }
 
 /// What a folder holds that serving left there as it was - the files that are placeholders in sync - and every folder
 /// in it, each before what is in it: a folder holds nothing of its own, and goes where nothing is kept in it.
-fn placeholders_in_sync(dir: &Path, found: &mut Vec<PathBuf>) {
+fn placeholders_in_sync(dir: &HostPath, found: &mut Vec<HostPath>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
+        let path = dir.entry(&entry.file_name());
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             found.push(path.clone());
             placeholders_in_sync(&path, found);
@@ -882,14 +944,14 @@ fn placeholders_in_sync(dir: &Path, found: &mut Vec<PathBuf>) {
 /// same folder, but where it is kept apart.
 struct Kept {
     _cloud: Cloud,
-    root: PathBuf,
-    shown: PathBuf,
+    root: HostPath,
+    shown: HostPath,
     read_only: bool,
 }
 
 impl crate::backend::Mount for Kept {
     fn shown(&self) -> String {
-        project::host::shown(&self.shown)
+        self.shown.to_string()
     }
 
     fn placed(&self, served: &Served, path: &str) {

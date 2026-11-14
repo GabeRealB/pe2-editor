@@ -242,9 +242,10 @@ mod tests {
     use crate::cache::Cache;
     use crate::ext::Loadable;
     use crate::lock::Lock;
+    use crate::testing::At as _;
     use pe2_ext::ty::Registered as _;
     use pe2_ext::{Extension, File, Registry, Result, Typed, ty};
-    use std::path::PathBuf;
+    use pe2_path::HostPath;
     use std::sync::atomic::AtomicUsize;
 
     static MADE: AtomicUsize = AtomicUsize::new(0);
@@ -271,11 +272,11 @@ mod tests {
         Ok(())
     }
 
-    fn opened(name: &str) -> (PathBuf, Lock, Arc<Requests>, Arc<Extensions>) {
-        let root = std::env::temp_dir().join(format!("pe2-requests-{name}-{}", std::process::id()));
+    fn opened(name: &str) -> (HostPath, Lock, Arc<Requests>, Arc<Extensions>) {
+        let root = crate::testing::scratch(&format!("requests-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         let write = |path: &str, text: &str| {
-            let path = root.join(path);
+            let path = root.at(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         };

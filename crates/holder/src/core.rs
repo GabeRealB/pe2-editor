@@ -8,8 +8,8 @@
 //! or does not (`Queue::post`). So nothing asked reads a project that lacks what was asked before it, and nobody
 //! waits for anything but its own turn.
 
+use pe2_path::HostPath;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -103,7 +103,7 @@ pub type Then = Box<dyn FnOnce(mcp::Reply) + Send>;
 #[derive(Default)]
 pub struct Taken {
     pub refreshed: Refreshed,
-    pub wrote: Vec<PathBuf>,
+    pub wrote: Vec<HostPath>,
 }
 
 impl Taken {
@@ -134,13 +134,13 @@ pub struct Core {
     pub listing: Option<Listing>,
     /// The files its own edits wrote, as they were then: reported again as they are - by what watches the layers,
     /// by the program that asked for the edit - they are taken in already.
-    written: HashMap<PathBuf, Option<Stamp>>,
+    written: HashMap<HostPath, Option<Stamp>>,
     /// What was due and taken, by its number, until it is due no more: taken once, however often it is asked
     /// to look while what became of it could not be said.
     due_taken: HashSet<u64>,
     /// The thread holding the files to what the index took of them as known, until it is done and what it found
     /// is taken in.
-    verifying: Option<JoinHandle<Vec<PathBuf>>>,
+    verifying: Option<JoinHandle<Vec<HostPath>>>,
 }
 
 impl Core {
@@ -252,7 +252,12 @@ impl Core {
     /// Make edits, in order: each a step of the history, and what follows from them - the index, what is
     /// served - brought up to date once for all of them, which is most of what one edit takes. How each went,
     /// and what they came to. In this layer; none: the highest that can be written.
-    pub fn edits(&mut self, history: &mut History, ops: &[vfs::ops::Op], layer: Option<&str>) -> (Vec<mcp::Reply>, Taken) {
+    pub fn edits(
+        &mut self,
+        history: &mut History,
+        ops: &[vfs::ops::Op],
+        layer: Option<&str>,
+    ) -> (Vec<mcp::Reply>, Taken) {
         self.edits_then(history, ops, Ok(layer), None, None)
     }
 
@@ -298,7 +303,7 @@ impl Core {
             }
         };
         // What the edits wrote that the index has not taken in yet, and all of it.
-        let (mut pending, mut changed): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+        let (mut pending, mut changed): (Vec<HostPath>, Vec<HostPath>) = (Vec::new(), Vec::new());
         let mut replies = Vec::with_capacity(ops.len());
         // What the refreshes of all of them changed, together.
         let mut all = Refreshed::default();
@@ -379,7 +384,7 @@ impl Core {
     fn wrote(
         &mut self,
         history: &History,
-        changed: Vec<PathBuf>,
+        changed: Vec<HostPath>,
         refreshed: Refreshed,
         answers: &Answers,
         then: Option<crate::files::Then>,
@@ -414,12 +419,13 @@ impl Core {
     ///
     /// # Errors
     /// The index could not follow it.
-    pub fn take_in(&mut self, changed: &[PathBuf]) -> Result<Option<Taken>, String> {
+    pub fn take_in(&mut self, changed: &[HostPath]) -> Result<Option<Taken>, String> {
         let changed = self.others(changed.to_vec());
         if changed.is_empty() {
             return Ok(None);
         }
-        let refreshed = self.index.refresh(&self.project, &changed).map_err(|e| format!("taking in what changed: {e:#}"))?;
+        let refreshed =
+            self.index.refresh(&self.project, &changed).map_err(|e| format!("taking in what changed: {e:#}"))?;
         self.feed(&changed, &refreshed, &[], None);
         project::give_back_memory();
         Ok(Some(Taken { refreshed, wrote: Vec::new() }))
@@ -428,7 +434,7 @@ impl Core {
     /// Of files told changed - by what watches the layers, by a program - those that are another's doing: what
     /// the holder's own edits wrote, as they wrote it, is taken in already. One written over since is another's,
     /// and forgotten as its own.
-    pub fn others(&mut self, changed: Vec<PathBuf>) -> Vec<PathBuf> {
+    pub fn others(&mut self, changed: Vec<HostPath>) -> Vec<HostPath> {
         let written = &mut self.written;
         let others = changed.into_iter().filter(|path| {
             let own = written.get(path).is_some_and(|was| *was == project::storage::stamp(path));
@@ -444,7 +450,13 @@ impl Core {
     /// them to be read again, then what differs of what is served - of the entries the refresh touched and those
     /// gone. What became of what was due (`answers`) is said in the same commit, as is what the refresh changed
     /// of the model.
-    fn feed(&mut self, changed: &[PathBuf], refreshed: &Refreshed, answers: &Answers, then: Option<crate::files::Then>) {
+    fn feed(
+        &mut self,
+        changed: &[HostPath],
+        refreshed: &Refreshed,
+        answers: &Answers,
+        then: Option<crate::files::Then>,
+    ) {
         let _span = tracing::info_span!("holder served update").entered();
         let said = if self.files.is_none() {
             Said::Unchanged
@@ -466,7 +478,7 @@ impl Core {
     fn say(
         &self,
         said: Said,
-        changed: Vec<PathBuf>,
+        changed: Vec<HostPath>,
         model: &project::model::Delta,
         answers: &Answers,
         then: Option<crate::files::Then>,

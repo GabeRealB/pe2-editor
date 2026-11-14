@@ -52,13 +52,18 @@ pub fn give_back_memory() {
 }
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{HostPath, Name};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub const FILE: &str = "project.toml";
+pub const FILE: Name = Name::constant("project.toml");
 /// Where a project's layers live, each a directory with its changeset beside it.
-pub const LAYERS: &str = ".layers";
+pub const LAYERS: Name = Name::constant(".layers");
+/// What follows a layer's folder's name in its changeset's.
+pub const CHANGESET_SUFFIX: Name = Name::constant(".toml");
+/// What follows a generated layer's folder's name in its plan's.
+pub const PLAN_SUFFIX: Name = Name::constant(".plan.jsonl");
 
 #[derive(Deserialize)]
 struct ProjectFile {
@@ -82,7 +87,8 @@ struct ProjectFile {
 /// A build the project can be: `[config.<name>]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    pub name: String,
+    /// Its name, which names its folder of what is built (`build/<name>`).
+    pub name: Name,
     pub release: Option<String>,
     /// The target building it, what its `target.<name>` sections are for.
     pub target: Option<String>,
@@ -160,7 +166,7 @@ impl std::fmt::Display for PropertyKind {
 /// What is wrong with a config's property, or with a property's declaration (no config).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyProblem {
-    pub config: Option<String>,
+    pub config: Option<Name>,
     pub property: String,
     pub why: String,
 }
@@ -298,17 +304,17 @@ struct FilesystemFile {
 }
 
 /// The folder a project is served at, in its root, for every program alike: its merged layers as one tree (`vfs`).
-pub const SERVED: &str = "assets";
+pub const SERVED: Name = Name::constant("assets");
 /// Where what that folder held that was not the project's is set aside before it is served (`vfs::strays`), a folder a
 /// time: the only copy of it, so not in the cache.
-pub const SET_ASIDE: &str = "assets.set-aside";
+pub const SET_ASIDE: Name = Name::constant("assets.set-aside");
 
 /// How this machine serves a project as a filesystem, as far as the project says (`project.local.toml`): what serves
 /// is chosen where it is served (`vfs::backend`), which knows the backends - a name is not judged here.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filesystem {
     /// The folder it is served at.
-    pub at: PathBuf,
+    pub at: HostPath,
     /// What serves it there (`[filesystem] serve`), where the project says.
     pub serve: Option<String>,
     /// What serves the files programs are given (`[filesystem] scopes`), where the project says.
@@ -330,9 +336,9 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
-    fn of(root: &Path, file: FilesystemFile) -> Filesystem {
+    fn of(root: &HostPath, file: FilesystemFile) -> Filesystem {
         Filesystem {
-            at: root.join(SERVED),
+            at: root.join(&SERVED),
             serve: file.serve,
             scopes: file.scopes,
             address: file.address,
@@ -348,12 +354,12 @@ impl Filesystem {
 /// How this machine serves the project at a folder, read from its `project.local.toml` alone: for what serves a
 /// project's files without loading it. One that cannot be read says nothing.
 #[must_use]
-pub fn local_filesystem(root: &Path) -> Filesystem {
+pub fn local_filesystem(root: &HostPath) -> Filesystem {
     Filesystem::of(root, read_local(root).map_or_default(|local| local.filesystem))
 }
 
-fn read_local(root: &Path) -> Result<LocalFile> {
-    let path = root.join(LOCAL);
+fn read_local(root: &HostPath) -> Result<LocalFile> {
+    let path = root.join(&LOCAL);
     match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
         Err(_) => Ok(LocalFile::default()),
@@ -361,7 +367,7 @@ fn read_local(root: &Path) -> Result<LocalFile> {
 }
 
 /// The file what of a project is this machine's is kept in.
-pub const LOCAL: &str = "project.local.toml";
+pub const LOCAL: Name = Name::constant("project.local.toml");
 
 /// What a layer may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,11 +388,11 @@ pub struct Layer {
     pub name: String,
     pub kind: LayerKind,
     /// Its content's directory: in `.layers/`, or a mounted tree.
-    pub path: PathBuf,
+    pub path: HostPath,
     /// Where its content appears in the resolved project: empty for a layer at the top, the mount point for a mount.
     pub at: String,
     /// Its changeset, in `.layers/`: `<path>.toml` beside a layer's directory, `.layers/<name>.toml` for a mount.
-    pub changeset: PathBuf,
+    pub changeset: HostPath,
     /// Its content is written only by its maker: stated in `project.toml`, or a generated layer (its plan's alone).
     pub read_only: bool,
     /// Whether its changeset is the project's to write: a mount's is, though its tree may be read-only.
@@ -402,7 +408,7 @@ pub struct Layer {
 #[derive(Clone)]
 pub struct Mount {
     pub at: String,
-    pub path: PathBuf,
+    pub path: HostPath,
     pub read_only: bool,
 }
 
@@ -410,29 +416,28 @@ impl Layer {
     /// A generated layer's plan: `<path>.plan.jsonl`, beside its folder as its changeset would be, so that what fills
     /// the layer travels with the project while what it made does not.
     #[must_use]
-    pub fn plan(&self) -> PathBuf {
-        let mut plan = self.path.clone().into_os_string();
-        plan.push(".plan.jsonl");
-        PathBuf::from(plan)
+    pub fn plan(&self) -> HostPath {
+        self.path.with_suffix(&PLAN_SUFFIX)
     }
 
-    /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree.
-    #[must_use]
-    pub fn disk(&self, path: &str) -> PathBuf {
-        if self.at.is_empty() {
-            return self.path.join(path);
-        }
-        match path.strip_prefix(&self.at) {
-            Some("") => self.path.clone(),
-            Some(rest) => self.path.join(rest.trim_start_matches('/')),
-            None => self.path.join(path),
-        }
+    /// A resolved path's place on disk in this layer: under its directory, or, for a mount, under its tree; joined part
+    /// by part, so that it is in the system's own separators.
+    ///
+    /// # Errors
+    /// The path is no path (a name no system takes in it): it names no place, and is never taken for another.
+    pub fn disk(&self, path: &str) -> Result<HostPath, pe2_path::PathError> {
+        let rest = match path.strip_prefix(&self.at) {
+            _ if self.at.is_empty() => path,
+            Some(rest) => rest,
+            None => path,
+        };
+        Ok(self.path.join(&pe2_path::RelPath::new(rest.trim_start_matches('/'))?))
     }
 }
 
 #[derive(Clone)]
 pub struct Project {
-    pub root: PathBuf,
+    pub root: HostPath,
     pub layers: Vec<Layer>,
     pub mounts: Vec<Mount>,
     /// What is mounted and not indexed: read by path alone (`resolve`) - the disc images (`roms`).
@@ -462,19 +467,21 @@ pub struct Project {
 fn configs_of(
     configs: std::collections::BTreeMap<String, ConfigFile>,
     declared: &toml::Table,
-) -> (Vec<Config>, Vec<Property>, Vec<PropertyProblem>) {
+) -> Result<(Vec<Config>, Vec<Property>, Vec<PropertyProblem>)> {
     let configs: Vec<Config> = configs
         .into_iter()
-        .map(|(name, c)| Config {
-            name,
-            release: c.release,
-            target: c.target,
-            disabled: c.disabled,
-            properties: c.properties,
+        .map(|(name, c)| {
+            Ok(Config {
+                name: Name::new(&name).with_context(|| format!("the config {name}, which names its build's folder"))?,
+                release: c.release,
+                target: c.target,
+                disabled: c.disabled,
+                properties: c.properties,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let (properties, problems) = properties_of(declared, &configs);
-    (configs, properties, problems)
+    Ok((configs, properties, problems))
 }
 
 /// A value written as TOML alone (`fr` is none; `"fr"`, `2`, `["-O2"]` are): what a property is set to from text.
@@ -522,22 +529,23 @@ fn properties_of(declared: &toml::Table, configs: &[Config]) -> (Vec<Property>, 
     (properties, problems)
 }
 
-fn resolve_path(directory: &Path, value: &str) -> PathBuf {
-    let p = Path::new(value);
-    if p.is_absolute() { p.to_path_buf() } else { directory.join(p) }
+/// A place `project.toml` or `project.local.toml` names: as it is where it is absolute, else within the project's folder.
+pub(crate) fn resolve_path(directory: &HostPath, value: &str) -> Result<HostPath> {
+    directory.resolve(Path::new(value)).with_context(|| format!("{value}: the place it names"))
+}
+
+/// A layer's or a mount point's name, as the name of its folder or changeset.
+fn layer_name(name: &str) -> Result<Name> {
+    Name::new(name).with_context(|| format!("the layer {name}"))
 }
 
 /// That each generated layer fills an asset layer of the project.
-fn check_fills(root: &Path, layers: &[Layer]) -> Result<()> {
+fn check_fills(root: &HostPath, layers: &[Layer]) -> Result<()> {
     for layer in layers {
         if let Some(filled) = &layer.fills {
             let found = layers.iter().find(|l| l.name == *filled);
             if !found.is_some_and(|l| l.kind == LayerKind::Assets) {
-                bail!(
-                    "{}: the layer {} fills {filled}, no asset layer of the project",
-                    root.join(FILE).display(),
-                    layer.name
-                );
+                bail!("{}: the layer {} fills {filled}, no asset layer of the project", root.join(&FILE), layer.name);
             }
         }
     }
@@ -553,14 +561,18 @@ const EMPTY: &str = "# A project. `res://` paths are absolute from this director
 /// # Errors
 /// A project is there already, or the folder cannot be written.
 pub fn create(directory: &Path) -> Result<()> {
-    let file = directory.join(FILE);
-    anyhow::ensure!(!file.exists(), "{} holds a project already", directory.display());
-    std::fs::create_dir_all(directory.join(".layers/project")).with_context(|| directory.display().to_string())?;
+    const OWN: Name = Name::constant("project");
+    const IGNORE: Name = Name::constant(".gitignore");
+    let directory = HostPath::new(directory).with_context(|| directory.display().to_string())?;
+    let file = directory.join(&FILE);
+    anyhow::ensure!(!file.as_path().exists(), "{directory} holds a project already");
+    let own = directory.join(&LAYERS).join(&OWN);
+    std::fs::create_dir_all(&own).with_context(|| directory.to_string())?;
     // Its own layer is records (`records`).
-    records::mark(&directory.join(".layers/project"), &records::Settings::default())?;
-    std::fs::write(&file, EMPTY).with_context(|| file.display().to_string())?;
+    records::mark(&own, &records::Settings::default())?;
+    std::fs::write(&file, EMPTY).with_context(|| file.to_string())?;
     // Where it is served is no part of it, nor what was set aside from there.
-    let ignore = directory.join(".gitignore");
+    let ignore = directory.join(&IGNORE);
     let mut text = std::fs::read_to_string(&ignore).unwrap_or_default();
     for folder in [SERVED, SET_ASIDE] {
         if !text.lines().any(|l| l.trim() == format!("/{folder}/")) {
@@ -568,7 +580,7 @@ pub fn create(directory: &Path) -> Result<()> {
             text = format!("{text}{separator}/{folder}/\n");
         }
     }
-    std::fs::write(&ignore, text).with_context(|| ignore.display().to_string())
+    std::fs::write(&ignore, text).with_context(|| ignore.to_string())
 }
 
 /// How a layer's content is stored (`storage` in `project.toml`).
@@ -582,8 +594,8 @@ pub enum Storage {
 }
 
 /// How a layer says it is stored, its pack opened where it is packed.
-fn storage_of(root: &Path, layer: &str, said: Option<&str>, generated: bool, path: &Path) -> Result<Storage> {
-    let file = root.join(FILE);
+fn storage_of(root: &HostPath, layer: &str, said: Option<&str>, generated: bool, path: &HostPath) -> Result<Storage> {
+    let file = root.join(&FILE);
     let storage = match said {
         None | Some("text") => Storage::Text,
         Some("packed") if generated => Storage::Packed,
@@ -597,15 +609,15 @@ fn storage_of(root: &Path, layer: &str, said: Option<&str>, generated: bool, pat
 }
 
 /// A project's mounts, and its unmanaged ones apart, each where this machine says (`project.local.toml`).
-fn mounts_of(root: &Path, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
+fn mounts_of(root: &HostPath, declared: Vec<MountFile>, local: &LocalFile) -> Result<(Vec<Mount>, Vec<Mount>)> {
     let (mut mounts, mut unmanaged) = (Vec::new(), Vec::new());
     for m in declared {
         let at = m.at.trim_matches('/').to_string();
         let path = match (m.unmanaged, local.mounts.get(&at), &m.path) {
-            (true, Some(here), _) => resolve_path(root, here),
-            (_, _, Some(path)) => resolve_path(root, path),
-            (true, None, None) => root.join(&at),
-            (false, _, None) => bail!("{}: the mount {at} says no path", root.join(FILE).display()),
+            (true, Some(here), _) => resolve_path(root, here)?,
+            (_, _, Some(path)) => resolve_path(root, path)?,
+            (true, None, None) => root.join(&pe2_path::RelPath::new(&at).with_context(|| format!("the mount {at}"))?),
+            (false, _, None) => bail!("{}: the mount {at} says no path", root.join(&FILE)),
         };
         let mount = Mount { at, path, read_only: m.read_only || m.unmanaged };
         if m.unmanaged { unmanaged.push(mount) } else { mounts.push(mount) }
@@ -619,8 +631,8 @@ impl Project {
     /// # Errors
     /// Its `project.toml` cannot be read or parsed.
     pub fn load(directory: &Path) -> Result<Project> {
-        let root = std::fs::canonicalize(directory).with_context(|| format!("{}", directory.display()))?;
-        let path = root.join(FILE);
+        let root = HostPath::new(directory).with_context(|| format!("{}", directory.display()))?;
+        let path = root.join(&FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
         let file: ProjectFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
         let local = read_local(&root)?;
@@ -628,45 +640,41 @@ impl Project {
         // The mounts are files layers at the bottom of the stack, in their order, each named after its mount point.
         let mut layers: Vec<Layer> = mounts
             .iter()
-            .map(|m| Layer {
-                name: m.at.clone(),
-                kind: LayerKind::Files,
-                path: std::fs::canonicalize(&m.path).unwrap_or_else(|_| m.path.clone()),
-                at: m.at.clone(),
-                changeset: root.join(LAYERS).join(format!("{}.toml", m.at)),
-                read_only: m.read_only,
-                changeset_writable: true,
-                mounted: true,
-                fills: None,
-                storage: Storage::Text,
+            .map(|m| -> Result<Layer> {
+                Ok(Layer {
+                    name: m.at.clone(),
+                    kind: LayerKind::Files,
+                    path: m.path.clone(),
+                    at: m.at.clone(),
+                    changeset: root.join(&LAYERS).join(&layer_name(&m.at)?).with_suffix(&CHANGESET_SUFFIX),
+                    read_only: m.read_only,
+                    changeset_writable: true,
+                    mounted: true,
+                    fills: None,
+                    storage: Storage::Text,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         for l in file.layer {
-            let path = resolve_path(&root, l.path.as_deref().unwrap_or(&format!("{LAYERS}/{}", l.name)));
-            let mut changeset = path.clone().into_os_string();
-            changeset.push(".toml");
+            let path = match l.path.as_deref() {
+                Some(path) => resolve_path(&root, path)?,
+                None => root.join(&LAYERS).join(&layer_name(&l.name)?),
+            };
+            let changeset = path.with_suffix(&CHANGESET_SUFFIX);
             if layers.iter().any(|m| m.name == l.name) || unmanaged.iter().any(|m| m.at == l.name) {
-                bail!("{}: the layer {} is named as a mount point is", root.join(FILE).display(), l.name);
+                bail!("{}: the layer {} is named as a mount point is", root.join(&FILE), l.name);
             }
             let kind = match l.kind.as_deref() {
                 None | Some("assets") => LayerKind::Assets,
                 Some("files") => LayerKind::Files,
                 Some("generated") => LayerKind::Generated,
                 Some(other) => {
-                    bail!(
-                        "{}: the layer {}: no kind {other} (assets, files, generated)",
-                        root.join(FILE).display(),
-                        l.name
-                    )
+                    bail!("{}: the layer {}: no kind {other} (assets, files, generated)", root.join(&FILE), l.name)
                 }
             };
             let generated = kind == LayerKind::Generated;
             if generated != l.fills.is_some() {
-                bail!(
-                    "{}: the layer {}: a generated layer, and it alone, fills another",
-                    root.join(FILE).display(),
-                    l.name
-                );
+                bail!("{}: the layer {}: a generated layer, and it alone, fills another", root.join(&FILE), l.name);
             }
             let read_only = l.read_only || generated;
             let storage = storage_of(&root, &l.name, l.storage.as_deref(), generated, &path)?;
@@ -675,7 +683,7 @@ impl Project {
                 kind,
                 path,
                 at: String::new(),
-                changeset: PathBuf::from(changeset),
+                changeset,
                 read_only,
                 changeset_writable: !read_only,
                 mounted: false,
@@ -697,7 +705,8 @@ impl Project {
             .collect();
         let links = local.build.links;
         let filesystem = Filesystem::of(&root, local.filesystem);
-        let (configs, properties, property_problems) = configs_of(file.config, &file.property);
+        let (configs, properties, property_problems) =
+            configs_of(file.config, &file.property).with_context(|| path.to_string())?;
         Ok(Project {
             root,
             layers,
@@ -730,10 +739,10 @@ impl Project {
     /// layer holding it or leaving it off, as the folders their files are read at (`records::held_folder`: on no disk,
     /// read through `content`), in name order. One whose tree is not in the store is said, and left out.
     #[must_use]
-    pub fn held_extensions(&self) -> Vec<PathBuf> {
-        let mut held: std::collections::BTreeMap<String, Option<PathBuf>> = std::collections::BTreeMap::new();
+    pub fn held_extensions(&self) -> Vec<HostPath> {
+        let mut held: std::collections::BTreeMap<String, Option<HostPath>> = std::collections::BTreeMap::new();
         for layer in self.layers.iter().rev().filter(|layer| !layer.mounted) {
-            if layer.path.join(ext::folder::HELD).is_dir() {
+            if layer.path.join(&ext::folder::HELD).is_dir() {
                 eprintln!(
                     "{} holds extensions as folders, as layers held them before records: \
                      `pe2-cli project store convert --layer {}` holds them as records",
@@ -775,7 +784,7 @@ impl Project {
     ///
     /// # Errors
     /// `uri` is not a `res://` path.
-    pub fn resolve(&self, uri: &str) -> Result<PathBuf> {
+    pub fn resolve(&self, uri: &str) -> Result<HostPath> {
         let Some(rel) = uri.strip_prefix("res://") else { bail!("{uri}: not a res:// path") };
         let rel = rel.trim_matches('/');
         let mut mounts: Vec<&Mount> = self.mounts.iter().chain(&self.unmanaged).collect();
@@ -785,10 +794,10 @@ impl Project {
                 return Ok(m.path.clone());
             }
             if let Some(rest) = rel.strip_prefix(&format!("{}/", m.at)) {
-                return Ok(m.path.join(rest));
+                return Ok(m.path.join(&pe2_path::RelPath::new(rest)?));
             }
         }
-        Ok(self.root.join(rel))
+        Ok(self.root.join(&pe2_path::RelPath::new(rel)?))
     }
 
     /// The generated layers, each with the plan that fills it.
@@ -808,35 +817,11 @@ impl Project {
 /// What tests of a project share.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::path::{Path, PathBuf};
-
-    /// A path as the project names it once loaded: by its real place, part by part - what a watch of its layers
-    /// tells of, and what a path a test joined together with `/` is not on every system. What of it is not
-    /// there (a file removed) follows what is.
-    pub fn real(path: &Path) -> PathBuf {
-        let mut there = path.to_path_buf();
-        let mut rest = Vec::new();
-        loop {
-            if let Ok(real) = std::fs::canonicalize(&there) {
-                return rest.iter().rev().fold(real, |path, part| path.join(part));
-            }
-            match (there.file_name().map(std::ffi::OsStr::to_os_string), there.parent().map(Path::to_path_buf)) {
-                (Some(name), Some(parent)) => {
-                    rest.push(name);
-                    there = parent;
-                }
-                _ => return path.to_path_buf(),
-            }
-        }
-    }
-
-    /// A path under a folder, part by part: as the system writes it, whatever form the folder is named in.
-    pub fn at(root: &Path, path: &str) -> PathBuf {
-        path.split('/').fold(root.to_path_buf(), |at, part| at.join(part))
-    }
+    use pe2_path::HostPath;
+    pub use pe2_path::testing::{At, scratch};
 
     /// Have a file or a folder say it was last changed then.
-    pub fn set_modified(path: &Path, at: std::time::SystemTime) {
+    pub fn set_modified(path: &HostPath, at: std::time::SystemTime) {
         let mut options = std::fs::OpenOptions::new();
         // What changes a time is allowed to: on Windows asked for by itself, of a folder too.
         #[cfg(windows)]
@@ -852,18 +837,13 @@ pub(crate) mod testing {
         }
         options.open(path).unwrap().set_modified(at).unwrap();
     }
-
-    /// Each of these paths as the project names it (`real`).
-    pub fn reals(paths: &[PathBuf]) -> Vec<PathBuf> {
-        paths.iter().map(|path| real(path)).collect()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn an_empty_project_loads_and_is_made_once() {
-        let dir = std::env::temp_dir().join(format!("pe2-new-project-{}", std::process::id()));
+        let dir = crate::testing::scratch("new-project");
         let _ = std::fs::remove_dir_all(&dir);
         super::create(&dir).unwrap();
         let project = super::Project::load(&dir).unwrap();
@@ -874,10 +854,10 @@ mod tests {
 
     #[test]
     fn configs_have_the_properties_declared_and_say_what_is_not_as_declared() {
-        let dir = std::env::temp_dir().join(format!("pe2-properties-{}", std::process::id()));
+        let dir = crate::testing::scratch("properties");
         let _ = std::fs::remove_dir_all(&dir);
         super::create(&dir).unwrap();
-        let file = dir.join(super::FILE);
+        let file = dir.join(&super::FILE);
         let mut text = std::fs::read_to_string(&file).unwrap();
         text.push_str(
             r#"
@@ -920,7 +900,7 @@ properties = { language = "de", flags = [1], nothing = true }
         let mut said: Vec<String> = project
             .property_problems
             .iter()
-            .map(|p| format!("{} {}", p.config.as_deref().unwrap_or("-"), p.property))
+            .map(|p| format!("{} {}", p.config.as_ref().map_or("-", pe2_path::Name::as_str), p.property))
             .collect();
         said.sort();
         assert_eq!(said, ["- odd", "wrong flags", "wrong language", "wrong level", "wrong nothing"]);

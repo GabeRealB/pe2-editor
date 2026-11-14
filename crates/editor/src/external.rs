@@ -1,7 +1,7 @@
 //! Opening files in other applications: the tool the settings name for the file's type, or the system's default.
 //! A form no tool reads is converted first - a BS picture to a PNG in the temporary directory.
 
-use std::path::{Path, PathBuf};
+use pe2_path::HostPath;
 use std::process::Command;
 
 use crate::settings::Tools;
@@ -65,7 +65,7 @@ impl Category {
     }
 
     /// The type of tool a file opens in, by its extension.
-    pub fn of(file: &Path) -> Category {
+    pub fn of(file: &HostPath) -> Category {
         match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("png" | "bs" | "pe2img" | "pe2clut" | "bmp" | "tga") => Category::Image,
             Some("wav" | "sfz" | "spk" | "vag") => Category::Audio,
@@ -78,14 +78,18 @@ impl Category {
 }
 
 /// The file a tool is given: a BS picture becomes a PNG in the temporary directory; any other file is itself.
-fn openable(file: &Path, name: &str) -> Result<PathBuf, String> {
+fn openable(file: &HostPath, name: &str) -> Result<HostPath, String> {
     if file.extension().is_none_or(|e| e != "bs") {
-        return Ok(file.to_path_buf());
+        return Ok(file.clone());
     }
     let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let picture = codecs::bs::decode(&bytes).map_err(|e| e.to_string())?;
-    let out = std::env::temp_dir().join("pe2-editor").join(format!("{}.png", name.replace(['/', '\\'], "_")));
-    std::fs::create_dir_all(out.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+    let temporary = HostPath::new(&std::env::temp_dir()).map_err(|e| e.to_string())?;
+    let picture_name =
+        pe2_path::Name::new(&format!("{}.png", name.replace(['/', '\\'], "_"))).map_err(|e| e.to_string())?;
+    let folder = temporary.join(&pe2_path::Name::constant("pe2-editor"));
+    let out = folder.join(&picture_name);
+    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     let writer = std::io::BufWriter::new(std::fs::File::create(&out).map_err(|e| e.to_string())?);
     let width = u32::try_from(picture.width).map_err(|e| e.to_string())?;
     let height = u32::try_from(picture.height).map_err(|e| e.to_string())?;
@@ -122,20 +126,20 @@ fn words(command: &str) -> Vec<String> {
 }
 
 /// The system's way of opening a file in its default application.
-fn system_default(file: &Path) -> Command {
+fn system_default(file: &HostPath) -> Command {
     if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(file);
+        c.args(["/C", "start", ""]).arg(file.as_os_str());
         c
     } else if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
-        c.arg(file);
+        c.arg(file.as_os_str());
         c
     } else {
         // Under WSL, wslview hands the file to Windows' default application.
         let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some();
         let mut c = Command::new(if wsl && which("wslview") { "wslview" } else { "xdg-open" });
-        c.arg(file);
+        c.arg(file.as_os_str());
         c
     }
 }
@@ -144,19 +148,22 @@ fn system_default(file: &Path) -> Command {
 ///
 /// # Errors
 /// The system's opener cannot be started.
-pub fn open_default(file: &Path) -> Result<(), String> {
+pub fn open_default(file: &HostPath) -> Result<(), String> {
     system_default(file).spawn().map(drop).map_err(|e| format!("{}: {e}", file.display()))
 }
 
 fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(program).is_file()))
+    let Ok(program) = pe2_path::Name::new(program) else { return false };
+    // Each folder the environment names, as the system names it.
+    let found = |folder: std::path::PathBuf| HostPath::new(&folder).is_ok_and(|folder| folder.join(&program).is_file());
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(found))
 }
 
 /// Open a file (named `name` for whatever it is converted to) with the tool for its type, or the system's default.
 ///
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.
-pub fn open(file: &Path, name: &str, tools: &Tools) -> Result<String, String> {
+pub fn open(file: &HostPath, name: &str, tools: &Tools) -> Result<String, String> {
     // A large file a layer holds as chunks is opened as assembled for it.
     let file = project::content::for_program(file).map_err(|e| format!("{}: {e}", file.display()))?;
     open_as(&file, name, Category::of(&file), tools)
@@ -166,7 +173,7 @@ pub fn open(file: &Path, name: &str, tools: &Tools) -> Result<String, String> {
 ///
 /// # Errors
 /// The file cannot be converted, or the tool cannot be started.
-pub fn open_as(file: &Path, name: &str, category: Category, tools: &Tools) -> Result<String, String> {
+pub fn open_as(file: &HostPath, name: &str, category: Category, tools: &Tools) -> Result<String, String> {
     let target = openable(file, name)?;
     let command = category.command(tools).trim();
     let mut process = if command.is_empty() {

@@ -11,14 +11,19 @@
 //! in what it serves - what only looks at the folder keeps nothing.
 
 use anyhow::{Result, bail};
+use pe2_path::HostPath;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 use crate::role::{Link, Role};
 
 /// The server, as a process of a project.
-pub static ROLE: Role =
-    Role { command: "server", socket: "server.sock", pipe: "pe2-server", lock: "server.lock", log: "server.log" };
+pub static ROLE: Role = Role {
+    command: "server",
+    socket: pe2_path::Name::constant("server.sock"),
+    pipe: "pe2-server",
+    lock: pe2_path::Name::constant("server.lock"),
+    log: pe2_path::Name::constant("server.log"),
+};
 
 /// What is served of the project, by each path in the served folder (`Index::served`): what the holder says in
 /// the shared filesystem, and the server reads there.
@@ -34,7 +39,7 @@ pub enum Shown {
     /// A file: where a layer holds it, its length and when it changed (seconds and nanoseconds since the epoch);
     /// whether it is a node's file (the folders its name makes are the node's, not entries).
     File {
-        disk: std::path::PathBuf,
+        disk: HostPath,
         size: u64,
         modified: (u64, u32),
         of_files: bool,
@@ -52,9 +57,9 @@ pub enum Source {
     #[default]
     Disk,
     /// Text a record holds: the record's file, and the file's name in it.
-    RecordText { record: std::path::PathBuf, name: String },
+    RecordText { record: HostPath, name: String },
     /// Kept in a store for a record, by its SHA-1.
-    Stored { sha1: String, store: std::path::PathBuf },
+    Stored { sha1: String, store: HostPath },
 }
 
 /// What changed of a listing: the paths shown anew or otherwise, and the paths gone.
@@ -97,8 +102,11 @@ impl Delta {
     pub fn apply_under(&self, listing: &mut Listing) {
         for path in &self.gone {
             let inside = format!("{path}/");
-            let under: Vec<String> =
-                listing.range(inside.clone()..).take_while(|(under, _)| under.starts_with(&inside)).map(|(under, _)| under.clone()).collect();
+            let under: Vec<String> = listing
+                .range(inside.clone()..)
+                .take_while(|(under, _)| under.starts_with(&inside))
+                .map(|(under, _)| under.clone())
+                .collect();
             for under in under {
                 listing.remove(&under);
             }
@@ -128,7 +136,7 @@ pub enum ToServer {
     Shown,
     /// These files changed in the layers - an edit made by whoever holds the project - for what is read of them to
     /// follow at once.
-    Changed { paths: Vec<std::path::PathBuf> },
+    Changed { paths: Vec<HostPath> },
     /// What it is doing.
     Status,
     /// Stop serving, now.
@@ -149,7 +157,9 @@ pub enum FromServer {
         note: Option<String>,
     },
     /// Not taken: another connection feeds it, whose it says.
-    Fed { by: String },
+    Fed {
+        by: String,
+    },
     Status {
         pid: u32,
         /// Where it serves; empty until it was given what to serve.
@@ -166,7 +176,9 @@ pub enum FromServer {
     Stopping,
     /// What was said is done.
     Done,
-    Error { why: String },
+    Error {
+        why: String,
+    },
 }
 
 /// A lease on the server: it serves while this is held.
@@ -199,7 +211,7 @@ fn lease(mut link: Link, who: &str) -> Result<Lease> {
 /// # Errors
 /// No server could be started (nothing can serve the project's folder here, as its log says), or it would not be
 /// kept.
-pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<Lease> {
+pub fn keep(root: &HostPath, who: &str, program: &HostPath, args: &[String]) -> Result<Lease> {
     let link = match ROLE.connect(root) {
         Some(link) => link,
         None => ROLE.start(root, program, args)?,
@@ -209,25 +221,25 @@ pub fn keep(root: &Path, who: &str, program: &Path, args: &[String]) -> Result<L
 
 /// Keep the server of the project in `root` for `who`, where one runs.
 #[must_use]
-pub fn keep_running(root: &Path, who: &str) -> Option<Lease> {
+pub fn keep_running(root: &HostPath, who: &str) -> Option<Lease> {
     lease(ROLE.connect(root)?, who).ok()
 }
 
 /// Whether a server runs for the project in `root`.
 #[must_use]
-pub fn running(root: &Path) -> bool {
+pub fn running(root: &HostPath) -> bool {
     ROLE.running(root)
 }
 
 /// What the server of the project in `root` says it is doing, where one listens.
 #[must_use]
-pub fn status(root: &Path) -> Option<FromServer> {
+pub fn status(root: &HostPath) -> Option<FromServer> {
     ROLE.connect(root)?.ask(&ToServer::Status).ok()
 }
 
 /// Tell the server of the project in `root` to stop, now: whether one was told.
 #[must_use]
-pub fn stop(root: &Path) -> bool {
+pub fn stop(root: &HostPath) -> bool {
     let Some(mut server) = ROLE.connect(root) else { return false };
     matches!(server.ask(&ToServer::Stop), Ok(FromServer::Stopping))
 }

@@ -5,6 +5,7 @@
 //!
 //! It fails, naming each, on a crate under a license the policy does not allow and on one with no text to show: a
 //! dependency added is settled when it is added, not found out later.
+#![allow(clippy::disallowed_methods, reason = "a build script: it lays out files by the folders cargo gives it")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -27,8 +28,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", hand.display());
     println!("cargo:rerun-if-changed={}", workspace.join("Cargo.lock").display());
     let table = hand.join("licenses.toml");
-    let said: toml::Table =
-        read(&table).parse().unwrap_or_else(|e| panic!("{} does not read: {e}", table.display()));
+    let said: toml::Table = read(&table).parse().unwrap_or_else(|e| panic!("{} does not read: {e}", table.display()));
 
     // The platform built for - or another, to hold what it links to the policy from this machine
     // (`PE2_LICENSES_FOR=x86_64-pc-windows-msvc cargo check -p licenses`): what is linked differs by platform.
@@ -335,13 +335,15 @@ impl Policy {
         let Some(license) = &package.license else {
             return Err("it names no license".into());
         };
-        let expression = Expression::parse(license).map_err(|e| format!("its license, `{license}`, does not read: {e}"))?;
+        let expression =
+            Expression::parse(license).map_err(|e| format!("its license, `{license}`, does not read: {e}"))?;
         if expression.met_by(&|name| self.allow.contains(name)).is_none() {
             return Err(format!("`{license}` is not among the licenses allowed"));
         }
         let folder = package.manifest.parent().expect("a manifest is in a folder");
         let mut texts = Vec::new();
-        let mut names: Vec<PathBuf> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        let mut names: Vec<PathBuf> =
+            std::fs::read_dir(folder).into_iter().flatten().flatten().map(|e| e.path()).collect();
         names.sort();
         for path in names {
             let name = path.file_name().expect("an entry has a name").to_string_lossy().into_owned();
@@ -377,7 +379,9 @@ impl Policy {
                      keep its repository's under licenses/texts and name it in licenses.toml"
                 ));
             };
-            texts.extend(under.into_iter().map(|name| (format!("{name}, the standard text"), self.standard[&name].clone())));
+            texts.extend(
+                under.into_iter().map(|name| (format!("{name}, the standard text"), self.standard[&name].clone())),
+            );
         }
         Ok(texts)
     }

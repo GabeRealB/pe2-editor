@@ -4,6 +4,11 @@ Every extension has an `extension.toml` beside its `Cargo.toml`. It is checked a
 key, a missing file or a file outside the extension fails the build. The component carries the manifest inside it,
 and the copy in the extension's folder must match.
 
+An extension can also be its manifest alone, with no code: a folder `<id>.extension/` holding `extension.toml` (and its
+guides, licenses and patches). That is how a tool is shipped - the programs it offers and where they are downloaded
+from - for other extensions and a project's builds to run. It is checked as it is loaded, as a built one is as it
+builds.
+
 ## About the extension
 
 | Key | Meaning |
@@ -41,5 +46,5 @@ Each `[[bundled]]` names something it ships that is not its own code, with its l
 ## Running programs
 
 An extension that runs programs sets `unsandboxed = true`, and may declare what it downloads (`[[setup]]`) and the
-programs it starts (`[[launch]]`). A sandboxed extension that declares either is refused. See
+programs it offers (`[[program]]`). A sandboxed extension that declares either is refused. See
 [Running programs](unsandboxed.md).

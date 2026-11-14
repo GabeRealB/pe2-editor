@@ -14,6 +14,7 @@
 //! The server does not serve over files in the folder that are not the project's (`vfs::strays`): the user chooses to
 //! set them aside or take them in, and the server is started again to.
 
+use pe2_path::HostPath;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -37,7 +38,7 @@ pub struct Files {
 /// since what it was given before, why it could not be said where it could not, who waits for it to be served
 /// (told by this being dropped), and what is done once it is.
 struct Shown {
-    changed: Vec<std::path::PathBuf>,
+    changed: Vec<HostPath>,
     failed: Option<String>,
     served: Option<mpsc::Sender<()>>,
     then: Option<Then>,
@@ -139,7 +140,7 @@ impl Files {
     pub fn say_then(
         &self,
         said: Said,
-        changed: Vec<std::path::PathBuf>,
+        changed: Vec<HostPath>,
         model: &project::model::Delta,
         answers: &crate::says::Answers,
         wait: bool,
@@ -197,8 +198,8 @@ fn who() -> &'static str {
 }
 
 /// `pe2-cli`, which the server is: this program where it is that, else the one beside it.
-fn cli() -> anyhow::Result<std::path::PathBuf> {
-    let program = std::env::current_exe()?;
+fn cli() -> anyhow::Result<HostPath> {
+    let program = HostPath::new(&std::env::current_exe()?)?;
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned());
     let cli = if name.as_deref() == Some("pe2-cli") { program } else { project::host::cli_beside(&program) };
     if !cli.is_file() {

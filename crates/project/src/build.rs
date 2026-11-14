@@ -2,11 +2,11 @@
 //! What is wired to what is read from the plans of every asset, and a build is only the `build` event: the outputs that answer it say so.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use pe2_ext::data::BuildConfig;
+use pe2_path::{HostPath, Name, RelPath};
 
 use crate::events::{Action, Effects, Expr, Outcome, Report, Trigger, order, schedule};
 use crate::ext::Extensions;
@@ -95,10 +95,10 @@ fn named(action: &Action) -> String {
 /// The config as what is made reads it.
 #[must_use]
 pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
-    let folder = project.root.join("build").join(&config.name);
+    let folder = project.root.join(&BUILT).join(&config.name);
     let said = |config: &Config| {
         let fixed = [
-            Some(("name".to_owned(), config.name.clone())),
+            Some(("name".to_owned(), config.name.to_string())),
             config.release.clone().map(|v| ("release".to_owned(), v)),
             config.target.clone().map(|v| ("target".to_owned(), v)),
         ];
@@ -115,10 +115,10 @@ pub fn build_config(project: &Project, config: &Config) -> BuildConfig {
     let mut seen = std::collections::HashSet::new();
     known.retain(|k| seen.insert(k.clone()));
     BuildConfig {
-        name: config.name.clone(),
+        name: config.name.to_string(),
         release: config.release.clone(),
         target: config.target.clone(),
-        folder: folder.display().to_string(),
+        folder: folder.to_string(),
         known,
         properties: project.properties_of(config),
     }
@@ -129,14 +129,20 @@ struct Site<'a> {
     project: &'a Project,
     index: &'a Index,
     extensions: &'a Extensions,
-    config: &'a BuildConfig,
+    /// The config's name, which names its folder of what is deployed.
+    config_name: Name,
     engine: Engine,
 }
 
-/// Where a deploy puts a file, relative to the project.
-fn deployed(place: &str, config: &str, file: &str) -> PathBuf {
-    let place = place.replace("{config}", config);
-    if place.ends_with('/') { Path::new(&place).join(file) } else { PathBuf::from(place) }
+/// Where in the project builds are deployed, each config's in a folder of its name.
+const BUILT: Name = Name::constant("build");
+
+/// Where in the project an output's `deploy` puts its file: the place it names, `{config}` the config's name, or in it
+/// where it ends in `/`.
+fn deployed(place: &str, config: &Name, file: &str) -> Result<RelPath> {
+    let place = place.replace("{config}", config.as_str());
+    let path = if place.ends_with('/') { format!("{place}{file}") } else { place };
+    RelPath::new(&path).with_context(|| format!("the place it is deployed at, {path}"))
 }
 
 impl Site<'_> {
@@ -157,7 +163,7 @@ impl Site<'_> {
             Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => {
                 let store = self.engine.store().context("no store holds it")?;
-                std::fs::read(store.blob_path(sha1)).with_context(|| sha1.clone())
+                std::fs::read(store.blob_path(sha1)?).with_context(|| sha1.clone())
             }
         }
     }
@@ -168,17 +174,17 @@ impl Site<'_> {
         let file = typed.file()?;
         let bytes = self.bytes(file)?;
         for place in places {
-            let relative = deployed(place, &self.config.name, &file.name);
+            let relative = deployed(place, &self.config_name, &file.name)?;
             let to = self.project.root.join(&relative);
             if let Some(folder) = to.parent() {
-                std::fs::create_dir_all(folder).with_context(|| folder.display().to_string())?;
+                std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
             }
             if std::fs::read(&to).ok().as_deref() != Some(&bytes) {
                 crate::cache::write_atomic(&to, &bytes)?;
             }
             for (link, target) in &self.project.links {
-                if Path::new(target) == relative {
-                    link_to(&to, &self.project.root.join(link))?;
+                if RelPath::new(target).is_ok_and(|target| target == relative) {
+                    link_to(&to, &crate::resolve_path(&self.project.root, link)?)?;
                 }
             }
         }
@@ -241,7 +247,9 @@ impl Site<'_> {
             && let Ok(file) = typed.file()
         {
             for place in &plan.outputs[at].events.deploy {
-                let _ = std::fs::remove_file(self.project.root.join(deployed(place, &self.config.name, &file.name)));
+                if let Ok(relative) = deployed(place, &self.config_name, &file.name) {
+                    let _ = std::fs::remove_file(self.project.root.join(&relative));
+                }
             }
         }
         store.forget_trace(&key);
@@ -284,24 +292,23 @@ pub fn epoch(
     cancel: &AtomicBool,
 ) -> Report {
     extensions.set_config(Some(build_config(project, config)), &config.disabled);
-    let config = build_config(project, config);
-    let site = Site { project, index, extensions, config: &config, engine: extensions.engine().for_a_run() };
+    let config_name = config.name.clone();
+    let site = Site { project, index, extensions, config_name, engine: extensions.engine().for_a_run() };
     schedule(&wiring.triggers, roots, &site, cancel)
 }
 
 /// Put a link to a file where it is looked for, or where links take a permission, a copy. One there already and right is left.
-fn link_to(file: &Path, at: &Path) -> Result<()> {
-    let file = std::fs::canonicalize(file)?;
+fn link_to(file: &HostPath, at: &HostPath) -> Result<()> {
     #[cfg(unix)]
-    if std::fs::read_link(at).is_ok_and(|now| now == file) {
+    if std::fs::read_link(at).is_ok_and(|now| now == **file) {
         return Ok(());
     }
     let _ = std::fs::remove_file(at);
     #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(&file, at);
+    let linked = std::os::unix::fs::symlink(file, at);
     #[cfg(not(unix))]
-    let linked = std::fs::copy(&file, at).map(|_| ());
-    linked.with_context(|| at.display().to_string())
+    let linked = std::fs::copy(file, at).map(|_| ());
+    linked.with_context(|| at.to_string())
 }
 
 /// The links a project asks for: where each goes, and the deployed file it stands for.

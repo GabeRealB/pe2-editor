@@ -20,8 +20,9 @@
 //! changes anything else waits for all that is behind to be written, and is written as it is said.
 
 use anyhow::{Context, Result};
+use pe2_path::{HostPath, Name, NotWithin, RelPath};
 use std::collections::{BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -34,8 +35,9 @@ const EVERY: Duration = Duration::from_secs(5);
 const HELD_LONG: Duration = Duration::from_secs(600);
 
 /// The log's folder, in the project's.
-fn log_dir(root: &Path) -> PathBuf {
-    root.join(crate::cache::DIR).join(crate::cache::STAGING).join("sfs")
+fn log_dir(root: &HostPath) -> HostPath {
+    const LOG: Name = Name::constant("sfs");
+    root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&LOG)
 }
 
 /// The tree of the shared space that holds what waits to be written: a file's path in the project, to the set
@@ -45,18 +47,21 @@ const WAITING: usize = 8;
 const WAITING_PATH: usize = 700;
 
 /// The projects whose files this process reads through what waits to be written, each with its shared space.
-static READ_THROUGH: RwLock<Vec<(PathBuf, Arc<sfs::Space>)>> = RwLock::new(Vec::new());
+static READ_THROUGH: RwLock<Vec<(HostPath, Arc<sfs::Space>)>> = RwLock::new(Vec::new());
 
 /// Read the files of the project in `root` through what waits to be written of them, in this process, from now
 /// on: what the server does as it starts, and whoever holds the project as it opens its storage.
-pub fn read_through(root: &Path, space: Arc<sfs::Space>) {
+pub fn read_through(root: &HostPath, space: Arc<sfs::Space>) {
     let mut read = READ_THROUGH.write().unwrap_or_else(PoisonError::into_inner);
     read.retain(|(of, _)| of != root);
-    read.push((root.to_path_buf(), space));
+    read.push((root.clone(), space));
 }
 
-fn name_in(root: &Path, path: &Path) -> Option<String> {
-    Some(path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"))
+/// A file's name in what waits to be written: its path within the project. One elsewhere, or within by a name no path
+/// takes, has none - and is never kept waiting (`Storage::defers`): it is written at once, so nothing of it waits to
+/// be read.
+fn name_in(root: &HostPath, path: &HostPath) -> Result<String, NotWithin> {
+    path.within(root).map(|within| within.as_str().to_owned())
 }
 
 /// What waits of a file, as the shared space keeps it: the set that said it (8), when - in microseconds since
@@ -97,37 +102,37 @@ pub fn stamped(time: std::time::SystemTime) -> std::time::SystemTime {
 /// bytes, or none where it is removed. None where nothing of it waits - it is as the disk has it - or this process
 /// reads its project through nothing.
 #[must_use]
-pub fn waiting_since(path: &Path) -> Option<(std::time::SystemTime, Option<Vec<u8>>)> {
+pub fn waiting_since(path: &HostPath) -> Option<(std::time::SystemTime, Option<Vec<u8>>)> {
     let read = READ_THROUGH.read().unwrap_or_else(PoisonError::into_inner);
     let (root, space) = read.iter().find(|(root, _)| path.starts_with(root))?;
     let pages = space.read().ok()?;
     if sfs::space::Pages::root(&pages, WAITING) == 0 {
         return None;
     }
-    waited(&sfs::tree::get(&pages, WAITING, name_in(root, path)?.as_bytes()).ok()??)
+    waited(&sfs::tree::get(&pages, WAITING, name_in(root, path).ok()?.as_bytes()).ok()??)
 }
 
 /// What a file holds as what waits to be written leaves it: its bytes, or none where it is removed. None where
 /// nothing of it waits.
 #[must_use]
-pub fn waiting(path: &Path) -> Option<Option<Vec<u8>>> {
+pub fn waiting(path: &HostPath) -> Option<Option<Vec<u8>>> {
     waiting_since(path).map(|(_, bytes)| bytes)
 }
 
 /// The files under a folder that wait to be written, each with when it was said and what it holds, or none where
 /// it is removed.
 #[must_use]
-pub fn waiting_under(folder: &Path) -> Vec<(PathBuf, std::time::SystemTime, Option<Vec<u8>>)> {
+pub fn waiting_under(folder: &HostPath) -> Vec<(HostPath, std::time::SystemTime, Option<Vec<u8>>)> {
     let read = READ_THROUGH.read().unwrap_or_else(PoisonError::into_inner);
     let Some((root, space)) = read.iter().find(|(root, _)| folder.starts_with(root)) else { return Vec::new() };
-    let (Ok(pages), Some(inside)) = (space.read(), name_in(root, folder).map(|name| format!("{name}/"))) else {
+    let (Ok(pages), Ok(inside)) = (space.read(), name_in(root, folder).map(|name| format!("{name}/"))) else {
         return Vec::new();
     };
     let mut found = Vec::new();
     let _ = sfs::tree::scan(&pages, WAITING, inside.as_bytes(), &mut |key, value| {
         let Some(name) = std::str::from_utf8(key).ok().filter(|name| name.starts_with(&inside)) else { return false };
-        if let Some((at, bytes)) = waited(value) {
-            found.push((root.join(name), at, bytes));
+        if let (Some((at, bytes)), Ok(name)) = (waited(value), RelPath::new(name)) {
+            found.push((root.join(&name), at, bytes));
         }
         true
     });
@@ -136,10 +141,10 @@ pub fn waiting_under(folder: &Path) -> Vec<(PathBuf, std::time::SystemTime, Opti
 
 /// Whether a folder is there for what waits to be written in it, though the disk may not have it yet.
 #[must_use]
-pub fn folder_waits(folder: &Path) -> bool {
+pub fn folder_waits(folder: &HostPath) -> bool {
     let read = READ_THROUGH.read().unwrap_or_else(PoisonError::into_inner);
     let Some((root, space)) = read.iter().find(|(root, _)| folder.starts_with(root)) else { return false };
-    let (Ok(pages), Some(inside)) = (space.read(), name_in(root, folder).map(|name| format!("{name}/"))) else {
+    let (Ok(pages), Ok(inside)) = (space.read(), name_in(root, folder).map(|name| format!("{name}/"))) else {
         return false;
     };
     let mut waits = false;
@@ -155,7 +160,7 @@ pub fn folder_waits(folder: &Path) -> bool {
 ///
 /// # Errors
 /// It is there and cannot be read.
-pub fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+pub fn read(path: &HostPath) -> std::io::Result<Option<Vec<u8>>> {
     if let Some(waits) = waiting(path) {
         return Ok(waits);
     }
@@ -169,7 +174,7 @@ pub fn read(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 /// A file's length and time of change, as what waits to be written leaves it: what its file will say once it is
 /// written, for whoever is to know that writing as its own. None where it is absent.
 #[must_use]
-pub fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+pub fn stamp(path: &HostPath) -> Option<(u64, std::time::SystemTime)> {
     match waiting_since(path) {
         Some((at, Some(bytes))) => Some((bytes.len() as u64, at)),
         Some((_, None)) => None,
@@ -182,7 +187,7 @@ pub fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
 
 /// Whether a file is there, as what waits to be written leaves it.
 #[must_use]
-pub fn is_file(path: &Path) -> bool {
+pub fn is_file(path: &HostPath) -> bool {
     waiting(path).map_or_else(|| path.is_file(), |waits| waits.is_some())
 }
 
@@ -190,7 +195,7 @@ pub fn is_file(path: &Path) -> bool {
 /// found it holding (none: absent) - what it has to hold still when it is written.
 #[derive(Clone, Debug)]
 pub struct Behind {
-    pub path: PathBuf,
+    pub path: HostPath,
     pub after: Option<Vec<u8>>,
     pub before: Option<String>,
     /// A folder to make, in place of a file.
@@ -202,14 +207,14 @@ pub struct Behind {
 
 /// What the holder of a project writes to its files, said in the log first.
 pub struct Storage {
-    root: PathBuf,
+    root: HostPath,
     shared: Arc<Shared>,
     /// What has on disk what was written, off the threads that write.
     syncing: Option<std::thread::JoinHandle<()>>,
 }
 
 struct Shared {
-    root: PathBuf,
+    root: HostPath,
     log: Arc<sfs::Log>,
     /// The space what waits to be written is kept in, for every process to read, attached when it is first
     /// needed - by a set that can be written behind, or asked for ahead of one (`Storage::prepare`); none where
@@ -228,7 +233,7 @@ struct Shared {
 #[derive(Default)]
 struct State {
     /// What was written since it was last had on disk.
-    unsynced: BTreeSet<PathBuf>,
+    unsynced: BTreeSet<HostPath>,
     /// Where the first set began whose files are not all on disk: from there the log is needed.
     since: Option<u64>,
     /// The set said whole whose files are being written this moment.
@@ -253,7 +258,9 @@ impl Shared {
         let attach = || {
             let root = &self.root;
             let space = crate::shared::space(root)
-                .inspect_err(|e| eprintln!("{}: nothing is written behind, the shared space cannot be had: {e}", root.display()))
+                .inspect_err(|e| {
+                    eprintln!("{}: nothing is written behind, the shared space cannot be had: {e}", root.display());
+                })
                 .ok()?;
             read_through(root, space.clone());
             Some(space)
@@ -321,7 +328,10 @@ impl Shared {
         match flushed {
             // Not on disk, the sets are not to reach the files: said, and tried again with what comes next.
             Err(e) => {
-                eprintln!("{}: what was changed could not be had on disk in the log, and waits: {e}", self.root.display());
+                eprintln!(
+                    "{}: what was changed could not be had on disk in the log, and waits: {e}",
+                    self.root.display()
+                );
                 let mut state = self.lock();
                 for set in sets.into_iter().rev() {
                     state.behind.push_front(set);
@@ -347,7 +357,8 @@ impl Shared {
                 let mut txn = space.write()?;
                 for (began, _, files) in &sets {
                     for file in files.iter().filter(|file| !file.folder) {
-                        let Some(name) = name_in(&self.root, &file.path) else { continue };
+                        // Every file kept waiting was named so (`defers`).
+                        let name = name_in(&self.root, &file.path).map_err(std::io::Error::other)?;
                         let ours = sfs::tree::get(&txn, WAITING, name.as_bytes())?
                             .is_some_and(|value| value.first_chunk::<8>() == Some(&began.to_le_bytes()));
                         if ours {
@@ -389,15 +400,22 @@ impl Shared {
             return;
         }
         if now != file.before {
-            let aside = self.root.join(crate::cache::DIR).join("conflicts").join(name_in(&self.root, &file.path).unwrap_or_default());
-            let kept = file.after.as_ref().map(|bytes| {
-                aside.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&aside, bytes))
+            const CONFLICTS: Name = Name::constant("conflicts");
+            // Kept aside by its path within the project, which every file written behind has (`defers`).
+            let conflicts = self.root.join(&crate::cache::DIR).join(&CONFLICTS);
+            let kept = file.after.as_ref().map(|bytes| -> std::io::Result<HostPath> {
+                let aside = conflicts.join(&file.path.within(&self.root).map_err(std::io::Error::other)?);
+                if let Some(folder) = aside.parent() {
+                    std::fs::create_dir_all(&folder)?;
+                }
+                std::fs::write(&aside, bytes)?;
+                Ok(aside)
             });
             eprintln!(
                 "{}: changed by something else while `{label}` waited to be written: left as it is{}",
                 file.path.display(),
                 match kept {
-                    Some(Ok(())) => format!(", what `{label}` made of it kept in {}", aside.display()),
+                    Some(Ok(aside)) => format!(", what `{label}` made of it kept in {aside}"),
                     Some(Err(e)) => format!(", and what `{label}` made of it lost: {e}"),
                     None => String::new(),
                 }
@@ -421,7 +439,10 @@ impl Shared {
         };
         if let Err(e) = done {
             // Said whole in the log: written again from it by whoever takes the project next.
-            eprintln!("{}: `{label}` could not be written, and is written again from the log later: {e}", file.path.display());
+            eprintln!(
+                "{}: `{label}` could not be written, and is written again from the log later: {e}",
+                file.path.display()
+            );
         }
     }
 
@@ -488,11 +509,11 @@ impl Storage {
     /// The storage of the project in `root`; none where its log cannot be opened - what is written is then written
     /// as it comes, with nothing to take it up from.
     #[must_use]
-    pub fn open(root: &Path) -> Option<Storage> {
+    pub fn open(root: &HostPath) -> Option<Storage> {
         let log = sfs::Log::shared(&log_dir(root), sfs::log::Config::default());
         let log = log.inspect_err(|e| eprintln!("{}: no log to write through: {e}", root.display())).ok()?;
         let shared = Arc::new(Shared {
-            root: root.to_path_buf(),
+            root: root.clone(),
             log,
             space: std::sync::OnceLock::new(),
             prepare: std::sync::atomic::AtomicBool::new(false),
@@ -505,14 +526,19 @@ impl Storage {
             let shared = shared.clone();
             std::thread::Builder::new().name("storage".into()).spawn(move || shared.run()).ok()
         };
-        Some(Storage { root: root.to_path_buf(), shared, syncing })
+        Some(Storage { root: root.clone(), shared, syncing })
     }
 
     /// A path as the log says it: within the project, from its root; elsewhere - a tree mounted from another
     /// place - whole.
     #[must_use]
-    pub fn name(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+    pub fn name(&self, path: &HostPath) -> String {
+        // Whole, where it is not within by names: elsewhere, or within by a name no path takes - which is read back
+        // as the place it is all the same (`again`).
+        match path.within(&self.root) {
+            Ok(within) => within.as_str().to_owned(),
+            Err(NotWithin::Outside | NotWithin::Refused(_)) => path.to_string(),
+        }
     }
 
     /// Say a set of changes whole, and have it on disk: where it began. Only then are its files to be touched -
@@ -577,9 +603,11 @@ impl Storage {
     #[must_use]
     pub fn defers(&self, files: &[Behind]) -> bool {
         let record = |file: &Behind| {
-            let shard = if file.folder { Some(file.path.as_path()) } else { file.path.parent() };
-            let records = shard.filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2)).and_then(Path::parent);
-            let named = file.path.starts_with(&self.root) && self.name(&file.path).len() <= WAITING_PATH;
+            let shard = if file.folder { Some(file.path.clone()) } else { file.path.parent() };
+            let records = shard
+                .filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2))
+                .and_then(|shard| shard.parent());
+            let named = name_in(&self.root, &file.path).is_ok_and(|name| name.len() <= WAITING_PATH);
             named && records.is_some_and(|records| records.file_name().is_some_and(|name| name == crate::records::DIR))
         };
         // The space is asked for last: what holds a project and never changes a record attaches none.
@@ -621,7 +649,8 @@ impl Storage {
             // Read by every process from here on, as this set leaves them.
             let mut txn = space.write()?;
             for file in files.iter().filter(|file| !file.folder) {
-                sfs::tree::put(&mut txn, WAITING, self.name(&file.path).as_bytes(), &waits_as(began, file))?;
+                let name = name_in(&self.root, &file.path).map_err(std::io::Error::other)?;
+                sfs::tree::put(&mut txn, WAITING, name.as_bytes(), &waits_as(began, file))?;
             }
             txn.commit().map_err(std::io::Error::from)
         })();
@@ -657,7 +686,12 @@ impl Storage {
         }
         while (!state.behind.is_empty() || state.writing) && !state.stopping {
             self.shared.wake.notify_all();
-            state = self.shared.wake.wait_timeout(state, Duration::from_millis(50)).unwrap_or_else(PoisonError::into_inner).0;
+            state = self
+                .shared
+                .wake
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -669,7 +703,7 @@ impl Storage {
     }
 
     /// The files of the set said last were written, these: to be had on disk soon, off this thread.
-    pub fn wrote(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+    pub fn wrote(&mut self, paths: impl IntoIterator<Item = HostPath>) {
         let mut state = self.shared.lock();
         state.unsynced.extend(paths);
         state.open = state.behind.front().map(|(began, _, _)| *began);
@@ -715,18 +749,19 @@ impl Drop for Storage {
 
 /// Have a file on disk: best effort - one gone since is nothing to have. Opened to read where that lets it be
 /// flushed, which a file kept read-only is too.
-pub(crate) fn sync_file(path: &Path) {
-    let opened = if cfg!(unix) { std::fs::File::open(path) } else { std::fs::OpenOptions::new().write(true).open(path) };
+pub(crate) fn sync_file(path: &HostPath) {
+    let opened =
+        if cfg!(unix) { std::fs::File::open(path) } else { std::fs::OpenOptions::new().write(true).open(path) };
     if let Ok(file) = opened {
         let _ = file.sync_all();
     }
 }
 
 /// Have files and folders on disk, each with the folder it is in.
-fn sync(paths: &BTreeSet<PathBuf>) {
+fn sync(paths: &BTreeSet<HostPath>) {
     let mut folders = BTreeSet::new();
     for path in paths {
-        folders.extend(path.parent().map(Path::to_path_buf));
+        folders.extend(path.parent());
         if path.is_dir() {
             folders.insert(path.clone());
         } else {
@@ -748,10 +783,10 @@ fn sync(paths: &BTreeSet<PathBuf>) {
 ///
 /// # Errors
 /// The log cannot be read, or a file cannot be written.
-pub fn redo(root: &Path) -> Result<Option<String>> {
+pub fn redo(root: &HostPath) -> Result<Option<String>> {
     let dir = log_dir(root);
     // No log, nothing was ever written through one: none is made to find that out.
-    if !dir.join(sfs::header::FILE).is_file() {
+    if !dir.join(&sfs::header::FILE).is_file() {
         return Ok(None);
     }
     let log = sfs::Log::shared(&dir, sfs::log::Config::default()).with_context(|| dir.display().to_string())?;
@@ -784,8 +819,8 @@ pub fn redo(root: &Path) -> Result<Option<String>> {
 /// Nothing waits to be written of the project in `root` any more - whoever said it is gone, and what it said whole
 /// was written again from the log: what the shared space still keeps as waiting, where a process has it attached
 /// still, is taken out.
-fn forget_waiting(root: &Path) {
-    let dir = root.join(crate::cache::DIR).join(crate::cache::STAGING).join(crate::shared::SPACE);
+fn forget_waiting(root: &HostPath) {
+    let dir = root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&crate::shared::SPACE);
     if !dir.is_dir() {
         return;
     }
@@ -807,42 +842,53 @@ fn forget_waiting(root: &Path) {
 }
 
 /// Make one change again: as it left the files, whatever of it they have already.
-fn again(root: &Path, change: &Stored, written: &mut BTreeSet<PathBuf>) -> Result<()> {
-    let at = |name: &str| if Path::new(name).is_absolute() { PathBuf::from(name) } else { root.join(name) };
+fn again(root: &HostPath, change: &Stored, written: &mut BTreeSet<HostPath>) -> Result<()> {
+    // As `Storage::name` said it: within the project, or whole.
+    let at = |name: &str| -> Result<HostPath> {
+        if Path::new(name).is_absolute() {
+            HostPath::from_plain(name.into()).with_context(|| format!("{name}: no place in its plain form"))
+        } else {
+            Ok(root.join(&RelPath::new(name)?))
+        }
+    };
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     match change {
         Stored::Put { path, bytes } => {
-            let path = at(path);
+            let path = at(path)?;
             if let Some(folder) = path.parent() {
-                std::fs::create_dir_all(folder).with_context(|| folder.display().to_string())?;
+                std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
             }
             crate::cache::write_atomic(&path, bytes)?;
             written.insert(path);
         }
-        Stored::Delete { path } => match std::fs::remove_file(at(path)) {
-            Err(e) if !gone(&e) => return Err(e).context(path.clone()),
-            _ => drop(written.insert(at(path))),
-        },
+        Stored::Delete { path } => {
+            let path = at(path)?;
+            match std::fs::remove_file(&path) {
+                Err(e) if !gone(&e) => return Err(e).context(path.to_string()),
+                _ => drop(written.insert(path)),
+            }
+        }
         Stored::Move { from, to } => {
-            let (from, to) = (at(from), at(to));
+            let (from, to) = (at(from)?, at(to)?);
             // Moved already where nothing is left to move; else what is in its way - what a move replaces - goes.
             if from.exists() {
                 if to.is_file() {
                     std::fs::remove_file(&to).with_context(|| to.display().to_string())?;
                 }
                 if let Some(folder) = to.parent() {
-                    std::fs::create_dir_all(folder).with_context(|| folder.display().to_string())?;
+                    std::fs::create_dir_all(&folder).with_context(|| folder.to_string())?;
                 }
                 std::fs::rename(&from, &to).with_context(|| format!("{} -> {}", from.display(), to.display()))?;
             }
             written.extend([from, to]);
         }
         Stored::MakeDir { path } => {
-            std::fs::create_dir_all(at(path)).with_context(|| path.clone())?;
-            written.insert(at(path));
+            let path = at(path)?;
+            std::fs::create_dir_all(&path).with_context(|| path.to_string())?;
+            written.insert(path);
         }
         Stored::RemoveDir { path } => {
-            let path = at(path);
+            let path = at(path)?;
             if std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
                 std::fs::remove_dir(&path).with_context(|| path.display().to_string())?;
             }
@@ -856,17 +902,18 @@ fn again(root: &Path, change: &Stored, written: &mut BTreeSet<PathBuf>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{Storage, Stored, log_dir};
+    use crate::testing::At as _;
 
     #[test]
     fn the_log_is_needed_until_what_was_written_is_on_disk() {
-        let root = std::env::temp_dir().join(format!("pe2-storage-{}", std::process::id()));
+        let root = crate::testing::scratch("storage");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let log = sfs::Log::shared(&log_dir(&root), sfs::log::Config::default()).unwrap();
         let needed = || log.header().storage();
         let mut storage = Storage::open(&root).unwrap();
         assert_eq!(needed(), None, "nothing written, nothing needed");
-        let file = root.join("a.txt");
+        let file = root.at("a.txt");
         let put = |text: &str| [Stored::Put { path: "a.txt".into(), bytes: text.as_bytes().to_vec() }];
         // Said whole: from there the log is needed, while its files are written and after.
         let first = storage.say("one", &put("one")).unwrap();

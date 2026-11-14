@@ -36,6 +36,7 @@ editor fills from discs you own.
 - [Events](making/events.md): what makes outputs, and when
 - [Configurations](making/configurations.md): building the project more than one way
 - [Your own operations and templates](making/own-operations.md)
+- [Builds](making/builds.md): how a package is built, by which programs, and builds generated
 
 **5. Built-in views**
 

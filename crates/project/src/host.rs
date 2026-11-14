@@ -16,14 +16,20 @@
 use anyhow::{Context, Result};
 use interprocess::local_socket::Name;
 use interprocess::local_socket::prelude::*;
+use pe2_path::HostPath;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::time::Duration;
 
 use crate::role::{Link, Role};
 
 /// The host, as a process of a project.
-pub static ROLE: Role = Role { command: "host", socket: "host.sock", pipe: "pe2-host", lock: "host.lock", log: "host.log" };
+pub static ROLE: Role = Role {
+    command: "host",
+    socket: pe2_path::Name::constant("host.sock"),
+    pipe: "pe2-host",
+    lock: pe2_path::Name::constant("host.lock"),
+    log: pe2_path::Name::constant("host.log"),
+};
 
 /// What a process says to the host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,11 +81,10 @@ pub enum FromHost {
 }
 
 /// The project in `root`'s path, hashed: what keeps a name global to the machine to that project.
-fn hashed(root: &Path) -> String {
+fn hashed(root: &HostPath) -> String {
     use sha1::Digest;
     use std::fmt::Write;
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let digest = sha1::Sha1::digest(root.to_string_lossy().to_lowercase().as_bytes());
+    let digest = sha1::Sha1::digest(root.to_string().to_lowercase().as_bytes());
     digest.iter().take(8).fold(String::new(), |mut hex, b| {
         let _ = write!(hex, "{b:02x}");
         hex
@@ -92,18 +97,20 @@ fn hashed(root: &Path) -> String {
 ///
 /// # Errors
 /// The name cannot be made.
-pub fn local_name(root: &Path, file: &str, prefix: &str) -> std::io::Result<Name<'static>> {
+pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::io::Result<Name<'static>> {
     #[cfg(unix)]
     {
         use interprocess::local_socket::GenericFilePath;
         // `sun_path`: 108 bytes on Linux, 104 on macOS, its terminating zero among them.
-        let path = root.join(crate::cache::DIR).join(file);
+        let path = root.join(&crate::cache::DIR).join(file);
         let path = if path.as_os_str().len() < 100 {
             path
         } else {
-            std::env::temp_dir().join(format!("{prefix}-{}.sock", hashed(root)))
+            let name =
+                pe2_path::Name::new(&format!("{prefix}-{}.sock", hashed(root))).map_err(std::io::Error::other)?;
+            HostPath::new(&std::env::temp_dir())?.join(&name)
         };
-        path.to_fs_name::<GenericFilePath>()
+        path.into_path_buf().to_fs_name::<GenericFilePath>()
     }
     #[cfg(windows)]
     {
@@ -122,7 +129,7 @@ pub struct Connection {
 impl Connection {
     /// Connect to the host of the project in `root`; none where none listens.
     #[must_use]
-    pub fn connect(root: &Path) -> Option<Connection> {
+    pub fn connect(root: &HostPath) -> Option<Connection> {
         ROLE.connect(root).map(|link| Connection { link })
     }
 
@@ -149,7 +156,7 @@ pub struct Lease {
 /// Borrow the project from the host holding it, for `who`: the host lets go of the lock, and takes it back once the
 /// lease is dropped. None where no host holds it.
 #[must_use]
-pub fn borrow(root: &Path, who: &str) -> Option<Lease> {
+pub fn borrow(root: &HostPath, who: &str) -> Option<Lease> {
     let mut connection = Connection::connect(root)?;
     match connection.ask(&ToHost::Lend { who: who.to_string() }) {
         Ok(FromHost::Lent) => Some(Lease { _connection: connection }),
@@ -162,7 +169,7 @@ const STOPPING: Duration = Duration::from_secs(30);
 
 /// Whether a host runs for the project in `root`.
 #[must_use]
-pub fn running(root: &Path) -> bool {
+pub fn running(root: &HostPath) -> bool {
     ROLE.running(root)
 }
 
@@ -173,7 +180,7 @@ pub fn running(root: &Path) -> bool {
 ///
 /// # Errors
 /// No host could be started.
-pub fn serving(root: &Path, program: &Path, args: &[String]) -> Result<(Connection, bool)> {
+pub fn serving(root: &HostPath, program: &HostPath, args: &[String]) -> Result<(Connection, bool)> {
     if let Some(mut host) = Connection::connect(root) {
         match host.ask(&ToHost::Status) {
             Ok(FromHost::Status { serves: false, .. }) => {
@@ -188,10 +195,10 @@ pub fn serving(root: &Path, program: &Path, args: &[String]) -> Result<(Connecti
 }
 
 /// The program a host is started as, where this one starts hosts for what is asked of a project (`ensure`).
-static STARTER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static STARTER: std::sync::OnceLock<HostPath> = std::sync::OnceLock::new();
 
 /// Start hosts as this program (`pe2-cli`) from now on, where something is asked of a project nothing holds.
-pub fn start_hosts_with(program: std::path::PathBuf) {
+pub fn start_hosts_with(program: HostPath) {
     let _ = STARTER.set(program);
 }
 
@@ -199,7 +206,7 @@ pub fn start_hosts_with(program: std::path::PathBuf) {
 /// serving its folder nowhere. Whether one runs. None is started by a program that was not told what a host is
 /// started as (`start_hosts_with`), nor by one working under another's lock - which then does the work itself.
 #[must_use]
-pub fn ensure(root: &Path) -> bool {
+pub fn ensure(root: &HostPath) -> bool {
     let Some(program) = STARTER.get() else { return false };
     if crate::lock::inherited(root) {
         return false;
@@ -211,7 +218,7 @@ pub fn ensure(root: &Path) -> bool {
         Ok(_) => true,
         Err(e) => {
             static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| eprintln!("no host could be started for {}: {e:#}; the work is done here", shown(root)));
+            SAID.call_once(|| eprintln!("no host could be started for {root}: {e:#}; the work is done here"));
             false
         }
     }
@@ -223,7 +230,7 @@ pub fn ensure(root: &Path) -> bool {
 ///
 /// # Errors
 /// None runs, and none could be started.
-pub fn stand_by(root: &Path, program: &Path) -> Result<()> {
+pub fn stand_by(root: &HostPath, program: &HostPath) -> Result<()> {
     if Connection::connect(root).is_some() {
         return Ok(());
     }
@@ -234,7 +241,7 @@ pub fn stand_by(root: &Path, program: &Path) -> Result<()> {
 /// the host takes it the moment what this returns is dropped - which is to be after the project's lock - where it
 /// would else find it free when it next looked. None where no host listens.
 #[must_use]
-pub fn leaving(root: &Path, who: &str) -> Option<Lease> {
+pub fn leaving(root: &HostPath, who: &str) -> Option<Lease> {
     let mut connection = Connection::connect(root)?;
     match connection.ask(&ToHost::Leaving { who: who.to_string() }) {
         Ok(FromHost::Awaiting) => Some(Lease { _connection: connection }),
@@ -245,7 +252,7 @@ pub fn leaving(root: &Path, who: &str) -> Option<Lease> {
 /// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.
 /// One something keeps - an editor it serves the folder for, `project serve` - is left.
 #[must_use]
-pub fn replace(root: &Path) -> bool {
+pub fn replace(root: &HostPath) -> bool {
     let Some(mut host) = Connection::connect(root) else { return !running(root) };
     if !matches!(host.ask(&ToHost::Status), Ok(FromHost::Status { leases: 0, .. })) {
         return false;
@@ -258,7 +265,7 @@ pub fn replace(root: &Path) -> bool {
 /// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
 /// where it lent the project, or something else holds it.
 #[must_use]
-pub fn answers(root: &Path) -> bool {
+pub fn answers(root: &HostPath) -> bool {
     let status = Connection::connect(root).and_then(|mut host| host.ask(&ToHost::Status).ok());
     matches!(status, Some(FromHost::Status { holder, .. }) if holder == "the host" || holder == "nobody")
 }
@@ -268,37 +275,23 @@ pub fn answers(root: &Path) -> bool {
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.
-pub fn start(root: &Path, program: &Path, args: &[String]) -> Result<Connection> {
+pub fn start(root: &HostPath, program: &HostPath, args: &[String]) -> Result<Connection> {
     ROLE.start(root, program, args).map(|link| Connection { link })
-}
-
-/// A path as a person reads it: on Windows, without the verbatim prefix a canonical path has (`\\?\D:\...`).
-#[must_use]
-pub fn shown(path: &Path) -> String {
-    let text = path.display().to_string();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) => rest.strip_prefix("UNC\\").map_or_else(|| rest.to_string(), |share| format!(r"\\{share}")),
-        None => text,
-    }
 }
 
 /// Where `pe2-cli` is for a program beside it (the editor): in the same folder.
 #[must_use]
-pub fn cli_beside(program: &Path) -> std::path::PathBuf {
-    program.with_file_name(format!("pe2-cli{}", std::env::consts::EXE_SUFFIX))
+pub fn cli_beside(program: &HostPath) -> HostPath {
+    let cli = pe2_path::Name::new(&format!("pe2-cli{}", std::env::consts::EXE_SUFFIX));
+    match (program.parent(), cli) {
+        (Some(folder), Ok(cli)) => folder.join(&cli),
+        _ => program.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FromHost, ToHost};
-
-    #[test]
-    fn a_path_is_shown_without_its_verbatim_prefix() {
-        use std::path::Path;
-        assert_eq!(super::shown(Path::new(r"\\?\D:\p\assets")), r"D:\p\assets");
-        assert_eq!(super::shown(Path::new(r"\\?\UNC\wsl.localhost\p")), r"\\wsl.localhost\p");
-        assert_eq!(super::shown(Path::new("/home/p")), "/home/p");
-    }
 
     #[test]
     fn messages_are_json_by_what_they_say() {

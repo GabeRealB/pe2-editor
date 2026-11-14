@@ -16,14 +16,14 @@
 //! and a WSL one would not see each other's locks across that share anyway.
 
 use anyhow::{Context, Result};
+use pe2_path::{HostPath, Name};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::cache::DIR;
 
-const LOCK: &str = "lock";
-const OWNER: &str = "lock.owner";
+const LOCK: Name = Name::constant("lock");
+const OWNER: Name = Name::constant("lock.owner");
 const HELD: &str = "PE2_PROJECT_LOCKED";
 
 /// A project held: the lock lasts until this is dropped. None when a parent process holds it for this one.
@@ -36,9 +36,10 @@ pub struct Lock {
 }
 
 /// Whether a parent process holds the project in `root` for this one.
-pub(crate) fn inherited(root: &Path) -> bool {
-    let held = std::env::var_os(HELD).map(PathBuf::from);
-    held.is_some_and(|h| std::fs::canonicalize(h).ok() == std::fs::canonicalize(root).ok())
+pub(crate) fn inherited(root: &HostPath) -> bool {
+    // The place the environment names, as the system names it.
+    let held = std::env::var_os(HELD).and_then(|held| HostPath::new(std::path::Path::new(&held)).ok());
+    held.is_some_and(|held| held == *root)
 }
 
 /// Why a project could not be locked.
@@ -60,12 +61,12 @@ impl std::fmt::Display for LockError {
 
 impl std::error::Error for LockError {}
 
-fn paths(root: &Path) -> (PathBuf, PathBuf) {
-    let dir = root.join(DIR);
-    (dir.join(LOCK), dir.join(OWNER))
+fn paths(root: &HostPath) -> (HostPath, HostPath) {
+    let dir = root.join(&DIR);
+    (dir.join(&LOCK), dir.join(&OWNER))
 }
 
-fn open(root: &Path) -> Result<File> {
+fn open(root: &HostPath) -> Result<File> {
     let (lock, _) = paths(root);
     crate::cache::make(root)?;
     OpenOptions::new()
@@ -77,14 +78,14 @@ fn open(root: &Path) -> Result<File> {
 }
 
 /// Who holds the project, as its owner file says.
-fn owner(root: &Path) -> String {
-    std::fs::read_to_string(paths(root).1).map_or_else(|_| "another process".into(), |s| s.trim().to_string())
+fn owner(root: &HostPath) -> String {
+    std::fs::read_to_string(&paths(root).1).map_or_else(|_| "another process".into(), |s| s.trim().to_string())
 }
 
 /// Record who holds the lock now.
-fn claim(root: &Path, file: File, who: &str) -> Result<Lock, LockError> {
+fn claim(root: &HostPath, file: File, who: &str) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {})", std::process::id());
-    std::fs::write(paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
+    std::fs::write(&paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
     Ok(Lock { file: Some(file), unprotected: None, _borrowed: None })
 }
 
@@ -103,9 +104,9 @@ fn unsupported(e: &std::io::Error) -> bool {
 }
 
 /// The project, held without a lock where its file system cannot lock: who works on it is still recorded.
-fn unprotected(root: &Path, lock: &Path, who: &str, e: &std::io::Error) -> Result<Lock, LockError> {
+fn unprotected(root: &HostPath, lock: &HostPath, who: &str, e: &std::io::Error) -> Result<Lock, LockError> {
     let owner = format!("{who} (process {}, without a lock)", std::process::id());
-    std::fs::write(paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
+    std::fs::write(&paths(root).1, owner).map_err(|e| LockError::Io(e.into()))?;
     let why = format!(
         "{} cannot be locked on its file system ({e}): nothing keeps another editor or tool from working on the \
          project at the same time",
@@ -118,7 +119,7 @@ fn unprotected(root: &Path, lock: &Path, who: &str, e: &std::io::Error) -> Resul
 /// let go of at once, which writes nothing: a process taking the project at that same instant is refused, and tries
 /// again as it would on any holder.
 #[must_use]
-pub fn holder(root: &Path) -> Option<String> {
+pub fn holder(root: &HostPath) -> Option<String> {
     let (lock, _) = paths(root);
     let file = OpenOptions::new().read(true).open(&lock).ok()?;
     // Taken, or not lockable at all: nobody holds it by a lock.
@@ -143,7 +144,7 @@ impl Lock {
     ///
     /// # Errors
     /// Another process holds the project, or the lock file cannot be made.
-    pub fn try_acquire(root: &Path, who: &str) -> Result<Lock, LockError> {
+    pub fn try_acquire(root: &HostPath, who: &str) -> Result<Lock, LockError> {
         Lock::try_lock(root, who, true)
     }
 
@@ -151,11 +152,11 @@ impl Lock {
     ///
     /// # Errors
     /// As `try_acquire`.
-    pub fn try_take(root: &Path, who: &str) -> Result<Lock, LockError> {
+    pub fn try_take(root: &HostPath, who: &str) -> Result<Lock, LockError> {
         Lock::try_lock(root, who, false)
     }
 
-    fn try_lock(root: &Path, who: &str, borrowing: bool) -> Result<Lock, LockError> {
+    fn try_lock(root: &HostPath, who: &str, borrowing: bool) -> Result<Lock, LockError> {
         if inherited(root) {
             return Ok(Lock { file: None, unprotected: None, _borrowed: None });
         }
@@ -184,7 +185,7 @@ impl Lock {
     ///
     /// # Errors
     /// The project is still held after `limit`, or the lock file cannot be made.
-    pub fn acquire_within(root: &Path, who: &str, limit: Duration) -> Result<Lock, LockError> {
+    pub fn acquire_within(root: &HostPath, who: &str, limit: Duration) -> Result<Lock, LockError> {
         let start = Instant::now();
         loop {
             match Lock::try_acquire(root, who) {
@@ -199,7 +200,7 @@ impl Lock {
     ///
     /// # Errors
     /// The lock file cannot be made or locked.
-    pub fn acquire(root: &Path, who: &str, waiting: impl FnOnce(&str)) -> Result<Lock, LockError> {
+    pub fn acquire(root: &HostPath, who: &str, waiting: impl FnOnce(&str)) -> Result<Lock, LockError> {
         let mut waiting = Some(waiting);
         loop {
             match Lock::try_acquire(root, who) {
@@ -218,14 +219,15 @@ impl Lock {
 #[cfg(test)]
 mod tests {
     use super::{Lock, LockError};
+    use crate::testing::At as _;
 
     #[test]
     fn one_holder_at_a_time() {
-        let root = std::env::temp_dir().join(format!("pe2-lock-{}", std::process::id()));
+        let root = crate::testing::scratch("lock");
         let _ = std::fs::remove_dir_all(&root);
         let held = Lock::try_acquire(&root, "the first").unwrap();
         // Locking a project with no cache yet makes one that git ignores.
-        assert_eq!(std::fs::read_to_string(root.join(".cache/.gitignore")).unwrap(), "*\n");
+        assert_eq!(std::fs::read_to_string(root.at(".cache/.gitignore")).unwrap(), "*\n");
         // A second handle on the file is a second holder to the OS, as another process would be.
         match Lock::try_acquire(&root, "the second") {
             Err(LockError::Held(owner)) => assert!(owner.starts_with("the first"), "{owner}"),
@@ -239,14 +241,14 @@ mod tests {
 
     #[test]
     fn a_file_system_without_locks_holds_unprotected() {
-        let root = std::env::temp_dir().join(format!("pe2-unlockable-{}", std::process::id()));
+        let root = crate::testing::scratch("unlockable");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        std::fs::create_dir_all(root.at(".cache")).unwrap();
         let e = std::io::Error::from(std::io::ErrorKind::Unsupported);
         assert!(super::unsupported(&e));
         assert!(!super::unsupported(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
         let held =
-            super::unprotected(&root, &root.join(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
+            super::unprotected(&root, &root.at(".cache/lock"), "the editor", &e).unwrap_or_else(|e| panic!("{e}"));
         assert!(held.unprotected().is_some_and(|why| why.contains("nothing keeps another editor")));
         drop(held);
         std::fs::remove_dir_all(&root).unwrap();

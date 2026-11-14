@@ -43,10 +43,10 @@
 //!   is found not to be the one pointed to - what is read there is right, of the last commit or one before it,
 //!   or said damaged.
 
+use pe2_path::{HostPath, Name};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -81,7 +81,22 @@ const PIECE: usize = 1 << 16;
 /// The most pieces a list has: room for more entries than a space has pages.
 const PIECES: usize = 2048;
 /// Where what a space held is kept, in its folder, when it is begun anew for not being trusted.
-const LEFT: &str = "left";
+const LEFT: Name = Name::constant("left");
+/// The files a space is kept in, in its folder: what it says of itself, its head, its free lists, who writes it, who
+/// is attached, what is pinned; what grows it, and what is set aside when it is found damaged.
+const CLEAN: Name = Name::constant("clean");
+const HEAD: Name = Name::constant("head");
+const FREE: Name = Name::constant("free");
+const WRITER: Name = Name::constant("writer");
+const ATTACHED_FILE: Name = Name::constant("attached");
+const PINS_FILE: Name = Name::constant("pins");
+const GROW: Name = Name::constant("grow");
+const DAMAGED: Name = Name::constant("damaged");
+
+/// A file of a space's own, named as the space names it (a number and what it holds).
+fn named(text: &str) -> io::Result<Name> {
+    Name::new(text).map_err(io::Error::other)
+}
 /// What a page begins with: its kind (1), nothing (3), its own number (4), the generation that wrote it (8).
 pub const PAGE_HEAD: usize = 16;
 /// How often, at most, a writer that readers hold back looks whether their processes still run.
@@ -218,7 +233,9 @@ impl From<Error> for io::Error {
     fn from(e: Error) -> io::Error {
         match e {
             Error::Io(e) => e,
-            Error::Damaged(why) => io::Error::new(io::ErrorKind::InvalidData, format!("the shared space is damaged: {why}")),
+            Error::Damaged(why) => {
+                io::Error::new(io::ErrorKind::InvalidData, format!("the shared space is damaged: {why}"))
+            }
         }
     }
 }
@@ -260,7 +277,7 @@ impl Drop for Mem {
 /// nothing else reads (`Space::private`).
 enum Backing {
     Files {
-        dir: PathBuf,
+        dir: HostPath,
         /// Kept mapped for as long as the space is.
         maps: Mutex<Vec<memmap2::MmapRaw>>,
         head: memmap2::MmapRaw,
@@ -367,7 +384,7 @@ pub struct Space {
     /// It began empty: what it is to hold is put there again by whoever owns it.
     fresh: AtomicBool,
     /// Where the pages of a space left behind are, with those mapped here: read, never written.
-    left: Option<(PathBuf, Mutex<Vec<memmap2::MmapRaw>>)>,
+    left: Option<(HostPath, Mutex<Vec<memmap2::MmapRaw>>)>,
     #[cfg(test)]
     faults: Mutex<Option<Faults>>,
 }
@@ -383,14 +400,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A file of a space, opened to be read, written and locked: made where there is none.
-fn opened(path: &Path) -> io::Result<File> {
+fn opened(path: &HostPath) -> io::Result<File> {
     std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
 }
 
 /// A file of a space, of at least this length, all of it the file's own on the disk - never a hole a full disk
 /// could refuse to who writes through a mapping: a full disk is an error here, to who asks for the room. Given
 /// by the system where it can give a file its blocks without writing them; written as zeros elsewhere.
-fn sized(path: &Path, len: u64) -> io::Result<File> {
+fn sized(path: &HostPath, len: u64) -> io::Result<File> {
     let file = opened(path)?;
     let has = file.metadata()?.len();
     if has < len {
@@ -441,7 +458,9 @@ fn lists_sum(header: &[u8], piece: &mut dyn FnMut(&str, usize) -> Option<Vec<u8>
     let seen = usize::try_from(number_at(header, listed::SEEN)).ok()?.min((LISTS - listed::AT) / 8);
     let mut sum = crc32fast::Hasher::new();
     sum.update(header.get(..listed::AT + seen * 8)?);
-    for (name, entry, count) in [("free", 8, number_at(header, listed::FREE)), ("held", 24, number_at(header, listed::HELD))] {
+    for (name, entry, count) in
+        [("free", 8, number_at(header, listed::FREE)), ("held", 24, number_at(header, listed::HELD))]
+    {
         let mut left = usize::try_from(count).ok()?;
         let mut number = 0;
         while left > 0 {
@@ -464,8 +483,9 @@ fn said_clean(generation: u64, lists: u32) -> [u8; 12] {
 
 /// Whether the files in `dir` are a space had on disk as it is: `clean` says the generation its header is at - which
 /// is whole, the last commit written, not damaged - and its lists of pages are those it was said with.
-fn is_clean(dir: &Path) -> bool {
-    let (Ok(said), Ok(head), Ok(free)) = (std::fs::read(dir.join("clean")), std::fs::read(dir.join("head")), std::fs::read(dir.join("free")))
+fn is_clean(dir: &HostPath) -> bool {
+    let (Ok(said), Ok(head), Ok(free)) =
+        (std::fs::read(dir.join(&CLEAN)), std::fs::read(dir.join(&HEAD)), std::fs::read(dir.join(&FREE)))
     else {
         return false;
     };
@@ -473,8 +493,11 @@ fn is_clean(dir: &Path) -> bool {
         return false;
     }
     let header = Commit::of_header(&head);
-    let latest = [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation);
-    let lists = lists_sum(&free, &mut |name, number| std::fs::read(dir.join(format!("{number:08}.{name}"))).ok());
+    let latest =
+        [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation);
+    let lists = lists_sum(&free, &mut |name, number| {
+        std::fs::read(dir.join(&named(&format!("{number:08}.{name}")).ok()?)).ok()
+    });
     number_at(&head, at::MAGIC) == MAGIC
         && number_at(&head, at::SEQ) % 2 == 0
         && number_at(&head, at::DAMAGED) == 0
@@ -485,22 +508,22 @@ fn is_clean(dir: &Path) -> bool {
 
 /// Make a chunk's file, whole, where there is none: by one process at a time, under a name of its own until it is
 /// whole - so that no process ever writes zeros into a chunk another is using.
-fn make_chunk(dir: &Path, number: usize) -> io::Result<File> {
-    let path = dir.join(format!("{number:08}.chunk"));
-    let whole = |path: &Path| {
+fn make_chunk(dir: &HostPath, number: usize) -> io::Result<File> {
+    let path = dir.join(&named(&format!("{number:08}.chunk"))?);
+    let whole = |path: &HostPath| {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
         (file.metadata().ok()?.len() >= CHUNK as u64).then_some(file)
     };
     if let Some(file) = whole(&path) {
         return Ok(file);
     }
-    let grow = opened(&dir.join("grow"))?;
+    let grow = opened(&dir.join(&GROW))?;
     grow.lock()?;
     let made = (|| {
         if let Some(file) = whole(&path) {
             return Ok(file);
         }
-        let being_made = dir.join(format!("{number:08}.chunk.{}", std::process::id()));
+        let being_made = dir.join(&named(&format!("{number:08}.chunk.{}", std::process::id()))?);
         let _ = std::fs::remove_file(&being_made);
         drop(sized(&being_made, CHUNK as u64)?);
         std::fs::rename(&being_made, &path)?;
@@ -532,7 +555,12 @@ impl Space {
     /// # Errors
     /// There is no memory for it.
     pub fn private() -> io::Result<Space> {
-        let backing = Backing::Memory { chunks: Mutex::default(), head: Mem::zeroed(3 * PAGE)?, free: Mem::zeroed(LISTS)?, pins: Mem::zeroed(PINNED)? };
+        let backing = Backing::Memory {
+            chunks: Mutex::default(),
+            head: Mem::zeroed(3 * PAGE)?,
+            free: Mem::zeroed(LISTS)?,
+            pins: Mem::zeroed(PINNED)?,
+        };
         let space = Space::with(backing, 0, true);
         space.atom(at::MAGIC).store(MAGIC, Ordering::Release);
         Ok(space)
@@ -543,10 +571,10 @@ impl Space {
     ///
     /// # Errors
     /// Its files cannot be made or mapped, are of another format, or every slot is taken.
-    pub fn open(dir: &Path) -> io::Result<Space> {
+    pub fn open(dir: &HostPath) -> io::Result<Space> {
         std::fs::create_dir_all(dir)?;
-        let writer = opened(&dir.join("writer"))?;
-        let attached = opened(&dir.join("attached"))?;
+        let writer = opened(&dir.join(&WRITER))?;
+        let attached = opened(&dir.join(&ATTACHED_FILE))?;
         // One process attaches at a time: who has it alone decides whether it is trusted before another counts on it.
         writer.lock()?;
         let parts = (|| {
@@ -566,14 +594,14 @@ impl Space {
                 attached.unlock()?;
             }
             attached.lock_shared()?;
-            let head = sized(&dir.join("head"), 3 * PAGE as u64)?;
+            let head = sized(&dir.join(&HEAD), 3 * PAGE as u64)?;
             let head = memmap2::MmapOptions::new().len(3 * PAGE).map_raw(&head)?;
-            let free = sized(&dir.join("free"), LISTS as u64)?;
+            let free = sized(&dir.join(&FREE), LISTS as u64)?;
             let free = memmap2::MmapOptions::new().len(LISTS).map_raw(&free)?;
-            let pins = sized(&dir.join("pins"), PINNED as u64)?;
+            let pins = sized(&dir.join(&PINS_FILE), PINNED as u64)?;
             let pins = memmap2::MmapOptions::new().len(PINNED).map_raw(&pins)?;
             let reader = (0..READERS).find_map(|slot| {
-                let file = opened(&dir.join(format!("reader.{slot}"))).ok()?;
+                let file = opened(&dir.join(&named(&format!("reader.{slot}")).ok()?)).ok()?;
                 file.try_lock().ok().map(|()| (slot, file))
             });
             let (slot, reader) = reader.ok_or_else(|| io::Error::other("every slot of the space is taken"))?;
@@ -586,8 +614,16 @@ impl Space {
                 return Err(e);
             }
         };
-        let backing =
-            Backing::Files { dir: dir.to_path_buf(), maps: Mutex::default(), head, free, pins, writer, attached, _reader: reader };
+        let backing = Backing::Files {
+            dir: dir.clone(),
+            maps: Mutex::default(),
+            head,
+            free,
+            pins,
+            writer,
+            attached,
+            _reader: reader,
+        };
         let space = Space::with(backing, slot, false);
         let made = match space.atom(at::MAGIC).compare_exchange(0, MAGIC, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(true),
@@ -615,11 +651,11 @@ impl Space {
     /// Take a space's pages out of its folder: nothing of it is trusted. Kept aside - in place of what was kept
     /// before - where it was found damaged (`damaged/`), and where it is of this format, as the processes that
     /// had it left it (`left/`, read by `left_behind`).
-    fn set_aside(dir: &Path) -> io::Result<()> {
-        let head = std::fs::read(dir.join("head")).ok();
+    fn set_aside(dir: &HostPath) -> io::Result<()> {
+        let head = std::fs::read(dir.join(&HEAD)).ok();
         let damaged = head.as_ref().is_some_and(|head| number_at(head, at::DAMAGED) != 0);
         let ours = head.as_ref().is_some_and(|head| number_at(head, at::MAGIC) == MAGIC);
-        let aside = if damaged { Some(dir.join("damaged")) } else { ours.then(|| dir.join(LEFT)) };
+        let aside = if damaged { Some(dir.join(&DAMAGED)) } else { ours.then(|| dir.join(&LEFT)) };
         if let Some(aside) = &aside {
             let _ = std::fs::remove_dir_all(aside);
             std::fs::create_dir_all(aside)?;
@@ -630,7 +666,7 @@ impl Space {
                 continue;
             }
             match &aside {
-                Some(aside) => std::fs::rename(entry.path(), aside.join(&name))?,
+                Some(aside) => std::fs::rename(entry.path(), aside.entry(&name))?,
                 None => std::fs::remove_file(entry.path())?,
             }
         }
@@ -646,18 +682,26 @@ impl Space {
     ///
     /// # Errors
     /// There is no memory for it, or its files cannot be read.
-    pub fn left_behind(dir: &Path) -> io::Result<Option<Space>> {
-        let left = dir.join(LEFT);
-        let Ok(head) = std::fs::read(left.join("head")) else { return Ok(None) };
+    pub fn left_behind(dir: &HostPath) -> io::Result<Option<Space>> {
+        let left = dir.join(&LEFT);
+        let Ok(head) = std::fs::read(left.join(&HEAD)) else { return Ok(None) };
         if head.len() < 3 * PAGE || number_at(&head, at::MAGIC) != MAGIC || number_at(&head, at::DAMAGED) != 0 {
             return Ok(None);
         }
         // The commit it is read at: the last written whole, whatever the header says - that is not checked.
-        let Some(commit) = [1usize, 2].iter().filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE])).max_by_key(|c| c.generation)
+        let Some(commit) = [1usize, 2]
+            .iter()
+            .filter_map(|n| Commit::read(&head[n * PAGE..(n + 1) * PAGE]))
+            .max_by_key(|c| c.generation)
         else {
             return Ok(None);
         };
-        let backing = Backing::Memory { chunks: Mutex::default(), head: Mem::zeroed(3 * PAGE)?, free: Mem::zeroed(LISTS)?, pins: Mem::zeroed(PINNED)? };
+        let backing = Backing::Memory {
+            chunks: Mutex::default(),
+            head: Mem::zeroed(3 * PAGE)?,
+            free: Mem::zeroed(LISTS)?,
+            pins: Mem::zeroed(PINNED)?,
+        };
         let mut space = Space::with(backing, 0, false);
         space.left = Some((left, Mutex::default()));
         space.atom(at::MAGIC).store(MAGIC, Ordering::Release);
@@ -666,8 +710,8 @@ impl Space {
     }
 
     /// Let go of what was kept of a space begun anew (`left_behind`): read, or not wanted.
-    pub fn forget_left(dir: &Path) {
-        let _ = std::fs::remove_dir_all(dir.join(LEFT));
+    pub fn forget_left(dir: &HostPath) {
+        let _ = std::fs::remove_dir_all(dir.join(&LEFT));
     }
 
     /// Have room for what is written first: the first chunk made, where there is none - by who can wait for it,
@@ -789,7 +833,10 @@ impl Space {
     /// A piece of one of the lists: mapped here where it is not yet, and made where there is none.
     fn piece(&self, list: &List, number: usize) -> io::Result<*mut u8> {
         let Some(known) = list.pieces.get(number) else {
-            return Err(io::Error::new(io::ErrorKind::StorageFull, "a list of the shared space's pages holds all it may"));
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "a list of the shared space's pages holds all it may",
+            ));
         };
         let mapped = known.load(Ordering::Acquire);
         if !mapped.is_null() {
@@ -814,7 +861,7 @@ impl Space {
                 if !again.is_null() {
                     return Ok(again);
                 }
-                let file = sized(&dir.join(format!("{number:08}.{}", list.name)), PIECE as u64)?;
+                let file = sized(&dir.join(&named(&format!("{number:08}.{}", list.name))?), PIECE as u64)?;
                 let map = memmap2::MmapOptions::new().len(PIECE).map_raw(&file)?;
                 let first = map.as_mut_ptr();
                 maps.push(map);
@@ -869,7 +916,9 @@ impl Space {
             if let Some(from) = self.cell(slot, 0).load(Ordering::SeqCst).checked_sub(1) {
                 readers.from = Some(readers.from.map_or(from, |lowest| lowest.min(from)));
             }
-            readers.at.extend((1..=PINS).filter_map(|cell| self.cell(slot, cell).load(Ordering::SeqCst).checked_sub(1)));
+            readers
+                .at
+                .extend((1..=PINS).filter_map(|cell| self.cell(slot, cell).load(Ordering::SeqCst).checked_sub(1)));
         }
         readers.at.sort_unstable();
         readers.at.dedup();
@@ -878,7 +927,8 @@ impl Space {
 
     /// What readers were at when the held pages were last judged, as the lists' header says.
     fn seen(&self) -> Readers {
-        let count = usize::try_from(self.list(listed::SEEN).load(Ordering::Acquire)).unwrap_or(0).min((LISTS - listed::AT) / 8);
+        let count =
+            usize::try_from(self.list(listed::SEEN).load(Ordering::Acquire)).unwrap_or(0).min((LISTS - listed::AT) / 8);
         Readers {
             at: (0..count).map(|i| self.list(listed::AT + i * 8).load(Ordering::Acquire)).collect(),
             from: self.list(listed::FROM).load(Ordering::Acquire).checked_sub(1),
@@ -967,7 +1017,7 @@ impl Space {
                 }
                 // Of a space left behind: its file, mapped to be read.
                 if let Some((dir, maps)) = &self.left {
-                    let file = match File::open(dir.join(format!("{number:08}.chunk"))) {
+                    let file = match File::open(dir.join(&named(&format!("{number:08}.chunk"))?)) {
                         Ok(file) if file.metadata()?.len() >= CHUNK as u64 => file,
                         _ => return Err(self.damaged(format!("a page in chunk {number}, which is not there whole"))),
                     };
@@ -995,7 +1045,7 @@ impl Space {
                 let file = if make {
                     make_chunk(dir, number)?
                 } else {
-                    let path = dir.join(format!("{number:08}.chunk"));
+                    let path = dir.join(&named(&format!("{number:08}.chunk"))?);
                     match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
                         Ok(file) if file.metadata()?.len() >= CHUNK as u64 => file,
                         Ok(_) => return Err(self.damaged(format!("chunk {number} is not whole"))),
@@ -1130,7 +1180,10 @@ impl Space {
         } else {
             // Every cell says another: said by the lowest of those that have none, from which on this process
             // counts as reading at every generation.
-            let lowest = pins.iter().find(|(_, reading)| reading.cell.is_none()).map_or(generation, |(lowest, _)| generation.min(*lowest));
+            let lowest = pins
+                .iter()
+                .find(|(_, reading)| reading.cell.is_none())
+                .map_or(generation, |(lowest, _)| generation.min(*lowest));
             let from = self.cell(self.slot, 0);
             if from.load(Ordering::SeqCst) == 0 {
                 said.fetch_add(1, Ordering::SeqCst);
@@ -1176,7 +1229,8 @@ impl Space {
         if slot == self.slot {
             return false;
         }
-        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(format!("reader.{slot}"))) else {
+        let Ok(reader) = named(&format!("reader.{slot}")) else { return false };
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(dir.join(&reader)) else {
             return false;
         };
         let gone = file.try_lock().is_ok();
@@ -1201,7 +1255,9 @@ impl Space {
     /// The writer's lock cannot be taken, or the space is damaged.
     pub fn write(&self) -> Result<Txn<'_>> {
         if self.left.is_some() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "a space left behind is read, never written").into());
+            return Err(
+                io::Error::new(io::ErrorKind::PermissionDenied, "a space left behind is read, never written").into()
+            );
         }
         let writing = lock(&self.writing);
         if let Backing::Files { writer, .. } = &self.backing {
@@ -1210,9 +1266,12 @@ impl Space {
         let from = (|| {
             // A writer that died publishing left the header half said: said again from the page it wrote.
             if self.atom(at::SEQ).load(Ordering::Acquire) % 2 == 1 {
-                let written = [0u64, 1].iter().filter_map(|g| Commit::read(self.commit_page(*g))).max_by_key(|c| c.generation);
+                let written =
+                    [0u64, 1].iter().filter_map(|g| Commit::read(self.commit_page(*g))).max_by_key(|c| c.generation);
                 let Some(commit) = written else {
-                    return Err(self.damaged("the header was left half said, and neither page a commit is written to is whole".into()));
+                    return Err(self.damaged(
+                        "the header was left half said, and neither page a commit is written to is whole".into(),
+                    ));
                 };
                 self.publish(&commit);
             }
@@ -1222,7 +1281,18 @@ impl Space {
         match from {
             Ok(from) => {
                 let commit = Commit { generation: from.generation + 1, ..from };
-                Ok(Txn { space: self, writing, from, commit, own: HashSet::new(), let_go: Vec::new(), spare: Vec::new(), looked: false, touched: false, done: false })
+                Ok(Txn {
+                    space: self,
+                    writing,
+                    from,
+                    commit,
+                    own: HashSet::new(),
+                    let_go: Vec::new(),
+                    spare: Vec::new(),
+                    looked: false,
+                    touched: false,
+                    done: false,
+                })
             }
             Err(e) => {
                 self.unlock_writer();
@@ -1335,7 +1405,7 @@ impl Space {
                 std::fs::OpenOptions::new().read(true).write(true).open(entry.path())?.sync_all()?;
             }
         }
-        let clean = dir.join("clean");
+        let clean = dir.join(&CLEAN);
         // SAFETY: the lists' header, whole; nobody writes it but who has the writer's lock, held here.
         let header = unsafe { std::slice::from_raw_parts(self.lists(), LISTS) }.to_vec();
         let lists = lists_sum(&header, &mut |name, number| {
@@ -1360,7 +1430,7 @@ impl Space {
             return Ok(());
         }
         if let Backing::Files { dir, .. } = &self.backing {
-            match std::fs::remove_file(dir.join("clean")) {
+            match std::fs::remove_file(dir.join(&CLEAN)) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
@@ -1802,7 +1872,11 @@ impl Txn<'_> {
     /// The space is damaged, or can no longer be said not to be as it was had on disk.
     pub fn commit(mut self) -> Result<()> {
         self.space.sound()?;
-        if self.own.is_empty() && self.let_go.is_empty() && self.commit.roots == self.from.roots && self.commit.log == self.from.log {
+        if self.own.is_empty()
+            && self.let_go.is_empty()
+            && self.commit.roots == self.from.roots
+            && self.commit.log == self.from.log
+        {
             self.done = true;
             return Ok(());
         }
@@ -1822,7 +1896,9 @@ impl Txn<'_> {
         for page in std::mem::take(&mut self.let_go) {
             let written = if any {
                 // SAFETY: the head of a page this transaction reached, which nobody writes.
-                let Ok(head) = self.space.page_at(page, false).map(|at| unsafe { std::slice::from_raw_parts(at, PAGE_HEAD) }) else {
+                let Ok(head) =
+                    self.space.page_at(page, false).map(|at| unsafe { std::slice::from_raw_parts(at, PAGE_HEAD) })
+                else {
                     continue;
                 };
                 number_at(head, 8)
@@ -1864,7 +1940,7 @@ impl Drop for Txn<'_> {
 }
 
 /// The spaces this process has attached (`shared`), each by its folder: for as long as it runs.
-static OPEN: Mutex<Vec<(PathBuf, Arc<Space>)>> = Mutex::new(Vec::new());
+static OPEN: Mutex<Vec<(pe2_path::HostPath, Arc<Space>)>> = Mutex::new(Vec::new());
 
 /// Leave every space this process has attached as whoever next attaches alone may trust it (`Space::leave`): what a
 /// process does last as it ends in order - one that ends runs nothing more of its own, and whatever of it still
@@ -1883,9 +1959,9 @@ pub fn rest_all() -> io::Result<()> {
 ///
 /// # Errors
 /// As `Space::open`.
-pub fn shared(dir: &Path) -> io::Result<Arc<Space>> {
+pub fn shared(dir: &pe2_path::HostPath) -> io::Result<Arc<Space>> {
     std::fs::create_dir_all(dir)?;
-    let dir = dir.canonicalize()?;
+    let dir = dir.clone();
     let mut open = lock(&OPEN);
     if let Some((_, space)) = open.iter().find(|(at, _)| *at == dir) {
         return Ok(space.clone());

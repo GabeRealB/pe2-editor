@@ -1,6 +1,7 @@
 //! Builds the built-in extensions as components (`wasm32-wasip3`, release, in the target directory's `extensions`
 //! folder, apart from this build's own) for `src/lib.rs` to embed: one `cargo build` makes the editor and its
 //! extensions.
+#![allow(clippy::disallowed_methods, reason = "a build script: it lays out files by the folders cargo gives it")]
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};

@@ -233,7 +233,10 @@ mod tests {
         answer(&mut txn, &[(first[0], Ok("Create folder a".into())), (first[1], Err("not here".into()))]).unwrap();
         txn.commit().unwrap();
         assert_eq!(due(&space.read().unwrap()).unwrap().len(), 1);
-        assert_eq!(settle(&space, &first, true).unwrap(), [Some(Ok("Create folder a".into())), Some(Err("not here".into()))]);
+        assert_eq!(
+            settle(&space, &first, true).unwrap(),
+            [Some(Ok("Create folder a".into())), Some(Err("not here".into()))]
+        );
         // Taken out: asked again, there is nothing to say of them.
         assert_eq!(settle(&space, &first, true).unwrap(), [None, None]);
         // The third is taken back while still due: answered after that, it is answered to nobody.
@@ -265,7 +268,8 @@ mod tests {
         assert_eq!(settle(&space, &said, false).unwrap(), [None, None]);
         // And a written file's content, long as its ranges are, is said as it is.
         let ranges = (0..4000u64).map(|at| (at * 4096, at * 9000, 4096)).collect::<Vec<_>>();
-        let written = crate::write::Written::Logged { log: "/somewhere/sfs".into(), len: 4000 * 4096, ranges };
+        let log = pe2_path::testing::scratch("due-log");
+        let written = crate::write::Written::Logged { log, len: 4000 * 4096, ranges };
         let op = Op::Write { path: "big.bin".into(), from: written };
         put(&space, std::slice::from_ref(&op)).unwrap();
         assert_eq!(due(&space.read().unwrap()).unwrap()[0].1, op);

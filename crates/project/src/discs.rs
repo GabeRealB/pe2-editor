@@ -6,22 +6,22 @@
 use anyhow::{Context, Result, bail};
 use formats::cdf::{self, Source};
 use formats::iso::{self, Image};
+use pe2_path::{HostPath, Name};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use crate::extract::sha1_file;
 
 /// A disc image in `roms`, by size and sha1 (its name may differ).
-pub(crate) fn find_disc(roms: &Path, name: &str, size: u64, sha1: &str) -> Result<PathBuf> {
-    let named = roms.join(name);
+pub(crate) fn find_disc(roms: &HostPath, name: &str, size: u64, sha1: &str) -> Result<HostPath> {
+    let named = roms.join(&Name::new(name)?);
     let mut candidates = vec![];
     if named.is_file() {
         candidates.push(named.clone());
     }
-    let mut others: Vec<PathBuf> = fs::read_dir(roms)
+    let mut others: Vec<HostPath> = fs::read_dir(roms)
         .with_context(|| format!("{}", roms.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter_map(|e| e.ok().map(|e| roms.entry(&e.file_name())))
         .filter(|p| p.is_file() && *p != named)
         .collect();
     others.sort();
@@ -49,7 +49,7 @@ pub struct OpenDisc {
     image: Image,
     pub layout: Layout,
     pub files: BTreeMap<String, iso::Entry>,
-    pub path: PathBuf,
+    pub path: HostPath,
 }
 
 impl OpenDisc {
@@ -57,7 +57,7 @@ impl OpenDisc {
     ///
     /// # Errors
     /// It is not there, or it holds other files.
-    pub fn open(roms: &Path, name: &str, layout: &Layout) -> Result<OpenDisc> {
+    pub fn open(roms: &HostPath, name: &str, layout: &Layout) -> Result<OpenDisc> {
         Self::open_at(find_disc(roms, &layout.image, layout.size, &layout.sha1)?, name, layout)
     }
 
@@ -65,7 +65,7 @@ impl OpenDisc {
     ///
     /// # Errors
     /// It cannot be read, or its files are not the layout's.
-    pub fn open_at(path: PathBuf, name: &str, layout: &Layout) -> Result<OpenDisc> {
+    pub fn open_at(path: HostPath, name: &str, layout: &Layout) -> Result<OpenDisc> {
         let image = Image::open(&path)?;
         let mut entries = image.root()?;
         if let Some(d) = entries.iter().find(|e| e.directory) {

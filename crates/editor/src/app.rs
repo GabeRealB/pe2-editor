@@ -4,8 +4,8 @@
 
 use eframe::egui::{self, RichText};
 use egui_tiles::{Behavior as _, TileId};
+use pe2_path::HostPath;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -49,12 +49,12 @@ const STEADY_FRAMES: u32 = 2;
 #[derive(Default, Deserialize)]
 struct OldSettings {
     zoom: Option<f32>,
-    last_project: Option<PathBuf>,
+    last_project: Option<HostPath>,
 }
 
 /// A screenshot asked for on the command line: taken once the window has settled, then the editor exits.
 struct Capture {
-    path: PathBuf,
+    path: HostPath,
     frames: u32,
     requested: bool,
     /// Whether the image is still to be saved (1) or saved (0).
@@ -64,9 +64,16 @@ struct Capture {
 /// What was asked while the project was being read, done once it has been.
 enum Deferred {
     Edit(EditRequest),
-    Step { redo: bool, force: bool, scope: Option<String> },
+    Step {
+        redo: bool,
+        force: bool,
+        scope: Option<String>,
+    },
     /// A files layer made of this name, and the entry of this uid overridden in it.
-    OverrideInNew { uid: String, name: String },
+    OverrideInNew {
+        uid: String,
+        name: String,
+    },
 }
 
 /// What waits on the documents with unsaved changes being saved or let go.
@@ -75,7 +82,7 @@ enum Closing {
     /// The window, closing.
     Quit,
     /// Another project, opening.
-    Open(PathBuf),
+    Open(HostPath),
     /// A build or a clean, by its event.
     Signal(&'static str),
     /// A document's last tab: where it is, and the document's uid.
@@ -84,7 +91,7 @@ enum Closing {
 
 /// A project being opened on a thread of its own: how far it is, and the workspace's start once it is.
 struct Opening {
-    dir: PathBuf,
+    dir: HostPath,
     began: std::time::Instant,
     progress: Arc<std::sync::Mutex<(String, usize, usize)>>,
     ready: std::sync::mpsc::Receiver<anyhow::Result<crate::workspace::Opened>>,
@@ -141,7 +148,7 @@ pub struct Editor {
     choosing: Option<Choosing>,
     layers_state: crate::layers::LayersState,
     /// A project that could not be opened because another process holds it: its directory and who holds it.
-    in_use: Option<(PathBuf, String)>,
+    in_use: Option<(HostPath, String)>,
     /// The selection last opened as a document.
     opened: Option<String>,
     /// Files being imported: their paths, a line each.
@@ -174,7 +181,7 @@ pub struct Editor {
     /// What the project opened asks of whoever opened it.
     onboarding: Option<crate::onboarding::Onboarding>,
     /// The project told "not now": this session leaves it alone.
-    not_now: Option<PathBuf>,
+    not_now: Option<HostPath>,
     /// Nobody is there to ask.
     unattended: bool,
     /// Agents using the window, and whether this session lets them act whatever the settings say.
@@ -185,10 +192,10 @@ pub struct Editor {
 }
 
 pub struct Start {
-    pub project: Option<PathBuf>,
+    pub project: Option<HostPath>,
     pub select: Option<String>,
     pub show: Option<String>,
-    pub screenshot: Option<PathBuf>,
+    pub screenshot: Option<HostPath>,
     pub max_surface: Option<u32>,
     /// Agents may act in the editor this session, whatever the settings say.
     pub agents_drive: bool,
@@ -354,16 +361,16 @@ impl Editor {
     }
 
     /// Open a project - the documents of the one open with unsaved changes saved or let go first, as the user says.
-    fn open(&mut self, dir: &Path) {
+    fn open(&mut self, dir: &HostPath) {
         if self.workspace.as_ref().is_some_and(|ws| !ws.unsaved_documents().is_empty()) {
-            self.closing = Some(Closing::Open(dir.to_path_buf()));
+            self.closing = Some(Closing::Open(dir.clone()));
             return;
         }
         self.open_now(dir);
     }
 
     /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
-    fn open_now(&mut self, dir: &Path) {
+    fn open_now(&mut self, dir: &HostPath) {
         // The project open now lets go of its lock first: opening it again must find it free. It finishes what it is on to
         // do that, on the thread opening the next.
         let leaving = self.workspace.take().map(Workspace::leave);
@@ -373,7 +380,7 @@ impl Editor {
         self.announce_opening(dir);
         let (done, ready) = std::sync::mpsc::channel();
         let (to_frames, agents) = std::sync::mpsc::channel();
-        let (dir_owned, said, ctx) = (dir.to_path_buf(), progress.clone(), self.ctx.clone());
+        let (dir_owned, said, ctx) = (dir.clone(), progress.clone(), self.ctx.clone());
         let link_ctx = self.ctx.clone();
         let started = std::thread::Builder::new().name("open".into()).spawn(move || {
             let report = |stage: &str, done: usize, total: usize| {
@@ -392,7 +399,7 @@ impl Editor {
         match started {
             Ok(_) => {
                 let began = std::time::Instant::now();
-                self.opening = Some(Opening { dir: dir.to_path_buf(), began, progress, ready, agents, select: None });
+                self.opening = Some(Opening { dir: dir.clone(), began, progress, ready, agents, select: None });
             }
             Err(e) => self.error = Some(format!("{}: {e}", dir.display())),
         }
@@ -428,7 +435,7 @@ impl Editor {
         let dir = opening.dir;
         match result {
             Ok(opened) => {
-                self.settings.last_project = std::path::absolute(&dir).ok();
+                self.settings.last_project = Some(dir.clone());
                 if let Some(label) = &opened.recovered {
                     self.message = Some(format!("An edit a crash interrupted was rolled back: {label}"));
                 }
@@ -1266,7 +1273,13 @@ impl Editor {
         let exporter = exporting.exporters[exporting.chosen].clone();
         let member = exporter.members.get(exporting.member).map(|(key, _)| key.clone());
         let (extensions, index, path) = (ws.extensions.clone(), ws.index.clone(), exporting.path.clone());
-        let to = PathBuf::from(exporting.to.trim());
+        let to = match exporting.to.trim().parse::<HostPath>() {
+            Ok(to) => to,
+            Err(why) => {
+                self.message = Some(format!("{}: no place to export to: {why}", exporting.to.trim()));
+                return;
+            }
+        };
         let (done, result) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         let what = format!("{} as {}", path.rsplit('/').next().unwrap_or(&path), exporter.label);
@@ -1275,14 +1288,14 @@ impl Editor {
             let made = (|| -> anyhow::Result<String> {
                 let asset = anyhow::Context::context(index.assets.get(&path), "the asset is gone")?;
                 let bytes = extensions.export(&index, asset, &exporter.output, member.as_deref())?;
-                if let Some(folder) = to.parent().filter(|f| !f.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(folder)?;
+                if let Some(folder) = to.parent() {
+                    std::fs::create_dir_all(&folder)?;
                 }
-                anyhow::Context::with_context(std::fs::write(&to, bytes), || to.display().to_string())?;
+                anyhow::Context::with_context(std::fs::write(&to, bytes), || to.to_string())?;
                 if reveal && let Some(folder) = to.parent() {
-                    let _ = crate::external::open_default(folder);
+                    let _ = crate::external::open_default(&folder);
                 }
-                Ok(to.display().to_string())
+                Ok(to.to_string())
             })();
             let _ = done.send(made.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
@@ -1826,7 +1839,7 @@ impl Editor {
     fn config_menu(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.active_config() else { return };
         let Some(ws) = self.workspace.as_ref() else { return };
-        let (configs, root) = (ws.project.configs.clone(), ws.project.root.display().to_string());
+        let (configs, root) = (ws.project.configs.clone(), ws.project.root.to_string());
         let mut chosen = None;
         ui.scope(|ui| {
             ui.menu_button(format!("{}  {}", active.name, icons::CARET_DOWN), |ui| {
@@ -1834,9 +1847,9 @@ impl Editor {
                     let label = config
                         .target
                         .as_ref()
-                        .map_or_else(|| config.name.clone(), |target| format!("{}  ·  {target}", config.name));
+                        .map_or_else(|| config.name.to_string(), |target| format!("{}  ·  {target}", config.name));
                     if ui.selectable_label(config.name == active.name, label).clicked() {
-                        chosen = Some(config.name.clone());
+                        chosen = Some(config.name.to_string());
                         ui.close();
                     }
                 }
@@ -2171,7 +2184,7 @@ impl Editor {
 
     /// Make a node of a template - of a file, where it takes one - beside the document in use, else in the folder the
     /// browser shows; it is then named, as it is made with the template's.
-    fn new_node(&mut self, template: &str, file: Option<&Path>) {
+    fn new_node(&mut self, template: &str, file: Option<&HostPath>) {
         let in_use = self.document_path();
         let Some(ws) = &mut self.workspace else { return };
         let folder = ws.new_node_folder(in_use.as_deref());
@@ -2507,8 +2520,8 @@ impl Editor {
                     let text = self
                         .workspace
                         .as_ref()
-                        .map(|ws| project::host::shown(&ws.project.root))
-                        .or_else(|| self.opening.as_ref().map(|o| format!("Opening {}", project::host::shown(&o.dir))))
+                        .map(|ws| ws.project.root.to_string())
+                        .or_else(|| self.opening.as_ref().map(|o| format!("Opening {}", o.dir)))
                         .unwrap_or_else(|| "No project open".to_string());
                     ui.add(egui::Label::new(RichText::new(text).small().color(theme::weak())).truncate());
                 }
@@ -2620,10 +2633,10 @@ impl Editor {
 
     /// Say, now, that it is opening the project in `dir`: before it takes the project, so that no agent's server takes
     /// it first for a request of its own.
-    fn announce_opening(&mut self, dir: &Path) {
+    fn announce_opening(&mut self, dir: &HostPath) {
         let Some(keeper) = &mut self.presence else { return };
         keeper.keep_now(mcp::presence::Presence {
-            opening: Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).display().to_string()),
+            opening: Some(dir.clone()),
             stage: Some("Starting".to_string()),
             agents: self.agents_drive || self.settings.agents.drive,
             ..mcp::presence::Presence::default()
@@ -2636,9 +2649,7 @@ impl Editor {
             return;
         }
         let ws = self.workspace.as_ref();
-        let opening = self.opening.as_ref().map(|opening| {
-            std::fs::canonicalize(&opening.dir).unwrap_or_else(|_| opening.dir.clone()).display().to_string()
-        });
+        let opening = self.opening.as_ref().map(|opening| opening.dir.clone());
         let stage = self.opening.as_ref().map(|opening| {
             let (stage, done, total) = opening.progress.lock().map_or_else(|p| p.into_inner().clone(), |p| p.clone());
             if total > 0 { format!("{stage} {done}/{total}") } else { stage }
@@ -2668,7 +2679,7 @@ impl Editor {
             }
         });
         let presence = mcp::presence::Presence {
-            project: ws.map(|ws| ws.project.root.display().to_string()),
+            project: ws.map(|ws| ws.project.root.clone()),
             opening,
             stage,
             busy: self.busy_with().into_iter().map(str::to_string).collect(),
@@ -2703,9 +2714,9 @@ impl Editor {
         let Some(text) = &mut self.import else { return };
         let Some(ws) = &self.workspace else { return };
         let asset = ws.selected.as_ref().and_then(|path| ws.index.assets.get(path)).cloned();
-        let files: Vec<PathBuf> = text.lines().filter_map(local_path).collect();
+        let files: Vec<HostPath> = text.lines().filter_map(local_path).collect();
         let (mut replace, mut add, mut cancel) = (false, false, false);
-        let mut made: Option<(String, PathBuf)> = None;
+        let mut made: Option<(String, HostPath)> = None;
         egui::Window::new("Import")
             .collapsible(false)
             .resizable(false)
@@ -2717,7 +2728,9 @@ impl Editor {
                 // A node of its own, as the templates taking it make one.
                 if let [file] = files.as_slice() {
                     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                    for template in ws.extensions.templates_for(name).into_iter().filter(|t| t.offered && file.is_file()) {
+                    for template in
+                        ws.extensions.templates_for(name).into_iter().filter(|t| t.offered && file.is_file())
+                    {
                         if ui.button(format!("New node: {}", template.label)).clicked() {
                             made = Some((template.name.clone(), file.clone()));
                         }
@@ -2732,7 +2745,7 @@ impl Editor {
                 let missing =
                     files.iter().find(|file| !file.is_file()).map(|file| format!("{} is not a file", file.display()));
                 let name_of =
-                    |file: &PathBuf| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                    |file: &HostPath| file.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
                 let stack = match files.as_slice() {
                     [] => Err("No file yet".to_string()),
                     [file] => ws
@@ -2805,10 +2818,10 @@ impl Editor {
                 });
             });
         if make {
-            let dir = PathBuf::from(text.trim());
+            let dir = std::path::Path::new(text.trim()).to_path_buf();
             self.new_dialog = None;
-            match project::create(&dir) {
-                Ok(()) => self.open(&dir),
+            match project::create(&dir).and_then(|()| Ok(HostPath::new(&dir)?)) {
+                Ok(dir) => self.open(&dir),
                 Err(why) => self.message = Some(format!("No project was made: {why:#}")),
             }
         } else if cancel {
@@ -2836,9 +2849,12 @@ impl Editor {
                 });
             });
         if open {
-            let dir = PathBuf::from(text.trim());
+            let typed = text.trim().to_string();
             self.open_dialog = None;
-            self.open(&dir);
+            match typed.parse::<HostPath>() {
+                Ok(dir) => self.open(&dir),
+                Err(why) => self.message = Some(format!("{typed}: no folder to open: {why}")),
+            }
         } else if cancel {
             self.open_dialog = None;
         }
@@ -2903,7 +2919,7 @@ impl Editor {
 
     /// Open a project, as the menu does.
     #[cfg(test)]
-    pub fn open_project(&mut self, dir: &Path) {
+    pub fn open_project(&mut self, dir: &HostPath) {
         self.open(dir);
     }
 
@@ -3115,7 +3131,7 @@ struct Exporting {
 
 impl Exporting {
     /// Where its file goes unless told: the project's `exports` folder, named after the asset and its member.
-    fn default_to(&self, root: &Path) -> String {
+    fn default_to(&self, root: &HostPath) -> String {
         let exporter = &self.exporters.get(self.chosen);
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
         let member = exporter.and_then(|e| e.members.get(self.member)).map(|(_, label)| format!("-{label}"));
@@ -3124,7 +3140,8 @@ impl Exporting {
             .chars()
             .map(|c| if c == '/' || c == '\\' { '_' } else { c })
             .collect();
-        root.join("exports").join(file).display().to_string()
+        let exports = root.join(&pe2_path::Name::constant("exports"));
+        pe2_path::Name::new(&file).map_or_else(|_| exports.to_string(), |file| exports.join(&file).to_string())
     }
 }
 
@@ -3256,7 +3273,7 @@ impl Outcome {
 
 /// A line of pasted paths as a path here: without the quotes Windows' Copy as path puts round it, and under WSL a Windows
 /// path where Windows' disks are mounted.
-fn local_path(line: &str) -> Option<PathBuf> {
+fn local_path(line: &str) -> Option<HostPath> {
     let line = line.trim().trim_matches('"');
     if line.is_empty() {
         return None;
@@ -3266,12 +3283,13 @@ fn local_path(line: &str) -> Option<PathBuf> {
         && drive.is_ascii_alphabetic()
     {
         let rest = line[3..].replace('\\', "/");
-        return Some(PathBuf::from(format!("/mnt/{}/{rest}", drive.to_ascii_lowercase() as char)));
+        let mounted = format!("/mnt/{}/{rest}", drive.to_ascii_lowercase() as char);
+        return HostPath::new(std::path::Path::new(&mounted)).ok();
     }
-    Some(PathBuf::from(line))
+    HostPath::new(std::path::Path::new(line)).ok()
 }
 
-fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
+fn save_png(path: &HostPath, image: &egui::ColorImage) -> Result<(), Box<dyn std::error::Error>> {
     let [width, height] = image.size;
     let mut encoder = png::Encoder::new(
         std::io::BufWriter::new(std::fs::File::create(path)?),
@@ -3288,12 +3306,14 @@ fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::er
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::local_path;
-    use std::path::PathBuf;
+    use pe2_path::HostPath;
+    use std::path::Path;
 
     #[test]
     fn a_pasted_path_is_read_as_a_path_here() {
-        assert_eq!(local_path("  \"/tmp/a b.mp4\" "), Some(PathBuf::from("/tmp/a b.mp4")));
-        assert_eq!(local_path(r#""C:\Users\me\a.mp4""#), Some(PathBuf::from("/mnt/c/Users/me/a.mp4")));
+        let place = |text: &str| HostPath::new(Path::new(text)).ok();
+        assert_eq!(local_path("  \"/tmp/a b.mp4\" "), place("/tmp/a b.mp4"));
+        assert_eq!(local_path(r#""C:\Users\me\a.mp4""#), place("/mnt/c/Users/me/a.mp4"));
         assert_eq!(local_path("   "), None);
     }
 }

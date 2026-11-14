@@ -16,7 +16,7 @@ pub mod requests;
 pub mod setup {
     pub use pe2_setup::*;
 
-    use std::path::Path;
+    use pe2_path::HostPath;
     use std::sync::atomic::AtomicBool;
 
     /// `pe2_setup::fetch`, what the extension's folder holds read through the project's content.
@@ -25,8 +25,8 @@ pub mod setup {
     /// As `pe2_setup::fetch`.
     pub fn fetch(
         setup: &Setup,
-        store: &Path,
-        folder: Option<&Path>,
+        store: &HostPath,
+        folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
     ) -> anyhow::Result<()> {
@@ -40,8 +40,8 @@ pub mod setup {
     /// As `pe2_setup::hashes`.
     pub fn hashes(
         setup: &Setup,
-        scratch: &Path,
-        folder: Option<&Path>,
+        scratch: &HostPath,
+        folder: Option<&HostPath>,
         progress: Progress,
         cancel: &AtomicBool,
     ) -> anyhow::Result<(String, Vec<String>)> {
@@ -49,6 +49,7 @@ pub mod setup {
         pe2_setup::hashes(setup, scratch, folder, progress, cancel)
     }
 }
+pub mod run;
 pub mod unsandboxed;
 
 use anyhow::{Context, Result};
@@ -56,8 +57,8 @@ use pe2_ext::{
     Asset, Extension, Field, Icon, Image, PanelDef, Project, Recognized, Registry, Signature, Source, Table, Tint,
     ToolDef, TypeDef, Value, ViewDef,
 };
+use pe2_path::HostPath;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{graph, index};
@@ -82,7 +83,7 @@ pub struct Preview<'a> {
 }
 
 /// The file an extension's folder holds its component in (`folder`).
-pub const EXTENSION_COMPONENT: &str = "extension.wasm";
+pub const EXTENSION_COMPONENT: pe2_path::Name = pe2_path::Name::constant("extension.wasm");
 
 /// Where an extension runs from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -90,14 +91,14 @@ pub enum Origin {
     /// A component built into the host: a built-in.
     Builtin,
     /// A component, from this file: tests, loaded with what they test.
-    Component(PathBuf),
+    Component(HostPath),
     /// An extension the project holds: its folder (`extensions/<id>.extension/` of a layer).
-    Project(PathBuf),
+    Project(HostPath),
     /// An extension in the user's own extensions folder, to be added to a project: its folder. It never runs from there.
-    User(PathBuf),
+    User(HostPath),
     /// An extension in the extensions folder beside the editor, to be added to a project: its folder. It never runs
     /// from there.
-    Install(PathBuf),
+    Install(HostPath),
     /// Linked into the host, its entry point called directly: a built-in, for debugging.
     Linked,
 }
@@ -313,7 +314,7 @@ impl Origin {
 
     /// The folder it is in, where it is in one of its own.
     #[must_use]
-    pub fn folder(&self) -> Option<&std::path::Path> {
+    pub fn folder(&self) -> Option<&HostPath> {
         match self {
             Origin::Project(folder) | Origin::User(folder) | Origin::Install(folder) => Some(folder),
             Origin::Component(_) | Origin::Builtin | Origin::Linked => None,
@@ -372,6 +373,10 @@ pub struct Extensions {
     pub unmet: Vec<(String, String)>,
     /// What was refused or disabled, and why.
     pub problems: Vec<String>,
+    /// What the unsandboxed extensions loaded offer to run, by id: where `<extension>:<program>` is found.
+    pub offered: unsandboxed::Offered,
+    /// Whether the project is trusted as a whole, so that its operations may run programs (`run::RUN`).
+    pub programs_trusted: Arc<std::sync::atomic::AtomicBool>,
     /// Each loaded extension's settings, by its id: as declared, with the values they took.
     pub settings: HashMap<String, Vec<(pe2_ext::Setting, toml::Value)>>,
     types: HashMap<String, (TypeDef, usize)>,
@@ -395,6 +400,10 @@ pub struct Extensions {
     /// path: one of them changing, or going, has them taken again.
     defined_at: RwLock<std::collections::BTreeSet<String>>,
     project_templates: RwLock<Arc<std::collections::BTreeMap<String, pe2_ext::TemplateDef>>>,
+    /// The project's generators (`graph::DEFINED_GENERATOR`), taken with its definitions.
+    generators: RwLock<Vec<Arc<index::Asset>>>,
+    /// The operations they made, for a configuration (said as text): made again where either changes.
+    generated: RwLock<Option<(String, Arc<graph::Definitions>)>>,
     /// The store outputs asked for in passing read and keep: the open project's, as these outlive it (`extensions::loaded`).
     store: std::sync::RwLock<Option<graph::store::Store>>,
     /// What is asked without waiting.
@@ -450,6 +459,79 @@ pub fn forbid() {
 #[must_use]
 pub fn forbidden() -> bool {
     FORBIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Extensions {
+    /// A program an extension loaded offers, as a project's operation names it (`<extension>:<program>`): what it
+    /// requires fetched, the program and the arguments before those passed, and what tells this program from another
+    /// (the extension's hash, which covers what it fetches, and the program's name).
+    ///
+    /// # Errors
+    /// It is no such name, no extension of its id offering programs is loaded, or it cannot be started.
+    pub fn program(&self, named: &str) -> anyhow::Result<(unsandboxed::Runnable, Vec<String>, String)> {
+        program_in(&self.offered, named)
+    }
+}
+
+/// A generator's operation, the others it makes named as the project names them: `#<output>`, wherever an operation is
+/// named (`op`, a for-each's `body`), is `<generator>#<output>`.
+fn own_named(table: &toml::Table, generator: &str) -> toml::Table {
+    let named = |key: &str, value: &toml::Value| match (key, value) {
+        ("op" | "body", toml::Value::String(text)) if text.starts_with('#') => {
+            Some(toml::Value::String(format!("{generator}{text}")))
+        }
+        _ => None,
+    };
+    table
+        .iter()
+        .map(|(key, value)| {
+            let value = named(key, value).unwrap_or_else(|| match value {
+                toml::Value::Table(inner) => toml::Value::Table(own_named(inner, generator)),
+                toml::Value::Array(items) => toml::Value::Array(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            toml::Value::Table(inner) => toml::Value::Table(own_named(inner, generator)),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            });
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+thread_local! {
+    /// Whether this thread is making what generators make (`Extensions::generated`).
+    static GENERATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a generator is made in: the configuration built, and no other node of the project.
+struct Alone;
+
+impl graph::exec::World for Alone {
+    fn node(&self, _: &toml::Value) -> Option<(&dyn graph::exec::Node, graph::Plan)> {
+        None
+    }
+}
+
+/// A program the extensions in `offered` offer, by `<extension>:<program>` (`Extensions::program`).
+///
+/// # Errors
+/// As `Extensions::program`.
+pub fn program_in(
+    offered: &unsandboxed::Offered,
+    named: &str,
+) -> anyhow::Result<(unsandboxed::Runnable, Vec<String>, String)> {
+    let (id, name) =
+        pe2_manifest::reference(named).with_context(|| format!("{named}: a program is named <extension>:<program>"))?;
+    let offering = offered.get().and_then(|offered| offered.get(id)).with_context(|| {
+        format!("{named}: no extension {id} offering programs runs here: add it to the project, and trust it")
+    })?;
+    let (program, args) = offering.offered_as(name, 0)?;
+    Ok((program, args, format!("{named}@{}", offering.trust)))
 }
 
 impl Extensions {
@@ -1471,7 +1553,9 @@ impl Extensions {
             pe2_ext::Content::Inline(bytes) => Ok(bytes.clone()),
             // Made here, it is in the store; only what is stored with its node is found there.
             pe2_ext::Content::Stored { sha1, .. } => match engine.store() {
-                Some(store) if store.blob_path(sha1).exists() => Ok(std::fs::read(store.blob_path(sha1))?),
+                Some(store) if store.blob_path(sha1).is_ok_and(|path| path.exists()) => {
+                    Ok(std::fs::read(store.blob_path(sha1)?)?)
+                }
                 _ => graph::exec::Node::read_content(asset, sha1),
             },
         }
@@ -1900,7 +1984,86 @@ impl Extensions {
     pub fn operations(&self) -> graph::Ops {
         let mut ops = self.graph_ops.get_or_init(|| self.make_operations()).clone();
         ops.definitions = self.definitions.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let generated = self.generated(&ops);
+        if !generated.is_empty() {
+            let mut all = (*ops.definitions).clone();
+            all.extend(generated.iter().map(|(uid, definition)| (uid.clone(), definition.clone())));
+            ops.definitions = Arc::new(all);
+        }
         ops
+    }
+
+    /// What the project's generators make for the configuration built: each output an operation, by
+    /// `uid://<generator>#<output>`. A generator is laid out with what the project defines itself (`defined`), never
+    /// with what generators make, and makes its operations of its own settings and the configuration; what goes wrong
+    /// of it is said as it is, and its operations are not there.
+    fn generated(&self, defined: &graph::Ops) -> Arc<graph::Definitions> {
+        let generators = self.generators.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if generators.is_empty() {
+            return Arc::default();
+        }
+        // Making them asks for the operations again on this thread (an extension's operation runs): there, they are
+        // the project's own definitions alone, as they are to a generator.
+        if GENERATING.with(std::cell::Cell::get) {
+            return Arc::default();
+        }
+        let config = self.config.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let said = format!("{config:?}");
+        if let Some((made_for, made)) = &*self.generated.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+            && *made_for == said
+        {
+            return made.clone();
+        }
+        GENERATING.with(|generating| generating.set(true));
+        let made = self.generate(&generators, defined, config.as_ref(), &said);
+        GENERATING.with(|generating| generating.set(false));
+        let made = Arc::new(made);
+        *self.generated.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((said, made.clone()));
+        made
+    }
+
+    /// What generators make for a configuration (`said`, as its text): each output an operation, by
+    /// `uid://<generator>#<output>`.
+    fn generate(
+        &self,
+        generators: &[Arc<index::Asset>],
+        defined: &graph::Ops,
+        config: Option<&pe2_ext::data::BuildConfig>,
+        said: &str,
+    ) -> graph::Definitions {
+        let mut made = graph::Definitions::new();
+        for asset in generators {
+            let Some(uid) = &asset.uid else { continue };
+            let (plan, problems) = graph::Plan::of_fields(asset.fields(), defined, &self.tail(asset));
+            for problem in problems {
+                tracing::warn!("generator {}: {problem:?}", asset.path);
+            }
+            let mut engine = graph::exec::Engine::new(defined.clone(), None);
+            engine.config = config.cloned();
+            let version = crate::extract::sha1_hex(
+                format!("{}\n{said}", graph::exec::Node::declaration_sha1(&**asset)).as_bytes(),
+            );
+            for output in &plan.outputs {
+                let named = format!("{uid}#{}", output.name);
+                let reach = graph::exec::Reach { engine: &engine, world: &Alone };
+                let given = engine.output_in(Some(reach), &plan, &**asset, &output.name, None, true);
+                let declared = match given.map(|given| given.value) {
+                    Ok(Some(value)) => match &*value {
+                        graph::Value::Table(table) => graph::Definition::of(&named, &own_named(table, uid), &version),
+                        other => Err(format!("it makes {}, no operation's declaration", other.ty())),
+                    },
+                    Ok(None) => Err("it makes nothing".to_string()),
+                    Err(e) => Err(format!("{e:#}")),
+                };
+                match declared {
+                    Ok(definition) => {
+                        made.insert(named, Arc::new(definition));
+                    }
+                    Err(why) => tracing::warn!("generator {}: {}: {why}", asset.path, output.name),
+                }
+            }
+        }
+        made
     }
 
     /// Take what a project defines - its operations and templates (`pe2.graph`) - from its index: what stacks lay in
@@ -1909,9 +2072,16 @@ impl Extensions {
     pub fn take_definitions(&self, index: &index::Index) -> Vec<index::Problem> {
         let mut problems = Vec::new();
         let mut definitions = graph::Definitions::new();
-        let defining = [graph::DEFINED, graph::DEFINED_TEMPLATE].into_iter().flat_map(|defined| self.find(index, defined));
+        let defining = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
+            .into_iter()
+            .flat_map(|defined| self.find(index, defined));
         let defined_at: std::collections::BTreeSet<String> = defining.map(|asset| asset.path.clone()).collect();
         *self.defined_at.write().unwrap_or_else(std::sync::PoisonError::into_inner) = defined_at;
+        // Its generators, made again for whatever configuration is built next.
+        let generators =
+            self.find(index, graph::DEFINED_GENERATOR).filter_map(|asset| index.assets.get(&asset.path).cloned());
+        *self.generators.write().unwrap_or_else(std::sync::PoisonError::into_inner) = generators.collect();
+        *self.generated.write().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         for asset in self.find(index, graph::DEFINED) {
             let Some(uid) = asset.uid.clone() else { continue };
             let version = graph::exec::Node::declaration_sha1(asset);
@@ -1950,13 +2120,16 @@ impl Extensions {
     /// stand as taken, and nothing of the project is looked through for them.
     #[must_use]
     pub fn definitions_among(&self, index: &index::Index, changed: &std::collections::BTreeSet<String>) -> bool {
-        let defining: Vec<&str> = [graph::DEFINED, graph::DEFINED_TEMPLATE]
+        let defining: Vec<&str> = [graph::DEFINED, graph::DEFINED_TEMPLATE, graph::DEFINED_GENERATOR]
             .into_iter()
             .filter_map(|defined| self.node_type_named(defined).map(|(of, _)| of.name.as_str()))
             .collect();
-        let defines = |asset: &index::Asset| self.node_types_of(asset).iter().any(|of| defining.contains(&of.name.as_str()));
+        let defines =
+            |asset: &index::Asset| self.node_types_of(asset).iter().any(|of| defining.contains(&of.name.as_str()));
         let defined_at = self.defined_at.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        changed.iter().any(|path| defined_at.contains(path) || index.assets.get(path).is_some_and(|asset| defines(asset)))
+        changed
+            .iter()
+            .any(|path| defined_at.contains(path) || index.assets.get(path).is_some_and(|asset| defines(asset)))
     }
 
     /// An operation the project defines, by its uid (`uid://...`).
@@ -1993,6 +2166,15 @@ impl Extensions {
             call.stored(&name, type_names(known.iter().map(|(i, _)| &recognizers[*i]))).map(graph::Value::Typed)
         });
         ops.add(stored);
+        // What runs a program: told apart by the extensions offering programs, by their hashes.
+        let offering = self.offered.get().map(|offered| {
+            offered.iter().fold(String::new(), |mut said, (id, u)| {
+                let _ = std::fmt::Write::write_fmt(&mut said, format_args!("{id} {}\n", u.trust));
+                said
+            })
+        });
+        let version = crate::extract::sha1_hex(offering.unwrap_or_default().as_bytes());
+        ops.add(run::op(self.offered.clone(), self.programs_trusted.clone(), &format!("1-{version}")));
         // What the host itself shows, and what extensions' viewers take.
         let host = [pe2_ext::Type::Image, pe2_ext::Type::Stream(Box::new(pe2_ext::Type::Any))];
         ops.viewers = Arc::new(host.into_iter().chain(self.viewers.iter().map(|(ty, _)| ty.clone())).collect());
@@ -2384,11 +2566,11 @@ impl graph::exec::World for Graph<'_> {
         files.filter(|(_, entry)| entry.kind == index::Kind::File).map(|(path, _)| path.clone()).collect()
     }
 
-    fn place(&self, path: &str) -> Option<std::path::PathBuf> {
-        std::fs::canonicalize(&self.index.entries.get(path)?.disk).ok()
+    fn place(&self, path: &str) -> Option<HostPath> {
+        Some(self.index.entries.get(path)?.disk.clone())
     }
 
-    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
+    fn entry(&self, path: &str) -> Option<HostPath> {
         self.index.entries.get(path).filter(|entry| entry.kind == index::Kind::File).map(|entry| entry.disk.clone())
     }
 
@@ -2422,7 +2604,7 @@ fn start_stream(
     for value in inputs.iter().flatten() {
         graph::exec::stored_contents(value, &mut stored);
     }
-    let contents: HashMap<String, std::path::PathBuf> =
+    let contents: HashMap<String, HostPath> =
         stored.into_iter().filter_map(|sha1| Some((sha1.clone(), call.content_path(&sha1)?))).collect();
     let hosted = Hosted::new(call);
     let lent_carried = pe2_ext::Call::carried_by(&inputs);
@@ -2445,15 +2627,12 @@ fn start_stream(
 /// inputs held, read where they are.
 struct StreamHost {
     path: String,
-    contents: HashMap<String, std::path::PathBuf>,
+    contents: HashMap<String, HostPath>,
 }
 
 impl StreamHost {
-    fn path_of(&self, sha1: &str) -> Result<&std::path::Path> {
-        self.contents
-            .get(sha1)
-            .map(std::path::PathBuf::as_path)
-            .with_context(|| format!("{}: no content {sha1}", self.path))
+    fn path_of(&self, sha1: &str) -> Result<&HostPath> {
+        self.contents.get(sha1).with_context(|| format!("{}: no content {sha1}", self.path))
     }
 }
 
@@ -2594,11 +2773,12 @@ impl pe2_ext::CallHost for Hosted<'_> {
     }
 
     fn keep(&self, path: &str, name: &str) -> Result<pe2_ext::File> {
-        self.call.keep(std::path::Path::new(path), name)
+        let path = HostPath::from_plain(path.into()).with_context(|| format!("{path}: no place a program wrote"))?;
+        self.call.keep(&path, name)
     }
 
     fn serve(&self, files: &[pe2_ext::File], how: &pe2_ext::Use) -> Result<String> {
-        self.call.serve(files, how).map(|at| at.display().to_string())
+        self.call.serve(files, how).map(|at| at.to_string())
     }
 
     fn path_of(&self, content: &pe2_ext::Content) -> Option<String> {
@@ -2692,6 +2872,7 @@ pub fn from_png(bytes: &[u8]) -> Result<Image> {
 #[expect(clippy::unnecessary_wraps, reason = "entry points may fail; these do not")]
 mod tests {
     use super::{Extensions, Loadable, Origin, Status, satisfies};
+    use crate::testing::At as _;
     use pe2_ext::{Extension, Registry, Result, Setting};
 
     fn images(r: &mut Registry) -> Result<()> {
@@ -2999,8 +3180,9 @@ mod tests {
             images.origin = origin;
             images
         };
-        let user = Origin::Component("images.wasm".into());
-        let project = Origin::Project("extensions/test.images.extension".into());
+        let places = crate::testing::scratch("ext-origins");
+        let user = Origin::Component(places.at("images.wasm"));
+        let project = Origin::Project(places.at("extensions/test.images.extension"));
         // The built-in listed first, the project's last: nearness decides, not order.
         let loaded = Extensions::load(vec![from(Origin::Linked), from(user.clone()), from(project.clone())], true);
         assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
@@ -3013,7 +3195,7 @@ mod tests {
         assert_eq!(replaced, [&user, &Origin::Linked]);
         // Two from one place: the second is refused, a problem.
         let mut other = from(user.clone());
-        other.origin = Origin::Component("copy.wasm".into());
+        other.origin = Origin::Component(places.at("copy.wasm"));
         let loaded = Extensions::load(vec![from(user), other], false);
         assert!(
             loaded.problems.iter().any(|p| p.contains("another of its id from the same place")),
@@ -3083,6 +3265,7 @@ mod calling {
     use crate::cache::Cache;
     use crate::index::Index;
     use crate::lock::Lock;
+    use crate::testing::At as _;
     use pe2_ext::{Extension, Image, Project, Registry, Result, Table, Value, anyhow, ty};
 
     fn paint(r: &mut Registry) -> Result<()> {
@@ -3114,13 +3297,13 @@ mod calling {
 
     #[test]
     fn extensions_reach_one_another_through_the_host() {
-        let root = std::env::temp_dir().join(format!("pe2-calling-{}", std::process::id()));
+        let root = crate::testing::scratch("calling");
         let _ = std::fs::remove_dir_all(&root);
         let canvas = "[[stack]]\nop = \"test.paint@canvas\"\n";
         for (path, text) in
             [("project.toml", "[[layer]]\nname = \"base\"\n"), (".layers/base/a.node/node.toml", canvas)]
         {
-            let path = root.join(path);
+            let path = root.at(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }

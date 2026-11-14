@@ -6,8 +6,8 @@
 //! of the cache, any of it may be deleted at the cost of time only; a value is written before the trace naming it, so
 //! a trace never names what is not there.
 
+use pe2_path::{HostPath, Name, RelPath};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pe2_value::Table;
@@ -18,7 +18,11 @@ use super::{Content, File, Image, Pcm, Typed, Value};
 use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 
-const DIR: &str = "store";
+const DIR: Name = Name::constant("store");
+const VALUES: Name = Name::constant("values");
+const BLOBS: Name = Name::constant("blobs");
+const TRACES: Name = Name::constant("traces");
+const TMP: Name = Name::constant("tmp");
 
 /// What the store writes, as CBOR.
 fn encode<T: Serialize>(what: &T) -> Result<Vec<u8>> {
@@ -156,11 +160,11 @@ impl Kept {
 
 #[derive(Clone)]
 pub struct Store {
-    dir: PathBuf,
+    dir: HostPath,
 }
 
 /// The file whose time is when the store was last swept.
-const SWEPT: &str = "swept";
+const SWEPT: Name = Name::constant("swept");
 
 /// How long a file in `tmp/` goes unwritten before it is taken for a stopped process's and removed.
 const STALE: std::time::Duration = std::time::Duration::from_hours(24);
@@ -171,16 +175,16 @@ impl Store {
     /// # Errors
     /// Its folder cannot be made.
     pub fn open(cache: &Cache) -> Result<Store> {
-        Store::at(cache.path(DIR))
+        Store::at(cache.path(&DIR))
     }
 
     /// A store in a folder of its own.
     ///
     /// # Errors
     /// The folder cannot be made.
-    pub fn at(dir: PathBuf) -> Result<Store> {
-        for sub in ["values", "blobs", "traces"] {
-            let path = dir.join(sub);
+    pub fn at(dir: HostPath) -> Result<Store> {
+        for sub in [VALUES, BLOBS, TRACES] {
+            let path = dir.join(&sub);
             std::fs::create_dir_all(&path).with_context(|| path.display().to_string())?;
         }
         let store = Store { dir };
@@ -192,8 +196,8 @@ impl Store {
     /// trace, which the traces' folder's time says. Never swept, it is.
     #[must_use]
     pub fn sweep_due(&self, every: std::time::Duration) -> bool {
-        let time = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        match (time(self.dir.join(SWEPT)), time(self.dir.join("traces"))) {
+        let time = |path: HostPath| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        match (time(self.dir.join(&SWEPT)), time(self.dir.join(&TRACES))) {
             (None, _) => true,
             (Some(swept), Some(written)) => {
                 written > swept && std::time::SystemTime::now().duration_since(swept).is_ok_and(|age| age >= every)
@@ -204,7 +208,7 @@ impl Store {
 
     /// Note that it was swept now, for every process that keeps in it (`sweep_due`).
     pub fn mark_swept(&self) {
-        let _ = std::fs::write(self.dir.join(SWEPT), b"");
+        let _ = std::fs::write(self.dir.join(&SWEPT), b"");
     }
 
     /// Remove from `tmp/` what was not written for `stale`: what processes being written into it leave of their own is
@@ -212,7 +216,7 @@ impl Store {
     /// that stopped without finishing - one killed or crashed. How many were removed.
     #[must_use = "how many were removed is the sweep's report"]
     pub fn sweep_tmp(&self, stale: std::time::Duration) -> usize {
-        let Ok(entries) = std::fs::read_dir(self.dir.join("tmp")) else { return 0 };
+        let Ok(entries) = std::fs::read_dir(self.dir.join(&TMP)) else { return 0 };
         let now = std::time::SystemTime::now();
         let old = |e: &std::fs::DirEntry| {
             let modified = e.metadata().and_then(|m| m.modified());
@@ -232,17 +236,19 @@ impl Store {
     }
 
     /// Where a blob is kept.
-    #[must_use]
-    pub fn blob_path(&self, sha1: &str) -> PathBuf {
-        self.dir.join("blobs").join(sha1.get(..2).unwrap_or("00")).join(sha1)
+    ///
+    /// # Errors
+    /// Its hash is no name a file can have.
+    pub fn blob_path(&self, sha1: &str) -> Result<HostPath> {
+        Ok(self.dir.join(&BLOBS).join(&RelPath::sharded(sha1, "")?))
     }
 
     fn put_blob(&self, bytes: &[u8]) -> Result<Blob> {
         let sha1 = sha1_hex(bytes);
-        let path = self.blob_path(&sha1);
+        let path = self.blob_path(&sha1)?;
         if !path.exists() {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+                std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
             }
             write_atomic(&path, bytes)?;
         }
@@ -251,27 +257,27 @@ impl Store {
 
     /// The project whose cache holds it (`<project>/.cache/store`), where it is one's.
     #[must_use]
-    pub fn project(&self) -> Option<&std::path::Path> {
+    pub fn project(&self) -> Option<HostPath> {
         let cache = self.dir.parent()?;
         (cache.file_name()? == crate::cache::DIR).then(|| cache.parent()).flatten()
     }
 
     /// Where what is written for the while is kept (`spill`).
     #[must_use]
-    pub fn tmp(&self) -> PathBuf {
-        self.dir.join("tmp")
+    pub fn tmp(&self) -> HostPath {
+        self.dir.join(&TMP)
     }
 
     /// A file to write a content too large to hold into: `tmp/` in the store, adopted as a blob once written.
     ///
     /// # Errors
     /// It cannot be made.
-    pub fn spill(&self) -> Result<(std::fs::File, PathBuf)> {
+    pub fn spill(&self) -> Result<(std::fs::File, HostPath)> {
         static SPILLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = self.dir.join("tmp");
+        let dir = self.dir.join(&TMP);
         std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
         let n = SPILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = dir.join(format!("{}-{n}", std::process::id()));
+        let path = dir.join(&Name::new(&format!("{}-{n}", std::process::id()))?);
         let file = std::fs::File::create(&path).with_context(|| path.display().to_string())?;
         Ok((file, path))
     }
@@ -280,14 +286,14 @@ impl Store {
     ///
     /// # Errors
     /// It cannot be moved.
-    pub fn adopt(&self, written: &std::path::Path, sha1: &str) -> Result<()> {
-        let path = self.blob_path(sha1);
+    pub fn adopt(&self, written: &HostPath, sha1: &str) -> Result<()> {
+        let path = self.blob_path(sha1)?;
         if path.exists() {
             let _ = std::fs::remove_file(written);
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+            std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
         }
         // Moved; or, made on another file system, copied.
         if std::fs::rename(written, &path).is_err() {
@@ -306,12 +312,12 @@ impl Store {
     }
 
     fn read_blob(&self, blob: &Blob) -> Result<Vec<u8>> {
-        let path = self.blob_path(&blob.sha1);
+        let path = self.blob_path(&blob.sha1)?;
         std::fs::read(&path).with_context(|| path.display().to_string())
     }
 
-    fn value_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("values").join(format!("{hash}.cbor"))
+    fn value_path(&self, hash: &str) -> Result<HostPath> {
+        Ok(self.dir.join(&VALUES).join(&Name::new(&format!("{hash}.cbor"))?))
     }
 
     /// Keep a content as a blob: inline, written; stored elsewhere (`locate` reads it, by its hash), copied.
@@ -319,11 +325,11 @@ impl Store {
         match content {
             Content::Inline(bytes) => self.put_blob(bytes),
             Content::Stored { sha1, size } => {
-                let path = self.blob_path(sha1);
+                let path = self.blob_path(sha1)?;
                 if !path.exists() {
                     let bytes = locate(sha1).with_context(|| format!("no content {sha1} to keep"))?;
                     if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
+                        std::fs::create_dir_all(&parent).with_context(|| parent.to_string())?;
                     }
                     write_atomic(&path, &bytes)?;
                 }
@@ -347,7 +353,7 @@ impl Store {
         if self.has(hash) {
             return Ok(());
         }
-        let path = self.value_path(hash);
+        let path = self.value_path(hash)?;
         let kept = match value {
             Value::Typed(typed) => Kept::Typed {
                 ty: typed.ty.clone(),
@@ -402,13 +408,13 @@ impl Store {
     /// again.)
     #[must_use]
     pub fn has(&self, hash: &str) -> bool {
-        self.value_path(hash).exists()
+        self.value_path(hash).is_ok_and(|path| path.exists())
     }
 
     /// A kept value's description, without reading its blobs.
     #[must_use]
     pub fn describe(&self, hash: &str) -> Option<Kept> {
-        decode(&std::fs::read(self.value_path(hash)).ok()?)
+        decode(&std::fs::read(self.value_path(hash).ok()?).ok()?)
     }
 
     /// A kept value: its files' contents by reference (read through `blob_path`), what is not a file's read now. One
@@ -424,7 +430,8 @@ impl Store {
         Ok(match kept {
             Kept::Typed { ty, also, files, settings, notes } => {
                 // Its contents by reference: each still kept (none removed but by the sweep, with the value).
-                if let Some(gone) = files.iter().find(|f| !self.blob_path(&f.blob.sha1).exists()) {
+                if let Some(gone) = files.iter().find(|f| !self.blob_path(&f.blob.sha1).is_ok_and(|path| path.exists()))
+                {
                     anyhow::bail!("{hash}: its {} is no longer kept", gone.name);
                 }
                 let settings = settings.to_toml();
@@ -463,14 +470,14 @@ impl Store {
         })
     }
 
-    fn trace_path(&self, key: &str) -> PathBuf {
-        self.dir.join("traces").join(format!("{key}.cbor"))
+    fn trace_path(&self, key: &str) -> Result<HostPath> {
+        Ok(self.dir.join(&TRACES).join(&Name::new(&format!("{key}.cbor"))?))
     }
 
     /// The trace kept under a key.
     #[must_use]
     pub fn trace(&self, key: &str) -> Option<Trace> {
-        decode(&std::fs::read(self.trace_path(key)).ok()?)
+        decode(&std::fs::read(self.trace_path(key).ok()?).ok()?)
     }
 
     /// Keep a trace under a key.
@@ -478,12 +485,14 @@ impl Store {
     /// # Errors
     /// It cannot be written.
     pub fn put_trace(&self, key: &str, trace: &Trace) -> Result<()> {
-        write_atomic(&self.trace_path(key), &encode(trace)?)
+        write_atomic(&self.trace_path(key)?, &encode(trace)?)
     }
 
     /// Forget a trace: what it was the trace of is made again when next asked for, though its value stays.
     pub fn forget_trace(&self, key: &str) {
-        let _ = std::fs::remove_file(self.trace_path(key));
+        if let Ok(path) = self.trace_path(key) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Remove the traces of nodes not `live`, and of each live node's output all but the newest of each of the two
@@ -508,12 +517,12 @@ impl Store {
         let stem = |e: &std::fs::DirEntry| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_string);
         let young = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m >= began);
         let entries =
-            |sub: &str| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
+            |sub: &Name| std::fs::read_dir(self.dir.join(sub)).into_iter().flatten().flatten().filter(|e| !young(e));
         let mut swept = (0, 0, 0);
         // Each live output's newest trace of each build, by when it was written.
         let mut newest: HashMap<(String, String), Builds> = HashMap::new();
         let mut gone = Vec::new();
-        for entry in entries("traces") {
+        for entry in entries(&TRACES) {
             let (Some(key), Some(trace)) = (stem(&entry), stem(&entry).and_then(|k| self.trace(&k))) else {
                 gone.push(entry.path());
                 continue;
@@ -533,7 +542,7 @@ impl Store {
                 std::collections::hash_map::Entry::Occupied(mut held) => {
                     if held.get().0 < written {
                         let (_, older, _) = held.insert((written, key, trace.value));
-                        gone.push(self.trace_path(&older));
+                        gone.extend(self.trace_path(&older).ok().map(HostPath::into_path_buf));
                     } else {
                         gone.push(entry.path());
                     }
@@ -549,7 +558,7 @@ impl Store {
             let mut builds: Vec<(std::time::SystemTime, String, String)> = builds.into_values().collect();
             builds.sort_by_key(|build| std::cmp::Reverse(build.0));
             for (_, key, _) in builds.iter().skip(BUILDS_KEPT) {
-                gone.push(self.trace_path(key));
+                gone.extend(self.trace_path(key).ok().map(HostPath::into_path_buf));
             }
             kept.extend(builds.into_iter().take(BUILDS_KEPT));
         }
@@ -567,7 +576,7 @@ impl Store {
             }
         }
         let mut blobs = HashSet::new();
-        for entry in entries("values") {
+        for entry in entries(&VALUES) {
             let Some(hash) = stem(&entry) else { continue };
             if values.contains(&hash)
                 && let Some(kept) = self.describe(&hash)
@@ -577,7 +586,7 @@ impl Store {
                 swept.1 += 1;
             }
         }
-        for dir in entries("blobs") {
+        for dir in entries(&BLOBS) {
             for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten().filter(|e| !young(e)) {
                 let name = entry.file_name();
                 if !name.to_str().is_some_and(|n| blobs.contains(n)) && std::fs::remove_file(entry.path()).is_ok() {

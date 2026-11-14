@@ -3,6 +3,7 @@
 //! `Writes`, a file put staged and applied when it is flushed, a folder made, a file or folder removed or moved. A server
 //! lasts as long as its `DavServer`; dropping it stops it.
 
+use pe2_path::HostPath;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -461,7 +462,7 @@ impl crate::backend::Backend for AsBackend {
         crate::backend::Can { write: true, folder: false }
     }
 
-    fn available(&self, _at: &std::path::Path) -> Result<(), String> {
+    fn available(&self, _at: &HostPath) -> Result<(), String> {
         Ok(())
     }
 

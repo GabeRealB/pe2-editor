@@ -1,0 +1,39 @@
+id = "pe2.python"
+version = "3.14.10"
+unsandboxed = true
+description = "CPython 3.14.10, as the editor's releases build it: one program, python3."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/pe2-editor"
+docs = "docs/index.md"
+install = "docs/install.md"
+
+[[setup]]
+name = "Python 3.14.10, built by the PE2 editor"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
+platform = "linux-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-linux-x86_64.zip"
+sha256 = "14d272a65f4c3ae515d44c35c5e676413bf3540bd7c9959e78175eed6c151d87"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "c8dcaf521b5ad340a88e74920843ee27017ca85e241f66ef384c405535af6c3f" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
+
+[[setup]]
+name = "Python 3.14.10, built by the PE2 editor"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
+platform = "macos-aarch64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-macos-aarch64.zip"
+sha256 = "9f913bbe1ac70ed8e17069af1eae99321477202dd017471c49aec6516ff6fd7b"
+take = { "bin/python3" = { to = "python/bin/python3", sha256 = "5312ea33a009c8f550d8296c54380ada452fab26ca246c9b0266343078ffca91" }, "lib" = { to = "python/lib", sha256 = "6ec8c1c7a307d8e2666f81d03df39831ec9f8d4b9158066f3d4546fae5742964" } }
+
+[[setup]]
+name = "Python 3.14.10, built by the PE2 editor"
+license = "PSF-2.0"
+copyright = "Python Software Foundation; MinGW port by the MSYS2 project"
+platform = "windows-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/python-3.14.10-1/python-3.14.10-windows-x86_64.zip"
+sha256 = "0f9807a1975fe526f318fd5e006973825ae439752604c4c63bb40a57a37db526"
+take = { "bin/python3.exe" = { to = "python/bin/python3.exe", sha256 = "f86f6cc30b02c4a2de36db0e164cad9a2bc963c531deb4646d14ed3bb585363a" }, "lib" = { to = "python/lib", sha256 = "aeee01c469104f15b35fe8c09fbea24f05c35d4dcfc2b4374231e6d3eca98a46" } }
+
+[[program]]
+name = "python3"
+program = "python/bin/python3"

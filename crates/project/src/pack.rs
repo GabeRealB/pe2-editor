@@ -11,14 +11,15 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+
+use pe2_path::{HostPath, Name, RelPath};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::chunks::{Manifest, Store};
 
 /// The listing's name in a packed layer's folder.
-pub const FILE: &str = ".pack";
+pub const FILE: pe2_path::Name = pe2_path::Name::constant(".pack");
 
 const HEADER: &str = "pe2 pack 1";
 
@@ -33,7 +34,7 @@ pub struct Entry {
 /// A packed layer: its folder, its files by path, the store holding their chunks, and its journal.
 #[derive(Debug)]
 pub struct Pack {
-    root: PathBuf,
+    root: HostPath,
     store: Store,
     entries: RwLock<BTreeMap<String, Entry>>,
     journal: Mutex<Journal>,
@@ -106,26 +107,26 @@ impl Pack {
     ///
     /// # Errors
     /// Its listing cannot be read, or the folder is in no project's layers.
-    pub fn open(root: &Path) -> io::Result<Arc<Pack>> {
+    pub fn open(root: &HostPath) -> io::Result<Arc<Pack>> {
         if let Some(open) =
-            PACKS.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|p| p.root == root)
+            PACKS.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|p| p.root == *root)
         {
             return Ok(open.clone());
         }
-        let store = Store::of(&root.join(FILE)).ok_or_else(|| bad("not in a project's layers"))?;
-        let (entries, lines) = match std::fs::read_to_string(root.join(FILE)) {
+        let store = Store::of(&root.join(&FILE)).ok_or_else(|| bad("not in a project's layers"))?;
+        let (entries, lines) = match std::fs::read_to_string(root.join(&FILE)) {
             Ok(text) => replay(&text)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => return Err(e),
         };
         let pack = Arc::new(Pack {
-            root: root.to_path_buf(),
+            root: root.clone(),
             store,
             entries: RwLock::new(entries),
             journal: Mutex::new(Journal { file: None, lines }),
         });
         let mut packs = PACKS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(open) = packs.iter().find(|p| p.root == root) {
+        if let Some(open) = packs.iter().find(|p| p.root == *root) {
             return Ok(open.clone());
         }
         packs.push(pack.clone());
@@ -137,7 +138,7 @@ impl Pack {
     /// # Errors
     /// Its listing cannot be read.
     pub fn reread(&self) -> io::Result<()> {
-        let (entries, lines) = match std::fs::read_to_string(self.root.join(FILE)) {
+        let (entries, lines) = match std::fs::read_to_string(self.root.join(&FILE)) {
             Ok(text) => replay(&text)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => return Err(e),
@@ -150,10 +151,11 @@ impl Pack {
 
     /// The pack holding a path, and the path within it: none where no open pack's folder holds it.
     #[must_use]
-    pub fn of(path: &Path) -> Option<(Arc<Pack>, String)> {
+    pub fn of(path: &HostPath) -> Option<(Arc<Pack>, String)> {
         let packs = PACKS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pack = packs.iter().find(|p| path.starts_with(&p.root) && path != p.root)?;
-        let rel = path.strip_prefix(&pack.root).ok()?.to_string_lossy().replace('\\', "/");
+        let pack = packs.iter().find(|p| path.starts_with(&p.root) && *path != p.root)?;
+        // What a pack holds it holds by names: a place within by one no path takes is none of its.
+        let rel = path.within(&pack.root).ok()?.as_str().to_owned();
         Some((pack.clone(), rel))
     }
 
@@ -190,7 +192,7 @@ impl Pack {
     fn append(&self, line: &str) -> io::Result<()> {
         let mut journal = self.journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if journal.file.is_none() {
-            let at = self.root.join(FILE);
+            let at = self.root.join(&FILE);
             std::fs::create_dir_all(&self.root)?;
             let new = !at.exists();
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&at)?;
@@ -250,7 +252,7 @@ impl Pack {
             text.push_str(&put_line(rel, entry));
             text.push('\n');
         }
-        crate::cache::write_atomic(&self.root.join(FILE), text.as_bytes()).map_err(io::Error::other)?;
+        crate::cache::write_atomic(&self.root.join(&FILE), text.as_bytes()).map_err(io::Error::other)?;
         *journal = Journal { file: None, lines: entries.len() };
         Ok(())
     }
@@ -288,7 +290,7 @@ impl Pack {
 }
 
 /// Read again the listings of the open packs among these paths (`Pack::reread`).
-pub fn reread_changed(paths: &[PathBuf]) {
+pub fn reread_changed(paths: &[HostPath]) {
     for path in paths.iter().filter(|p| p.file_name().is_some_and(|n| n == FILE)) {
         if let Some((pack, _)) = Pack::of(path)
             && let Err(e) = pack.reread()
@@ -298,34 +300,52 @@ pub fn reread_changed(paths: &[PathBuf]) {
     }
 }
 
-/// What is in a folder, on disk or in the packed layer holding it: each entry's name, its path and whether it is a
-/// folder - a file really there before one the pack holds alike.
+/// An entry's name as a folder lists it: a name, or what it was refused as (`PathError::text` shows it) and why.
+pub type Listed = Result<Name, pe2_path::PathError>;
+
+/// The text an entry is listed by: its name, or how the one refused shows.
 #[must_use]
-pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
-    let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
+pub fn shown(listed: &Listed) -> &str {
+    match listed {
+        Ok(name) => name.as_str(),
+        Err(refused) => &refused.text,
+    }
+}
+
+/// What is in a folder, on disk or in the packed layer holding it: each entry's name - checked, as every name the
+/// system gives is: one no path takes is listed as refused, for whoever reads the folder to say so, never passed over
+/// or read otherwise than it is - its path and whether it is a folder; a file really there before one the pack holds
+/// alike.
+#[must_use]
+pub fn read_dir(dir: &HostPath) -> Vec<(Listed, HostPath, bool)> {
+    let mut out: Vec<(Listed, HostPath, bool)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_dir() || kind.is_file() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            seen.insert(name.clone());
-            out.push((name, entry.path(), kind.is_dir()));
+            let raw = entry.file_name();
+            let name = match raw.to_str() {
+                Some(text) => Name::new(text),
+                None => Err(pe2_path::PathError { text: raw.to_string_lossy().into(), why: pe2_path::Why::NotText }),
+            };
+            seen.insert(shown(&name).to_owned());
+            out.push((name, dir.entry(&raw), kind.is_dir()));
         }
     }
     // A held extension's tree (`records::held_at`), and a records layer's, as their records make them.
     let held = crate::records::held_at(dir).map(|(held, within)| held.list(&within));
     for (name, folder) in held.into_iter().flatten().chain(crate::records::Set::list(dir).into_iter().flatten()) {
         if seen.insert(name.clone()) {
-            out.push((name.clone(), dir.join(&name), folder));
+            out.push((Name::new(&name), dir.entry(std::ffi::OsStr::new(&name)), folder));
         }
     }
-    let packed = Pack::of(&dir.join(FILE)).map(|(pack, _)| pack).filter(|pack| dir.starts_with(&pack.root));
+    let packed = Pack::of(&dir.join(&FILE)).map(|(pack, _)| pack).filter(|pack| dir.starts_with(&pack.root));
     if let Some(pack) = packed {
-        let rel =
-            dir.strip_prefix(&pack.root).map_or_else(|_| String::new(), |r| r.to_string_lossy().replace('\\', "/"));
-        for (name, folder) in pack.list(&rel) {
+        // Listed by its name within the pack; a folder named otherwise is none of the pack's, and lists nothing of it.
+        let listed = dir.within(&pack.root).map_or_default(|rel| pack.list(rel.as_str()));
+        for (name, folder) in listed {
             if seen.insert(name.clone()) {
-                out.push((name.clone(), dir.join(&name), folder));
+                out.push((Name::new(&name), dir.entry(std::ffi::OsStr::new(&name)), folder));
             }
         }
     }
@@ -334,7 +354,7 @@ pub fn read_dir(dir: &Path) -> Vec<(String, PathBuf, bool)> {
 
 /// Whether a path is a folder, on disk or in a packed layer.
 #[must_use]
-pub fn is_dir(path: &Path) -> bool {
+pub fn is_dir(path: &HostPath) -> bool {
     Pack::of(path).is_some_and(|(pack, rel)| pack.is_folder(&rel))
         || crate::records::held_at(path).is_some_and(|(held, within)| held.is_folder(&within))
         || crate::records::Set::is_folder(path) == Some(true)
@@ -343,7 +363,7 @@ pub fn is_dir(path: &Path) -> bool {
 
 /// Whether a path is a file, on disk or in a packed layer.
 #[must_use]
-pub fn is_file(path: &Path) -> bool {
+pub fn is_file(path: &HostPath) -> bool {
     Pack::of(path).is_some_and(|(pack, rel)| pack.stat(&rel).is_some())
         || crate::records::held_at(path).is_some_and(|(held, within)| held.file(&within).is_some())
         || crate::records::Set::is_file(path) == Some(true)
@@ -352,7 +372,7 @@ pub fn is_file(path: &Path) -> bool {
 
 /// Set how a layer is stored in `project.toml` (`storage`): none for the default, its files as files.
 fn set_storage(project: &crate::Project, layer: &str, storage: Option<&str>) -> io::Result<()> {
-    let at = project.root.join(crate::FILE);
+    let at = project.root.join(&crate::FILE);
     let text = std::fs::read_to_string(&at)?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(io::Error::other)?;
     let layers = doc.get_mut("layer").and_then(toml_edit::Item::as_array_of_tables_mut);
@@ -384,7 +404,7 @@ fn generated<'a>(project: &'a crate::Project, name: &str) -> io::Result<&'a crat
 }
 
 /// Every file of a folder, recursively, but what is hidden (its listing, its record's companions starting with `.`).
-fn files_in(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
+fn files_in(dir: &HostPath, rel: &str, out: &mut Vec<(String, HostPath)>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
@@ -392,8 +412,8 @@ fn files_in(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
         }
         let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
         match entry.file_type() {
-            Ok(t) if t.is_dir() => files_in(&entry.path(), &child, out),
-            Ok(t) if t.is_file() => out.push((child, entry.path())),
+            Ok(t) if t.is_dir() => files_in(&dir.entry(&entry.file_name()), &child, out),
+            Ok(t) if t.is_file() => out.push((child, dir.entry(&entry.file_name()))),
             _ => {}
         }
     }
@@ -413,7 +433,10 @@ pub fn pack_layer(project: &crate::Project, name: &str) -> io::Result<usize> {
     let mut count = 0;
     for (rel, path) in found.into_iter().filter(|(rel, _)| rel != crate::plan::RECORD) {
         let logical = crate::chunks::logical(&path).unwrap_or_else(|| path.clone());
-        let rel = crate::chunks::logical(Path::new(&rel)).map_or(rel, |l| l.to_string_lossy().into_owned());
+        let rel = match rel.strip_suffix(crate::chunks::SUFFIX.as_str()) {
+            Some(logical) if !logical.is_empty() => logical.to_owned(),
+            _ => rel,
+        };
         let bytes = crate::content::read(&logical)?;
         pack.put(&rel, &bytes)?;
         std::fs::remove_file(&path)?;
@@ -436,26 +459,27 @@ pub fn unpack_layer(project: &crate::Project, name: &str) -> io::Result<usize> {
     for (rel, entry) in &entries {
         let bytes =
             entry.manifest.read_range(&pack.store, 0, usize::try_from(entry.manifest.size).unwrap_or(usize::MAX))?;
-        let at = layer.path.join(rel);
-        std::fs::create_dir_all(at.parent().unwrap_or(&layer.path))?;
+        let at = layer.path.join(&RelPath::new(rel).map_err(io::Error::other)?);
+        std::fs::create_dir_all(at.parent().unwrap_or_else(|| layer.path.clone()))?;
         match crate::content::chunked(&at, &bytes)? {
             Some(manifest) => crate::cache::write_atomic(&crate::chunks::manifest_path(&at), manifest.as_bytes()),
             None => crate::cache::write_atomic(&at, &bytes),
         }
         .map_err(io::Error::other)?;
     }
-    std::fs::remove_file(layer.path.join(FILE))?;
+    std::fs::remove_file(layer.path.join(&FILE))?;
     PACKS.write().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| p.root != layer.path);
     set_storage(project, name, None)?;
     Ok(entries.len())
 }
 
 /// Remove the empty folders under a folder, it kept.
-fn remove_empty(dir: &Path) {
+fn remove_empty(dir: &HostPath) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            remove_empty(&entry.path());
-            let _ = std::fs::remove_dir(entry.path());
+            let folder = dir.entry(&entry.file_name());
+            remove_empty(&folder);
+            let _ = std::fs::remove_dir(&folder);
         }
     }
 }
@@ -463,27 +487,29 @@ fn remove_empty(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{Pack, is_dir, is_file, read_dir};
+    use crate::testing::At as _;
 
     #[test]
     fn a_packed_layer_holds_its_files_and_reads_back_after_a_restart_of_its_journal() {
-        let root = std::env::temp_dir().join(format!("pe2-pack-{}", std::process::id()));
+        let root = crate::testing::scratch("pack");
         let _ = std::fs::remove_dir_all(&root);
-        let layer = root.join(".layers/gen");
+        let layer = root.at(".layers/gen");
         let pack = Pack::open(&layer).unwrap();
         pack.put("a.node/native.bin", b"native").unwrap();
         pack.put("a.node/node.toml", b"x = 1\n").unwrap();
         pack.put("b/c.bin", b"c").unwrap();
         pack.remove("b/c.bin").unwrap();
-        assert!(is_dir(&layer.join("a.node")) && is_file(&layer.join("a.node/native.bin")));
-        assert!(!is_file(&layer.join("b/c.bin")) && !is_dir(&layer.join("b")));
-        let listed: Vec<(String, bool)> = read_dir(&layer).into_iter().map(|(n, _, d)| (n, d)).collect();
+        assert!(is_dir(&layer.at("a.node")) && is_file(&layer.at("a.node/native.bin")));
+        assert!(!is_file(&layer.at("b/c.bin")) && !is_dir(&layer.at("b")));
+        let listed: Vec<(String, bool)> =
+            read_dir(&layer).into_iter().map(|(n, _, d)| (super::shown(&n).to_owned(), d)).collect();
         assert!(listed.contains(&("a.node".into(), true)), "{listed:?}");
-        let text = std::fs::read_to_string(layer.join(super::FILE)).unwrap();
+        let text = std::fs::read_to_string(layer.join(&super::FILE)).unwrap();
         let (entries, lines) = super::replay(&text).unwrap();
         assert_eq!((entries.len(), lines), (2, 4));
         assert_eq!(entries["a.node/native.bin"].manifest.sha1, crate::extract::sha1_hex(b"native"));
         pack.compact().unwrap();
-        let (entries, lines) = super::replay(&std::fs::read_to_string(layer.join(super::FILE)).unwrap()).unwrap();
+        let (entries, lines) = super::replay(&std::fs::read_to_string(layer.join(&super::FILE)).unwrap()).unwrap();
         assert_eq!((entries.len(), lines), (2, 2));
         std::fs::remove_dir_all(&root).unwrap();
     }

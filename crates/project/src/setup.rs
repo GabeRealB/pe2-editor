@@ -4,7 +4,7 @@
 //! be.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use pe2_path::HostPath;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::history::History;
@@ -31,6 +31,7 @@ pub fn add_generated(project: &Project, name: &str, fills: &str, history: &mut H
     let mut document = read(&project.root)?;
     let item = document.entry("layer").or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
     let layers = item.as_array_of_tables_mut().with_context(|| format!("`layer` in {FILE} is no list of tables"))?;
+    let folder = pe2_path::Name::new(name).with_context(|| format!("the layer {name}"))?;
     let path = format!("{}/{name}", crate::LAYERS);
     let mut layer = Table::new();
     layer.insert("name", value(name));
@@ -46,16 +47,16 @@ pub fn add_generated(project: &Project, name: &str, fills: &str, history: &mut H
         layers.push(table);
     }
     let mut tx = history.begin(format!("Add the layer {name}, filling {fills}"));
-    tx.make_dir(&project.root.join(&path))?;
-    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.make_dir(&project.root.join(&crate::LAYERS).join(&folder))?;
+    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     ignored(&mut tx, &project.root, &format!("/{path}/"))?;
     tx.commit().map(drop)
 }
 
 /// Have the project's `.gitignore` leave out a path, where it does not already (read as the transaction's writes so
 /// far leave it, so a second entry reads the first).
-fn ignored(tx: &mut crate::history::Transaction<'_>, root: &Path, entry: &str) -> Result<()> {
-    let file = root.join(".gitignore");
+fn ignored(tx: &mut crate::history::Transaction<'_>, root: &HostPath, entry: &str) -> Result<()> {
+    let file = root.join(&crate::cache::GITIGNORE);
     let text = tx.read(&file)?.and_then(|bytes| String::from_utf8(bytes).ok()).unwrap_or_default();
     if text.lines().any(|line| line.trim() == entry) {
         return Ok(());
@@ -71,7 +72,7 @@ fn ignored(tx: &mut crate::history::Transaction<'_>, root: &Path, entry: &str) -
 /// The project has no such unmanaged mount, or the file cannot be written.
 pub fn locate(project: &Project, at: &str, path: &str) -> Result<()> {
     anyhow::ensure!(project.unmanaged.iter().any(|m| m.at == at), "the project has no unmanaged mount {at}");
-    let file = project.root.join(crate::LOCAL);
+    let file = project.root.join(&crate::LOCAL);
     let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
     table(&mut document, "mounts")?.insert(at, value(path));
     std::fs::write(&file, document.to_string()).with_context(|| file.display().to_string())
@@ -115,7 +116,7 @@ pub fn add_mount(
     }
     mounts.push(mount);
     let mut tx = history.begin(format!("Mount {at}"));
-    tx.write(&project.root.join(FILE), document.to_string().as_bytes())?;
+    tx.write(&project.root.join(&FILE), document.to_string().as_bytes())?;
     if unmanaged {
         ignored(&mut tx, &project.root, &format!("/{at}/"))?;
         ignored(&mut tx, &project.root, &format!("/{}", crate::LOCAL))?;
@@ -132,7 +133,7 @@ pub fn add_mount(
 /// It links that file already, or the file cannot be written.
 pub fn add_link(project: &Project, at: &str, deployed: &str) -> Result<()> {
     anyhow::ensure!(!project.links.contains_key(at), "the project links {at} already");
-    let file = project.root.join(crate::LOCAL);
+    let file = project.root.join(&crate::LOCAL);
     let mut document: DocumentMut = std::fs::read_to_string(&file).unwrap_or_default().parse()?;
     let build = table(&mut document, "build")?;
     build.set_implicit(true);
@@ -237,10 +238,11 @@ mod tests {
     use crate::Project;
     use crate::cache::Cache;
     use crate::history::History;
+    use crate::testing::At as _;
 
     #[test]
     fn a_project_is_set_up_by_its_edits_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("pe2-setup-{}", std::process::id()));
+        let dir = crate::testing::scratch("setup");
         let _ = std::fs::remove_dir_all(&dir);
         crate::create(&dir).unwrap();
         let project = || Project::load(&dir).unwrap();
@@ -257,8 +259,7 @@ mod tests {
             (files.kind, files.fills.as_deref(), files.read_only),
             (crate::LayerKind::Generated, Some("game"), true)
         );
-        // Each place as the project names it: by the project's real folder, part by part.
-        let at = |path: &str| crate::testing::at(&crate::testing::real(&dir), path);
+        let at = |path: &str| dir.at(path);
         assert_eq!(files.plan(), at(".layers/game-files.plan.jsonl"));
         assert_eq!(made.unmanaged[0].path, at("roms"));
         assert_eq!(made.resolve("res://roms/a.bin").unwrap(), at("roms/a.bin"));
@@ -279,17 +280,17 @@ mod tests {
         let at = |name: &str| made.layers.iter().position(|l| l.name == name).unwrap();
         assert!(at("game") < at("project"), "the game's layer is below the project's own");
         assert_eq!(at("game-files"), at("game") + 1, "a generated layer is right above the layer it fills");
-        let ignored = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        let ignored = std::fs::read_to_string(dir.at(".gitignore")).unwrap();
         assert!(ignored.contains("/.layers/game-files/") && ignored.contains("/roms/"), "{ignored}");
         assert!(ignored.contains("/project.local.toml"), "{ignored}");
         // Where the discs are is this machine's.
-        let elsewhere = dir.with_extension("elsewhere");
-        super::locate(&made, "roms", &elsewhere.to_string_lossy()).unwrap();
+        let elsewhere = dir.with_suffix(&pe2_path::Name::constant(".elsewhere"));
+        super::locate(&made, "roms", &elsewhere.to_string()).unwrap();
         assert_eq!(project().unmanaged[0].path, elsewhere);
         // So are the links it wants.
         super::add_link(&project(), "../compile_commands.json", "build/compile_commands.json").unwrap();
         assert_eq!(project().links["../compile_commands.json"], "build/compile_commands.json");
-        assert!(!std::fs::read_to_string(dir.join(crate::FILE)).unwrap().contains("links"));
+        assert!(!std::fs::read_to_string(dir.join(&crate::FILE)).unwrap().contains("links"));
         assert!(super::add_generated(&project(), "more", "nothing", &mut history).is_err());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);

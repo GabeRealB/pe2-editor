@@ -23,10 +23,10 @@
 //! into or distributed with this program: the library called is the one installed on the user's system
 //! (`dokan2.dll`), found and loaded at run time.
 
+use pe2_path::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
@@ -372,7 +372,8 @@ unsafe extern "system" fn create_file(
     info.context = 0;
     let (wants_folder, wants_file) = (options & FILE_DIRECTORY_FILE != 0, options & FILE_NON_DIRECTORY_FILE != 0);
     // One there already, opened by what would also have made it, is said so.
-    let there = if matches!(disposition, FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE) { COLLISION } else { SUCCESS };
+    let there =
+        if matches!(disposition, FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE) { COLLISION } else { SUCCESS };
     match provider.shown(&path) {
         Some(Shown { folder: true, .. }) => {
             if wants_file {
@@ -818,7 +819,7 @@ fn wide(text: &str) -> Vec<u16> {
 pub struct Mounted {
     instance: Instance,
     provider: *const Provider,
-    at: PathBuf,
+    at: HostPath,
     mount_point: Vec<u16>,
     _options: Box<Options>,
     _operations: Box<Operations>,
@@ -869,8 +870,8 @@ fn refused(code: i32) -> &'static str {
 
 /// The room there is on the volume a folder is on: free, and in all. Asked of the folder it is in, never of the folder
 /// itself once it is mounted on - that would be asking this.
-fn room(at: &Path) -> (u64, u64) {
-    let around = wide(&at.parent().unwrap_or(at).to_string_lossy());
+fn room(at: &HostPath) -> (u64, u64) {
+    let around = wide(&at.parent().unwrap_or_else(|| at.clone()).to_string_lossy());
     let (mut free, mut total) = (0u64, 0u64);
     // SAFETY: a path ended by a zero, and where each number is written.
     let asked =
@@ -882,9 +883,9 @@ fn room(at: &Path) -> (u64, u64) {
 ///
 /// # Errors
 /// Dokany is not installed, or would not mount there.
-pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> io::Result<Mounted> {
+pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str) -> io::Result<Mounted> {
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "Dokany is not installed"))?;
-    let at = crate::backend::plain(at);
+    let at = at.clone();
     // What a process that ended while it served there left of it, first.
     crate::backend::unjoin(&at);
     std::fs::create_dir_all(&at)?;
@@ -956,7 +957,9 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
     let told = Arc::new(AtomicBool::new(false));
     let telling = {
         let (served, stop, at, instance) = (served.clone(), told.clone(), at.clone(), instance as usize);
-        std::thread::Builder::new().name("dokan-notify".into()).spawn(move || tell_changes(&served, instance, &at, &stop))?
+        std::thread::Builder::new()
+            .name("dokan-notify".into())
+            .spawn(move || tell_changes(&served, instance, &at, &stop))?
     };
     let mounted = Mounted {
         instance,
@@ -987,7 +990,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &Path, name: &str) -> 
 
 /// Tell what watches the mount of what changes in the tree served by other means than the mount - the project changed
 /// beneath it: each file changed, each node gone or new. Until `stop`.
-fn tell_changes(served: &Served, instance: usize, at: &Path, stop: &AtomicBool) {
+fn tell_changes(served: &Served, instance: usize, at: &HostPath, stop: &AtomicBool) {
     let Some(api) = api() else { return };
     let instance = instance as Instance;
     let full = |path: &str| wide(&format!("{}\\{}", at.display(), path.replace('/', "\\")));
@@ -1037,7 +1040,7 @@ impl Backend for AsBackend {
         Can { write: true, folder: true }
     }
 
-    fn available(&self, _at: &Path) -> Result<(), String> {
+    fn available(&self, _at: &HostPath) -> Result<(), String> {
         let Some(api) = api() else { return Err("Dokany is not installed (dokan2.dll)".into()) };
         // SAFETY: the library's own function, which takes nothing.
         if unsafe { (api.driver_version)() } == 0 {
@@ -1054,9 +1057,9 @@ impl Backend for AsBackend {
         Ok(crate::backend::Finishing::of(mount(job.served, writes.clone(), job.at, job.name)?, writes))
     }
 
-    fn clear(&self, at: &Path, _name: &str) {
+    fn clear(&self, at: &HostPath, _name: &str) {
         // A folder still mounted on by a process that ended: no longer, and a plain folder again.
-        let at = crate::backend::plain(at);
+        let at = at.clone();
         if let Some(api) = api() {
             let mount_point = wide(&at.to_string_lossy());
             // SAFETY: a path ended by a zero.
@@ -1065,7 +1068,7 @@ impl Backend for AsBackend {
         crate::backend::unjoin(&at);
     }
 
-    fn retire(&self, at: &Path, name: &str) {
+    fn retire(&self, at: &HostPath, name: &str) {
         // Nothing of it is on disk but the folder itself, mounted on: a junction to a volume that is gone. One that
         // leads to a folder is another backend's, kept apart, and stays.
         if crate::backend::joined_to(at).is_none_or(|to| !to.exists()) {
@@ -1076,6 +1079,6 @@ impl Backend for AsBackend {
 
 impl Mount for Mounted {
     fn shown(&self) -> String {
-        project::host::shown(&self.at)
+        self.at.to_string()
     }
 }

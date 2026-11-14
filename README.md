@@ -40,21 +40,27 @@ pe2-editor path/to/project          # or open a project you have
 The workspace uses the nightly Rust toolchain named in `rust-toolchain.toml`; `rustup` installs it on first use.
 
 ```bash
+cargo xtask prepare                 # what a build needs that is no crate (on Windows, the DirectX Shader Compiler)
 cargo build --release               # pe2-editor and pe2-cli, in target/release/
 cargo xtask dist                    # laid out as a release, in target/dist/pe2-<version>-<platform>/
 cargo xtask package                 # the same, as archives with their SHA-256 sums
 ```
 
+On Windows a build fails until `cargo xtask prepare` has fetched what `prepare.toml` pins (`--target <triple>` for
+another platform's build); `dist` prepares by itself.
+
 A release holds the two programs, the user documentation, `LICENSES.txt`, and the extensions that ship beside
-the editor rather than inside it (`pe2.psx`, `pe2.ffmpeg`).
+the editor rather than inside it (`pe2.psx`, `pe2.ffmpeg`, and the tools: `pe2.gcc-psx`, `pe2.binutils-mipsel`, ...).
 
 ## Extensions
 
-Most extensions are built in. The two that run programs on your machine, `pe2.psx` (the game's compiler) and
-`pe2.ffmpeg` (video), ship beside the editor and run only if you trust them. See [extensions](docs/extending/extensions.md).
+Most extensions are built in. Those that run programs on your machine ship beside the editor and run only if you
+trust them: `pe2.ffmpeg` (video), and the tools a project's builds run - each only a manifest, offering its programs
+(`pe2.gcc-psx`, `pe2.binutils-mipsel`, `pe2.binutils-mipsel-maspsx`, `pe2.aro-cpp`, `pe2.python`). `pe2.psx`, the
+PlayStation's images, ships beside them too. See [extensions](docs/extending/extensions.md).
 
 For extension authors: `cargo xtask hash <manifest> --write` fills in the checksums of what a manifest downloads,
-and `cargo xtask pins` checks that every pinned download is still there. What `pe2.psx` and `pe2.ffmpeg` download is
+and `cargo xtask pins` checks that every pinned download is still there. What the tools and `pe2.ffmpeg` download is
 built from source by `cargo xtask packages` (the zig projects in `packages/`) and published as this repository's
 releases, one a package version.
 

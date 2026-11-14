@@ -40,6 +40,28 @@ An imported asset's settings come from its source file. The **imports** layer ru
 attaches what it derived to the asset in the index. After a change, only the changed assets' imports, and the
 definitions a project provides, are attached again.
 
+## Running programs
+
+A build is a graph like any: its actions are `run` boxes (`project::ext::run`), each a program on files. What it takes is
+laid out in a folder of its own, the program is started there with arguments whose placeholders name that folder, its
+files, its outputs, the configuration, a setting of what it takes, or its `values`; what it writes under the names it
+gives, or prints, is what it makes. Only programs extensions offer run (`<extension>:<program>`), and only for a project
+trusted as a whole. Its version names the extensions offering programs by their hashes, so a tool changed remakes what
+it made; outputs it names in `rewrite` have the folder written `tree`, so what is made of them is the same wherever it
+ran. Which programs, which arguments, how many steps a unit takes: all of it is the graph's, none of it the editor's - a
+package is built by whatever operation its node names (`pe2.packages`: what it gives a build).
+
+## Generators
+
+A generator (`pe2.graph@generator`) is a node whose outputs are operations - declarations, each defining one - as a
+build system makes its build from a description. When definitions are taken, the generators are collected; what they
+make is made when the operations are next asked for, for the configuration built, and kept until it or they change,
+each output defining `uid://<generator>#<output>` (`#<output>` naming another of its own). A generator is laid out
+with the project's own definitions alone and made of its own settings and the configuration, no other node, so it
+cannot depend on what it makes; a thread making them is given those definitions alone when it asks again. Plans are
+laid out afresh with the definitions of the configuration built, so two configurations may build a package with two
+graphs, their results kept apart by what each read.
+
 ## Configurations
 
 A configuration is a release, a target and properties declared in `project.toml`. What reads the configuration
@@ -48,5 +70,6 @@ fit its property is a problem, not an error: the default holds.
 
 ## Where to look
 
-`project::graph` (stacks, graph layers, lowering, the built-in operations and their labels), `graph::exec` (the
+`project::graph` (stacks, graph layers, lowering, the built-in operations and their labels), `project::ext::run` (the
+`run` box), `Extensions::generated` (generators), `graph::exec` (the
 evaluator, traces, keys), `graph::store` (what is kept), `project::imports`, `Project::configs` in `project`.

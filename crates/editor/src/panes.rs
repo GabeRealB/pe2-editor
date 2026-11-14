@@ -4,6 +4,7 @@
 
 use eframe::egui::{self, Color32, RichText};
 use egui_tiles::{Tile, TileId, Tiles, UiResponse};
+use pe2_path::HostPath;
 use project::ext::Extensions;
 use project::index::Asset;
 use serde::{Deserialize, Serialize};
@@ -2380,10 +2381,10 @@ impl SettingsPage {
 /// chosen one's form on the right.
 /// What serves projects as filesystems on this machine: the project's folder, and the files programs are given - each
 /// the best suited, a backend that can do it (one not available here said why), or nothing.
-fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, project: Option<&std::path::Path>) {
+fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, project: Option<&HostPath>) {
     use vfs::backend::{Can, Setting, all, choose};
     // Whether a backend is available is asked of a folder: the project's, or any where none is open.
-    let anywhere = std::env::temp_dir();
+    let Ok(anywhere) = HostPath::new(&std::env::temp_dir()) else { return };
     let at = project.unwrap_or(&anywhere);
     let row = |ui: &mut egui::Ui, label: &str, says: &mut Option<String>, needs: Can, nothing: &str| {
         ui.label(label);
@@ -2436,7 +2437,8 @@ fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, proje
         ui.label(label);
         ui.horizontal(|ui| {
             let mut text = says.clone().unwrap_or_default();
-            let hint = if default >= 1 << 30 { format!("{} GiB", default >> 30) } else { format!("{} MiB", default >> 20) };
+            let hint =
+                if default >= 1 << 30 { format!("{} GiB", default >> 30) } else { format!("{} MiB", default >> 20) };
             let edited = ui.add(egui::TextEdit::singleline(&mut text).hint_text(hint).desired_width(90.0));
             if edited.changed() {
                 *says = Some(text.trim().to_string()).filter(|text| !text.is_empty());
@@ -2457,7 +2459,8 @@ fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, proje
             // Where a backend keeping a folder's content apart from it keeps it: empty is the system's place for it.
             ui.label("Kept apart in");
             let mut text = says.cache.clone().unwrap_or_default();
-            let edited = ui.add(egui::TextEdit::singleline(&mut text).hint_text("the user's local data").desired_width(260.0));
+            let edited =
+                ui.add(egui::TextEdit::singleline(&mut text).hint_text("the user's local data").desired_width(260.0));
             if edited.changed() {
                 says.cache = Some(text.trim().to_string()).filter(|text| !text.is_empty());
             }
@@ -2520,7 +2523,7 @@ fn settings_ui(
                     (SettingsPage::Files, ws) => {
                         use crate::settings::TakeIn;
                         let at = ws.map(|ws| ws.project.filesystem.at.clone());
-                        served_by_ui(ui, &mut settings.filesystem, at.as_deref());
+                        served_by_ui(ui, &mut settings.filesystem, at.as_ref());
                         theme::section(ui, "Changes other programs make", |ui| {
                             let take_in = &mut settings.changes.take_in;
                             ui.radio_value(take_in, TakeIn::OnFocus, "Take them in when the editor regains focus");
@@ -2572,10 +2575,8 @@ fn settings_ui(
 fn agents_ui(ui: &mut egui::Ui, settings: &mut EditorSettings) {
     theme::section(ui, "Agents connected to the project", |ui| {
         ui.label(
-            RichText::new(
-                "They read the project, and the editor's window: its widgets and how it looks.",
-            )
-            .color(theme::weak()),
+            RichText::new("They read the project, and the editor's window: its widgets and how it looks.")
+                .color(theme::weak()),
         );
         ui.checkbox(&mut settings.agents.drive, "Let them use the editor: click, type, press keys");
         ui.label(
@@ -2698,7 +2699,7 @@ fn project_settings_ui(
         return;
     }
     let p = &ws.project;
-    let file = p.root.join(project::FILE);
+    let file = p.root.join(&project::FILE);
     ui.horizontal(|ui| {
         if ui.small_button(format!("{}  Open project.toml", icons::ARROW_SQUARE_OUT)).clicked() {
             *message = Some(external::open(&file, "project.toml", tools).unwrap_or_else(|e| e));
@@ -2771,8 +2772,7 @@ fn project_settings_ui(
                     .map(|m| {
                         let access = if m.read_only { "  (read only)" } else { "" };
                         // Where it is, as the layers above name theirs: resolved, not as project.toml reaches it.
-                        let path = resolved(&m.path);
-                        (format!("res://{}", m.at), format!("{}{access}", path.display()))
+                        (format!("res://{}", m.at), format!("{}{access}", m.path))
                     })
                     .collect();
                 grid(ui, "mounts", rows);
@@ -2780,19 +2780,6 @@ fn project_settings_ui(
         }
         _ => {}
     }
-}
-
-/// A path with what it steps back over taken out (`a/../b`: `b`), by its text alone: how a place is shown.
-fn resolved(path: &std::path::Path) -> std::path::PathBuf {
-    let mut out = std::path::PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir if out.file_name().is_some() => drop(out.pop()),
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// A config's property set to a value, or to its default (`None`).
@@ -2807,7 +2794,7 @@ fn configurations_ui(ui: &mut egui::Ui, ws: &Workspace) -> Option<PropertyEdit> 
         ui.label(RichText::new("No configurations ([config.<name>])").color(theme::weak()));
     }
     for config in &p.configs {
-        theme::section(ui, &config.name, |ui| {
+        theme::section(ui, config.name.as_str(), |ui| {
             egui::Grid::new(("config", &config.name)).num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
                 let fixed = [("release", &config.release), ("target", &config.target)];
                 for (key, value) in fixed.into_iter().filter_map(|(k, v)| v.as_ref().map(|v| (k, v))) {
@@ -2828,13 +2815,13 @@ fn configurations_ui(ui: &mut egui::Ui, ws: &Workspace) -> Option<PropertyEdit> 
                         name.on_hover_text(description);
                     }
                     let value = set.or(property.default.as_ref());
-                    if let Some(to) = property_editor(ui, (&config.name, property), value) {
-                        edit = Some((config.name.clone(), property.name.clone(), Some(to)));
+                    if let Some(to) = property_editor(ui, (config.name.as_str(), property), value) {
+                        edit = Some((config.name.to_string(), property.name.clone(), Some(to)));
                     }
                     ui.horizontal(|ui| {
                         if set.is_some() {
                             if property.default.is_some() && ui.small_button("Default").clicked() {
-                                edit = Some((config.name.clone(), property.name.clone(), None));
+                                edit = Some((config.name.to_string(), property.name.clone(), None));
                             }
                         } else {
                             ui.label(RichText::new("default").small().color(theme::weak()));
@@ -2843,7 +2830,7 @@ fn configurations_ui(ui: &mut egui::Ui, ws: &Workspace) -> Option<PropertyEdit> 
                     ui.end_row();
                 }
             });
-            for problem in p.property_problems.iter().filter(|q| q.config.as_deref() == Some(&config.name)) {
+            for problem in p.property_problems.iter().filter(|q| q.config.as_ref() == Some(&config.name)) {
                 theme::warning(ui, &format!("{}: {}", problem.property, problem.why));
             }
         });

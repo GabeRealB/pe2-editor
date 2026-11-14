@@ -2,6 +2,9 @@
 //! across everything a process can stop at: a writer at each step of a transaction (`Space::fault`), a reader
 //! before and after its pin, a reader killed while pinned, a page that is not the one pointed to, and a disk that
 //! kept any part of what was last written.
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
+use std::path::Path;
 
 use super::*;
 use crate::tree;
@@ -9,8 +12,8 @@ use std::sync::atomic::AtomicUsize;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
-fn folder(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("pe2-sfs-space-{name}-{}", std::process::id()));
+fn folder(name: &str) -> HostPath {
+    let dir = pe2_path::testing::scratch(&format!("sfs-space-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -19,7 +22,9 @@ struct Rng(u64);
 
 impl Rng {
     fn of(prefix: &str, n: u64) -> Rng {
-        let seed = prefix.bytes().fold(0x9E37_79B9_7F4A_7C15u64, |seed, byte| (seed ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3));
+        let seed = prefix
+            .bytes()
+            .fold(0x9E37_79B9_7F4A_7C15u64, |seed, byte| (seed ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3));
         Rng((seed ^ n.wrapping_mul(0xD6E8_FEB8_6659_FD93)) | 1)
     }
 
@@ -257,9 +262,9 @@ fn readers_on_other_threads_read_one_commit_whole() {
 }
 
 /// This test program again, to run one of its tests as another process.
-fn process(test: &str, variable: &str, dir: &Path) -> std::process::Command {
+fn process(test: &str, variable: &str, dir: &HostPath) -> std::process::Command {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command.args(["--ignored", "--exact", &format!("space::tests::{test}")]).env(variable, dir);
+    command.args(["--ignored", "--exact", &format!("space::tests::{test}")]).env(variable, dir.as_os_str());
     command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     command
 }
@@ -268,7 +273,7 @@ fn process(test: &str, variable: &str, dir: &Path) -> std::process::Command {
 #[ignore = "run by two_processes_write_one_space, as its second process"]
 fn the_second_writer() {
     let Ok(dir) = std::env::var("PE2_SFS_SPACE_SECOND") else { return };
-    let space = Space::open(Path::new(&dir)).unwrap();
+    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap();
     run_beside(&space, "second", 400, 200);
     // Leaving in order, beside the one that goes on: what it wrote is on disk, and nothing is said clean.
     assert!(!space.rest().unwrap());
@@ -298,7 +303,7 @@ fn two_processes_write_one_space() {
     assert!(second.wait().unwrap().success());
     after("second", 400, 200, &mut model);
     same(&space.read().unwrap(), &model);
-    assert!(!dir.join("clean").exists(), "said clean by one that left beside another");
+    assert!(!dir.at("clean").exists(), "said clean by one that left beside another");
     // The last to leave in order has all of it on disk: whoever attaches next, alone, has it as both left it.
     assert!(space.rest().unwrap());
     drop(space);
@@ -332,11 +337,18 @@ fn lists_hold(space: &Space, views: &[&Pinned]) {
     let free: HashSet<u64> = free.into_iter().collect();
     for view in views {
         for page in reached(&|tree, into| tree::reached(*view, tree, into).unwrap()) {
-            assert!(!free.contains(&page), "page {page} is free, and a view at {} reaches it", view.commit().generation);
+            assert!(
+                !free.contains(&page),
+                "page {page} is free, and a view at {} reaches it",
+                view.commit().generation
+            );
         }
     }
     // Those held are in the order they were freed, each written before it was freed.
-    assert!(held.windows(2).all(|pair| pair[0].2 <= pair[1].2) && held.iter().all(|(_, written, freed)| written < freed), "{held:?}");
+    assert!(
+        held.windows(2).all(|pair| pair[0].2 <= pair[1].2) && held.iter().all(|(_, written, freed)| written < freed),
+        "{held:?}"
+    );
 }
 
 /// The steps a writer may stop at.
@@ -359,7 +371,7 @@ fn the_writer_that_stops() {
     let (Ok(dir), Ok(at)) = (std::env::var("PE2_SFS_SPACE_STOPS"), std::env::var("PE2_SFS_SPACE_AT")) else { return };
     let (step, nth) = at.split_once('#').unwrap();
     let (step, nth) = (step.to_owned(), nth.parse::<usize>().unwrap());
-    let space = Arc::new(Space::open(Path::new(&dir)).unwrap());
+    let space = Arc::new(Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap());
     let hits = AtomicUsize::new(0);
     space.set_faults(Arc::new(move |point| {
         if point == step && hits.fetch_add(1, Ordering::AcqRel) + 1 == nth {
@@ -397,7 +409,9 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             // Beside a process that has it attached, it is as its last commit left it: all of every transaction
             // the writer says it made, and nothing of the one it stopped in.
             let snapshot = space.read().unwrap();
-            let made = tree::get(&snapshot, 0, b"stops.made").unwrap().map_or(0, |made| u64::from_le_bytes(made.try_into().unwrap()));
+            let made = tree::get(&snapshot, 0, b"stops.made")
+                .unwrap()
+                .map_or(0, |made| u64::from_le_bytes(made.try_into().unwrap()));
             assert!(status.success() == (made == 300), "{step} #{nth}: made {made}, {status}");
             after("stops", made, 150, &mut model);
             same(&snapshot, &model);
@@ -425,7 +439,7 @@ fn a_writer_that_stops_at_any_step_leaves_its_last_commit() {
             let alone = Space::open(&dir).unwrap();
             assert!(alone.fresh() && Space::left_behind(&dir).unwrap().is_none());
             Space::forget_left(&dir);
-            assert!(!dir.join("left").exists());
+            assert!(!dir.at("left").exists());
             drop(alone);
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -480,9 +494,9 @@ fn a_reader_stopped_about_its_pin_reads_what_is_there_when_it_goes_on() {
 #[ignore = "run by a_reader_killed_while_pinned_holds_no_page_back, as the reader"]
 fn the_reader_that_is_killed() {
     let Ok(dir) = std::env::var("PE2_SFS_SPACE_PINS") else { return };
-    let space = Space::open(Path::new(&dir)).unwrap();
+    let space = Space::open(&HostPath::new(Path::new(&dir)).unwrap()).unwrap();
     let _pinned = space.read().unwrap();
-    std::fs::write(Path::new(&dir).join("pinned"), b"").unwrap();
+    std::fs::write(HostPath::new(Path::new(&dir)).unwrap().at("pinned"), b"").unwrap();
     std::thread::sleep(Duration::from_secs(60));
 }
 
@@ -494,7 +508,7 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
     run(&space, "p", 0..60, 100, &mut model);
     let mut reader = process("the_reader_that_is_killed", "PE2_SFS_SPACE_PINS", &dir).spawn().unwrap();
     let waited = Instant::now();
-    while !dir.join("pinned").exists() {
+    while !dir.at("pinned").exists() {
         assert!(waited.elapsed() < Duration::from_secs(30), "the reader never pinned");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -505,8 +519,14 @@ fn a_reader_killed_while_pinned_holds_no_page_back() {
     assert!(held.held > 0, "its pin held no page back: {held:?}");
     run(&space, "p", 160..460, 100, &mut model);
     let held_on = space.usage().unwrap();
-    assert!(held_on.held >= held.held && held_on.held <= before.pages - before.free, "{before:?}, {held:?}, {held_on:?}");
-    assert!(held_on.pages <= before.pages + (before.pages - before.free) + 64, "it held back more than it reads: {before:?}, {held_on:?}");
+    assert!(
+        held_on.held >= held.held && held_on.held <= before.pages - before.free,
+        "{before:?}, {held:?}, {held_on:?}"
+    );
+    assert!(
+        held_on.pages <= before.pages + (before.pages - before.free) + 64,
+        "it held back more than it reads: {before:?}, {held_on:?}"
+    );
     lists_hold(&space, &[]);
     reader.kill().unwrap();
     reader.wait().unwrap();
@@ -543,7 +563,7 @@ fn a_page_that_is_not_the_one_pointed_to_is_said_to_everyone_and_kept_aside() {
     // The next to have it alone begins anew, the damaged one kept aside.
     let anew = Space::open(&dir).unwrap();
     assert!(anew.fresh());
-    assert!(dir.join("damaged/head").is_file() && dir.join("damaged/00000000.chunk").is_file());
+    assert!(dir.at("damaged/head").is_file() && dir.at("damaged/00000000.chunk").is_file());
     let mut model = Model::new();
     run(&anew, "p", 0..10, 100, &mut model);
     same(&anew.read().unwrap(), &model);
@@ -559,9 +579,15 @@ fn a_cell_that_is_not_within_its_page_is_said() {
     let root = space.read().unwrap().root(0);
     // Where the root's first cell is said to be: past the page's end.
     // SAFETY: a page of the space, written here on purpose.
-    unsafe { std::slice::from_raw_parts_mut(space.page_at(root & NUMBER, false).unwrap().add(PAGE_HEAD + 12), 2).fill(0xFF) };
+    unsafe {
+        std::slice::from_raw_parts_mut(space.page_at(root & NUMBER, false).unwrap().add(PAGE_HEAD + 12), 2).fill(0xFF);
+    }
     let read = listed(&space.read().unwrap());
-    assert!(matches!(&read, Err(Error::Damaged(why)) if why.contains("holds what is not within it")), "{:?}", read.map(|all| all.len()));
+    assert!(
+        matches!(&read, Err(Error::Damaged(why)) if why.contains("holds what is not within it")),
+        "{:?}",
+        read.map(|all| all.len())
+    );
     assert!(matches!(space.write(), Err(Error::Damaged(_))));
 }
 
@@ -583,9 +609,9 @@ fn attached_to_alone_it_is_trusted_only_as_it_was_had_on_disk() {
     }
     {
         let space = Space::open(&dir).unwrap();
-        assert!(dir.join("clean").exists());
+        assert!(dir.at("clean").exists());
         run(&space, "p", 60..61, 100, &mut model);
-        assert!(!dir.join("clean").exists(), "said clean after a change");
+        assert!(!dir.at("clean").exists(), "said clean after a change");
         // Another that attaches meanwhile has it as it is.
         let beside = Space::open(&dir).unwrap();
         assert!(!beside.fresh());
@@ -611,14 +637,14 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
         let view = first.pinned().unwrap();
         run(&second, "p", 80..120, 100, &mut model);
         assert!(!first.rest().unwrap(), "said clean beside another that has it attached");
-        assert!(!dir.join("clean").exists());
+        assert!(!dir.at("clean").exists());
         drop((view, first));
         assert!(second.rest().unwrap());
-        assert!(dir.join("clean").exists());
+        assert!(dir.at("clean").exists());
         // Rested again with nothing changed, nothing is done; changed, it is said clean no more until it rests.
         assert!(second.rest().unwrap());
         run(&second, "p", 120..121, 100, &mut model);
-        assert!(!dir.join("clean").exists(), "said clean after a change");
+        assert!(!dir.at("clean").exists(), "said clean after a change");
         assert!(second.rest().unwrap());
     }
     {
@@ -641,7 +667,7 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
         run(&second, "p", 420..440, 100, &mut model);
         assert!(!first.leave().unwrap());
         assert!(second.leave().unwrap(), "of two that leave at once neither had it on disk");
-        assert!(dir.join("clean").exists());
+        assert!(dir.at("clean").exists());
         drop((first, second));
         let space = Space::open(&dir).unwrap();
         assert!(!space.fresh());
@@ -651,9 +677,9 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
     {
         // One that makes ready to write says so ahead of its first change - and ends without resting.
         let space = Space::open(&dir).unwrap();
-        assert!(!space.fresh() && dir.join("clean").exists());
+        assert!(!space.fresh() && dir.at("clean").exists());
         space.ready();
-        assert!(!dir.join("clean").exists(), "said clean by one that is to write");
+        assert!(!dir.at("clean").exists(), "said clean by one that is to write");
         same(&space.read().unwrap(), &model);
     }
     let space = Space::open(&dir).unwrap();
@@ -663,7 +689,7 @@ fn left_in_order_it_is_trusted_by_who_attaches_next_alone() {
 }
 
 /// The files of a space's pages, read.
-fn pages_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+fn pages_of(dir: &HostPath) -> BTreeMap<String, Vec<u8>> {
     let files = std::fs::read_dir(dir).unwrap().flatten().filter_map(|entry| {
         let name = entry.file_name().into_string().ok()?;
         (of_pages(&name) && entry.file_type().ok()?.is_file()).then(|| (name, std::fs::read(entry.path()).unwrap()))
@@ -700,7 +726,7 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
             // A disk that kept, of each file: all of what was written since it was had on disk, none of it, or
             // any pages of it.
             let Some(was) = before.get(name) else {
-                std::fs::write(mixed.join(name), now).unwrap();
+                std::fs::write(mixed.at(name), now).unwrap();
                 continue;
             };
             let of_list = name == "head" || name == "free" || name.contains(".free") || name.contains(".held");
@@ -714,14 +740,14 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
                 let later = kept == 1 || (kept == 2 && rng.below(2) == 0);
                 bytes.extend_from_slice(if later { now } else { was });
             }
-            std::fs::write(mixed.join(name), bytes).unwrap();
+            std::fs::write(mixed.at(name), bytes).unwrap();
         }
         // Not said clean, it begins anew, and what the disk kept is read beside it: what one of those commits
         // held, or it says that a page is not the one pointed to. Never anything else.
         let unclean = folder(&format!("disk-{seed}-unclean"));
         std::fs::create_dir_all(&unclean).unwrap();
         for entry in std::fs::read_dir(&mixed).unwrap().flatten() {
-            std::fs::copy(entry.path(), unclean.join(entry.file_name())).unwrap();
+            std::fs::copy(entry.path(), unclean.entry(&entry.file_name())).unwrap();
         }
         let begun = Space::open(&unclean).unwrap();
         assert!(begun.fresh());
@@ -737,7 +763,7 @@ fn whatever_part_of_its_last_writes_a_disk_kept_it_reads_right_or_says_so() {
         drop((left, begun));
         std::fs::remove_dir_all(&unclean).unwrap();
         // And said clean all the same, as it was when that was true.
-        std::fs::write(mixed.join("clean"), &before["clean"]).unwrap();
+        std::fs::write(mixed.at("clean"), &before["clean"]).unwrap();
         let space = Space::open(&mixed).unwrap();
         if space.fresh() {
             anew += 1;
@@ -798,7 +824,10 @@ fn a_tree_loaded_whole_is_what_it_was_given_and_changed_as_any_is() {
         for (key, value) in model.iter().step_by(7) {
             let found = tree::get_in(&read, 0, key).unwrap();
             assert_eq!(found.as_deref(), Some(value.as_slice()));
-            assert_eq!(matches!(found, Some(std::borrow::Cow::Borrowed(_))), 8 + key.len() + value.len() <= (4096 - 28) / 3);
+            assert_eq!(
+                matches!(found, Some(std::borrow::Cow::Borrowed(_))),
+                8 + key.len() + value.len() <= (4096 - 28) / 3
+            );
         }
         assert_eq!(tree::get_in(&read, 0, b"load/none").unwrap(), None);
         // Those of a prefix, and no other.
@@ -890,7 +919,11 @@ fn a_view_pinned_is_held_by_whoever_holds_it_and_reads_what_it_began_with() {
     run(&space, "pin", 400..800, 200, &mut model);
     let settled = space.usage().unwrap().pages;
     run(&space, "pin", 800..1600, 200, &mut model);
-    assert!(space.usage().unwrap().pages <= settled + settled / 4, "{} pages after, {settled} before", space.usage().unwrap().pages);
+    assert!(
+        space.usage().unwrap().pages <= settled + settled / 4,
+        "{} pages after, {settled} before",
+        space.usage().unwrap().pages
+    );
 }
 
 #[test]
@@ -1024,7 +1057,10 @@ fn the_lists_of_pages_grow_by_pieces_and_what_they_list_is_taken_again() {
     empty(&space);
     fill(&space, 4);
     assert_eq!(space.usage().unwrap().pages, emptied.pages);
-    assert_eq!(tree::get(&space.read().unwrap(), 0, &9_999u32.to_be_bytes()).unwrap().as_deref(), Some(&[4u8; 3000][..]));
+    assert_eq!(
+        tree::get(&space.read().unwrap(), 0, &9_999u32.to_be_bytes()).unwrap().as_deref(),
+        Some(&[4u8; 3000][..])
+    );
 }
 
 #[test]

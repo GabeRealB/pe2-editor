@@ -14,9 +14,9 @@
 //! backend needs telling (`placed`, `released`), and what a process that ended left of one is the backend's to clear
 //! (`clear`).
 
+use pe2_path::HostPath;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 
 use project::content::Use;
@@ -64,9 +64,9 @@ pub struct Job<'a> {
     /// Who applies what programs change; none serves read-only.
     pub owner: Option<Arc<dyn Owner>>,
     /// The folder it is served at, for a backend serving at one.
-    pub at: &'a Path,
+    pub at: &'a HostPath,
     /// Where a backend keeps what is being written until it is applied.
-    pub staging: &'a Path,
+    pub staging: &'a HostPath,
     /// What it is served as, where the system shows or registers a name.
     pub name: &'a str,
     /// The address it is served at, for a backend serving at one; none is the backend's own.
@@ -99,7 +99,7 @@ pub trait Backend: Sync {
     ///
     /// # Errors
     /// Why not, as a sentence's end ("the Projected File System is not turned on").
-    fn available(&self, at: &Path) -> Result<(), String>;
+    fn available(&self, at: &HostPath) -> Result<(), String>;
 
     /// Serve a job, until what this returns is dropped.
     ///
@@ -109,29 +109,29 @@ pub trait Backend: Sync {
 
     /// Clear what a serving that ended - let go of, or its process gone - left at a folder, served there by a name: of
     /// this backend's, or of any where which served it is not known. The folder is then empty, or gone.
-    fn clear(&self, _at: &Path, _name: &str) {}
+    fn clear(&self, _at: &HostPath, _name: &str) {}
 
     /// Leave a folder it served, by a name, to another backend about to serve there: what it left there as it served
     /// it goes - it can be read again - and the folder is a plain one again; what was put or changed there while
     /// nothing served it stays, for whoever serves next to say (`strays`).
-    fn retire(&self, _at: &Path, _name: &str) {}
+    fn retire(&self, _at: &HostPath, _name: &str) {}
 
     /// Let go of what it keeps on disk of what was read at a folder it serves, where that is more than a budget of
     /// bytes: what was read longest ago first (`record`), until it fits; what was changed there is never touched.
     /// Nothing, for one that keeps nothing.
-    fn collect(&self, _at: &Path, _record: &crate::access::Access, _budget: u64) {}
+    fn collect(&self, _at: &HostPath, _record: &crate::access::Access, _budget: u64) {}
 
     /// No longer know a folder it served, by the name it served it as, where the system keeps one registered.
     ///
     /// # Errors
     /// It cannot be forgotten.
-    fn forget(&self, _at: &Path, _name: &str) -> io::Result<()> {
+    fn forget(&self, _at: &HostPath, _name: &str) -> io::Result<()> {
         Ok(())
     }
 
     /// Whether a file at the folder it served is what serving left there, as it left it - not a file put there, or
     /// changed while nothing served it.
-    fn left_as_served(&self, _file: &Path) -> bool {
+    fn left_as_served(&self, _file: &HostPath) -> bool {
         false
     }
 }
@@ -276,7 +276,7 @@ pub fn budget(says: &[Option<&str>], default: u64) -> u64 {
 pub fn choose(
     setting: &Setting,
     needs: Can,
-    at: &Path,
+    at: &HostPath,
     how: &Use,
     light: bool,
 ) -> Result<Option<&'static dyn Backend>, String> {
@@ -309,7 +309,7 @@ fn choose_among<'a>(
     backends: &[&'a dyn Backend],
     setting: &Setting,
     needs: Can,
-    at: &Path,
+    at: &HostPath,
     how: &Use,
     light: bool,
 ) -> Result<Option<&'a dyn Backend>, String> {
@@ -342,12 +342,11 @@ fn choose_among<'a>(
 }
 
 /// What says where this machine keeps apart what a backend keeps of a folder elsewhere than in it (`keep_apart_by`).
-static APART: std::sync::OnceLock<Box<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>> =
-    std::sync::OnceLock::new();
+static APART: std::sync::OnceLock<Box<dyn Fn() -> Option<HostPath> + Send + Sync>> = std::sync::OnceLock::new();
 
 /// Ask this, from now on, where the machine keeps such things apart (its settings' `[filesystem] cache`): given by
 /// the program, which is what reads the machine's settings, once.
-pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + Sync + 'static) {
+pub fn keep_apart_by(machine: impl Fn() -> Option<HostPath> + Send + Sync + 'static) {
     let _ = APART.set(Box::new(machine));
 }
 
@@ -356,17 +355,25 @@ pub fn keep_apart_by(machine: impl Fn() -> Option<std::path::PathBuf> + Send + S
 /// (`%LOCALAPPDATA%\pe2-editor\served`: this machine's, not what roams with the user). None where nothing says and
 /// the system has no such place.
 #[must_use]
-pub fn apart_for(at: &Path) -> Option<std::path::PathBuf> {
-    let project = at.parent().and_then(|root| project::local_filesystem(root).cache);
+pub fn apart_for(at: &HostPath) -> Option<HostPath> {
+    // Places a setting or the environment names, as the system names them.
+    let place = |text: &std::ffi::OsStr| HostPath::new(std::path::Path::new(text)).ok();
+    let project = at.parent().and_then(|root| project::local_filesystem(&root).cache);
     let machine = || APART.get().and_then(|machine| machine());
-    let default = || Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("pe2-editor").join("served"));
-    project.map(std::path::PathBuf::from).or_else(machine).or_else(|| if cfg!(windows) { default() } else { None })
+    let default = || {
+        let local = place(&std::env::var_os("LOCALAPPDATA")?)?;
+        Some(local.join(&pe2_path::RelPath::constant("pe2-editor/served")))
+    };
+    project
+        .and_then(|cache| place(std::ffi::OsStr::new(&cache)))
+        .or_else(machine)
+        .or_else(|| if cfg!(windows) { default() } else { None })
 }
 
 /// Make a folder ready for a backend to serve at: every other backend of this system that serves at folders retires
 /// what it left there (`Backend::retire`), so that serving by one after another finds no leftovers of the other's to
 /// take for files that are not the project's.
-pub fn hand_over(to: &dyn Backend, at: &Path, name: &str) {
+pub fn hand_over(to: &dyn Backend, at: &HostPath, name: &str) {
     for other in all().iter().filter(|other| other.can().folder && other.name() != to.name()) {
         other.retire(at, name);
     }
@@ -374,7 +381,7 @@ pub fn hand_over(to: &dyn Backend, at: &Path, name: &str) {
 
 /// Why no backend serves a job at a folder: each, and what it lacks or why it is not available.
 #[must_use]
-pub fn why_none(needs: Can, at: &Path) -> String {
+pub fn why_none(needs: Can, at: &HostPath) -> String {
     let whys: Vec<String> = all()
         .iter()
         .filter_map(|b| {
@@ -385,20 +392,9 @@ pub fn why_none(needs: Can, at: &Path) -> String {
     whys.join("; ")
 }
 
-/// A path without the verbatim prefix canonicalizing gives it (`\\?\D:\x` as `D:\x`), where it has a drive: as Windows
-/// names a folder in what it asks and registers, and as what mounts on one takes it.
-#[cfg(windows)]
-pub(crate) fn plain(path: &Path) -> std::path::PathBuf {
-    let text = path.to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC\\") => std::path::PathBuf::from(rest),
-        _ => path.to_path_buf(),
-    }
-}
-
 /// Whether a folder is a junction: a link to a folder elsewhere, not one of its own.
 #[cfg(windows)]
-pub(crate) fn joined(at: &Path) -> bool {
+pub(crate) fn joined(at: &HostPath) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     std::fs::symlink_metadata(at).is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
@@ -406,19 +402,20 @@ pub(crate) fn joined(at: &Path) -> bool {
 
 /// Where a junction leads, plainly written; none where the folder is none.
 #[cfg(windows)]
-pub(crate) fn joined_to(at: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn joined_to(at: &HostPath) -> Option<HostPath> {
     if !joined(at) {
         return None;
     }
+    // What it leads to as Windows follows it (`\??\C:\...`): the place as the system names it.
     let to = std::fs::read_link(at).ok()?;
     let text = to.to_string_lossy();
-    Some(plain(Path::new(text.strip_prefix(r"\??\").unwrap_or(&text))))
+    HostPath::new(std::path::Path::new(text.strip_prefix(r"\??\").unwrap_or(&text))).ok()
 }
 
 /// Make a folder a plain one again where it is a junction: removed as the junction it is - what it led to is not
 /// touched - and made again.
 #[cfg(windows)]
-pub(crate) fn unjoin(at: &Path) {
+pub(crate) fn unjoin(at: &HostPath) {
     if joined(at) && std::fs::remove_dir(at).is_ok() {
         let _ = std::fs::create_dir(at);
     }
@@ -431,7 +428,7 @@ pub(crate) fn unjoin(at: &Path) {
 /// The folder cannot be made or opened, or Windows refuses the junction (a volume that takes none, a folder that
 /// holds something).
 #[cfg(windows)]
-pub(crate) fn join_to(at: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn join_to(at: &HostPath, to: &HostPath) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -442,7 +439,7 @@ pub(crate) fn join_to(at: &Path, to: &Path) -> io::Result<()> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     std::fs::create_dir_all(at)?;
     // The name Windows follows (`\??\C:\...`) and the one it shows (`C:\...`), each ended by a zero.
-    let shown: Vec<u16> = plain(to).as_os_str().encode_wide().collect();
+    let shown: Vec<u16> = to.as_os_str().encode_wide().collect();
     let followed: Vec<u16> = r"\??\".encode_utf16().chain(shown.iter().copied()).collect();
     let long = || io::Error::other("too long a path for a junction");
     let bytes = |units: &[u16]| u16::try_from(units.len() * 2).map_err(|_| long());
@@ -471,7 +468,7 @@ pub(crate) fn join_to(at: &Path, to: &Path) -> io::Result<()> {
 
 /// The filesystem of the volume a path is on (`NTFS`, `ReFS`), where Windows says: the path need not be there yet.
 #[cfg(windows)]
-pub(crate) fn volume_filesystem(at: &Path) -> Option<String> {
+pub(crate) fn volume_filesystem(at: &HostPath) -> Option<String> {
     use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
     let root: Vec<u16> = volume_of(at)?.encode_utf16().chain(std::iter::once(0)).collect();
     let mut name = [0u16; 64];
@@ -485,10 +482,9 @@ pub(crate) fn volume_filesystem(at: &Path) -> Option<String> {
 
 /// The volume a path is on, as Windows names its root (`E:\`); the path need not be there yet.
 #[cfg(windows)]
-pub(crate) fn volume_of(at: &Path) -> Option<String> {
+pub(crate) fn volume_of(at: &HostPath) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
-    let at = std::path::absolute(at).ok()?;
     // The volume the folder itself is on: a junction is asked of the folder it is in, or Windows answers for the
     // volume it leads to.
     let there = at.ancestors().find(|a| a.exists() && !joined(a))?;
@@ -509,7 +505,7 @@ pub fn unmount_all() {
 #[cfg(test)]
 mod tests {
     use super::{Backend, Can, Job, Mount, Setting, Use, choose_among, setting};
-    use std::path::Path;
+    use pe2_path::HostPath;
 
     /// A backend that only says what it is.
     struct Said {
@@ -540,7 +536,7 @@ mod tests {
         fn prepares(&self) -> bool {
             self.prepares
         }
-        fn available(&self, _: &Path) -> Result<(), String> {
+        fn available(&self, _: &HostPath) -> Result<(), String> {
             if self.here { Ok(()) } else { Err("it is not turned on".into()) }
         }
         fn mount(&self, _: &Job) -> std::io::Result<Box<dyn Mount>> {
@@ -557,7 +553,7 @@ mod tests {
         let full = said("full", BOTH, true);
         let wire = said("wire", Can::WRITTEN, true);
         let all: [&dyn Backend; 4] = [&light, &off, &full, &wire];
-        let at = Path::new("x");
+        let at = &pe2_path::testing::scratch("backend-choice");
         // Read once, and much to write to lay it out: a backend suits better than copies.
         let how = Use::once();
         let chosen = |setting: &Setting, needs: Can| {
@@ -588,21 +584,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_folder_leads_to_another_and_is_one_of_its_own_again() {
-        let root = std::env::temp_dir().join(format!("pe2-junction-{}", std::process::id()));
-        let (at, to) = (root.join("at"), root.join("to"));
+        use pe2_path::testing::At as _;
+        let root = pe2_path::testing::scratch("junction");
+        let (at, to) = (root.at("at"), root.at("to"));
         std::fs::create_dir_all(&to).unwrap();
-        std::fs::write(to.join("there.txt"), "there").unwrap();
+        std::fs::write(to.at("there.txt"), "there").unwrap();
         assert!(!super::joined(&at) && super::joined_to(&at).is_none());
         super::join_to(&at, &to).expect("joined");
-        assert_eq!(super::joined_to(&at).as_deref(), Some(super::plain(&to).as_path()));
+        assert_eq!(super::joined_to(&at), Some(to.clone()));
         // What is opened through it is in the other; what is written through it too.
-        assert_eq!(std::fs::read_to_string(at.join("there.txt")).unwrap(), "there");
-        std::fs::write(at.join("new.txt"), "new").unwrap();
-        assert_eq!(std::fs::read_to_string(to.join("new.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(at.at("there.txt")).unwrap(), "there");
+        std::fs::write(at.at("new.txt"), "new").unwrap();
+        assert_eq!(std::fs::read_to_string(to.at("new.txt")).unwrap(), "new");
         // One of its own again, empty: what it led to is as it was.
         super::unjoin(&at);
         assert!(!super::joined(&at) && std::fs::read_dir(&at).unwrap().next().is_none());
-        assert!(to.join("there.txt").exists() && to.join("new.txt").exists());
+        assert!(to.at("there.txt").exists() && to.at("new.txt").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -614,7 +611,7 @@ mod tests {
         let keeper = Said { keeps: true, ..said("keeper", Can::BY_PATH, true) };
         let eager = Said { keeps: true, prepares: true, ..said("eager", BOTH, true) };
         let all: [&dyn Backend; 3] = [&plain, &keeper, &eager];
-        let at = Path::new("x");
+        let at = &pe2_path::testing::scratch("backend-choice");
         let chosen = |needs: Can, how: &Use, light: bool| {
             choose_among(&all, &Setting::Auto, needs, at, how, light).unwrap().map_or("copies", Backend::name)
         };

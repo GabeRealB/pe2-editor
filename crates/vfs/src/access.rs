@@ -9,8 +9,8 @@
 //! folder worked in, what was read last time is still kept - while filling in the background slows what is read
 //! meanwhile.
 
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,7 @@ fn is_zero(bytes: &u64) -> bool {
 /// What was read of something served, and where that is remembered.
 #[derive(Debug)]
 pub struct Access {
-    file: Option<PathBuf>,
+    file: Option<HostPath>,
     read: Mutex<(BTreeMap<String, Read>, bool)>,
 }
 
@@ -43,11 +43,18 @@ fn now() -> u64 {
 impl Access {
     /// What was read of a use of a project, by its name: as remembered from the last time, nothing where it is new.
     #[must_use]
-    pub fn of(project: &Path, what: &str) -> Access {
+    pub fn of(project: &HostPath, what: &str) -> Access {
+        const ACCESS: pe2_path::Name = pe2_path::Name::constant("access");
         let name = project::extract::sha1_hex(what.as_bytes());
-        let file = project.join(project::cache::DIR).join("access").join(format!("{name}.json"));
-        let read = std::fs::read(&file).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        Access { file: Some(file), read: Mutex::new((read, false)) }
+        let file = pe2_path::Name::new(&format!("{name}.json"))
+            .ok()
+            .map(|file| project.join(&project::cache::DIR).join(&ACCESS).join(&file));
+        let read = file
+            .as_ref()
+            .and_then(|file| std::fs::read(file).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Access { file, read: Mutex::new((read, false)) }
     }
 
     /// A record remembered nowhere: of what is served for no project.

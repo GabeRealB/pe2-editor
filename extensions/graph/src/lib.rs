@@ -1,6 +1,8 @@
 //! pe2.graph: what a project defines of its own work graph. An operation - a graph of others, with the inputs and
 //! settings it takes - any stack uses by its uid as it uses an extension's, made once and used everywhere: the host
-//! lays its graph into each stack using it. A template, a node's stack to start from, offered beside the extensions'.
+//! lays its graph into each stack using it. A generator: a node whose outputs are operations, made for the configuration
+//! built - the host takes each as `uid://<generator>#<output>` - as a build system makes its build from a description. A
+//! template, a node's stack to start from, offered beside the extensions'.
 
 use pe2_ext::{Field, Icon, Registry, Result, Tint};
 
@@ -11,6 +13,13 @@ fn register(r: &mut Registry) -> Result<()> {
     r.named_type("operation")
         .alias("operation")
         .label("Operation")
+        .data()
+        .icon(Icon::Stack, Tint::Code)
+        .field(Field::new("label").label("Label"))
+        .register();
+    r.named_type("generator")
+        .alias("generator")
+        .label("Generator")
         .data()
         .icon(Icon::Stack, Tint::Code)
         .field(Field::new("label").label("Label"))

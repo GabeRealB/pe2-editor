@@ -369,6 +369,9 @@ pub struct Ops {
 pub const DEFINED: &str = "pe2.graph@operation";
 /// What a project defines a template as.
 pub const DEFINED_TEMPLATE: &str = "pe2.graph@template";
+/// What a project defines a generator as: a node whose outputs are operations (each a declaration defining one),
+/// made for the configuration built and taken as `uid://<generator>#<output>`.
+pub const DEFINED_GENERATOR: &str = "pe2.graph@generator";
 
 /// The operations a project defines, by uid.
 pub type Definitions = HashMap<String, Arc<Definition>>;
@@ -457,7 +460,16 @@ impl Definition {
             return Err("it makes nothing: it has no `output` box".into());
         }
         let label = layer.get("label").and_then(Toml::as_str).map_or_else(|| uid.to_string(), str::to_owned);
-        Ok(Definition { uid: uid.to_string(), label, version: version.to_string(), inputs, input_boxes, settings, outputs, ops })
+        Ok(Definition {
+            uid: uid.to_string(),
+            label,
+            version: version.to_string(),
+            inputs,
+            input_boxes,
+            settings,
+            outputs,
+            ops,
+        })
     }
 
     /// Its settings' values: the layer's, else their defaults.
@@ -664,12 +676,16 @@ fn add_logic(ops: &mut Ops) {
 /// boolean as one, anything else as a table's `value`.
 fn add_boxes(ops: &mut Ops) {
     let declared = |settings: &Table| Type::parse(settings.get("type")?.as_str()?, "").ok();
-    ops.add(OpDef::new(INPUT, "Input", "1").output_of(declared).makes(Type::Any, |_| {
-        anyhow::bail!("an input is given only inside an operation the project defines")
-    }));
-    ops.add(OpDef::new(GIVEN, "Given", "1").output_of(declared).makes(Type::Any, |_| {
-        anyhow::bail!("what is given from outside is never made")
-    }));
+    ops.add(
+        OpDef::new(INPUT, "Input", "1")
+            .output_of(declared)
+            .makes(Type::Any, |_| anyhow::bail!("an input is given only inside an operation the project defines")),
+    );
+    ops.add(
+        OpDef::new(GIVEN, "Given", "1")
+            .output_of(declared)
+            .makes(Type::Any, |_| anyhow::bail!("what is given from outside is never made")),
+    );
     // Run by the evaluation itself, which lays its body out (`exec::Evaluation::for_each`).
     ops.add(
         OpDef::new(FOR_EACH, "For each", "1")

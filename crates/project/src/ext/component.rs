@@ -29,6 +29,7 @@
 use anyhow::{Context, Result, anyhow};
 use pe2_ext::{Asset, Field, Image, Name, Project, Registry, Source, Table, UiHost};
 use pe2_ext::{Value, View};
+use pe2_path::HostPath;
 use std::path::Path;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -772,7 +773,7 @@ impl unsandboxed::Host for State {
             )));
         }
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let fetched = super::setup::fetch(setup, store, unsandboxed.folder.as_deref(), &mut |_, _| {}, &cancel);
+        let fetched = super::setup::fetch(setup, store, unsandboxed.folder.as_ref(), &mut |_, _| {}, &cancel);
         Ok(fetched.map_err(|e| format!("{id}: {name}: {e:#}")))
     }
 
@@ -780,19 +781,17 @@ impl unsandboxed::Host for State {
         let Some(unsandboxed) = &self.unsandboxed else {
             return Ok(Err(format!("{}: it runs in the sandbox", self.id)));
         };
-        let (folder, fetched) = (unsandboxed.folder.as_deref(), unsandboxed.fetched());
         // Paths in its filesystem's form, as the program reads them.
         let args: Vec<String> = args.iter().map(|arg| host_arg(arg)).collect();
-        // A name it launches is another program with arguments of its own, before those passed.
-        let (program, args) = match unsandboxed.launch.iter().find(|launch| launch.name == tool) {
-            Some(launch) => {
-                let (program, mut before) = launch.resolved(folder, &fetched);
+        // A program it offers, or another extension does, is another with arguments of its own, before those passed.
+        let (program, args) = match unsandboxed.start(&tool) {
+            Ok((program, mut before)) => {
                 before.extend(args);
                 (program, before)
             }
-            None => (super::unsandboxed::program(folder, &fetched, &tool), args),
+            Err(e) => return Ok(Err(format!("{}: {e:#}", self.id))),
         };
-        let mut command = std::process::Command::new(&program);
+        let mut command = std::process::Command::new(program.as_os_str());
         command
             .args(&args)
             .stdin(std::process::Stdio::piped())
@@ -824,13 +823,13 @@ impl unsandboxed::Host for State {
                          `pe2-cli project extension setup {id}`, or its Fetches in the editor's Extensions{see}"
                     );
                 }
-                return Ok(Err(format!("{}: {e}{see}", program.display())));
+                return Ok(Err(format!("{program}: {e}{see}")));
             }
         };
         let (input, output, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (Some(output), Some(mut stderr)) = (output, stderr) else {
             let _ = child.kill();
-            return Ok(Err(format!("{}: no pipes", program.display())));
+            return Ok(Err(format!("{program}: no pipes")));
         };
         let said: Arc<Mutex<Vec<u8>>> = Arc::default();
         let kept = said.clone();
@@ -2751,25 +2750,27 @@ fn file_from_wit(f: types::File) -> pe2_ext::File {
 }
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.
-fn compiled_dir() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("PE2_CACHE") {
-        return Some(std::path::PathBuf::from(dir).join("compiled"));
+fn compiled_dir() -> Option<HostPath> {
+    const COMPILED: pe2_path::Name = pe2_path::Name::constant("compiled");
+    const EDITOR: pe2_path::Name = pe2_path::Name::constant("pe2-editor");
+    // A folder the environment names, as the system names it.
+    let place = |var: &str| std::env::var_os(var).and_then(|dir| HostPath::new(std::path::Path::new(&dir)).ok());
+    if let Some(dir) = place("PE2_CACHE") {
+        return Some(dir.join(&COMPILED));
     }
     let base = if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+        place("LOCALAPPDATA")
     } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Caches"))
+        place("HOME").map(|home| home.join(&pe2_path::RelPath::constant("Library/Caches")))
     } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        place("XDG_CACHE_HOME").or_else(|| place("HOME").map(|home| home.join(&pe2_path::Name::constant(".cache"))))
     };
-    Some(base?.join("pe2-editor").join("compiled"))
+    Some(base?.join(&EDITOR).join(&COMPILED))
 }
 
 /// Remove compiled components not written for 30 days: those of extensions since rebuilt, mostly; one still used is
 /// compiled again.
-fn sweep(dir: &Path) {
+fn sweep(dir: &HostPath) {
     const KEPT: Duration = Duration::from_hours(30 * 24);
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let old = entry
@@ -2778,8 +2779,8 @@ fn sweep(dir: &Path) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > KEPT);
-        if old && entry.path().extension().is_some_and(|e| e == "cwasm") {
-            let _ = std::fs::remove_file(entry.path());
+        if old && std::path::Path::new(&entry.file_name()).extension().is_some_and(|e| e == "cwasm") {
+            let _ = std::fs::remove_file(dir.entry(&entry.file_name()));
         }
     }
 }
@@ -2792,7 +2793,7 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
     let mut settings = std::hash::DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut settings);
     let key = format!("{}-{:016x}", crate::extract::sha1_hex(bytes), settings.finish());
-    let file = compiled_dir().map(|dir| dir.join(format!("{key}.cwasm")));
+    let file = compiled_dir().zip(pe2_path::Name::new(&format!("{key}.cwasm")).ok()).map(|(dir, name)| dir.join(&name));
     if let Some(kept) = file.as_ref().and_then(|f| std::fs::read(f).ok())
         && let Some((digest, code)) = kept.split_at_checked(20)
         && Sha1::digest(code).as_slice() == digest
@@ -2812,8 +2813,8 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
         let mut kept = Sha1::digest(&code).to_vec();
         kept.extend_from_slice(&code);
         if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-            sweep(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            sweep(&dir);
         }
         let _ = crate::cache::write_atomic(&file, &kept);
     }
@@ -2824,9 +2825,9 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
 ///
 /// # Errors
 /// It cannot be read, compiled or instantiated, or its registration fails.
-pub fn load(path: &Path) -> Result<Loadable> {
+pub fn load(path: &HostPath) -> Result<Loadable> {
     let bytes = crate::content::read(path).with_context(|| path.display().to_string())?;
-    load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.to_path_buf()))
+    load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.clone()))
 }
 
 /// Who a component is, as `extension!` writes it into the section the host reads without running it
@@ -2851,9 +2852,9 @@ pub struct About {
     /// What it fetches onto a machine before it runs (`setup`): unsandboxed, the programs it starts.
     #[serde(default)]
     pub setup: Vec<super::setup::Setup>,
-    /// What it starts by name that is another program with arguments (`unsandboxed::Launch`).
+    /// The programs it offers, by name (`unsandboxed::Program`).
     #[serde(default)]
-    pub launch: Vec<super::unsandboxed::Launch>,
+    pub program: Vec<super::unsandboxed::Program>,
     /// What is said of it, which the code does not know.
     #[serde(flatten)]
     pub described: Described,
@@ -2892,11 +2893,11 @@ pub struct Bundled {
     pub text: String,
 }
 
-/// What only an extension running unsandboxed may have: setup, which fetches what the programs it starts are, and
-/// launches, which name them. One in the sandbox starts none.
+/// What only an extension running unsandboxed may have: setup, which fetches what the programs it starts are, and the
+/// programs it offers. One in the sandbox starts none.
 ///
 /// # Errors
-/// It runs in the sandbox, and fetches or launches.
+/// It runs in the sandbox, and fetches or offers programs.
 pub fn sandboxed_fetches_nothing(about: &About) -> Result<()> {
     anyhow::ensure!(
         about.unsandboxed || about.setup.is_empty(),
@@ -2904,8 +2905,8 @@ pub fn sandboxed_fetches_nothing(about: &About) -> Result<()> {
          extension fetches"
     );
     anyhow::ensure!(
-        about.unsandboxed || about.launch.is_empty(),
-        "it names programs to launch and runs in the sandbox, which starts none: only an unsandboxed extension launches"
+        about.unsandboxed || about.program.is_empty(),
+        "it offers programs and runs in the sandbox, which starts none: only an unsandboxed extension offers programs"
     );
     Ok(())
 }
@@ -2986,28 +2987,34 @@ pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> 
 /// What an unsandboxed extension is, beyond its component.
 #[derive(Clone, Debug)]
 pub struct Unsandboxed {
+    /// Its id, as what it offers is named by others (`<id>:<program>`).
+    pub id: String,
     /// The folder it is in: what it ships.
-    pub folder: Option<std::path::PathBuf>,
+    pub folder: Option<HostPath>,
     /// Its hash: what the user enabled, and what it makes is kept by.
     pub trust: String,
     /// Its installation notes, where it has any: what a program it cannot start points to.
-    pub install: Option<std::path::PathBuf>,
+    pub install: Option<HostPath>,
     /// Where what its setup fetches is kept on this machine.
-    pub store: Option<std::path::PathBuf>,
+    pub store: Option<HostPath>,
     /// What its setup fetches for this platform.
     pub setup: Vec<super::setup::Setup>,
     /// Of what is optional, what the user turned off on this computer, by key.
     pub off: std::collections::BTreeSet<String>,
-    /// What it starts by name that is another program, for this platform.
-    pub launch: Vec<super::unsandboxed::Launch>,
+    /// The programs it offers, for this platform.
+    pub programs: Vec<super::unsandboxed::Program>,
+    /// What every extension loaded beside it offers: where `<extension>:<name>` is found.
+    pub offered: super::unsandboxed::Offered,
 }
 
 impl Unsandboxed {
     /// What its setup fetched onto this machine: the folders, each laid out as its tree is - looked at as it starts a
     /// program, so that what was fetched since is found.
-    fn fetched(&self) -> Vec<std::path::PathBuf> {
+    pub(crate) fn fetched(&self) -> Vec<HostPath> {
         let Some(store) = &self.store else { return vec![] };
-        self.setup.iter().filter(|setup| setup.fetched(store)).map(|setup| setup.place(store)).collect()
+        // The store's places, as the system names them.
+        let fetched = self.setup.iter().filter(|setup| setup.fetched(store));
+        fetched.filter_map(|setup| HostPath::new(&setup.place(store)).ok()).collect()
     }
 
     /// Have what it requires on this machine before anything of it runs - an operation, a service, a reading - as a
@@ -3021,17 +3028,120 @@ impl Unsandboxed {
         let Some(store) = &self.store else { return Ok(()) };
         let cancel = std::sync::atomic::AtomicBool::new(false);
         for setup in self.setup.iter().filter(|setup| !setup.lazy && !setup.fetched(store)) {
-            super::setup::fetch(setup, store, self.folder.as_deref(), &mut |_, _| {}, &cancel)
+            super::setup::fetch(setup, store, self.folder.as_ref(), &mut |_, _| {}, &cancel)
                 .with_context(|| format!("fetching {}, which it requires", setup.name))?;
         }
         Ok(())
     }
 
+    /// A program to start as `tool` names it: another extension's (`<extension>:<name>`), one it offers by name, or a
+    /// place in its tree, else on the system - the program and the arguments before what is passed. What the extension
+    /// offering it requires is fetched first.
+    ///
+    /// # Errors
+    /// The extension named is not loaded or offers no such program, or what it requires cannot be fetched.
+    pub fn start(&self, tool: &str) -> Result<(super::unsandboxed::Runnable, Vec<String>)> {
+        if let Some((id, name)) = pe2_manifest::reference(tool) {
+            return self.other(id)?.offered_as(name, 0);
+        }
+        match self.programs.iter().find(|program| program.name == tool) {
+            Some(program) => self.started(program, 0),
+            None => Ok((super::unsandboxed::program(self.folder.as_ref(), &self.fetched(), tool), Vec::new())),
+        }
+    }
+
+    /// One of the programs it offers, by name, started as it says.
+    ///
+    /// # Errors
+    /// It offers none of that name, or it cannot be started (`started`).
+    pub fn offered_as(&self, name: &str, depth: usize) -> Result<(super::unsandboxed::Runnable, Vec<String>)> {
+        let program = self.programs.iter().find(|program| program.name == name).with_context(|| {
+            let offered: Vec<&str> = self.programs.iter().map(|p| p.name.as_str()).collect();
+            format!("{} offers no program {name} here (it offers {})", self.id, offered.join(", "))
+        })?;
+        self.started(program, depth)
+    }
+
+    /// Another extension loaded beside it, which offers programs.
+    fn other(&self, id: &str) -> Result<&Arc<Unsandboxed>> {
+        self.offered.get().and_then(|offered| offered.get(id)).with_context(|| {
+            format!("no extension {id} offering programs runs here: add it to the project, and trust it")
+        })
+    }
+
+    /// A program it offers, started: what it requires fetched, its program and each `@` argument found - a place in its
+    /// tree, or another extension's program (its path, which takes no arguments of its own there).
+    fn started(
+        &self,
+        program: &super::unsandboxed::Program,
+        depth: usize,
+    ) -> Result<(super::unsandboxed::Runnable, Vec<String>)> {
+        anyhow::ensure!(depth < 8, "{}: {} names programs naming each other in a circle", self.id, program.name);
+        self.have_required()?;
+        let (folder, fetched) = (self.folder.as_ref(), self.fetched());
+        let (path, mut args) =
+            if let Some((id, name)) = program.program.strip_prefix('@').and_then(pe2_manifest::reference) {
+                self.other(id)?.offered_as(name, depth + 1)?
+            } else {
+                let place = program.program.strip_prefix('@').unwrap_or(&program.program);
+                (super::unsandboxed::program(folder, &fetched, place), Vec::new())
+            };
+        for arg in &program.args {
+            let Some(place) = arg.strip_prefix('@') else {
+                args.push(arg.clone());
+                continue;
+            };
+            match pe2_manifest::reference(place) {
+                Some((id, name)) => {
+                    let (other, before) = self.other(id)?.offered_as(name, depth + 1)?;
+                    anyhow::ensure!(
+                        before.is_empty(),
+                        "{}: {} names {place} for its path, and that one starts with arguments of its own",
+                        self.id,
+                        program.name
+                    );
+                    args.push(other.to_string());
+                }
+                None => args.push(
+                    super::unsandboxed::in_tree(folder, &fetched, place)
+                        .map_or_else(|| place.to_string(), |p| p.to_string()),
+                ),
+            }
+        }
+        Ok((path, args))
+    }
+
     /// What it requires and is not fetched yet, by name.
     fn unset(&self) -> Vec<String> {
-        let store = self.store.as_deref();
+        let store = self.store.as_ref();
         let missing = |setup: &&super::setup::Setup| !setup.lazy && store.is_none_or(|store| !setup.fetched(store));
         self.setup.iter().filter(missing).map(|setup| setup.name.clone()).collect()
+    }
+}
+
+/// An extension that is only its manifest: no component, nothing registered - what it is, is the programs it offers and
+/// what they are fetched from (`unsandboxed`, where it runs outside the sandbox, as one offering programs does).
+#[must_use]
+pub fn load_manifest(about: About, origin: Origin, unsandboxed: Option<Arc<Unsandboxed>>) -> Loadable {
+    let trust = unsandboxed.map(|unsandboxed| unsandboxed.trust.clone());
+    Loadable {
+        id: about.id,
+        version: about.version,
+        requires: about.requires,
+        weak: about.weak,
+        optional: about.optional,
+        provides: about.provides,
+        origin,
+        register: Some(Box::new(|_| Ok(()))),
+        component: None,
+        size: None,
+        contract: None,
+        build: trust.clone(),
+        settings: toml::Table::new(),
+        trust,
+        described: about.described,
+        setup: about.setup,
+        reaches: Vec::new(),
     }
 }
 
@@ -3039,8 +3149,8 @@ impl Unsandboxed {
 ///
 /// # Errors
 /// As `load_bytes`.
-pub fn load_unsandboxed(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Unsandboxed) -> Result<Loadable> {
-    load_with(name, bytes, origin, Some(Arc::new(unsandboxed)))
+pub fn load_unsandboxed(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Arc<Unsandboxed>) -> Result<Loadable> {
+    load_with(name, bytes, origin, Some(unsandboxed))
 }
 
 fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<Loadable> {
@@ -3071,7 +3181,7 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
                 // What counts as it is for the section alone: it is read to know the extension, before it runs.
                 let told = About {
                     setup: said.setup.clone(),
-                    launch: said.launch.clone(),
+                    program: said.program.clone(),
                     described: said.described.clone(),
                     ..told
                 };
@@ -3178,7 +3288,7 @@ fn start(
         platforms: told.platforms,
         unsandboxed: told.unsandboxed,
         setup: Vec::new(),
-        launch: Vec::new(),
+        program: Vec::new(),
         described: Described::default(),
     };
     Ok((Arc::new(shared), about, registration))

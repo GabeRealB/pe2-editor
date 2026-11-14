@@ -16,14 +16,14 @@
 //! and what is asked meanwhile comes after it, in order. So is attaching the imports of a project just opened.
 
 use holder::core::{Core, Queue};
+use pe2_path::HostPath;
 use project::Project;
 use project::cache::Cache;
 use project::ext::Extensions;
-use project::imports::Imports;
 use project::history::History;
+use project::imports::Imports;
 use project::index::{Index, LayerInfo, Working};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -33,7 +33,7 @@ use crate::workspace::{LayerView, Loaded, Node};
 /// What the worker is asked.
 pub enum Job {
     /// Paths changed on disk, by another program.
-    Paths(Vec<PathBuf>),
+    Paths(Vec<HostPath>),
     /// The layers hidden from view (the editor's eyes): every asset assembled again.
     Hidden(BTreeSet<String>),
     /// The point of the history shown, read-only - after its first steps, of one document or all - or none: now.
@@ -148,7 +148,8 @@ impl Outside {
             }
             mcp::Request::Edit { op, layer } => {
                 let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
-                let made = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_edit(&op, layer.as_deref())));
+                let made =
+                    queue.call(move |worker| worker.asked_outside(|worker| worker.asked_edit(&op, layer.as_deref())));
                 Ok(made.unwrap_or_else(closed))
             }
             mcp::Request::Due => {
@@ -163,7 +164,8 @@ impl Outside {
             }
             mcp::Request::Signal { events, config } => {
                 let Some(queue) = self.queue.upgrade() else { return Ok(closed()) };
-                let asked = queue.call(move |worker| worker.asked_outside(|worker| worker.asked_signal(events, config)));
+                let asked =
+                    queue.call(move |worker| worker.asked_outside(|worker| worker.asked_signal(events, config)));
                 drop(queue);
                 match asked {
                     // Answered by what runs the epoch, once it has ended.
@@ -177,7 +179,7 @@ impl Outside {
 }
 
 /// What tells which files are not as an index opened behind took them to be (`Index::verification`).
-pub type Verify = Box<dyn FnOnce() -> Vec<PathBuf> + Send>;
+pub type Verify = Box<dyn FnOnce() -> Vec<HostPath> + Send>;
 
 /// What a project read again has that the window takes up (`Workspace::take_up`).
 pub struct Reloaded {
@@ -254,7 +256,7 @@ pub struct Worker {
     /// What the window shows that edits asked from outside it depend on.
     showing: Arc<Mutex<Showing>>,
     /// What other programs changed, as the window collected it and has yet to have taken in.
-    pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    pending: Arc<Mutex<BTreeSet<HostPath>>>,
     /// The last ticket of what it took in.
     covered: u64,
     /// What runs the epochs events set off: the window's.
@@ -301,7 +303,7 @@ pub struct Start {
     pub shown: Arc<Index>,
     pub history: History,
     pub showing: Arc<Mutex<Showing>>,
-    pub pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    pub pending: Arc<Mutex<BTreeSet<HostPath>>>,
     pub runner: Arc<Mutex<holder::runner::Runner>>,
     pub cache: Cache,
     pub store: project::graph::store::Store,
@@ -440,7 +442,7 @@ impl TakeIn {
     }
 
     /// Take these paths in; returns the job's ticket.
-    pub fn paths(&mut self, paths: Vec<PathBuf>) -> u64 {
+    pub fn paths(&mut self, paths: Vec<HostPath>) -> u64 {
         self.send(Job::Paths(paths))
     }
 
@@ -660,7 +662,7 @@ impl Worker {
 
     /// What other programs changed, as the window collected it, asked to be taken in.
     fn ask_pending(&mut self) {
-        let pending: Vec<PathBuf> =
+        let pending: Vec<HostPath> =
             std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner)).into_iter().collect();
         if !pending.is_empty() {
             self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((0, Job::Paths(pending)));
@@ -688,7 +690,8 @@ impl Worker {
                 steps.iter().rev().find(|s| s.undoable() || redo).map_or_else(Vec::new, project::history::Step::paths)
             };
             let index = &self.core.index;
-            let stepped = if redo { self.history.redo(index, None, false) } else { self.history.undo(index, None, false) };
+            let stepped =
+                if redo { self.history.redo(index, None, false) } else { self.history.undo(index, None, false) };
             return match stepped {
                 Ok(step) => {
                     self.select.clone_from(&step.selection);
@@ -752,7 +755,8 @@ impl Worker {
         let showing = self.showing();
         self.history.set_author(showing.author);
         let layers = self.core.index.layers();
-        let layer = showing.layers.editable(&layers, showing.viewing.then_some(VIEWING)).map(|layer| layer.name.clone());
+        let layer =
+            showing.layers.editable(&layers, showing.viewing.then_some(VIEWING)).map(|layer| layer.name.clone());
         self.take_due(layer.as_deref().map_err(String::as_str), then);
     }
 
@@ -976,7 +980,8 @@ impl Worker {
             Arc::new(self.core.index.hand_over())
         };
         self.shown = Some(shown.clone());
-        let reading = Reading { project: self.project_shown.clone(), index: shown.clone(), extensions: self.extensions.clone() };
+        let reading =
+            Reading { project: self.project_shown.clone(), index: shown.clone(), extensions: self.extensions.clone() };
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(reading);
         Snapshot {
             ticket,

@@ -8,10 +8,11 @@
 //!   and reading a file cost in this crate alone, to tell them from what a backend and the system add.
 //! - `folder`: a project's folder as something serves it now (`PE2_BENCH_FOLDER`): listed, its small files and its
 //!   largest read a first time and again, files written into it and removed.
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,19 +30,20 @@ fn rate(bytes: u64, time: Duration) -> f64 {
 }
 
 /// Every file under a folder, with its length as its folder lists it.
-fn listed(dir: &Path, found: &mut Vec<(PathBuf, u64)>) {
+fn listed(dir: &HostPath, found: &mut Vec<(HostPath, u64)>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let Ok(meta) = entry.metadata() else { continue };
+        let place = dir.entry(&entry.file_name());
         if meta.is_dir() {
-            listed(&entry.path(), found);
+            listed(&place, found);
         } else {
-            found.push((entry.path(), meta.len()));
+            found.push((place, meta.len()));
         }
     }
 }
 
 /// Read files whole, a megabyte at a time: how many bytes they held.
-fn read(paths: &[PathBuf]) -> u64 {
+fn read(paths: &[HostPath]) -> u64 {
     let mut buffer = vec![0u8; 1 << 20];
     let mut bytes = 0;
     for path in paths {
@@ -70,7 +72,7 @@ fn backend() -> String {
 /// (named, so that what is small is served all the same, not laid out).
 fn scopes() -> vfs::scoped::Scopes {
     vfs::scoped::Scopes::install(|| {
-        let here = std::env::temp_dir();
+        let here = HostPath::new(&std::env::temp_dir()).expect("the system's temporary folder");
         let first = || vfs::backend::all().iter().find(|b| b.can().folder && b.available(&here).is_ok());
         let named = std::env::var("PE2_TEST_SCOPES").ok().or_else(|| first().map(|b| b.name().to_string()));
         vfs::scoped::Machine { scopes: named, copies: None }
@@ -80,7 +82,7 @@ fn scopes() -> vfs::scoped::Scopes {
 #[test]
 #[ignore = "a benchmark, run by hand"]
 fn scope() {
-    let root = std::env::temp_dir().join(format!("pe2-bench-scope-{}", std::process::id()));
+    let root = pe2_path::testing::scratch("bench-scope");
     std::fs::create_dir_all(&root).unwrap();
     let small: Arc<[u8]> = Arc::from(vec![7u8; 8 << 10]);
     let large: Arc<[u8]> = Arc::from(vec![9u8; 8 << 20]);
@@ -100,16 +102,17 @@ fn scope() {
     }
     let serving = scopes();
     let (served, folder) =
-        timed(|| project::content::serve_folder(Some(&root), &files, &once(), &root.join("fallback")).expect("served"));
-    let list = |dir: &Path| {
+        timed(|| project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served"));
+    let list = |dir: &HostPath| {
         let mut found = Vec::new();
         listed(dir, &mut found);
         found
     };
     let (list_first, all) = timed(|| list(&folder.at));
     let (list_again, _) = timed(|| list(&folder.at));
-    let paths = |under: &str| -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = all.iter().map(|(p, _)| p.clone()).filter(|p| p.starts_with(folder.at.join(under))).collect();
+    let paths = |under: &str| -> Vec<HostPath> {
+        let mut paths: Vec<HostPath> =
+            all.iter().map(|(p, _)| p.clone()).filter(|p| p.starts_with(&folder.at.at(under))).collect();
         paths.sort();
         paths
     };
@@ -130,8 +133,10 @@ fn scope() {
         rate(large_bytes, large_again),
     );
     // Asked whether it is there, in the folder of many: names that are, names that are not, names in another case.
-    let wide = folder.at.join("wide");
-    let asked = |names: &[String]| names.iter().filter(|name| std::fs::metadata(wide.join(name)).is_ok()).count();
+    let wide = folder.at.at("wide");
+    let asked = |names: &[String]| {
+        names.iter().filter(|name| std::fs::metadata(wide.entry(std::ffi::OsStr::new(name))).is_ok()).count()
+    };
     let named = |name: &dyn Fn(u32) -> String| (0..2000).map(name).collect::<Vec<String>>();
     let kinds = [
         ("there", named(&|n| format!("h{n:04}.h"))),
@@ -159,16 +164,17 @@ fn scope() {
 #[test]
 #[ignore = "a benchmark, run by hand"]
 fn mounts() {
-    let base = std::env::temp_dir().join(format!("pe2-bench-mounts-{}", std::process::id()));
+    let base = pe2_path::testing::scratch("bench-mounts");
     let files = BTreeMap::from([("a.h".to_string(), Given::Bytes(Arc::from(&b"#define A 1"[..])))]);
     let serving = scopes();
     let mut kept = Vec::new();
     for nth in 0..4 {
-        let root = base.join(format!("p{nth}"));
+        let root = base.at(&format!("p{nth}"));
         std::fs::create_dir_all(&root).unwrap();
-        let (served, folder) =
-            timed(|| project::content::serve_folder(Some(&root), &files, &once(), &root.join("fallback")).expect("served"));
-        let (answered, read) = timed(|| std::fs::read(folder.at.join("a.h")).map(|bytes| bytes.len()));
+        let (served, folder) = timed(|| {
+            project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served")
+        });
+        let (answered, read) = timed(|| std::fs::read(folder.at.at("a.h")).map(|bytes| bytes.len()));
         println!("BENCH mounts {}: mount {nth} served in {served:.1?}, read {read:?} in {answered:.1?}", backend());
         kept.push(folder);
     }
@@ -184,7 +190,8 @@ fn folder() {
         println!("BENCH folder: set PE2_BENCH_FOLDER to a project's served folder");
         return;
     };
-    let (root, label) = (PathBuf::from(folder), std::env::var("PE2_BENCH_LABEL").unwrap_or_default());
+    let root = HostPath::new(std::path::Path::new(&folder)).expect("the folder named");
+    let label = std::env::var("PE2_BENCH_LABEL").unwrap_or_default();
     let list = || {
         let mut found = Vec::new();
         listed(&root, &mut found);
@@ -200,7 +207,8 @@ fn folder() {
         all.len(),
         total >> 20
     );
-    let small: Vec<PathBuf> = all.iter().filter(|(_, len)| *len <= 64 << 10).take(3000).map(|(p, _)| p.clone()).collect();
+    let small: Vec<HostPath> =
+        all.iter().filter(|(_, len)| *len <= 64 << 10).take(3000).map(|(p, _)| p.clone()).collect();
     let (small_first, small_bytes) = timed(|| read(&small));
     let (small_again, _) = timed(|| read(&small));
     println!(
@@ -220,9 +228,12 @@ fn folder() {
     }
     // Asked whether it is there, as a compiler looking for a header along its paths does: names that are, names that
     // are not, and names written in another case (there on Windows, not elsewhere).
-    let asked = |paths: &[PathBuf]| paths.iter().filter(|path| std::fs::metadata(path).is_ok()).count();
-    let renamed = |change: &dyn Fn(&str) -> String| -> Vec<PathBuf> {
-        let named = small.iter().filter_map(|path| Some(path.with_file_name(change(path.file_name()?.to_str()?))));
+    let asked = |paths: &[HostPath]| paths.iter().filter(|path| std::fs::metadata(path).is_ok()).count();
+    let renamed = |change: &dyn Fn(&str) -> String| -> Vec<HostPath> {
+        let named = small.iter().filter_map(|path| {
+            let renamed = change(path.file_name()?.to_str()?);
+            Some(path.parent()?.entry(std::ffi::OsStr::new(&renamed)))
+        });
         named.collect()
     };
     let (missing, cased) = (renamed(&|name| format!("zz_no_{name}")), renamed(&|name| name.to_uppercase()));
@@ -239,23 +250,26 @@ fn folder() {
         return;
     }
     // Written, given time to land in the project, then removed: how long each takes the program, and the project.
-    let dir = root.join("zz_bench");
+    let dir = root.at("zz_bench");
     let payload = vec![5u8; 4 << 10];
     let (written, ()) = timed(|| {
         std::fs::create_dir_all(&dir).expect("folder made");
         for nth in 0..200 {
-            std::fs::write(dir.join(format!("f{nth:03}.bin")), &payload).expect("written");
+            std::fs::write(dir.at(&format!("f{nth:03}.bin")), &payload).expect("written");
         }
     });
     let megabyte = vec![3u8; 1 << 20];
     let (big, ()) = timed(|| {
         use std::io::Write;
-        let mut file = std::fs::File::create(dir.join("big.bin")).expect("made");
+        let mut file = std::fs::File::create(dir.at("big.bin")).expect("made");
         for _ in 0..64 {
             file.write_all(&megabyte).expect("written");
         }
     });
-    println!("BENCH folder {label} write: 200 files of 4 KiB in {written:.2?}, 64 MiB at {:.0} MiB/s", rate(64 << 20, big));
+    println!(
+        "BENCH folder {label} write: 200 files of 4 KiB in {written:.2?}, 64 MiB at {:.0} MiB/s",
+        rate(64 << 20, big)
+    );
     std::thread::sleep(Duration::from_secs(4));
     let mut back = Vec::new();
     listed(&dir, &mut back);
@@ -281,7 +295,7 @@ fn tree() {
         println!("BENCH tree: set PE2_BENCH_PROJECT to a project's folder");
         return;
     };
-    let project = project::Project::load(Path::new(&root)).expect("a project");
+    let project = project::Project::load(std::path::Path::new(&root)).expect("a project");
     let (indexed, index) = timed(|| project::index::Index::without_store(&project).expect("indexed"));
     // A view of the shared filesystem, and that view with pages kept of what is read.
     let listing = index.served();

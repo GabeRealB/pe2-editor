@@ -30,9 +30,9 @@
 //! - A move the project refuses is put back where it was; a removal it refuses (a node's `node.toml` alone)
 //!   shows the file again; a folder it refuses goes, where nothing was put in it.
 
+use pe2_path::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -45,7 +45,7 @@ use crate::write::{Owner, Refusal, Written, is_junk};
 use crate::{Changes, Served};
 
 /// The folder of the log, in the writes' own.
-pub const LOG: &str = "sfs";
+pub const LOG: pe2_path::Name = pe2_path::Name::constant("sfs");
 
 /// When a new file is the project's: once nothing has it open and its burst of changes has ended - the pause since
 /// its last change is several times the time between its changes, within these bounds. A file written under a
@@ -99,11 +99,27 @@ fn writing(content: &RwLock<sfs::Content>) -> std::sync::RwLockWriteGuard<'_, sf
 /// what is served, and the record that said it was done (`sfs::Op`), which is answered in the log.
 enum Asked {
     /// A file as it was written: what was said of its content, kept while it is read.
-    Write { number: u64, content: Arc<RwLock<sfs::Content>>, given: Given },
-    Folder { number: u64, said: Option<u64> },
+    Write {
+        number: u64,
+        content: Arc<RwLock<sfs::Content>>,
+        given: Given,
+    },
+    Folder {
+        number: u64,
+        said: Option<u64>,
+    },
     /// A path moved, already so in what is served: where from, where to, and what the move is known by there.
-    Rename { number: u64, from: String, to: String, said: Option<u64>, moved: u64 },
-    Remove { number: u64, said: Option<u64> },
+    Rename {
+        number: u64,
+        from: String,
+        to: String,
+        said: Option<u64>,
+        moved: u64,
+    },
+    Remove {
+        number: u64,
+        said: Option<u64>,
+    },
 }
 
 impl State {
@@ -190,7 +206,7 @@ impl State {
 struct Given {
     pins: Arc<Mutex<Vec<u64>>>,
     pin: Option<u64>,
-    file: Option<PathBuf>,
+    file: Option<HostPath>,
     /// The file's number in the log, and where the log ended when it was read.
     taken: Option<(u64, u64)>,
     /// How many times the file had been changed when it was read.
@@ -229,7 +245,7 @@ struct Inner {
     space: Arc<sfs::Space>,
     owner: Arc<dyn Owner>,
     /// Where a file is written out for who takes it whole, for as long as that takes.
-    dir: PathBuf,
+    dir: HostPath,
     /// The log what is written goes to.
     log: Arc<sfs::Log>,
     /// Every content there is, for as long as anything has it - staged, or being read this moment: the log is kept
@@ -293,7 +309,7 @@ impl Writes {
     ///
     /// # Errors
     /// The folder or its log cannot be made, or the tree served is no view of a shared filesystem.
-    pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &Path) -> io::Result<Writes> {
+    pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &HostPath) -> io::Result<Writes> {
         Writes::with(served, owner, dir, sfs::log::Config::default(), Pace::default())
     }
 
@@ -304,7 +320,7 @@ impl Writes {
     pub fn with(
         served: &Served,
         owner: Arc<dyn Owner>,
-        dir: &Path,
+        dir: &HostPath,
         log: sfs::log::Config,
         pace: Pace,
     ) -> io::Result<Writes> {
@@ -316,16 +332,16 @@ impl Writes {
         // share, which whoever holds the project may have open.
         let shared = |name: &std::ffi::OsStr| name == LOG || name == project::shared::SPACE;
         for entry in std::fs::read_dir(dir)?.flatten().filter(|entry| !shared(&entry.file_name())) {
-            let path = entry.path();
+            let path = dir.entry(&entry.file_name());
             let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         }
-        let log = sfs::Log::shared(&dir.join(LOG), log)?;
+        let log = sfs::Log::shared(&dir.join(&LOG), log)?;
         let wake: Arc<(Mutex<bool>, Condvar)> = Arc::default();
         let writes = Writes(Arc::new(Inner {
             served: served.clone(),
             space,
             owner,
-            dir: dir.to_path_buf(),
+            dir: dir.clone(),
             log,
             contents: Mutex::default(),
             pins: Arc::default(),
@@ -542,7 +558,9 @@ impl Writes {
             let Ok((from, given)) = self.given(&content) else { continue };
             if matches!(crate::due::replace(&self.0.space, due, &Op::Write { path, from }), Ok(true)) {
                 let mut state = self.lock();
-                if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content)) {
+                if let Some(staged) =
+                    state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content))
+                {
                     staged.dirty = reading(&content).changes() != given.changes;
                 }
                 state.ask(due, Asked::Write { number, content, given });
@@ -550,9 +568,10 @@ impl Writes {
         }
         let behind: Vec<(u64, Arc<RwLock<sfs::Content>>)> = {
             let state = self.lock();
-            let behind = state.staged.iter().filter(|(_, staged)| {
-                reading(&staged.content).first().is_some_and(|first| first + far < written)
-            });
+            let behind = state
+                .staged
+                .iter()
+                .filter(|(_, staged)| reading(&staged.content).first().is_some_and(|first| first + far < written));
             behind.map(|(number, staged)| (*number, staged.content.clone())).collect()
         };
         for (number, content) in behind {
@@ -612,19 +631,21 @@ impl Writes {
         if let Some(first) = first {
             pins.lock().unwrap_or_else(PoisonError::into_inner).push(first);
         }
-        let written = Written::Logged { log: self.0.log.dir().to_path_buf(), len, ranges };
+        let log =
+            HostPath::from_plain(self.0.log.dir().to_path_buf()).ok_or_else(|| io::Error::other("the log's folder"))?;
+        let written = Written::Logged { log, len, ranges };
         Ok((written, Given { pins, pin: first, file: None, taken: Some(taken), changes }))
     }
 
     /// A staged file's content written out to a file of its own, for who takes it whole: its path, to be removed
     /// once taken.
-    fn written_out(&self, content: &RwLock<sfs::Content>) -> io::Result<PathBuf> {
+    fn written_out(&self, content: &RwLock<sfs::Content>) -> io::Result<HostPath> {
         let number = {
             let mut state = self.lock();
             state.next += 1;
             state.next
         };
-        let path = self.0.dir.join(format!("{number}"));
+        let path = self.0.dir.join(&pe2_path::Name::new(&number.to_string()).map_err(io::Error::other)?);
         let mut out = io::BufWriter::new(std::fs::File::create(&path)?);
         reading(content).write_to(&self.0.log, &mut out)?;
         io::Write::flush(&mut out)?;
@@ -812,9 +833,11 @@ impl Writes {
         state.staged.remove(&number);
         state.new.remove(&number);
         let said = state.removals.remove(&number);
-        let asked = state.asked.values().any(|asked| matches!(asked, Asked::Remove { number: of, .. } if *of == number));
+        let asked =
+            state.asked.values().any(|asked| matches!(asked, Asked::Remove { number: of, .. } if *of == number));
         let mut txn = self.0.space.write()?;
-        let project = fs::node(&txn, SERVED, number)?.is_some_and(|node| node.flags & NEW == 0) || state.promised(number);
+        let project =
+            fs::node(&txn, SERVED, number)?.is_some_and(|node| node.flags & NEW == 0) || state.promised(number);
         let due = if asked || !project {
             None
         } else {
@@ -904,7 +927,8 @@ impl Writes {
         let content = {
             let mut state = self.lock();
             let number = state.handles.get(&handle).copied().ok_or_else(not_found)?;
-            if state.new.contains_key(&number) && state.staged.get(&number).is_some_and(|staged| staged.asked.is_none()) {
+            if state.new.contains_key(&number) && state.staged.get(&number).is_some_and(|staged| staged.asked.is_none())
+            {
                 self.touch(&mut state, number);
             }
             let staged = state.staged.get_mut(&number).ok_or_else(not_found)?;
@@ -999,7 +1023,9 @@ impl Writes {
         let mut state = self.lock();
         let Some(number) = state.handles.get(&handle).copied() else { return Ok(()) };
         match state.refused.remove(&number) {
-            Some(why) => Err(io::Error::other(format!("what was written before was not taken into the project: {why}"))),
+            Some(why) => {
+                Err(io::Error::other(format!("what was written before was not taken into the project: {why}")))
+            }
             None => Ok(()),
         }
     }
@@ -1344,8 +1370,9 @@ impl Writes {
         if name == project::index::NODE_FILE {
             return false;
         }
-        let declared = found(pages, &joined(folder, project::index::NODE_FILE));
-        let declared = declared.is_some_and(|(number, node)| node.flags & NEW != 0 && self.lock().staged.contains_key(&number));
+        let declared = found(pages, &joined(folder, project::index::NODE_FILE.as_str()));
+        let declared =
+            declared.is_some_and(|(number, node)| node.flags & NEW != 0 && self.lock().staged.contains_key(&number));
         declared && found(pages, folder).is_none_or(|(_, node)| node.flags & NODE == 0)
     }
 
@@ -1357,7 +1384,8 @@ impl Writes {
         let (files, removals): (Vec<u64>, Vec<u64>) = {
             let state = self.lock();
             let unasked = |number: &u64| state.staged.get(number).is_none_or(|staged| staged.asked.is_none());
-            let files = state.new.iter().filter(|(number, due)| **due <= now && !state.open(**number) && unasked(number));
+            let files =
+                state.new.iter().filter(|(number, due)| **due <= now && !state.open(**number) && unasked(number));
             let removals = state.removed.iter().filter(|(_, due)| due.is_some_and(|due| due <= now));
             (files.map(|(number, _)| *number).collect(), removals.map(|(number, _)| *number).collect())
         };
@@ -1368,9 +1396,11 @@ impl Writes {
         // folder to be a node.
         let mut writes: Vec<(String, u64, Arc<RwLock<sfs::Content>>)> = Vec::new();
         for number in files {
-            let at = fs::node(&pages, SERVED, number).ok().flatten().zip(fs::path(&pages, SERVED, number).ok().flatten());
+            let at =
+                fs::node(&pages, SERVED, number).ok().flatten().zip(fs::path(&pages, SERVED, number).ok().flatten());
             let mut state = self.lock();
-            let staged = state.staged.get(&number).filter(|staged| staged.dirty && reading(&staged.content).is_logged());
+            let staged =
+                state.staged.get(&number).filter(|staged| staged.dirty && reading(&staged.content).is_logged());
             let (Some((node, path)), Some(staged)) = (at, staged) else {
                 state.new.remove(&number);
                 state.touched.remove(&number);
@@ -1415,7 +1445,8 @@ impl Writes {
             let Some(due) = due else { continue };
             state.new.remove(&number);
             state.touched.remove(&number);
-            if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content)) {
+            if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content))
+            {
                 // What is written to it from here on is not what was said.
                 staged.dirty = reading(&content).changes() != given.changes;
                 staged.asked = Some(due);
@@ -1505,7 +1536,9 @@ impl Writes {
                 let mut state = self.lock();
                 state.refused.remove(&number);
                 let open = state.open(number);
-                if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content)) {
+                if let Some(staged) =
+                    state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content))
+                {
                     if staged.asked == Some(due) {
                         staged.asked = None;
                     }
@@ -1525,7 +1558,9 @@ impl Writes {
                 eprintln!("{path}: written, and not taken into the project: {why}");
                 let mut state = self.lock();
                 state.refused.insert(number, why);
-                if let Some(staged) = state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content)) {
+                if let Some(staged) =
+                    state.staged.get_mut(&number).filter(|staged| Arc::ptr_eq(&staged.content, &content))
+                {
                     staged.asked = None;
                     staged.dirty = true;
                 }
@@ -1570,7 +1605,11 @@ impl Writes {
                 done(said, true);
                 self.lock().removed.remove(&number);
                 let _ordered = self.ordered();
-                let folder = self.pages().ok().and_then(|pages| fs::node(&pages, SERVED, number).ok().flatten()).map(|node| node.folder);
+                let folder = self
+                    .pages()
+                    .ok()
+                    .and_then(|pages| fs::node(&pages, SERVED, number).ok().flatten())
+                    .map(|node| node.folder);
                 if let (Ok(()), Some(folder)) = (self.flag(number, 0, GONE), folder) {
                     self.0.served.told(Changes { new: vec![(path, folder)], ..Changes::default() });
                 }
@@ -1604,7 +1643,9 @@ impl Writes {
         let node = fs::node(&txn, SERVED, number)?;
         let above = there(&txn, parent(from)).filter(|(_, node)| node.folder).filter(|_| found(&txn, from).is_none());
         let back = match (&now, &node, above) {
-            (Some(_), Some(_), Some((above, _))) => fs::rename(&mut txn, SERVED, number, above, name(from), SERVER).is_ok(),
+            (Some(_), Some(_), Some((above, _))) => {
+                fs::rename(&mut txn, SERVED, number, above, name(from), SERVER).is_ok()
+            }
             _ => false,
         };
         txn.commit()?;
@@ -1774,7 +1815,10 @@ impl Writes {
             let _ = header.flush();
             return;
         };
-        let dirty = |writes: &Writes, files: &HashMap<u64, (u64, Arc<RwLock<sfs::Content>>)>, file: u64, dirty: bool| {
+        let dirty = |writes: &Writes,
+                     files: &HashMap<u64, (u64, Arc<RwLock<sfs::Content>>)>,
+                     file: u64,
+                     dirty: bool| {
             let Some((number, content)) = files.get(&file) else { return };
             let mut state = writes.lock();
             if let Some(staged) = state.staged.get_mut(number).filter(|staged| Arc::ptr_eq(&staged.content, content)) {
@@ -1933,7 +1977,8 @@ impl Writes {
             state.touched.clear();
             state.again = None;
             let dirty = |staged: &Staged| staged.dirty && reading(&staged.content).is_logged();
-            state.new = state.staged.iter().filter(|(_, staged)| dirty(staged)).map(|(number, _)| (*number, now)).collect();
+            state.new =
+                state.staged.iter().filter(|(_, staged)| dirty(staged)).map(|(number, _)| (*number, now)).collect();
             for due in state.removed.values_mut().flatten() {
                 *due = now;
             }
@@ -1961,8 +2006,9 @@ mod tests {
     use super::Writes;
     use crate::Served;
     use crate::write::{Change, Owner, Refusal};
+    use pe2_path::HostPath;
+    use pe2_path::testing::At as _;
     use project::server::{Delta, Listing, Shown as Listed, Source};
-    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Arc, Mutex};
@@ -1986,7 +2032,7 @@ mod tests {
         space: Arc<sfs::Space>,
         served: Served,
         /// Where its files' content is.
-        files: PathBuf,
+        files: HostPath,
         listing: Mutex<Listing>,
         takes: Mutex<Takes>,
         /// Where it says that it starts to take a written file, and waits to be told to go on.
@@ -2005,8 +2051,8 @@ mod tests {
 
     impl Holder {
         /// A project of these files, each with its text, over the folder `dir` a test keeps its writes in.
-        fn new(dir: &Path, files: &[(&str, &str)], takes: Takes) -> Arc<Holder> {
-            let at = PathBuf::from(format!("{}-files", dir.display()));
+        fn new(dir: &HostPath, files: &[(&str, &str)], takes: Takes) -> Arc<Holder> {
+            let at = dir.with_suffix(&pe2_path::Name::constant("-files"));
             let _ = std::fs::remove_dir_all(&at);
             std::fs::create_dir_all(&at).unwrap();
             let space = Arc::new(sfs::Space::private().unwrap());
@@ -2033,7 +2079,7 @@ mod tests {
         }
 
         /// As `new`, taking a written file only once told to go on: it says when it starts to.
-        fn gated(dir: &Path, files: &[(&str, &str)]) -> (Arc<Holder>, Receiver<()>, Sender<()>) {
+        fn gated(dir: &HostPath, files: &[(&str, &str)]) -> (Arc<Holder>, Receiver<()>, Sender<()>) {
             let holder = Holder::new(dir, files, Takes::All);
             let (started, starts) = channel();
             let (goes_on, go_on) = channel();
@@ -2042,7 +2088,7 @@ mod tests {
         }
 
         fn file(&self, bytes: &[u8]) -> Listed {
-            let disk = self.files.join(self.made.fetch_add(1, Ordering::Relaxed).to_string());
+            let disk = self.files.at(&self.made.fetch_add(1, Ordering::Relaxed).to_string());
             std::fs::write(&disk, bytes).unwrap();
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
             let modified = (now.as_secs(), now.subsec_nanos());
@@ -2168,20 +2214,20 @@ mod tests {
             self.taken()
         }
 
-        fn left(&self, path: &str, _staged: &Path) {
+        fn left(&self, path: &str, _staged: &HostPath) {
             self.left.lock().unwrap().push(path.to_string());
         }
     }
 
     /// Done with a test's folders: its writes' and its project's files'.
-    fn done(dir: &Path) {
+    fn done(dir: &HostPath) {
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(format!("{}-files", dir.display()));
     }
 
     #[test]
     fn what_nobody_takes_yet_is_kept_and_given_once_someone_does() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-later-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-later");
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2207,7 +2253,7 @@ mod tests {
 
     #[test]
     fn the_log_is_let_go_of_behind_what_is_written_whatever_waits() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-log-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-log");
         // Nobody takes anything: what is written waits, for as long as this runs.
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
@@ -2227,7 +2273,7 @@ mod tests {
         }
         assert_eq!(writes.read("waits.txt", 0, 100).unwrap(), b"written first, and kept");
         assert_eq!(writes.read("big.bin", 0, 200 << 10).unwrap(), last);
-        let segments = std::fs::read_dir(dir.join("sfs").join("log")).unwrap().count();
+        let segments = std::fs::read_dir(dir.at("sfs").at("log")).unwrap().count();
         assert!(segments <= 8, "the log keeps what is read from, not all that was written: {segments} segments");
         drop(writes);
         done(&dir);
@@ -2237,7 +2283,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement"]
     fn bench_writes() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-bench-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-bench");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
@@ -2293,7 +2339,7 @@ mod tests {
 
     #[test]
     fn a_save_returns_at_once_and_is_the_projects_a_moment_later() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-save-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-save");
         let (owner, starts, goes_on) = Holder::gated(&dir, &[("saved.txt", "before")]);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2317,7 +2363,7 @@ mod tests {
 
     #[test]
     fn a_new_file_is_the_projects_once_its_burst_of_changes_has_ended() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-burst-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-burst");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let pace = super::Pace { least: Duration::from_millis(400), most: Duration::from_secs(2) };
@@ -2343,7 +2389,7 @@ mod tests {
 
     #[test]
     fn a_folder_is_made_at_once_whoever_takes_it_when() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-mkdir-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-mkdir");
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
@@ -2369,7 +2415,7 @@ mod tests {
 
     #[test]
     fn what_is_written_in_a_folder_goes_with_it_when_it_is_renamed() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-moved-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-moved");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
@@ -2391,7 +2437,7 @@ mod tests {
 
     #[test]
     fn what_the_project_refuses_late_is_said_at_the_next_sync_or_close() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-late-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-late");
         let owner = Holder::new(&dir, &[], Takes::Never);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
@@ -2431,7 +2477,7 @@ mod tests {
 
     #[test]
     fn a_rename_is_shown_at_once_and_the_project_told_in_its_turn() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-rename-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-rename");
         // Nobody takes anything yet.
         let owner = Holder::new(&dir, &[("old/in/a.txt", "a")], Takes::Nothing);
         let served = owner.served.clone();
@@ -2462,7 +2508,7 @@ mod tests {
 
     #[test]
     fn a_file_moved_onto_one_that_is_there_gives_it_its_content_and_goes() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-onto-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-onto");
         let owner = Holder::new(&dir, &[("a.txt", "one"), ("b.txt", "two"), ("d.txt", "four")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2496,7 +2542,7 @@ mod tests {
 
     #[test]
     fn a_rename_the_project_refuses_is_put_back() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-back-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-back");
         let owner = Holder::new(&dir, &[("old/a.txt", "a")], Takes::Never);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner, &dir).unwrap();
@@ -2513,7 +2559,7 @@ mod tests {
 
     #[test]
     fn what_was_in_transit_is_taken_up_by_a_serving_that_starts_again() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-again-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-again");
         done(&dir);
         let project = [("kept.txt", "before"), ("gone.txt", "g"), ("old/x.txt", "x"), ("part.txt", "0123456789")];
         {
@@ -2579,7 +2625,7 @@ mod tests {
 
     #[test]
     fn what_was_written_in_a_folder_the_project_has_renamed_is_taken_up_where_it_is() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-where-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-where");
         done(&dir);
         {
             let owner = Holder::new(&dir, &[("old/x.txt", "x")], Takes::Ordered);
@@ -2614,7 +2660,7 @@ mod tests {
 
     #[test]
     fn what_the_project_took_is_not_given_again() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-took-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-took");
         done(&dir);
         {
             let owner = Holder::new(&dir, &[], Takes::All);
@@ -2656,7 +2702,7 @@ mod tests {
 
     #[test]
     fn a_serving_that_ended_leaves_nothing_to_take_up() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-ended-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-ended");
         done(&dir);
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
@@ -2679,7 +2725,7 @@ mod tests {
 
     #[test]
     fn what_nobody_took_by_the_end_is_left_with_the_owner() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-left-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-left");
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2694,7 +2740,7 @@ mod tests {
 
     #[test]
     fn new_files_that_have_settled_are_given_to_the_project_together() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-many-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-many");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         // Paced so that nothing is given before it is asked for here.
@@ -2724,7 +2770,7 @@ mod tests {
 
     #[test]
     fn what_waits_to_settle_is_given_to_the_project_as_serving_ends() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-finish-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-finish");
         let owner = Holder::new(&dir, &[], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::with(&served, owner.clone(), &dir, sfs::log::Config::default(), UNHURRIED).unwrap();
@@ -2741,7 +2787,7 @@ mod tests {
 
     #[test]
     fn a_folder_the_project_was_given_is_shown_before_the_tree_follows() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-given-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-given");
         // An owner that takes what it is given, the tree served following in its own time - as where another process
         // holds the project, and lists what is served a moment later.
         let owner = Holder::new(&dir, &[], Takes::All);
@@ -2767,7 +2813,7 @@ mod tests {
 
     #[test]
     fn a_folder_made_where_one_was_just_removed_is_kept() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-folder-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes-folder");
         let owner = Holder::new(&dir, &[("kept/a.txt", "a")], Takes::All);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();
@@ -2793,7 +2839,7 @@ mod tests {
 
     #[test]
     fn a_file_removed_while_the_project_is_given_it_is_removed_from_the_project() {
-        let dir = std::env::temp_dir().join(format!("pe2-writes-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("writes");
         let (owner, starts, goes_on) = Holder::gated(&dir, &[]);
         let served = owner.served.clone();
         let writes = Writes::new(&served, owner.clone(), &dir).unwrap();

@@ -5,10 +5,10 @@
 use anyhow::{Context, Result, bail};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
+use pe2_path::HostPath;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -21,13 +21,13 @@ pub struct Role {
     /// The command it runs as (`pe2-cli project <command>`), and what it is called where one is said.
     pub command: &'static str,
     /// Its socket, in the cache (Unix).
-    pub socket: &'static str,
+    pub socket: pe2_path::Name,
     /// What its pipe's name starts with (Windows), and its socket's where the cache's path is too long for one.
     pub pipe: &'static str,
     /// The file it locks for as long as it runs: one a project.
-    pub lock: &'static str,
+    pub lock: pe2_path::Name,
     /// What one started by another process writes of itself.
-    pub log: &'static str,
+    pub log: pe2_path::Name,
 }
 
 /// How long one started is waited for to listen, while it runs (one that ends says why at once): long enough for it
@@ -39,14 +39,14 @@ impl Role {
     ///
     /// # Errors
     /// The name cannot be made.
-    pub fn name(&self, root: &Path) -> std::io::Result<Name<'static>> {
-        crate::host::local_name(root, self.socket, self.pipe)
+    pub fn name(&self, root: &HostPath) -> std::io::Result<Name<'static>> {
+        crate::host::local_name(root, &self.socket, self.pipe)
     }
 
     /// Whether one runs for the project in `root`: one has its lock.
     #[must_use]
-    pub fn running(&self, root: &Path) -> bool {
-        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(DIR).join(self.lock)) else {
+    pub fn running(&self, root: &HostPath) -> bool {
+        let Ok(lock) = std::fs::OpenOptions::new().write(true).open(root.join(&DIR).join(&self.lock)) else {
             return false;
         };
         let free = lock.try_lock().is_ok();
@@ -60,19 +60,22 @@ impl Role {
     ///
     /// # Errors
     /// One runs already - a second one started in a race ends here, and its starter finds the first.
-    pub fn claim(&self, root: &Path) -> Result<std::fs::File> {
+    pub fn claim(&self, root: &HostPath) -> Result<std::fs::File> {
         crate::cache::make(root)?;
-        let one =
-            std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(DIR).join(self.lock))?;
+        let one = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(&DIR).join(&self.lock))?;
         if one.try_lock().is_err() {
-            bail!("{}: a {} runs for it already", crate::host::shown(root), self.command);
+            bail!("{root}: a {} runs for it already", self.command);
         }
         Ok(one)
     }
 
     /// Wait for the one of the project in `root` to be gone, this long at most: whether it is.
     #[must_use]
-    pub fn gone_within(&self, root: &Path, limit: Duration) -> bool {
+    pub fn gone_within(&self, root: &HostPath, limit: Duration) -> bool {
         let told = Instant::now();
         while self.running(root) && told.elapsed() < limit {
             std::thread::sleep(Duration::from_millis(50));
@@ -82,7 +85,7 @@ impl Role {
 
     /// Connect to the one of the project in `root`; none where none listens.
     #[must_use]
-    pub fn connect(&self, root: &Path) -> Option<Link> {
+    pub fn connect(&self, root: &HostPath) -> Option<Link> {
         Stream::connect(self.name(root).ok()?).ok().map(|stream| Link { stream: BufReader::new(stream) })
     }
 
@@ -92,11 +95,11 @@ impl Role {
     ///
     /// # Errors
     /// It could not be started, or did not listen in time.
-    pub fn start(&self, root: &Path, program: &Path, args: &[String]) -> Result<Link> {
+    pub fn start(&self, root: &HostPath, program: &HostPath, args: &[String]) -> Result<Link> {
         crate::cache::make(root)?;
-        let log = std::fs::File::create(root.join(DIR).join(self.log))?;
-        let mut command = std::process::Command::new(program);
-        command.args(["project", self.command, "--project"]).arg(root).args(args);
+        let log = std::fs::File::create(root.join(&DIR).join(&self.log))?;
+        let mut command = std::process::Command::new(program.as_os_str());
+        command.args(["project", self.command, "--project"]).arg(root.as_os_str()).args(args);
         command.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
         #[cfg(unix)]
         {
@@ -126,7 +129,7 @@ impl Role {
                 if let Some(link) = self.connect(root) {
                     return Ok(link);
                 }
-                let said = std::fs::read_to_string(root.join(DIR).join(self.log)).unwrap_or_default();
+                let said = std::fs::read_to_string(root.join(&DIR).join(&self.log)).unwrap_or_default();
                 bail!("the {} ended ({status}): {}", self.command, said.trim());
             }
             if started.elapsed() > STARTING {
@@ -143,7 +146,7 @@ impl Role {
     /// The socket cannot be made.
     pub fn listen(
         &'static self,
-        root: &Path,
+        root: &HostPath,
         stopping: Arc<AtomicBool>,
         connection: impl Fn(Stream) + Send + Sync + 'static,
     ) -> Result<Listening> {
@@ -161,7 +164,7 @@ impl Role {
                 let _ = std::thread::Builder::new().name("connection".into()).spawn(move || connection(stream));
             }
         })?;
-        Ok(Listening { role: self, root: root.to_path_buf(), stopping, thread: Some(thread) })
+        Ok(Listening { role: self, root: root.clone(), stopping, thread: Some(thread) })
     }
 }
 
@@ -197,7 +200,7 @@ impl Link {
 #[derive(Debug)]
 pub struct Listening {
     role: &'static Role,
-    root: PathBuf,
+    root: HostPath,
     stopping: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }

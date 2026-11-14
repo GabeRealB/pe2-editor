@@ -1,0 +1,44 @@
+id = "pe2.binutils-mipsel-maspsx"
+version = "2.47.0"
+requires = ["pe2.binutils-mipsel@^2.47", "pe2.python@^3.14"]
+unsandboxed = true
+description = "GNU binutils 2.47 for mipsel with maspsx for their assembler: as assembles as Sony's ASPSX did, through maspsx and GNU as; ld, nm and objcopy are pe2.binutils-mipsel's."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/pe2-editor"
+docs = "docs/index.md"
+install = "docs/install.md"
+
+[[setup]]
+name = "maspsx, with this extension's patches"
+license = "MIT"
+copyright = "Mark Street and its contributors"
+url = "https://github.com/mkst/maspsx/archive/4ffa8b5106f9780d5d4aa7609f184949433ddbbc.tar.gz"
+sha256 = "c9d007c88bd2ac7f63ba65e8b7b07732a2b06034eba55b41c3ccfaacc926f464"
+patches = [
+    { file = "patches/maspsx-lo-load-nop.patch", sha256 = "1b53f01c545064d77463777eab58545bfbafcdb347ed35ac6cc12d01b51f188c" },
+    { file = "patches/maspsx-bss-layout.patch", sha256 = "283ac620be70623a64c84df8f595e066f90573f226b99ee89edc14f9fca14a4f" },
+    { file = "patches/maspsx-bss-local.patch", sha256 = "6d5b285d487581d814666cb580acff4f8d718566656472cc2fa152e2f4487bd0" },
+]
+
+[setup.take]
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/maspsx.py" = { to = "maspsx/maspsx.py", sha256 = "7c165d0fd32768b9e9d4ffc6f8cb685721135b2ee275545c5b49c65c9352fd23" }
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/maspsx" = { to = "maspsx/maspsx", sha256 = "6ef9a34b6a046c50fcee89b518db3696144eb9404178a8b70e8f3f36b4877d20" }
+"maspsx-4ffa8b5106f9780d5d4aa7609f184949433ddbbc/LICENSE" = { to = "maspsx/LICENSE", sha256 = "4fd8c6ef76afa63ce817a0d6627027e9ecb03c0816fa91964e4544b2119dbfdf" }
+
+
+[[program]]
+name = "as"
+program = "@pe2.python:python3"
+args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@pe2.binutils-mipsel:as"]
+
+[[program]]
+name = "ld"
+program = "@pe2.binutils-mipsel:ld"
+
+[[program]]
+name = "nm"
+program = "@pe2.binutils-mipsel:nm"
+
+[[program]]
+name = "objcopy"
+program = "@pe2.binutils-mipsel:objcopy"

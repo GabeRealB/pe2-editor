@@ -9,8 +9,8 @@
 //! nothing, and no read is cut off.
 
 use anyhow::{Context, Result, bail};
+use pe2_path::HostPath;
 use std::io::BufReader;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -39,7 +39,7 @@ struct Server {
     stopping: Arc<AtomicBool>,
     /// The layers' files it was told changed, each as it was when what is read of it was read again: reported again
     /// as it still is - by its watch, after whoever holds the project told of it - it is read already.
-    reread: Mutex<std::collections::HashMap<std::path::PathBuf, Option<Stamp>>>,
+    reread: Mutex<std::collections::HashMap<HostPath, Option<Stamp>>>,
 }
 
 /// What tells a file's version from another: its time and length; none where it is gone.
@@ -69,7 +69,7 @@ struct Mounted {
 }
 
 /// `pe2-cli project server`.
-pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
+pub fn run(directory: &HostPath, backend: Option<&str>, address: Option<&str>, strays: Strays) -> Result<()> {
     // It serves files, and runs nothing of a project's: no extension is loaded in this process, whatever comes.
     project::ext::forbid();
     let p = Project::load(directory)?;
@@ -83,7 +83,10 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         let machine = extensions::filesystem_defaults();
         vfs::backend::budget(&[p.filesystem.pages.as_deref(), machine.pages.as_deref()], vfs::backend::PAGES)
     };
-    let ring = (pages > 0).then(|| project::shared::ring(&p.root, &shared, pages)).transpose().context("the pages kept of what is read")?;
+    let ring = (pages > 0)
+        .then(|| project::shared::ring(&p.root, &shared, pages))
+        .transpose()
+        .context("the pages kept of what is read")?;
     let ring = ring.map(Arc::new);
     // A record whoever holds the project changed and has yet to write is read as that leaves it.
     project::storage::read_through(&p.root, shared.clone());
@@ -118,7 +121,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
             connection(&server, ids.fetch_add(1, Ordering::Relaxed), stream);
         }
     })?;
-    println!("{} is served by `{}` once it is listed", project::host::shown(&p.root), serving.name());
+    println!("{} is served by `{}` once it is listed", p.root, serving.name());
     server.keep_going();
     // Stopping, whyever: what is said to it from now on finds it so.
     server.stopping.store(true, Ordering::Relaxed);
@@ -142,7 +145,6 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     println!("stopped");
     Ok(())
 }
-
 
 /// What is done with what the folder a project is served at holds that is not the project's (`vfs::strays`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -193,7 +195,7 @@ fn serving_of(
     // A folder programs work in: any of it, any number of times.
     let how = project::content::Use::general();
     let Some(backend) = choose(&setting, Can::WRITTEN, at, &how, false).map_err(anyhow::Error::msg)? else {
-        bail!("nothing serves {} here ({})", project::host::shown(&p.root), why_none(Can::WRITTEN, at));
+        bail!("nothing serves {} here ({})", p.root, why_none(Can::WRITTEN, at));
     };
     let address = address.or(p.filesystem.address.as_deref());
     let address = address.map(|a| a.parse().with_context(|| format!("`{a}`: no address"))).transpose()?;
@@ -207,17 +209,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Server {
     /// Read again what these files of the layers are to what is read of the project, where they changed since it
     /// last did: its packs' listings. What its records hold it reads by what is said to be served, not by them.
-    fn reread(&self, changed: &[std::path::PathBuf]) {
-        let stamp = |path: &Path| {
+    fn reread(&self, changed: &[HostPath]) {
+        let stamp = |path: &HostPath| {
             let meta = std::fs::metadata(path).ok()?;
             Some((meta.modified().ok()?, meta.len()))
         };
-        let changed: Vec<std::path::PathBuf> = {
+        let changed: Vec<HostPath> = {
             let mut read = lock(&self.reread);
             if read.len() > 10_000 {
                 read.clear();
             }
-            let other = |path: &&std::path::PathBuf| {
+            let other = |path: &&HostPath| {
                 let now = stamp(path);
                 read.insert((*path).clone(), now) != Some(now)
             };
@@ -280,7 +282,9 @@ impl Server {
         if let Err(e) = self.follow(&mut state) {
             // What it cannot read it does not serve: said to who asked, and to its log.
             println!("what is served could not be read in the shared filesystem: {e:#}");
-            return FromServer::Error { why: format!("what is served could not be read in the shared filesystem: {e:#}") };
+            return FromServer::Error {
+                why: format!("what is served could not be read in the shared filesystem: {e:#}"),
+            };
         }
         state.feeder = Some((from, who.to_string()));
         if state.mounted.is_none() {
@@ -309,7 +313,7 @@ impl Server {
     /// then mounted. What it holds while it serves, where that is, and what is to be known of how.
     fn mount(self: &Arc<Self>) -> Result<(Mounted, String, Option<String>)> {
         let (p, serving) = (&self.project, self.serving);
-        let staging = p.root.join(project::cache::DIR).join(project::cache::STAGING);
+        let staging = p.root.join(&project::cache::DIR).join(&project::cache::STAGING);
         let owner: Arc<dyn vfs::write::Owner> = self.clone();
         if serving.can().folder {
             // What another backend left there of its own serving is no stray: it goes first.
@@ -324,16 +328,9 @@ impl Server {
             name: &served_name(p),
             address: self.address,
         };
-        let mount = serving
-            .mount(&job)
-            .with_context(|| format!("serving {} by `{}`", project::host::shown(&p.root), serving.name()))?;
+        let mount = serving.mount(&job).with_context(|| format!("serving {} by `{}`", p.root, serving.name()))?;
         let at = mount.shown();
-        println!(
-            "{} served at {at} by `{}` ({} entries)",
-            project::host::shown(&p.root),
-            serving.name(),
-            self.served.tree().len()
-        );
+        println!("{} served at {at} by `{}` ({} entries)", p.root, serving.name(), self.served.tree().len());
         let record = self.remembered();
         let collecting = serving.keeps().then(|| {
             let (server, record) = (self.clone(), record.clone());
@@ -583,12 +580,16 @@ impl vfs::write::Owner for Server {
 
     /// What was written and nobody took by the time serving ends: set aside beside the folder, by its path there,
     /// as what is not the project's is - the staging is emptied when the folder is next served.
-    fn left(&self, path: &str, staged: &Path) {
+    fn left(&self, path: &str, staged: &HostPath) {
         let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let aside = self.project.root.join(project::SET_ASIDE).join(seconds.to_string()).join(path);
-        let kept = aside.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::copy(staged, &aside));
+        let Ok(within) = pe2_path::RelPath::new(&format!("{seconds}/{path}")) else { return };
+        let aside = self.project.root.join(&project::SET_ASIDE).join(&within);
+        let kept = aside
+            .parent()
+            .map_or(Ok(()), |folder| std::fs::create_dir_all(&folder))
+            .and_then(|()| std::fs::copy(staged, &aside));
         match kept {
-            Ok(_) => println!("{path}: not taken into the project, and set aside in {}", project::host::shown(&aside)),
+            Ok(_) => println!("{path}: not taken into the project, and set aside in {aside}"),
             Err(e) => eprintln!("{path}: not taken into the project, and lost: {e}"),
         }
     }
@@ -600,7 +601,7 @@ fn clear_strays(
     serving: &dyn vfs::backend::Backend,
     strays: Strays,
     owner: &dyn vfs::write::Owner,
-    staging: &Path,
+    staging: &HostPath,
 ) -> Result<()> {
     let at = &p.filesystem.at;
     let found = vfs::strays::strays(at, serving);
@@ -608,8 +609,8 @@ fn clear_strays(
         return Ok(());
     }
     let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let aside = p.root.join(project::SET_ASIDE).join(seconds.to_string());
-    let shown = project::host::shown(at);
+    let aside = p.root.join(&project::SET_ASIDE).join(&pe2_path::Name::new(&seconds.to_string())?);
+    let shown = at.to_string();
     match strays {
         Strays::Refuse => {
             let listed: Vec<&str> = found.iter().take(8).map(String::as_str).collect();
@@ -624,12 +625,12 @@ fn clear_strays(
                 files(found.len()),
                 if found.len() == 1 { "is" } else { "are" },
                 listed.join(", "),
-                project::host::shown(&p.root.join(project::SET_ASIDE)),
+                p.root.join(&project::SET_ASIDE),
             );
         }
         Strays::SetAside => {
             vfs::strays::set_aside(at, &found, &aside)?;
-            println!("{} {shown} held set aside in {}", files(found.len()), project::host::shown(&aside));
+            println!("{} {shown} held set aside in {}", files(found.len()), aside);
         }
         Strays::TakeIn => {
             let kept = vfs::strays::take_in(at, &found, owner, staging, &aside)?;
@@ -638,7 +639,7 @@ fn clear_strays(
                 println!(
                     "{} more - editors' leftovers, names storage keeps - set aside in {}",
                     files(kept.len()),
-                    project::host::shown(&aside)
+                    aside
                 );
             }
         }

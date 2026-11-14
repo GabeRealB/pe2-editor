@@ -79,7 +79,8 @@ mod section {
     use std::io;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+        UnmapViewOfFile,
     };
 
     pub struct Section {
@@ -102,7 +103,9 @@ mod section {
             let long = len as u64;
             let (high, low) = (u32::try_from(long >> 32).unwrap_or(0), u32::try_from(long & 0xFFFF_FFFF).unwrap_or(0));
             // SAFETY: a name ended by a zero; no file behind it, so the paging file is.
-            let handle = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, high, low, wide.as_ptr()) };
+            let handle = unsafe {
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, high, low, wide.as_ptr())
+            };
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -135,7 +138,7 @@ pub struct Ring {
     /// How many slots it has: a multiple of `WAYS`.
     slots: usize,
     /// A file of memory it is in, held while it is mapped here: removed by the last process to let go of it.
-    shared: Option<(std::fs::File, std::path::PathBuf)>,
+    shared: Option<(std::fs::File, pe2_path::HostPath)>,
 }
 
 impl Drop for Ring {
@@ -211,7 +214,8 @@ impl Ring {
             if !memory.is_dir() {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, "no memory to name here"));
             }
-            let path = memory.join(name);
+            let name = pe2_path::Name::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let path = pe2_path::HostPath::new(memory)?.join(&name);
             // Held shared while it is mapped here: who lets go of it last removes it.
             let held = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
             // One of another length is made anew only where no process has it: it is not cut short under one that
@@ -295,7 +299,10 @@ impl Ring {
         PAGE + slot * SAID
     }
 
-    #[expect(clippy::cast_ptr_alignment, reason = "what is said of a slot begins at a multiple of eight, this four after one")]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "what is said of a slot begins at a multiple of eight, this four after one"
+    )]
     fn used(&self, slot: usize) -> &AtomicU32 {
         // SAFETY: as `word`: within what is said of the slot, aligned to four bytes.
         unsafe { &*self.map.first().add(Ring::said(slot) + 36).cast::<AtomicU32>() }
@@ -389,7 +396,8 @@ impl Ring {
                 taken = Some((slot, counter, u32::MAX));
                 break;
             }
-            let age = if counter == 0 { u32::MAX - 1 } else { now.wrapping_sub(self.used(slot).load(Ordering::Relaxed)) };
+            let age =
+                if counter == 0 { u32::MAX - 1 } else { now.wrapping_sub(self.used(slot).load(Ordering::Relaxed)) };
             if taken.is_none_or(|(_, _, oldest)| age > oldest) {
                 taken = Some((slot, counter, age));
             }
@@ -423,6 +431,7 @@ impl Ring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pe2_path::HostPath;
     use std::sync::atomic::AtomicBool;
 
     /// A page's bytes, as its key alone says them: what is read back is held to it.
@@ -431,8 +440,8 @@ mod tests {
         (0..len as u64).map(|i| u8::try_from((seed.wrapping_add(i.wrapping_mul(31))) % 251).unwrap()).collect()
     }
 
-    fn file(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("pe2-sfs-ring-{name}-{}", std::process::id()));
+    fn file(name: &str) -> HostPath {
+        let path = pe2_path::testing::scratch(&format!("sfs-ring-{name}"));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -540,7 +549,7 @@ mod tests {
         }
         let second = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "ring::tests::the_second_process"])
-            .env("PE2_SFS_RING_SECOND", &path)
+            .env("PE2_SFS_RING_SECOND", path.as_os_str())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -607,7 +616,7 @@ mod tests {
         let anew = Ring::shared(&name, 4 << 20).unwrap();
         assert_eq!(anew.get(&key, &mut out), None, "made anew once nobody had it");
         drop(anew);
-        assert!(!Path::new("/dev/shm").join(&name).exists(), "left behind");
+        assert!(!HostPath::new(Path::new("/dev/shm")).unwrap().join(&pe2_path::Name::new(&name).unwrap()).exists(), "left behind");
     }
 
     #[test]
@@ -642,7 +651,9 @@ mod tests {
     #[ignore = "a measurement"]
     fn bench_ring() {
         let path = file("bench");
-        for (name, ring) in [("memory", Ring::private(256 << 20).unwrap()), ("a file", Ring::open(&path, 256 << 20).unwrap())] {
+        for (name, ring) in
+            [("memory", Ring::private(256 << 20).unwrap()), ("a file", Ring::open(&path, 256 << 20).unwrap())]
+        {
             let key = |n: u64| Key { number: n % 5000, version: 1, page: n / 5000 };
             let page = page_of(&key(0), PAGE);
             let mut out = [0u8; PAGE];
@@ -678,7 +689,10 @@ mod tests {
                 std::hint::black_box(&out);
             }
             let hot = hot.elapsed();
-            eprintln!("{name}: the same sixteen pages read again and again {:.0} ns each", hot.as_secs_f64() * 1e9 / 1_000_000.0);
+            eprintln!(
+                "{name}: the same sixteen pages read again and again {:.0} ns each",
+                hot.as_secs_f64() * 1e9 / 1_000_000.0
+            );
             eprintln!(
                 "{name}: {} pages; a page put {:.0} ns the first time, {:.0} ns after; a page read {:.0} ns ({} of 1,000,000 found); a miss {:.0} ns",
                 ring.pages(),

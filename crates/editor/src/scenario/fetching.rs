@@ -1,4 +1,5 @@
 //! What extensions fetch, fetched beside the editor once they run: trusting them consents to it.
+use pe2_path::testing::At as _;
 
 use super::isolate;
 use crate::fetcher::{Fetcher, State};
@@ -23,7 +24,7 @@ fn requiring() -> (Extensions, Setup, Setup) {
     let present = Present {
         id: "test.fetching".to_string(),
         version: "0.1.0".to_string(),
-        origin: Origin::Project("extensions/test.fetching.extension".into()),
+        origin: Origin::Project(pe2_path::testing::scratch("fetching").at("extensions/test.fetching.extension")),
         requires: vec![],
         weak: vec![],
         optional: vec![],
@@ -85,29 +86,29 @@ fn what_was_fetched_is_listed_and_what_the_project_does_not_use_removed() {
     isolate();
     let store = extensions::setup_folder().expect("a store");
     // What an older editor left, which no project names.
-    let left = store.join("0123456789abcdef-scenario");
+    let left = store.at("0123456789abcdef-scenario");
     std::fs::create_dir_all(&left).expect("a folder");
-    std::fs::write(left.join("cc1"), "a compiler").expect("a file");
+    std::fs::write(left.at("cc1"), "a compiler").expect("a file");
     let mut editor = Scenario::open(Fixture::untrusted(false));
     editor.click_label("Continue");
     let mut editor = Scenario::open_showing(editor.into_fixture(), Some("extensions"));
     editor.click_label("Fetched");
-    editor.expect("PE2.PSX");
-    editor.expect("GCC 2.8.1 for the PlayStation");
+    editor.expect("PE2.FFMPEG");
+    editor.expect("FFmpeg 9.0.2, built by the PE2 editor");
     editor.expect("ELSEWHERE");
     editor.expect("an older editor's 0123456789abcdef-scenario");
     editor.click("Remove what this project does not use");
     assert!(!left.exists(), "removed");
-    let psx: Vec<Setup> = editor
+    let ffmpeg: Vec<Setup> = editor
         .workspace()
         .extensions
         .present
         .iter()
-        .filter(|p| p.id == "pe2.psx")
+        .filter(|p| p.id == "pe2.ffmpeg")
         .flat_map(|p| p.setup.clone())
         .collect();
     assert!(
-        psx.iter().filter(|setup| setup.here()).all(|setup| setup.fetched(&store)),
+        ffmpeg.iter().filter(|setup| setup.here()).all(|setup| setup.fetched(&store)),
         "what the project uses is kept"
     );
     editor.expect_not("an older editor's");

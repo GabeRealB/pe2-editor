@@ -17,12 +17,12 @@ fn trusting_a_layer_runs_what_is_in_it() {
     let mut editor = Scenario::open(Fixture::untrusted(false));
     assert!(editor.asking());
     editor.expect(ASKS);
-    editor.expect("pe2.psx");
-    assert_eq!(editor.status("pe2.psx"), Status::NotEnabled { changed: false });
+    editor.expect("pe2.ffmpeg");
+    assert_eq!(editor.status("pe2.ffmpeg"), Status::NotEnabled { changed: false });
     editor.click("layer mods");
     editor.click_label("Continue");
     assert!(!editor.asking());
-    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
     let editor = editor.opened_again();
     assert!(!editor.asking(), "answered, it is not asked again");
 }
@@ -31,7 +31,7 @@ fn trusting_a_layer_runs_what_is_in_it() {
 fn trusting_the_whole_project_covers_its_layers() {
     let mut editor = Scenario::open(Fixture::untrusted(false));
     editor.click_label("Trust the whole project");
-    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn saying_no_is_remembered_and_not_now_is_not() {
     let mut editor = Scenario::open(Fixture::untrusted(false));
     editor.click_label("Not now");
     assert!(!editor.asking());
-    assert_eq!(editor.status("pe2.psx"), Status::NotEnabled { changed: false });
+    assert_eq!(editor.status("pe2.ffmpeg"), Status::NotEnabled { changed: false });
     let mut editor = editor.opened_again();
     assert!(editor.asking(), "not now is for this session");
     editor.click_label("Continue");
@@ -57,7 +57,7 @@ fn what_the_project_requires_is_asked_about_even_after_a_no() {
     assert!(editor.problems().iter().any(|problem| problem.contains("not trusted")), "{:?}", editor.problems());
     editor.click("layer mods");
     editor.click_label("Continue");
-    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
     assert_eq!(editor.problems(), [""; 0]);
 }
 
@@ -77,20 +77,20 @@ fn a_no_can_be_taken_back_in_the_extensions_pane() {
     let fixture = editor.into_fixture();
     let mut editor = Scenario::open_showing(fixture, Some("extensions"));
     assert!(!editor.asking());
-    editor.click("pe2.psx: not enabled");
+    editor.click("pe2.ffmpeg: not enabled");
     editor.click("Trust layer mods");
-    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
 }
 
 #[test]
 fn trusting_shows_what_it_downloads_and_asks_nothing_more() {
     let mut editor = Scenario::open(Fixture::untrusted(false));
-    editor.expect("pe2.psx downloads:");
-    editor.expect("GCC 2.8.1 for the PlayStation");
-    editor.expect("https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1");
+    editor.expect("pe2.ffmpeg downloads:");
+    editor.expect("FFmpeg 9.0.2, built by the PE2 editor");
+    editor.expect("https://github.com/GabeRealB/pe2-editor/releases/download/ffmpeg-9.0.2-1/ffmpeg-9.0.2");
     editor.expect("sha256");
     editor.click_label("Trust the whole project");
-    editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+    editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
     assert!(!editor.asking(), "trusting it was consenting to what it downloads");
 }
 
@@ -102,10 +102,10 @@ fn the_extensions_pane_fits_a_narrow_window_and_a_wide_one() {
         let mut editor = Scenario::open(Fixture::untrusted(false));
         editor.click_label("Continue");
         let mut editor = Scenario::open_sized(editor.into_fixture(), Some("extensions"), size);
-        editor.type_into("Filter extensions", "psx");
-        editor.click("pe2.psx: not enabled");
+        editor.type_into("Filter extensions", "ffmpeg");
+        editor.click("pe2.ffmpeg: not enabled");
         editor.expect("OUTSIDE THE SANDBOX");
         editor.click("Trust layer mods");
-        editor.until("it to run", |editor| editor.status("pe2.psx") == Status::Loaded);
+        editor.until("it to run", |editor| editor.status("pe2.ffmpeg") == Status::Loaded);
     }
 }

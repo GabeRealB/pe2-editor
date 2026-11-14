@@ -190,7 +190,7 @@ impl Runner {
                     let wired = wiring.counts();
                     let ended = Finished {
                         roots: job.roots,
-                        config: job.config.name,
+                        config: job.config.name.to_string(),
                         report,
                         problems: wiring.problems,
                         wired,

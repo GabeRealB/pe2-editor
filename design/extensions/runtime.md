@@ -41,6 +41,11 @@ what the Extensions pane shows. Results are cached per process by what was found
 An extension whose manifest is embedded is compiled and instantiated only when it actually registers, so a disabled
 or unmet extension never runs. Compiled code is cached per user, keyed by the bytes and the engine's settings.
 
+An extension may also be only its manifest - a folder with `extension.toml` and no component: a tool, the programs it
+offers and what they are fetched from. It registers nothing; it is checked as one with a component is, its manifest
+by the same checks the SDK's macro runs (`pe2-manifest`, which both use), and trusted by its folder, its manifest
+counting, as that is what it is.
+
 ## Running a component
 
 - **One engine per component**, deterministic (canonical NaNs, deterministic SIMD), interrupted by epochs that one
@@ -79,6 +84,11 @@ An unsandboxed extension gets the whole system and may start programs. It runs o
   read for its manifest and never instantiated.
 - **Programs** are looked for in the extension's folder (per platform first), then its downloads, then the system.
   Programs given files from a sealed extension get them through the served filesystem.
+- **Programs offered** (`[[program]]`) are named by others as `<extension>:<program>`: what every unsandboxed
+  extension loaded offers is kept with the loaded set (`unsandboxed::Offered`, filled once it is known which loaded),
+  and a program is started through the extension offering it - its required downloads fetched first, its tree's places
+  found, other extensions' programs it names (`@<extension>:<program>`, maspsx's assembler) found in turn. So a tool is
+  an extension of its own, and what builds - another extension, or a project's `run` boxes - names it.
 - **Downloads** (`[[setup]]`) are fetched by the host, not the extension: checked by hash, unpacked, patched, and
   kept in a store shared by every project. Required ones are fetched before the first call, optional ones when the
   extension asks and the user allows.
@@ -91,6 +101,7 @@ the editor. Adding a built-in means adding it to the build list and to the linke
 
 ## Where to look
 
-`project::ext` (`Extensions`, loading, `may_call`, hooks), `ext::component` (wasmtime, limits, instances),
-`ext::folder`, `ext::unsandboxed`, `ext::requests`, `crates/extensions` (finding, trust, settings, built-ins),
-`crates/setup` (downloads).
+`project::ext` (`Extensions`, loading, `may_call`, hooks, `program`), `ext::component` (wasmtime, limits, instances,
+`Unsandboxed::start`), `ext::folder` (`checked_alone`), `ext::unsandboxed`, `ext::requests`, `crates/extensions`
+(finding, trust, settings, built-ins, `manifest_alone`), `crates/manifest` (what a manifest may say), `crates/setup`
+(downloads).

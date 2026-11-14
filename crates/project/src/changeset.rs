@@ -20,8 +20,8 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use crate::cache::write_atomic;
 
@@ -68,7 +68,7 @@ impl Changeset {
     ///
     /// # Errors
     /// It cannot be read, or is not a changeset.
-    pub fn load(path: &Path) -> Result<Changeset> {
+    pub fn load(path: &HostPath) -> Result<Changeset> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Changeset::default()),
@@ -180,7 +180,7 @@ impl Changeset {
     ///
     /// # Errors
     /// The file cannot be written.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &HostPath) -> Result<()> {
         write_atomic(path, self.render().as_bytes())
     }
 

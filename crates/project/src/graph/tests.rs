@@ -1,3 +1,5 @@
+use crate::testing::At as _;
+use pe2_path::HostPath;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
@@ -159,16 +161,19 @@ fn ops() -> Ops {
         bytes.make_ascii_uppercase();
         Ok(file(bytes))
     }));
-    ops.add(OpDef::new("t.served", "Served and read back", "1").input(port("in", file_type())).makes(file_type(), |call| {
-        let input = call.take(0)?.take();
-        let Value::Typed(typed) = input else { anyhow::bail!("not a file") };
-        let mut files = typed.files.clone();
-        files.push(File::new("dir/extra.txt", b"!".to_vec()));
-        let folder = call.serve(&files, &crate::content::Use::default())?;
-        let mut read = std::fs::read(folder.join(&files[0].name))?;
-        read.extend(std::fs::read(folder.join("dir/extra.txt"))?);
-        Ok(file(read))
-    }));
+    ops.add(OpDef::new("t.served", "Served and read back", "1").input(port("in", file_type())).makes(
+        file_type(),
+        |call| {
+            let input = call.take(0)?.take();
+            let Value::Typed(typed) = input else { anyhow::bail!("not a file") };
+            let mut files = typed.files.clone();
+            files.push(File::new("dir/extra.txt", b"!".to_vec()));
+            let folder = call.serve(&files, &crate::content::Use::default())?;
+            let mut read = std::fs::read(folder.at(&files[0].name))?;
+            read.extend(std::fs::read(folder.at("dir/extra.txt"))?);
+            Ok(file(read))
+        },
+    ));
     ops.add(OpDef::new("t.split", "Texts as files", "1").makes(Type::List(Box::new(file_type())), |call| {
         let texts = call.settings().get("texts").and_then(toml::Value::as_array).cloned().unwrap_or_default();
         Ok(Value::List(texts.iter().filter_map(toml::Value::as_str).map(|t| file(t.as_bytes().to_vec())).collect()))
@@ -495,7 +500,7 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
 
 #[test]
 fn a_kept_output_holds_while_what_it_read_does() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-store-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-store");
     let _ = std::fs::remove_dir_all(&dir);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let node = Bundle::new(STACK, &[("a.txt", "abc")]);
@@ -522,7 +527,7 @@ fn a_kept_output_holds_while_what_it_read_does() {
 
 #[test]
 fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-alike-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-alike");
     let _ = std::fs::remove_dir_all(&dir);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let one = Bundle::new(STACK, &[("a.txt", "abc")]);
@@ -533,14 +538,14 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     // Each found kept by its own trace; the other's file changing leaves it.
     two.files.lock().unwrap().insert("a.txt".into(), b"xyz".to_vec());
     assert!(engine.output(&plan, &one, "source", false).unwrap().kept);
-    let count = |sub: &str| std::fs::read_dir(dir.join(sub)).unwrap().count();
+    let count = |sub: &str| std::fs::read_dir(dir.at(sub)).unwrap().count();
     assert_eq!((count("traces"), count("values")), (2, 1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-tail-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-tail");
     let _ = std::fs::remove_dir_all(&dir);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
@@ -582,7 +587,7 @@ fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
 
 #[test]
 fn an_outputs_newest_trace_of_each_of_the_last_two_builds_is_kept() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-builds-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-builds");
     let _ = std::fs::remove_dir_all(&dir);
     // One project, its operation built three ways: an editor of each version on it in turn.
     let built = |version: &str| {
@@ -672,7 +677,7 @@ impl super::exec::World for Nodes {
 }
 
 /// A node reading the project's plain files, held in a folder.
-struct Tree(Bundle, Ops, std::path::PathBuf);
+struct Tree(Bundle, Ops, HostPath);
 
 impl super::exec::World for Tree {
     fn node(&self, _: &toml::Value) -> Option<(&dyn Node, Plan)> {
@@ -680,7 +685,7 @@ impl super::exec::World for Tree {
     }
 
     fn entries(&self, folder: &str) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.2.join(folder))
+        let mut names: Vec<String> = std::fs::read_dir(self.2.at(folder))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
@@ -688,25 +693,25 @@ impl super::exec::World for Tree {
         names.into_iter().map(|name| format!("{folder}/{name}")).collect()
     }
 
-    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
-        Some(self.2.join(path)).filter(|disk| disk.is_file())
+    fn entry(&self, path: &str) -> Option<HostPath> {
+        Some(self.2.at(path)).filter(|disk| disk.is_file())
     }
 
     fn assets_of(&self, _: &str) -> Vec<(String, String)> {
-        vec![("packages/one".to_string(), std::fs::read_to_string(self.2.join("declaration")).unwrap())]
+        vec![("packages/one".to_string(), std::fs::read_to_string(self.2.at("declaration")).unwrap())]
     }
 }
 
 #[test]
 fn what_is_made_from_the_projects_files_is_made_again_when_they_change() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-tree-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-tree");
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("tree/src")).unwrap();
-    std::fs::write(dir.join("tree/src/a.c"), "one").unwrap();
-    std::fs::write(dir.join("tree/declaration"), "public = []").unwrap();
-    let engine = Engine::new(ops(), Some(Store::at(dir.join("store")).unwrap()));
+    std::fs::create_dir_all(dir.at("tree/src")).unwrap();
+    std::fs::write(dir.at("tree/src/a.c"), "one").unwrap();
+    std::fs::write(dir.at("tree/declaration"), "public = []").unwrap();
+    let engine = Engine::new(ops(), Some(Store::at(dir.at("store")).unwrap()));
     let declared = "[[stack]]\nop = \"t.tree\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
-    let world = Tree(Bundle::new(declared, &[]), engine.ops.clone(), dir.join("tree"));
+    let world = Tree(Bundle::new(declared, &[]), engine.ops.clone(), dir.at("tree"));
     let reach = super::exec::Reach { engine: &engine, world: &world };
     let make = || {
         let (node, plan) = super::exec::World::node(&world, &toml::Value::String(String::new())).unwrap();
@@ -714,15 +719,15 @@ fn what_is_made_from_the_projects_files_is_made_again_when_they_change() {
     };
     assert!(!make().kept);
     assert!(make().kept, "nothing changed");
-    std::fs::write(dir.join("tree/src/a.c"), "two").unwrap();
+    std::fs::write(dir.at("tree/src/a.c"), "two").unwrap();
     assert!(!make().kept, "a file read changed");
     assert!(make().kept);
-    std::fs::write(dir.join("tree/src/b.c"), "new").unwrap();
+    std::fs::write(dir.at("tree/src/b.c"), "new").unwrap();
     assert!(!make().kept, "a file came to the folder listed");
-    std::fs::remove_file(dir.join("tree/src/b.c")).unwrap();
+    std::fs::remove_file(dir.at("tree/src/b.c")).unwrap();
     assert!(!make().kept, "a file left it");
     assert!(make().kept);
-    std::fs::write(dir.join("tree/declaration"), "public = [\"include\"]").unwrap();
+    std::fs::write(dir.at("tree/declaration"), "public = [\"include\"]").unwrap();
     assert!(!make().kept, "a declaration read changed");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -738,7 +743,7 @@ fn joining(parts: &str) -> String {
 
 #[test]
 fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-reach-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-reach");
     let _ = std::fs::remove_dir_all(&dir);
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let mut a = Bundle::new(PART, &[("part.bin", "head-")]);
@@ -759,7 +764,7 @@ fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     };
     let stored = |given: &super::exec::Given| match &given.value.as_deref() {
         Some(Value::Typed(typed)) => match &typed.files[0].content {
-            Content::Stored { sha1, .. } => std::fs::read(engine.store().unwrap().blob_path(sha1)).unwrap(),
+            Content::Stored { sha1, .. } => std::fs::read(engine.store().unwrap().blob_path(sha1).unwrap()).unwrap(),
             Content::Inline(_) => panic!("held in memory"),
         },
         _ => panic!("not a file"),
@@ -794,7 +799,7 @@ impl super::exec::World for Counted<'_> {
 
 #[test]
 fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-run-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-run");
     let _ = std::fs::remove_dir_all(&dir);
     // An engine for one run: an epoch's.
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap())).for_a_run();
@@ -836,7 +841,7 @@ fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() 
 
 #[test]
 fn marks_are_kept_as_they_are() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-marks-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-marks");
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::at(dir.clone()).unwrap();
     let rect = pe2_ext::Rect { x: 1.0, y: 2.0, width: 3.0, height: 4.0 };
@@ -1025,14 +1030,14 @@ fn a_wire_names_a_layer_and_one_of_its_outputs() {
 }
 
 /// What is left in a store's `tmp/`.
-fn left_in_tmp(dir: &std::path::Path) -> Vec<String> {
-    let entries = std::fs::read_dir(dir.join("tmp")).into_iter().flatten().flatten();
+fn left_in_tmp(dir: &HostPath) -> Vec<String> {
+    let entries = std::fs::read_dir(dir.at("tmp")).into_iter().flatten().flatten();
     entries.map(|e| e.file_name().to_string_lossy().into_owned()).collect()
 }
 
 #[test]
 fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-tmp-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-tmp");
     let _ = std::fs::remove_dir_all(&dir);
     let mut ops = ops();
     let file_type = || Type::File(Box::new(Type::Any));
@@ -1061,22 +1066,22 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
     let made = engine.output(&plan, &temps, "native", false).unwrap();
     let Some(Value::Typed(typed)) = made.value.as_deref() else { panic!("not a file") };
     let Content::Stored { sha1, .. } = &typed.files[0].content else { panic!("not kept") };
-    assert_eq!(std::fs::read(engine.store().unwrap().blob_path(sha1)).unwrap(), b"made");
+    assert_eq!(std::fs::read(engine.store().unwrap().blob_path(sha1).unwrap()).unwrap(), b"made");
     assert_eq!(left_in_tmp(&dir), Vec::<String>::new(), "a path handed out and not kept");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-stale-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-stale");
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("tmp/old.expand")).unwrap();
+    std::fs::create_dir_all(dir.at("tmp/old.expand")).unwrap();
     let day = std::time::Duration::from_hours(25);
     for (name, age) in [("1-0", day), ("2-0", std::time::Duration::ZERO)] {
-        let file = std::fs::File::create(dir.join("tmp").join(name)).unwrap();
+        let file = std::fs::File::create(dir.at("tmp").at(name)).unwrap();
         file.set_modified(std::time::SystemTime::now() - age).unwrap();
     }
-    crate::testing::set_modified(&dir.join("tmp/old.expand"), std::time::SystemTime::now() - day);
+    crate::testing::set_modified(&dir.at("tmp/old.expand"), std::time::SystemTime::now() - day);
     let _store = Store::at(dir.clone()).unwrap();
     // What a stopped process left goes, a folder of it too; what is being written stays.
     assert_eq!(left_in_tmp(&dir), ["2-0"]);
@@ -1085,7 +1090,7 @@ fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
 
 #[test]
 fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-due-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-due");
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::at(dir.clone()).unwrap();
     let every = std::time::Duration::from_mins(30);
@@ -1093,7 +1098,7 @@ fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
     store.mark_swept();
     let set = |path: &str, ago: std::time::Duration| {
         let at = std::time::SystemTime::now() - ago;
-        crate::testing::set_modified(&dir.join(path), at);
+        crate::testing::set_modified(&dir.at(path), at);
     };
     // Swept an hour ago, nothing kept since.
     set("swept", std::time::Duration::from_hours(1));
@@ -1364,7 +1369,6 @@ fn an_operation_the_project_defines_may_not_use_itself() {
     assert!(plan.steps.iter().any(|s| s.op == "t.upper" && s.at.contains("Upper in a language")), "{:?}", plan.steps);
 }
 
-
 /// Two inputs, a boolean setting saying whether the first is made upper case, two outputs.
 const TWO: &str = r#"
 [[stack]]
@@ -1387,7 +1391,10 @@ fn an_operation_the_project_defines_says_what_it_is_with_its_boxes() {
     assert_eq!(names(&definition.inputs), ["first", "second"]);
     assert_eq!(definition.settings.iter().map(|(p, _)| p.name.as_str()).collect::<Vec<_>>(), ["loud"]);
     assert_eq!(definition.outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["joined", "second"]);
-    let twice = TWO.replace("name = \"second\", index = 1, from = { value = \"b\" }", "name = \"joined\", from = { value = \"b\" }");
+    let twice = TWO.replace(
+        "name = \"second\", index = 1, from = { value = \"b\" }",
+        "name = \"joined\", from = { value = \"b\" }",
+    );
     let refused = super::Definition::of("uid://two", &toml::from_str(&twice).unwrap(), "1").unwrap_err();
     assert!(refused.contains("two outputs"), "{refused}");
     let outputless = TWO.replace("op = \"output\"", "op = \"t.join\"");
@@ -1456,7 +1463,7 @@ ops.out = { op = "output", name = "out", from = { value = "up" } }
 
 #[test]
 fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-each-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-each");
     let _ = std::fs::remove_dir_all(&dir);
     let ops = with_definitions(&[("uid://louder", LOUDER)]);
     let stack = |texts: &str| {
@@ -1565,7 +1572,7 @@ fn what_a_node_using_an_operation_with_a_setting_unset_by_default_is_is_read_off
 
 #[test]
 fn an_operation_is_served_a_folder_of_its_files_for_its_run() {
-    let dir = std::env::temp_dir().join(format!("pe2-graph-served-{}", std::process::id()));
+    let dir = crate::testing::scratch("graph-served");
     let _ = std::fs::remove_dir_all(&dir);
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.served\"\n\n[[stack]]\nop = \"output\"\nname = \"read\"\n";
     let (plan, wrong) = Plan::of(&toml::from_str(stack).unwrap(), &ops(), &[]);
@@ -1574,8 +1581,9 @@ fn an_operation_is_served_a_folder_of_its_files_for_its_run() {
     let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
     let given = engine.output(&plan, &node, "read", true).unwrap();
     assert_eq!(data(&node, &given.value.unwrap()), b"abc!");
-    let tmp = dir.join("tmp");
-    let left = std::fs::read_dir(&tmp).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("served-")).count());
+    let tmp = dir.at("tmp");
+    let left = std::fs::read_dir(&tmp)
+        .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("served-")).count());
     assert_eq!(left.unwrap_or(0), 0, "the folder is gone once the run is done");
     let _ = std::fs::remove_dir_all(&dir);
 }

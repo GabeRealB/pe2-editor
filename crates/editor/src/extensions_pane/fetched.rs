@@ -4,6 +4,7 @@
 //! editor's, what fetches left unfinished); then cleaning it up: what is due now, or what this project does not use.
 //! The store is the computer's, shared by every project (`setup::kept`): what goes is fetched again where one needs it.
 
+use pe2_path::HostPath;
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, RichText};
@@ -69,7 +70,9 @@ pub(super) fn fetched_ui(ui: &mut egui::Ui, ws: &mut Workspace, state: &mut Stat
                     },
                 )
                 .on_hover_text(
-                    k.name.as_ref().map_or_else(|| store.join(&k.key).display().to_string(), |(_, url)| url.clone()),
+                    k.name
+                        .as_ref()
+                        .map_or_else(|| store.entry(std::ffi::OsStr::new(&k.key)).to_string(), |(_, url)| url.clone()),
                 );
                 ui.label(weak(format!("{} · used {}", kept::size(k.bytes), kept::ago(k.used))));
             });
@@ -92,7 +95,7 @@ fn package_ui(
     ws: &mut Workspace,
     p: &project::ext::Present,
     setup: &Setup,
-    store: &std::path::Path,
+    store: &HostPath,
     runs: bool,
     held: Option<&Kept>,
     removed: &mut Vec<String>,
@@ -151,7 +154,7 @@ fn removable_row(ui: &mut egui::Ui, name: &str, button: &str, says: &str, clicke
 /// (unused for long and not this project's, and what fetches left unfinished), or everything this project does not use.
 fn clean_up_ui(
     ui: &mut egui::Ui,
-    store: &std::path::Path,
+    store: &HostPath,
     held: &[Kept],
     named: &HashSet<String>,
     elsewhere: usize,

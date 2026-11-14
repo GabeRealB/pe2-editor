@@ -1806,7 +1806,8 @@ fn layer_settings(
                 .settings
                 .iter()
                 .map(|(property, _)| {
-                    let mut field = Field::new(&property.name).label(property.label.as_deref().unwrap_or(&property.name));
+                    let mut field =
+                        Field::new(&property.name).label(property.label.as_deref().unwrap_or(&property.name));
                     if let Some(default) = &property.default {
                         field = field.default_value(default.clone());
                     }

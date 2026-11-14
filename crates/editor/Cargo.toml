@@ -26,6 +26,7 @@ workspace = true
 tracing.workspace = true
 codecs.workspace = true
 project.workspace = true
+pe2-path.workspace = true
 vfs.workspace = true
 extensions.workspace = true
 pe2-ext.workspace = true
@@ -58,8 +59,14 @@ tracy = ["project/tracy"]
 tests = ["dep:egui_kittest"]
 
 [dev-dependencies]
+pe2-path = { workspace = true, features = ["testing"] }
 egui_kittest.workspace = true
 
 # Ended by a signal, the editor unmounts what it mounted (its scoped mounts).
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ctrlc.workspace = true
+
+[build-dependencies]
+# What a build needs beside its programs and is no crate (`build.rs`): read from `prepare.toml`, held to its hashes.
+toml.workspace = true
+sha2.workspace = true

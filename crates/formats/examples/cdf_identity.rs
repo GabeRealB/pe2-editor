@@ -6,6 +6,8 @@
 //! image, a palette's colors after its 16-byte header, an image's column table and strips), any other from its
 //! payload as stored - with the stored header's sector length and load address, and compared with the disc's
 //! sectors. It reports each type and names the first few chunks that differ, exiting non-zero if any does.
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 
 use formats::{cdf, lzss};
 use std::collections::BTreeMap;
@@ -22,16 +24,16 @@ struct Stored {
     payload: Vec<u8>,
 }
 
-fn stored(roms: &Path) -> Vec<Stored> {
+fn stored(roms: &HostPath) -> Vec<Stored> {
     let mut out = Vec::new();
     for disc in ["disk1", "disk2"] {
-        let dir = roms.join(disc);
+        let dir = roms.at(disc);
         let mut containers: Vec<(String, Vec<u8>, Vec<cdf::FileEntry>)> = Vec::new();
-        if let (Ok(hed), Ok(bytes)) = (std::fs::read(dir.join("STAGE0.HED")), std::fs::read(dir.join("STAGE0.CDF"))) {
+        if let (Ok(hed), Ok(bytes)) = (std::fs::read(dir.at("STAGE0.HED")), std::fs::read(dir.at("STAGE0.CDF"))) {
             containers.push(("stage0".into(), bytes, cdf::stage0_files(&hed).expect("STAGE0.HED")));
         }
         for n in 1..=5 {
-            if let Ok(bytes) = std::fs::read(dir.join(format!("STAGE{n}.CDF"))) {
+            if let Ok(bytes) = std::fs::read(dir.at(&format!("STAGE{n}.CDF"))) {
                 let files = cdf::stage_files(&mut bytes.as_slice()).expect("its folders");
                 containers.push((format!("stage{n}"), bytes, files));
             }
@@ -74,7 +76,7 @@ fn payload_of(s: &Stored) -> Vec<u8> {
 
 fn main() {
     let roms = std::env::args().nth(1).expect("the folder of a release's discs");
-    let all = stored(Path::new(&roms));
+    let all = stored(&HostPath::new(Path::new(&roms)).expect("the folder of a release's discs"));
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let per = all.len().div_ceil(threads).max(1);
     let results: Vec<(u8, bool, &str)> = std::thread::scope(|scope| {

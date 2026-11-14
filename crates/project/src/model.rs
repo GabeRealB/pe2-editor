@@ -18,8 +18,8 @@
 //! because a process died or the power went, over what that space kept beside it, each record held to its file -
 //! and whoever holds the project says back what the opening read anew (`took`).
 
+use pe2_path::HostPath;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sfs::space::{Pages, Result, Txn};
@@ -65,7 +65,7 @@ pub const LINKS: usize = 12;
 /// Raised whenever what the trees hold changes shape: a model of another format is emptied, and filled again -
 /// as is one of another schema of the project's cache (`cache::SCHEMA`), which is raised where what is derived
 /// of the files changes.
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 
 /// What a key of `INPUTS` begins with: the model's word of itself; a file's record; a declaration's text; a layer,
 /// with what its listing depends on; something a layer holds.
@@ -183,26 +183,21 @@ impl<'a> In<'a> {
 
 /// A file's name in the model: where it is in the project's folder, by its parts - the same whatever the folder is
 /// called on this system, or where it is - or, for one elsewhere (a mount's), its whole path.
-pub(crate) fn name(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(within) => {
-            let parts: Vec<_> = within.components().map(|part| part.as_os_str().to_string_lossy()).collect();
-            format!("/{}", parts.join("/"))
-        }
-        Err(_) => format!("={}", path.to_string_lossy()),
+pub(crate) fn name(root: &HostPath, path: &HostPath) -> String {
+    // Whole, where it is not within by names: elsewhere, or within by a name no path takes - the same file all the
+    // same (`named`).
+    match path.within(root) {
+        Ok(within) => format!("/{within}"),
+        Err(pe2_path::NotWithin::Outside | pe2_path::NotWithin::Refused(_)) => format!("={path}"),
     }
 }
 
 /// The file a name is of.
-pub(crate) fn named(root: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn named(root: &HostPath, name: &str) -> Option<HostPath> {
     if let Some(elsewhere) = name.strip_prefix('=') {
-        return Some(PathBuf::from(elsewhere));
+        return HostPath::from_plain(elsewhere.into());
     }
-    let within = name.strip_prefix('/')?;
-    let mut path = root.to_path_buf();
-    // Each part by itself: a path Windows takes as it is written has no other separator than its own.
-    path.extend(within.split('/').filter(|part| !part.is_empty()));
-    Some(path)
+    Some(root.join(&pe2_path::RelPath::new(name.strip_prefix('/')?).ok()?))
 }
 
 /// The key of what the model holds of a kind under a name: the name itself, or - too long for a key - its hash.
@@ -304,8 +299,9 @@ fn recorded(value: &[u8]) -> Option<(Record, Option<String>)> {
         let (mut uid, mut error) = (None, None);
         read.maybe(&mut uid)?;
         let variants = (0..read.u32()?).map(|_| read.text()).collect::<Option<Vec<_>>>()?;
-        let references =
-            (0..read.u32()?).map(|_| Some((read.text()?, read.text()?, read.text()?, read.text()?))).collect::<Option<Vec<_>>>()?;
+        let references = (0..read.u32()?)
+            .map(|_| Some((read.text()?, read.text()?, read.text()?, read.text()?)))
+            .collect::<Option<Vec<_>>>()?;
         read.maybe(&mut error)?;
         Some(Declaration { shape, uid, variants, references, error, text: Arc::from("") })
     };
@@ -321,12 +317,14 @@ fn text(text: &str) -> Vec<u8> {
 }
 
 /// Something a layer holds at a path, as a walk of it finds it: a folder; a plain file, with where it is; a bundle,
-/// with its files by name and where each is.
+/// with its files by name and where each is; or what it holds by a name no path takes (at its path as shown), with
+/// why - none of the project's, and a problem until it is renamed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Held {
     Folder,
-    File(PathBuf),
-    Bundle(BTreeMap<String, PathBuf>),
+    File(HostPath),
+    Bundle(BTreeMap<String, HostPath>),
+    Refused(Box<str>),
 }
 
 /// What the model holds of the layers: each by its name, with what its listing was made by (its place and the
@@ -352,7 +350,7 @@ pub struct Stack {
 /// the records of the layers stored as records, and the stack applied over them.
 #[derive(Default)]
 pub struct Known {
-    pub files: HashMap<PathBuf, Record>,
+    pub files: HashMap<HostPath, Record>,
     pub layers: Layers,
     pub records: Records,
     pub stack: Option<Stack>,
@@ -466,7 +464,7 @@ fn held_name(layer: &str, path: &str) -> String {
 }
 
 /// Something a layer holds, as the model keeps it under its name.
-fn held(root: &Path, held_name: &str, held: &Held) -> Vec<u8> {
+fn held(root: &HostPath, held_name: &str, held: &Held) -> Vec<u8> {
     let mut out = Out::new();
     let long = if held_name.len() > NAMED { says::NAMED } else { 0 };
     match held {
@@ -483,6 +481,10 @@ fn held(root: &Path, held_name: &str, held: &Held) -> Vec<u8> {
                 out.text(&name(root, path));
             }
         }
+        Held::Refused(why) => {
+            out.u8(long | 0xC);
+            out.text(why);
+        }
     }
     if long != 0 {
         out.text(held_name);
@@ -491,16 +493,18 @@ fn held(root: &Path, held_name: &str, held: &Held) -> Vec<u8> {
 }
 
 /// Something a layer holds read back, with the name it says where its key could not.
-fn held_of(root: &Path, value: &[u8]) -> Option<(Held, Option<String>)> {
+fn held_of(root: &HostPath, value: &[u8]) -> Option<(Held, Option<String>)> {
     let mut read = In::after_stamp(value)?;
     let said = read.u8()?;
     let held = match said & !says::NAMED {
         0 => Held::Folder,
         4 => Held::File(named(root, &read.text()?)?),
         8 => {
-            let files = (0..read.u32()?).map(|_| Some((read.text()?, named(root, &read.text()?)?))).collect::<Option<_>>()?;
+            let files =
+                (0..read.u32()?).map(|_| Some((read.text()?, named(root, &read.text()?)?))).collect::<Option<_>>()?;
             Held::Bundle(files)
         }
+        0xC => Held::Refused(read.text()?.into()),
         _ => return None,
     };
     let name = if said & says::NAMED == 0 { None } else { Some(read.text()?) };
@@ -527,7 +531,7 @@ impl Delta {
     }
 
     /// A file's record is this now - or, with none, the file is no more.
-    pub fn file(&mut self, root: &Path, path: &Path, now: Option<&Record>) {
+    pub fn file(&mut self, root: &HostPath, path: &HostPath, now: Option<&Record>) {
         let name = name(root, path);
         let (of_record, of_text) = (key(FILE, &name), key(TEXT, &name));
         self.changes.push((INPUTS, of_record, now.map(|now| record(&name, now))));
@@ -536,7 +540,7 @@ impl Delta {
     }
 
     /// A layer holds this at a path now - or, with none, nothing there any more.
-    pub fn held(&mut self, root: &Path, layer: &str, path: &str, now: Option<&Held>) {
+    pub fn held(&mut self, root: &HostPath, layer: &str, path: &str, now: Option<&Held>) {
         let name = held_name(layer, path);
         self.changes.push((INPUTS, key(HELD, &name), now.map(|now| held(root, &name, now))));
     }
@@ -656,7 +660,11 @@ fn meta(generation: u64) -> Vec<u8> {
 ///
 /// # Errors
 /// The space cannot be written.
-pub fn fill_files<'a>(txn: &mut Txn<'_>, root: &Path, records: impl Iterator<Item = (&'a Path, &'a Record)>) -> Result<()> {
+pub fn fill_files<'a>(
+    txn: &mut Txn<'_>,
+    root: &HostPath,
+    records: impl Iterator<Item = (&'a HostPath, &'a Record)>,
+) -> Result<()> {
     let generation = txn.generation().to_le_bytes();
     let mut wanted: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for (path, now) in records {
@@ -702,7 +710,7 @@ pub fn fill_files<'a>(txn: &mut Txn<'_>, root: &Path, records: impl Iterator<Ite
 /// anew - a process died, the power went - kept beside it (`sfs::Space::left_behind`), where that reads whole;
 /// else nothing. Whoever opens over it holds it to the files.
 #[must_use]
-pub fn known(root: &Path) -> Known {
+pub fn known(root: &HostPath) -> Known {
     let _span = tracing::info_span!("model: what is known of the files read").entered();
     // All of it at one commit, each part read on a thread of its own.
     let all = |space: &sfs::Space| -> Option<Known> {
@@ -736,7 +744,10 @@ pub fn stack(pages: &impl Pages) -> Result<Option<Stack>> {
         return Ok(None);
     }
     let Some(made_of) = sfs::tree::get_in(pages, STACK, &[MADE_OF])? else { return Ok(None) };
-    let made_of = made_of.get(8..).and_then(|text| std::str::from_utf8(text).ok()).ok_or_else(|| invalid("a stack made of nothing said"))?;
+    let made_of = made_of
+        .get(8..)
+        .and_then(|text| std::str::from_utf8(text).ok())
+        .ok_or_else(|| invalid("a stack made of nothing said"))?;
     let mut stack = Stack { made_of: made_of.to_owned(), ..Stack::default() };
     let mut failed = None;
     sfs::tree::scan_prefix(pages, STACK, &[NODE], &mut |key, value| {
@@ -797,7 +808,7 @@ pub fn records(pages: &impl Pages) -> Result<Records> {
 ///
 /// # Errors
 /// The space is damaged, or holds what is none of that.
-pub fn layers(pages: &impl Pages, root: &Path) -> Result<Layers> {
+pub fn layers(pages: &impl Pages, root: &HostPath) -> Result<Layers> {
     let mut layers = Layers::new();
     if !is_begun(pages)? {
         return Ok(layers);
@@ -835,7 +846,7 @@ pub fn layers(pages: &impl Pages, root: &Path) -> Result<Layers> {
 ///
 /// # Errors
 /// The shared space is not there, or cannot be written.
-pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()> {
+pub fn took(root: &HostPath, index: &mut crate::index::Index) -> std::io::Result<()> {
     let _span = tracing::info_span!("model: what the opening read said").entered();
     let opened = index.take_opened();
     let space = crate::shared::space(root)?;
@@ -858,7 +869,7 @@ pub fn took(root: &Path, index: &mut crate::index::Index) -> std::io::Result<()>
 ///
 /// # Errors
 /// The space is damaged, or holds what is no record.
-pub fn file(pages: &impl Pages, root: &Path, path: &Path) -> Result<Option<Record>> {
+pub fn file(pages: &impl Pages, root: &HostPath, path: &HostPath) -> Result<Option<Record>> {
     let name = name(root, path);
     let Some(value) = sfs::tree::get_in(pages, INPUTS, &key(FILE, &name))? else { return Ok(None) };
     let (mut record, _) = recorded(&value).ok_or_else(|| invalid("a file's record that is none"))?;
@@ -870,7 +881,8 @@ pub fn file(pages: &impl Pages, root: &Path, path: &Path) -> Result<Option<Recor
 
 /// A declaration's text, by its file's name.
 fn declared(pages: &impl Pages, name: &str) -> Result<Arc<str>> {
-    let value = sfs::tree::get_in(pages, INPUTS, &key(TEXT, name))?.ok_or_else(|| invalid("a declaration with no text"))?;
+    let value =
+        sfs::tree::get_in(pages, INPUTS, &key(TEXT, name))?.ok_or_else(|| invalid("a declaration with no text"))?;
     let text = value.get(8..).and_then(|text| std::str::from_utf8(text).ok());
     text.map(Arc::from).ok_or_else(|| invalid("a declaration's text that is none"))
 }
@@ -893,8 +905,8 @@ fn texts(pages: &impl Pages) -> Result<HashMap<Vec<u8>, Arc<str>>> {
 ///
 /// # Errors
 /// The space is damaged, or holds what is no record.
-pub fn files(pages: &impl Pages, root: &Path) -> Result<HashMap<PathBuf, Record>> {
-    let mut files: HashMap<PathBuf, (String, Record)> = HashMap::new();
+pub fn files(pages: &impl Pages, root: &HostPath) -> Result<HashMap<HostPath, Record>> {
+    let mut files: HashMap<HostPath, (String, Record)> = HashMap::new();
     if !is_begun(pages)? {
         return Ok(HashMap::new());
     }
@@ -930,47 +942,72 @@ pub fn files(pages: &impl Pages, root: &Path) -> Result<HashMap<PathBuf, Record>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::At as _;
+    use pe2_path::HostPath;
 
     fn a_record(n: u64, declared: bool) -> Record {
         let declaration = declared.then(|| Declaration {
             shape: format!("shape {n}"),
             uid: (n % 2 == 0).then(|| format!("uid://{n:012}")),
             variants: (0..n % 3).map(|v| format!("variant {v}")).collect(),
-            references: (0..n % 4).map(|r| (format!("slot{r}"), format!("uid://{r:012}"), format!("a/b{r}"), String::new())).collect(),
+            references: (0..n % 4)
+                .map(|r| (format!("slot{r}"), format!("uid://{r:012}"), format!("a/b{r}"), String::new()))
+                .collect(),
             error: (n % 5 == 0).then(|| "it cannot be parsed".to_string()),
-            text: Arc::from(format!("uid = \"uid://{n:012}\"\n# {}\n", "x".repeat(usize::try_from(n * 97 % 3000).unwrap()))),
+            text: Arc::from(format!(
+                "uid = \"uid://{n:012}\"\n# {}\n",
+                "x".repeat(usize::try_from(n * 97 % 3000).unwrap())
+            )),
         });
         let sha1 = if n % 11 == 0 { String::new() } else { crate::extract::sha1_hex(&n.to_le_bytes()) };
         Record { size: n * 7, modified: (1_700_000_000 + n, 5), recorded: (1_700_000_100, 9), sha1, declaration }
     }
 
-    fn files_of(root: &Path, count: u64) -> HashMap<PathBuf, Record> {
-        let mut files: HashMap<PathBuf, Record> = (0..count)
-            .map(|n| (root.join(format!(".layers/game/{}/n{n}.node", n % 17)).join(if n % 3 == 0 { "node.toml" } else { "a.bin" }), a_record(n, n % 3 == 0)))
+    fn files_of(root: &HostPath, count: u64) -> HashMap<HostPath, Record> {
+        let mut files: HashMap<HostPath, Record> = (0..count)
+            .map(|n| {
+                (
+                    root.at(&format!(".layers/game/{}/n{n}.node", n % 17)).at(if n % 3 == 0 {
+                        "node.toml"
+                    } else {
+                        "a.bin"
+                    }),
+                    a_record(n, n % 3 == 0),
+                )
+            })
             .collect();
         // One elsewhere, as a mount's; one whose name no key holds.
-        files.insert(PathBuf::from("/somewhere/else/file.c"), a_record(1, false));
-        files.insert(root.join(format!("deep/{}/node.toml", "long/".repeat(200))), a_record(3, true));
+        files.insert(crate::testing::scratch("model-elsewhere").at("file.c"), a_record(1, false));
+        files.insert(root.at(&format!("deep/{}node.toml", "long/".repeat(200))), a_record(3, true));
         files
     }
 
     /// What two layers hold, as a walk of them finds it: folders, plain files, bundles - one of a name no key holds.
-    fn held_by(root: &Path) -> Layers {
-        let game = root.join(".layers/game");
-        let bundle = |n: u64| -> BTreeMap<String, PathBuf> {
-            let folder = game.join(format!("rooms/r{n}.node"));
-            (0..=n % 3).map(|f| (format!("file{f}.bin"), folder.join(format!("file{f}.bin")))).collect()
+    fn held_by(root: &HostPath) -> Layers {
+        let game = root.at(".layers/game");
+        let bundle = |n: u64| -> BTreeMap<String, HostPath> {
+            let folder = game.at(&format!("rooms/r{n}.node"));
+            (0..=n % 3).map(|f| (format!("file{f}.bin"), folder.at(&format!("file{f}.bin")))).collect()
         };
-        let mut holds: BTreeMap<String, Held> = (0..200u64).map(|n| (format!("rooms/r{n}.node"), Held::Bundle(bundle(n)))).collect();
+        let mut holds: BTreeMap<String, Held> =
+            (0..200u64).map(|n| (format!("rooms/r{n}.node"), Held::Bundle(bundle(n)))).collect();
         holds.insert("rooms".into(), Held::Folder);
-        holds.insert("rooms/notes.txt".into(), Held::File(game.join("rooms/notes.txt")));
+        holds.insert("rooms/notes.txt".into(), Held::File(game.at("rooms/notes.txt")));
         holds.insert(format!("deep/{}", "long/".repeat(200)), Held::Folder);
-        let code: BTreeMap<String, Held> = [("src".to_string(), Held::Folder), ("src/a.c".to_string(), Held::File(PathBuf::from("/elsewhere/src/a.c")))].into();
-        [("game".to_string(), ("made by this".to_string(), holds)), ("code".to_string(), ("and that".to_string(), code))].into()
+        let code: BTreeMap<String, Held> = [
+            ("src".to_string(), Held::Folder),
+            ("src/a.c".to_string(), Held::File(crate::testing::scratch("model-code").at("src/a.c"))),
+        ]
+        .into();
+        [
+            ("game".to_string(), ("made by this".to_string(), holds)),
+            ("code".to_string(), ("and that".to_string(), code)),
+        ]
+        .into()
     }
 
     /// What `held_by` holds, said as a change of the model.
-    fn holds(root: &Path) -> Delta {
+    fn holds(root: &HostPath) -> Delta {
         let mut delta = Delta::default();
         for (layer, (made_by, holds)) in held_by(root) {
             delta.layer(&layer, Some(&made_by));
@@ -983,7 +1020,7 @@ mod tests {
 
     #[test]
     fn what_the_model_holds_of_layers_is_what_was_said_of_them() {
-        let root = Path::new("/a project");
+        let root = &crate::testing::scratch("model-root-1");
         let space = sfs::Space::private().unwrap();
         let mut txn = space.write().unwrap();
         fill_files(&mut txn, root, std::iter::empty()).unwrap();
@@ -993,7 +1030,7 @@ mod tests {
         assert_eq!(layers(&space.read().unwrap(), root).unwrap(), now);
         // A bundle's files change, a folder goes, a layer's listing is made by something else, and a layer is no more.
         let mut delta = Delta::default();
-        let changed = Held::Bundle([("only.bin".to_string(), root.join(".layers/game/rooms/r7.node/only.bin"))].into());
+        let changed = Held::Bundle([("only.bin".to_string(), root.at(".layers/game/rooms/r7.node/only.bin"))].into());
         delta.held(root, "game", "rooms/r7.node", Some(&changed));
         delta.held(root, "game", &format!("deep/{}", "long/".repeat(200)), None);
         delta.layer("game", Some("made by another"));
@@ -1028,17 +1065,33 @@ mod tests {
             let mut files = BTreeMap::new();
             if kind == Kind::Node {
                 let text = format!("type = \"data\"\n# {}\n", "y".repeat(usize::try_from(n * 131 % 4000).unwrap()));
-                files.insert("node.toml".to_string(), File { content: Some(Content::Text(text)), was: (op == Op::Override).then(|| "3f2a".repeat(10)) });
-                files.insert("native.bin".to_string(), File { content: Some(Content::Stored { sha1: "9c1e".repeat(10), size: n * 1000 }), was: None });
+                files.insert(
+                    "node.toml".to_string(),
+                    File { content: Some(Content::Text(text)), was: (op == Op::Override).then(|| "3f2a".repeat(10)) },
+                );
+                files.insert(
+                    "native.bin".to_string(),
+                    File { content: Some(Content::Stored { sha1: "9c1e".repeat(10), size: n * 1000 }), was: None },
+                );
                 files.insert("gone.bin".to_string(), File { content: None, was: Some("77aa".repeat(10)) });
             } else if op == Op::Create {
                 files.insert(String::new(), File { content: Some(Content::Text(String::new())), was: None });
             }
             let placed = matches!(op, Op::Create | Op::Move);
-            let record = Record { op, kind, parent: (placed && n % 2 == 0).then(|| format!("uid://parent{n}")), name: placed.then(|| format!("name {n}")), files };
+            let record = Record {
+                op,
+                kind,
+                parent: (placed && n % 2 == 0).then(|| format!("uid://parent{n}")),
+                name: placed.then(|| format!("name {n}")),
+                files,
+            };
             (format!("uid://{n:012}"), (Arc::new(record), (1_700_000_000 + n, 7), 100 + n))
         };
-        [("game".to_string(), (0..300).map(record).collect()), ("project".to_string(), (300..320).map(record).collect())].into()
+        [
+            ("game".to_string(), (0..300).map(record).collect()),
+            ("project".to_string(), (300..320).map(record).collect()),
+        ]
+        .into()
     }
 
     #[test]
@@ -1052,7 +1105,7 @@ mod tests {
             }
         }
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, Path::new("/a project"), std::iter::empty()).unwrap();
+        fill_files(&mut txn, &crate::testing::scratch("model-root-fill"), std::iter::empty()).unwrap();
         delta.apply(&mut txn).unwrap();
         txn.commit().unwrap();
         assert_eq!(records(&space.read().unwrap()).unwrap(), now);
@@ -1078,23 +1131,23 @@ mod tests {
 
     #[test]
     fn what_the_model_holds_of_files_is_what_it_was_given_and_what_changed_of_it() {
-        let root = Path::new("/a project");
+        let root = &crate::testing::scratch("model-root-2");
         let space = sfs::Space::private().unwrap();
         assert!(files(&space.read().unwrap(), root).unwrap().is_empty());
         let mut now = files_of(root, 400);
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        fill_files(&mut txn, root, now.iter()).unwrap();
         txn.commit().unwrap();
         assert_eq!(files(&space.read().unwrap(), root).unwrap(), now);
         // Filled again with the same, nothing is written: the space is at the commit it was at.
         let generation = space.read().unwrap().commit().generation;
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        fill_files(&mut txn, root, now.iter()).unwrap();
         txn.commit().unwrap();
         assert_eq!(space.read().unwrap().commit().generation, generation);
         // What a refresh changes: files read again, one new, some gone - and one of them by a name no key holds.
         let mut delta = Delta::default();
-        let long = root.join(format!("deep/{}/node.toml", "long/".repeat(200)));
+        let long = root.at(&format!("deep/{}node.toml", "long/".repeat(200)));
         for (n, path) in now.keys().cloned().collect::<Vec<_>>().into_iter().enumerate() {
             match n % 5 {
                 0 => {
@@ -1110,8 +1163,8 @@ mod tests {
             }
         }
         let added = a_record(77, true);
-        delta.file(root, &root.join("new/node.toml"), Some(&added));
-        now.insert(root.join("new/node.toml"), added);
+        delta.file(root, &root.at("new/node.toml"), Some(&added));
+        now.insert(root.at("new/node.toml"), added);
         delta.file(root, &long, None);
         now.remove(&long);
         // Gathered and not applied, nothing changed; applied and given up, nothing either.
@@ -1133,7 +1186,7 @@ mod tests {
         // Brought to another set of files by what differs: the same as filled with them from nothing.
         let other = files_of(root, 300);
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, root, other.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        fill_files(&mut txn, root, other.iter()).unwrap();
         txn.commit().unwrap();
         assert_eq!(files(&space.read().unwrap(), root).unwrap(), other);
     }
@@ -1145,10 +1198,10 @@ mod tests {
     #[ignore = "of a project given"]
     fn the_model_a_project_was_left_is_what_its_files_say() {
         let Ok(root) = std::env::var("PE2_MODEL_OF") else { return };
-        let project = crate::Project::load(Path::new(&root)).unwrap();
+        let project = crate::Project::load(std::path::Path::new(&root)).unwrap();
         let space = crate::shared::space(&project.root).unwrap();
         assert!(!space.fresh(), "its space was begun anew: nothing left it in order");
-        let unread = |mut records: HashMap<PathBuf, Record>| {
+        let unread = |mut records: HashMap<HostPath, Record>| {
             for record in records.values_mut() {
                 record.recorded = (0, 0);
             }
@@ -1156,16 +1209,30 @@ mod tests {
         };
         let held = unread(files(&space.read().unwrap(), &project.root).unwrap());
         let index = crate::index::Index::without_store(&project).unwrap();
-        let read = unread(index.file_records().map(|(path, record)| (path.to_path_buf(), record.clone())).collect());
-        let differing: Vec<_> = held.keys().chain(read.keys()).filter(|path| held.get(*path) != read.get(*path)).collect();
-        assert!(differing.is_empty(), "{} of {} files differ: {:#?}", differing.len(), read.len(), &differing[..differing.len().min(10)]);
+        let read = unread(index.file_records().map(|(path, record)| (path.clone(), record.clone())).collect());
+        let differing: Vec<_> =
+            held.keys().chain(read.keys()).filter(|path| held.get(*path) != read.get(*path)).collect();
+        assert!(
+            differing.is_empty(),
+            "{} of {} files differ: {:#?}",
+            differing.len(),
+            read.len(),
+            &differing[..differing.len().min(10)]
+        );
         // And of every layer what a walk of it finds.
         let (held_by, walked) = (layers(&space.read().unwrap(), &project.root).unwrap(), index.layers_known());
         for (layer, (made_by, holds)) in &walked {
-            let (was_made_by, held) = held_by.get(layer).unwrap_or_else(|| panic!("the model knows nothing of the layer {layer}"));
+            let (was_made_by, held) =
+                held_by.get(layer).unwrap_or_else(|| panic!("the model knows nothing of the layer {layer}"));
             assert_eq!(was_made_by, made_by, "{layer}: what its listing was made by");
-            let differing: Vec<_> = held.keys().chain(holds.keys()).filter(|path| held.get(*path) != holds.get(*path)).collect();
-            assert!(differing.is_empty(), "{layer}: {} paths differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+            let differing: Vec<_> =
+                held.keys().chain(holds.keys()).filter(|path| held.get(*path) != holds.get(*path)).collect();
+            assert!(
+                differing.is_empty(),
+                "{layer}: {} paths differ: {:#?}",
+                differing.len(),
+                &differing[..differing.len().min(10)]
+            );
         }
         assert_eq!(held_by.len(), walked.len());
         // And of every layer stored as records the records an index built afresh reads.
@@ -1173,13 +1240,29 @@ mod tests {
         for (layer, now) in &read_now {
             let was = recorded.get(layer).unwrap_or_else(|| panic!("the model has no record of the layer {layer}"));
             let differing: Vec<_> = was.keys().chain(now.keys()).filter(|uid| was.get(*uid) != now.get(*uid)).collect();
-            assert!(differing.is_empty(), "{layer}: {} records differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+            assert!(
+                differing.is_empty(),
+                "{layer}: {} records differ: {:#?}",
+                differing.len(),
+                &differing[..differing.len().min(10)]
+            );
         }
         assert_eq!(recorded.len(), read_now.len());
         // And the stack applied, as one applied afresh over them has it.
-        let (kept, applied) = (stack(&space.read().unwrap()).unwrap().expect("the model holds no stack"), index.stack_known());
-        let differing: Vec<_> = kept.nodes.keys().chain(applied.nodes.keys()).filter(|path| kept.nodes.get(*path) != applied.nodes.get(*path)).collect();
-        assert!(differing.is_empty(), "{} entries of the stack differ: {:#?}", differing.len(), &differing[..differing.len().min(10)]);
+        let (kept, applied) =
+            (stack(&space.read().unwrap()).unwrap().expect("the model holds no stack"), index.stack_known());
+        let differing: Vec<_> = kept
+            .nodes
+            .keys()
+            .chain(applied.nodes.keys())
+            .filter(|path| kept.nodes.get(*path) != applied.nodes.get(*path))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "{} entries of the stack differ: {:#?}",
+            differing.len(),
+            &differing[..differing.len().min(10)]
+        );
         assert!(kept == applied, "what the stack says besides its entries, or what it was made of, differs");
         let entries = applied.nodes.len();
         let of_records: usize = read_now.values().map(BTreeMap::len).sum();
@@ -1197,38 +1280,46 @@ mod tests {
     #[test]
     #[ignore = "a measurement"]
     fn bench_fill() {
-        let root = Path::new("/home/someone/a project");
+        let root = &crate::testing::scratch("model-bench");
         // As a project of 14,000 files: half of them declarations of a kibibyte and a half.
-        let now: HashMap<PathBuf, Record> = (0..14_000u64)
+        let now: HashMap<HostPath, Record> = (0..14_000u64)
             .map(|n| {
                 let mut record = a_record(n, n % 2 == 0);
                 if let Some(declaration) = &mut record.declaration {
                     declaration.text = Arc::from("x".repeat(1400));
                 }
                 let folder = format!(".layers/game/stages/stage{}/rooms/room{}/n{n}.node", n % 7, n % 31);
-                (root.join(folder).join(if n % 2 == 0 { "node.toml" } else { "native.bin" }), record)
+                (root.at(&folder).at(if n % 2 == 0 { "node.toml" } else { "native.bin" }), record)
             })
             .collect();
         let space = sfs::Space::private().unwrap();
         for what in ["into nothing", "again, the same", "again, the same"] {
             let started = std::time::Instant::now();
             let mut txn = space.write().unwrap();
-            fill_files(&mut txn, root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+            fill_files(&mut txn, root, now.iter()).unwrap();
             txn.commit().unwrap();
             eprintln!("14,000 files' records filled {what}: {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         }
         let started = std::time::Instant::now();
-        let wanted: usize = now.iter().map(|(path, now)| key(FILE, &name(root, path)).len() + record("x", now).len()).sum();
-        eprintln!("named and written as values alone: {:.1} ms ({wanted} bytes)", started.elapsed().as_secs_f64() * 1e3);
+        let wanted: usize =
+            now.iter().map(|(path, now)| key(FILE, &name(root, path)).len() + record("x", now).len()).sum();
+        eprintln!(
+            "named and written as values alone: {:.1} ms ({wanted} bytes)",
+            started.elapsed().as_secs_f64() * 1e3
+        );
         let started = std::time::Instant::now();
         let read = files(&space.read().unwrap(), root).unwrap();
-        eprintln!("all read back: {:.1} ms; {} pages", started.elapsed().as_secs_f64() * 1e3, space.usage().unwrap().pages);
+        eprintln!(
+            "all read back: {:.1} ms; {} pages",
+            started.elapsed().as_secs_f64() * 1e3,
+            space.usage().unwrap().pages
+        );
         assert_eq!(read.len(), now.len());
     }
 
     #[test]
     fn what_processes_that_died_left_of_the_files_is_known_to_who_comes_next() {
-        let root = std::env::temp_dir().join(format!("pe2-model-left-{}", std::process::id()));
+        let root = crate::testing::scratch("model-left");
         let _ = std::fs::remove_dir_all(&root);
         let at = crate::shared::space_at(&root);
         std::fs::create_dir_all(&at).unwrap();
@@ -1237,7 +1328,7 @@ mod tests {
             // As a holder that is killed: its model said, the space never left in order.
             let space = sfs::Space::open(&at).unwrap();
             let mut txn = space.write().unwrap();
-            fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+            fill_files(&mut txn, &root, now.iter()).unwrap();
             holds(&root).apply(&mut txn).unwrap();
             txn.commit().unwrap();
         }
@@ -1246,11 +1337,11 @@ mod tests {
         assert_eq!(left.files, now);
         assert_eq!(left.layers, held_by(&root));
         let space = crate::shared::space(&root).unwrap();
-        assert!(space.fresh() && at.join("left").is_dir());
+        assert!(space.fresh() && at.at("left").is_dir());
         assert!(files(&space.read().unwrap(), &root).unwrap().is_empty());
         // Said again in the space as it is now, it is known from there, and what was kept beside it goes.
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, &root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        fill_files(&mut txn, &root, now.iter()).unwrap();
         txn.commit().unwrap();
         sfs::Space::forget_left(&at);
         let said = known(&root);
@@ -1261,11 +1352,12 @@ mod tests {
 
     #[test]
     fn a_file_is_named_by_where_it_is_in_the_project_wherever_that_is() {
-        let (here, there) = (Path::new("/home/someone/project"), Path::new("/mnt/other/project"));
-        let file = here.join(".layers").join("game").join("a.node").join("node.toml");
-        assert_eq!(name(here, &file), "/.layers/game/a.node/node.toml");
-        assert_eq!(named(there, &name(here, &file)), Some(there.join(".layers/game/a.node/node.toml")));
-        assert_eq!(named(here, &name(here, Path::new("/elsewhere/x.c"))), Some(PathBuf::from("/elsewhere/x.c")));
+        let (here, there) = (crate::testing::scratch("model-here"), crate::testing::scratch("model-there"));
+        let file = here.at(".layers/game/a.node/node.toml");
+        assert_eq!(name(&here, &file), "/.layers/game/a.node/node.toml");
+        assert_eq!(named(&there, &name(&here, &file)), Some(there.at(".layers/game/a.node/node.toml")));
+        let elsewhere = crate::testing::scratch("model-elsewhere").at("x.c");
+        assert_eq!(named(&here, &name(&here, &elsewhere)), Some(elsewhere));
         // The keys of files are apart from those of their texts, and from the model's word of itself.
         assert_ne!(key(FILE, "/a"), key(TEXT, "/a"));
         assert!(key(FILE, &"x".repeat(5000)).len() < 100);
@@ -1273,7 +1365,7 @@ mod tests {
 
     #[test]
     fn a_model_of_another_format_is_filled_again() {
-        let root = Path::new("/a project");
+        let root = &crate::testing::scratch("model-root-3");
         let space = sfs::Space::private().unwrap();
         let mut txn = space.write().unwrap();
         // As a format before this one left it: its word of itself another, and keys this one knows nothing of.
@@ -1287,7 +1379,7 @@ mod tests {
         assert!(files(&space.read().unwrap(), root).unwrap().is_empty());
         let now = files_of(root, 20);
         let mut txn = space.write().unwrap();
-        fill_files(&mut txn, root, now.iter().map(|(path, record)| (path.as_path(), record))).unwrap();
+        fill_files(&mut txn, root, now.iter()).unwrap();
         txn.commit().unwrap();
         let read = space.read().unwrap();
         assert_eq!(files(&read, root).unwrap(), now);

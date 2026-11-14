@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn what_is_appended_is_read_as_it_was() {
-        let dir = std::env::temp_dir().join(format!("pe2-sfs-ops-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("sfs-ops");
         let _ = std::fs::remove_dir_all(&dir);
         let log = Log::open(&dir, Config { segment: 1 << 16, budget: 1 << 20 }).unwrap();
         let ops = [

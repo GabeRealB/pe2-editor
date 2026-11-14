@@ -29,14 +29,14 @@
 //! have them (`Set`), its entries placed through the layers below, read through `content` as a packed layer's are.
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{HostPath, Name, RelPath};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 
 /// The folder of a layer's records, in its folder: a name a scan of the layer leaves out.
-pub const DIR: &str = ".records";
+pub const DIR: Name = Name::constant(".records");
 /// The file marking a layer's folder as records: their format, and the layer's settings.
-pub const MARKER: &str = "layer.toml";
+pub const MARKER: Name = Name::constant("layer.toml");
 /// The format of the records this program reads and writes.
 pub const FORMAT: i64 = 1;
 
@@ -95,12 +95,17 @@ pub struct Record {
 /// kind = "extension"
 /// tree = "<the SHA-1 of its tree>"
 /// ```
-pub const EXTENSIONS: &str = "extensions";
+pub const EXTENSIONS: Name = Name::constant("extensions");
+
+/// An extension's id with what follows it in a file's name: an id a name cannot hold is held by none (`_`).
+fn id_name(id: &str, suffix: &str) -> Name {
+    Name::new(&format!("{id}{suffix}")).unwrap_or_else(|_| Name::constant("_"))
+}
 
 /// Where a layer's record of the extension of an id is.
 #[must_use]
-pub fn extension_path(layer: &Path, id: &str) -> PathBuf {
-    layer.join(DIR).join(EXTENSIONS).join(format!("{id}.toml"))
+pub fn extension_path(layer: &HostPath, id: &str) -> HostPath {
+    layer.join(&DIR).join(&EXTENSIONS).join(&id_name(id, ".toml"))
 }
 
 /// The text of a layer's record of an extension: holding the tree named, or (none) leaving below's off.
@@ -120,9 +125,9 @@ pub fn extension_record(tree: Option<&str>) -> String {
 ///
 /// # Errors
 /// A record cannot be read, or is of a format this program does not know.
-pub fn extensions_of(layer: &Path) -> Result<BTreeMap<String, Option<String>>> {
+pub fn extensions_of(layer: &HostPath) -> Result<BTreeMap<String, Option<String>>> {
     let mut out = BTreeMap::new();
-    for file in std::fs::read_dir(layer.join(DIR).join(EXTENSIONS)).into_iter().flatten().flatten() {
+    for file in std::fs::read_dir(layer.join(&DIR).join(&EXTENSIONS)).into_iter().flatten().flatten() {
         let path = file.path();
         let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".toml")) else {
             continue;
@@ -154,7 +159,7 @@ pub fn extensions_of(layer: &Path) -> Result<BTreeMap<String, Option<String>>> {
 /// its path within it, never by its own hash.
 #[derive(Clone, Debug)]
 pub struct HeldExtension {
-    pub layer: PathBuf,
+    pub layer: HostPath,
     pub id: String,
     /// Its tree's hash.
     pub tree: String,
@@ -166,25 +171,26 @@ pub struct HeldExtension {
 
 /// Where the files of the extension of an id a layer holds are read: its folder, as a path on no disk.
 #[must_use]
-pub fn held_folder(layer: &Path, id: &str) -> PathBuf {
-    layer.join(crate::ext::folder::HELD).join(format!("{id}{}", crate::ext::folder::SUFFIX))
+pub fn held_folder(layer: &HostPath, id: &str) -> HostPath {
+    layer.join(&crate::ext::folder::HELD).join(&id_name(id, crate::ext::folder::SUFFIX))
 }
 
 /// The trees of the extensions read, by their records' files and their stamps: a tree is read once.
-type HeldRead = std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, Option<std::sync::Arc<HeldExtension>>)>;
+type HeldRead =
+    std::collections::HashMap<HostPath, (std::time::SystemTime, u64, Option<std::sync::Arc<HeldExtension>>)>;
 static HELD_TREES: std::sync::RwLock<Option<HeldRead>> = std::sync::RwLock::new(None);
 
 /// The extension a layer holds at a folder (`held_folder`): none where the folder is no held extension's, or the layer
 /// leaves it off.
 #[must_use]
-pub fn held(folder: &Path) -> Option<std::sync::Arc<HeldExtension>> {
+pub fn held(folder: &HostPath) -> Option<std::sync::Arc<HeldExtension>> {
     let id = crate::ext::folder::id_of(folder)?;
     let parent = folder.parent()?;
     if parent.file_name()? != crate::ext::folder::HELD {
         return None;
     }
     let layer = parent.parent()?;
-    let record = extension_path(layer, id);
+    let record = extension_path(&layer, id);
     let meta = std::fs::metadata(&record).ok()?;
     let stamp = (meta.modified().ok()?, meta.len());
     if let Some(found) =
@@ -194,11 +200,11 @@ pub fn held(folder: &Path) -> Option<std::sync::Arc<HeldExtension>> {
         return found.2.clone();
     }
     let read = || -> Option<std::sync::Arc<HeldExtension>> {
-        let tree = extensions_of(layer).ok()?.remove(id)??;
-        let store = crate::chunks::Store::of(layer)?;
+        let tree = extensions_of(&layer).ok()?.remove(id)??;
+        let store = crate::chunks::Store::of(&layer)?;
         let files = std::sync::Arc::new(store.get_tree(&tree).ok()?);
         Some(std::sync::Arc::new(HeldExtension {
-            layer: layer.to_path_buf(),
+            layer: layer.clone(),
             id: id.to_string(),
             tree,
             files,
@@ -214,14 +220,15 @@ pub fn held(folder: &Path) -> Option<std::sync::Arc<HeldExtension>> {
 
 /// The held extension a path is in (`held`), and the path within its folder ("" for the folder).
 #[must_use]
-pub fn held_at(path: &Path) -> Option<(std::sync::Arc<HeldExtension>, String)> {
+pub fn held_at(path: &HostPath) -> Option<(std::sync::Arc<HeldExtension>, String)> {
     // Its folder is the nearest ancestor named `<id>.extension` in a layer's `extensions/`.
     let folder = path.ancestors().find(|a| {
         crate::ext::folder::id_of(a).is_some()
-            && a.parent().and_then(Path::file_name) == Some(crate::ext::folder::HELD.as_ref())
+            && a.parent().is_some_and(|layer| layer.file_name().is_some_and(|name| name == crate::ext::folder::HELD))
     })?;
-    let held = held(folder)?;
-    let within = path.strip_prefix(folder).ok()?.to_string_lossy().replace('\\', "/");
+    let held = held(&folder)?;
+    // Its files are its tree's, held by names: a place within by one no path takes is none of them.
+    let within = path.within(&folder).ok()?.as_str().to_owned();
     Some((held, within))
 }
 
@@ -265,19 +272,19 @@ impl HeldExtension {
 ///
 /// # Errors
 /// A folder cannot be read or kept, or its record written.
-pub fn hold_extensions(project: &crate::Project, layer: &Path) -> Result<usize> {
-    let held = layer.join(crate::ext::folder::HELD);
+pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usize> {
+    let held = layer.join(&crate::ext::folder::HELD);
     let store = crate::chunks::Store::at(&project.root);
     let mut count = 0;
     for entry in std::fs::read_dir(&held).into_iter().flatten().flatten() {
-        let folder = entry.path();
+        let folder = held.entry(&entry.file_name());
         let Some(id) = crate::ext::folder::id_of(&folder).map(str::to_string) else { continue };
         if !folder.is_dir() {
             continue;
         }
         let (tree, _) = store.put_folder(&folder)?;
         let at = extension_path(layer, &id);
-        std::fs::create_dir_all(at.parent().unwrap_or(layer))?;
+        std::fs::create_dir_all(at.parent().unwrap_or_else(|| layer.clone()))?;
         crate::cache::write_atomic(&at, extension_record(Some(&tree)).as_bytes())?;
         std::fs::remove_dir_all(&folder)?;
         count += 1;
@@ -290,14 +297,15 @@ pub fn hold_extensions(project: &crate::Project, layer: &Path) -> Result<usize> 
 
 /// Where a layer's record of an entry is, in its folder.
 #[must_use]
-pub fn path_of(layer: &Path, uid: &str) -> PathBuf {
+pub fn path_of(layer: &HostPath, uid: &str) -> HostPath {
     let key = uid.strip_prefix("uid://").unwrap_or(uid);
-    layer.join(DIR).join(&key[..2.min(key.len())]).join(format!("{key}.toml"))
+    let place = RelPath::sharded(key, ".toml").unwrap_or_else(|_| RelPath::constant("_/_.toml"));
+    layer.join(&DIR).join(&place)
 }
 
 /// The uid a record's file is of: none for a file that is no record.
 #[must_use]
-pub fn uid_of(path: &Path) -> Option<String> {
+pub fn uid_of(path: &HostPath) -> Option<String> {
     let key = path.file_name()?.to_str()?.strip_suffix(".toml")?;
     let shard = path.parent()?;
     // Entries' records are sharded by two characters; the extensions' are elsewhere.
@@ -308,8 +316,8 @@ pub fn uid_of(path: &Path) -> Option<String> {
 
 /// Whether a layer's folder is stored as records.
 #[must_use]
-pub fn is_records(layer: &Path) -> bool {
-    layer.join(DIR).join(MARKER).is_file()
+pub fn is_records(layer: &HostPath) -> bool {
+    layer.join(&DIR).join(&MARKER).is_file()
 }
 
 /// What a records layer says of itself, as a changeset says it of a layer stored as a tree.
@@ -323,7 +331,7 @@ pub struct Settings {
 ///
 /// # Errors
 /// The marker cannot be written.
-pub fn mark(layer: &Path, settings: &Settings) -> Result<()> {
+pub fn mark(layer: &HostPath, settings: &Settings) -> Result<()> {
     let mut doc = toml_edit::DocumentMut::new();
     doc["format"] = toml_edit::value(FORMAT);
     if settings.read_only {
@@ -332,8 +340,8 @@ pub fn mark(layer: &Path, settings: &Settings) -> Result<()> {
     if !settings.ignore.is_empty() {
         doc["ignore"] = toml_edit::value(settings.ignore.iter().map(String::as_str).collect::<toml_edit::Array>());
     }
-    std::fs::create_dir_all(layer.join(DIR))?;
-    let at = layer.join(DIR).join(MARKER);
+    std::fs::create_dir_all(layer.join(&DIR))?;
+    let at = layer.join(&DIR).join(&MARKER);
     crate::cache::write_atomic(&at, doc.to_string().as_bytes())
 }
 
@@ -341,8 +349,8 @@ pub fn mark(layer: &Path, settings: &Settings) -> Result<()> {
 ///
 /// # Errors
 /// Another format, or no marker one can read.
-pub fn settings(layer: &Path) -> Result<Settings> {
-    let at = layer.join(DIR).join(MARKER);
+pub fn settings(layer: &HostPath) -> Result<Settings> {
+    let at = layer.join(&DIR).join(&MARKER);
     let text = std::fs::read_to_string(&at).with_context(|| at.display().to_string())?;
     let table: toml::Table = toml::from_str(&text).with_context(|| at.display().to_string())?;
     match table.get("format").and_then(toml::Value::as_integer) {
@@ -510,9 +518,8 @@ impl Record {
 
 /// A records layer as what reads it sees it: its records by uid, each with its file's time, and the tree of files they
 /// make at the paths a layer's tree would have them.
-#[derive(Default)]
 struct View {
-    dir: PathBuf,
+    dir: HostPath,
     settings: Settings,
     records: Read,
     /// Each file by its path in the layer: its entry's uid and its name in the entry ("" for a plain file).
@@ -527,6 +534,23 @@ struct View {
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
     /// What is wrong with its records: those with no place.
     problems: Vec<String>,
+}
+
+impl View {
+    /// What a records layer in `dir` is seen as before its records are read.
+    fn new(dir: HostPath) -> View {
+        View {
+            dir,
+            settings: Settings::default(),
+            records: Read::default(),
+            files: BTreeMap::new(),
+            folders: std::collections::BTreeSet::new(),
+            placed: std::collections::HashMap::new(),
+            named: std::sync::Arc::default(),
+            children: std::collections::HashMap::new(),
+            problems: Vec::new(),
+        }
+    }
 }
 
 impl View {
@@ -551,7 +575,7 @@ impl View {
 
 /// What is known of a project's records layers, for a set to open over (`Set::open_over`): each layer's records by
 /// uid, each with its file's time and length, by the layer's folder.
-pub type Known = std::collections::HashMap<PathBuf, BTreeMap<String, Recorded>>;
+pub type Known = std::collections::HashMap<HostPath, BTreeMap<String, Recorded>>;
 /// A record as it was read, with its file's time and length.
 pub type Recorded = (std::sync::Arc<Record>, std::time::SystemTime, u64);
 
@@ -560,16 +584,16 @@ pub type Recorded = (std::sync::Arc<Record>, std::time::SystemTime, u64);
 pub struct Differences {
     /// The records that came, went, changed, or whose file is of another time or length, by layer (its folder)
     /// and uid: what the project's model is told of.
-    pub records: Vec<(PathBuf, String)>,
+    pub records: Vec<(HostPath, String)>,
     /// For each layer (by folder), where the entries whose records came, went or changed were, and are.
-    pub paths: Vec<(PathBuf, BTreeSet<String>)>,
+    pub paths: Vec<(HostPath, BTreeSet<String>)>,
     /// Any of them is placed otherwise.
     pub placed: bool,
     /// Any of them is (or was) an override: what it merges is merged again.
     pub overrides: bool,
     /// The layers (by folder) whose records are as they were, taken as read before: nothing of them is to be
     /// derived again.
-    pub same: BTreeSet<PathBuf>,
+    pub same: BTreeSet<HostPath>,
 }
 
 /// A record read, with the stamp of its file: what a reading again finds unchanged it takes as it was.
@@ -586,7 +610,7 @@ type Read = BTreeMap<String, Held>;
 /// A project's records layers, as seen through its stack: what `content` and a scan read them by. One a project, made
 /// again as its records or its changesets change (`Set::open`).
 pub struct Set {
-    root: PathBuf,
+    root: HostPath,
     store: crate::chunks::Store,
     views: Vec<std::sync::Arc<View>>,
     /// Records whose place cannot be found, by what: their parent is nowhere below.
@@ -619,9 +643,9 @@ impl Below {
 
 /// Where a tree layer's changeset places the entries it names, kept by its file's stamp: read again only when the
 /// file changed.
-fn tree_places(changeset: &Path) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+fn tree_places(changeset: &HostPath) -> std::sync::Arc<std::collections::HashMap<String, String>> {
     type Kept = (Option<(std::time::SystemTime, u64)>, std::sync::Arc<std::collections::HashMap<String, String>>);
-    static KEPT: std::sync::Mutex<Vec<(PathBuf, Kept)>> = std::sync::Mutex::new(Vec::new());
+    static KEPT: std::sync::Mutex<Vec<(HostPath, Kept)>> = std::sync::Mutex::new(Vec::new());
     let stamp = std::fs::metadata(changeset).ok().and_then(|meta| Some((meta.modified().ok()?, meta.len())));
     let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((_, (was, places))) = kept.iter().find(|(path, _)| path == changeset)
@@ -636,9 +660,10 @@ fn tree_places(changeset: &Path) -> std::sync::Arc<std::collections::HashMap<Str
             places.insert(uid, to);
         }
     }
-    let places: std::sync::Arc<std::collections::HashMap<String, String>> = std::sync::Arc::new(places.into_iter().collect());
+    let places: std::sync::Arc<std::collections::HashMap<String, String>> =
+        std::sync::Arc::new(places.into_iter().collect());
     kept.retain(|(path, _)| path != changeset);
-    kept.push((changeset.to_path_buf(), (stamp, places.clone())));
+    kept.push((changeset.clone(), (stamp, places.clone())));
     places
 }
 
@@ -671,16 +696,16 @@ fn place(
 /// A records layer's records after these files changed, from what was read of it before: each record among them
 /// read again, or gone with its file - the others neither listed nor looked at. None where that cannot be told from
 /// the paths: a folder of records is among them, or anything of the layer's that is no record.
-fn read_changed(dir: &Path, before: &Read, changed: &[PathBuf]) -> Option<Result<Read>> {
-    let within = dir.join(DIR);
-    let ours: Vec<&PathBuf> = changed.iter().filter(|path| path.starts_with(&within)).collect();
-    let records: Option<Vec<(String, &PathBuf)>> = ours
+fn read_changed(dir: &HostPath, before: &Read, changed: &[HostPath]) -> Option<Result<Read>> {
+    let within = dir.join(&DIR);
+    let ours: Vec<&HostPath> = changed.iter().filter(|path| path.starts_with(&within)).collect();
+    let records: Option<Vec<(String, &HostPath)>> = ours
         .iter()
         .map(|path| {
             // A record is `<shard>/<uid>.toml`, its shard a folder of the records' own named by two letters -
             // what is beside the shards (the extensions the layer holds, its settings) is no record of an entry.
             let shard = path.parent().filter(|shard| shard.file_name().is_some_and(|name| name.len() == 2));
-            let in_shard = shard.and_then(Path::parent) == Some(within.as_path());
+            let in_shard = shard.and_then(|shard| shard.parent()).is_some_and(|records| records == within);
             Some((uid_of(path).filter(|_| in_shard)?, *path))
         })
         .collect();
@@ -739,21 +764,22 @@ fn waits(read: &mut Read, uid: String, text: &str, at: std::time::SystemTime) ->
 
 /// A records layer's records, read on every core: those whose file is as it was when `before` read it taken from it.
 /// What waits to be written of them is as that leaves it.
-fn read_records(dir: &Path, before: Option<&Read>) -> Result<Read> {
+fn read_records(dir: &HostPath, before: Option<&Read>) -> Result<Read> {
     // What waits is asked first: a record not waiting by now is in its file already, as it was last said - where
     // one read from its file first, and found waiting no more after, would be missed in both.
-    let waiting = crate::storage::waiting_under(&dir.join(DIR));
-    let shards: Vec<PathBuf> = std::fs::read_dir(dir.join(DIR))
+    let waiting = crate::storage::waiting_under(&dir.join(&DIR));
+    let records_dir = dir.join(&DIR);
+    let shards: Vec<HostPath> = std::fs::read_dir(&records_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|shard| shard.file_type().is_ok_and(|t| t.is_dir()) && shard.file_name().len() == 2)
-        .map(|shard| shard.path())
+        .map(|shard| records_dir.entry(&shard.file_name()))
         .collect();
-    let read_shard = |shard: &PathBuf| -> Result<Vec<(String, Held)>> {
+    let read_shard = |shard: &HostPath| -> Result<Vec<(String, Held)>> {
         let mut out = Vec::new();
         for file in std::fs::read_dir(shard)?.flatten() {
-            let path = file.path();
+            let path = shard.entry(&file.file_name());
             let Some(uid) = uid_of(&path) else { continue };
             let meta = file.metadata()?;
             let (modified, len) = (meta.modified()?, meta.len());
@@ -823,11 +849,15 @@ impl Set {
     ///
     /// # Errors
     /// As `open`.
-    pub fn open_after(project: &crate::Project, changed: &[PathBuf]) -> Result<std::sync::Arc<Set>> {
+    pub fn open_after(project: &crate::Project, changed: &[HostPath]) -> Result<std::sync::Arc<Set>> {
         Set::opened(project, Some(changed), None)
     }
 
-    fn opened(project: &crate::Project, changed: Option<&[PathBuf]>, known: Option<(Known, bool)>) -> Result<std::sync::Arc<Set>> {
+    fn opened(
+        project: &crate::Project,
+        changed: Option<&[HostPath]>,
+        known: Option<(Known, bool)>,
+    ) -> Result<std::sync::Arc<Set>> {
         let (mut known, taken) = known.unwrap_or_default();
         let _span = tracing::info_span!("records open").entered();
         // What was read of it before: a record whose file is as it was is not read again.
@@ -837,7 +867,7 @@ impl Set {
         // Whether anything below the layer at hand may place its entries otherwise than before: all of it read anew,
         // or a layer below changed.
         let mut below_changed = changed.is_none();
-        let touched = |within: &Path| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
+        let touched = |within: &HostPath| changed.is_none_or(|paths| paths.iter().any(|path| path.starts_with(within)));
         for layer in &project.layers {
             if !is_records(&layer.path) {
                 below_changed |= changed.is_some_and(|paths| paths.contains(&layer.changeset));
@@ -845,7 +875,7 @@ impl Set {
                 continue;
             }
             let before = previous.as_ref().and_then(|p| p.views.iter().find(|v| v.dir == layer.path));
-            if let Some(before) = before.filter(|_| !below_changed && !touched(&layer.path.join(DIR))) {
+            if let Some(before) = before.filter(|_| !below_changed && !touched(&layer.path.join(&DIR))) {
                 // As it was read: what it places is there for the layers above, as it was.
                 places.layers.push(before.named.clone());
                 views.push(before.clone());
@@ -857,7 +887,8 @@ impl Set {
             let after = before.zip(changed).and_then(|(view, paths)| read_changed(&layer.path, &view.records, paths));
             // What is known of the layer, as records read: what was read here before, where nothing else is.
             let known: Option<Read> = known.remove(&layer.path).map(|known| {
-                let held = known.into_iter().map(|(uid, (record, modified, len))| (uid, Held { record, modified, len }));
+                let held =
+                    known.into_iter().map(|(uid, (record, modified, len))| (uid, Held { record, modified, len }));
                 held.collect()
             });
             let records = match (after, known) {
@@ -867,7 +898,7 @@ impl Set {
                 (None, Some(known)) => read_records(&layer.path, Some(&known))?,
                 (None, None) => read_records(&layer.path, before.map(|v| &v.records))?,
             };
-            let mut view = View { dir: layer.path.clone(), settings, ..View::default() };
+            let mut view = View { settings, ..View::new(layer.path.clone()) };
             let mut named = std::collections::HashMap::new();
             // Each record's place (`place`).
             let mut located: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -885,9 +916,9 @@ impl Set {
                 if record.op == Op::Delete || record.op == Op::Move {
                     continue;
                 }
-                let mut folder = Path::new(at).parent();
-                while let Some(f) = folder.filter(|f| !f.as_os_str().is_empty()) {
-                    view.folders.insert(f.to_string_lossy().replace('\\', "/"));
+                let mut folder = RelPath::new(at).ok().and_then(|at| at.parent());
+                while let Some(f) = folder.filter(|f| !f.is_root()) {
+                    view.folders.insert(f.as_str().to_owned());
                     folder = f.parent();
                 }
                 match record.kind {
@@ -904,9 +935,9 @@ impl Set {
                         for (name, file) in &record.files {
                             if file.content.is_some() {
                                 view.files.insert(format!("{at}/{name}"), (uid.clone(), name.clone()));
-                                let mut folder = Path::new(name).parent();
-                                while let Some(f) = folder.filter(|f| !f.as_os_str().is_empty()) {
-                                    view.folders.insert(format!("{at}/{}", f.to_string_lossy().replace('\\', "/")));
+                                let mut folder = RelPath::new(name).ok().and_then(|name| name.parent());
+                                while let Some(f) = folder.filter(|f| !f.is_root()) {
+                                    view.folders.insert(format!("{at}/{f}"));
                                     folder = f.parent();
                                 }
                             }
@@ -938,9 +969,9 @@ impl Set {
 
     /// What is read of a project's records layers now, where anything is.
     #[must_use]
-    pub fn current(root: &Path) -> Option<std::sync::Arc<Set>> {
+    pub fn current(root: &HostPath) -> Option<std::sync::Arc<Set>> {
         let sets = SETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        sets.iter().find(|s| s.root == root).cloned()
+        sets.iter().find(|s| s.root == *root).cloned()
     }
 
     /// What differs between two readings of a project's records layers: for each layer (by folder), the paths of the
@@ -1008,33 +1039,46 @@ impl Set {
 
     /// A layer's record as it was read, by the layer's folder and its uid.
     #[must_use]
-    pub fn recorded(&self, layer: &Path, uid: &str) -> Option<Recorded> {
-        let view = self.views.iter().find(|view| view.dir == layer)?;
+    pub fn recorded(&self, layer: &HostPath, uid: &str) -> Option<Recorded> {
+        let view = self.views.iter().find(|view| view.dir == *layer)?;
         view.records.get(uid).map(|held| (held.record.clone(), held.modified, held.len))
     }
 
     /// Every record of a layer as it was read, by the layer's folder; none where it is no records layer.
     #[must_use]
-    pub fn records_read(&self, layer: &Path) -> Option<BTreeMap<String, Recorded>> {
-        let view = self.views.iter().find(|view| view.dir == layer)?;
-        Some(view.records.iter().map(|(uid, held)| (uid.clone(), (held.record.clone(), held.modified, held.len))).collect())
+    pub fn records_read(&self, layer: &HostPath) -> Option<BTreeMap<String, Recorded>> {
+        let view = self.views.iter().find(|view| view.dir == *layer)?;
+        Some(
+            view.records
+                .iter()
+                .map(|(uid, held)| (uid.clone(), (held.record.clone(), held.modified, held.len)))
+                .collect(),
+        )
     }
 
     /// The records' files that are not as they were read - of another time or length, gone, or there with nothing
     /// read of them: what a set opened over what was known, with no file looked at (`open_over`), is held to, on
     /// a thread of its own. Taken in as a change of those files, each is read again.
     #[must_use]
-    pub fn differing(&self) -> Vec<PathBuf> {
+    pub fn differing(&self) -> Vec<HostPath> {
         let mut differing = Vec::new();
         for view in &self.views {
             let mut found = BTreeSet::new();
-            let shards = std::fs::read_dir(view.dir.join(DIR)).into_iter().flatten().flatten();
-            for shard in shards.filter(|shard| shard.file_type().is_ok_and(|t| t.is_dir()) && shard.file_name().len() == 2) {
-                for file in std::fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-                    let path = file.path();
+            let records_dir = view.dir.join(&DIR);
+            let shards = std::fs::read_dir(&records_dir).into_iter().flatten().flatten();
+            for shard in
+                shards.filter(|shard| shard.file_type().is_ok_and(|t| t.is_dir()) && shard.file_name().len() == 2)
+            {
+                let shard = records_dir.entry(&shard.file_name());
+                for file in std::fs::read_dir(&shard).into_iter().flatten().flatten() {
+                    let path = shard.entry(&file.file_name());
                     let Some(uid) = uid_of(&path) else { continue };
                     let stamp = file.metadata().ok().and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-                    let same = view.records.get(&uid).zip(stamp).is_some_and(|(held, (modified, len))| held.modified == modified && held.len == len);
+                    let same = view
+                        .records
+                        .get(&uid)
+                        .zip(stamp)
+                        .is_some_and(|(held, (modified, len))| held.modified == modified && held.len == len);
                     if !same {
                         differing.push(path);
                     }
@@ -1048,7 +1092,7 @@ impl Set {
     }
 
     /// The records layer a path is in, and the path within it.
-    fn view_of(path: &Path) -> Option<(std::sync::Arc<Set>, usize, String)> {
+    fn view_of(path: &HostPath) -> Option<(std::sync::Arc<Set>, usize, String)> {
         let sets = SETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         for set in sets.iter() {
             for (i, view) in set.views.iter().enumerate() {
@@ -1062,7 +1106,7 @@ impl Set {
 
     /// A file of a records layer by its path: its content, and when its record was written.
     #[must_use]
-    pub fn file(path: &Path) -> Option<(Content, std::time::SystemTime, crate::chunks::Store)> {
+    pub fn file(path: &HostPath) -> Option<(Content, std::time::SystemTime, crate::chunks::Store)> {
         let (set, i, rel) = Set::view_of(path)?;
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
@@ -1073,7 +1117,7 @@ impl Set {
     /// Where the content of a file of a records layer lives, for what serves it to read it without the records: the
     /// record holding its text, or the store keeping it.
     #[must_use]
-    pub fn source(path: &Path) -> Option<crate::server::Source> {
+    pub fn source(path: &HostPath) -> Option<crate::server::Source> {
         use crate::server::Source;
         let (set, i, rel) = Set::view_of(path)?;
         let view = &set.views[i];
@@ -1087,7 +1131,7 @@ impl Set {
 
     /// A file of a records layer's length and when its record was written, without its content.
     #[must_use]
-    pub fn stat(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    pub fn stat(path: &HostPath) -> Option<(u64, std::time::SystemTime)> {
         let (set, i, rel) = Set::view_of(path)?;
         let view = &set.views[i];
         let (uid, name) = view.files.get(&rel)?;
@@ -1097,7 +1141,7 @@ impl Set {
 
     /// What a folder of a records layer holds: each name, and whether it is a folder. None for a path in no records layer.
     #[must_use]
-    pub fn list(dir: &Path) -> Option<Vec<(String, bool)>> {
+    pub fn list(dir: &HostPath) -> Option<Vec<(String, bool)>> {
         let (set, i, rel) = Set::view_of(dir)?;
         let view = &set.views[i];
         let out = view.children.get(&rel).cloned().unwrap_or_default();
@@ -1106,21 +1150,21 @@ impl Set {
 
     /// A records layer's records, by uid: none where the folder is no records layer read.
     #[must_use]
-    pub fn records_of(dir: &Path) -> Option<BTreeMap<String, Record>> {
-        let (set, i, _) = Set::view_of(&dir.join(DIR))?;
+    pub fn records_of(dir: &HostPath) -> Option<BTreeMap<String, Record>> {
+        let (set, i, _) = Set::view_of(&dir.join(&DIR))?;
         Some(set.views[i].records.iter().map(|(uid, held)| (uid.clone(), (*held.record).clone())).collect())
     }
 
     /// Whether a path is a folder of a records layer: none where it is in none.
     #[must_use]
-    pub fn is_folder(path: &Path) -> Option<bool> {
+    pub fn is_folder(path: &HostPath) -> Option<bool> {
         let (set, i, rel) = Set::view_of(path)?;
         Some(rel.is_empty() || set.views[i].folders.contains(&rel))
     }
 
     /// Whether a path is a file of a records layer: none where it is in none.
     #[must_use]
-    pub fn is_file(path: &Path) -> Option<bool> {
+    pub fn is_file(path: &HostPath) -> Option<bool> {
         let (set, i, rel) = Set::view_of(path)?;
         Some(set.views[i].files.contains_key(&rel))
     }
@@ -1128,8 +1172,8 @@ impl Set {
     /// What a records layer's records say as a changeset says it of a layer stored as a tree: what it creates, by uid
     /// and path; what it does to entries from below; whether it is read only, what it ignores.
     #[must_use]
-    pub fn changeset(dir: &Path) -> Option<crate::changeset::Changeset> {
-        let (set, i, _) = Set::view_of(&dir.join(DIR))?;
+    pub fn changeset(dir: &HostPath) -> Option<crate::changeset::Changeset> {
+        let (set, i, _) = Set::view_of(&dir.join(&DIR))?;
         let view = &set.views[i];
         let mut changeset = crate::changeset::Changeset {
             read_only: view.settings.read_only,
@@ -1180,7 +1224,7 @@ pub fn of_tree(
     layer: &crate::Layer,
 ) -> Result<(Settings, BTreeMap<String, Record>)> {
     let changeset = index.changeset(&layer.name).with_context(|| format!("the index has no layer {}", layer.name))?;
-    let records = records_of_tree(project, index, &layer.name, &|path| layer.disk(path), changeset)?;
+    let records = records_of_tree(project, index, &layer.name, &|path| Ok(layer.disk(path)?), changeset)?;
     Ok((Settings { read_only: changeset.read_only, ignore: changeset.ignore.clone() }, records))
 }
 
@@ -1190,7 +1234,7 @@ fn records_of_tree(
     project: &crate::Project,
     index: &crate::index::Index,
     layer: &str,
-    disk: &dyn Fn(&str) -> PathBuf,
+    disk: &dyn Fn(&str) -> Result<HostPath>,
     changeset: &crate::changeset::Changeset,
 ) -> Result<BTreeMap<String, Record>> {
     use crate::changeset::Op as Did;
@@ -1220,33 +1264,38 @@ fn records_of_tree(
         };
         Ok((parent, name.strip_suffix(crate::index::BUNDLE_SUFFIX).unwrap_or(name).to_string()))
     };
-    let kind_at = |path: &str| {
-        if path.ends_with(crate::index::BUNDLE_SUFFIX) {
+    let kind_at = |path: &str| -> Result<Kind> {
+        Ok(if path.ends_with(crate::index::BUNDLE_SUFFIX) {
             Kind::Node
-        } else if crate::pack::is_dir(&disk(path)) {
+        } else if crate::pack::is_dir(&disk(path)?) {
             Kind::Folder
         } else {
             Kind::File
-        }
+        })
     };
-    let content = |disk: &Path| -> Result<Content> {
+    let content = |disk: &HostPath| -> Result<Content> {
         let bytes = crate::content::read(disk).with_context(|| disk.display().to_string())?;
         Content::of(&bytes, &store)
     };
     // A bundle's files, by name, as its folder holds them.
     let bundle = |path: &str| -> Result<BTreeMap<String, File>> {
         let mut files = BTreeMap::new();
-        for (name, file) in crate::index::bundle_files(&disk(path)) {
+        let (held, refused) = crate::index::bundle_files(&disk(path)?);
+        // Every file of it is the record's, or none is: one named so no path takes it is renamed first.
+        if let Some(why) = refused.first() {
+            bail!("{path}: {why}");
+        }
+        for (name, file) in held {
             files.insert(name, File { content: Some(content(&file)?), was: None });
         }
         Ok(files)
     };
     let mut records = BTreeMap::new();
     for (uid, path) in &changeset.entries {
-        let kind = kind_at(path);
+        let kind = kind_at(path)?;
         let files = match kind {
             Kind::Node => bundle(path)?,
-            Kind::File => BTreeMap::from([(String::new(), File { content: Some(content(&disk(path))?), was: None })]),
+            Kind::File => BTreeMap::from([(String::new(), File { content: Some(content(&disk(path)?)?), was: None })]),
             Kind::Folder => BTreeMap::new(),
         };
         let (parent, name) = place(path)?;
@@ -1276,7 +1325,7 @@ fn records_of_tree(
                 };
                 let mut files = BTreeMap::new();
                 for (file, base) in bases {
-                    let held_at = if file.is_empty() { disk(&at) } else { disk(&at).join(file) };
+                    let held_at = if file.is_empty() { disk(&at)? } else { disk(&at)?.join(&RelPath::new(file)?) };
                     let held = if base.removed { None } else { Some(content(&held_at)?) };
                     files.insert(file.clone(), File { content: held, was: base.was.clone() });
                 }
@@ -1294,38 +1343,39 @@ fn records_of_tree(
 ///
 /// # Errors
 /// The tree or its changeset cannot be read, or the records cannot be written.
-pub fn import(project: &crate::Project, cache: &crate::cache::Cache, name: &str, from: &Path) -> Result<usize> {
+pub fn import(project: &crate::Project, cache: &crate::cache::Cache, name: &str, from: &HostPath) -> Result<usize> {
     let layer = project.layer(name)?;
     if layer.mounted || layer.kind == crate::LayerKind::Generated {
         bail!("{name}: a mounted or generated layer is no records layer");
     }
-    let changeset = crate::changeset::Changeset::load(&from.with_extension("toml"))?;
+    let changeset = crate::changeset::Changeset::load(&from.with_suffix(&crate::CHANGESET_SUFFIX))?;
     let records = {
         let index = crate::index::Index::open(project, cache)?;
-        records_of_tree(project, &index, name, &|path| from.join(path), &changeset)?
+        let disk = |path: &str| Ok(from.join(&RelPath::new(path)?));
+        records_of_tree(project, &index, name, &disk, &changeset)?
     };
     let settings = Settings { read_only: changeset.read_only, ignore: changeset.ignore.clone() };
     // Written beside, as a layer of its own, then in the place of what was there.
-    let fresh = layer.path.join(".import");
+    let fresh = layer.path.join(&Name::constant(".import"));
     let _ = std::fs::remove_dir_all(&fresh);
     write_all(&fresh, &settings, &records)?;
     // The extensions it holds are no entries of the tree: kept as they are.
-    let held = layer.path.join(DIR).join(EXTENSIONS);
+    let held = layer.path.join(&DIR).join(&EXTENSIONS);
     if held.is_dir() {
-        std::fs::rename(&held, fresh.join(DIR).join(EXTENSIONS))?;
+        std::fs::rename(&held, fresh.join(&DIR).join(&EXTENSIONS))?;
     }
-    let old = layer.path.join(".records.old");
+    let old = layer.path.join(&Name::constant(".records.old"));
     let _ = std::fs::remove_dir_all(&old);
-    if layer.path.join(DIR).exists() {
-        std::fs::rename(layer.path.join(DIR), &old)?;
+    if layer.path.join(&DIR).exists() {
+        std::fs::rename(layer.path.join(&DIR), &old)?;
     }
-    std::fs::rename(fresh.join(DIR), layer.path.join(DIR))?;
+    std::fs::rename(fresh.join(&DIR), layer.path.join(&DIR))?;
     let _ = std::fs::remove_dir_all(&old);
     std::fs::remove_dir_all(&fresh)?;
     // A tree it was: its files and changeset go.
     for entry in std::fs::read_dir(&layer.path)?.flatten() {
         if of_the_tree(&entry.file_name()) {
-            let path = entry.path();
+            let path = layer.path.entry(&entry.file_name());
             if path.is_dir() {
                 std::fs::remove_dir_all(&path)?;
             } else {
@@ -1345,32 +1395,38 @@ pub fn import(project: &crate::Project, cache: &crate::cache::Cache, name: &str,
 ///
 /// # Errors
 /// The layer is no records layer read, or a file cannot be read or written.
-pub fn export(project: &crate::Project, name: &str, to: &Path) -> Result<usize> {
+pub fn export(project: &crate::Project, name: &str, to: &HostPath) -> Result<usize> {
     let layer = project.layer(name)?;
     Set::open(project)?;
     let mut changeset = Set::changeset(&layer.path).with_context(|| format!("{name} is no records layer"))?;
     changeset.ops.clear();
     for path in changeset.entries.values() {
-        let (from, out) = (layer.path.join(path), to.join(path));
-        if path.ends_with(crate::index::BUNDLE_SUFFIX) {
+        let path = RelPath::new(path)?;
+        let (from, out) = (layer.path.join(&path), to.join(&path));
+        if path.as_str().ends_with(crate::index::BUNDLE_SUFFIX) {
             std::fs::create_dir_all(&out)?;
-            for (file, at) in crate::index::bundle_files(&from) {
-                let target = out.join(&file);
+            let (held, refused) = crate::index::bundle_files(&from);
+            // Every file of it goes, or none does: one named so no path takes it is renamed first.
+            if let Some(why) = refused.first() {
+                bail!("{path}: {why}");
+            }
+            for (file, at) in held {
+                let target = out.join(&RelPath::new(&file)?);
                 if let Some(folder) = target.parent() {
-                    std::fs::create_dir_all(folder)?;
+                    std::fs::create_dir_all(&folder)?;
                 }
                 std::fs::write(&target, crate::content::read(&at)?)?;
             }
         } else if crate::content::exists(&from) {
             if let Some(folder) = out.parent() {
-                std::fs::create_dir_all(folder)?;
+                std::fs::create_dir_all(&folder)?;
             }
             std::fs::write(&out, crate::content::read(&from)?)?;
         } else {
             std::fs::create_dir_all(&out)?;
         }
     }
-    changeset.save(&to.with_extension("toml"))?;
+    changeset.save(&to.with_suffix(&crate::CHANGESET_SUFFIX))?;
     Ok(changeset.entries.len())
 }
 
@@ -1378,7 +1434,7 @@ pub fn export(project: &crate::Project, name: &str, to: &Path) -> Result<usize> 
 ///
 /// # Errors
 /// A record cannot be written.
-pub fn write_all(dir: &Path, settings: &Settings, records: &BTreeMap<String, Record>) -> Result<()> {
+pub fn write_all(dir: &HostPath, settings: &Settings, records: &BTreeMap<String, Record>) -> Result<()> {
     for (uid, record) in records {
         let at = path_of(dir, uid);
         if let Some(shard) = at.parent() {
@@ -1527,8 +1583,7 @@ fn override_files(
 /// nor the extensions it holds (`ext::folder::HELD`), which are no entries: held as records of their own
 /// (`hold_extensions`).
 fn of_the_tree(name: &std::ffi::OsStr) -> bool {
-    let name = name.to_string_lossy();
-    !name.starts_with('.') && name != crate::ext::folder::HELD
+    !name.to_string_lossy().starts_with('.') && *name != crate::ext::folder::HELD
 }
 
 /// What a project's index shows, for comparing: each entry by path - its kind, uid, and files by name and SHA-1.
@@ -1580,7 +1635,7 @@ pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &str
         (shown(&index), settings, records)
     };
     // The tree aside, where nothing reads it: a dot-folder of the layer's.
-    let aside = layer.path.join(".tree");
+    let aside = layer.path.join(&Name::constant(".tree"));
     std::fs::create_dir_all(&aside)?;
     let mut moved = Vec::new();
     for entry in std::fs::read_dir(&layer.path)?.flatten() {
@@ -1588,18 +1643,18 @@ pub fn convert(project: &crate::Project, cache: &crate::cache::Cache, name: &str
         if !of_the_tree(&file_name) {
             continue;
         }
-        std::fs::rename(entry.path(), aside.join(&file_name))?;
+        std::fs::rename(layer.path.entry(&file_name), aside.entry(&file_name))?;
         moved.push(file_name);
     }
-    let changeset_aside = aside.join(".changeset.toml");
+    let changeset_aside = aside.join(&Name::constant(".changeset.toml"));
     let had_changeset = layer.changeset.is_file();
     if had_changeset {
         std::fs::rename(&layer.changeset, &changeset_aside)?;
     }
     let put_back = || -> Result<()> {
-        let _ = std::fs::remove_dir_all(layer.path.join(DIR));
+        let _ = std::fs::remove_dir_all(layer.path.join(&DIR));
         for file_name in &moved {
-            std::fs::rename(aside.join(file_name), layer.path.join(file_name))?;
+            std::fs::rename(aside.entry(file_name), layer.path.entry(file_name))?;
         }
         if had_changeset {
             std::fs::rename(&changeset_aside, &layer.changeset)?;
@@ -1643,6 +1698,7 @@ pub struct Converted {
 #[cfg(test)]
 mod tests {
     use super::{Content, File, Kind, Op, Record};
+    use crate::testing::At as _;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1681,11 +1737,11 @@ mod tests {
 
     #[test]
     fn a_record_is_placed_by_its_uid() {
-        let layer = std::path::Path::new("/p/.layers/top");
+        let layer = &crate::testing::scratch("record-place").at(".layers/top");
         let at = super::path_of(layer, "uid://1hwweozpa40d9");
-        assert_eq!(at, layer.join(".records/1h/1hwweozpa40d9.toml"));
+        assert_eq!(at, layer.at(".records/1h/1hwweozpa40d9.toml"));
         assert_eq!(super::uid_of(&at).as_deref(), Some("uid://1hwweozpa40d9"));
-        assert_eq!(super::uid_of(&layer.join(".records").join(super::MARKER)), None);
-        assert_eq!(super::uid_of(&layer.join("1h/1hwweozpa40d9.toml")), None);
+        assert_eq!(super::uid_of(&layer.at(".records").join(&super::MARKER)), None);
+        assert_eq!(super::uid_of(&layer.at("1h/1hwweozpa40d9.toml")), None);
     }
 }

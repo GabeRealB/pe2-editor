@@ -16,7 +16,8 @@
 //! and the built-ins, nothing else. Folders elsewhere - yours, those beside the editor - are where it takes them from,
 //! kept as a tree when added - or from an archive of a folder (`<id>-<version>.extension.zip`), unpacked.
 
-use std::path::Path;
+use pe2_path::HostPath;
+use pe2_path::Name;
 
 use anyhow::{Context, Result, bail};
 
@@ -31,35 +32,42 @@ pub const ARCHIVE_SUFFIX: &str = ".extension.zip";
 
 /// The folder of a project's layer its extensions' files are read at (`records::held_folder`): where they were folders
 /// before they were records (`records::hold_extensions`).
-pub const HELD: &str = "extensions";
+pub const HELD: Name = Name::constant("extensions");
 
 /// An extension's manifest, in its folder.
-pub const MANIFEST: &str = "extension.toml";
+pub const MANIFEST: Name = Name::constant(MANIFEST_NAME);
+const MANIFEST_NAME: &str = "extension.toml";
 
 /// What of an extension's folder is only read, beside its icon: none of it counts toward trusting it.
-const READ_ONLY: &[&str] = &[MANIFEST, "docs", "licenses", "CHANGELOG.md", TESTS];
+const READ_ONLY: &[&str] = &[MANIFEST_NAME, "docs", "licenses", "CHANGELOG.md", TESTS];
 
 /// Whether a path within an extension's folder is only read.
 #[must_use]
-pub fn read_only(name: &Path, about: &About) -> bool {
-    let top = name.components().next().map_or_default(|c| c.as_os_str().to_string_lossy().into_owned());
-    READ_ONLY.contains(&top.as_str())
+pub fn read_only(name: &pe2_path::RelPath, about: &About) -> bool {
+    let top = name.parts().next().unwrap_or_default();
+    READ_ONLY.contains(&top)
         || top.starts_with("LICENSE")
-        || about.described.icon.as_deref().is_some_and(|icon| name == Path::new(icon))
+        || about.described.icon.as_deref().is_some_and(|icon| name.as_str() == icon)
 }
 
 /// The id a folder is named for: its name without `.extension`.
 #[must_use]
-pub fn id_of(folder: &Path) -> Option<&str> {
-    folder.file_name()?.to_str()?.strip_suffix(SUFFIX).filter(|id| !id.is_empty())
+pub fn id_of(folder: &HostPath) -> Option<&str> {
+    id_named(folder.file_name()?.to_str()?)
+}
+
+/// The id a folder's name is for: without `.extension`.
+#[must_use]
+pub fn id_named(name: &str) -> Option<&str> {
+    name.strip_suffix(SUFFIX).filter(|id| !id.is_empty())
 }
 
 /// What a folder's manifest says, read alone.
 ///
 /// # Errors
 /// It has none, or it cannot be read.
-pub fn manifest(folder: &Path) -> Result<About> {
-    let file = folder.join(MANIFEST);
+pub fn manifest(folder: &HostPath) -> Result<About> {
+    let file = folder.join(&MANIFEST);
     let text = crate::content::read_to_string(&file).with_context(|| format!("it has no {MANIFEST}"))?;
     toml::from_str(&text).with_context(|| file.display().to_string())
 }
@@ -68,11 +76,39 @@ pub fn manifest(folder: &Path) -> Result<About> {
 ///
 /// # Errors
 /// It has no manifest, its component carries another or none, or its folder is named for another id.
-pub fn checked(folder: &Path, bytes: &[u8]) -> Result<About> {
+pub fn checked(folder: &HostPath, bytes: &[u8]) -> Result<About> {
     let text =
-        crate::content::read_to_string(&folder.join(MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
+        crate::content::read_to_string(&folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
     let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
     checked_text(&text, &name, bytes)
+}
+
+/// The manifest of an extension that has no component, checked: its keys and what it names in its folder (`check`), in
+/// a folder named for its id.
+///
+/// # Errors
+/// It has no manifest, or what it says is wrong (`pe2_manifest::check`), or its folder is named for another id.
+pub fn checked_alone(folder: &HostPath) -> Result<About> {
+    let text =
+        crate::content::read_to_string(&folder.join(&MANIFEST)).with_context(|| format!("it has no {MANIFEST}"))?;
+    let table: toml::Table = text.parse().with_context(|| MANIFEST.to_string())?;
+    let read = |name: &str| {
+        let within = pe2_path::RelPath::new(name).map_err(|e| e.to_string())?;
+        crate::content::read(&folder.join(&within)).map_err(|e| e.to_string())
+    };
+    pe2_manifest::check(&table, &read).map_err(|why| anyhow::anyhow!("{MANIFEST}: {why}"))?;
+    let about: About = toml::from_str(&text).context(MANIFEST)?;
+    let name = folder.file_name().map_or_default(|n| n.to_string_lossy().into_owned());
+    if id_named(&name) != Some(about.id.as_str()) {
+        bail!("it is {}, in {name}: its folder is {}{SUFFIX}", about.id, about.id);
+    }
+    Ok(about)
+}
+
+/// Whether an extension's folder is only its manifest: no component beside it.
+#[must_use]
+pub fn alone(folder: &HostPath) -> bool {
+    !crate::pack::is_file(&folder.join(&super::EXTENSION_COMPONENT)) && crate::pack::is_file(&folder.join(&MANIFEST))
 }
 
 /// An extension's manifest (`text`) checked: its component's (`bytes`), in a folder named (`name`) for its id - in its
@@ -92,7 +128,7 @@ pub fn checked_text(text: &str, name: &str, bytes: &[u8]) -> Result<About> {
         let differs = keys.into_iter().find(|key| held.get(*key) != carried.get(*key)).cloned().unwrap_or_default();
         bail!("its {MANIFEST} is not its component's: {differs} differs");
     }
-    if id_of(Path::new(name)) != Some(about.id.as_str()) {
+    if id_named(name) != Some(about.id.as_str()) {
         bail!("it is {}, in {name}: its folder is {}{SUFFIX}", about.id, about.id);
     }
     Ok(about)
@@ -100,18 +136,17 @@ pub fn checked_text(text: &str, name: &str, bytes: &[u8]) -> Result<About> {
 
 #[cfg(test)]
 mod tests {
-    use super::{About, checked_text, id_of, read_only};
-    use std::path::Path;
+    use super::{About, checked_text, id_named, read_only};
 
     #[test]
     fn what_is_only_read_is_named_by_its_place() {
         let about: About = toml::from_str("id = \"a\"\nversion = \"0.1.0\"\nicon = \"art/icon.png\"\n").unwrap();
         for read in ["extension.toml", "docs/install.md", "licenses/gcc.txt", "LICENSE", "LICENSE-MIT", "art/icon.png"]
         {
-            assert!(read_only(Path::new(read), &about), "{read}");
+            assert!(read_only(&pe2_path::RelPath::new(read).unwrap(), &about), "{read}");
         }
         for run in ["extension.wasm", "linux-x86_64/cc1", "art/other.png", "docs.wasm"] {
-            assert!(!read_only(Path::new(run), &about), "{run}");
+            assert!(!read_only(&pe2_path::RelPath::new(run).unwrap(), &about), "{run}");
         }
     }
 
@@ -129,8 +164,8 @@ mod tests {
 
     #[test]
     fn a_folder_is_named_for_its_id() {
-        assert_eq!(id_of(Path::new("x/pe2.psx.extension")), Some("pe2.psx"));
-        assert_eq!(id_of(Path::new("x/pe2.psx")), None);
-        assert_eq!(id_of(Path::new(".extension")), None);
+        assert_eq!(id_named("pe2.psx.extension"), Some("pe2.psx"));
+        assert_eq!(id_named("pe2.psx"), None);
+        assert_eq!(id_named(".extension"), None);
     }
 }

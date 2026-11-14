@@ -11,6 +11,8 @@ members = [
     "crates/value",
     "crates/ext",
     "crates/ext-macros",
+    "crates/manifest",
+    "crates/path",
     "crates/setup",
     "crates/model",
     "crates/project",
@@ -69,6 +71,8 @@ pe2-value = { path = "crates/value" }
 project = { path = "crates/project" }
 pe2-ext = { path = "crates/ext" }
 pe2-ext-macros = { path = "crates/ext-macros" }
+pe2-manifest = { path = "crates/manifest" }
+pe2-path = { path = "crates/path" }
 pe2-setup = { path = "crates/setup" }
 # The guest side of the extensions' contract (crates/ext/wit), for extensions built as components.
 wit-bindgen = "0.63"

@@ -17,17 +17,19 @@ beside the editor, only from a project.
 The program is looked for in the extension's folder for the user's platform, then in the extension's folder, then
 among its downloads, then on the system.
 
-`[[launch]]` names a program the extension starts in a particular way:
+`[[program]]` offers a program by name, started in a particular way - to the extension itself, and to others, which
+start it as `<extension>:<name>` (`spawn("pe2.gcc-psx:cc1", ...)`, or a project's `run` box):
 
 ```toml
-[[launch]]
-name = "maspsx"
-platform = "linux-x86_64"
-program = "python/bin/python3.13"
-args = ["-B", "@maspsx/maspsx.py"]
+[[program]]
+name = "as"
+program = "@pe2.python:python3"
+args = ["-B", "@maspsx/maspsx.py", "--gnu-as-path", "@pe2.binutils-mipsel:as"]
 ```
 
-`@` marks a place inside the extension's tree.
+`program` is a place in the extension's tree, or another extension's program. In `args`, `@` marks a place in the tree,
+or another extension's program, by its path; what the one starting it passes follows. Starting another extension's
+program fetches what that extension requires first; it has to be in the project and trusted.
 
 ## Downloads
 

@@ -10,9 +10,9 @@
 //! nothing else of the project.
 
 use crate::server::{Delta, Listing, Shown, Source};
+use pe2_path::HostPath;
 use sfs::fs::{self, Bytes, Node, ROOT, SERVED};
 use sfs::space::{Pages, Result, Txn};
-use std::path::{Path, PathBuf};
 
 /// A folder that is a project node (an asset): its files in it beside what is inside it.
 pub const NODE: u32 = 1;
@@ -43,20 +43,20 @@ const NOT_YET: u32 = NEW | WAITS | JUNK;
 pub const MOVES: usize = 11;
 
 /// The shared space's folder, in the cache's folder of what serving keeps.
-pub const SPACE: &str = "space";
+pub const SPACE: pe2_path::Name = pe2_path::Name::constant("space");
 
 /// The space the processes of the project in `root` share, attached here.
 ///
 /// # Errors
 /// As `sfs::space::shared`.
-pub fn space(root: &Path) -> std::io::Result<std::sync::Arc<sfs::Space>> {
+pub fn space(root: &HostPath) -> std::io::Result<std::sync::Arc<sfs::Space>> {
     sfs::space::shared(&space_at(root))
 }
 
 /// Where a project's shared space is kept.
 #[must_use]
-pub fn space_at(root: &Path) -> PathBuf {
-    root.join(crate::cache::DIR).join(crate::cache::STAGING).join(SPACE)
+pub fn space_at(root: &HostPath) -> HostPath {
+    root.join(&crate::cache::DIR).join(&crate::cache::STAGING).join(&SPACE)
 }
 
 /// The pages kept of what is read of the files of the project in `root` (`sfs::ring`), of about this many bytes:
@@ -66,7 +66,7 @@ pub fn space_at(root: &Path) -> PathBuf {
 ///
 /// # Errors
 /// There is no memory for it.
-pub fn ring(root: &Path, space: &sfs::Space, bytes: u64) -> std::io::Result<sfs::ring::Ring> {
+pub fn ring(root: &HostPath, space: &sfs::Space, bytes: u64) -> std::io::Result<sfs::ring::Ring> {
     // What a process of any project left there as it died goes first: it is taken until it is removed.
     sfs::ring::sweep("pe2-ring-");
     let named = crate::extract::sha1_hex(root.to_string_lossy().as_bytes());
@@ -105,7 +105,11 @@ pub fn say_whole(space: &sfs::Space, listing: &Listing) -> Result<()> {
 ///
 /// # Errors
 /// As `show`, and what `also` could not do.
-pub fn say_whole_with(space: &sfs::Space, listing: &Listing, also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
+pub fn say_whole_with(
+    space: &sfs::Space,
+    listing: &Listing,
+    also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>,
+) -> Result<()> {
     let mut txn = space.write()?;
     also(&mut txn)?;
     show_whole(&mut txn, listing, now())?;
@@ -134,7 +138,11 @@ pub fn say_with(space: &sfs::Space, delta: &Delta, also: &mut dyn FnMut(&mut Txn
 ///
 /// # Errors
 /// As `show`, and what `also` could not do.
-pub fn say_each_with(space: &sfs::Space, deltas: &[Delta], also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
+pub fn say_each_with(
+    space: &sfs::Space,
+    deltas: &[Delta],
+    also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>,
+) -> Result<()> {
     let mut txn = space.write()?;
     // First: a move the project took is no longer one its paths are read through (`moved`), and what is said
     // here is said of the project with that move made.
@@ -220,7 +228,7 @@ fn text(out: &mut Vec<u8>, text: &str) {
 }
 
 /// Where a file's content lives, as a node of the shared filesystem says it.
-fn place(disk: &Path, source: &Source) -> Vec<u8> {
+fn place(disk: &HostPath, source: &Source) -> Vec<u8> {
     let mut out = Vec::new();
     match source {
         Source::Disk => {
@@ -245,7 +253,7 @@ fn place(disk: &Path, source: &Source) -> Vec<u8> {
 
 /// Where a file's content lives, read back: where a layer holds it, and its source.
 #[must_use]
-pub fn placed(said: &[u8]) -> Option<(PathBuf, Source)> {
+pub fn placed(said: &[u8]) -> Option<(HostPath, Source)> {
     let (kind, mut rest) = said.split_first()?;
     let mut text = || {
         let (len, after) = rest.split_first_chunk::<4>()?;
@@ -253,11 +261,13 @@ pub fn placed(said: &[u8]) -> Option<(PathBuf, Source)> {
         rest = after;
         String::from_utf8(text.to_vec()).ok()
     };
-    let disk = PathBuf::from(text()?);
+    // Places the holder wrote, in the form a `HostPath` holds.
+    let place = |text: String| HostPath::from_plain(text.into());
+    let disk = place(text()?)?;
     let source = match kind {
         0 => Source::Disk,
-        1 => Source::RecordText { record: PathBuf::from(text()?), name: text()? },
-        2 => Source::Stored { sha1: text()?, store: PathBuf::from(text()?) },
+        1 => Source::RecordText { record: place(text()?)?, name: text()? },
+        2 => Source::Stored { sha1: text()?, store: place(text()?)? },
         _ => return None,
     };
     Some((disk, source))
@@ -367,7 +377,9 @@ fn shown(txn: &mut Txn<'_>, path: &str, shown: &Shown, now: u64, last: &mut Last
             let number = folder_in(txn, parent, name, false, last)?;
             let flags = if matches!(shown, Shown::Node) { NODE } else { 0 };
             // The project's from here on, whoever made it; removed through the folder, it stays so.
-            if let Some(node) = fs::node(txn, SERVED, number)?.filter(|node| node.flags & !GONE != flags && number != ROOT) {
+            if let Some(node) =
+                fs::node(txn, SERVED, number)?.filter(|node| node.flags & !GONE != flags && number != ROOT)
+            {
                 fs::set(txn, SERVED, number, &Node { flags: flags | (node.flags & GONE), ..node }, HOLDER)?;
             }
         }
@@ -376,7 +388,15 @@ fn shown(txn: &mut Txn<'_>, path: &str, shown: &Shown, now: u64, last: &mut Last
             let parent = folder(txn, folder_path, *of_files, last)?;
             let bytes = Bytes::Derived(place(disk, source));
             let flags = if *of_files { OF_FILES } else { 0 };
-            let mut file = Node { flags, len: *size, modified: nanos(*modified), parent, name: name.to_owned(), bytes, ..Node::default() };
+            let mut file = Node {
+                flags,
+                len: *size,
+                modified: nanos(*modified),
+                parent,
+                name: name.to_owned(),
+                bytes,
+                ..Node::default()
+            };
             match fs::lookup(txn, SERVED, parent, name)? {
                 Some(number) => match fs::node(txn, SERVED, number)? {
                     Some(was) if !was.folder => {
@@ -546,7 +566,9 @@ pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Opti
             gone(&mut delta, &join(&folder, was));
         }
         // Where it is now - or, gone, was: what is gone with the folder it was in is said by that folder's going.
-        let Some(folder) = fs::path(pages, SERVED, now.as_ref().map_or(change.parent, |node| node.parent))? else { continue };
+        let Some(folder) = fs::path(pages, SERVED, now.as_ref().map_or(change.parent, |node| node.parent))? else {
+            continue;
+        };
         let Some(node) = now else {
             gone(&mut delta, &join(&folder, &change.name));
             continue;
@@ -591,10 +613,12 @@ pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pe2_path::HostPath;
     use sfs::Space;
 
     fn file(size: u64, at: u64, of_files: bool, source: Source) -> Shown {
-        Shown::File { disk: PathBuf::from("/layers/game/x"), size, modified: (at, 0), of_files, source }
+        let disk = HostPath::new(&std::env::temp_dir()).unwrap().join(&pe2_path::RelPath::constant("layers/game/x"));
+        Shown::File { disk, size, modified: (at, 0), of_files, source }
     }
 
     /// A project of two folders, a file in each.
@@ -621,13 +645,18 @@ mod tests {
         // Whoever serves the folder makes a folder in it, and one in that, a program having asked.
         let mut txn = space.write().unwrap();
         let rooms = fs::at(&txn, SERVED, "rooms").unwrap().unwrap();
-        let folder = |parent: u64, name: &str| Node { folder: true, flags: NEW, parent, name: name.into(), ..Node::default() };
+        let folder =
+            |parent: u64, name: &str| Node { folder: true, flags: NEW, parent, name: name.into(), ..Node::default() };
         let made = fs::make(&mut txn, SERVED, &folder(rooms, "made"), SERVER).unwrap();
         fs::make(&mut txn, SERVED, &folder(made, "inside"), SERVER).unwrap();
         let seen = txn.generation();
         txn.commit().unwrap();
         assert_eq!(listed(&space.read().unwrap()).unwrap(), before, "no part of what the project serves");
-        assert_eq!(changed(&space.read().unwrap(), seen - 1, &before).unwrap(), Some(Delta::default()), "nor a change of it");
+        assert_eq!(
+            changed(&space.read().unwrap(), seen - 1, &before).unwrap(),
+            Some(Delta::default()),
+            "nor a change of it"
+        );
         // Said whole again, or a path beside it said gone, it stays; said gone itself - which the project never had
         // - it stays too.
         say_whole(&space, &before).unwrap();
@@ -638,7 +667,11 @@ mod tests {
         now.insert("rooms/made".to_owned(), Shown::Folder);
         say(&space, &Delta::between(&before, &now)).unwrap();
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
-        assert_eq!(fs::at(&space.read().unwrap(), SERVED, "rooms/made").unwrap(), Some(made), "under the number it had");
+        assert_eq!(
+            fs::at(&space.read().unwrap(), SERVED, "rooms/made").unwrap(),
+            Some(made),
+            "under the number it had"
+        );
         assert_eq!(flags_at(&space, "rooms/made/inside"), Some(NEW));
     }
 
@@ -686,12 +719,14 @@ mod tests {
         say_whole(&space, &now).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         let pages = space.read().unwrap();
-        let a = fs::at(&pages, SERVED, "halls/a.txt").unwrap().and_then(|number| fs::node(&pages, SERVED, number).unwrap());
+        let a =
+            fs::at(&pages, SERVED, "halls/a.txt").unwrap().and_then(|number| fs::node(&pages, SERVED, number).unwrap());
         assert_eq!(a.map(|node| node.len), Some(5));
         drop(pages);
         // The project takes the move, and says so in the commit that says what it serves after it: where it was
         // gone, where it is shown - and nothing of what is there taken away for it.
-        let moved_listing: Listing = now.iter().map(|(path, it)| (path.replacen("rooms", "halls", 1), it.clone())).collect();
+        let moved_listing: Listing =
+            now.iter().map(|(path, it)| (path.replacen("rooms", "halls", 1), it.clone())).collect();
         say_with(&space, &Delta::between(&now, &moved_listing), &mut |txn| unmoved(txn, 7).map(drop)).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         assert_eq!(listed(&space.read().unwrap()).unwrap(), moved_listing);
@@ -704,8 +739,11 @@ mod tests {
     }
 
     fn listing() -> Listing {
-        let record = Source::RecordText { record: PathBuf::from("/layers/top/.records/ab/uid.toml"), name: "node.toml".into() };
-        let stored = Source::Stored { sha1: "da39a3ee".into(), store: PathBuf::from("/layers/.store") };
+        let layers = HostPath::new(&std::env::temp_dir()).unwrap().join(&pe2_path::Name::constant("layers"));
+        let record = layers.join(&pe2_path::RelPath::constant("top/.records/ab/uid.toml"));
+        let record = Source::RecordText { record, name: "node.toml".into() };
+        let stored =
+            Source::Stored { sha1: "da39a3ee".into(), store: layers.join(&pe2_path::Name::constant(".store")) };
         Listing::from([
             ("rooms".to_owned(), Shown::Folder),
             ("rooms/patio".to_owned(), Shown::Node),
@@ -811,9 +849,10 @@ mod tests {
     #[ignore = "a measurement, of the project PE2_BENCH_PROJECT names"]
     fn bench_saying_what_is_served() {
         let Ok(root) = std::env::var("PE2_BENCH_PROJECT") else { return };
-        let index = crate::index::Index::without_store(&crate::Project::load(Path::new(&root)).unwrap()).unwrap();
+        let index =
+            crate::index::Index::without_store(&crate::Project::load(std::path::Path::new(&root)).unwrap()).unwrap();
         let listing = index.served();
-        let dir = std::env::temp_dir().join(format!("pe2-shared-bench-{}", std::process::id()));
+        let dir = crate::testing::scratch("shared-bench");
         let _ = std::fs::remove_dir_all(&dir);
         for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
             let whole = std::time::Instant::now();
@@ -831,7 +870,8 @@ mod tests {
             let Shown::File { disk, size, modified, of_files, source } = shown.clone() else { unreachable!() };
             let changed = std::time::Instant::now();
             for n in 1..=100 {
-                let other = Shown::File { disk: disk.clone(), size: size + n, modified, of_files, source: source.clone() };
+                let other =
+                    Shown::File { disk: disk.clone(), size: size + n, modified, of_files, source: source.clone() };
                 say(&space, &Delta { shown: [(path.clone(), other)].into(), gone: [].into() }).unwrap();
             }
             let changed = changed.elapsed();
@@ -885,11 +925,20 @@ mod tests {
         assert_eq!(node(&space).1.modified, 300_000_000_000);
         // What each change was is said for who reads them after: made, then changed twice, by the holder.
         let mut said = Vec::new();
-        assert!(fs::changes(&space.read().unwrap(), SERVED, 0, &mut |_, change| {
-            said.push((change.what, change.number, change.by));
-            true
-        })
-        .unwrap());
-        assert_eq!(said, [(fs::What::Made, number, HOLDER), (fs::What::Changed, number, HOLDER), (fs::What::Changed, number, HOLDER)]);
+        assert!(
+            fs::changes(&space.read().unwrap(), SERVED, 0, &mut |_, change| {
+                said.push((change.what, change.number, change.by));
+                true
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            said,
+            [
+                (fs::What::Made, number, HOLDER),
+                (fs::What::Changed, number, HOLDER),
+                (fs::What::Changed, number, HOLDER)
+            ]
+        );
     }
 }

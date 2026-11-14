@@ -11,7 +11,8 @@
 //! A place is compared with where the file really is: what a layer above overrides is the file of that layer, and a link
 //! out of a place is not in it.
 
-use std::path::{Path, PathBuf};
+use pe2_path::HostPath;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use project::ext::Origin;
@@ -37,16 +38,16 @@ pub fn trusts_everything() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trusted {
     /// The project, by its real path.
-    pub project: PathBuf,
+    pub project: HostPath,
     /// Real paths.
-    pub places: Vec<PathBuf>,
+    pub places: Vec<HostPath>,
     /// Places the user was asked about and said no to.
-    pub declined: Vec<PathBuf>,
+    pub declined: Vec<HostPath>,
 }
 
 /// The file holding what the user enabled and trusts.
-pub(crate) fn file() -> Option<PathBuf> {
-    Some(data_folder()?.join("unsandboxed.toml"))
+pub(crate) fn file() -> Option<HostPath> {
+    Some(data_folder()?.join(&pe2_path::Name::constant("unsandboxed.toml")))
 }
 
 /// What the file holds.
@@ -69,7 +70,8 @@ pub(crate) fn write(table: &Table) -> std::io::Result<()> {
 pub fn trusted() -> Vec<Trusted> {
     let table = read();
     let held = table.get("trusted").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    let path = |value: &Value| value.as_str().map(PathBuf::from);
+    // Each as the system names it now - what an older editor wrote in another form is the same place.
+    let path = |value: &Value| value.as_str().and_then(|text| HostPath::new(Path::new(text)).ok());
     held.iter()
         .filter_map(|entry| {
             let project = entry.get("project").and_then(path)?;
@@ -81,9 +83,9 @@ pub fn trusted() -> Vec<Trusted> {
 }
 
 fn store(all: &[Trusted]) -> std::io::Result<()> {
-    let text = |path: &Path| Value::String(path.display().to_string());
+    let text = |path: &HostPath| Value::String(path.to_string());
     let entry = |trusted: &Trusted| {
-        let list = |paths: &[PathBuf]| Value::Array(paths.iter().map(|place| text(place)).collect());
+        let list = |paths: &[HostPath]| Value::Array(paths.iter().map(&text).collect());
         let mut entry = Table::from_iter([
             ("project".to_string(), text(&trusted.project)),
             ("places".to_string(), list(&trusted.places)),
@@ -105,24 +107,25 @@ fn store(all: &[Trusted]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// One is not there, or what is trusted cannot be written.
-pub fn trust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
-    let project = project.canonicalize()?;
-    let places = places.iter().map(|place| place.canonicalize()).collect::<std::io::Result<Vec<_>>>()?;
+pub fn trust(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
+    if let Some(place) = places.iter().find(|place| !place.exists()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{place}: nothing is there")));
+    }
     let mut all = trusted();
-    let at = entry(&mut all, &project);
+    let at = entry(&mut all, project);
     for place in places {
-        all[at].declined.retain(|declined| *declined != place);
-        if !all[at].places.contains(&place) {
-            all[at].places.push(place);
+        all[at].declined.retain(|declined| declined != place);
+        if !all[at].places.contains(place) {
+            all[at].places.push(place.clone());
         }
     }
     store(&all)
 }
 
 /// A project's entry, made where it has none.
-fn entry(all: &mut Vec<Trusted>, project: &Path) -> usize {
-    all.iter().position(|known| known.project == project).unwrap_or_else(|| {
-        all.push(Trusted { project: project.to_path_buf(), places: Vec::new(), declined: Vec::new() });
+fn entry(all: &mut Vec<Trusted>, project: &HostPath) -> usize {
+    all.iter().position(|known| known.project == *project).unwrap_or_else(|| {
+        all.push(Trusted { project: project.clone(), places: Vec::new(), declined: Vec::new() });
         all.len() - 1
     })
 }
@@ -131,13 +134,12 @@ fn entry(all: &mut Vec<Trusted>, project: &Path) -> usize {
 ///
 /// # Errors
 /// What is trusted cannot be written.
-pub fn decline(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
+pub fn decline(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
     if places.is_empty() {
         return Ok(());
     }
-    let project = project.canonicalize()?;
     let mut all = trusted();
-    let at = entry(&mut all, &project);
+    let at = entry(&mut all, project);
     for place in places {
         if !all[at].declined.contains(place) {
             all[at].declined.push(place.clone());
@@ -150,12 +152,9 @@ pub fn decline(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// What is trusted cannot be written.
-pub fn distrust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
-    let project = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
-    let places: Vec<PathBuf> =
-        places.iter().map(|place| place.canonicalize().unwrap_or_else(|_| place.clone())).collect();
+pub fn distrust(project: &HostPath, places: &[HostPath]) -> std::io::Result<()> {
     let mut all = trusted();
-    for known in all.iter_mut().filter(|known| known.project == project) {
+    for known in all.iter_mut().filter(|known| known.project == *project) {
         known.places.retain(|place| !places.is_empty() && !places.contains(place));
     }
     all.retain(|known| !known.places.is_empty() || !known.declined.is_empty());
@@ -166,7 +165,7 @@ pub fn distrust(project: &Path, places: &[PathBuf]) -> std::io::Result<()> {
 ///
 /// # Errors
 /// What is trusted cannot be written.
-pub fn distrust_place(place: &Path) -> std::io::Result<()> {
+pub fn distrust_place(place: &HostPath) -> std::io::Result<()> {
     let mut all = trusted();
     for known in &mut all {
         known.places.retain(|held| held != place);
@@ -208,7 +207,7 @@ pub enum Allowed {
     /// This run trusts everything.
     Everything,
     /// It is in a place trusted.
-    Place(PathBuf),
+    Place(HostPath),
 }
 
 impl Allowed {
@@ -217,22 +216,16 @@ impl Allowed {
     pub fn said(&self) -> String {
         match self {
             Allowed::Everything => "It runs because this run trusts everything (--trust-everything).".to_string(),
-            Allowed::Place(place) => format!("It runs because you trust {}.", place.display()),
+            Allowed::Place(place) => format!("It runs because you trust {place}."),
         }
     }
 }
 
-/// Where a path really is: what of it is on disk canonicalized, what is not (an extension's files a project holds,
-/// read from its tree: `records::held_folder`) kept as it is below that.
-#[must_use]
-pub fn real(path: &Path) -> Option<PathBuf> {
-    let (on_disk, real) = path.ancestors().find_map(|a| Some((a, a.canonicalize().ok()?)))?;
-    Some(real.join(path.strip_prefix(on_disk).ok()?))
-}
-
-/// Which of these places holds a file, where it really is.
-fn holding<'a>(file: &Path, mut places: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
-    let real = real(file)?;
+/// Which of these places holds a file, where it really is now: its links resolved again as far as it is on disk (what
+/// is not - an extension's files a project holds, read from its tree: `records::held_folder` - as it is below that),
+/// so that a link out of a place is not in it.
+fn holding<'a>(file: &HostPath, mut places: impl Iterator<Item = &'a HostPath>) -> Option<HostPath> {
+    let real = HostPath::new(file).ok()?;
     places.find(|place| real.starts_with(place)).cloned()
 }
 
@@ -257,20 +250,20 @@ pub fn allowed_by(origin: &Origin) -> Option<Allowed> {
 #[cfg(test)]
 mod tests {
     use super::{Allowed, Origin, Trusted, allowed};
-    use std::path::PathBuf;
+    use pe2_path::HostPath;
+    use pe2_path::testing::At as _;
 
     /// A project's layers in a folder, one holding an extension, with its real paths.
-    fn places(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("pe2-trust-{name}-{}", std::process::id()));
+    fn places(name: &str) -> (HostPath, HostPath, HostPath) {
+        let root = pe2_path::testing::scratch(&format!("trust-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         for layer in ["mine", "mine_too", "theirs"] {
-            std::fs::create_dir_all(root.join(layer).join("extensions/x.extension")).unwrap();
+            std::fs::create_dir_all(root.at(layer).at("extensions/x.extension")).unwrap();
         }
-        let root = root.canonicalize().unwrap();
-        (root.clone(), root.join("mine"), root.join("theirs/extensions/x.extension"))
+        (root.clone(), root.at("mine"), root.at("theirs/extensions/x.extension"))
     }
 
-    fn in_project(folder: PathBuf) -> Origin {
+    fn in_project(folder: HostPath) -> Origin {
         Origin::Project(folder)
     }
 
@@ -278,15 +271,15 @@ mod tests {
     fn a_place_holds_what_is_really_in_it() {
         let (root, mine, theirs) = places("place");
         let trusted = [Trusted { project: root.clone(), places: vec![mine.clone()], declined: Vec::new() }];
-        let there = allowed(&in_project(mine.join("extensions/x.extension")), false, &trusted);
+        let there = allowed(&in_project(mine.at("extensions/x.extension")), false, &trusted);
         assert_eq!(there, Some(Allowed::Place(mine.clone())));
         // Another layer, and one whose name begins alike.
         assert_eq!(allowed(&in_project(theirs.clone()), false, &trusted), None);
-        assert_eq!(allowed(&in_project(root.join("mine_too/extensions/x.extension")), false, &trusted), None);
+        assert_eq!(allowed(&in_project(root.at("mine_too/extensions/x.extension")), false, &trusted), None);
         // A link in a place trusted, to what is not.
         #[cfg(unix)]
         {
-            let link = mine.join("extensions/elsewhere.extension");
+            let link = mine.at("extensions/elsewhere.extension");
             std::os::unix::fs::symlink(&theirs, &link).unwrap();
             assert_eq!(allowed(&in_project(link), false, &trusted), None);
         }
@@ -295,7 +288,7 @@ mod tests {
 
     #[test]
     fn what_is_kept_apart_runs_nowhere_and_a_run_may_trust_everything() {
-        let folder = PathBuf::from("/nowhere/x.extension");
+        let folder = pe2_path::testing::scratch("nowhere").at("x.extension");
         assert_eq!(allowed(&Origin::User(folder.clone()), false, &[]), None);
         assert_eq!(allowed(&in_project(folder.clone()), false, &[]), None);
         assert_eq!(allowed(&in_project(folder), true, &[]), Some(Allowed::Everything));

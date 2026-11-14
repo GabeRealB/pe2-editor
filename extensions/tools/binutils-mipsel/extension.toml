@@ -1,0 +1,51 @@
+id = "pe2.binutils-mipsel"
+version = "2.47.0"
+unsandboxed = true
+description = "GNU binutils 2.47 for mipsel, as the editor's releases build them: as, ld, nm and objcopy."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/pe2-editor"
+docs = "docs/index.md"
+install = "docs/install.md"
+
+[[setup]]
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation, Inc."
+platform = "linux-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-linux-x86_64.zip"
+sha256 = "d00749652829b46d5c7748a4254e8dd29ff250de1b1350696d4e397938842c3e"
+take = { "as" = { to = "mips-linux-gnu-as", sha256 = "ba2dbbbdfee7571d17af0d24dfda700f6d4a02ad98fbd524d0b31d83dfc078a6" }, "ld" = { to = "mips-linux-gnu-ld", sha256 = "0e1ba58f9a33a53947ebcbbbebade91ceaf0d0a24bcd6bedb9153296212f0852" }, "nm" = { to = "mips-linux-gnu-nm", sha256 = "ae9e992d7eb48d91f72da8d161b423745f1e236027eee9be879634949864e06f" }, "objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "51bab827506f273fe8ce271f4c6e26cc8a435acf000644a945388af4afa63d5b" } }
+
+[[setup]]
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation, Inc."
+platform = "macos-aarch64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-macos-aarch64.zip"
+sha256 = "0b60bc15de117cb62a810bf948cb5e62c236db5139be107cb8d3f3fba421a4f5"
+take = { "as" = { to = "mips-linux-gnu-as", sha256 = "5e5c48be56a35d66ced0a5084273a143ef946ac22353bfa09df5181538398d97" }, "ld" = { to = "mips-linux-gnu-ld", sha256 = "d9385f9144be09800284f0c6d276f4a6c38101bacde80297eb1ed4d08e66af32" }, "nm" = { to = "mips-linux-gnu-nm", sha256 = "224102801bd69fee19b3793a9860d198464f934b0a48c75480cde435e41c6853" }, "objcopy" = { to = "mips-linux-gnu-objcopy", sha256 = "39f8c4b9726aa67152b354ae1b43872c2d11a553407633f0989ebcf6b7fe05ac" } }
+
+[[setup]]
+name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
+license = "GPL-3.0-or-later"
+copyright = "Free Software Foundation, Inc."
+platform = "windows-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/binutils-mipsel-2.47-1/binutils-mipsel-2.47-windows-x86_64.zip"
+sha256 = "3cae8720d342422c94b8e80abb611330b1272933556693b9a59b6ec4f7c8444e"
+take = { "as.exe" = { to = "mips-linux-gnu-as.exe", sha256 = "5478e7b1e7f510e203a9d66adfa68d37de06ab2d0fd187436fe7434c09658480" }, "ld.exe" = { to = "mips-linux-gnu-ld.exe", sha256 = "3559ecd54a6d79211c39df08806dd2dd2d71ed932681607a1057d92a3fc169d1" }, "nm.exe" = { to = "mips-linux-gnu-nm.exe", sha256 = "0cf54e637610358392c0db6670d20d733f96bf08982cc09cca1b778a1377ebe8" }, "objcopy.exe" = { to = "mips-linux-gnu-objcopy.exe", sha256 = "7706d6bc9e79de4bdf360ba38febfa7b9d43b811a1723f94c7c40df4cebef713" } }
+
+[[program]]
+name = "as"
+program = "mips-linux-gnu-as"
+
+[[program]]
+name = "ld"
+program = "mips-linux-gnu-ld"
+
+[[program]]
+name = "nm"
+program = "mips-linux-gnu-nm"
+
+[[program]]
+name = "objcopy"
+program = "mips-linux-gnu-objcopy"

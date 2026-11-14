@@ -7,8 +7,7 @@
 //!
 //! A plan runs as the work graph's only work (`runner`): after the epoch running, which may be cancelled for it, and
 //! before any event signaled meanwhile, which waits until what it wrote is taken in.
-
-use std::path::PathBuf;
+use pe2_path::HostPath;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -21,7 +20,7 @@ use crate::workspace::Workspace;
 /// A plan running.
 struct Running {
     layer: String,
-    path: PathBuf,
+    path: HostPath,
     progress: Arc<Progress>,
     /// Set once it runs, the epoch before it ended.
     started: Arc<std::sync::atomic::AtomicBool>,
@@ -66,7 +65,7 @@ impl Fill {
     }
 }
 
-const PUT_OFF: &str = "fill-put-off.toml";
+const PUT_OFF: pe2_path::RelPath = pe2_path::RelPath::constant("fill-put-off.toml");
 
 /// How a layer's state is remembered as put off.
 fn remembered(state: &State) -> String {
@@ -145,7 +144,7 @@ fn finish(ws: &mut Workspace) -> Option<String> {
 /// The step, where there is one to show; what a run did, once it is done.
 pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
     if ws.fill.put_off_as.is_none() {
-        let read = std::fs::read_to_string(ws.cache_path(PUT_OFF)).ok().and_then(|t| toml::from_str(&t).ok());
+        let read = std::fs::read_to_string(ws.cache_path(&PUT_OFF)).ok().and_then(|t| toml::from_str(&t).ok());
         ws.fill.put_off_as = Some(read.unwrap_or_default());
     }
     let said = finish(ws);
@@ -225,7 +224,7 @@ pub fn ui(ctx: &egui::Context, ws: &mut Workspace) -> Option<String> {
             let put = ws.fill.put_off_as.get_or_insert_default();
             put.insert(layer.clone(), state);
             if let Ok(text) = toml::to_string(put) {
-                let _ = std::fs::write(ws.cache_path(PUT_OFF), text);
+                let _ = std::fs::write(ws.cache_path(&PUT_OFF), text);
             }
         }
     }

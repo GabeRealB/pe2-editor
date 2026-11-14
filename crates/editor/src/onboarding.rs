@@ -4,8 +4,8 @@
 //! nothing to settle, and again only of what is new, or while the project is not whole. The answers are the user's: an agent
 //! driving the editor cannot give them.
 
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText};
 use extensions::trust;
@@ -17,7 +17,7 @@ use crate::workspace::Workspace;
 
 /// A place to trust, and what it holds.
 pub struct Place {
-    pub path: PathBuf,
+    pub path: HostPath,
     /// What it is to the project: `layer mods`, or where it is.
     pub label: String,
     pub extensions: Vec<String>,
@@ -30,7 +30,7 @@ pub struct Place {
 
 /// What is being asked.
 pub struct Onboarding {
-    pub root: PathBuf,
+    pub root: HostPath,
     pub places: Vec<Place>,
     /// What the project requires and no answer here gives it, and why.
     pub missing: Vec<(String, String)>,
@@ -50,25 +50,20 @@ pub enum Answer {
 }
 
 /// The place an extension is in: the layer or mount holding it, else its own folder.
-pub fn place_of(ws: &Workspace, file: &Path) -> (PathBuf, String) {
+pub fn place_of(ws: &Workspace, file: &HostPath) -> (HostPath, String) {
     // One the project holds is read where its folder was in its layer, on no disk.
-    let real = extensions::trust::real(file).unwrap_or_else(|| file.to_path_buf());
-    let holding = ws
-        .project
-        .layers
-        .iter()
-        .filter_map(|layer| Some((layer, layer.path.canonicalize().ok()?)))
-        .find(|(_, path)| real.starts_with(path));
-    if let Some((layer, path)) = holding {
-        return (path, format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));
+    let real = HostPath::new(file).unwrap_or_else(|_| file.clone());
+    let holding = ws.project.layers.iter().find(|layer| real.starts_with(&layer.path));
+    if let Some(layer) = holding {
+        return (layer.path.clone(), format!("{} {}", if layer.mounted { "mount" } else { "layer" }, layer.name));
     }
-    let folder = real.parent().unwrap_or(&real).to_path_buf();
-    let label = folder.display().to_string();
+    let folder = real.parent().unwrap_or_else(|| real.clone());
+    let label = folder.to_string();
     (folder, label)
 }
 
 /// Where an extension is that a place may hold: the folder a project holds it in, or a file named.
-pub fn file_of(present: &Present) -> Option<&PathBuf> {
+pub fn file_of(present: &Present) -> Option<&HostPath> {
     match &present.origin {
         Origin::Project(file) | Origin::Component(file) => Some(file),
         _ => None,
@@ -78,11 +73,11 @@ pub fn file_of(present: &Present) -> Option<&PathBuf> {
 /// What a project has to ask; none where there is nothing. `config_chosen`: the user has settled on one already.
 #[must_use]
 pub fn asked(ws: &Workspace, config_chosen: bool) -> Option<Onboarding> {
-    let root = ws.project.root.canonicalize().ok()?;
+    let root = ws.project.root.clone();
     let answered = trust::trusted().into_iter().find(|known| known.project == root);
     let declined = answered.map_or_default(|known| known.declined);
     let required = |id: &str| ws.extensions.unmet.iter().any(|(unmet, _)| unmet == id);
-    let mut places: BTreeMap<PathBuf, Place> = BTreeMap::new();
+    let mut places: BTreeMap<HostPath, Place> = BTreeMap::new();
     let waiting = ws.extensions.present.iter().filter(|present| matches!(present.status, Status::NotEnabled { .. }));
     for present in waiting {
         let Some(file) = file_of(present) else { continue };
@@ -113,7 +108,7 @@ pub fn asked(ws: &Workspace, config_chosen: bool) -> Option<Onboarding> {
     }
     let untrusted = |id: &str| places.values().any(|place| place.extensions.iter().any(|extension| extension == id));
     let missing: Vec<(String, String)> = ws.extensions.unmet.iter().filter(|(id, _)| !untrusted(id)).cloned().collect();
-    let configs: Vec<String> = ws.project.configs.iter().map(|config| config.name.clone()).collect();
+    let configs: Vec<String> = ws.project.configs.iter().map(|config| config.name.to_string()).collect();
     let configs = if configs.len() > 1 && !config_chosen { configs } else { Vec::new() };
     let places: Vec<Place> = places.into_values().collect();
     if places.is_empty() && missing.is_empty() && configs.is_empty() {
@@ -132,7 +127,7 @@ impl Onboarding {
         let chosen = |trusted: bool| {
             self.places.iter().filter(move |place| place.trust == trusted).map(|place| place.path.clone())
         };
-        let mut trusting: Vec<PathBuf> = chosen(true).collect();
+        let mut trusting: Vec<HostPath> = chosen(true).collect();
         if matches!(answer, Answer::Everything) {
             trusting.push(self.root.clone());
         }

@@ -1,0 +1,20 @@
+[package]
+name = "pe2-path"
+description = "The editor's paths as types: a name, a relative path, a uid, a resource path (a uid and a suffix), a path within a scope of the virtual filesystem, and a path on disk for the filesystem's implementations; each checked when made"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# What tests share (`testing`): for dev-dependencies alone.
+testing = []
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

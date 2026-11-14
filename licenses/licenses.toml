@@ -145,6 +145,18 @@ in = ["pe2-editor", "pe2-cli"]
 on = ["windows"]
 texts = ["standard/LGPL-3.0.txt", "standard/GPL-3.0.txt"]
 
+[[bundled]]
+name = "DirectX Shader Compiler, dxcompiler.dll"
+version = "1.9.2609"
+what = """Microsoft's release of it, beside the editor (`prepare.toml`): what Direct3D 12's shaders are compiled \
+with"""
+license = "NCSA"
+copyright = "University of Illinois at Urbana-Champaign; Microsoft Corporation"
+from = "https://github.com/microsoft/DirectXShaderCompiler"
+in = ["pe2-editor"]
+on = ["windows"]
+texts = ["texts/directx-shader-compiler/LICENSE-LLVM.txt", "texts/directx-shader-compiler/ThirdPartyNotices.txt"]
+
 # What is no part of the editor and is used where the system has it.
 [[installed]]
 name = "Dokany"

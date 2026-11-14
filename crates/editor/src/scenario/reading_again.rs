@@ -1,4 +1,5 @@
 //! What a project is made of changing: it is read again with what it was still showing.
+use pe2_path::testing::At as _;
 
 use project::ext::Status;
 
@@ -49,7 +50,7 @@ fn what_is_asked_while_it_is_read_again_comes_after_it() {
 fn a_project_toml_that_cannot_be_read_leaves_the_project_as_it_was() {
     let mut editor = Scenario::open(Fixture::rig());
     editor.show("rig/skeleton");
-    let file = editor.fixture.root().join(project::FILE);
+    let file = editor.fixture.root().join(&project::FILE);
     let good = editor.project_file();
     std::fs::write(&file, "[[layer\n").expect("written");
     editor.take_in_outside_changes();
@@ -99,13 +100,13 @@ fn another_project_opens_without_waiting_for_the_one_left() {
 #[test]
 fn code_is_overridden_in_a_layer_made_for_it() {
     let mut editor = Scenario::open(Fixture::code());
-    let root = editor.fixture.root().to_path_buf();
+    let root = editor.fixture.root().clone();
     editor.override_entry("src/thing.c").expect("an entry");
     editor.expect("is code, from code");
     editor.type_into("new files layer", "mine");
     editor.click("Create and override");
     assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    let copy = root.join(".layers/mine/src/thing.c");
+    let copy = root.at(".layers/mine/src/thing.c");
     assert_eq!(std::fs::read_to_string(&copy).expect("the copy"), "int thing;\n");
     assert!(editor.workspace().layers.iter().any(|layer| layer.name == "mine"), "the project has it");
 }
@@ -113,7 +114,7 @@ fn code_is_overridden_in_a_layer_made_for_it() {
 #[test]
 fn code_overridden_while_the_project_is_read_waits_its_turn() {
     let mut editor = Scenario::open(Fixture::code());
-    let root = editor.fixture.root().to_path_buf();
+    let root = editor.fixture.root().clone();
     editor.override_entry("src/thing.c").expect("an entry");
     editor.type_into("new files layer", "mine");
     editor.hold_reading().expect("held");
@@ -123,7 +124,7 @@ fn code_overridden_while_the_project_is_read_waits_its_turn() {
     assert!(!editor.project_file().contains("name = \"mine\""), "nothing is written while the project is read");
     editor.release_reading().expect("let go");
     assert!(editor.project_file().contains("name = \"mine\""), "the layer was added");
-    assert!(root.join(".layers/mine/src/thing.c").is_file());
+    assert!(root.at(".layers/mine/src/thing.c").is_file());
 }
 
 #[test]
@@ -132,7 +133,7 @@ fn a_project_toml_changed_in_nothing_it_is_read_for_leaves_what_is_showing() {
     editor.show("rig/skeleton");
     let shown = editor.workspace().views_alive();
     assert!(shown > 0, "something to keep");
-    let file = editor.fixture.root().join(project::FILE);
+    let file = editor.fixture.root().join(&project::FILE);
     let said = format!("{}\n# a note\n", editor.project_file());
     std::fs::write(&file, said).expect("written");
     editor.take_in_outside_changes();

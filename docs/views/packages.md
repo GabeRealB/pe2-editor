@@ -20,5 +20,7 @@ for them.
 
 ## The compiler
 
-Building packages needs the `pe2.psx` extension, which runs the game's compiler on your computer. It ships beside
-the editor; see its own guide in the **Extensions** pane, and [trust](../extending/extensions.md#trust).
+A package is built by an operation the project names (see [Builds](../making/builds.md)), whose programs - the game's
+compiler, the binutils - are tool extensions the project holds, and whose last step is `pe2.psx`'s. They ship beside
+the editor; see their guides in the **Extensions** pane, and [trust](../extending/extensions.md#trust): a build runs
+programs only for a project you trust.

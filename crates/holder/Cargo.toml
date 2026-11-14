@@ -16,6 +16,10 @@ mcp.workspace = true
 notify.workspace = true
 pe2-ext.workspace = true
 project.workspace = true
+pe2-path.workspace = true
 tracing.workspace = true
 vfs.workspace = true
 sfs.workspace = true
+
+[dev-dependencies]
+pe2-path = { workspace = true, features = ["testing"] }

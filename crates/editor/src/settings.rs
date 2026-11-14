@@ -2,11 +2,11 @@
 //! editable by hand: appearance, the external tools files open in, startup. A project's settings are its
 //! `project.toml`; the Settings pane shows both.
 
+use pe2_path::HostPath;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 pub const APP_ID: &str = "pe2-editor";
-const FILE: &str = "settings.toml";
+const FILE: pe2_path::Name = pe2_path::Name::constant("settings.toml");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -216,7 +216,7 @@ pub struct EditorSettings {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub active_configs: std::collections::BTreeMap<String, String>,
     /// The project opened last (state, not a preference).
-    pub last_project: Option<PathBuf>,
+    pub last_project: Option<HostPath>,
     /// Where the main window was (state, not a preference).
     pub main_window: Option<WindowState>,
 }
@@ -233,8 +233,8 @@ pub struct WindowState {
 }
 
 /// Where the settings live: the editor's per-user storage directory.
-pub fn path() -> Option<PathBuf> {
-    extensions::data_folder().map(|d| d.join(FILE))
+pub fn path() -> Option<HostPath> {
+    extensions::data_folder().map(|d| d.join(&FILE))
 }
 
 impl EditorSettings {

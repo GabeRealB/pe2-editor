@@ -1,0 +1,39 @@
+id = "pe2.aro-cpp"
+version = "0.17.1"
+unsandboxed = true
+description = "A C preprocessor taking GCC's cc1 -E arguments, made of aro as zig 0.17.1 carries it: one program, cpp."
+license = "CC0-1.0"
+repository = "https://github.com/GabeRealB/pe2-editor"
+docs = "docs/index.md"
+install = "docs/install.md"
+
+[[setup]]
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "linux-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-linux-x86_64.zip"
+sha256 = "a2398e60a70480099c5c602f54c1b23d0e97dfedbd169c44283e3663e1bb9fce"
+take = { "cpp" = { to = "cpp", sha256 = "a33b65d17c0fbf14d31b1de4fed4d0a593146afe6f12d1f1c3545a234945139b" } }
+
+[[setup]]
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "macos-aarch64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-macos-aarch64.zip"
+sha256 = "3859072b2e80990046e495f4bf0d4a56e4ea07f578f2b5581fca01e91a072d2c"
+take = { "cpp" = { to = "cpp", sha256 = "cdd4156ca6f33d0d1dd28eaf9a5833a7435415974bdd26e627e63334fb9154f4" } }
+
+[[setup]]
+name = "aro-cpp, a C preprocessor made of aro as zig 0.17.1 carries it, built by the PE2 editor"
+license = "MIT"
+copyright = "Zig contributors; aro by Veikka Tuominen and its contributors"
+platform = "windows-x86_64"
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/aro-cpp-0.17.1-1/aro-cpp-0.17.1-windows-x86_64.zip"
+sha256 = "e480cd5facad0a84f5977b009a5ca8ec8ebcf7036b729d195b16e9e6f0fff201"
+take = { "cpp.exe" = { to = "cpp.exe", sha256 = "d2a227d0388b023baebe02eda2cf30df8356fdc643b45eef070787ab0da247c3" } }
+
+[[program]]
+name = "cpp"
+program = "cpp"

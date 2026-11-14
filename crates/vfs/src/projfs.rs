@@ -9,19 +9,20 @@
 //! What it serves no program changes: its files are read-only, and removing, renaming, linking or writing one is
 //! refused to every process but this one, which removes what it no longer serves.
 
+use pe2_path::HostPath;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use windows::Win32::Storage::ProjectedFileSystem::{
     PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN, PRJ_DIR_ENTRY_BUFFER_HANDLE,
-    PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION, PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL,
-    PRJ_NOTIFICATION_MAPPING, PRJ_NOTIFICATION_PARAMETERS, PRJ_NOTIFICATION_PRE_DELETE, PRJ_NOTIFICATION_PRE_RENAME,
-    PRJ_NOTIFICATION_PRE_SET_HARDLINK, PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL, PRJ_NOTIFY_PRE_DELETE, PRJ_NOTIFY_PRE_RENAME,
-    PRJ_NOTIFY_PRE_SET_HARDLINK, PRJ_PLACEHOLDER_INFO, PRJ_PLACEHOLDER_VERSION_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
+    PRJ_FILE_BASIC_INFO, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION,
+    PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL, PRJ_NOTIFICATION_MAPPING, PRJ_NOTIFICATION_PARAMETERS,
+    PRJ_NOTIFICATION_PRE_DELETE, PRJ_NOTIFICATION_PRE_RENAME, PRJ_NOTIFICATION_PRE_SET_HARDLINK,
+    PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL, PRJ_NOTIFY_PRE_DELETE, PRJ_NOTIFY_PRE_RENAME, PRJ_NOTIFY_PRE_SET_HARDLINK,
+    PRJ_PLACEHOLDER_INFO, PRJ_PLACEHOLDER_VERSION_INFO, PRJ_STARTVIRTUALIZING_OPTIONS,
 };
 use windows_core::{GUID, HRESULT, PCWSTR};
 
@@ -50,8 +51,12 @@ type Start = unsafe extern "system" fn(
     *mut PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
 ) -> HRESULT;
 type Stop = unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT);
-type WritePlaceholder =
-    unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PCWSTR, *const PRJ_PLACEHOLDER_INFO, u32) -> HRESULT;
+type WritePlaceholder = unsafe extern "system" fn(
+    PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    PCWSTR,
+    *const PRJ_PLACEHOLDER_INFO,
+    u32,
+) -> HRESULT;
 type Fill = unsafe extern "system" fn(PCWSTR, *const PRJ_FILE_BASIC_INFO, PRJ_DIR_ENTRY_BUFFER_HANDLE) -> HRESULT;
 type WriteData =
     unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, *const GUID, *const c_void, u64, u32) -> HRESULT;
@@ -129,7 +134,7 @@ struct Provider {
 pub struct Projected {
     context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
     provider: *const Provider,
-    at: PathBuf,
+    at: HostPath,
 }
 
 // SAFETY: the context is the library's handle for any thread; the provider is shared, read through its locks.
@@ -158,7 +163,7 @@ const REFUSED: &str = "this is a developer volume (a Dev Drive), which lets the 
 
 /// Why a folder could not be virtualized - and, where its volume lets the filter attach to nothing, that it does:
 /// which only trying tells, what a volume allows being an administrator's to ask.
-fn not_virtualized(at: &Path, why: HRESULT) -> io::Error {
+fn not_virtualized(at: &HostPath, why: HRESULT) -> io::Error {
     /// "The file system minifilter cannot attach to the developer volume."
     const NO_FILTER: u32 = 0x8007_01DE;
     if why.0.cast_unsigned() != NO_FILTER {
@@ -178,7 +183,7 @@ fn not_virtualized(at: &Path, why: HRESULT) -> io::Error {
 ///
 /// # Errors
 /// Windows has no Projected File System turned on, or the folder cannot be made or virtualized.
-pub fn serve(served: &Served, at: &Path) -> io::Result<Projected> {
+pub fn serve(served: &Served, at: &HostPath) -> io::Result<Projected> {
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no Projected File System here"))?;
     std::fs::create_dir_all(at)?;
     let root = wide(&at.to_string_lossy());
@@ -217,14 +222,15 @@ pub fn serve(served: &Served, at: &Path) -> io::Result<Projected> {
     let mut context = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT(std::ptr::null_mut());
     // SAFETY: the root marked above, callbacks of the documented signatures, the provider they are given, and options
     // that live through the call.
-    let started =
-        unsafe { (api.start)(PCWSTR(root.as_ptr()), &raw const callbacks, raw.cast(), &raw const options, &raw mut context) };
+    let started = unsafe {
+        (api.start)(PCWSTR(root.as_ptr()), &raw const callbacks, raw.cast(), &raw const options, &raw mut context)
+    };
     if started.is_err() {
         // SAFETY: the provider made above, which nothing calls into.
         drop(unsafe { std::sync::Arc::from_raw(raw) });
         return Err(not_virtualized(at, started));
     }
-    Ok(Projected { context, provider: raw, at: at.to_path_buf() })
+    Ok(Projected { context, provider: raw, at: at.clone() })
 }
 
 /// A string as Windows takes it: UTF-16, ended by a zero.
@@ -292,7 +298,9 @@ unsafe extern "system" fn placeholder(data: *const PRJ_CALLBACK_DATA) -> HRESULT
     let name = wide(&node.path.replace('/', "\\"));
     let size = u32::try_from(std::mem::size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX);
     // SAFETY: the context of this instance, a path and its placeholder's information, as documented.
-    unsafe { (api.write_placeholder)(data.NamespaceVirtualizationContext, PCWSTR(name.as_ptr()), &raw const info, size) }
+    unsafe {
+        (api.write_placeholder)(data.NamespaceVirtualizationContext, PCWSTR(name.as_ptr()), &raw const info, size)
+    }
 }
 
 unsafe extern "system" fn start_listing(data: *const PRJ_CALLBACK_DATA, id: *const GUID) -> HRESULT {
@@ -430,7 +438,7 @@ impl crate::backend::Backend for AsBackend {
         true
     }
 
-    fn available(&self, at: &Path) -> Result<(), String> {
+    fn available(&self, at: &HostPath) -> Result<(), String> {
         if api().is_none() {
             return Err("the Projected File System is not turned on (the Windows feature `Client-ProjFS`)".into());
         }
@@ -451,7 +459,7 @@ impl crate::backend::Backend for AsBackend {
         Ok(Box::new(serve(job.served, job.at)?))
     }
 
-    fn clear(&self, at: &Path, _name: &str) {
+    fn clear(&self, at: &HostPath, _name: &str) {
         // What it kept on disk of what was read: plain files to Windows once nothing virtualizes the folder.
         let _ = std::fs::remove_dir_all(at);
     }
@@ -459,11 +467,15 @@ impl crate::backend::Backend for AsBackend {
 
 impl crate::backend::Mount for Projected {
     fn shown(&self) -> String {
-        project::host::shown(&self.at)
+        self.at.to_string()
     }
 
     fn released(&self, path: &str) {
         // What was read of it is kept on disk until removed.
-        let _ = std::fs::remove_dir_all(self.at.join(path));
+        // Released by its path in the tree, which holds checked names; one that is none is said, and its copy stays.
+        match pe2_path::RelPath::new(path) {
+            Ok(within) => drop(std::fs::remove_dir_all(self.at.join(&within))),
+            Err(why) => eprintln!("{why}: released, and what was read of it left on disk"),
+        }
     }
 }

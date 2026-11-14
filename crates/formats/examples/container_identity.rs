@@ -4,6 +4,8 @@
 //!
 //! Each container is made again from what it holds as stored - each file's bytes, its stream records, a folder's
 //! stored streams after its files - and compared with the disc's: STAGE0.HED and STAGE0.CDF, and every STAGE<N>.CDF.
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 
 use formats::cdf;
 use std::path::Path;
@@ -36,10 +38,10 @@ fn main() {
     let roms = std::env::args().nth(1).expect("the folder of a release's discs");
     let mut failed = false;
     for disc in ["disk1", "disk2"] {
-        let dir = Path::new(&roms).join(disc);
+        let dir = HostPath::new(Path::new(&roms)).expect("the folder of a release's discs").at(disc);
         // Stage 0: each file up to the next distinct place, its trailing data (the ending's stream) with it.
-        let hed = std::fs::read(dir.join("STAGE0.HED")).expect("STAGE0.HED");
-        let cdf0 = std::fs::read(dir.join("STAGE0.CDF")).expect("STAGE0.CDF");
+        let hed = std::fs::read(dir.at("STAGE0.HED")).expect("STAGE0.HED");
+        let cdf0 = std::fs::read(dir.at("STAGE0.CDF")).expect("STAGE0.CDF");
         let files = cdf::stage0_files(&hed).expect("its files");
         let mut starts: Vec<u64> = files.iter().map(|f| f.offset).collect();
         starts.sort_unstable();
@@ -57,7 +59,7 @@ fn main() {
         failed |= !same;
         println!("{disc}/STAGE0: {}", if same { "the same" } else { "differs" });
         for n in 1..=5 {
-            let Ok(bytes) = std::fs::read(dir.join(format!("STAGE{n}.CDF"))) else { continue };
+            let Ok(bytes) = std::fs::read(dir.at(&format!("STAGE{n}.CDF"))) else { continue };
             let mut src: &[u8] = &bytes;
             let folders = cdf::stage_folders(&mut src).expect("its folders");
             let files = cdf::stage_files(&mut src).expect("its files");

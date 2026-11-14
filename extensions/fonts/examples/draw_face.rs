@@ -2,6 +2,8 @@
 //! and its glyphs written as PNGs.
 //!
 //! `cargo run --release -p pe2-fonts --example draw_face -- <face.ufo> <out dir> [em texels] [outline texels]`
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +15,7 @@ const TEXT: &str = "The quick brown fox jumps over the lazy dog.\nPACK MY BOX WI
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (folder, out) = (Path::new(&args[0]), Path::new(&args[1]));
+    let (folder, out) = (Path::new(&args[0]), HostPath::new(Path::new(&args[1])).expect("the folder to write in"));
     let number = |i: usize| args.get(i).map(|n| n.parse::<f64>().expect("a number"));
     let raster = Raster { pixels_per_em: number(2), outline: number(3).unwrap_or(1.0), ..Raster::default() };
     let mut files = BTreeMap::new();
@@ -33,7 +35,7 @@ fn main() {
     let glyphs = pe2_fonts::face::from_ufo(&font, &raster).expect("its glyphs");
     let drawn = glyphs.iter().filter(|g| g.art.is_some()).count();
     println!("{} glyphs, {drawn} drawn", glyphs.len());
-    std::fs::create_dir_all(out).expect("the out folder");
+    std::fs::create_dir_all(&out).expect("the out folder");
     for (name, image) in
         [("sample.png", pe2_fonts::render::lines(&glyphs, TEXT, 0)), ("glyphs.png", pe2_fonts::render::sheet(&glyphs))]
     {
@@ -43,6 +45,6 @@ fn main() {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().and_then(|mut w| w.write_image_data(&image.rgba)).expect("a PNG");
-        std::fs::write(out.join(name), png).expect("written");
+        std::fs::write(out.at(name), png).expect("written");
     }
 }

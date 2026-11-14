@@ -6,7 +6,7 @@
 
 use eframe::egui::{self, RichText};
 use egui_extras::syntax_highlighting::{self, CodeTheme};
-use std::path::{Path, PathBuf};
+use pe2_path::HostPath;
 use std::time::SystemTime;
 
 use crate::theme;
@@ -37,7 +37,7 @@ enum Content {
 }
 
 /// The highlighter's language for a file's extension, where it knows one.
-fn language(path: &Path) -> Option<&'static str> {
+fn language(path: &HostPath) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match extension.as_str() {
         "c" | "h" | "inc" | "cpp" | "hpp" => "c",
@@ -53,12 +53,12 @@ fn language(path: &Path) -> Option<&'static str> {
     })
 }
 
-fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
+fn stamp(path: &HostPath) -> Option<(u64, SystemTime)> {
     project::content::stat(path).ok()
 }
 
 impl Viewed {
-    fn read(path: &Path) -> Viewed {
+    fn read(path: &HostPath) -> Viewed {
         let stamp = stamp(path);
         let mut truncated = None;
         let content = match project::content::read_range(path, 0, LIMIT) {
@@ -133,22 +133,22 @@ fn split_lines(whole: &egui::text::LayoutJob) -> Vec<egui::text::LayoutJob> {
 /// The files viewed so far, read again when they change on disk.
 #[derive(Default)]
 pub struct Viewer {
-    files: std::collections::HashMap<PathBuf, Viewed>,
+    files: std::collections::HashMap<HostPath, Viewed>,
 }
 
 impl Viewer {
     /// A file's view.
-    fn get(&mut self, path: &Path) -> &mut Viewed {
+    fn get(&mut self, path: &HostPath) -> &mut Viewed {
         let now = stamp(path);
         let stale = self.files.get(path).is_none_or(|v| v.stamp != now);
         if stale {
-            self.files.insert(path.to_path_buf(), Viewed::read(path));
+            self.files.insert(path.clone(), Viewed::read(path));
         }
         self.files.get_mut(path).expect("just read")
     }
 
     /// Show a file: its text, or its bytes.
-    pub fn ui(&mut self, ui: &mut egui::Ui, path: &Path) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, path: &HostPath) {
         let viewed = self.get(path);
         let summary = match &viewed.content {
             Content::Text(text) => {
@@ -234,10 +234,10 @@ mod tests {
 
     #[test]
     fn tells_text_from_binary() {
-        let dir = std::env::temp_dir().join(format!("pe2-viewer-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("viewer");
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, bytes: &[u8]| {
-            let path = dir.join(name);
+            let path = pe2_path::testing::At::at(&dir, name);
             std::fs::write(&path, bytes).unwrap();
             Viewed::read(&path)
         };

@@ -61,3 +61,30 @@ makes = [
 
 A template that takes no files is listed under **File ▸ New node**. One that takes files is offered in the
 [Import dialog](../working/import-export.md) when you import a file it matches.
+
+## Generators
+
+A generator is a node whose outputs are operations: it makes them from a description, for the configuration being
+built, as a build system makes a build from what a project says of it. Each output is an operation used as
+`uid://<generator>#<output>`, made again when the configuration built changes or the generator does. Its outputs name
+one another as `#<output>`.
+
+```toml
+[[stack]]
+id = "description"
+op = "pe2.graph@generator"
+label = "The PlayStation"
+# ... the description, which what generates reads ...
+
+[[stack]]
+op = "pe2.packages@generate"
+part = "package"
+description = { from = "description" }
+
+[[stack]]
+op = "output"
+name = "package"
+```
+
+A generator is made of its own settings and the configuration alone; it reads no other node. What goes wrong making it
+is said where it is used: an operation it should make is not there.

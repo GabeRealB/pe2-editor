@@ -1,7 +1,8 @@
 //! Projects for scenarios, written where each scenario has its own: nothing here comes from a disc.
+use pe2_path::testing::At as _;
 
+use pe2_path::HostPath;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::suite::Suite;
@@ -11,7 +12,7 @@ const LAYER: &str = "base";
 
 /// A project in a folder of its own, gone with it.
 pub struct Fixture {
-    root: PathBuf,
+    root: HostPath,
     /// Someone else's, and left as it is.
     given: bool,
 }
@@ -19,15 +20,15 @@ pub struct Fixture {
 impl Fixture {
     /// A project that is there already.
     #[must_use]
-    pub fn given(root: &Path) -> Fixture {
-        Fixture { root: root.to_path_buf(), given: true }
+    pub fn given(root: &HostPath) -> Fixture {
+        Fixture { root: root.clone(), given: true }
     }
 
     fn new() -> Fixture {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         super::isolate();
         let fixture = Fixture {
-            root: super::folder().join(format!("project-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
+            root: super::folder().at(&format!("project-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
             given: false,
         };
         fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n"));
@@ -35,7 +36,7 @@ impl Fixture {
     }
 
     fn write(&self, path: &str, text: &str) {
-        let path = self.root().join(path);
+        let path = self.root().at(path);
         std::fs::create_dir_all(path.parent().expect("under the root")).expect("a folder");
         std::fs::write(path, text).expect("a file");
     }
@@ -50,7 +51,7 @@ impl Fixture {
     /// A file of a node, whole.
     #[must_use]
     pub fn bytes(self, path: &str, file: &str, bytes: &[u8]) -> Fixture {
-        let at = self.root.join(format!(".layers/{LAYER}/{path}.node/{file}"));
+        let at = self.root.at(&format!(".layers/{LAYER}/{path}.node/{file}"));
         std::fs::create_dir_all(at.parent().expect("a bundle")).expect("a folder");
         std::fs::write(at, bytes).expect("a file");
         self
@@ -68,7 +69,7 @@ impl Fixture {
     pub fn notes_under_records() -> Fixture {
         let fixture = Fixture::notes();
         fixture.write("project.toml", &format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"top\"\n"));
-        project::records::mark(&fixture.root.join(".layers/top"), &project::records::Settings::default())
+        project::records::mark(&fixture.root.at(".layers/top"), &project::records::Settings::default())
             .expect("a records layer");
         fixture
     }
@@ -85,13 +86,13 @@ impl Fixture {
     /// An extension to be held by a layer: its component, with the manifest it carries, in a folder of its own in the
     /// layer's (`extensions/<id>.extension`, as layers held them before records), which `settle` makes the layer hold.
     /// Its folder, for what else it is to have.
-    fn hold(&self, layer: &str, component: &[u8]) -> std::path::PathBuf {
+    fn hold(&self, layer: &str, component: &[u8]) -> HostPath {
         let about = project::ext::component::about(component).expect("who it is");
-        let at = self.root.join(format!(".layers/{layer}/extensions/{}.extension", about.id));
+        let at = self.root.at(&format!(".layers/{layer}/extensions/{}.extension", about.id));
         std::fs::create_dir_all(&at).expect("its folder");
-        std::fs::write(at.join("extension.wasm"), component).expect("a component");
+        std::fs::write(at.at("extension.wasm"), component).expect("a component");
         let manifest = project::ext::component::manifest_text(component).expect("its manifest");
-        std::fs::write(at.join("extension.toml"), manifest).expect("a manifest");
+        std::fs::write(at.at("extension.toml"), manifest).expect("a manifest");
         // What it fetches, as though fetched: a test downloads nothing.
         let store = extensions::setup_folder().expect("a data folder");
         for setup in about.setup.iter().filter(|setup| setup.here()) {
@@ -103,11 +104,11 @@ impl Fixture {
     /// What runs outside the sandbox, in a layer of its own beside the first: the project has to be asked about it.
     #[must_use]
     pub fn untrusted(required: bool) -> Fixture {
-        let bytes = extensions::built_apart("pe2_psx.wasm").expect("built with the others");
+        let bytes = extensions::built_apart("pe2_ffmpeg.wasm").expect("built with the others");
         let fixture = Fixture::new();
         let mut file = format!("[[layer]]\nname = \"{LAYER}\"\n\n[[layer]]\nname = \"mods\"\n");
         if required {
-            file.push_str("\n[[extension]]\nid = \"pe2.psx\"\n");
+            file.push_str("\n[[extension]]\nid = \"pe2.ffmpeg\"\n");
         }
         fixture.write("project.toml", &file);
         fixture.hold("mods", &bytes);
@@ -118,7 +119,7 @@ impl Fixture {
     /// Make a layer hold the extensions `hold` put in it, as a project holds them: each named by a record of the layer's,
     /// its tree in the store.
     fn settle(&self, layer: &str) {
-        let at = self.root.join(".layers").join(layer);
+        let at = self.root.at(".layers").at(layer);
         let project = project::Project::load(&self.root).expect("the project");
         project::records::hold_extensions(&project, &at).expect("its extensions held");
     }
@@ -133,7 +134,7 @@ impl Fixture {
         let mut file = String::new();
         for layer in &layers {
             let _ = writeln!(file, "[[layer]]\nname = \"{layer}\"\n");
-            std::fs::create_dir_all(fixture.root.join(".layers").join(layer)).expect("a layer");
+            std::fs::create_dir_all(fixture.root.at(".layers").at(layer)).expect("a layer");
         }
         for config in &declared.configs {
             let _ = writeln!(file, "[config.{config}]\n");
@@ -148,11 +149,11 @@ impl Fixture {
                 .unwrap_or_else(|| panic!("{id} was not built"));
             fixture.hold(layers[0], &bytes);
         }
-        let tests = std::fs::read(suite.folder.join("tests.wasm")).expect("its tests");
+        let tests = std::fs::read(suite.folder.at("tests.wasm")).expect("its tests");
         let at = fixture.hold(layers[0], &tests);
-        std::fs::create_dir_all(at.join("data")).expect("its data's folder");
-        for entry in std::fs::read_dir(suite.folder.join("data")).into_iter().flatten().flatten() {
-            std::fs::copy(entry.path(), at.join("data").join(entry.file_name())).expect("its data");
+        std::fs::create_dir_all(at.at("data")).expect("its data's folder");
+        for entry in std::fs::read_dir(suite.folder.at("data")).into_iter().flatten().flatten() {
+            std::fs::copy(entry.path(), at.at("data").entry(&entry.file_name())).expect("its data");
         }
         fixture.settle(layers[0]);
         if declared.trust {
@@ -172,9 +173,9 @@ impl Fixture {
             .expect("built with the others");
         let fixture = Fixture::new();
         let at = fixture.hold(LAYER, &component);
-        std::fs::create_dir_all(at.join("tests/data")).expect("its tests' folder");
-        std::fs::write(at.join("tests/tests.wasm"), tests).expect("its tests");
-        std::fs::copy(suite.join("data/doll.usda"), at.join("tests/data/doll.usda")).expect("its data");
+        std::fs::create_dir_all(at.at("tests/data")).expect("its tests' folder");
+        std::fs::write(at.at("tests/tests.wasm"), tests).expect("its tests");
+        std::fs::copy(suite.at("data/doll.usda"), at.at("tests/data/doll.usda")).expect("its data");
         fixture.settle(LAYER);
         fixture
     }
@@ -279,14 +280,14 @@ name = "played"
     }
 
     #[must_use]
-    pub fn root(&self) -> &Path {
+    pub fn root(&self) -> &HostPath {
         &self.root
     }
 
     /// Where a node's declaration is.
     #[must_use]
-    pub fn node_file(&self, path: &str) -> PathBuf {
-        self.root().join(format!(".layers/{LAYER}/{path}.node/node.toml"))
+    pub fn node_file(&self, path: &str) -> HostPath {
+        self.root().at(&format!(".layers/{LAYER}/{path}.node/node.toml"))
     }
 }
 

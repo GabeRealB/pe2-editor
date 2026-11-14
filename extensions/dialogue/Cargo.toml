@@ -22,4 +22,5 @@ toml.workspace = true
 typeface.workspace = true
 
 [dev-dependencies]
+pe2-path = { workspace = true, features = ["testing"] }
 serde_json.workspace = true

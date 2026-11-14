@@ -1,28 +1,18 @@
 # pe2.psx
 
-The PlayStation target. It provides `package-target`: given the files `pe2.packages` gathered for a package, it
-compiles the package's C units, assembles its assembly, and links its image by the package's link script, which places
-it in the game's memory.
+The PlayStation, as the build of a package ends: what is the platform's and no compiler's.
 
-A config builds for it by naming it as its target (`target = "psx"` in `[config.<name>]` of `project.toml`).
+A package's build - an operation of the project's, its programs offered by the tool extensions - compiles the package,
+links it by its link script, which places it in the game's memory, and cuts its image out of what it linked
+(`objcopy -j .image`). **The image the game loads** (`pe2.psx@finish`) is its last step: it makes that image the
+package's `.pe2pkg`, named as the release names its files (`aya/mist`: `aya_mist.pe2pkg`), or, for a package marked an
+executable (`target.psx.executable = true`), the executable the PlayStation's BIOS loads: the PS-X EXE header - its
+entry point, where it loads and how much, the stack, the region's license string of the release built - before the
+image, padded to whole sectors.
 
-## What it runs
+A configuration builds for it by naming it as its target (`target = "psx"`), which also picks what packages say of
+this target alone (`target.psx` in a package: its link script, its prebuilt objects, what it publishes).
 
-| Program | What for | Where it comes from |
-|---|---|---|
-| `cpp` | preprocessing, taking what a GCC's `cc1 -E` takes | fetched: the C preprocessor of aro, the C front end zig carries |
-| `cc1` | compiling, as GCC 2.8.1 for the PlayStation | fetched: GCC 2.8.1 with old-gcc's patches for the PlayStation |
-| `maspsx` | the compiler's assembly made what the original assembler made | fetched: maspsx at commit `4ffa8b5`, with three patches of this extension's (`patches/`), run by Python 3.14, fetched too |
-| `mips-linux-gnu-as`, `-ld`, `-nm`, `-objcopy` | assembling, linking, reading symbols, making images | fetched: GNU binutils 2.47 for `mipsel` |
+It also tells a language server what a package's sources are read as (`flags`).
 
-The preprocessor, the compiler, the binutils and Python are built from their sources by the editor's own releases, for
-Linux on x86_64, macOS on Apple silicon and Windows; maspsx is fetched from its own repository. Those for Linux and
-Windows were checked: built with them, every package's image is the game's own, byte for byte. Those for macOS have not
-been run yet.
-
-What it fetches is downloaded once a machine, from where its manifest says and checked against the hashes it gives:
-trusting it consents to that, and the editor fetches it once it runs (`pe2-cli project extension setup pe2.psx` does so
-ahead of time). The trust prompt lists each download, with its license and who holds its rights. A program is looked for in its
-folder, then in what was fetched, then on the system. What the system has to provide is in [installing](install.md).
-
-It runs outside the sandbox: you trust it before anything of it runs.
+It runs no program, and runs in the sandbox.

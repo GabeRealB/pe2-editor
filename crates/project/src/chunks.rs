@@ -39,30 +39,36 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+/// Where a store keeps what it keeps by `key`, as `ab/abcdef`: an error where the key is no name a file can have.
+fn sharded(dir: &HostPath, key: &str) -> io::Result<HostPath> {
+    Ok(dir.join(&RelPath::sharded(key, "").map_err(io::Error::other)?))
+}
+use pe2_path::{HostPath, Name, RelPath};
 use std::time::{Duration, SystemTime};
 
 /// Files this long or longer are stored as chunks.
 pub const THRESHOLD: usize = 1 << 20;
 
 /// What this process wrote into stores and has not had on disk yet - as many as are worth telling apart.
-static WRITTEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static WRITTEN: std::sync::Mutex<Vec<HostPath>> = std::sync::Mutex::new(Vec::new());
 /// How many of them are kept: a process that fills a layer from the discs writes far more, and takes none of them up.
 const KEPT: usize = 4096;
 
 /// A file was written into a store.
-fn written(path: &Path) {
+fn written(path: &HostPath) {
     let mut written = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if written.len() < KEPT {
-        written.push(path.to_path_buf());
+        written.push(path.clone());
     }
 }
 
 /// Have on disk what this process wrote into the stores of the project in `root` since it last did: before a
 /// record that names any of it is said in the log, so that what the log brings back names nothing a loss of power
 /// took (`storage::Storage::say`). What it wrote for another project is that one's to have on disk.
-pub fn sync_written(root: &Path) {
-    let written: Vec<PathBuf> = {
+pub fn sync_written(root: &HostPath) {
+    let written: Vec<HostPath> = {
         let mut all = WRITTEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (ours, others) = std::mem::take(&mut *all).into_iter().partition(|path| path.starts_with(root));
         *all = others;
@@ -73,15 +79,15 @@ pub fn sync_written(root: &Path) {
     }
 }
 /// The name a manifest adds to its file's.
-pub const SUFFIX: &str = ".chunks";
+pub const SUFFIX: Name = Name::constant(".chunks");
 /// The store, among a project's layers.
-pub const STORE: &str = ".store";
+pub const STORE: Name = Name::constant(".store");
 /// Where the store keeps whole files by their SHA-1 - a manifest of chunks each, whatever their size: the versions an
 /// override was made from (`changeset::Base`), what a layer holds of its own.
-const FILES: &str = "files";
+const FILES: Name = Name::constant("files");
 /// Where it keeps whole objects, and trees of them.
-const OBJECTS: &str = "objects";
-const TREES: &str = "trees";
+const OBJECTS: Name = Name::constant("objects");
+const TREES: Name = Name::constant("trees");
 const TREE_HEADER: &str = "pe2 tree 1";
 const HEADER: &str = "pe2 chunks 1";
 const MIN: usize = 16 << 10;
@@ -252,18 +258,18 @@ impl Tree {
 /// A project's chunk store.
 #[derive(Clone, Debug)]
 pub struct Store {
-    pub dir: PathBuf,
+    pub dir: HostPath,
 }
 
 impl Store {
     /// The store of the project in `root`.
     #[must_use]
-    pub fn at(root: &Path) -> Store {
-        Store { dir: root.join(crate::LAYERS).join(STORE) }
+    pub fn at(root: &HostPath) -> Store {
+        Store { dir: root.join(&crate::LAYERS).join(&STORE) }
     }
 
-    fn file_path(&self, sha1: &str) -> PathBuf {
-        self.dir.join(FILES).join(&sha1[..2.min(sha1.len())]).join(sha1)
+    fn file_path(&self, sha1: &str) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&FILES), sha1)
     }
 
     /// Keep a file whole, by its SHA-1 (given), its chunks shared with every other file holding them.
@@ -272,7 +278,7 @@ impl Store {
     /// It cannot be written.
     pub fn put_file(&self, bytes: &[u8]) -> io::Result<String> {
         let sha1 = crate::extract::sha1_hex(bytes);
-        let path = self.file_path(&sha1);
+        let path = self.file_path(&sha1)?;
         if path.exists() {
             // Kept again: as new to a sweep as one written now, its chunks too.
             let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(SystemTime::now()));
@@ -280,7 +286,7 @@ impl Store {
             return Ok(sha1);
         }
         let manifest = self.put(bytes)?;
-        std::fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, manifest.render())?;
         std::fs::rename(&temporary, &path)?;
@@ -293,7 +299,7 @@ impl Store {
     /// # Errors
     /// It is not kept, or its chunks are not all there.
     pub fn get_file(&self, sha1: &str) -> io::Result<Vec<u8>> {
-        let manifest = Manifest::parse(&std::fs::read_to_string(self.file_path(sha1))?)?;
+        let manifest = Manifest::parse(&std::fs::read_to_string(self.file_path(sha1)?)?)?;
         let len = usize::try_from(manifest.size).map_err(io::Error::other)?;
         manifest.read_range(self, 0, len)
     }
@@ -303,29 +309,31 @@ impl Store {
     /// # Errors
     /// It is not kept.
     pub fn file_manifest(&self, sha1: &str) -> io::Result<Manifest> {
-        Manifest::parse(&std::fs::read_to_string(self.file_path(sha1))?)
+        Manifest::parse(&std::fs::read_to_string(self.file_path(sha1)?)?)
     }
 
     /// Where a whole object is: a file only ever read, never written once kept.
-    #[must_use]
-    pub fn object_path(&self, sha1: &str) -> PathBuf {
-        self.dir.join(OBJECTS).join(&sha1[..2.min(sha1.len())]).join(sha1)
+    ///
+    /// # Errors
+    /// Its hash is no name a file can have.
+    pub fn object_path(&self, sha1: &str) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&OBJECTS), sha1)
     }
 
-    fn tree_path(&self, sha1: &str) -> PathBuf {
-        self.dir.join(TREES).join(&sha1[..2.min(sha1.len())]).join(sha1)
+    fn tree_path(&self, sha1: &str) -> io::Result<HostPath> {
+        sharded(&self.dir.join(&TREES), sha1)
     }
 
     /// Write `bytes` at `path` once: where it is there already, it is touched instead (as new to a sweep as one written
     /// now), as what is named by its hash holds the same.
-    fn write_once(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fn write_once(&self, path: &HostPath, bytes: &[u8]) -> io::Result<()> {
         if path.exists() {
             // A read-only object is touched through a handle opened to read: its owner may set its times.
             let opened = std::fs::File::options().write(true).open(path).or_else(|_| std::fs::File::open(path));
             let _ = opened.and_then(|f| f.set_modified(SystemTime::now()));
             return Ok(());
         }
-        std::fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, bytes)?;
         std::fs::rename(&temporary, path)?;
@@ -339,7 +347,7 @@ impl Store {
     /// It cannot be written.
     pub fn put_object(&self, bytes: &[u8]) -> io::Result<String> {
         let sha1 = crate::extract::sha1_hex(bytes);
-        let path = self.object_path(&sha1);
+        let path = self.object_path(&sha1)?;
         self.write_once(&path, bytes)?;
         // Read-only: an object is what its hash says, and what reads it in place must not change it.
         let mut permissions = std::fs::metadata(&path)?.permissions();
@@ -355,7 +363,7 @@ impl Store {
     /// # Errors
     /// It is not kept.
     pub fn get_object(&self, sha1: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.object_path(sha1))
+        std::fs::read(self.object_path(sha1)?)
     }
 
     /// Keep a tree (its objects kept already), by the SHA-1 of its text (given).
@@ -365,7 +373,7 @@ impl Store {
     pub fn put_tree(&self, tree: &Tree) -> io::Result<String> {
         let text = tree.render();
         let sha1 = crate::extract::sha1_hex(text.as_bytes());
-        self.write_once(&self.tree_path(&sha1), text.as_bytes())?;
+        self.write_once(&self.tree_path(&sha1)?, text.as_bytes())?;
         Ok(sha1)
     }
 
@@ -374,23 +382,23 @@ impl Store {
     /// # Errors
     /// It is not kept, or is no tree.
     pub fn get_tree(&self, sha1: &str) -> io::Result<Tree> {
-        Tree::parse(&std::fs::read_to_string(self.tree_path(sha1))?)
+        Tree::parse(&std::fs::read_to_string(self.tree_path(sha1)?)?)
     }
 
     /// Keep a folder's files as a tree of whole objects, by the tree's SHA-1 (given), with the tree.
     ///
     /// # Errors
     /// A file cannot be read, or kept.
-    pub fn put_folder(&self, folder: &Path) -> io::Result<(String, Tree)> {
-        fn walk(dir: &Path, at: &str, out: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
+    pub fn put_folder(&self, folder: &HostPath) -> io::Result<(String, Tree)> {
+        fn walk(dir: &HostPath, at: &str, out: &mut Vec<(String, HostPath)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let path = if at.is_empty() { name } else { format!("{at}/{name}") };
                 if entry.file_type()?.is_dir() {
-                    walk(&entry.path(), &path, out)?;
+                    walk(&dir.entry(&entry.file_name()), &path, out)?;
                 } else {
-                    out.push((path, entry.path()));
+                    out.push((path, dir.entry(&entry.file_name())));
                 }
             }
             Ok(())
@@ -412,7 +420,7 @@ impl Store {
             #[cfg(unix)]
             if executable {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(self.object_path(&sha1), std::fs::Permissions::from_mode(0o555))?;
+                std::fs::set_permissions(self.object_path(&sha1)?, std::fs::Permissions::from_mode(0o555))?;
             }
             tree.files.insert(name, TreeFile { sha1, size: bytes.len() as u64, executable });
         }
@@ -420,13 +428,18 @@ impl Store {
     }
 
     /// Every whole object and tree kept, by SHA-1, with where.
-    fn kept_in(&self, kind: &str) -> Vec<(String, PathBuf)> {
-        let shards = std::fs::read_dir(self.dir.join(kind)).into_iter().flatten().flatten();
+    fn kept_in(&self, kind: &Name) -> Vec<(String, HostPath)> {
+        let dir = self.dir.join(kind);
+        let shards = std::fs::read_dir(&dir).into_iter().flatten().flatten();
         shards
-            .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
-            .filter_map(|file| {
+            .flat_map(|shard| {
+                let shard = dir.entry(&shard.file_name());
+                let files = std::fs::read_dir(&shard).into_iter().flatten().flatten();
+                files.map(move |file| (shard.clone(), file))
+            })
+            .filter_map(|(shard, file)| {
                 let name = file.file_name().to_str().filter(|n| Path::new(n).extension().is_none())?.to_string();
-                Some((name, file.path()))
+                Some((name, shard.entry(&file.file_name())))
             })
             .collect()
     }
@@ -434,23 +447,23 @@ impl Store {
     /// Whether a file is kept, by its SHA-1.
     #[must_use]
     pub fn has_file(&self, sha1: &str) -> bool {
-        self.file_path(sha1).is_file()
+        self.file_path(sha1).is_ok_and(|path| path.is_file())
     }
 
     /// Every file kept whole, by SHA-1, with its manifest's text.
-    fn files(&self) -> Vec<(String, PathBuf)> {
-        self.kept_in(FILES)
+    fn files(&self) -> Vec<(String, HostPath)> {
+        self.kept_in(&FILES)
     }
 
     /// The store of the project whose layers hold a path: none for a path in no project's `.layers`.
     #[must_use]
-    pub fn of(path: &Path) -> Option<Store> {
+    pub fn of(path: &HostPath) -> Option<Store> {
         let layers = path.ancestors().find(|a| a.file_name().is_some_and(|n| n == crate::LAYERS))?;
-        Some(Store { dir: layers.join(STORE) })
+        Some(Store { dir: layers.join(&STORE) })
     }
 
-    fn path(&self, hash: &str) -> PathBuf {
-        self.dir.join(&hash[..2.min(hash.len())]).join(hash)
+    fn path(&self, hash: &str) -> io::Result<HostPath> {
+        sharded(&self.dir, hash)
     }
 
     /// A chunk.
@@ -458,7 +471,7 @@ impl Store {
     /// # Errors
     /// It is not in the store.
     pub fn get(&self, hash: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(self.path(hash))
+        std::fs::read(self.path(hash)?)
     }
 
     /// Store a content's chunks - those not stored already - and give its manifest.
@@ -470,13 +483,13 @@ impl Store {
         for cut in fastcdc::v2020::FastCDC::new(bytes, MIN, AVG, MAX) {
             let chunk = &bytes[cut.offset..cut.offset + cut.length];
             let hash = blake3::hash(chunk).to_hex().to_string();
-            let path = self.path(&hash);
+            let path = self.path(&hash)?;
             if path.exists() {
                 // Stored again: as new to a sweep as one written now (`sweep_settled`).
                 let _ =
                     std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(SystemTime::now()));
             } else {
-                std::fs::create_dir_all(path.parent().unwrap_or(&self.dir))?;
+                std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
                 let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
                 std::fs::File::create(&temporary)?.write_all(chunk)?;
                 std::fs::rename(&temporary, &path)?;
@@ -505,7 +518,7 @@ impl Store {
     pub fn remove(&self, hashes: &BTreeSet<String>) -> u64 {
         let mut freed = 0;
         for hash in hashes {
-            let path = self.path(hash);
+            let Ok(path) = self.path(hash) else { continue };
             freed += std::fs::metadata(&path).map_or(0, |m| m.len());
             let _ = std::fs::remove_file(path);
         }
@@ -515,17 +528,14 @@ impl Store {
 
 /// A file's manifest: its path with `.chunks` added.
 #[must_use]
-pub fn manifest_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(SUFFIX);
-    PathBuf::from(name)
+pub fn manifest_path(path: &HostPath) -> HostPath {
+    path.with_suffix(&SUFFIX)
 }
 
 /// The file a manifest stands for: its path without `.chunks`; none for a path that is no manifest.
 #[must_use]
-pub fn logical(path: &Path) -> Option<PathBuf> {
-    let text = path.to_str()?;
-    text.strip_suffix(SUFFIX).map(PathBuf::from)
+pub fn logical(path: &HostPath) -> Option<HostPath> {
+    path.without_suffix(&SUFFIX)
 }
 
 /// The chunks no manifest names: of the store, those absent from `named`.
@@ -543,9 +553,9 @@ pub struct Pass {
 }
 
 /// Every file of a folder, recursively, its hidden ones too (`.chunks` manifests are not hidden; the store is not walked).
-fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+fn files_under(dir: &HostPath, out: &mut Vec<HostPath>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
+        let path = dir.entry(&entry.file_name());
         match entry.file_type() {
             Ok(t) if t.is_dir() && entry.file_name() != STORE => files_under(&path, out),
             Ok(t) if t.is_file() => out.push(path),
@@ -564,9 +574,9 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 /// A file cannot be read, or its chunks or manifest written.
 pub fn migrate(project: &crate::Project, index: &crate::index::Index) -> io::Result<Pass> {
     let mut pass = Pass::default();
-    let layers: Vec<&Path> = project.layers.iter().filter(|l| !l.mounted).map(|l| l.path.as_path()).collect();
-    let in_layers = |path: &Path| layers.iter().any(|layer| path.starts_with(layer));
-    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
+    let layers: Vec<&HostPath> = project.layers.iter().filter(|l| !l.mounted).map(|l| &l.path).collect();
+    let in_layers = |path: &HostPath| layers.iter().any(|layer| path.starts_with(layer));
+    let mut found: BTreeSet<HostPath> = BTreeSet::new();
     for entry in index.entries.values().filter(|e| e.kind == crate::index::Kind::File) {
         found.insert(entry.disk.clone());
     }
@@ -587,8 +597,13 @@ pub fn migrate(project: &crate::Project, index: &crate::index::Index) -> io::Res
         pass.before += len;
         pass.after += manifest.len() as u64;
     }
-    let store = Store { dir: project.root.join(crate::LAYERS).join(STORE) };
-    let held: u64 = store.hashes().iter().map(|h| std::fs::metadata(store.path(h)).map_or(0, |m| m.len())).sum();
+    let store = Store::at(&project.root);
+    let held: u64 = store
+        .hashes()
+        .iter()
+        .filter_map(|h| store.path(h).ok())
+        .map(|path| std::fs::metadata(path).map_or(0, |m| m.len()))
+        .sum();
     pass.after += held;
     Ok(pass)
 }
@@ -614,13 +629,13 @@ pub fn sweep(project: &crate::Project) -> io::Result<(usize, u64)> {
 pub const SWEEP_EVERY: Duration = Duration::from_hours(24);
 pub const SETTLED: Duration = Duration::from_hours(1);
 /// When it was swept last, in the cache.
-const SWEPT: &str = "chunks.swept";
+const SWEPT: Name = Name::constant("chunks.swept");
 
 /// Sweep the store where it was not swept for `SWEEP_EVERY`, of chunks nothing names and stored longer ago than
 /// `SETTLED`, while the project is written: how many went and the bytes they held, none where it was not due.
 #[must_use = "what was swept is the sweep's report"]
 pub fn sweep_if_due(project: &crate::Project) -> Option<io::Result<(usize, u64)>> {
-    let marker = project.root.join(crate::cache::DIR).join(SWEPT);
+    let marker = project.root.join(&crate::cache::DIR).join(&SWEPT);
     let age = std::fs::metadata(&marker).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
     if age.is_some_and(|age| age < SWEEP_EVERY) {
         return None;
@@ -640,7 +655,7 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
     for layer in project.layers.iter().filter(|l| !l.mounted) {
         files_under(&layer.path, &mut found);
     }
-    files_under(&project.root.join(crate::cache::DIR).join("history"), &mut found);
+    files_under(&project.root.join(&crate::cache::DIR).join(&crate::history::DIR), &mut found);
     // The changesets name the files kept whole that overrides were made from; the history, those its steps can put back.
     found.extend(project.layers.iter().map(|l| l.changeset.clone()));
     let mut kept = BTreeSet::new();
@@ -655,17 +670,17 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
         }
     }
     // A packed layer's listing names its chunks too.
-    for layer in project.layers.iter().filter(|l| l.path.join(crate::pack::FILE).is_file()) {
+    for layer in project.layers.iter().filter(|l| l.path.join(&crate::pack::FILE).is_file()) {
         named.extend(crate::pack::Pack::open(&layer.path)?.chunks());
     }
     let store = Store::at(&project.root);
-    let old = |path: &Path| {
+    let old = |path: &HostPath| {
         let modified = std::fs::metadata(path).and_then(|m| m.modified());
         settled.is_zero() || modified.ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= settled)
     };
     // A tree named keeps its objects; one nothing names goes, and so does an object neither a tree nor a text names.
     let (mut gone_files, mut freed) = (0, 0);
-    for (sha1, path) in store.kept_in(TREES) {
+    for (sha1, path) in store.kept_in(&TREES) {
         if kept.contains(&sha1) || !old(&path) {
             let tree = std::fs::read_to_string(&path).ok().and_then(|t| Tree::parse(&t).ok()).unwrap_or_default();
             kept.extend(tree.files.into_values().map(|file| file.sha1));
@@ -675,7 +690,7 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
             let _ = std::fs::remove_file(&path);
         }
     }
-    for (sha1, path) in store.kept_in(OBJECTS) {
+    for (sha1, path) in store.kept_in(&OBJECTS) {
         if !kept.contains(&sha1) && old(&path) {
             freed += std::fs::metadata(&path).map_or(0, |m| m.len());
             gone_files += 1;
@@ -694,13 +709,13 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
         }
     }
     let mut gone = unreferenced(&store, &named);
-    gone.retain(|hash| old(&store.path(hash)));
+    gone.retain(|hash| store.path(hash).is_ok_and(|path| old(&path)));
     freed += store.remove(&gone);
     Ok((gone.len() + gone_files, freed))
 }
 
 /// Remove a whole object, read-only as it is: Windows refuses to remove a read-only file.
-fn remove_object(path: &Path) {
+fn remove_object(path: &HostPath) {
     if let Ok(meta) = std::fs::metadata(path) {
         let mut permissions = meta.permissions();
         #[expect(clippy::permissions_set_readonly_false, reason = "it is removed at once")]
@@ -724,6 +739,7 @@ fn sha1s_in(text: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{Manifest, Store};
+    use crate::testing::At as _;
 
     fn content(len: usize, seed: u32) -> Vec<u8> {
         let mut x = seed;
@@ -739,7 +755,7 @@ mod tests {
 
     #[test]
     fn a_large_file_reads_back_by_range_and_an_edit_stores_little() {
-        let dir = std::env::temp_dir().join(format!("pe2-chunks-{}", std::process::id()));
+        let dir = crate::testing::scratch("chunks");
         let store = Store { dir: dir.clone() };
         let bytes = content(3 << 20, 7);
         let manifest = store.put(&bytes).expect("stored");
@@ -761,15 +777,15 @@ mod tests {
 
     #[test]
     fn a_tree_keeps_its_objects_from_a_sweep_while_something_names_it() {
-        let root = std::env::temp_dir().join(format!("pe2-chunks-tree-{}", std::process::id()));
+        let root = crate::testing::scratch("chunks-tree");
         let _ = std::fs::remove_dir_all(&root);
         crate::create(&root).unwrap();
         let project = crate::Project::load(&root).unwrap();
         let store = Store::at(&root);
-        let folder = root.join("x.extension");
-        std::fs::create_dir_all(folder.join("docs")).unwrap();
-        std::fs::write(folder.join("extension.wasm"), content(300_000, 4)).unwrap();
-        std::fs::write(folder.join("docs/a b.md"), "# A\n").unwrap();
+        let folder = root.at("x.extension");
+        std::fs::create_dir_all(folder.at("docs")).unwrap();
+        std::fs::write(folder.at("extension.wasm"), content(300_000, 4)).unwrap();
+        std::fs::write(folder.at("docs/a b.md"), "# A\n").unwrap();
         let (sha1, tree) = store.put_folder(&folder).unwrap();
         assert_eq!(super::Tree::parse(&tree.render()).unwrap(), tree);
         assert_eq!(store.get_tree(&sha1).unwrap(), tree);
@@ -777,7 +793,7 @@ mod tests {
         // Kept again: the same hash, nothing new.
         assert_eq!(store.put_folder(&folder).unwrap().0, sha1);
         // Named in a layer's text, the tree and its objects stay; named by nothing, they go.
-        let named = root.join(crate::LAYERS).join("project").join("named.toml");
+        let named = root.join(&crate::LAYERS).at("project").at("named.toml");
         std::fs::write(&named, format!("tree = \"{sha1}\"\n")).unwrap();
         assert_eq!(super::sweep(&project).unwrap().0, 0);
         std::fs::remove_file(&named).unwrap();
@@ -789,15 +805,15 @@ mod tests {
     #[test]
     fn a_sweep_while_writing_leaves_what_was_stored_lately() {
         use std::time::{Duration, SystemTime};
-        let root = std::env::temp_dir().join(format!("pe2-chunks-sweep-{}", std::process::id()));
+        let root = crate::testing::scratch("chunks-sweep");
         let _ = std::fs::remove_dir_all(&root);
         crate::create(&root).unwrap();
         let project = crate::Project::load(&root).unwrap();
-        let store = Store { dir: root.join(crate::LAYERS).join(super::STORE) };
+        let store = Store { dir: root.join(&crate::LAYERS).join(&super::STORE) };
         let (old, fresh, again) = (content(200_000, 1), content(200_000, 2), content(200_000, 3));
         let age = |m: &Manifest, by: Duration| {
             for (hash, _) in &m.chunks {
-                let file = std::fs::File::options().write(true).open(store.path(hash)).unwrap();
+                let file = std::fs::File::options().write(true).open(store.path(hash).unwrap()).unwrap();
                 file.set_modified(SystemTime::now() - by).unwrap();
             }
         };

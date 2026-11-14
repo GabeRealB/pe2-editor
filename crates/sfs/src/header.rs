@@ -1,13 +1,13 @@
 //! The shared header: one page (`state`) every process of a project maps, of positions in the log kept as atomics -
 //! read with no call to the system and no question to another process.
 
+use pe2_path::HostPath;
 use std::fs::File;
 use std::io;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The header's file, in the library's folder.
-pub const FILE: &str = "state";
+pub const FILE: pe2_path::Name = pe2_path::Name::constant("state");
 
 const MAGIC: u64 = u64::from_le_bytes(*b"pe2sfs\x00\x01");
 const SIZE: usize = 4096;
@@ -33,7 +33,12 @@ pub struct Header {
 impl std::fmt::Debug for Header {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (tail, durable) = (self.tail(), self.durable());
-        write!(f, "header (tail {tail}, kept from {durable}, in transit {:?}, storage {:?})", self.transit(), self.storage())
+        write!(
+            f,
+            "header (tail {tail}, kept from {durable}, in transit {:?}, storage {:?})",
+            self.transit(),
+            self.storage()
+        )
     }
 }
 
@@ -42,9 +47,10 @@ impl Header {
     ///
     /// # Errors
     /// The file cannot be made or mapped, or is no header of this format.
-    pub fn open(dir: &Path) -> io::Result<Header> {
+    pub fn open(dir: &HostPath) -> io::Result<Header> {
         std::fs::create_dir_all(dir)?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(FILE))?;
+        let file =
+            std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(&FILE))?;
         if file.metadata()?.len() < SIZE as u64 {
             // Written, not only sized: the page is the file's own, never a hole that a full disk could refuse.
             use std::io::Write as _;

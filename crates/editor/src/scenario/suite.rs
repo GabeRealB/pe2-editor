@@ -10,8 +10,8 @@
 //!         test.toml       what a project for them holds
 //!         data/           what they make their nodes from
 //! ```
-
-use std::path::{Path, PathBuf};
+use pe2_path::HostPath;
+use pe2_path::testing::At as _;
 
 use serde::Deserialize;
 
@@ -42,7 +42,7 @@ pub struct Declared {
 pub struct Suite {
     /// What it is called: the extension it is of.
     pub name: String,
-    pub folder: PathBuf,
+    pub folder: HostPath,
     pub declared: Declared,
 }
 
@@ -51,19 +51,19 @@ impl Suite {
     ///
     /// # Errors
     /// Its `test.toml` cannot be read.
-    pub fn at(folder: &Path) -> Result<Suite, String> {
+    pub fn at(folder: &HostPath) -> Result<Suite, String> {
         let name = folder
             .parent()
-            .and_then(Path::file_name)
-            .map_or_else(|| "tests".to_string(), |name| name.to_string_lossy().into_owned());
-        let manifest = folder.join("test.toml");
+            .and_then(|extension| extension.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "tests".to_string());
+        let manifest = folder.at("test.toml");
         let text = if manifest.is_file() {
             std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?
         } else {
             String::new()
         };
         let declared = toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest.display()))?;
-        Ok(Suite { name, folder: folder.to_path_buf(), declared })
+        Ok(Suite { name, folder: folder.clone(), declared })
     }
 
     /// A project of what it declares.
@@ -119,7 +119,7 @@ pub struct Out {
     /// Each thing as a line of JSON, for whatever is reading.
     pub json: bool,
     /// Where to keep what the window showed when a test failed.
-    pub artifacts: Option<PathBuf>,
+    pub artifacts: Option<HostPath>,
 }
 
 impl Out {
@@ -221,11 +221,11 @@ pub fn built() -> Vec<Suite> {
 ///
 /// # Errors
 /// One holds no tests, or its `test.toml` cannot be read.
-pub fn in_folders(folders: &[PathBuf]) -> Result<Vec<Suite>, String> {
-    let found = |folder: &PathBuf| {
-        let inside = folder.join("tests");
+pub fn in_folders(folders: &[HostPath]) -> Result<Vec<Suite>, String> {
+    let found = |folder: &HostPath| {
+        let inside = folder.at("tests");
         let folder = if inside.is_dir() { inside } else { folder.clone() };
-        if folder.join("tests.wasm").is_file() {
+        if folder.at("tests.wasm").is_file() {
             Suite::at(&folder)
         } else {
             Err(format!("{}: no tests.wasm", folder.display()))

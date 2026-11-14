@@ -6,8 +6,8 @@
 //! shown in the status bar and the pane. What failed waits to be tried again, from the pane. Between fetches, the store
 //! is swept where a sweep is due (`setup::kept`), keeping what the project's extensions name.
 
+use pe2_path::HostPath;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +35,7 @@ struct Running {
 pub struct Fetcher {
     running: Option<Running>,
     /// Asked for, to fetch next: each with its extension and its folder, where its patches are.
-    queued: VecDeque<(String, Option<PathBuf>, Setup)>,
+    queued: VecDeque<(String, Option<HostPath>, Setup)>,
     /// What failed, by key, with why: tried again only when asked.
     failed: BTreeMap<String, String>,
     /// When this asked last whether the store is due a sweep.
@@ -67,7 +67,7 @@ impl Fetcher {
         let wanted = |setup: &Setup| !setup.fetched(&store) && !failed.contains_key(&setup.key());
         let required = extensions.present.iter().find_map(|present| {
             let setup = extensions::required(present).into_iter().find(|setup| wanted(setup))?;
-            Some((present.id.clone(), present.origin.folder().map(PathBuf::from), setup.clone()))
+            Some((present.id.clone(), present.origin.folder().cloned(), setup.clone()))
         });
         let next = match required {
             Some(next) => Some(next),
@@ -92,7 +92,7 @@ impl Fetcher {
             };
             let mut progress = |done, total| set(State::Fetching(done, total));
             let cancel = AtomicBool::new(false);
-            if let Err(e) = project::ext::setup::fetch(&fetched, &store, folder.as_deref(), &mut progress, &cancel) {
+            if let Err(e) = project::ext::setup::fetch(&fetched, &store, folder.as_ref(), &mut progress, &cancel) {
                 set(State::Failed(format!("{e:#}")));
             }
             finished.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -102,9 +102,9 @@ impl Fetcher {
     }
 
     /// Fetch something optional now: what an extension would fetch when it asks for it, its patches in its folder.
-    pub fn fetch_now(&mut self, id: &str, folder: Option<&std::path::Path>, setup: &Setup) {
+    pub fn fetch_now(&mut self, id: &str, folder: Option<&HostPath>, setup: &Setup) {
         self.failed.remove(&setup.key());
-        self.queued.push_back((id.to_string(), folder.map(PathBuf::from), setup.clone()));
+        self.queued.push_back((id.to_string(), folder.cloned(), setup.clone()));
     }
 
     /// Try what failed again.

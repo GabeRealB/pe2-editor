@@ -470,7 +470,8 @@ impl UiHost for Host<'_> {
         let fill = ui.visuals().widgets.inactive.weak_bg_fill;
         let width = if width > 0.0 { width } else { ui.available_width() };
         let rows = usize::try_from(rows.max(1)).unwrap_or(1);
-        let edit = egui::TextEdit::multiline(text).id_salt(id).desired_width(width).desired_rows(rows).background_color(fill);
+        let edit =
+            egui::TextEdit::multiline(text).id_salt(id).desired_width(width).desired_rows(rows).background_color(fill);
         let response = ui.add_enabled(self.frame.editable, edit);
         let committed = response.lost_focus();
         self.last = Some(response);

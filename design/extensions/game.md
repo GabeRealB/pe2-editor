@@ -32,7 +32,17 @@ A room's bundle declares its resources by index and joins them as the disc store
 are data nodes of their structure, their text in string tables, their glyphs from font faces; a translated table is
 laid over the original by the configuration's language. Flags are named in registries, each ID owned by one name.
 
+## Building the game's code
+
+The game's packages are built by graphs of the project's, not by an extension that knows the toolchain: `pe2.packages`
+gives the pieces a build is wired from (a language's units, a first pass's files, `resolve`, the objects collected, what
+links a package, what it publishes), `run` boxes run the programs tool extensions offer (each a manifest alone: GCC
+2.8.1's `cc1`, the binutils, maspsx as the assembler of a flavor of them, aro's preprocessor, Python), and `pe2.psx`
+makes the image the PlayStation loads of what was linked and runs nothing. A generator makes the build from a
+description, per configuration, so the game's matching build and any other are descriptions of the same kind; the
+project's nodes say which (see [The work graph](../building/graph.md)).
+
 ## Where to look
 
-`crates/formats`, `crates/codecs`, `crates/model` (models), `crates/typeface` (fonts), and each extension under
-`extensions/`.
+`crates/formats`, `crates/codecs`, `crates/model` (models), `crates/typeface` (fonts), each extension under
+`extensions/` (`packages/src/build.rs` and `generate.rs`, `psx`), and the tools in `extensions/tools/`.

@@ -14,9 +14,10 @@
 //! A scope serves folders too (`content::serve_folders_with`): the files an operation hands a program, each where it is
 //! or held in memory, under `<scope>/run-<n>/` for as long as the operation runs - nothing written for them.
 
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +28,7 @@ use crate::backend::{self, Backend, Can, Job, Mount};
 
 /// A project's scope: the files it serves, and its mount once it has one.
 struct Scope {
-    at: PathBuf,
+    at: HostPath,
     served: Served,
     files: BTreeMap<String, Given>,
     mounted: Option<Mounted>,
@@ -52,7 +53,7 @@ impl Scope {
 
 /// The scopes this process serves, by project, and what the machine says serves them.
 struct Held {
-    scopes: BTreeMap<PathBuf, Scope>,
+    scopes: BTreeMap<HostPath, Scope>,
     machine: Box<dyn Fn() -> Machine + Send>,
 }
 
@@ -80,9 +81,14 @@ impl Scopes {
     }
 
     /// Where a project's scope is, for this process, mounted or not.
+    ///
+    /// # Panics
+    /// Never: a process's number is a name.
     #[must_use]
-    pub fn at(root: &Path) -> PathBuf {
-        root.join(project::cache::DIR).join("scope").join(std::process::id().to_string())
+    pub fn at(root: &HostPath) -> HostPath {
+        const SCOPE: pe2_path::Name = pe2_path::Name::constant("scope");
+        let process = pe2_path::Name::new(&std::process::id().to_string()).expect("a number is a name");
+        root.join(&project::cache::DIR).join(&SCOPE).join(&process)
     }
 }
 
@@ -98,15 +104,12 @@ impl Drop for Scopes {
 }
 
 /// The project whose store holds a layer's file: the folder holding the `.layers` it lies in.
-fn project_of(disk: &Path) -> Option<PathBuf> {
-    disk.ancestors()
-        .find(|a| a.file_name().is_some_and(|n| n == project::LAYERS))
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
+fn project_of(disk: &HostPath) -> Option<HostPath> {
+    disk.ancestors().find(|a| a.file_name().is_some_and(|n| n == project::LAYERS)).and_then(|layers| layers.parent())
 }
 
 /// Serve a layer's file in its project's scope, mounting it first where it is not: its path there.
-fn expose(held: &mut Held, disk: &Path) -> io::Result<PathBuf> {
+fn expose(held: &mut Held, disk: &HostPath) -> io::Result<HostPath> {
     let root =
         project_of(disk).ok_or_else(|| io::Error::other(format!("{}: in no project's layers", disk.display())))?;
     let machine = (held.machine)();
@@ -120,20 +123,20 @@ fn expose(held: &mut Held, disk: &Path) -> io::Result<PathBuf> {
     let name = disk.file_name().map_or_else(|| "content".into(), |n| n.to_string_lossy().into_owned());
     let path = format!("{sha1}/{name}");
     if !scope.files.contains_key(&path) {
-        scope.files.insert(path.clone(), Given::Disk(disk.to_path_buf()));
+        scope.files.insert(path.clone(), Given::Disk(disk.clone()));
         scope.served.set_files(&scope.files);
     }
     mount(scope, &root, backend)?;
     scope.placed(&path);
-    Ok(scope.at.join(path))
+    Ok(scope.at.join(&pe2_path::RelPath::new(&path).map_err(io::Error::other)?))
 }
 
 /// A project's scope, made where it has none yet (what processes that ended left of theirs swept first).
-fn scope_of<'a>(scopes: &'a mut BTreeMap<PathBuf, Scope>, root: &Path) -> &'a mut Scope {
+fn scope_of<'a>(scopes: &'a mut BTreeMap<HostPath, Scope>, root: &HostPath) -> &'a mut Scope {
     if !scopes.contains_key(root) {
         sweep(root);
     }
-    scopes.entry(root.to_path_buf()).or_insert_with(|| Scope {
+    scopes.entry(root.clone()).or_insert_with(|| Scope {
         at: Scopes::at(root),
         served: Served::default(),
         files: BTreeMap::new(),
@@ -145,12 +148,12 @@ fn scope_of<'a>(scopes: &'a mut BTreeMap<PathBuf, Scope>, root: &Path) -> &'a mu
 /// is dropped.
 fn serve(
     held: &Arc<Mutex<Held>>,
-    root: Option<&Path>,
+    root: Option<&HostPath>,
     files: &BTreeMap<String, Given>,
     how: &Use,
 ) -> io::Result<Folder> {
     static RUN: AtomicU64 = AtomicU64::new(0);
-    let root = root.ok_or_else(|| io::Error::other("no project to serve a folder in"))?.to_path_buf();
+    let root = root.ok_or_else(|| io::Error::other("no project to serve a folder in"))?.clone();
     let mut scopes = held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let machine = (scopes.machine)();
     // Laid out instead where that suits better: nothing is served, and whoever asked lays them out.
@@ -168,12 +171,12 @@ fn serve(
         return Err(e);
     }
     scope.placed(&run);
-    let at = scope.at.join(&run);
+    let at = scope.at.join(&pe2_path::Name::new(&run).map_err(io::Error::other)?);
     Ok(Folder::new(at, Box::new(unserve)))
 }
 
 /// How much laying files out for a program may write, for a project: as it says, else the machine, else the default.
-fn copies(root: &Path, machine: &Machine) -> u64 {
+fn copies(root: &HostPath, machine: &Machine) -> u64 {
     let says = project::local_filesystem(root).copies;
     backend::budget(&[says.as_deref(), machine.copies.as_deref()], backend::COPIES)
 }
@@ -184,7 +187,7 @@ fn copies(root: &Path, machine: &Machine) -> u64 {
 ///
 /// # Errors
 /// Copies suit better, or the backend named cannot serve it: laid out either way, by whoever asked.
-fn chosen(root: &Path, machine: &Machine, how: &Use, written: u64) -> io::Result<&'static dyn Backend> {
+fn chosen(root: &HostPath, machine: &Machine, how: &Use, written: u64) -> io::Result<&'static dyn Backend> {
     let says = project::local_filesystem(root).scopes;
     let setting = backend::setting(&[says.as_deref(), machine.scopes.as_deref()]);
     let light = written <= copies(root, machine);
@@ -196,7 +199,7 @@ fn chosen(root: &Path, machine: &Machine, how: &Use, written: u64) -> io::Result
 /// A folder served in a scope: taken out of it, and its inode numbers let go of, once this is dropped.
 struct Unserve {
     held: Arc<Mutex<Held>>,
-    root: PathBuf,
+    root: HostPath,
     run: String,
 }
 
@@ -217,8 +220,8 @@ impl Drop for Unserve {
 
 /// Remove the scopes processes that have ended left in a project's cache: each cleared by the backend that served it,
 /// or by every one that could have where nothing says which.
-fn sweep(root: &Path) {
-    let Some(dir) = Scopes::at(root).parent().map(Path::to_path_buf) else { return };
+fn sweep(root: &HostPath) {
+    let Some(dir) = Scopes::at(root).parent() else { return };
     let mine = std::process::id().to_string();
     for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         let pid = entry.file_name().to_string_lossy().into_owned();
@@ -230,12 +233,12 @@ fn sweep(root: &Path) {
         let name = scope_name(root, &pid);
         for backend in backend::all() {
             if backend.can().folder && served_by.as_deref().is_none_or(|by| by == backend.name()) {
-                backend.clear(&entry.path(), &name);
+                backend.clear(&dir.entry(&entry.file_name()), &name);
             }
         }
-        let _ = std::fs::remove_dir_all(dir.join(format!("{pid}.staging")));
+        let _ = std::fs::remove_dir_all(dir.entry(std::ffi::OsStr::new(&format!("{pid}.staging"))));
         let _ = std::fs::remove_file(Marker::path(&dir, &pid));
-        let _ = std::fs::remove_dir(entry.path());
+        let _ = std::fs::remove_dir(dir.entry(&entry.file_name()));
     }
 }
 
@@ -249,17 +252,17 @@ enum Left {
 /// On Windows the process holds it open, shared with nothing, while it serves - so that nothing can read it until it
 /// lets go of it, or ends; elsewhere the system says which processes run.
 struct Marker {
-    path: PathBuf,
+    path: HostPath,
     held: Option<std::fs::File>,
 }
 
 impl Marker {
-    fn path(dir: &Path, pid: &str) -> PathBuf {
-        dir.join(format!("{pid}.alive"))
+    fn path(dir: &HostPath, pid: &str) -> HostPath {
+        dir.entry(std::ffi::OsStr::new(&format!("{pid}.alive")))
     }
 
     /// Say this process serves its scope in `dir`, by a backend, until dropped.
-    fn hold(dir: &Path, by: &str) -> io::Result<Marker> {
+    fn hold(dir: &HostPath, by: &str) -> io::Result<Marker> {
         use std::io::Write;
         let path = Marker::path(dir, &std::process::id().to_string());
         let mut options = std::fs::OpenOptions::new();
@@ -273,7 +276,7 @@ impl Marker {
     }
 
     /// What the process a scope is named after left; where whether it runs cannot be told, it is taken to.
-    fn left(dir: &Path, pid: &str) -> Left {
+    fn left(dir: &HostPath, pid: &str) -> Left {
         let said = std::fs::read_to_string(Marker::path(dir, pid));
         let by = |said: io::Result<String>| said.ok().map(|by| by.trim().to_string()).filter(|by| !by.is_empty());
         if cfg!(windows) {
@@ -282,7 +285,9 @@ impl Marker {
                 said => Left::By(by(said)),
             };
         }
-        if cfg!(target_os = "linux") && !Path::new("/proc").join(pid).exists() {
+        let process =
+            pe2_path::Name::new(pid).ok().and_then(|pid| Some(HostPath::new(Path::new("/proc")).ok()?.join(&pid)));
+        if cfg!(target_os = "linux") && !process.is_some_and(|process| process.exists()) {
             return Left::By(by(said));
         }
         Left::Running
@@ -297,9 +302,8 @@ impl Drop for Marker {
 }
 
 /// The name a scope is served by, where the system shows or registers one: its own, by the project and the process.
-fn scope_name(root: &Path, pid: &str) -> String {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let hash = project::extract::sha1_hex(root.to_string_lossy().as_bytes());
+fn scope_name(root: &HostPath, pid: &str) -> String {
+    let hash = project::extract::sha1_hex(root.to_string().as_bytes());
     format!("scope-{pid}-{}", &hash[..12])
 }
 
@@ -307,9 +311,9 @@ fn scope_name(root: &Path, pid: &str) -> String {
 struct Mounted {
     mount: Option<Box<dyn Mount>>,
     backend: &'static dyn Backend,
-    at: PathBuf,
+    at: HostPath,
     name: String,
-    staging: PathBuf,
+    staging: HostPath,
     _alive: Marker,
 }
 
@@ -322,13 +326,13 @@ impl Drop for Mounted {
 }
 
 /// A scope's mount, made where it has none, by a backend; one it has already serves on, whichever it is by.
-fn mount(scope: &mut Scope, root: &Path, backend: &'static dyn Backend) -> io::Result<()> {
+fn mount(scope: &mut Scope, root: &HostPath, backend: &'static dyn Backend) -> io::Result<()> {
     if scope.mounted.is_none() {
         let pid = std::process::id().to_string();
-        let dir = scope.at.parent().map_or_else(PathBuf::new, Path::to_path_buf);
+        let dir = scope.at.parent().unwrap_or_else(|| scope.at.clone());
         std::fs::create_dir_all(&dir)?;
         let alive = Marker::hold(&dir, backend.name())?;
-        let (name, staging) = (scope_name(root, &pid), dir.join(format!("{pid}.staging")));
+        let (name, staging) = (scope_name(root, &pid), dir.entry(std::ffi::OsStr::new(&format!("{pid}.staging"))));
         // Held from before it serves: what serving leaves, should it fail, is cleared as it is dropped.
         let mut mounted =
             Mounted { mount: None, backend, at: scope.at.clone(), name: name.clone(), staging, _alive: alive };
@@ -349,13 +353,15 @@ fn mount(scope: &mut Scope, root: &Path, backend: &'static dyn Backend) -> io::R
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::Scopes;
+    use pe2_path::HostPath;
+    use pe2_path::testing::At as _;
 
     /// Scopes served by the backend `PE2_TEST_SCOPES` names (how the tests are run through each backend of a system),
     /// else by the first of this system's that serves at a folder here: named, as what is served here is small
     /// enough that it would be laid out otherwise.
     fn scopes() -> Scopes {
         Scopes::install(|| {
-            let here = std::env::temp_dir();
+            let here = HostPath::new(&std::env::temp_dir()).unwrap();
             let first = || crate::backend::all().iter().find(|b| b.can().folder && b.available(&here).is_ok());
             let named = std::env::var("PE2_TEST_SCOPES").ok().or_else(|| first().map(|b| b.name().to_string()));
             super::Machine { scopes: named, copies: None }
@@ -369,24 +375,24 @@ mod tests {
 
     #[test]
     fn a_chunked_file_is_given_to_programs_in_its_scope() {
-        let root = std::env::temp_dir().join(format!("pe2-scope-{}", std::process::id()));
+        let root = pe2_path::testing::scratch("scope");
         let _ = std::fs::remove_dir_all(&root);
-        let file = root.join(".layers/top/a.node/movie.str");
+        let file = root.at(".layers/top/a.node/movie.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         project::content::write(&file, &bytes).expect("written");
         let scopes = scopes();
         let given = project::content::for_program(&file).expect("given");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.
         let fuse = cfg!(windows) || std::path::Path::new("/dev/fuse").exists();
-        assert_eq!(given.starts_with(Scopes::at(&root)), fuse, "{}", given.display());
+        assert_eq!(given.starts_with(&Scopes::at(&root)), fuse, "{}", given.display());
         if fuse {
             // As a program reads it: a file, by path, its name kept.
             assert_eq!(given.file_name().unwrap(), "movie.str");
             assert_eq!(std::fs::read(&given).expect("read through the scope"), bytes);
-            assert!(!root.join(".cache/materialized").exists(), "nothing copied");
+            assert!(!root.at(".cache/materialized").exists(), "nothing copied");
         } else {
             // No FUSE here: a copy in the cache.
-            assert!(given.starts_with(root.join(".cache/materialized")));
+            assert!(given.starts_with(&root.at(".cache/materialized")));
         }
         drop(scopes);
         assert!(!Scopes::at(&root).exists(), "unmounted and gone");
@@ -395,7 +401,7 @@ mod tests {
     #[test]
     fn what_a_scope_serves_no_program_changes() {
         use project::content::Given;
-        let root = std::env::temp_dir().join(format!("pe2-scope-read-only-{}", std::process::id()));
+        let root = pe2_path::testing::scratch("scope-read-only");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let files = std::collections::BTreeMap::from([
@@ -403,8 +409,9 @@ mod tests {
             ("sub/other.h".to_string(), Given::Bytes(std::sync::Arc::from(&b"#define B 2"[..]))),
         ]);
         let scopes = scopes();
-        let folder = project::content::serve_folder(Some(&root), &files, &once(), &root.join("fallback")).expect("served");
-        if folder.at.starts_with(Scopes::at(&root)) {
+        let folder =
+            project::content::serve_folder(Some(&root), &files, &once(), &root.at("fallback")).expect("served");
+        if folder.at.starts_with(&Scopes::at(&root)) {
             // As another program would: this process's own removals are how a scope lets go of what it served.
             let run = |command: String| {
                 let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
@@ -423,10 +430,10 @@ mod tests {
                 run("mv sub moved".into());
                 run("rm -rf sub".into());
             }
-            assert_eq!(std::fs::read(folder.at.join("kept.h")).unwrap(), b"#define A 1", "not written or removed");
-            assert!(!folder.at.join("moved.h").exists(), "not renamed");
-            assert_eq!(std::fs::read(folder.at.join("sub/other.h")).unwrap(), b"#define B 2", "its folder kept");
-            assert!(!folder.at.join("moved").exists(), "its folder not renamed");
+            assert_eq!(std::fs::read(folder.at.at("kept.h")).unwrap(), b"#define A 1", "not written or removed");
+            assert!(!folder.at.at("moved.h").exists(), "not renamed");
+            assert_eq!(std::fs::read(folder.at.at("sub/other.h")).unwrap(), b"#define B 2", "its folder kept");
+            assert!(!folder.at.at("moved").exists(), "its folder not renamed");
         }
         drop(folder);
         drop(scopes);
@@ -437,12 +444,12 @@ mod tests {
     #[test]
     fn a_folder_is_served_to_programs_where_its_files_are_until_it_is_let_go_of() {
         use project::content::Given;
-        let root = std::env::temp_dir().join(format!("pe2-scope-folder-{}", std::process::id()));
+        let root = pe2_path::testing::scratch("scope-folder");
         let _ = std::fs::remove_dir_all(&root);
-        let chunked = root.join(".layers/top/a.node/big.bin");
+        let chunked = root.at(".layers/top/a.node/big.bin");
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         project::content::write(&chunked, &big).expect("written");
-        let plain = root.join("plain.h");
+        let plain = root.at("plain.h");
         std::fs::write(&plain, "#define A 1\n").unwrap();
         let files = std::collections::BTreeMap::from([
             ("units".to_string(), Given::Bytes(std::sync::Arc::from(&b"self/a.c"[..]))),
@@ -450,15 +457,15 @@ mod tests {
             ("dep/big.bin".to_string(), Given::Disk(chunked)),
         ]);
         let scopes = scopes();
-        let fallback = root.join("fallback");
+        let fallback = root.at("fallback");
         let folder = project::content::serve_folder(Some(&root), &files, &once(), &fallback).expect("served");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.
         let fuse = cfg!(windows) || std::path::Path::new("/dev/fuse").exists();
-        assert_eq!(folder.at.starts_with(Scopes::at(&root)), fuse, "{}", folder.at.display());
-        assert_eq!(std::fs::read(folder.at.join("units")).unwrap(), b"self/a.c");
-        assert_eq!(std::fs::read_to_string(folder.at.join("self/include/a.h")).unwrap(), "#define A 1\n");
-        assert_eq!(std::fs::read(folder.at.join("dep/big.bin")).unwrap(), big);
-        let listed: Vec<String> = std::fs::read_dir(folder.at.join("self"))
+        assert_eq!(folder.at.starts_with(&Scopes::at(&root)), fuse, "{}", folder.at.display());
+        assert_eq!(std::fs::read(folder.at.at("units")).unwrap(), b"self/a.c");
+        assert_eq!(std::fs::read_to_string(folder.at.at("self/include/a.h")).unwrap(), "#define A 1\n");
+        assert_eq!(std::fs::read(folder.at.at("dep/big.bin")).unwrap(), big);
+        let listed: Vec<String> = std::fs::read_dir(folder.at.at("self"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();

@@ -29,6 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 pe2-setup.workspace = true
+pe2-manifest.workspace = true
+pe2-path.workspace = true
 codecs.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
@@ -43,3 +45,6 @@ blake3 = "1"
 [features]
 # Spans on a timeline: Tracy's viewer connects to the running program (project::profile).
 tracy = ["dep:tracing-tracy"]
+
+[dev-dependencies]
+pe2-path = { workspace = true, features = ["testing"] }

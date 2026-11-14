@@ -4,9 +4,9 @@
 //! is the runner's to lose, and each runs in a project of its own, so that the one open here stays as it is. With no runner
 //! beside the editor, which a build that ships has not, the pane says so and that is all.
 
+use pe2_path::HostPath;
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
@@ -33,8 +33,8 @@ struct Test {
     /// Why it failed.
     why: String,
     /// The files of what the window showed.
-    said: Option<PathBuf>,
-    picture: Option<PathBuf>,
+    said: Option<HostPath>,
+    picture: Option<HostPath>,
 }
 
 /// The runner at work.
@@ -48,7 +48,7 @@ struct Job {
 #[derive(Default)]
 pub struct Tests {
     /// Set by what tests the pane; otherwise it is looked for beside the editor.
-    runner: Option<PathBuf>,
+    runner: Option<HostPath>,
     suites: BTreeMap<String, Vec<Test>>,
     job: Option<Job>,
     asked: bool,
@@ -57,7 +57,7 @@ pub struct Tests {
     /// What the runner said that it should not have.
     trouble: Option<String>,
     /// The picture of the failure selected.
-    shown: Option<(PathBuf, egui::TextureHandle)>,
+    shown: Option<(HostPath, egui::TextureHandle)>,
 }
 
 impl Drop for Tests {
@@ -74,7 +74,7 @@ fn short(name: &str) -> &str {
 impl Tests {
     /// Use this runner, and ask it what there is.
     #[cfg(any(test, feature = "tests"))]
-    pub fn use_runner(&mut self, runner: PathBuf) {
+    pub fn use_runner(&mut self, runner: HostPath) {
         self.runner = Some(runner);
         self.asked = false;
     }
@@ -92,21 +92,20 @@ impl Tests {
         self.job.is_some()
     }
 
-    fn runner(&self) -> Option<PathBuf> {
+    fn runner(&self) -> Option<HostPath> {
         let found = || {
-            let beside = std::env::current_exe()
-                .ok()?
-                .with_file_name(format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX));
+            let runner = pe2_path::Name::new(&format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX)).ok()?;
+            let beside = HostPath::new(&std::env::current_exe().ok()?).ok()?.parent()?.join(&runner);
             beside.is_file().then_some(beside)
         };
         self.runner.clone().or_else(found)
     }
 
     /// Start the runner with these arguments, what it reports read as it comes.
-    fn start(&mut self, ctx: &egui::Context, runner: &Path, arguments: &[String]) {
+    fn start(&mut self, ctx: &egui::Context, runner: &HostPath, arguments: &[String]) {
         self.stop();
         self.trouble = None;
-        let mut command = Command::new(runner);
+        let mut command = Command::new(runner.as_os_str());
         command.args(arguments).arg("--json").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
@@ -178,7 +177,11 @@ impl Tests {
     fn heard(&mut self, line: &str) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { return };
         let field = |key: &str| event.get(key).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-        let path = |key: &str| event.get(key).and_then(serde_json::Value::as_str).map(PathBuf::from);
+        // Where the runner says it wrote what it is telling of, as the system names it.
+        let path = |key: &str| {
+            let text = event.get(key).and_then(serde_json::Value::as_str)?;
+            HostPath::new(std::path::Path::new(text)).ok()
+        };
         let seconds = event.get("seconds").and_then(serde_json::Value::as_f64).unwrap_or_default();
         let (suite, name) = (field("suite"), field("name"));
         // What is not of a test, as `done` is.
@@ -211,7 +214,7 @@ impl Tests {
     }
 
     /// Run tests, by name: all with none named.
-    fn run(&mut self, ctx: &egui::Context, runner: &Path, mut arguments: Vec<String>, names: &[String]) {
+    fn run(&mut self, ctx: &egui::Context, runner: &HostPath, mut arguments: Vec<String>, names: &[String]) {
         for test in self.suites.values_mut().flatten() {
             if names.is_empty() || names.contains(&test.name) {
                 *test = Test {
@@ -228,7 +231,8 @@ impl Tests {
             arguments.extend(["--filter".to_string(), name.clone()]);
         }
         // What the last run left goes: only what a test still shows is of use.
-        let artifacts = std::env::temp_dir().join("pe2-test-failures");
+        let Ok(temporary) = HostPath::new(&std::env::temp_dir()) else { return };
+        let artifacts = temporary.join(&pe2_path::Name::constant("pe2-test-failures"));
         if names.is_empty() {
             let _ = std::fs::remove_dir_all(&artifacts);
         }
@@ -276,7 +280,7 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
             Origin::Project(folder) => Some(folder.clone()),
             _ => None,
         })
-        .filter(|folder| project::pack::is_file(&folder.join("tests").join("tests.wasm")))
+        .filter(|folder| project::pack::is_file(&folder.join(&pe2_path::RelPath::constant("tests/tests.wasm"))))
         .map(|folder| folder.display().to_string())
         .collect();
     if !folders.is_empty() {
@@ -287,7 +291,7 @@ fn suites_of(ws: &Workspace) -> Vec<String> {
 }
 
 /// A failure's picture, as a texture.
-fn picture(ctx: &egui::Context, file: &Path) -> Option<egui::TextureHandle> {
+fn picture(ctx: &egui::Context, file: &HostPath) -> Option<egui::TextureHandle> {
     let decoded = codecs::ora::decode_png(&std::fs::read(file).ok()?).ok()?;
     let codecs::ora::Pixels::Rgba(pixels) = decoded.pixels else { return None };
     let bytes: Vec<u8> = pixels.into_iter().flatten().collect();
@@ -332,7 +336,7 @@ pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     };
     // Built apart from the editor (`--features tests`), the runner can be left behind it, and then speaks an older contract
     // to the extensions than they do.
-    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let modified = |path: &std::path::Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let behind =
         std::env::current_exe().ok().and_then(|editor| Some(modified(&runner)? < modified(&editor)?)).unwrap_or(false);
     let arguments = suites_of(ws);

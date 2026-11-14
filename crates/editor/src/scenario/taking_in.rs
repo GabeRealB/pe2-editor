@@ -1,21 +1,23 @@
 //! What a project takes from where extensions are kept: added, copied whole, and removed.
+use pe2_path::testing::At as _;
 
 use super::{Fixture, Scenario, isolate};
+use pe2_path::HostPath;
 
 /// An extension in the user's own folder, as one is kept (`<id>.extension`): a built-in's component, as there is no
 /// other to hand, with the manifest it carries. Gone with it.
-struct Kept(std::path::PathBuf);
+struct Kept(HostPath);
 
 impl Kept {
     fn formats() -> Kept {
         isolate();
         let (_, bytes) =
             extensions::components().iter().find(|(package, _)| *package == "pe2-formats").expect("a built-in");
-        let folder = extensions::user_folder().expect("a data folder").join("pe2.formats.extension");
+        let folder = extensions::user_folder().expect("a data folder").at("pe2.formats.extension");
         std::fs::create_dir_all(&folder).expect("a folder");
-        std::fs::write(folder.join("extension.wasm"), bytes).expect("a component");
+        std::fs::write(folder.at("extension.wasm"), bytes).expect("a component");
         let manifest = project::ext::component::manifest_text(bytes).expect("its manifest");
-        std::fs::write(folder.join("extension.toml"), manifest).expect("a manifest");
+        std::fs::write(folder.at("extension.toml"), manifest).expect("a manifest");
         Kept(folder)
     }
 }
@@ -26,11 +28,11 @@ impl Kept {
         let folder = Kept::formats();
         let mut entries = vec![];
         for name in ["extension.wasm", "extension.toml"] {
-            entries.push((format!("pe2.formats.extension/{name}"), std::fs::read(folder.0.join(name)).expect("it")));
+            entries.push((format!("pe2.formats.extension/{name}"), std::fs::read(folder.0.at(name)).expect("it")));
         }
         let entries: Vec<codecs::zip::Entry> =
             entries.iter().map(|(name, data)| codecs::zip::Entry { name, data, deflate: true, mode: 0o644 }).collect();
-        let archive = folder.0.with_file_name("pe2.formats-0.1.0.extension.zip");
+        let archive = folder.0.parent().expect("in a folder").at("pe2.formats-0.1.0.extension.zip");
         std::fs::write(&archive, codecs::zip::write(&entries)).expect("an archive");
         drop(folder);
         Kept(archive)
@@ -93,7 +95,7 @@ fn what_is_kept_archived_is_unpacked_into_the_project() {
     editor.until("the project to hold it", |editor| {
         editor.workspace().extensions.loaded.iter().any(|l| {
             l.id == "pe2.formats"
-                && matches!(&l.origin, project::ext::Origin::Project(folder) if project::pack::is_file(&folder.join("extension.toml")))
+                && matches!(&l.origin, project::ext::Origin::Project(folder) if project::pack::is_file(&folder.at("extension.toml")))
         })
     });
     drop(kept);

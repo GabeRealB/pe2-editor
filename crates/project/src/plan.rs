@@ -26,15 +26,16 @@
 //! movies) is one, run after everything is written, its key that of what it comes `after`.
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{HostPath, Name, RelPath};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::discs::{self, Container, OpenDisc};
 use crate::extract::sha1_hex;
 
-pub const RECORD: &str = "extraction.record.jsonl";
+pub const RECORD: Name = Name::constant("extraction.record.jsonl");
 
 /// A release a plan reads: where its discs are looked for (`res://`), and each disc's image, by name, size and sha1 -
 /// the sha1 deciding, the name where it is looked for first.
@@ -166,7 +167,7 @@ impl Header {
 ///
 /// # Errors
 /// The file cannot be read, or its first line is no plan's.
-pub fn header(plan: &Path) -> Result<Header> {
+pub fn header(plan: &HostPath) -> Result<Header> {
     use std::io::BufRead;
     let file = std::fs::File::open(plan).with_context(|| plan.display().to_string())?;
     let mut line = String::new();
@@ -179,7 +180,7 @@ impl Plan {
     ///
     /// # Errors
     /// A line is no JSON, or no plan's, or takes what no line before it makes.
-    pub fn read(path: &Path) -> Result<Plan> {
+    pub fn read(path: &HostPath) -> Result<Plan> {
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         Self::parse(&text).with_context(|| path.display().to_string())
     }
@@ -403,14 +404,14 @@ pub enum Releases {
 }
 
 /// A disc a run looks for: its release, its name, size and sha1, and where it is looked for.
-type DiscSought<'a> = (&'a String, &'a (String, u64, String), Option<PathBuf>);
+type DiscSought<'a> = (&'a String, &'a (String, u64, String), Option<HostPath>);
 
 /// The releases a run reads, and where each of their discs is, by its sha1.
 fn found_releases(
     project: &crate::Project,
     plan: &Plan,
     releases: &Releases,
-) -> Result<(std::collections::BTreeSet<String>, HashMap<String, PathBuf>)> {
+) -> Result<(std::collections::BTreeSet<String>, HashMap<String, HostPath>)> {
     let asked: Vec<&String> = match releases {
         Releases::Only(names) => {
             for name in names {
@@ -476,7 +477,7 @@ struct Record {
     releases: Option<std::collections::BTreeSet<String>>,
 }
 
-fn read_record(path: &Path) -> Record {
+fn read_record(path: &HostPath) -> Record {
     let Ok(text) = std::fs::read_to_string(path) else { return Record::default() };
     let mut record = Record::default();
     let head = text.lines().next().and_then(|line| serde_json::from_str::<Value>(line).ok());
@@ -503,7 +504,7 @@ fn read_record(path: &Path) -> Record {
     record
 }
 
-fn write_record(path: &Path, plan: &Plan, record: &Record) -> Result<()> {
+fn write_record(path: &HostPath, plan: &Plan, record: &Record) -> Result<()> {
     let mut text = json!({"record": 1, "plan": plan.sha1, "releases": record.releases}).to_string();
     text.push('\n');
     for ((node, file), written) in &record.files {
@@ -654,8 +655,8 @@ pub struct Disc {
     pub name: String,
     pub size: u64,
     /// Where it was looked for: its release's `look_in`, resolved.
-    pub look_in: PathBuf,
-    pub found: Option<PathBuf>,
+    pub look_in: Option<HostPath>,
+    pub found: Option<HostPath>,
 }
 
 /// Look for the discs a plan reads where it says, each by its size and sha1 (each image of its size hashed).
@@ -663,9 +664,10 @@ pub struct Disc {
 pub fn discs(project: &crate::Project, header: &Header) -> Vec<Disc> {
     let mut out = Vec::new();
     for (release, input) in header.order.iter().filter_map(|r| Some((r, header.inputs.get(r)?))) {
-        let look_in = project.resolve(&input.look_in).unwrap_or_else(|_| PathBuf::from(&input.look_in));
+        // A place `res://`, or one written as the system writes it.
+        let look_in = project.resolve(&input.look_in).ok().or_else(|| HostPath::new(Path::new(&input.look_in)).ok());
         for (name, size, sha1) in &input.discs {
-            let found = discs::find_disc(&look_in, name, *size, sha1).ok();
+            let found = look_in.as_ref().and_then(|look_in| discs::find_disc(look_in, name, *size, sha1).ok());
             out.push(Disc {
                 release: release.clone(),
                 name: name.clone(),
@@ -692,7 +694,7 @@ pub struct Observed {
 
 /// What `observe` notes as it goes, and where it keeps what was read.
 struct Observing {
-    keep: Option<PathBuf>,
+    keep: Option<HostPath>,
     /// The operations whose bytes are kept, by kind: all where empty.
     kinds: Vec<String>,
     seen: Mutex<Vec<Observed>>,
@@ -702,7 +704,7 @@ impl Observing {
     fn saw(&self, op: &Op, bytes: &[u8]) -> Result<()> {
         let sha1 = sha1_hex(bytes);
         if let Some(keep) = self.keep.as_ref().filter(|_| self.kinds.is_empty() || self.kinds.contains(&op.kind)) {
-            let path = keep.join(&sha1);
+            let path = keep.join(&Name::new(&sha1)?);
             if !path.exists() {
                 std::fs::write(&path, bytes).with_context(|| path.display().to_string())?;
             }
@@ -733,11 +735,11 @@ impl Observing {
 /// # Errors
 /// The plan cannot be read, or what is read cannot be kept.
 pub fn observe(
-    plan_file: &Path,
-    look_in: &dyn Fn(&str) -> Result<PathBuf>,
+    plan_file: &HostPath,
+    look_in: &dyn Fn(&str) -> Result<HostPath>,
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
-    keep: Option<&Path>,
+    keep: Option<&HostPath>,
     kinds: &[String],
 ) -> Result<Vec<Observed>> {
     let plan = Plan::read(plan_file)?;
@@ -756,14 +758,13 @@ pub fn observe(
     if let Some(keep) = keep {
         std::fs::create_dir_all(keep).with_context(|| keep.display().to_string())?;
     }
-    let observing =
-        Observing { keep: keep.map(Path::to_path_buf), kinds: kinds.to_vec(), seen: Mutex::new(Vec::new()) };
+    let observing = Observing { keep: keep.cloned(), kinds: kinds.to_vec(), seen: Mutex::new(Vec::new()) };
     let progress = Progress::default();
     let state = RunState {
         plan: &plan,
         keys: &keys,
         inputs: plan.inputs.iter().map(|(r, i)| Ok((r.clone(), look_in(&i.look_in)?))).collect::<Result<_>>()?,
-        layer: Path::new(""),
+        layer: None,
         found: HashMap::new(),
         engine,
         extensions,
@@ -798,7 +799,7 @@ impl Plan {
 
 /// Where a recorded file's bytes are in the layer: its own place, or, one the same as what the releases share, the
 /// shared file's.
-fn on_disk(plan: &Plan, layer: &Path, node: &str, file: &str, written: &Written) -> PathBuf {
+fn on_disk(plan: &Plan, layer: &HostPath, node: &str, file: &str, written: &Written) -> HostPath {
     match plan.plain_of(file).filter(|_| written.shared) {
         Some(shared) => file_path(layer, node, shared),
         None => file_path(layer, node, file),
@@ -807,7 +808,7 @@ fn on_disk(plan: &Plan, layer: &Path, node: &str, file: &str, written: &Written)
 
 /// Keep no release's own file that is the same as what the releases share: each removed, recorded as the shared one.
 /// How many.
-fn share_alike(plan: &Plan, layer: &Path, record: &mut Record) -> usize {
+fn share_alike(plan: &Plan, layer: &HostPath, record: &mut Record) -> usize {
     let alike: Vec<(String, String)> = record
         .files
         .iter()
@@ -835,8 +836,13 @@ fn share_alike(plan: &Plan, layer: &Path, record: &mut Record) -> usize {
 }
 
 /// The path of a bundle's file in the layer.
-fn file_path(layer: &Path, node: &str, file: &str) -> PathBuf {
-    layer.join(format!("{node}{}", crate::index::BUNDLE_SUFFIX)).join(file)
+fn file_path(layer: &HostPath, node: &str, file: &str) -> HostPath {
+    // Its names are the plan's, checked as it is read (`Plan::read`): one that is no path is the layer's folder,
+    // which no file can be written as.
+    match RelPath::new(&format!("{node}{}/{file}", crate::index::BUNDLE_SUFFIX)) {
+        Ok(within) => layer.join(&within),
+        Err(_) => layer.clone(),
+    }
 }
 
 /// What a run is to make: each file whose key changed, or which is not there as written - a folder's, any of its
@@ -844,7 +850,7 @@ fn file_path(layer: &Path, node: &str, file: &str) -> PathBuf {
 fn wanted(
     plan: &Plan,
     keys: &[String],
-    layer: &Path,
+    layer: &HostPath,
     old: &Record,
     record: &mut Record,
     ran: &mut Ran,
@@ -897,7 +903,7 @@ fn joined(
     plan: &Plan,
     keys: &[String],
     last: &[usize],
-    layers: [&Path; 2],
+    layers: [&HostPath; 2],
     engine: &crate::graph::exec::Engine,
     extensions: &crate::ext::Extensions,
     record: &mut Record,
@@ -940,14 +946,14 @@ pub fn run(
     let nodes = &project.layer(fills)?.path;
     // What the nodes are, read as any layer's: a records layer's through its records.
     crate::records::Set::open(project)?;
-    let layer = generated.path.as_path();
+    let layer = &generated.path;
     let mut plan = Plan::read(&generated.plan())?;
     let unmet = plan.unmet(extensions);
     anyhow::ensure!(unmet.is_empty(), "the plan needs {}", unmet.join("; "));
     let keys = plan.keys(&|id| extensions.version_of(id));
     let (available, found) = found_releases(project, &plan, releases)?;
     let possible = plan.resolve(&available);
-    let old = read_record(&layer.join(RECORD));
+    let old = read_record(&layer.join(&RECORD));
     let mut record = Record::default();
     let in_order = plan.releases().into_iter().filter(|r| available.contains(r)).collect();
     let mut ran = Ran { releases: in_order, ..Ran::default() };
@@ -1005,7 +1011,7 @@ pub fn run(
             .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
             .collect::<Result<_>>()?,
         found,
-        layer,
+        layer: Some(layer),
         engine,
         extensions,
         checked,
@@ -1035,7 +1041,7 @@ pub fn run(
     if let Some(why) = failed {
         record.releases = Some(available.iter().cloned().chain(old.releases.clone().unwrap_or_default()).collect());
         // What was written is kept as made: a run stopped or failed goes on from there next time.
-        write_record(&layer.join(RECORD), &plan, &record)?;
+        write_record(&layer.join(&RECORD), &plan, &record)?;
         return Err(why);
     }
     for at in (0..plan.ops.len()).filter(|&at| state.checked[at]) {
@@ -1051,12 +1057,12 @@ pub fn run(
     });
     ran.shared = share_alike(&plan, layer, &mut record);
     ran.removed = remove_left(layer, &old, &record);
-    write_record(&layer.join(RECORD), &plan, &record)?;
+    write_record(&layer.join(&RECORD), &plan, &record)?;
     Ok(ran)
 }
 
 /// Remove what no bundle is given any more: what the last run recorded and this one did not. How many went.
-fn remove_left(layer: &Path, old: &Record, record: &Record) -> usize {
+fn remove_left(layer: &HostPath, old: &Record, record: &Record) -> usize {
     let left = old.files.keys().filter(|entry| !record.files.contains_key(*entry));
     left.filter(|(node, file)| {
         let path = file_path(layer, node, file);
@@ -1082,9 +1088,10 @@ struct RunState<'a> {
     plan: &'a Plan,
     keys: &'a [String],
     /// Where each release's discs are looked for, and where those found are, by sha1.
-    inputs: HashMap<String, PathBuf>,
-    found: HashMap<String, PathBuf>,
-    layer: &'a Path,
+    inputs: HashMap<String, HostPath>,
+    found: HashMap<String, HostPath>,
+    /// The layer it writes; none where it only observes.
+    layer: Option<&'a HostPath>,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
     /// The checks to run.
@@ -1104,6 +1111,11 @@ struct RunState<'a> {
 }
 
 impl RunState<'_> {
+    /// The layer it writes.
+    fn layer(&self) -> Result<&HostPath> {
+        self.layer.context("observing what a plan reads writes nothing")
+    }
+
     fn run(&self, at: usize, add: &dyn Fn(usize)) {
         if self.observing.is_none() && self.failed.lock().is_ok_and(|failed| failed.is_some()) {
             return;
@@ -1131,12 +1143,12 @@ impl RunState<'_> {
                     let key = Plan::file_key(self.keys, given);
                     let Some(bytes) = bytes else {
                         // An optional file not made: recorded so, so that it is not asked for again.
-                        let _ = crate::content::remove(&file_path(self.layer, node, &file));
+                        let _ = crate::content::remove(&file_path(self.layer()?, node, &file));
                         self.lock_written()
                             .push(((node.clone(), file), Written { key, sha1: String::new(), size: 0, shared: false }));
                         continue;
                     };
-                    let path = file_path(self.layer, node, &file);
+                    let path = file_path(self.layer()?, node, &file);
                     crate::content::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
                     let written = Written { key, sha1: sha1_hex(&bytes), size: bytes.len() as u64, shared: false };
                     self.lock_written().push(((node.clone(), file), written));
@@ -1218,7 +1230,7 @@ impl RunState<'_> {
             let bytes = match &file.content {
                 crate::graph::Content::Inline(bytes) => bytes.clone(),
                 crate::graph::Content::Stored { sha1, .. } => {
-                    let path = self.engine.store().context("no store")?.blob_path(sha1);
+                    let path = self.engine.store().context("no store")?.blob_path(sha1)?;
                     std::fs::read(&path).with_context(|| path.display().to_string())?
                 }
             };
@@ -1396,12 +1408,12 @@ impl Plan {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn state(plan_file: &Path, layer: &Path, extensions: &crate::ext::Extensions) -> Result<State> {
+pub fn state(plan_file: &HostPath, layer: &HostPath, extensions: &crate::ext::Extensions) -> Result<State> {
     if !plan_file.is_file() {
         return Ok(State::NoPlan);
     }
     let mut plan = Plan::read(plan_file)?;
-    let record = read_record(&layer.join(RECORD));
+    let record = read_record(&layer.join(&RECORD));
     if record.files.is_empty() && record.checks.is_empty() {
         return Ok(State::Empty);
     }
@@ -1480,10 +1492,10 @@ impl Checked {
 ///
 /// # Errors
 /// The plan cannot be read.
-pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
+pub fn verify(plan_file: &HostPath, layer: &HostPath, versions: &dyn Fn(&str) -> String) -> Result<Checked> {
     let mut plan = Plan::read(plan_file)?;
     let keys = plan.keys(versions);
-    let record = read_record(&layer.join(RECORD));
+    let record = read_record(&layer.join(&RECORD));
     let releases = plan.as_recorded(&record);
     let possible = plan.resolve(&releases);
     // Each file given, as recorded: a folder's, every file recorded in it - none being one missing.
@@ -1544,14 +1556,15 @@ pub fn verify(plan_file: &Path, layer: &Path, versions: &dyn Fn(&str) -> String)
 mod tests {
     use super::Plan;
     use crate::extract::sha1_hex;
+    use crate::testing::At as _;
 
     #[test]
     fn a_layer_says_whether_its_plan_ran_and_what_it_needs() {
-        let layer = std::env::temp_dir().join(format!("pe2-plan-state-{}", std::process::id()));
+        let layer = crate::testing::scratch("plan-state");
         let _ = std::fs::remove_dir_all(&layer);
         std::fs::create_dir_all(&layer).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
-        let plan_file = layer.with_extension("plan.jsonl");
+        let plan_file = layer.with_suffix(&crate::PLAN_SUFFIX);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::NoPlan);
         let plan = r#"{"plan":1,"inputs":{"USA":{"look_in":"res://roms","discs":[]}},"requires":[{"id":"pe2.nothing","version":"^0.1"}]}
 {"id":"a","op":"disc","args":{"image":{"name":"x","size":1,"sha1":"00"},"slots":[]}}
@@ -1606,34 +1619,34 @@ mod tests {
         assert!(!plan.emits[0].files.iter().find(|g| g.name == "EUR/own.bin").unwrap().possible);
         assert_eq!(plan.ops[plan.by_id["made"]].takes["bytes"], ["a:USA"]);
         // What is recorded of USA alone, every file of it there: filled but for Europe.
-        let layer = std::env::temp_dir().join(format!("pe2-plan-partial-{}", std::process::id()));
+        let layer = crate::testing::scratch("plan-partial");
         let _ = std::fs::remove_dir_all(&layer);
-        std::fs::create_dir_all(layer.join("n.node")).unwrap();
-        let plan_file = layer.with_extension("plan.jsonl");
+        std::fs::create_dir_all(layer.at("n.node")).unwrap();
+        let plan_file = layer.with_suffix(&crate::PLAN_SUFFIX);
         std::fs::write(&plan_file, &text).unwrap();
         let mut record = super::Record { releases: Some(only(&["USA"])), ..super::Record::default() };
         for name in ["native.bin", "inflated"] {
-            std::fs::write(layer.join("n.node").join(name), "x").unwrap();
+            std::fs::write(layer.at("n.node").at(name), "x").unwrap();
             let written = super::Written { key: key(&plan, name), sha1: "x".into(), size: 1, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         let parsed = Plan::parse(&text).unwrap();
-        super::write_record(&layer.join(super::RECORD), &parsed, &record).unwrap();
+        super::write_record(&layer.join(&super::RECORD), &parsed, &record).unwrap();
         let extensions = crate::ext::Extensions::load(Vec::new(), true);
         assert_eq!(super::state(&plan_file, &layer, &extensions).unwrap(), super::State::Partial(vec!["EUR".into()]));
         // A release's own file the same as what the releases share is not kept: the shared one is it.
         let mut record = super::Record::default();
-        std::fs::create_dir_all(layer.join("n.node/EUR")).unwrap();
+        std::fs::create_dir_all(layer.at("n.node/EUR")).unwrap();
         for (name, bytes) in [("own.bin", "same"), ("EUR/own.bin", "same"), ("inflated", "x"), ("EUR/inflated", "y")] {
-            std::fs::write(layer.join("n.node").join(name), bytes).unwrap();
+            std::fs::write(layer.at("n.node").at(name), bytes).unwrap();
             let written = super::Written { key: "k".into(), sha1: sha1_hex(bytes.as_bytes()), size: 4, shared: false };
             record.files.insert(("n".into(), name.into()), written);
         }
         assert_eq!(super::share_alike(&parsed, &layer, &mut record), 1);
-        assert!(!layer.join("n.node/EUR/own.bin").exists() && layer.join("n.node/EUR/inflated").exists());
+        assert!(!layer.at("n.node/EUR/own.bin").exists() && layer.at("n.node/EUR/inflated").exists());
         let own = &record.files[&("n".to_string(), "EUR/own.bin".to_string())];
         assert!(own.shared);
-        assert_eq!(super::on_disk(&parsed, &layer, "n", "EUR/own.bin", own), layer.join("n.node/own.bin"));
+        assert_eq!(super::on_disk(&parsed, &layer, "n", "EUR/own.bin", own), layer.at("n.node/own.bin"));
         let _ = std::fs::remove_dir_all(&layer);
         let _ = std::fs::remove_file(&plan_file);
     }

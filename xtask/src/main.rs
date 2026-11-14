@@ -1,12 +1,17 @@
 //! The editor's own tasks, run as `cargo xtask <task>`:
 //!
-//! - `dist [--tests] [--out <folder>]`: the editor built and laid out as it ships, in
+//! - `prepare [--target <triple>]`: what a build for a platform needs that is no crate (`prepare.toml`: on Windows,
+//!   the DirectX Shader Compiler), fetched and held to its hashes into `prepared/<platform>/` - the host's, or the one
+//!   the target triple names. A build for a platform needing something fails until it is prepared, and puts it
+//!   beside the programs it makes (`crates/editor/build.rs`); a release has it there too.
+//! - `dist [--tests] [--out <folder>]`: prepared, built and laid out as it ships, in
 //!   `<out>/pe2-<version>-<platform>/` (`target/dist/` where unsaid): `pe2-editor` and `pe2-cli`, what a user reads
 //!   of them in `docs/` (the workspace's `docs/`), what they are built with and under which license in
 //!   `LICENSES.txt` (`licenses::Listing::document`, each extension's own in its `licenses/`), and beside them in
 //!   `extensions/` the extensions built apart from the editor, each a folder as one is kept (`<id>.extension/`): its
 //!   component, its manifest and what its crate has to be read (`docs/`, `licenses/`, ...), and what it ships -
-//!   what each fetches onto a machine its manifest says (`[[setup]]`). A project adds them from there by id (`pe2-cli project extension add
+//!   what each fetches onto a machine its manifest says (`[[setup]]`) - and the tools (`extensions/tools/`), each only
+//!   its manifest: the programs it offers and what they are fetched from. A project adds them from there by id (`pe2-cli project extension add
 //!   pe2.psx`), copying them; nothing runs from beside the editor. `--tests` adds `pe2-test-runner`, a build for testing
 //!   that what ships has not.
 //! - `package [--out <folder>]`: `dist`, then archived: the editor alone, `pe2-<version>-<platform>.zip`, and each
@@ -19,6 +24,10 @@
 //! - `packages [--package <package>]... [--platform <platform>]... [--zig <zig>] [--publish]`: the packages the
 //!   extensions download, built from their sources by the zig projects in `packages/` and laid out as their releases,
 //!   one a package version - published with `--publish` (`packages.rs`).
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the workspace's build driver, as a build script is: it lays out and packs files of the folders it is run in"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,7 +37,8 @@ use sha2::{Digest, Sha256};
 
 mod packages;
 
-const USAGE: &str = "cargo xtask dist [--tests] [--out <folder>]\n\
+const USAGE: &str = "cargo xtask prepare [--target <triple>]\n\
+                     cargo xtask dist [--tests] [--out <folder>]\n\
                      cargo xtask package [--out <folder>]\n\
                      cargo xtask hash <manifest> [--write]\n\
                      cargo xtask pins [<manifest>...]\n\
@@ -51,7 +61,16 @@ fn main() -> Result<()> {
             Some("--write") => true,
             Some(other) => bail!("no option {other}\n{USAGE}"),
         };
-        return pe2_setup::hash_manifest(Path::new(&manifest), write);
+        return pe2_setup::hash_manifest(&pe2_path::HostPath::new(Path::new(&manifest))?, write);
+    }
+    if task == "prepare" {
+        let platform = match (args.next().as_deref(), args.next()) {
+            (None, _) => platform()?,
+            (Some("--target"), Some(triple)) => platform_of(&triple)?,
+            _ => bail!("{USAGE}"),
+        };
+        let (workspace, _) = places()?;
+        return prepare(&workspace, &platform).map(drop);
     }
     if task == "packages" {
         let (workspace, target) = places()?;
@@ -97,6 +116,12 @@ fn manifests() -> Result<Vec<PathBuf>> {
             }
         }
     }
+    // The tools: extensions that are only their manifests.
+    for entry in std::fs::read_dir(workspace.join(TOOLS))?.flatten() {
+        if entry.path().join("extension.toml").is_file() {
+            found.push(entry.path().join("extension.toml"));
+        }
+    }
     found.sort();
     Ok(found)
 }
@@ -111,7 +136,9 @@ fn pins(manifests: Vec<PathBuf>) -> Result<()> {
         }
         println!("== {}", manifest.display());
         gone.extend(
-            pe2_setup::check_pins(&manifest)?.into_iter().map(|entry| format!("{}: {entry}", manifest.display())),
+            pe2_setup::check_pins(&pe2_path::HostPath::new(&manifest)?)?
+                .into_iter()
+                .map(|entry| format!("{}: {entry}", manifest.display())),
         );
     }
     ensure!(gone.is_empty(), "no source answers for:\n  {}", gone.join("\n  "));
@@ -134,6 +161,54 @@ fn platform() -> Result<String> {
     Ok(format!("{os}-{}", std::env::consts::ARCH))
 }
 
+/// The platform a target triple builds for, as `platform` names one (`x86_64-pc-windows-msvc`: `windows-x86_64`).
+fn platform_of(triple: &str) -> Result<String> {
+    let arch = triple.split('-').next().context("a target triple names its architecture first")?;
+    let os = if triple.contains("-windows") {
+        "windows"
+    } else if triple.contains("-linux") {
+        "linux"
+    } else if triple.contains("-apple-darwin") {
+        "macos"
+    } else {
+        bail!("no platform for {triple}")
+    };
+    Ok(format!("{os}-{arch}"))
+}
+
+/// What a build needs and is no crate, as `prepare.toml` lists it: its `[[setup]]` entries.
+#[derive(serde::Deserialize)]
+struct Prepare {
+    #[serde(default)]
+    setup: Vec<pe2_setup::Setup>,
+}
+
+/// The file listing what a build needs that is no crate.
+const PREPARE: &str = "prepare.toml";
+
+/// The folder it is fetched into, a folder each platform's (`prepared/<platform>/`).
+const PREPARED: &str = "prepared";
+
+/// `prepare`: what a build for a platform needs that is no crate, fetched into `prepared/<platform>/` and held to its
+/// hashes - where a build finds it (`crates/editor/build.rs`); what is there as pinned already is not fetched again.
+/// The names of the files there.
+fn prepare(workspace: &Path, platform: &str) -> Result<Vec<String>> {
+    let manifest = workspace.join(PREPARE);
+    let text = std::fs::read_to_string(&manifest).with_context(|| manifest.display().to_string())?;
+    let listed: Prepare = toml::from_str(&text).with_context(|| manifest.display().to_string())?;
+    let into = workspace.join(PREPARED).join(platform);
+    std::fs::create_dir_all(&into).with_context(|| into.display().to_string())?;
+    let into = pe2_path::HostPath::new(&into)?;
+    let mut names = Vec::new();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for setup in listed.setup.iter().filter(|setup| setup.platform.as_deref().is_none_or(|named| named == platform)) {
+        println!("{} ({platform})", setup.name);
+        pe2_setup::fetch_into(setup, &into, &mut |_, _| {}, &cancel).with_context(|| setup.name.clone())?;
+        names.extend(setup.take.places().into_iter().map(|(to, _)| to.to_string()));
+    }
+    Ok(names)
+}
+
 /// `cargo` run in the workspace with these arguments.
 fn cargo(workspace: &Path, args: &[&str]) -> Result<()> {
     let program = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -145,6 +220,8 @@ fn cargo(workspace: &Path, args: &[&str]) -> Result<()> {
 /// The editor built and laid out as it ships: the tree's folder.
 fn dist(options: &Options) -> Result<PathBuf> {
     let (workspace, target) = places()?;
+    // What the build needs and is no crate, which it puts beside the programs.
+    let beside = prepare(&workspace, &platform()?)?;
     // The editor and the CLI; their build builds the extensions apart from them too (`extensions/build.rs`).
     cargo(&workspace, &["build", "--release", "--package", "editor", "--package", "cli"])?;
     if options.tests {
@@ -169,16 +246,21 @@ fn dist(options: &Options) -> Result<PathBuf> {
         let file = format!("{program}{}", std::env::consts::EXE_SUFFIX);
         copy(&release.join(&file), &tree.join(&file))?;
     }
+    // Beside them, as prepared and held to its pin: where they look first.
+    for file in beside {
+        copy(&workspace.join(PREPARED).join(platform()?).join(&file), &tree.join(&file))?;
+    }
     // What a user reads of the editor, as an extension ships its own.
     copy(&workspace.join(DOCS), &tree.join(DOCS))?;
     // What the programs are built with, each license's text with it: what they say themselves (`pe2-cli licenses`).
     let listing = licenses::listing();
     let built_for = platform()?;
     ensure!(listing.target == built_for, "the licenses were gathered for {}, not {built_for}", listing.target);
-    std::fs::write(tree.join(LICENSES), listing.document(None)).with_context(|| tree.join(LICENSES).display().to_string())?;
+    std::fs::write(tree.join(LICENSES), listing.document(None))
+        .with_context(|| tree.join(LICENSES).display().to_string())?;
     let extensions = tree.join(EXTENSIONS);
     for (source, component) in [("extensions/psx", "pe2_psx.wasm"), ("extensions/ffmpeg", "pe2_ffmpeg.wasm")] {
-        let folder = extension(&workspace.join(source), &components.join(component), &extensions)?;
+        let folder = extension(&workspace.join(source), Some(&components.join(component)), &extensions)?;
         // What its component links, beside what its crate says of what it ships and fetches.
         let name = folder.file_name().context("a folder has a name")?.to_string_lossy().into_owned();
         let id = name.strip_suffix(".extension").context("an extension's folder")?;
@@ -187,8 +269,18 @@ fn dist(options: &Options) -> Result<PathBuf> {
         std::fs::create_dir_all(folder.join("licenses")).with_context(|| folder.display().to_string())?;
         std::fs::write(&file, listing.document(Some(id))).with_context(|| file.display().to_string())?;
     }
+    // The tools: programs and what they are fetched from, no component.
+    let mut tools: Vec<PathBuf> =
+        std::fs::read_dir(workspace.join(TOOLS))?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    tools.sort();
+    for source in tools {
+        extension(&source, None, &extensions)?;
+    }
     Ok(tree)
 }
+
+/// The folder of the workspace holding the tool extensions: each only a manifest, with its guides and patches.
+const TOOLS: &str = "extensions/tools";
 
 /// The folder of what a user reads of the editor: the workspace's, and the one beside the editor.
 const DOCS: &str = "docs";
@@ -211,15 +303,18 @@ const MANIFEST: &str = "extension.toml";
 /// What of an extension's crate is to be read, copied into its folder where it is there.
 const READ: &[&str] = &["docs", "licenses", "CHANGELOG.md"];
 
-/// An extension's folder, as one is kept (`<id>.extension`), in `to`: its component, its manifest and what its crate
-/// (`source`) has to be read - and the files its manifest names, its setup's patches among them. The folder.
-fn extension(source: &Path, component: &Path, to: &Path) -> Result<PathBuf> {
+/// An extension's folder, as one is kept (`<id>.extension`), in `to`: its component (none, for one that is only its
+/// manifest), its manifest and what its crate (`source`) has to be read - and the files its manifest names, its setup's
+/// patches among them. The folder.
+fn extension(source: &Path, component: Option<&Path>, to: &Path) -> Result<PathBuf> {
     let text =
         std::fs::read_to_string(source.join(MANIFEST)).with_context(|| source.join(MANIFEST).display().to_string())?;
     let manifest: toml::Table = text.parse().with_context(|| source.join(MANIFEST).display().to_string())?;
     let id = manifest.get("id").and_then(toml::Value::as_str).context("its manifest has no id")?;
     let folder = to.join(format!("{id}.extension"));
-    copy(component, &folder.join(COMPONENT))?;
+    if let Some(component) = component {
+        copy(component, &folder.join(COMPONENT))?;
+    }
     copy(&source.join(MANIFEST), &folder.join(MANIFEST))?;
     let mut read: Vec<String> = READ.iter().map(ToString::to_string).collect();
     let licenses = std::fs::read_dir(source).with_context(|| source.display().to_string())?.flatten();

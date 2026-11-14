@@ -2,6 +2,7 @@
 //! otherwise answered here under the project lock, taken for that request alone.
 
 use anyhow::Context as _;
+use pe2_path::HostPath;
 use project::Project;
 use project::cache::Cache;
 use project::index::Index;
@@ -13,7 +14,6 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::{Reply, Request, View, answer, link};
@@ -39,7 +39,7 @@ whether this server's program was rebuilt since it started (then it runs older c
 
 /// Answer a request for the project in `root`: through the editor when it serves the project, else here.
 #[must_use]
-pub fn execute(root: &Path, request: &Request) -> Reply {
+pub fn execute(root: &HostPath, request: &Request) -> Reply {
     // The editors and who holds the project: answered here, never through an editor nor under the project's lock.
     if matches!(request, Request::Call { name, .. } if name == "editors") {
         let text = crate::presence::report(root).to_string();
@@ -127,7 +127,7 @@ pub fn execute(root: &Path, request: &Request) -> Reply {
 /// must not be asked twice (an edit). None where nothing can hold it for this program (it works under another's lock,
 /// no host can be started) or the holder lent it: whoever asked then does the work itself, or says it is not done.
 #[must_use]
-pub fn ask_holder(root: &Path, request: &Request) -> Option<Reply> {
+pub fn ask_holder(root: &HostPath, request: &Request) -> Option<Reply> {
     greet(root);
     if let Some(reply) = link::forward_patiently(root, request) {
         return Some(reply);
@@ -149,14 +149,14 @@ pub fn ask_holder(root: &Path, request: &Request) -> Option<Reply> {
 /// (another build of it, started with another data folder or another trust) would answer with other code or
 /// settings than its own. One nobody keeps is told to stop, and the one started next is this program's; one that is
 /// kept, or an editor, is only said to differ.
-fn greet(root: &Path) {
-    static GREETED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+fn greet(root: &HostPath) {
+    static GREETED: std::sync::Mutex<Vec<HostPath>> = std::sync::Mutex::new(Vec::new());
     {
         let mut greeted = GREETED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if greeted.iter().any(|known| known == root) {
             return;
         }
-        greeted.push(root.to_path_buf());
+        greeted.push(root.clone());
     }
     let Some(Reply::Hello(holder)) = link::forward(root, &Request::Hello) else { return };
     if holder.editor {
@@ -175,7 +175,7 @@ fn greet(root: &Path) {
 }
 
 /// Make an edit while holding the project for it alone: a step of a history of its own, which ends with it.
-fn edit_here(root: &Path, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -> Reply {
+fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -> Reply {
     if matches!(op, vfs::ops::Op::Undo | vfs::ops::Op::Redo) {
         return Reply::failed(
             "nothing holds the project: what is taken back is an editor's or a host's history".into(),
@@ -203,14 +203,14 @@ fn edit_here(root: &Path, lock: &Lock, op: &vfs::ops::Op, layer: Option<&str>) -
 /// The protocol's side of the server.
 #[derive(Clone)]
 pub struct Server {
-    root: PathBuf,
+    root: HostPath,
     /// The tools as last listed: every project's, until the project's holder said its own.
     tools: std::sync::Arc<std::sync::Mutex<Vec<Tool>>>,
 }
 
 impl Server {
     #[must_use]
-    pub fn new(root: PathBuf) -> Server {
+    pub fn new(root: HostPath) -> Server {
         Server { root, tools: std::sync::Arc::new(std::sync::Mutex::new(crate::definitions())) }
     }
 
@@ -289,7 +289,7 @@ impl ServerHandler for Server {
 ///
 /// # Errors
 /// The runtime cannot start or the connection fails.
-pub fn serve_stdio(root: PathBuf) -> anyhow::Result<()> {
+pub fn serve_stdio(root: HostPath) -> anyhow::Result<()> {
     crate::presence::note_start();
     // Made before the runtime: listing the extensions' tools loads them, and a component's call blocks its thread.
     let server = Server::new(root);

@@ -4,13 +4,16 @@
 //! script, and objects it links as they are.
 //!
 //! Everything about what a package is lives here. `gather` finds its sources and follows what they request, reading through the host so that
-//! what is read is the stack as resolved and is recorded: a package is made again when what it reaches changes, and only then. A target
-//! takes over after that, given the files reached: `package-target@compile` makes its `objects`, and the last two steps, `symbols` and
-//! `link`, link it as the PS1 does, one image a package; a target linking packages otherwise removes them in a layer of its own and takes
-//! the `objects`. Which target it is, a package does not know.
+//! what is read is the stack as resolved and is recorded: a package is made again when what it reaches changes, and only then. A build
+//! takes over after that, given the files reached: an operation the project defines, after `gather` in the package's node - a graph of
+//! `run` boxes, the programs extensions offer, and of what `build` gives it (a language's units, a first pass's files put in the tree,
+//! `resolve`, the objects collected, what links it, what it publishes) - making its image, its `objects` and its `symbols`, whatever
+//! the target and the toolchain. Which they are, a package does not know.
 
+mod build;
 mod database;
 mod gather;
+mod generate;
 mod scan;
 mod tokenizers;
 mod typed;
@@ -22,95 +25,23 @@ use pe2_ext::{Call, Field, Icon, Registry, Result, Retain, Table, Tint, Value, a
 
 pe2_ext::extension!(register);
 
-/// A package's stack: what it reaches gathered, then built by whichever target is there, which it does not name; and the
-/// same again for each of its variants, an image each.
+/// A package's stack: what it reaches gathered (`sources`), which a build - an operation the project defines, after it in
+/// the package's node - makes its image, its objects and what it publishes of; the same again for each of its variants.
 const STACK: &str = r#"[[stack]]
 op = "pe2.packages@package"
 
 [[stack]]
 id = "sources"
 op = "pe2.packages@gather"
-
-[[stack]]
-op = "package-target@preprocess"
-
-[[stack]]
-id = "resolved"
-op = "pe2.packages@resolve"
-
-[[stack]]
-op = "output"
-name = "resolved"
-retain = "transient"
-
-[[stack]]
-id = "objects"
-op = "package-target@compile"
-
-[[stack]]
-op = "output"
-name = "objects"
-retain = "cache"
-
-[[stack]]
-op = "package-target@symbols"
-sources = { from = "resolved" }
-objects = { from = "objects" }
-
-[[stack]]
-op = "output"
-name = "symbols"
-retain = "cache"
-
-[[stack]]
-op = "package-target@link"
-sources = { from = "resolved" }
-objects = { from = "objects" }
-
-[[stack]]
-op = "output"
-name = "native"
-retain = "cache"
-pull = ["pe2.events@build", "pe2.events@files-changed"]
-listen = ["pe2.events@clean"]
-deploy = "build/{config}/"
-
-[[stack]]
-op = "output"
-each = "variants"
-branch = "sources"
-retain = "cache"
-pull = ["pe2.events@build", "pe2.events@files-changed"]
-listen = ["pe2.events@clean"]
-deploy = "build/{config}/"
 "#;
 
-/// A library's stack: a package's up to its objects, which what depends on it links - none, where it has nothing to
-/// compile and no objects of its own (headers alone).
+/// A library's stack: a package's, its build making its objects alone, which what depends on it links.
 const LIBRARY_STACK: &str = r#"[[stack]]
 op = "pe2.packages@package"
 
 [[stack]]
+id = "sources"
 op = "pe2.packages@gather"
-
-[[stack]]
-op = "package-target@preprocess"
-
-[[stack]]
-op = "pe2.packages@resolve"
-
-[[stack]]
-op = "output"
-name = "resolved"
-retain = "transient"
-
-[[stack]]
-op = "package-target@compile"
-
-[[stack]]
-op = "output"
-name = "objects"
-retain = "cache"
 "#;
 
 /// What a language server reads, for the config in use, wherever any of it may have changed.
@@ -219,6 +150,7 @@ fn register(r: &mut Registry) -> Result<()> {
         .output::<SourceTree>()
         .steps(gather::resolve());
     tokenizers::register(r);
+    build::register(r);
     let _ = r
         .op("item")
         .label("An item of the list")

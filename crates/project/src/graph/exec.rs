@@ -3,6 +3,7 @@
 //! read of their node - its files, its declaration - is recorded as they read it: the outputs' trace, by which a kept
 //! output is known still to hold without making it again.
 
+use pe2_path::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -53,7 +54,7 @@ pub trait Node: Sync {
         )
     }
     /// Where a content of the node is, by its hash: a stored file's, or what its outputs made.
-    fn content_path(&self, sha1: &str) -> Option<std::path::PathBuf> {
+    fn content_path(&self, sha1: &str) -> Option<HostPath> {
         let _ = sha1;
         None
     }
@@ -105,7 +106,7 @@ impl Node for crate::index::Asset {
         self.files.iter().find(|f| f.name == name && f.made_by.is_none()).map(|f| f.size)
     }
 
-    fn content_path(&self, sha1: &str) -> Option<std::path::PathBuf> {
+    fn content_path(&self, sha1: &str) -> Option<HostPath> {
         self.files.iter().find(|f| f.sha1 == sha1).map(|f| f.path.clone())
     }
 
@@ -181,7 +182,6 @@ pub fn config_hash(config: Option<&pe2_ext::data::BuildConfig>, part: ConfigPart
 /// What a `for_each`'s items are traced as made by.
 const FOR_EACH_MADE: &str = "for_each@1";
 
-
 impl Reads {
     /// Add what another read: an output made from a kept one read what that one did.
     pub fn merge(&mut self, other: &Reads) {
@@ -236,13 +236,13 @@ pub trait World: Sync {
         vec![]
     }
     /// Where a plain file of the project is on disk.
-    fn entry(&self, path: &str) -> Option<std::path::PathBuf> {
+    fn entry(&self, path: &str) -> Option<HostPath> {
         let _ = path;
         None
     }
 
     /// Where a file or folder is on disk, followed through links.
-    fn place(&self, path: &str) -> Option<std::path::PathBuf> {
+    fn place(&self, path: &str) -> Option<HostPath> {
         let _ = path;
         None
     }
@@ -409,7 +409,7 @@ pub struct Call<'a> {
     /// What it may read of other nodes, where it is held to that.
     needs: Option<&'a Needs>,
     /// The paths it handed a program to write (`temp`): what is not kept of them is removed when it is done.
-    temps: Mutex<Vec<std::path::PathBuf>>,
+    temps: Mutex<Vec<HostPath>>,
     /// The folders it had served to programs (`serve`): served until it is done.
     served: Mutex<Vec<crate::content::Folder>>,
 }
@@ -438,7 +438,7 @@ struct Got {
 }
 
 /// Where stored contents of other nodes' outputs are, by hash.
-type Others = Mutex<HashMap<String, std::path::PathBuf>>;
+type Others = Mutex<HashMap<String, HostPath>>;
 
 /// Another node's output, made or found kept, and its stored contents found: where its node has them, or - its node having
 /// them nowhere a path names - kept in the store.
@@ -452,8 +452,8 @@ fn fetch(reach: Reach<'_>, others: &Others, reference: &toml::Value, address: &s
         let path = match (reach.engine.store(), node.content_path(&sha1)) {
             (_, Some(path)) => path,
             // What a node's own output made is in no file of its: the store has it already.
-            (Some(store), None) if store.blob_path(&sha1).exists() => store.blob_path(&sha1),
-            (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1),
+            (Some(store), None) if store.blob_path(&sha1).is_ok_and(|path| path.exists()) => store.blob_path(&sha1)?,
+            (Some(store), None) => store.blob_path(&store.keep(&node.read_content(&sha1)?)?.sha1)?,
             (None, None) => continue,
         };
         others.insert(sha1, path);
@@ -740,7 +740,7 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// There is no store, or it cannot be made.
-    pub fn temp(&self) -> Result<std::path::PathBuf> {
+    pub fn temp(&self) -> Result<HostPath> {
         let path = self.store.context("no store to keep it in")?.spill()?.1;
         self.temps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.clone());
         Ok(path)
@@ -752,7 +752,7 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// A file's content cannot be found, or the folder cannot be served.
-    pub fn serve(&self, files: &[File], how: &crate::content::Use) -> Result<std::path::PathBuf> {
+    pub fn serve(&self, files: &[File], how: &crate::content::Use) -> Result<HostPath> {
         use crate::content::Given;
         let mut given = std::collections::BTreeMap::new();
         for file in files {
@@ -769,8 +769,11 @@ impl<'a> Call<'a> {
             given.insert(file.name.clone(), content);
         }
         let project = self.store.and_then(Store::project);
-        let fallback = self.store.map_or_else(std::env::temp_dir, Store::tmp);
-        let folder = crate::content::serve_folder(project, &given, how, &fallback)?;
+        let fallback = match self.store {
+            Some(store) => store.tmp(),
+            None => HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?,
+        };
+        let folder = crate::content::serve_folder(project.as_ref(), &given, how, &fallback)?;
         let at = folder.at.clone();
         self.served.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(folder);
         Ok(at)
@@ -780,7 +783,7 @@ impl<'a> Call<'a> {
     ///
     /// # Errors
     /// There is no store, or it cannot be read or moved.
-    pub fn keep(&self, path: &std::path::Path, name: &str) -> Result<File> {
+    pub fn keep(&self, path: &HostPath, name: &str) -> Result<File> {
         let store = self.store.context("no store to keep it in")?;
         let sha1 = crate::extract::sha1_file(path).with_context(|| path.display().to_string())?;
         let size = std::fs::metadata(path).with_context(|| path.display().to_string())?.len();
@@ -811,10 +814,10 @@ impl<'a> Call<'a> {
 
     /// Where a stored content is: in the store, or among its node's files.
     #[must_use]
-    pub fn content_path(&self, sha1: &str) -> Option<std::path::PathBuf> {
+    pub fn content_path(&self, sha1: &str) -> Option<HostPath> {
         let other = || self.others.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha1).cloned();
         self.store
-            .map(|s| s.blob_path(sha1))
+            .and_then(|s| s.blob_path(sha1).ok())
             .filter(|p| p.exists())
             .or_else(other)
             .or_else(|| self.recorder.node.content_path(sha1))
@@ -900,7 +903,7 @@ pub struct Writer {
     name: String,
     store: Option<Store>,
     memory: Vec<u8>,
-    spilled: Option<(std::fs::File, std::path::PathBuf)>,
+    spilled: Option<(std::fs::File, HostPath)>,
     hasher: Sha1,
     size: u64,
 }
@@ -1266,7 +1269,8 @@ impl Evaluation<'_> {
         let Some(definition) = self.ops.definitions.get(uid) else {
             return fail(format!("`{uid}`: the project defines no such operation"));
         };
-        let settings: Table = step.settings.iter().filter(|(k, _)| *k != "body").map(|(k, v)| (k.clone(), v.clone())).collect();
+        let settings: Table =
+            step.settings.iter().filter(|(k, _)| *k != "body").map(|(k, v)| (k.clone(), v.clone())).collect();
         let (plan, problems) = Plan::of_definition(definition, &settings, self.ops, &format!("{}: body", step.at));
         if let Some(problem) = problems.first() {
             return fail(format!("{}: {}", problem.at, problem.what));
@@ -1286,7 +1290,8 @@ impl Evaluation<'_> {
             Value::Table(table) => table
                 .into_iter()
                 .map(|(key, value)| {
-                    let item = Table::from_iter([("key".to_string(), toml::Value::String(key)), ("value".to_string(), value)]);
+                    let item =
+                        Table::from_iter([("key".to_string(), toml::Value::String(key)), ("value".to_string(), value)]);
                     Arc::new(Value::Table(item))
                 })
                 .collect(),
@@ -1394,7 +1399,7 @@ impl Evaluation<'_> {
                 others,
                 needs: None,
                 temps: Mutex::default(),
-            served: Mutex::default(),
+                served: Mutex::default(),
             };
             return match tracing::info_span!("stream", of = %step.op).in_scope(|| start(&mut call)) {
                 Ok(producer) => {
@@ -1514,7 +1519,7 @@ impl Evaluation<'_> {
                 others: self.others,
                 needs: Some(&needs),
                 temps: Mutex::default(),
-            served: Mutex::default(),
+                served: Mutex::default(),
             };
             value = tracing::info_span!("op", of = %op).in_scope(|| run(&mut call))?;
         }
@@ -1583,8 +1588,8 @@ impl Evaluation<'_> {
         match content {
             Content::Inline(bytes) => Ok(bytes.clone()),
             Content::Stored { sha1, .. } => {
-                let path = self.store.context("no store")?.blob_path(sha1);
-                std::fs::read(&path).with_context(|| path.display().to_string())
+                let path = self.store.context("no store")?.blob_path(sha1)?;
+                std::fs::read(&path).with_context(|| path.to_string())
             }
         }
     }

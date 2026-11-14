@@ -34,17 +34,21 @@
 //! Only the holder of the project lock writes (`lock.rs`).
 
 use anyhow::{Context, Result, bail};
+use pe2_path::{HostPath, Name};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cache::{Cache, write_atomic};
 use crate::extract::sha1_hex;
 use crate::index::{Index, Working, WorkingFile};
 
-const DIR: &str = "history";
-const SESSION: &str = "session.jsonl";
+pub(crate) const DIR: Name = Name::constant("history");
+const SESSION: Name = Name::constant("session.jsonl");
+/// Where it keeps the contents it may put back, by their hashes.
+const BLOBS: Name = Name::constant("blobs");
+/// Where it keeps what it removed, a folder or a file a step, by their numbers.
+const TRASH: Name = Name::constant("trash");
 /// How long the session's file may grow by what is appended before it is written whole again.
 const SESSION_LONG: u64 = 4 << 20;
 /// How many steps a session keeps.
@@ -56,13 +60,13 @@ const MERGE_WITHIN: Duration = Duration::from_millis(1500);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     /// A file's content before and after, by hash; none: absent.
-    Write { path: PathBuf, before: Option<String>, after: Option<String> },
+    Write { path: HostPath, before: Option<String>, after: Option<String> },
     /// A file or a folder moved.
-    Rename { from: PathBuf, to: PathBuf },
+    Rename { from: HostPath, to: HostPath },
     /// A folder made (for a file written into it).
-    MakeDir { path: PathBuf },
+    MakeDir { path: HostPath },
     /// An empty folder removed.
-    RemoveDir { path: PathBuf },
+    RemoveDir { path: HostPath },
 }
 
 impl Change {
@@ -78,7 +82,7 @@ impl Change {
     }
 
     /// The paths it touches.
-    fn paths(&self) -> Vec<&Path> {
+    fn paths(&self) -> Vec<&HostPath> {
         match self {
             Change::Write { path, .. } | Change::MakeDir { path } | Change::RemoveDir { path } => vec![path],
             Change::Rename { from, to } => vec![from, to],
@@ -141,8 +145,8 @@ impl Step {
 
     /// Every path it touches.
     #[must_use]
-    pub fn paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = self.changes.iter().flat_map(Change::paths).map(Path::to_path_buf).collect();
+    pub fn paths(&self) -> Vec<HostPath> {
+        let mut paths: Vec<HostPath> = self.changes.iter().flat_map(Change::paths).map(HostPath::clone).collect();
         paths.sort();
         paths.dedup();
         paths
@@ -198,8 +202,8 @@ pub struct Session {
 #[derive(Debug)]
 pub enum StepError {
     /// Files it touches changed since outside the editor, or documents it edited were taken from disk since: forcing
-    /// it overwrites them.
-    Changed(Vec<PathBuf>),
+    /// it overwrites them. Each as it is said: a file by its place, a document's file by its asset's path and name.
+    Changed(Vec<String>),
     Io(anyhow::Error),
 }
 
@@ -207,7 +211,7 @@ impl std::fmt::Display for StepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StepError::Changed(paths) => {
-                let names: Vec<String> = paths.iter().take(3).map(|p| p.display().to_string()).collect();
+                let names: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
                 let more = if paths.len() > 3 { format!(" and {} more", paths.len() - 3) } else { String::new() };
                 write!(f, "changed outside the editor since: {}{more}", names.join(", "))
             }
@@ -231,9 +235,9 @@ fn disk_file<'i>(index: &'i Index, uid: &str, file: &str) -> Option<&'i crate::i
 /// What a history shows of itself - its steps done and undone, the documents with unsaved changes, a session a
 /// crash left, and the contents it keeps by their hash: the history's own, or a copy as of a moment
 /// (`History::view`) for whoever shows it while another thread has the history.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct View {
-    dir: PathBuf,
+    dir: HostPath,
     done: Vec<Step>,
     undone: Vec<Step>,
     documents: BTreeMap<String, Document>,
@@ -259,12 +263,17 @@ pub struct History {
     trashed: usize,
     /// The paths its steps wrote - made, undone, redone - since they were last taken (`take_written`): what the
     /// editor takes in as its own changes.
-    written: Vec<PathBuf>,
+    written: Vec<HostPath>,
     /// The log its changes to files are said in before they are made; none where it could not be opened.
     storage: Option<crate::storage::Storage>,
 }
 
 impl View {
+    /// What a history in `dir` shows before it holds anything.
+    fn new(dir: HostPath) -> View {
+        View { dir, done: Vec::new(), undone: Vec::new(), documents: BTreeMap::new(), left: None }
+    }
+
     /// The session a crash ended, where one was left and is not taken up or let go yet.
     #[must_use]
     pub fn left(&self) -> Option<&Session> {
@@ -314,7 +323,10 @@ impl View {
             .iter()
             .map(|(uid, document)| {
                 let files = document.working.iter().map(|(name, sha1)| {
-                    let file = sha1.as_ref().map(|sha1| WorkingFile { path: self.blob_path(sha1), sha1: sha1.clone() });
+                    // A hash that names no file of its folder is no content it kept.
+                    let file = sha1
+                        .as_ref()
+                        .and_then(|sha1| Some(WorkingFile { path: self.blob_path(sha1).ok()?, sha1: sha1.clone() }));
                     (name.clone(), file)
                 });
                 (uid.clone(), Working { files: files.collect() })
@@ -350,18 +362,18 @@ impl View {
     pub fn working_at(&self, point: usize, scope: Option<&str>) -> HashMap<String, Working> {
         let mut working = self.working();
         for ((uid, file), sha1) in self.states_at(point, scope) {
-            let file_at = sha1.map(|sha1| WorkingFile { path: self.blob_path(&sha1), sha1 });
+            let file_at = sha1.and_then(|sha1| Some(WorkingFile { path: self.blob_path(&sha1).ok()?, sha1 }));
             working.entry(uid).or_default().files.insert(file, file_at);
         }
         working
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("blobs").join(hash)
+    fn blob_path(&self, hash: &str) -> Result<HostPath> {
+        Ok(self.dir.join(&BLOBS).join(&Name::new(hash)?))
     }
 
     fn blob(&self, hash: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash);
+        let path = self.blob_path(hash)?;
         std::fs::read(&path).with_context(|| format!("{}: a content the history kept is gone", path.display()))
     }
 }
@@ -388,9 +400,9 @@ impl History {
     /// # Errors
     /// The history's folder cannot be read, cleared or made.
     pub fn open(cache: &Cache) -> Result<(History, Option<String>)> {
-        let dir = cache.path(DIR);
+        let dir = cache.path(&DIR);
         let mut history = History {
-            view: View { dir: dir.clone(), ..View::default() },
+            view: View::new(dir.clone()),
             merge_within: MERGE_WITHIN,
             revision: std::cell::Cell::new(0),
             journaled: false,
@@ -398,16 +410,16 @@ impl History {
             author: "user".into(),
             trashed: 0,
             written: vec![],
-            storage: cache.dir.parent().and_then(crate::storage::Storage::open),
+            storage: cache.dir.parent().and_then(|root| crate::storage::Storage::open(&root)),
         };
         let recovered = cache.recovered.clone();
-        let left = std::fs::read_to_string(dir.join(SESSION))
+        let left = std::fs::read_to_string(dir.join(&SESSION))
             .ok()
             .and_then(|text| Session::read(&text))
             .filter(|left| !left.done.is_empty() || !left.undone.is_empty() || !left.documents.is_empty());
         if left.is_some() {
             // What it kept stays, for what it left to be taken up; the trash goes on numbering after it.
-            history.trashed = std::fs::read_dir(dir.join("trash"))
+            history.trashed = std::fs::read_dir(dir.join(&TRASH))
                 .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<usize>().ok()).max())
                 .ok()
                 .flatten()
@@ -415,7 +427,7 @@ impl History {
         } else if dir.exists() {
             std::fs::remove_dir_all(&dir).with_context(|| format!("{}", dir.display()))?;
         }
-        std::fs::create_dir_all(dir.join("blobs")).with_context(|| format!("{}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(&BLOBS)).with_context(|| format!("{}", dir.display()))?;
         history.view.left = left;
         Ok((history, recovered))
     }
@@ -502,12 +514,12 @@ impl History {
 
     /// The paths its steps wrote since they were last taken, made, undone or redone.
     #[must_use]
-    pub fn written(&self) -> &[PathBuf] {
+    pub fn written(&self) -> &[HostPath] {
         &self.written
     }
 
     /// The files steps wrote since this was last asked, for the index to take in.
-    pub fn take_written(&mut self) -> Vec<PathBuf> {
+    pub fn take_written(&mut self) -> Vec<HostPath> {
         std::mem::take(&mut self.written)
     }
 
@@ -837,7 +849,7 @@ impl History {
             if forwards { step.changes.clone() } else { step.changes.iter().rev().map(Change::inverse).collect() };
         let edits: Vec<Edit> =
             if forwards { step.edits.clone() } else { step.edits.iter().rev().map(Edit::inverse).collect() };
-        let mut differing = Self::changed(&list);
+        let mut differing: Vec<String> = Self::changed(&list).iter().map(ToString::to_string).collect();
         differing.extend(self.edited(index, &edits));
         if !differing.is_empty() {
             if !force {
@@ -855,7 +867,7 @@ impl History {
     }
 
     /// The documents' files not as a list of edits expects them, followed in order, each named by its asset's path.
-    fn edited(&self, index: &Index, edits: &[Edit]) -> Vec<PathBuf> {
+    fn edited(&self, index: &Index, edits: &[Edit]) -> Vec<String> {
         let mut state: HashMap<(&str, &str), Option<String>> = HashMap::new();
         let mut differing = vec![];
         for edit in edits {
@@ -863,7 +875,7 @@ impl History {
             let now = state.get(&key).cloned().unwrap_or_else(|| self.current(index, &edit.uid, &edit.file));
             if now != edit.before {
                 let path = index.by_uid.get(&edit.uid).unwrap_or(&edit.path);
-                differing.push(Path::new(path).join(&edit.file));
+                differing.push(format!("{path}: {}", edit.file));
             }
             state.insert(key, edit.after.clone());
         }
@@ -873,23 +885,23 @@ impl History {
     /// The files not as a list of changes expects them, followed in order: a file written twice is expected as the
     /// first write left it. Folders are not checked: one made is there or not, and one to remove that holds something
     /// now is left alone.
-    fn changed(list: &[Change]) -> Vec<PathBuf> {
-        let mut state: HashMap<&Path, Option<String>> = HashMap::new();
+    fn changed(list: &[Change]) -> Vec<HostPath> {
+        let mut state: HashMap<&HostPath, Option<String>> = HashMap::new();
         // Whether what an earlier move took away or put there is there, as the list leaves it.
-        let mut moved: HashMap<&Path, bool> = HashMap::new();
+        let mut moved: HashMap<&HostPath, bool> = HashMap::new();
         let mut differing = vec![];
         for change in list {
             match change {
                 Change::Write { path, before, after } => {
-                    let now = state.get(path.as_path()).cloned().unwrap_or_else(|| current_hash(path));
+                    let now = state.get(path).cloned().unwrap_or_else(|| current_hash(path));
                     if now != *before {
                         differing.push(path.clone());
                     }
                     state.insert(path, after.clone());
                 }
                 Change::Rename { from, to } => {
-                    let untouched = !state.contains_key(from.as_path()) && !state.contains_key(to.as_path());
-                    let there = |path: &Path| moved.get(path).copied().unwrap_or_else(|| path.exists());
+                    let untouched = !state.contains_key(from) && !state.contains_key(to);
+                    let there = |path: &HostPath| moved.get(path).copied().unwrap_or_else(|| path.exists());
                     if untouched && (!there(from) || there(to)) {
                         differing.push(from.clone());
                     }
@@ -959,7 +971,7 @@ impl History {
             }
         }
         if let Some(storage) = &mut self.storage {
-            storage.wrote(changes.iter().flat_map(Change::paths).map(Path::to_path_buf));
+            storage.wrote(changes.iter().flat_map(Change::paths).map(HostPath::clone));
         }
         Ok(())
     }
@@ -976,7 +988,9 @@ impl History {
                     let after = after.as_ref().map(|hash| self.blob(hash)).transpose().ok()?;
                     Some(Behind { path: path.clone(), after, before: before.clone(), folder: false, at })
                 }
-                Change::MakeDir { path } => Some(Behind { path: path.clone(), after: None, before: None, folder: true, at }),
+                Change::MakeDir { path } => {
+                    Some(Behind { path: path.clone(), after: None, before: None, folder: true, at })
+                }
                 Change::Rename { .. } | Change::RemoveDir { .. } => None,
             })
             .collect()
@@ -1029,7 +1043,7 @@ impl History {
         self.appended.set(None);
         if let Ok(mut text) = serde_json::to_string(&Journaled::Whole(session)) {
             text.push('\n');
-            if write_atomic(&self.view.dir.join(SESSION), text.as_bytes()).is_ok() {
+            if write_atomic(&self.view.dir.join(&SESSION), text.as_bytes()).is_ok() {
                 self.appended.set(Some((self.view.done.len(), self.view.undone.len(), text.len() as u64)));
             }
         }
@@ -1044,7 +1058,9 @@ impl History {
             self.revision.set(self.revision.get() + 1);
             return;
         }
-        let Some((done, undone, long)) = self.appended.get().filter(|(done, _, long)| *done <= self.view.done.len() && *long < SESSION_LONG) else {
+        let Some((done, undone, long)) =
+            self.appended.get().filter(|(done, _, long)| *done <= self.view.done.len() && *long < SESSION_LONG)
+        else {
             return self.journal();
         };
         self.revision.set(self.revision.get() + 1);
@@ -1059,7 +1075,7 @@ impl History {
         let appended = serde_json::to_string(&since).ok().and_then(|mut text| {
             use std::io::Write as _;
             text.push('\n');
-            let mut file = std::fs::OpenOptions::new().append(true).open(self.view.dir.join(SESSION)).ok()?;
+            let mut file = std::fs::OpenOptions::new().append(true).open(self.view.dir.join(&SESSION)).ok()?;
             file.write_all(text.as_bytes()).ok()?;
             Some(text.len() as u64)
         });
@@ -1101,7 +1117,7 @@ impl History {
     }
 
     /// Keep a file's current content; its hash, none where it is absent.
-    fn keep_current(&self, path: &Path) -> Result<Option<String>> {
+    fn keep_current(&self, path: &HostPath) -> Result<Option<String>> {
         match crate::storage::read(path) {
             Ok(Some(bytes)) => self.keep(&bytes).map(Some),
             Ok(None) => Ok(None),
@@ -1256,16 +1272,17 @@ impl Transaction<'_> {
 
     /// What a path is as the changes so far leave it: a file they wrote or removed, a folder they made or
     /// removed, something they moved away - or what the disk has, at the path it had before they moved it.
-    fn seen(&self, path: &Path) -> Seen {
-        let mut at = path.to_path_buf();
+    fn seen(&self, path: &HostPath) -> Seen {
+        let mut at = path.clone();
         for change in self.step.changes.iter().rev() {
             match change {
                 Change::Write { path, after, .. } if *path == at => return Seen::File(after.clone()),
                 Change::MakeDir { path } if *path == at => return Seen::Folder,
                 Change::RemoveDir { path } if *path == at => return Seen::Gone,
                 Change::Rename { from, to } => {
-                    if let Ok(inside) = at.strip_prefix(to) {
-                        at = if inside.as_os_str().is_empty() { from.clone() } else { from.join(inside) };
+                    // Moved by its own parts, whatever its names are.
+                    if let Some(before) = at.moved(to, from) {
+                        at = before;
                     } else if at.starts_with(from) {
                         return Seen::Gone;
                     }
@@ -1279,7 +1296,7 @@ impl Transaction<'_> {
     /// Whether the changes so far say a file or a folder is at a path, or that nothing is; none where they say
     /// nothing of it - the disk does, at `on_disk`.
     #[must_use]
-    pub fn pending(&self, path: &Path) -> Option<bool> {
+    pub fn pending(&self, path: &HostPath) -> Option<bool> {
         match self.seen(path) {
             Seen::File(after) => Some(after.is_some()),
             Seen::Folder => Some(true),
@@ -1290,10 +1307,10 @@ impl Transaction<'_> {
 
     /// Where on disk what is at a path is now, the changes so far having moved it there from elsewhere or not.
     #[must_use]
-    pub fn on_disk(&self, path: &Path) -> PathBuf {
+    pub fn on_disk(&self, path: &HostPath) -> HostPath {
         match self.seen(path) {
             Seen::Disk(at) => at,
-            _ => path.to_path_buf(),
+            _ => path.clone(),
         }
     }
 
@@ -1301,7 +1318,7 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// It cannot be read.
-    pub fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, path: &HostPath) -> Result<Option<Vec<u8>>> {
         match self.seen(path) {
             Seen::File(Some(hash)) => self.history.blob(&hash).map(Some),
             Seen::File(None) | Seen::Folder | Seen::Gone => Ok(None),
@@ -1310,15 +1327,16 @@ impl Transaction<'_> {
         }
     }
 
-    fn exists(&self, path: &Path) -> bool {
+    fn exists(&self, path: &HostPath) -> bool {
         self.pending(path).unwrap_or_else(|| {
             let at = self.on_disk(path);
             // A file as what waits to be written leaves it; a folder there for what waits in it.
-            crate::storage::waiting(&at).map_or_else(|| at.exists() || crate::storage::folder_waits(&at), |waits| waits.is_some())
+            crate::storage::waiting(&at)
+                .map_or_else(|| at.exists() || crate::storage::folder_waits(&at), |waits| waits.is_some())
         })
     }
 
-    fn is_file(&self, path: &Path) -> bool {
+    fn is_file(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::File(after) => after.is_some(),
             Seen::Disk(at) => crate::storage::is_file(&at),
@@ -1326,7 +1344,7 @@ impl Transaction<'_> {
         }
     }
 
-    fn is_dir(&self, path: &Path) -> bool {
+    fn is_dir(&self, path: &HostPath) -> bool {
         match self.seen(path) {
             Seen::Folder => true,
             Seen::Disk(at) => at.is_dir(),
@@ -1335,7 +1353,7 @@ impl Transaction<'_> {
     }
 
     /// A file's content as the changes so far leave it, kept; its hash, none where it is absent.
-    fn current(&self, path: &Path) -> Result<Option<String>> {
+    fn current(&self, path: &HostPath) -> Result<Option<String>> {
         match self.seen(path) {
             Seen::File(after) => Ok(after),
             Seen::Disk(at) => self.history.keep_current(&at),
@@ -1344,13 +1362,8 @@ impl Transaction<'_> {
     }
 
     /// Make the folders a path needs that do not exist.
-    fn make_parents(&mut self, path: &Path) {
-        let mut missing: Vec<PathBuf> = path
-            .ancestors()
-            .skip(1)
-            .take_while(|d| !d.as_os_str().is_empty() && !self.exists(d))
-            .map(Path::to_path_buf)
-            .collect();
+    fn make_parents(&mut self, path: &HostPath) {
+        let mut missing: Vec<HostPath> = path.ancestors().skip(1).take_while(|d| !self.exists(d)).collect();
         missing.reverse();
         for dir in missing {
             self.change(Change::MakeDir { path: dir });
@@ -1361,7 +1374,7 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// It cannot be written, or the history cannot keep what it was.
-    pub fn write(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+    pub fn write(&mut self, path: &HostPath, bytes: &[u8]) -> Result<()> {
         // A large content in a layer is stored as chunks: what the step keeps is its manifest, the other form gone.
         let manifest = crate::chunks::manifest_path(path);
         if let Some(text) = crate::content::chunked(path, bytes)? {
@@ -1377,24 +1390,24 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// Its folder cannot be made, or it cannot be written.
-    pub fn write_stored(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
+    pub fn write_stored(&mut self, path: &HostPath, bytes: &[u8]) -> Result<()> {
         self.make_parents(path);
         let before = self.current(path)?;
         let after = Some(self.history.keep(bytes)?);
         if before == after {
             return Ok(());
         }
-        self.change(Change::Write { path: path.to_path_buf(), before, after });
+        self.change(Change::Write { path: path.clone(), before, after });
         Ok(())
     }
 
     /// Remove a stored file where there is one.
-    fn drop_stored(&mut self, path: &Path) -> Result<()> {
+    fn drop_stored(&mut self, path: &HostPath) -> Result<()> {
         if !self.is_file(path) {
             return Ok(());
         }
         let before = self.current(path)?;
-        self.change(Change::Write { path: path.to_path_buf(), before, after: None });
+        self.change(Change::Write { path: path.clone(), before, after: None });
         Ok(())
     }
 
@@ -1402,10 +1415,10 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// It cannot be made.
-    pub fn make_dir(&mut self, path: &Path) -> Result<()> {
+    pub fn make_dir(&mut self, path: &HostPath) -> Result<()> {
         self.make_parents(path);
         if !self.is_dir(path) {
-            self.change(Change::MakeDir { path: path.to_path_buf() });
+            self.change(Change::MakeDir { path: path.clone() });
         }
         Ok(())
     }
@@ -1414,13 +1427,13 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// It does not exist or cannot be removed.
-    pub fn remove(&mut self, path: &Path) -> Result<()> {
+    pub fn remove(&mut self, path: &HostPath) -> Result<()> {
         if self.is_dir(path) {
             self.history.trashed += 1;
-            let trash = self.history.view.dir.join("trash");
+            let trash = self.history.view.dir.join(&TRASH);
             std::fs::create_dir_all(&trash)?;
-            let to = trash.join(self.history.trashed.to_string());
-            self.change(Change::Rename { from: path.to_path_buf(), to });
+            let to = trash.join(&Name::new(&self.history.trashed.to_string())?);
+            self.change(Change::Rename { from: path.clone(), to });
             return Ok(());
         }
         // A file, in whichever form it is stored.
@@ -1437,19 +1450,19 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// Something is at `to`, or it cannot be copied or moved.
-    pub fn place(&mut self, from: &Path, to: &Path) -> Result<()> {
+    pub fn place(&mut self, from: &HostPath, to: &HostPath) -> Result<()> {
         if self.exists(to) {
             bail!("{}: something is there", to.display());
         }
         self.history.trashed += 1;
-        let trash = self.history.view.dir.join("trash");
+        let trash = self.history.view.dir.join(&TRASH);
         std::fs::create_dir_all(&trash)?;
-        let staged = trash.join(self.history.trashed.to_string());
+        let staged = trash.join(&Name::new(&self.history.trashed.to_string())?);
         copy_all(from, &staged).with_context(|| format!("{} to {}", from.display(), staged.display()))?;
         // On disk before the log says it is moved into place: the log holds the move, not what is moved.
         sync_all(&staged);
         self.make_parents(to);
-        self.change(Change::Rename { from: staged, to: to.to_path_buf() });
+        self.change(Change::Rename { from: staged, to: to.clone() });
         Ok(())
     }
 
@@ -1457,7 +1470,7 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// The source does not exist, the target does, or the move fails.
-    pub fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+    pub fn rename(&mut self, from: &HostPath, to: &HostPath) -> Result<()> {
         // A file held as its manifest moves as it.
         let (manifest, to_manifest) = (crate::chunks::manifest_path(from), crate::chunks::manifest_path(to));
         if !self.exists(from) && self.is_file(&manifest) && !self.exists(to) && !self.exists(&to_manifest) {
@@ -1469,7 +1482,7 @@ impl Transaction<'_> {
             bail!("{} cannot move to {}", from.display(), to.display());
         }
         self.make_parents(to);
-        self.change(Change::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+        self.change(Change::Rename { from: from.clone(), to: to.clone() });
         Ok(())
     }
 
@@ -1477,9 +1490,10 @@ impl Transaction<'_> {
     ///
     /// # Errors
     /// The changes cannot be said in the log, or a file cannot be written: nothing is changed then.
-    pub fn commit(mut self) -> Result<Vec<PathBuf>> {
+    pub fn commit(mut self) -> Result<Vec<HostPath>> {
         let label = self.step.label.clone();
-        tracing::info_span!("edit: said in the log and written").in_scope(|| self.history.apply_all(&label, &self.step.changes))?;
+        tracing::info_span!("edit: said in the log and written")
+            .in_scope(|| self.history.apply_all(&label, &self.step.changes))?;
         self.committed = true;
         let paths = self.step.paths();
         self.history.written.extend(paths.iter().cloned());
@@ -1500,14 +1514,14 @@ enum Seen {
     /// Nothing: removed, or moved away.
     Gone,
     /// What the disk has, at this path - the one it had before they moved it.
-    Disk(PathBuf),
+    Disk(HostPath),
 }
 
 /// Have a file, or a folder and all in it, on disk: best effort.
-fn sync_all(path: &Path) {
+fn sync_all(path: &HostPath) {
     if path.is_dir() {
         for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-            sync_all(&entry.path());
+            sync_all(&path.entry(&entry.file_name()));
         }
         if cfg!(unix) {
             let _ = std::fs::File::open(path).and_then(|folder| folder.sync_all());
@@ -1518,12 +1532,12 @@ fn sync_all(path: &Path) {
 }
 
 /// A file or a folder copied, with everything in it; a file keeps its permissions.
-fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
+fn copy_all(from: &HostPath, to: &HostPath) -> std::io::Result<()> {
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
-            copy_all(&entry.path(), &to.join(entry.file_name()))?;
+            copy_all(&from.entry(&entry.file_name()), &to.entry(&entry.file_name()))?;
         }
         return Ok(());
     }
@@ -1531,9 +1545,9 @@ fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Keep bytes in a history's folder, once: their hash.
-fn keep_in(dir: &Path, bytes: &[u8]) -> Result<String> {
+fn keep_in(dir: &HostPath, bytes: &[u8]) -> Result<String> {
     let hash = sha1_hex(bytes);
-    let path = dir.join("blobs").join(&hash);
+    let path = dir.join(&BLOBS).join(&Name::new(&hash)?);
     if !path.exists() {
         write_atomic(&path, bytes)?;
     }
@@ -1541,11 +1555,11 @@ fn keep_in(dir: &Path, bytes: &[u8]) -> Result<String> {
 }
 
 /// The hash of what a file holds - as what waits to be written leaves it; none where it is absent.
-fn current_hash(path: &Path) -> Option<String> {
+fn current_hash(path: &HostPath) -> Option<String> {
     crate::storage::read(path).ok().flatten().map(|bytes| sha1_hex(&bytes))
 }
 
-fn is_empty_dir(path: &Path) -> bool {
+fn is_empty_dir(path: &HostPath) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
@@ -1556,31 +1570,32 @@ mod tests {
     use crate::cache::Cache;
     use crate::index::Index;
     use crate::lock::Lock;
-    use std::path::{Path, PathBuf};
+    use crate::testing::At as _;
+    use pe2_path::HostPath;
 
-    fn project(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("pe2-history-{name}-{}", std::process::id()));
+    fn project(name: &str) -> HostPath {
+        let root = crate::testing::scratch(&format!("history-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("layer/a")).unwrap();
-        std::fs::write(root.join("project.toml"), "").unwrap();
-        std::fs::write(root.join("layer/a/one"), "one").unwrap();
+        std::fs::create_dir_all(root.at("layer/a")).unwrap();
+        std::fs::write(root.at("project.toml"), "").unwrap();
+        std::fs::write(root.at("layer/a/one"), "one").unwrap();
         root
     }
 
-    fn history(root: &Path) -> (History, Option<String>) {
+    fn history(root: &HostPath) -> (History, Option<String>) {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test").unwrap();
         History::open(&Cache::open(&project, &lock).unwrap()).unwrap()
     }
 
     /// The index of a project, for what undo reads of documents.
-    fn index(root: &Path) -> Index {
+    fn index(root: &HostPath) -> Index {
         let project = Project::load(root).unwrap();
         let lock = Lock::try_acquire(root, "a test").unwrap();
         Index::open(&project, &Cache::open(&project, &lock).unwrap()).unwrap()
     }
 
-    fn read(path: &Path) -> Option<String> {
+    fn read(path: &HostPath) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }
 
@@ -1589,25 +1604,25 @@ mod tests {
         let root = project("steps");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let (one, two) = (root.join("layer/a/one"), root.join("layer/b/c/two"));
+        let (one, two) = (root.at("layer/a/one"), root.at("layer/b/c/two"));
         let mut tx = history.begin("edit");
         tx.write(&one, b"ONE").unwrap();
         tx.write(&two, b"two").unwrap();
         tx.commit().unwrap();
         let mut tx = history.begin("delete");
-        tx.remove(&root.join("layer/a")).unwrap();
-        tx.rename(&root.join("layer/b"), &root.join("layer/d")).unwrap();
+        tx.remove(&root.at("layer/a")).unwrap();
+        tx.rename(&root.at("layer/b"), &root.at("layer/d")).unwrap();
         tx.commit().unwrap();
-        assert!(!one.exists() && read(&root.join("layer/d/c/two")).as_deref() == Some("two"));
+        assert!(!one.exists() && read(&root.at("layer/d/c/two")).as_deref() == Some("two"));
         history.undo(&index, None, false).unwrap();
         assert_eq!((read(&one).as_deref(), read(&two).as_deref()), (Some("ONE"), Some("two")));
         history.undo(&index, None, false).unwrap();
         // The folders the write made are gone with it: an undone copy leaves nothing behind.
         assert_eq!(read(&one).as_deref(), Some("one"));
-        assert!(!root.join("layer/b").exists());
+        assert!(!root.at("layer/b").exists());
         history.redo(&index, None, false).unwrap();
         history.redo(&index, None, false).unwrap();
-        assert!(!one.exists() && root.join("layer/d/c/two").exists());
+        assert!(!one.exists() && root.at("layer/d/c/two").exists());
         assert!(history.redo(&index, None, false).is_err());
         crate::cache::remove_all(&root);
     }
@@ -1617,7 +1632,7 @@ mod tests {
         let root = project("chunked");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let file = root.join(".layers/top/a.node/native.bin");
+        let file = root.at(".layers/top/a.node/native.bin");
         let manifest = crate::chunks::manifest_path(&file);
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
         let mut tx = history.begin("write");
@@ -1646,13 +1661,13 @@ mod tests {
         let root = project("outside");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let one = root.join("layer/a/one");
+        let one = root.at("layer/a/one");
         let mut tx = history.begin("edit");
         tx.write(&one, b"mine").unwrap();
         tx.commit().unwrap();
         std::fs::write(&one, "theirs").unwrap();
         match history.undo(&index, None, false) {
-            Err(StepError::Changed(paths)) => assert_eq!(paths, std::slice::from_ref(&one)),
+            Err(StepError::Changed(paths)) => assert_eq!(paths, [one.to_string()]),
             other => panic!("{other:?}"),
         }
         history.undo(&index, None, true).unwrap();
@@ -1666,31 +1681,31 @@ mod tests {
     #[test]
     fn what_is_not_committed_touches_nothing_and_reads_its_own_changes() {
         let root = project("pending");
-        let (one, new) = (root.join("layer/a/one"), root.join("layer/new/file"));
+        let (one, new) = (root.at("layer/a/one"), root.at("layer/new/file"));
         let (mut history, _) = history(&root);
         let mut tx = history.begin("failed");
         tx.write(&one, b"half").unwrap();
         tx.write(&new, b"x").unwrap();
-        tx.rename(&root.join("layer/a"), &root.join("layer/moved")).unwrap();
+        tx.rename(&root.at("layer/a"), &root.at("layer/moved")).unwrap();
         // Read as its changes so far leave the files: written, made, moved.
-        assert_eq!(tx.read(&root.join("layer/moved/one")).unwrap().as_deref(), Some(&b"half"[..]));
+        assert_eq!(tx.read(&root.at("layer/moved/one")).unwrap().as_deref(), Some(&b"half"[..]));
         assert_eq!(tx.read(&one).unwrap(), None, "moved away");
         assert_eq!(tx.pending(&new), Some(true));
-        assert_eq!(tx.pending(&root.join("layer/new")), Some(true), "the folder made for it");
-        assert_eq!(tx.pending(&root.join("layer/untouched")), None, "what it says nothing of is the disk's");
+        assert_eq!(tx.pending(&root.at("layer/new")), Some(true), "the folder made for it");
+        assert_eq!(tx.pending(&root.at("layer/untouched")), None, "what it says nothing of is the disk's");
         // And no file is touched: dropped uncommitted, it changed nothing.
         assert_eq!(read(&one).as_deref(), Some("one"));
-        assert!(!root.join("layer/new").exists() && !root.join("layer/moved").exists());
+        assert!(!root.at("layer/new").exists() && !root.at("layer/moved").exists());
         drop(tx);
         assert_eq!(read(&one).as_deref(), Some("one"));
         assert!(history.done().is_empty());
         // Committed, the files are as it read them.
         let mut tx = history.begin("made");
         tx.write(&one, b"whole").unwrap();
-        tx.rename(&root.join("layer/a"), &root.join("layer/moved")).unwrap();
+        tx.rename(&root.at("layer/a"), &root.at("layer/moved")).unwrap();
         tx.commit().unwrap();
-        assert_eq!(read(&root.join("layer/moved/one")).as_deref(), Some("whole"));
-        assert!(!root.join("layer/a").exists());
+        assert_eq!(read(&root.at("layer/moved/one")).as_deref(), Some("whole"));
+        assert!(!root.at("layer/a").exists());
         drop(history);
         crate::cache::remove_all(&root);
     }
@@ -1699,7 +1714,7 @@ mod tests {
     fn what_the_log_has_whole_and_the_files_have_not_is_written_when_the_project_is_next_taken() {
         use crate::storage::{Storage, Stored};
         let root = project("redo");
-        let one = root.join("layer/a/one");
+        let one = root.at("layer/a/one");
         {
             // Said whole, on disk - and its process gone before any file was written.
             let mut storage = Storage::open(&root).unwrap();
@@ -1711,17 +1726,19 @@ mod tests {
             ];
             storage.say("crashed", &changes).unwrap();
             // Another, cut short before it was whole: nothing.
-            sfs::storage::began(&sfs::Log::shared(&root.join(".cache/filesystem/sfs"), sfs::log::Config::default()).unwrap())
-                .unwrap();
+            sfs::storage::began(
+                &sfs::Log::shared(&root.at(".cache/filesystem/sfs"), sfs::log::Config::default()).unwrap(),
+            )
+            .unwrap();
             std::mem::forget(storage);
         }
         assert_eq!(read(&one).as_deref(), Some("one"), "no file was touched");
         // Whoever takes the project next writes it, before anything reads the files.
         let (history, recovered) = history(&root);
         assert!(recovered.as_deref().is_some_and(|said| said.contains("crashed")), "{recovered:?}");
-        assert_eq!(read(&root.join("layer/moved/one")).as_deref(), Some("ONE"));
-        assert_eq!(read(&root.join("layer/new/file")).as_deref(), Some("x"));
-        assert!(!root.join("layer/a").exists());
+        assert_eq!(read(&root.at("layer/moved/one")).as_deref(), Some("ONE"));
+        assert_eq!(read(&root.at("layer/new/file")).as_deref(), Some("x"));
+        assert!(!root.at("layer/a").exists());
         assert!(history.done().is_empty());
         drop(history);
         // Written again once: the next to take it finds nothing to write.
@@ -1733,11 +1750,10 @@ mod tests {
 
     /// Where a records layer of the project keeps the record of a uid - the layer's own folder there, as a
     /// layer's is: only a record and the folder of its first two letters are written behind.
-    fn record(root: &Path, uid: &str) -> PathBuf {
-        // Under the root as the project names it, which is how every path of an edit is made.
-        let records = std::fs::canonicalize(root).unwrap().join(".layers").join("top").join(".records");
+    fn record(root: &HostPath, uid: &str) -> HostPath {
+        let records = root.at(".layers/top/.records");
         std::fs::create_dir_all(&records).unwrap();
-        records.join(&uid[..2]).join(format!("{uid}.toml"))
+        records.at(&uid[..2]).at(&format!("{uid}.toml"))
     }
 
     #[test]
@@ -1755,7 +1771,7 @@ mod tests {
         // Said, and no file touched - nor their folders made: read as the set leaves them by whoever asks.
         assert!(!a.exists() && !a.parent().unwrap().exists());
         assert_eq!(read_through(&a).unwrap().as_deref(), Some(&b"one"[..]));
-        assert_eq!(waiting_under(a.parent().unwrap().parent().unwrap()).len(), 2);
+        assert_eq!(waiting_under(&a.parent().unwrap().parent().unwrap()).len(), 2);
         // Changed again and removed while they wait: each as the last set leaves it.
         let mut tx = history.begin("again");
         tx.write_stored(&a, b"ONE!").unwrap();
@@ -1785,9 +1801,9 @@ mod tests {
         assert_eq!(read(&a).as_deref(), Some("ONE!"));
         history.hold_back(false);
         let mut tx = history.begin("a file");
-        tx.write(&root.join("layer/a/one"), b"ONE").unwrap();
+        tx.write(&root.at("layer/a/one"), b"ONE").unwrap();
         tx.commit().unwrap();
-        assert_eq!((read(&a).as_deref(), read(&root.join("layer/a/one")).as_deref()), (Some("last"), Some("ONE")));
+        assert_eq!((read(&a).as_deref(), read(&root.at("layer/a/one")).as_deref()), (Some("last"), Some("ONE")));
         drop(history);
         crate::cache::remove_all(&root);
     }
@@ -1808,7 +1824,7 @@ mod tests {
         history.hold_back(false);
         history.settle();
         assert_eq!(read(&a).as_deref(), Some("theirs"), "not written over");
-        assert_eq!(read(&root.join(".cache/conflicts/.layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
+        assert_eq!(read(&root.at(".cache/conflicts/.layers/top/.records/aa/aa1.toml")).as_deref(), Some("ours"));
         assert!(crate::storage::waiting(&a).is_none(), "read as it is from here on");
         drop(history);
         crate::cache::remove_all(&root);
@@ -1841,7 +1857,7 @@ mod tests {
         let root = project("merge");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let one = root.join("layer/a/one");
+        let one = root.at("layer/a/one");
         for text in ["o", "on", "onx"] {
             let mut tx = history.begin("type").merging("one");
             tx.write(&one, text.as_bytes()).unwrap();
@@ -1854,14 +1870,14 @@ mod tests {
     }
 
     /// A project of one layer holding the assets `a` and `b`.
-    fn documents_project(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("pe2-history-{name}-{}", std::process::id()));
+    fn documents_project(name: &str) -> HostPath {
+        let root = crate::testing::scratch(&format!("history-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".layers/top/a.node")).unwrap();
-        std::fs::create_dir_all(root.join(".layers/top/b.node")).unwrap();
-        std::fs::write(root.join("project.toml"), "[[layer]]\nname = \"top\"\n").unwrap();
-        std::fs::write(root.join(".layers/top/a.node/node.toml"), "uid = \"uid://a\"\nx = 1\n").unwrap();
-        std::fs::write(root.join(".layers/top/b.node/node.toml"), "uid = \"uid://b\"\ny = 1\n").unwrap();
+        std::fs::create_dir_all(root.at(".layers/top/a.node")).unwrap();
+        std::fs::create_dir_all(root.at(".layers/top/b.node")).unwrap();
+        std::fs::write(root.at("project.toml"), "[[layer]]\nname = \"top\"\n").unwrap();
+        std::fs::write(root.at(".layers/top/a.node/node.toml"), "uid = \"uid://a\"\nx = 1\n").unwrap();
+        std::fs::write(root.at(".layers/top/b.node/node.toml"), "uid = \"uid://b\"\ny = 1\n").unwrap();
         root
     }
 
@@ -1884,7 +1900,7 @@ mod tests {
         assert!(edit(&mut history, "uid://a", "uid = \"uid://a\"\nx = 3\n"));
         // Nothing is written: the working copies hold the edits, and the index shows them.
         assert_eq!(
-            std::fs::read_to_string(root.join(".layers/top/a.node/node.toml")).unwrap(),
+            std::fs::read_to_string(root.at(".layers/top/a.node/node.toml")).unwrap(),
             "uid = \"uid://a\"\nx = 1\n"
         );
         let mut shown = index.clone();
@@ -1912,7 +1928,7 @@ mod tests {
         let root = documents_project("save");
         let (mut history, _) = history(&root);
         let index = index(&root);
-        let a = root.join(".layers/top/a.node/node.toml");
+        let a = root.at(".layers/top/a.node/node.toml");
         history
             .edit(&index, "uid://a", "a", "node.toml", b"uid = \"uid://a\"\nx = 2\n", "Edit a".into(), None)
             .unwrap();
@@ -1975,7 +1991,7 @@ mod tests {
     fn a_journaled_session_is_appended_to_and_read_back_as_it_was() {
         let root = documents_project("appended");
         let index = index(&root);
-        let session = root.join(".cache/history/session.jsonl");
+        let session = root.at(".cache/history/session.jsonl");
         {
             let (history, _) = history(&root);
             let mut history = history.journaled();

@@ -12,7 +12,7 @@
 //! - Removing an entry deletes it (a delete of what comes from below); renaming one moves it, its uid kept - a node
 //!   with what is inside it.
 
-use std::path::PathBuf;
+use pe2_path::HostPath;
 
 use anyhow::{Context, Result, bail};
 use project::history::History;
@@ -24,14 +24,14 @@ use project::{Project, edit};
 #[serde(rename_all = "snake_case")]
 pub enum Written {
     /// A file of its own.
-    File(PathBuf),
+    File(HostPath),
     /// In the log the project's processes share (`sfs::Log`), kept in this folder: how long it is, and its ranges -
     /// where each starts in the file, how long it is, where it is in the log. Read where the log is mapped.
-    Logged { log: PathBuf, len: u64, ranges: Vec<(u64, u64, u64)> },
+    Logged { log: HostPath, len: u64, ranges: Vec<(u64, u64, u64)> },
 }
 
-impl From<PathBuf> for Written {
-    fn from(file: PathBuf) -> Written {
+impl From<HostPath> for Written {
+    fn from(file: HostPath) -> Written {
         Written::File(file)
     }
 }
@@ -174,7 +174,7 @@ pub trait Owner: Send + Sync {
 
     /// What a program wrote at this path, staged in this file, was not given to the project by the time serving
     /// ends: the owner's to keep, where it can - the staging is emptied when the folder is next served.
-    fn left(&self, _path: &str, _staged: &std::path::Path) {}
+    fn left(&self, _path: &str, _staged: &HostPath) {}
 }
 
 /// Files programs make for themselves beside what they edit - swap files, backups, lock files - which stay in the
@@ -281,7 +281,7 @@ pub fn apply(
     index: &Index,
     layer: &str,
     history: &mut History,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<HostPath>> {
     let label = change.label();
     match change {
         Change::Write { path, staged } => {
@@ -321,7 +321,7 @@ fn write(
     bytes: &[u8],
     label: String,
     history: &mut History,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<HostPath>> {
     // A declaration makes its folder a node, wherever it is - in a folder, or inside another node - unless that folder
     // is a node already: one there already is its folder of children.
     if let Some(folder) = path.strip_suffix(&format!("/{NODE_FILE}")).filter(|f| !f.is_empty())
@@ -352,7 +352,7 @@ fn rename(
     to: &str,
     label: String,
     history: &mut History,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<HostPath>> {
     match place(index, from) {
         Place::Entry(real, entry) => {
             let mut touched = Vec::new();
@@ -384,8 +384,7 @@ fn rename(
 }
 
 fn new_uid(index: &Index) -> Result<String> {
-    let id = project::uid::new(|id| index.by_uid.contains_key(&project::uid::text(id)))?;
-    Ok(project::uid::text(id))
+    Ok(project::uid::new(|uid| index.by_uid.contains_key(&uid.to_string()))?.to_string())
 }
 
 #[cfg(test)]

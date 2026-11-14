@@ -5,6 +5,7 @@
 //! model holds it in one moment, and nothing of a refresh is said where the refresh failed. Whether a server is
 //! fed makes no difference to it: what feeds one (`files::Files`) only tells it that something was said.
 
+use pe2_path::HostPath;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use project::server::{Delta, Listing};
@@ -33,7 +34,8 @@ impl Says {
     /// In the space the project's processes share, attached here where it is not yet.
     #[must_use]
     pub fn of(project: &project::Project) -> Says {
-        let shared = project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
+        let shared =
+            project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
         Says { shared, current: Mutex::default() }
     }
 
@@ -59,10 +61,11 @@ impl Says {
     ///
     /// # Errors
     /// The space is not there, or cannot be written.
-    pub fn took(&self, root: &std::path::Path, index: &mut project::index::Index) -> Result<(), String> {
+    pub fn took(&self, root: &HostPath, index: &mut project::index::Index) -> Result<(), String> {
         self.forget();
         self.shared.as_ref().map_err(Clone::clone)?;
-        project::model::took(root, index).map_err(|e| format!("the project's model could not be said in the shared space: {e}"))
+        project::model::took(root, index)
+            .map_err(|e| format!("the project's model could not be said in the shared space: {e}"))
     }
 
     /// Say, in one commit: what a refresh changed of the model, what is served after it, and what became of what

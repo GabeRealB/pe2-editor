@@ -1,21 +1,23 @@
 //! What is edited from outside the window - through the served folder, the command line, an agent - as the editor
 //! takes it: a step of its history, in the layer edits go to, taken back by undo.
+use pe2_path::testing::At as _;
 
 use super::{Fixture, Scenario};
+use pe2_path::HostPath;
 
 /// What a records layer holds: its records' files, by name.
 fn records(scenario: &mut Scenario) -> Vec<String> {
-    let at = scenario.workspace().project.root.join(".layers/top/.records");
+    let at = scenario.workspace().project.root.at(".layers/top/.records");
     let mut found: Vec<String> = walk(&at).into_iter().filter(|name| name != "layer.toml").collect();
     found.sort();
     found
 }
 
-fn walk(dir: &std::path::Path) -> Vec<String> {
+fn walk(dir: &HostPath) -> Vec<String> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            out.extend(walk(&entry.path()));
+            out.extend(walk(&dir.entry(&entry.file_name())));
         } else {
             out.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -58,7 +60,9 @@ fn what_is_due_is_taken_from_where_it_is_said_and_answered_with_its_take_in() {
     let numbers = vfs::due::put(&space, &ops).expect("said due");
     let (reply, answered) = std::sync::mpsc::channel();
     editor.workspace().take_due(&reply);
-    editor.until("who asked to look to be answered", |_| answered.try_recv().is_ok_and(|reply| matches!(reply, mcp::Reply::Taken { count: 3 })));
+    editor.until("who asked to look to be answered", |_| {
+        answered.try_recv().is_ok_and(|reply| matches!(reply, mcp::Reply::Taken { count: 3 }))
+    });
     // Answered once it is taken in, and said where it was due: nothing is due, each has its answer.
     assert!(editor.workspace().index.entries.contains_key("made/inside"));
     assert!(!vfs::due::any(&space.read().unwrap()));
@@ -85,7 +89,8 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
     let space = project::shared::space(&root).expect("the shared space");
     let outside = editor.workspace().outside();
     let folder = |path: &str| vfs::ops::Op::Folder { path: path.into() };
-    let edit = |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
+    let edit =
+        |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
     // An edit, and one over the project as the first left it: made by the worker, answered here - no frame is
     // drawn meanwhile.
     assert!(matches!(edit(folder("made")), mcp::Reply::Edited { .. }));
@@ -124,7 +129,7 @@ fn what_is_asked_on_the_agents_link_is_done_with_no_frame_drawn() {
 #[test]
 fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
-    let kept = editor.workspace().cache_path("editor/layers.toml");
+    let kept = editor.workspace().cache_path(&pe2_path::RelPath::constant("editor/layers.toml"));
     editor.workspace().toggle_lock("top").expect("locked");
     // Written by the worker's thread, aside: there a moment after, with no frame waited for.
     editor.until("the view to be kept", |_| std::fs::read_to_string(&kept).is_ok_and(|text| text.contains("top")));
@@ -134,7 +139,8 @@ fn the_view_of_the_layers_is_kept_off_the_windows_thread() {
 fn what_the_editor_wrote_is_no_change_of_another_program() {
     let mut editor = Scenario::open(Fixture::notes_under_records());
     let outside = editor.workspace().outside();
-    let edit = |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
+    let edit =
+        |op: vfs::ops::Op| outside.answer(mcp::Request::Edit { op, layer: None }).expect("the worker's to answer");
     assert!(matches!(edit(vfs::ops::Op::Folder { path: "made".into() }), mcp::Reply::Edited { .. }));
     assert!(matches!(edit(vfs::ops::Op::Override { path: "notes".into() }), mcp::Reply::Edited { .. }));
     // What watches the layers tells of the files those wrote, a moment after: they are the editor's own.

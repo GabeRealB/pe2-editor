@@ -4,7 +4,7 @@
 //! (`forget`, `adopt`, `remove-unlisted`) is a layer's own path, as the problem gives it. A file's content goes by the
 //! path of a file holding it (`from`), never inline: what applies it reads it there.
 
-use std::path::PathBuf;
+use pe2_path::HostPath;
 
 use anyhow::{Context, Result, bail};
 use project::Project;
@@ -154,7 +154,7 @@ pub fn apply(
     index: &Index,
     layer: &str,
     history: &mut History,
-) -> Result<(String, Vec<PathBuf>)> {
+) -> Result<(String, Vec<HostPath>)> {
     let touched = match op {
         _ if let Some(change) = op.as_change() => crate::write::apply(&change, project, index, layer, history)?,
         Op::Override { path } => edit::override_entry(project, index, layer, &uid_at(index, path)?, history)?,

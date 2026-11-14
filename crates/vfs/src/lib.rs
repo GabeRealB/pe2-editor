@@ -21,9 +21,9 @@ pub mod backend;
 #[cfg(windows)]
 pub mod cloud;
 pub mod dav;
-pub mod due;
 #[cfg(windows)]
 pub mod dokan;
+pub mod due;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fuse;
 pub mod ops;
@@ -192,8 +192,12 @@ impl View {
         use sfs::ring::{Key, PAGE};
         let path = self.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(ino).map(str::to_string);
         let found = path.and_then(|path| self.known(&path));
-        let Some((_, node, (number, version))) = found else { return Err(std::io::Error::from(std::io::ErrorKind::NotFound)) };
-        let What::File(Given::Disk(disk)) = &node.what else { return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory)) };
+        let Some((_, node, (number, version))) = found else {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        };
+        let What::File(Given::Disk(disk)) = &node.what else {
+            return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+        };
         // A long file is read where it lives: read from one end to the other, the system has it there faster than
         // page by page from here, and it would take the place of very many short ones.
         let Some(ring) = self.ring.as_ref().filter(|_| node.size <= PAGED) else {
@@ -503,7 +507,8 @@ impl Tree {
     #[must_use]
     pub fn node(&self, ino: u64) -> Option<Arc<Node>> {
         let Some(view) = &self.shared else { return self.nodes.get(&ino).cloned() };
-        let path = view.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(ino).map(str::to_string)?;
+        let path =
+            view.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(ino).map(str::to_string)?;
         view.at(&path).map(|(_, node)| node)
     }
 
@@ -538,14 +543,24 @@ impl Tree {
     pub fn entries(&self, path: &str) -> Option<Vec<(String, u64, Arc<Node>)>> {
         let names = self.children(path)?;
         let path = path.trim_matches('/');
-        Some(names.into_keys().filter_map(|name| self.at(&joined(path, &name)).map(|(ino, node)| (name, ino, node))).collect())
+        Some(
+            names
+                .into_keys()
+                .filter_map(|name| self.at(&joined(path, &name)).map(|(ino, node)| (name, ino, node)))
+                .collect(),
+        )
     }
 
     /// A folder's child by name.
     #[must_use]
     pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
         if let Some(view) = &self.shared {
-            let folder = view.inodes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).path(parent).map(str::to_string)?;
+            let folder = view
+                .inodes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .path(parent)
+                .map(str::to_string)?;
             return view.at(&joined(&folder, name)).map(|(ino, _)| ino);
         }
         match &self.nodes.get(&parent)?.what {
@@ -672,7 +687,11 @@ impl Changes {
     /// no more is gone, one not listed before is new - and with a node's file, each folder its name made or left
     /// empty, which no listing has.
     #[must_use]
-    pub fn of(before: &project::server::Listing, delta: &project::server::Delta, after: &project::server::Listing) -> Changes {
+    pub fn of(
+        before: &project::server::Listing,
+        delta: &project::server::Delta,
+        after: &project::server::Listing,
+    ) -> Changes {
         use project::server::{Listing, Shown};
         let folder = |shown: &Shown| !matches!(shown, Shown::File { .. });
         // Whether a folder no listing has is there: something is listed inside it.
@@ -996,11 +1015,12 @@ impl Served {
 #[cfg(test)]
 mod tests {
     use super::{Changes, Inodes, Tree};
+    use pe2_path::testing::At as _;
     use project::server::{Delta, Listing, Shown, Source};
-    use std::path::PathBuf;
 
     fn file(disk: &str, size: u64, of_files: bool) -> Shown {
-        let (disk, modified, source) = (PathBuf::from(disk), (1_700_000_000 + size, 0), Source::Disk);
+        let disk = pe2_path::testing::scratch("shown").at(disk.trim_start_matches('/'));
+        let (modified, source) = ((1_700_000_000 + size, 0), Source::Disk);
         Shown::File { disk, size, modified, of_files, source }
     }
 
@@ -1029,11 +1049,19 @@ mod tests {
         // The folder a node's files made goes with the last of them; a folder where a file is now goes, and is new.
         assert_eq!(
             changes.gone,
-            [("a/n/glyphs".to_string(), true), ("a/n/glyphs/x.glif".to_string(), false), ("b".to_string(), true), ("b/old.txt".to_string(), false)]
+            [
+                ("a/n/glyphs".to_string(), true),
+                ("a/n/glyphs/x.glif".to_string(), false),
+                ("b".to_string(), true),
+                ("b/old.txt".to_string(), false)
+            ]
         );
         // The folders a node's file makes come with it, outermost first.
         let new: Vec<(&str, bool)> = changes.new.iter().map(|(path, folder)| (path.as_str(), *folder)).collect();
-        assert_eq!(new, [("b", false), ("c", true), ("c/sub", true), ("c/sub/deep", true), ("c/sub/deep/y.glif", false)]);
+        assert_eq!(
+            new,
+            [("b", false), ("c", true), ("c/sub", true), ("c/sub/deep", true), ("c/sub/deep/y.glif", false)]
+        );
         // A folder that is an entry no more, with a node's file still in it: not gone. And an entry again: not new.
         let mut entry = before.clone();
         entry.insert("a/n/glyphs".into(), Shown::Folder);
@@ -1070,7 +1098,12 @@ mod tests {
         // holds, which is asked of the tree.
         for node in held.nodes.values() {
             let (ino, viewed) = tree.at(&node.path).unwrap_or_else(|| panic!("{} is not shown", node.path));
-            assert_eq!((viewed.size, viewed.asset, viewed.of_files), (node.size, node.asset, node.of_files), "{}", node.path);
+            assert_eq!(
+                (viewed.size, viewed.asset, viewed.of_files),
+                (node.size, node.asset, node.of_files),
+                "{}",
+                node.path
+            );
             assert_eq!(std::mem::discriminant(&viewed.what), std::mem::discriminant(&node.what));
             assert_eq!(served.path(ino).as_deref(), Some(node.path.as_str()));
             assert_eq!(tree.node(ino).map(|node| node.path.clone()), Some(node.path.clone()));
@@ -1086,48 +1119,54 @@ mod tests {
         project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
         assert!(served.tree().at("a/plain.txt").is_none());
         assert_eq!(served.tree().at("b/new.txt").map(|(_, node)| node.size), Some(8));
-        assert_eq!(served.tree().children("b").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["new.txt".to_string()]));
+        assert_eq!(
+            served.tree().children("b").map(|names| names.into_keys().collect::<Vec<_>>()),
+            Some(vec!["new.txt".to_string()])
+        );
     }
 
     #[test]
     fn a_views_files_are_read_through_the_pages_kept_of_them() {
-        let dir = std::env::temp_dir().join(format!("pe2-vfs-pages-{}", std::process::id()));
+        let dir = pe2_path::testing::scratch("vfs-pages");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A file of some pages and a part of one, and an empty one.
         let content: Vec<u8> = (0..3 * 4096 + 1000u32).map(|n| u8::try_from(n % 251).unwrap()).collect();
-        std::fs::write(dir.join("a.bin"), &content).unwrap();
-        std::fs::write(dir.join("empty"), b"").unwrap();
+        std::fs::write(dir.at("a.bin"), &content).unwrap();
+        std::fs::write(dir.at("empty"), b"").unwrap();
         let shown = |name: &str, size: usize, at: u64| Shown::File {
-            disk: dir.join(name),
+            disk: dir.at(name),
             size: size as u64,
             modified: (at, 0),
             of_files: false,
             source: Source::Disk,
         };
         let listing: Listing =
-            [("a.bin".to_string(), shown("a.bin", content.len(), 1)), ("empty".to_string(), shown("empty", 0, 1))].into();
+            [("a.bin".to_string(), shown("a.bin", content.len(), 1)), ("empty".to_string(), shown("empty", 0, 1))]
+                .into();
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
         project::shared::say_whole(&space, &listing).unwrap();
         let ring = std::sync::Arc::new(sfs::ring::Ring::private(1 << 20).unwrap());
         let served = super::Served::shared(space.clone(), Some(ring));
         let (tree, a) = (served.tree(), served.ino("a.bin"));
         // Whatever is asked - within a page, across pages, past the end - is what the file holds there.
-        for (offset, len) in [(0usize, 10usize), (4090, 20), (100, 9000), (12_000, 5000), (0, 1 << 20), (13_288, 10), (20_000, 10)] {
+        for (offset, len) in
+            [(0usize, 10usize), (4090, 20), (100, 9000), (12_000, 5000), (0, 1 << 20), (13_288, 10), (20_000, 10)]
+        {
             let read = tree.read(a, offset as u64, len).unwrap();
             let end = content.len().min(offset + len);
             assert_eq!(read, &content[offset.min(end)..end], "from {offset}, {len}");
         }
         assert_eq!(tree.read(served.ino("empty"), 0, 100).unwrap(), b"");
         // Read from the pages kept: the file itself is gone, and all of it is read again.
-        std::fs::remove_file(dir.join("a.bin")).unwrap();
+        std::fs::remove_file(dir.at("a.bin")).unwrap();
         assert_eq!(tree.read(a, 0, 1 << 20).unwrap(), content);
         let mut part = [0u8; 300];
         assert_eq!(tree.read_into(a, 5000, &mut part).unwrap(), 300);
         assert_eq!(part[..], content[5000..5300]);
         // Another version of the file is another file to them: what was kept of the one before is not read as it.
         let other: Vec<u8> = content.iter().rev().copied().collect();
-        std::fs::write(dir.join("a.bin"), &other).unwrap();
+        std::fs::write(dir.at("a.bin"), &other).unwrap();
         let mut next = listing.clone();
         next.insert("a.bin".into(), shown("a.bin", other.len(), 2));
         project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
@@ -1170,8 +1209,14 @@ mod tests {
         assert!(tree.at("a").is_none() && tree.at("a/x.txt").is_none() && tree.at("c/old.txt").is_none());
         assert_eq!(tree.at("c/x.txt").map(|(ino, node)| (ino, node.size)), Some((x, 1)));
         assert_eq!(tree.at("c/sub/y.txt").map(|(ino, _)| ino), Some(y));
-        assert_eq!(tree.children("").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["c".to_string(), "d.txt".to_string()]));
-        assert_eq!(tree.children("c").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["sub".to_string(), "x.txt".to_string()]));
+        assert_eq!(
+            tree.children("").map(|names| names.into_keys().collect::<Vec<_>>()),
+            Some(vec!["c".to_string(), "d.txt".to_string()])
+        );
+        assert_eq!(
+            tree.children("c").map(|names| names.into_keys().collect::<Vec<_>>()),
+            Some(vec!["sub".to_string(), "x.txt".to_string()])
+        );
         // And moved on, and back - a rename the project refused.
         moved("c", "e");
         assert_eq!(served.tree().at("e/sub/y.txt").map(|(ino, _)| ino), Some(y));
@@ -1192,7 +1237,10 @@ mod tests {
         sfs::fs::set(&mut txn, sfs::fs::SERVED, number, &gone, project::shared::SERVER).unwrap();
         txn.commit().unwrap();
         assert!(served.tree().at("d.txt").is_none());
-        assert_eq!(served.tree().children("").map(|names| names.into_keys().collect::<Vec<_>>()), Some(vec!["c".to_string()]));
+        assert_eq!(
+            served.tree().children("").map(|names| names.into_keys().collect::<Vec<_>>()),
+            Some(vec!["c".to_string()])
+        );
     }
 
     #[test]

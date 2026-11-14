@@ -8,17 +8,17 @@
 //! project, a while after nothing was asked of it and nothing keeps it.
 
 use anyhow::{Result, bail};
+use pe2_path::HostPath;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use holder::core::{Core, Queue};
 use project::Project;
 use project::cache::Cache;
 use project::history::History;
 use project::host::{FromHost, ROLE, ToHost};
-use holder::core::{Core, Queue};
 use project::index::Index;
 use project::lock::{Lock, LockError};
 
@@ -92,7 +92,12 @@ struct Host {
 
 /// `pe2-cli project host`: hold the project in `directory`, and keep its folder served by `backend` (at `address`,
 /// dealing with what is not the project's there as `strays` says) unless that is `none`.
-pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, strays: crate::server::Strays) -> Result<()> {
+pub fn run(
+    directory: &HostPath,
+    backend: Option<&str>,
+    address: Option<&str>,
+    strays: crate::server::Strays,
+) -> Result<()> {
     // What it says of itself (`mcp::Holder`) is of the program as it is now, not as it may be built again.
     mcp::presence::note_start();
     let p = Project::load(directory)?;
@@ -167,7 +172,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         host.feed_from_now();
         host.served()?;
     } else {
-        println!("{} held, and served nowhere", project::host::shown(&p.root));
+        println!("{} held, and served nowhere", p.root);
     }
     let talking = Arc::downgrade(&host);
     let _talking = ROLE.listen(&p.root, host.stopping.clone(), move |stream| {
@@ -321,7 +326,9 @@ impl Host {
         let started = self.ask(move |state| {
             host.ready(state)?;
             let State { held, reading, runner, .. } = state;
-            let (Some(held), Some(reading)) = (held.as_ref(), reading.as_ref()) else { return Err(mcp::Reply::Declined) };
+            let (Some(held), Some(reading)) = (held.as_ref(), reading.as_ref()) else {
+                return Err(mcp::Reply::Declined);
+            };
             // What the project requires and lacks, said; what its extensions have yet to fetch, fetched.
             if let Err(e) = crate::whole(&reading.extensions) {
                 return Err(mcp::Reply::failed(format!("{e:#}")));
@@ -401,7 +408,7 @@ impl Host {
 
     /// Take in what changed in the layers while it holds the project: the index refreshed, what is served listed
     /// again. While another holds it, that one does.
-    fn take_in(&self, changed: Vec<PathBuf>) {
+    fn take_in(&self, changed: Vec<HostPath>) {
         self.ask(move |state| {
             let Some(held) = state.held.as_mut() else { return };
             match held.core.take_in(&changed) {
@@ -422,7 +429,7 @@ impl Host {
         if server.is_none() {
             let root = &self.project.root;
             *server = match &self.serve {
-                Some(args) => Some(project::server::keep(root, WHO, &std::env::current_exe()?, args)?),
+                Some(args) => Some(project::server::keep(root, WHO, &this_program()?, args)?),
                 None => project::server::keep_running(root, WHO),
             };
         }
@@ -480,7 +487,7 @@ impl Host {
                 // Whoever holds the project feeds it.
                 None => return Ok(()),
                 Some(State::Served(at, _)) => {
-                    println!("{} served at {at}", project::host::shown(&self.project.root));
+                    println!("{} served at {at}", self.project.root);
                     return Ok(());
                 }
                 Some(State::Failed { why, .. }) => bail!(why),
@@ -772,4 +779,12 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
     if leased {
         host.leased(false);
     }
+}
+
+/// This program, as a place.
+///
+/// # Errors
+/// The system cannot say where it is.
+pub(crate) fn this_program() -> std::io::Result<HostPath> {
+    HostPath::new(&std::env::current_exe()?)
 }

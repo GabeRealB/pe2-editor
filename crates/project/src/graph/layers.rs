@@ -237,7 +237,8 @@ pub fn remove_operation(text: &str, at: usize, id: &str) -> Result<String> {
         for op in ops.iter_mut().filter_map(|(_, op)| op.as_table_mut()) {
             let Some(from) = op.get_mut("from").and_then(Value::as_table_mut) else { continue };
             // Wires to it, or to one of its outputs (`id.<name>`).
-            let to_it = |source: &str| source == id || source.strip_prefix(id).is_some_and(|rest| rest.starts_with('.'));
+            let to_it =
+                |source: &str| source == id || source.strip_prefix(id).is_some_and(|rest| rest.starts_with('.'));
             from.retain(|_, wired| match wired {
                 Value::String(source) => !to_it(source),
                 Value::Array(sources) => {
