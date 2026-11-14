@@ -14,9 +14,9 @@ name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
 copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "linux-x86_64"
-url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-linux-x86_64.zip"
-sha256 = "4987655eb857692518f9165593f137ff98490d7c40fa5a66cd62fdb20493f925"
-take = { "cc1" = { to = "cc1", sha256 = "e8f052df62c1f7f495eb24d616654aaebaeb74d5554ad50412db73f2216dd93d" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-2/gcc-psx-2.8.1-linux-x86_64.zip"
+sha256 = "7f21c7e89b62677b3be9e98e9e74be6222376373979d94a035de7a6c3cb91e2b"
+take = { "cc1" = { to = "cc1", sha256 = "0e972ffc59e9898370471cc4b64386cdfcbfc6341a1a42504ec3d637e0a6b054" } }
 
 [[setup]]
 name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
@@ -41,9 +41,9 @@ name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
 copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "macos-aarch64"
-url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-macos-aarch64.zip"
-sha256 = "4b08d88e7258223f85f142cdf5e60a567d42f4fedec09001bf5f9b2abda6c5e4"
-take = { "cc1" = { to = "cc1", sha256 = "30c2c9b359ec8c0fac64c04beae72c69a7a4cf8ba4b5aa08b94537cf8cc206c4" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-2/gcc-psx-2.8.1-macos-aarch64.zip"
+sha256 = "88e7fcacc3d9dbd2a0817e237333602e18e9cba7943140d895cb2a4d93775219"
+take = { "cc1" = { to = "cc1", sha256 = "43b545301b881359940b527cd80199e59d7cdc1a67813909b957023f1ce7cf34" } }
 
 [[setup]]
 name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"
@@ -68,9 +68,9 @@ name = "GCC 2.8.1 for the PlayStation, built by the PE2 editor"
 license = "GPL-2.0-or-later"
 copyright = "Free Software Foundation, Inc.; patched for the PlayStation by the decompals old-gcc project"
 platform = "windows-x86_64"
-url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-1/gcc-psx-2.8.1-windows-x86_64.zip"
-sha256 = "69c43bb7f77bb6296f674520278a418111c5e5376bb415959c65ae47cb79ab2f"
-take = { "cc1.exe" = { to = "cc1.exe", sha256 = "7e23e26ffe4dfb624c8cfe5716e6c6b4818bf299caaf7366b899323002569f40" } }
+url = "https://github.com/GabeRealB/pe2-editor/releases/download/gcc-psx-2.8.1-2/gcc-psx-2.8.1-windows-x86_64.zip"
+sha256 = "c0235ed5ca1885fc9a912ca8d72bd80e7563cffe2675862879839dc19301c9cb"
+take = { "cc1.exe" = { to = "cc1.exe", sha256 = "8cfdb1fabe54f016cb6d7b9871f2fdbc9da3917cffb155d3b8e904c8c2ce443e" } }
 
 [[setup]]
 name = "GNU binutils 2.47 for mipsel, built by the PE2 editor"

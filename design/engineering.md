@@ -37,10 +37,12 @@ nothing fetched before, so that what its project fetched is what it is built fro
 component (a URL changed and not described fails the task by name), and a release is laid out of it: an archive a
 platform, packed deterministically - two runs give the same bytes - with `licenses/`, the license of every component
 linked into it there; `sources/`, each component's source named by its name and version, the `packages/` folder and the
-zig that built them (what the licenses ask of whoever ships the result); notes listing what it is made of;
-`SHA256SUMS`; and the `[[setup]]` entries the extensions' manifests take. A release is a package version,
-`<package>-<version>-<release>` (`release` in `packages.toml` counts its builds), so packages change apart; `--publish`
-makes it a release of the editor's repository, never over one published already.
+zig that built them (what the licenses ask of whoever ships the result); notes saying what the release changed and what
+it is made of; `SHA256SUMS`; and the `[[setup]]` entries the extensions' manifests take. A release is a package version,
+`<package>-<version>-<release>` (`release` in `packages.toml` counts its builds), so packages change apart; what each
+changed is written in the package's `CHANGELOG.md`, newest first, under `## <version>-<release>`, and a release's notes
+carry its entry alone, with a link to the whole file at the commit built. `--publish` makes it a release of the
+editor's repository, never over one published already and never of a release its changelog says nothing of.
 
 The projects are built in a copy of `packages/` (`target/packages/projects/`, kept between runs with zig's cache in
 it), so that nothing zig makes - what it fetches for a project, its cache - is made in `packages/`; what is built

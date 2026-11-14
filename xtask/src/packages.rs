@@ -19,14 +19,16 @@
 //! 5. What the licenses ask of whoever ships the package, and what it takes to build it again, in `sources/`: each
 //!    component's source as zig keeps it, named `<name>-<version>.tar.gz`; the `packages/` folder
 //!    (`pe2-editor-packages.zip`); the zig used.
-//! 6. `NOTES.md` saying what the package is and what it is made of, `setup.toml`, the `[[setup]]` entry of each archive
-//!    as an extension's manifest takes it once published, and `SHA256SUMS` of all of it.
+//! 6. `NOTES.md` saying what the package is, what the release changed - its entry in the package's `CHANGELOG.md`
+//!    (`## <version>-<release>`), with a link to the whole file at the commit built - and what it is made of,
+//!    `setup.toml`, the `[[setup]]` entry of each archive as an extension's manifest takes it once published, and
+//!    `SHA256SUMS` of all of it.
 //!
 //! Each release in `target/packages/<tag>/`. `--zig <path>` builds with another zig, for trying one: what it makes is
 //! not what the pins say, and says so in its notes. `--publish` makes each release one of the repository
 //! `packages.toml` names, with `gh`: its notes the page, every file an asset - which nobody should do but who means to
-//! publish it, never of a build with another zig, and never over a release already published (a package built anew
-//! at the same version is a new `release` of it in `packages.toml`).
+//! publish it, never of a build with another zig, never of a release its changelog has no entry for, and never over a
+//! release already published (a package built anew at the same version is a new `release` of it in `packages.toml`).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -179,9 +181,18 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
     let copy = work.join("projects");
     mirror(&packages, &copy)?;
     let date = commit_time(&packages)?;
+    let commit = commit_of(&packages)?;
     for name in &names {
         let package = &config.packages[name];
         let tag = package.tag(name);
+        let entry = changes(&packages.join(name), &format!("{}-{}", package.version, package.release))?;
+        ensure!(
+            entry.is_some() || !options.publish,
+            "{tag}: packages/{name}/CHANGELOG.md has no entry `## {}-{}`: say what the release changes",
+            package.version,
+            package.release
+        );
+        let changed = changed(&config, name, &commit, entry.as_deref());
         let project = copy.join(name);
         ensure!(project.join("build.zig").is_file(), "no project of {name} ({})", project.display());
         // What zig fetched for the project, made again by this build alone: what it keeps there is what the package
@@ -212,7 +223,7 @@ pub fn run(args: impl Iterator<Item = String>, workspace: &Path, target: &Path) 
         }
         sources(&packages, &work.join("global"), tarball.as_deref(), &used, &release.join("sources"))?;
         let zig_file = tarball.as_deref().and_then(Path::file_name).map(|f| f.to_string_lossy().into_owned());
-        let notes = notes(&config, name, &tag, &built, &used, zig_file.as_deref());
+        let notes = notes(&config, name, &tag, &changed, &built, &used, zig_file.as_deref());
         std::fs::write(release.join("NOTES.md"), notes).context("NOTES.md")?;
         let setup = setup(&config, name, &tag, &built)?;
         std::fs::write(release.join("setup.toml"), setup).context("setup.toml")?;
@@ -505,13 +516,70 @@ fn names_no_build_path(out: &Path, work: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a release changed: the entry of its package's `CHANGELOG.md` under `## <version>-<release>`, to the next heading
+/// of its level; none where the file or the entry is missing, or the entry says nothing.
+fn changes(project: &Path, release: &str) -> Result<Option<String>> {
+    let path = project.join("CHANGELOG.md");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(entry(&text, release)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| path.display().to_string()),
+    }
+}
+
+/// Its lines are wrapped as the repository's are: a paragraph's are joined, as a release's page would break each one, and
+/// an item of a list starts a line of its own.
+fn entry(text: &str, release: &str) -> Option<String> {
+    let heading = format!("## {release}");
+    let mut lines = text.lines().skip_while(|line| line.trim_end() != heading);
+    lines.next()?;
+    let mut body = String::new();
+    for line in lines.take_while(|line| !line.starts_with("## ")).map(str::trim_end) {
+        let item = line.trim_start().starts_with("- ") || line.trim_start().starts_with("* ");
+        if line.is_empty() {
+            if !body.is_empty() && !body.ends_with("\n\n") {
+                body.push_str("\n\n");
+            }
+        } else if body.is_empty() || body.ends_with('\n') {
+            body.push_str(line);
+        } else if item {
+            body.push('\n');
+            body.push_str(line);
+        } else {
+            body.push(' ');
+            body.push_str(line.trim_start());
+        }
+    }
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// The notes' "What changed": the release's entry, and where every release's is - the package's changelog at the commit
+/// built.
+fn changed(config: &Config, name: &str, commit: &str, entry: Option<&str>) -> String {
+    let whole = format!("{}/blob/{commit}/packages/{name}/CHANGELOG.md", config.repository);
+    match entry {
+        Some(entry) => format!("{entry}\n\nEvery release's: [`packages/{name}/CHANGELOG.md`]({whole})."),
+        None => format!("`packages/{name}/CHANGELOG.md` says nothing of this release."),
+    }
+}
+
+/// The commit `packages/` is built at.
+fn commit_of(packages: &Path) -> Result<String> {
+    let output =
+        Command::new("git").current_dir(packages).args(["rev-parse", "HEAD"]).output().context("git does not run")?;
+    ensure!(output.status.success(), "git cannot say which commit is checked out");
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// When the last commit changing `packages/` was made, in seconds since 1970, as `SOURCE_DATE_EPOCH` gives it: what the
 /// packages are built from, and not what is committed beside them - the extensions' manifests holding the archives'
-/// hashes, which would otherwise change the date, and the archives, with each commit of them.
+/// hashes, which would otherwise change the date, and the archives, with each commit of them - nor the changelogs, which
+/// say what a release changed and are written for one before it is built.
 fn commit_time(packages: &Path) -> Result<String> {
     let output = Command::new("git")
         .current_dir(packages)
-        .args(["log", "-1", "--format=%ct", "--", "."])
+        .args(["log", "-1", "--format=%ct", "--", ".", ":(exclude)*/CHANGELOG.md"])
         .output()
         .context("git does not run")?;
     ensure!(output.status.success(), "git cannot say when the commit was made");
@@ -833,7 +901,15 @@ fn sources(packages: &Path, global: &Path, zig: Option<&Path>, used: &[Used], to
 }
 
 /// What a release is, for its page.
-fn notes(config: &Config, name: &str, tag: &str, built: &[Archive], used: &[Used], zig: Option<&str>) -> String {
+fn notes(
+    config: &Config,
+    name: &str,
+    tag: &str,
+    changed: &str,
+    built: &[Archive],
+    used: &[Used],
+    zig: Option<&str>,
+) -> String {
     let package = &config.packages[name];
     let mut out = String::new();
     let _ = writeln!(out, "# {tag}\n");
@@ -846,6 +922,7 @@ fn notes(config: &Config, name: &str, tag: &str, built: &[Archive], used: &[Used
         "License: {}. Copyright: {}. Upstream: {}.\n",
         package.license, package.copyright, package.upstream
     );
+    let _ = writeln!(out, "## What changed\n\n{changed}\n");
     let _ = writeln!(out, "## Files\n");
     for archive in built {
         if let Some(file) = archive.path.file_name() {
@@ -955,6 +1032,17 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Component, c_tokens, check, declared, mirror, names_version, shuffle, signed_file};
+
+    #[test]
+    fn a_release_says_what_its_entry_says() {
+        let text = "# p\n\nAbout.\n\n## 1.0-2\n\nFixed it.\nWell.\n\n## 1.0-1\n\nFirst.\n";
+        assert_eq!(super::entry(text, "1.0-2").as_deref(), Some("Fixed it. Well."));
+        let listed = "## 2-1\n\nTwo things:\n- one,\n  wrapped\n- two\n\nAnd after.\n";
+        assert_eq!(super::entry(listed, "2-1").as_deref(), Some("Two things:\n- one, wrapped\n- two\n\nAnd after."));
+        assert_eq!(super::entry(text, "1.0-1").as_deref(), Some("First."));
+        assert_eq!(super::entry(text, "1.0-3"), None);
+        assert_eq!(super::entry("## 1.0-1\n\n## 1.0-0\nx\n", "1.0-1"), None);
+    }
 
     #[test]
     fn tokens_are_the_same_however_spaced() {
