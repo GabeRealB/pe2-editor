@@ -372,7 +372,7 @@ fn expand(call: &mut Call) -> Result<Typed> {
             args.extend(searched(call, &sources, tree));
             args.extend([format!("-I{}", text(tree)), "-o".to_string(), text(&expanded), text(&tree.join(unit))]);
             run(PREPROCESSOR, &args)?;
-            let mut said = fs::read(&expanded)?;
+            let mut said = main_file_not_entered(fs::read(&expanded)?);
             for form in forms(tree) {
                 said = replaced(&said, form.as_bytes(), TREE.as_bytes());
             }
@@ -382,6 +382,18 @@ fn expand(call: &mut Call) -> Result<Typed> {
     });
     let _ = fs::remove_dir_all(&scratch);
     Ok(Typed::new(SourceTree::NAME, made?))
+}
+
+/// A unit as the compiler can read it: the preprocessor marks its first line as a file entered (`# 1 "unit.c" 1`), with no
+/// file to return to, on which the compiler's COFF debugging output crashes; that line keeps its file and line, not the flag.
+fn main_file_not_entered(mut said: Vec<u8>) -> Vec<u8> {
+    let end = said.iter().position(|&b| b == b'\n').unwrap_or(said.len());
+    let line = said[..end].strip_suffix(b"\r").unwrap_or(&said[..end]);
+    if line.starts_with(b"# ") && line.ends_with(b"\" 1") {
+        let flag = line.len() - 2;
+        said.drain(flag..flag + 2);
+    }
+    said
 }
 
 /// These bytes with one run of them put for another.
@@ -799,6 +811,16 @@ mod tests {
         assert_eq!((word(0x10), word(0x18), word(0x1C), word(0x30)), (0x8001_4358, 0x8001_0000, 0x800, 0x801F_FFF0));
         assert!(made[0x4C..].starts_with(b"Sony Computer Entertainment Inc. for North America area\0"));
         assert_eq!((made.len(), &made[0x800..0x803]), (0x1000, &[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn a_unit_does_not_enter_its_own_file() {
+        let said = b"# 1 \"tree/src/package.c\" 1\n# 1 \"<builtin>\" 1\nint g;\n".to_vec();
+        assert_eq!(super::main_file_not_entered(said), b"# 1 \"tree/src/package.c\"\n# 1 \"<builtin>\" 1\nint g;\n");
+        let crlf = b"# 1 \"a.c\" 1\r\nint g;\r\n".to_vec();
+        assert_eq!(super::main_file_not_entered(crlf), b"# 1 \"a.c\"\r\nint g;\r\n");
+        let plain = b"int g;\n".to_vec();
+        assert_eq!(super::main_file_not_entered(plain.clone()), plain);
     }
 
     #[test]
