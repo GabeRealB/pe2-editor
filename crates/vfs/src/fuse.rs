@@ -581,7 +581,9 @@ fn tell_kernel(
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         // What is written through the mount, the kernel lets go of what it kept of at once; what changed in the tree
         // is looked for as often as before.
+        #[allow(clippy::disallowed_methods, reason = "the pace the kernel is told at: the system's, as FUSE is")]
         let looked = std::time::Instant::now();
+        #[allow(clippy::disallowed_methods, reason = "the pace the kernel is told at: the system's, as FUSE is")]
         while let Ok(ino) = stale.recv_timeout(std::time::Duration::from_millis(200).saturating_sub(looked.elapsed())) {
             // Told the tree changed: looked at now.
             if ino == 0 {
@@ -647,6 +649,10 @@ fn tell_kernel(
                 let _ = notifier.inval_inode(INodeNo(ino), 0, 0);
             }
             if tree.at(folder).is_some() {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "a time the kernel is told of a folder: the system's, as FUSE is"
+                )]
                 touch(folder, SystemTime::now());
             }
         }
@@ -729,6 +735,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str)
 pub fn windows_cannot_reach() -> Option<String> {
     // SAFETY: getuid cannot fail and touches no memory.
     let root = unsafe { libc::getuid() } == 0;
+    #[allow(clippy::disallowed_methods, reason = "what the machine is, asked of the system")]
     let wsl =
         std::env::var_os("WSL_DISTRO_NAME").is_some() || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
     (wsl && !root && !users_may_allow_others()).then(|| {

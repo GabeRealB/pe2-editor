@@ -1109,7 +1109,7 @@ mod tests {
     /// A tree that is a view of a shared filesystem holding this listing, with the space it is in.
     fn viewed(listing: &Listing) -> (std::sync::Arc<sfs::Space>, super::Served) {
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
-        project::shared::say_whole(&space, listing).unwrap();
+        project::shared::say_whole(&space, listing, &pe2_io::SystemClock).unwrap();
         let served = super::Served::shared(space.clone(), None);
         (space, served)
     }
@@ -1152,7 +1152,7 @@ mod tests {
         let mut next = listing.clone();
         next.remove(&*t("a/plain.txt"));
         next.insert(t("b/new.txt"), file("/l/b/new.txt", 8, false));
-        project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
+        project::shared::say(&space, &Delta::between(&listing, &next), &pe2_io::SystemClock).unwrap();
         assert!(served.tree().at(p("a/plain.txt")).is_none());
         assert_eq!(served.tree().at(p("b/new.txt")).map(|(_, node)| node.size), Some(8));
         assert_eq!(
@@ -1183,7 +1183,7 @@ mod tests {
         let listing: Listing =
             [(t("a.bin"), shown("a.bin", content.len(), 1)), (t("empty"), shown("empty", 0, 1))].into();
         let space = std::sync::Arc::new(sfs::Space::private().unwrap());
-        project::shared::say_whole(&space, &listing).unwrap();
+        project::shared::say_whole(&space, &listing, &pe2_io::SystemClock).unwrap();
         let ring = std::sync::Arc::new(sfs::ring::Ring::private(1 << 20).unwrap());
         let served = super::Served::shared(space.clone(), Some(ring));
         let (tree, a) = (served.tree(), served.ino(p("a.bin")));
@@ -1207,7 +1207,7 @@ mod tests {
         std::fs::write(dir.at("a.bin"), &other).unwrap();
         let mut next = listing.clone();
         next.insert(t("a.bin"), shown("a.bin", other.len(), 2));
-        project::shared::say(&space, &Delta::between(&listing, &next)).unwrap();
+        project::shared::say(&space, &Delta::between(&listing, &next), &pe2_io::SystemClock).unwrap();
         assert_eq!(served.tree().read(a, 0, 1 << 20).unwrap(), other);
         assert_eq!(served.tree().read(a, 4000, 200).unwrap(), &other[4000..4200]);
         std::fs::remove_dir_all(&dir).unwrap();

@@ -13,6 +13,7 @@ members = [
     "crates/ext-macros",
     "crates/manifest",
     "crates/path",
+    "crates/io",
     "crates/setup",
     "crates/model",
     "crates/project",
@@ -73,6 +74,7 @@ pe2-ext = { path = "crates/ext" }
 pe2-ext-macros = { path = "crates/ext-macros" }
 pe2-manifest = { path = "crates/manifest" }
 pe2-path = { path = "crates/path" }
+pe2-io = { path = "crates/io" }
 pe2-setup = { path = "crates/setup" }
 # The guest side of the extensions' contract (crates/ext/wit), for extensions built as components.
 wit-bindgen = "0.63"
@@ -80,6 +82,8 @@ wit-bindgen = "0.63"
 wasmtime = { version = "50", default-features = false, features = ["anyhow", "runtime", "cranelift", "component-model", "component-model-async", "std", "parallel-compilation", "addr2line", "demangle", "pooling-allocator"] }
 wasmparser = "0.261"
 wasmtime-wasi = { version = "50", default-features = false, features = ["p3"] }
+# The randomness trait wasmtime-wasi takes, which a component's WASI is given through.
+rand_core = { version = "0.10", default-features = false }
 # The built-in extensions (`extensions/`) and the list of them the editor ships.
 extensions = { path = "extensions" }
 pe2-fonts = { path = "extensions/fonts" }

@@ -96,7 +96,7 @@ pub fn add_extension(
         "{} cannot hold extensions: the project does not write it",
         layer.name
     );
-    let (tree, _) = crate::chunks::Store::at(&project.root).put_folder(from)?;
+    let (tree, _) = crate::chunks::Store::at(&project.root).put_folder(from, project.io.clock().wall())?;
     let held_already = held_in(layer, &about.id) == Some(Says::Holds(tree));
     let mut document = read(&project.root)?;
     let before = document.to_string();

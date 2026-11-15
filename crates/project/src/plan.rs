@@ -1027,7 +1027,7 @@ pub fn run(
             .map(|(release, input)| Ok((release.clone(), project.resolve(&input.look_in)?)))
             .collect::<Result<_>>()?,
         found,
-        layer: Some(layer),
+        layer: Some((layer, project.io.clock())),
         engine,
         extensions,
         checked,
@@ -1106,8 +1106,8 @@ struct RunState<'a> {
     /// Where each release's discs are looked for, and where those found are, by sha1.
     inputs: HashMap<String, HostPath>,
     found: HashMap<pe2_ext::Sha1, HostPath>,
-    /// The layer it writes; none where it only observes.
-    layer: Option<&'a HostPath>,
+    /// The layer it writes, and the clock its files are written by; none where it only observes.
+    layer: Option<(&'a HostPath, &'a dyn pe2_io::Clock)>,
     engine: &'a crate::graph::exec::Engine,
     extensions: &'a crate::ext::Extensions,
     /// The checks to run.
@@ -1129,7 +1129,12 @@ struct RunState<'a> {
 impl RunState<'_> {
     /// The layer it writes.
     fn layer(&self) -> Result<&HostPath> {
-        self.layer.context("observing what a plan reads writes nothing")
+        self.layer.map(|(layer, _)| layer).context("observing what a plan reads writes nothing")
+    }
+
+    /// The time it writes at.
+    fn now(&self) -> Result<std::time::SystemTime> {
+        self.layer.map(|(_, clock)| clock.wall()).context("observing what a plan reads writes nothing")
     }
 
     fn run(&self, at: usize, add: &dyn Fn(usize)) {
@@ -1165,7 +1170,8 @@ impl RunState<'_> {
                         continue;
                     };
                     let path = file_path(self.layer()?, node, &file);
-                    crate::content::write(&path, bytes.as_slice()).with_context(|| path.display().to_string())?;
+                    crate::content::write(&path, bytes.as_slice(), self.now()?)
+                        .with_context(|| path.display().to_string())?;
                     let written = Written {
                         key,
                         sha1: Some(crate::extract::sha1_of(&bytes)),

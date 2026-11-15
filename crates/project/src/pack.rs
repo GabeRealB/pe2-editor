@@ -213,8 +213,8 @@ impl Pack {
     ///
     /// # Errors
     /// Its chunks or its line cannot be written.
-    pub fn put(&self, rel: &str, bytes: &[u8]) -> io::Result<()> {
-        let entry = Entry { manifest: Arc::new(self.store.put(bytes)?), modified: SystemTime::now() };
+    pub fn put(&self, rel: &str, bytes: &[u8], at: SystemTime) -> io::Result<()> {
+        let entry = Entry { manifest: Arc::new(self.store.put(bytes, at)?), modified: at };
         self.append(&put_line(rel, &entry))?;
         self.entries.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rel.to_string(), entry);
         self.compact_if_due()
@@ -445,7 +445,7 @@ pub fn pack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> {
             _ => rel,
         };
         let bytes = crate::content::read(&logical)?;
-        pack.put(&rel, &bytes)?;
+        pack.put(&rel, &bytes, project.io.clock().wall())?;
         std::fs::remove_file(&path)?;
         count += 1;
     }
@@ -468,7 +468,7 @@ pub fn unpack_layer(project: &crate::Project, name: &Name) -> io::Result<usize> 
             entry.manifest.read_range(&pack.store, 0, usize::try_from(entry.manifest.size).unwrap_or(usize::MAX))?;
         let at = layer.path.join(&RelPath::new(rel).map_err(io::Error::other)?);
         std::fs::create_dir_all(at.parent().unwrap_or_else(|| layer.path.clone()))?;
-        match crate::content::chunked(&at, &bytes)? {
+        match crate::content::chunked(&at, &bytes, project.io.clock().wall())? {
             Some(manifest) => crate::cache::write_atomic(&crate::chunks::manifest_path(&at), manifest.as_bytes()),
             None => crate::cache::write_atomic(&at, &bytes),
         }
@@ -492,9 +492,14 @@ fn remove_empty(dir: &HostPath) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Pack, is_dir, is_file, read_dir};
     use crate::testing::At as _;
+    use std::time::SystemTime;
 
     #[test]
     fn a_packed_layer_holds_its_files_and_reads_back_after_a_restart_of_its_journal() {
@@ -502,9 +507,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let layer = root.at(".layers/gen");
         let pack = Pack::open(&layer).unwrap();
-        pack.put("a.node/native.bin", b"native").unwrap();
-        pack.put("a.node/node.toml", b"x = 1\n").unwrap();
-        pack.put("b/c.bin", b"c").unwrap();
+        pack.put("a.node/native.bin", b"native", SystemTime::now()).unwrap();
+        pack.put("a.node/node.toml", b"x = 1\n", SystemTime::now()).unwrap();
+        pack.put("b/c.bin", b"c", SystemTime::now()).unwrap();
         pack.remove("b/c.bin").unwrap();
         assert!(is_dir(&layer.at("a.node")) && is_file(&layer.at("a.node/native.bin")));
         assert!(!is_file(&layer.at("b/c.bin")) && !is_dir(&layer.at("b")));

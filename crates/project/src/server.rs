@@ -227,10 +227,16 @@ fn lease(mut link: Link, who: &str) -> Result<Lease> {
 /// # Errors
 /// No server could be started (nothing can serve the project's folder here, as its log says), or it would not be
 /// kept.
-pub fn keep(root: &HostPath, who: &str, program: &std::path::Path, args: &[String]) -> Result<Lease> {
+pub fn keep(
+    root: &HostPath,
+    who: &str,
+    program: &std::path::Path,
+    args: &[String],
+    clock: &dyn pe2_io::Clock,
+) -> Result<Lease> {
     let link = match ROLE.connect(root) {
         Some(link) => link,
-        None => ROLE.start(root, program, args)?,
+        None => ROLE.start(root, program, args, clock)?,
     };
     lease(link, who)
 }

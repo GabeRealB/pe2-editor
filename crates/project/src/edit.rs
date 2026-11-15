@@ -246,7 +246,7 @@ fn own_copy(
             let bytes = crate::content::read(source).with_context(|| source.display().to_string())?;
             let disk = if file.is_root() { layer.disk(&at) } else { layer.disk(&at).join(file) };
             out.write(&disk, &bytes)?;
-            let was = store.put_file(&bytes)?;
+            let was = store.put_file(&bytes, index.io().clock().wall())?;
             files.insert(file.clone(), Base { was: Some(was), removed: false });
         }
     }
@@ -354,7 +354,7 @@ fn put_files(
             Some(bytes) => {
                 out.write(&disk, bytes)?;
                 if let Some(now) = now {
-                    store.put_file(&crate::content::read(now)?)?;
+                    store.put_file(&crate::content::read(now)?, at.project.io.clock().wall())?;
                 }
                 bases.insert((*file).to_owned(), Base { was: now_sha1, removed: false });
             }
@@ -472,7 +472,7 @@ fn make_parents(
             continue;
         }
         shown_free(index, changeset, folder, &[])?;
-        let uid = new_uid(index, taken)?;
+        let uid = new_uid(index, taken);
         out.make_dir(&layer.disk(folder))?;
         changeset.entries.insert(uid, folder.to_owned());
     }
@@ -480,10 +480,10 @@ fn make_parents(
 }
 
 /// A uid neither the project nor this step has given.
-fn new_uid(index: &Index, taken: &mut HashSet<Uid>) -> Result<Uid> {
-    let uid = crate::uid::new(|uid| taken.contains(&uid) || index.by_uid.contains_key(&uid))?;
+fn new_uid(index: &Index, taken: &mut HashSet<Uid>) -> Uid {
+    let uid = crate::uid::new(index.io().random(), |uid| taken.contains(&uid) || index.by_uid.contains_key(&uid));
     taken.insert(uid);
-    Ok(uid)
+    uid
 }
 
 /// Make a plain file in a layer at a resolved path, with its content and a new uid; the folders it is the first thing
@@ -506,7 +506,7 @@ pub fn create_file(
     let mut taken = HashSet::new();
     make_parents(&mut out, index, layer, &mut changeset, path, &mut taken)?;
     out.write(&layer.disk(path), bytes)?;
-    let uid = new_uid(index, &mut taken)?;
+    let uid = new_uid(index, &mut taken);
     changeset.entries.insert(uid, path.to_owned());
     out.changeset(&changeset)?;
     out.done()?;
@@ -531,7 +531,7 @@ pub fn create_folder(
     let mut taken = HashSet::new();
     make_parents(&mut out, index, layer, &mut changeset, path, &mut taken)?;
     out.make_dir(&layer.disk(path))?;
-    let uid = new_uid(index, &mut taken)?;
+    let uid = new_uid(index, &mut taken);
     changeset.entries.insert(uid, path.to_owned());
     out.changeset(&changeset)?;
     out.done()?;
@@ -864,7 +864,7 @@ pub fn resolve(
                     out.write(&place.disk(file), &merged.bytes)?;
                 }
                 if let Some(now) = now {
-                    store.put_file(&crate::content::read(now)?)?;
+                    store.put_file(&crate::content::read(now)?, project.io.clock().wall())?;
                 }
                 kept.insert(file.clone(), Base { was: now_sha1, removed: base.removed });
             }
@@ -950,7 +950,13 @@ mod tests {
     }
 
     fn open(root: &HostPath) -> Open {
-        let project = Project::load(root).unwrap();
+        // On a monotonic clock that stands: what joins a step does not depend on how fast the disk under it is. The
+        // time of day is the system's, which tells the files written apart.
+        let io = pe2_io::Composed {
+            clock: std::sync::Arc::new(pe2_io::Standing::monotonic()),
+            ..pe2_io::Composed::system()
+        };
+        let project = Project::load_with(root, std::sync::Arc::new(io)).unwrap();
         let lock = Lock::try_acquire(root, "a test").unwrap();
         let cache = Cache::open(&project, &lock).unwrap();
         let index = Index::open(&project, &cache).unwrap();
@@ -1753,8 +1759,7 @@ mod tests {
             ["base", "top"]
         );
         assert_eq!(o.index.assets[&tree("g/a")].fields().get("note").and_then(pe2_value::Value::as_str), Some("x"));
-        // A continued edit joins the step; undone, the copy goes with it.
-        o.history.merge_whenever();
+        // A continued edit joins the step - however long it took, on a clock that stands; undone, the copy goes with it.
         let text = b"stack = [{ op = \"t.image\" }]\nnote = \"xy\"\n";
         let paths = super::write_file(
             &o.project,

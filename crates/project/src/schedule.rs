@@ -105,6 +105,10 @@ impl Group {
 }
 
 /// Whether groups are set aside (`PE2_SCHEDULE=fifo`), to compare what they change.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the process's one pool, made once for every project it holds: by the process's own environment"
+)]
 fn unweighed() -> bool {
     static FIFO: OnceLock<bool> = OnceLock::new();
     *FIFO.get_or_init(|| std::env::var("PE2_SCHEDULE").is_ok_and(|mode| mode == "fifo"))
@@ -225,6 +229,10 @@ pub fn threads() -> usize {
     pool().threads
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the process's one pool, made once for every project it holds: by the process's own environment"
+)]
 fn threads_wanted() -> usize {
     let cores = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
     std::env::var("PE2_JOBS").ok().and_then(|jobs| jobs.parse().ok()).unwrap_or(cores.saturating_sub(1)).max(1)
@@ -378,11 +386,19 @@ fn wait_helping<S>(group: &Group, lock: &Mutex<S>, told: &Condvar, done: impl Fn
             } else {
                 let state = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 if !done(&state) {
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "a helper's wake missed costs a millisecond: the time decides nothing"
+                    )]
                     drop(told.wait_timeout(state, Duration::from_millis(1)));
                 }
             }
             continue;
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "a helper's wake missed costs a millisecond: the time decides nothing"
+        )]
         drop(told.wait_timeout(state, Duration::from_millis(1)));
     }
 }
@@ -434,8 +450,16 @@ impl<T: Send> Work<'_, T> {
                 list.waiting.pop_front()
             };
             let Some(item) = item else { continue };
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "what a group took, for the next of each to be taken fairly: the order work runs in, never what it makes"
+            )]
             let started = Instant::now();
             let done = std::panic::catch_unwind(AssertUnwindSafe(|| (self.worker)(item, &|more| self.add(more))));
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "what a group took, for the next of each to be taken fairly: the order work runs in, never what it makes"
+            )]
             self.group.charge(started.elapsed());
             if let Err(panic) = done {
                 self.panicked.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(panic);
@@ -544,8 +568,16 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
             }
             let at = next.fetch_add(1, Ordering::Relaxed);
             let Some(item) = items.get(at) else { return false };
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "what a group took, for the next of each to be taken fairly: the order work runs in, never what it makes"
+            )]
             let started = Instant::now();
             let done = std::panic::catch_unwind(AssertUnwindSafe(|| work(item)));
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "what a group took, for the next of each to be taken fairly: the order work runs in, never what it makes"
+            )]
             group.charge(started.elapsed());
             match done {
                 Ok(done) => made.lock().unwrap_or_else(PoisonError::into_inner)[at] = Some(done),
@@ -581,6 +613,10 @@ pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + S
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

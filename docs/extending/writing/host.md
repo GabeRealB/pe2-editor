@@ -61,7 +61,8 @@ An `Asset` gives its `path` (a `TreePath`), `uid`, kind, fields, parts and files
 
 ## Limits
 
-In the sandbox an extension has no files, network or environment of its own, and its clock does not move. Each
+In the sandbox an extension has no files, network or environment of its own, its clock does not move, and its random
+numbers are the same each time it starts: given the same inputs, it makes the same output. Each
 call has a time limit: a second to answer a question, two to draw a view, ten for long work.
 
 When a call fails, what the extension printed to standard error is shown with the error. There is no progress

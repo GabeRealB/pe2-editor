@@ -4,6 +4,10 @@
 //!
 //! The page (stage 0 file 20162's font image) and Medium's, Large's and Small's tables (the executable's
 //! `_gFontGlyphs*`) are read into the faces' glyphs and the atlas's layout, made again from them, and compared.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "an example run by hand: it reads what its arguments and the machine give"
+)]
 use sfs::testing::At as _;
 
 use pe2_fonts::atlas::{self, FaceSpec, PageSpec};

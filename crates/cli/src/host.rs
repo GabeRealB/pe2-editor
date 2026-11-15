@@ -115,7 +115,7 @@ pub fn run(
         args
     });
     let says = Arc::new(holder::says::Says::of(&p));
-    let held = match Lock::try_take(&p.root, WHO) {
+    let held = match Lock::try_take(&p.root, WHO, &*p.io) {
         Ok(lock) => {
             let (index, history) = hold(&p, &lock)?;
             Some(Held { link: None, core: core(&p, index, &says), history, lock })
@@ -136,12 +136,12 @@ pub fn run(
         says,
         queue: Queue::start("holder", state)?,
         leases: AtomicUsize::new(0),
-        quiet_since: Mutex::new(Instant::now()),
+        quiet_since: Mutex::new(p.io.clock().now()),
         stopping: Arc::new(AtomicBool::new(false)),
         inherited,
         kept: AtomicBool::new(false),
         answering: AtomicUsize::new(0),
-        asked: Mutex::new(Instant::now()),
+        asked: Mutex::new(p.io.clock().now()),
     });
     // The project's model, where its processes share it, holds what the index read; and the files are held to
     // what it took of them as known, behind what is asked first.
@@ -176,7 +176,7 @@ pub fn run(
         println!("{} held, and served nowhere", p.root);
     }
     let talking = Arc::downgrade(&host);
-    let _talking = ROLE.listen(&p.root, host.stopping.clone(), move |stream| {
+    let _talking = ROLE.listen(&p.root, host.stopping.clone(), p.io.clone(), move |stream| {
         if let Some(host) = talking.upgrade() {
             connection(&host, stream);
         }
@@ -227,6 +227,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Host {
+    /// The time now, by the project's clock: what its lifetime is measured by.
+    fn now(&self) -> Instant {
+        self.project.io.clock().now()
+    }
+
+    /// How long ago that was, by the project's clock.
+    fn since(&self, then: Instant) -> Duration {
+        self.now().saturating_duration_since(then)
+    }
+
+    /// Wait this long, by the project's clock.
+    fn pause(&self, duration: Duration) {
+        pe2_io::sleep(self.project.io.clock(), duration);
+    }
+
     /// Have the thread holding the project do this, after all it was asked before, and wait for what it comes to.
     /// None where that thread is gone - what it was doing failed, as it said: the host stops, for whoever asks
     /// next to start another.
@@ -255,14 +270,14 @@ impl Host {
                 request if !request.uses_window() => host.read(request),
                 _ => mcp::Reply::Declined,
             };
-            *lock(&host.asked) = Instant::now();
+            *lock(&host.asked) = host.now();
             host.answering.fetch_sub(1, Ordering::Relaxed);
             reply
         };
-        let root = self.project.root.clone();
+        let (root, io) = (self.project.root.clone(), self.project.io.clone());
         self.ask(move |state| {
             if let Some(held) = &mut state.held {
-                match mcp::link::Listener::start(&root, answer) {
+                match mcp::link::Listener::start(&root, io, answer) {
                     Ok(link) => held.link = Some(link),
                     Err(e) => eprintln!("edits cannot be sent here: {e}"),
                 }
@@ -306,7 +321,7 @@ impl Host {
                 let _ = project::imports::Imports::open(&cache)?.attach(&mut held.core.index, &extensions);
                 let store = project::graph::store::Store::open(&cache)?;
                 extensions.keep_in(store.clone());
-                anyhow::Ok(Reading { extensions, store, last: Instant::now() })
+                anyhow::Ok(Reading { extensions, store, last: self.now() })
             })();
             match made {
                 Ok(made) => *reading = Some(made),
@@ -314,7 +329,7 @@ impl Host {
             }
         }
         if let Some(reading) = reading.as_mut() {
-            reading.last = Instant::now();
+            reading.last = self.now();
         }
         Ok(())
     }
@@ -430,7 +445,7 @@ impl Host {
         if server.is_none() {
             let root = &self.project.root;
             *server = match &self.serve {
-                Some(args) => Some(project::server::keep(root, WHO, &this_program()?, args)?),
+                Some(args) => Some(project::server::keep(root, WHO, &this_program()?, args, self.project.io.clock())?),
                 None => project::server::keep_running(root, WHO),
             };
         }
@@ -481,7 +496,7 @@ impl Host {
     /// It does not serve: over what the folder holds that is not the project's, most likely, as it says.
     fn served(&self) -> Result<()> {
         use holder::files::State;
-        let asked = Instant::now();
+        let asked = self.now();
         loop {
             let state = lock(&self.files).as_ref().map(|files| files.state());
             match state {
@@ -492,10 +507,10 @@ impl Host {
                     return Ok(());
                 }
                 Some(State::Failed { why, .. }) => bail!(why),
-                Some(State::Starting) if asked.elapsed() > SERVING => {
+                Some(State::Starting) if self.since(asked) > SERVING => {
                     bail!("the server did not serve it within {}s", SERVING.as_secs())
                 }
-                Some(State::Starting) => std::thread::sleep(Duration::from_millis(50)),
+                Some(State::Starting) => self.pause(Duration::from_millis(50)),
             }
         }
     }
@@ -511,7 +526,7 @@ impl Host {
         if lock(&self.files).is_none() {
             self.feed_from_now();
         }
-        let asked = Instant::now();
+        let asked = self.now();
         loop {
             let feed = lock(&self.files).as_ref().map(|files| files.state());
             if let Some(holder::files::State::Failed { why, .. }) = feed {
@@ -521,7 +536,7 @@ impl Host {
                 Some(project::server::FromServer::Status { at, note, .. }) if !at.is_empty() => {
                     return FromHost::Kept { at, note };
                 }
-                Some(_) if asked.elapsed() < SERVING => std::thread::sleep(Duration::from_millis(50)),
+                Some(_) if self.since(asked) < SERVING => self.pause(Duration::from_millis(50)),
                 Some(_) => return FromHost::Error { why: "the server was listed nothing to serve in time".into() },
                 None => return FromHost::Error { why: "the server serving its folder is gone".into() },
             }
@@ -576,13 +591,14 @@ impl Host {
     }
 
     /// Take the project back, where nobody holds it and nobody borrowed it.
+    #[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
     fn take_back(self: &Arc<Self>) {
         let host = self.clone();
         let found = self.ask(move |state| {
             if state.held.is_some() || state.lent_to.is_some() {
                 return None;
             }
-            let taken = Lock::try_take(&host.project.root, WHO).ok()?;
+            let taken = Lock::try_take(&host.project.root, WHO, &*host.project.io).ok()?;
             let found = Instant::now();
             let held = (|| {
                 let cache = Cache::open(&host.project, &taken)?;
@@ -623,13 +639,13 @@ impl Host {
     /// Hold on until stopped, or until - while it holds the project - nothing keeps it and nothing was asked of it for
     /// a while; meanwhile taking the project back whenever it is free.
     fn keep_going(self: &Arc<Self>) {
-        let (mut waiting, mut looked) = (false, Instant::now());
+        let (mut waiting, mut looked) = (false, self.now());
         while !self.stopping.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(200));
+            self.pause(Duration::from_millis(200));
             self.take_back();
             self.forget_reading();
-            if looked.elapsed() > Duration::from_secs(1) {
-                looked = Instant::now();
+            if self.since(looked) > Duration::from_secs(1) {
+                looked = self.now();
                 // Started to keep the folder served, it stops where that is stopped.
                 if self.server_gone() && self.serve.is_some() {
                     break;
@@ -655,7 +671,7 @@ impl Host {
             if serves && self.project.filesystem.keep {
                 continue;
             }
-            let asked = lock(&self.asked).elapsed().min(lock(&self.quiet_since).elapsed());
+            let asked = self.since(*lock(&self.asked)).min(self.since(*lock(&self.quiet_since)));
             if self.answering.load(Ordering::Relaxed) > 0 || asked < IDLE {
                 continue;
             }
@@ -678,8 +694,9 @@ impl Host {
 
     /// What answering reads took, let go of once none was asked for a while.
     fn forget_reading(&self) {
-        self.ask(|state| {
-            if state.reading.as_ref().is_some_and(|r| r.last.elapsed() > READING_KEPT) {
+        let now = self.now();
+        self.ask(move |state| {
+            if state.reading.as_ref().is_some_and(|r| now.saturating_duration_since(r.last) > READING_KEPT) {
                 state.reading = None;
                 // What ran its epochs goes with it, once none runs.
                 drop(state.runner.take_if(|(runner, _)| !runner.busy()));
@@ -696,7 +713,7 @@ impl Host {
         } else {
             self.leases.fetch_sub(1, Ordering::Relaxed);
         }
-        *lock(&self.quiet_since) = Instant::now();
+        *lock(&self.quiet_since) = self.now();
     }
 
     fn status(&self) -> FromHost {
@@ -723,6 +740,7 @@ fn running(state: &State) -> String {
 
 /// One process talking to the host: a lease while it keeps the folder served or borrows the project, ended with the
 /// connection.
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
     let mut stream = BufReader::new(stream);
     let (mut leased, mut borrowing, mut leaving) = (false, false, None::<Instant>);
@@ -786,6 +804,10 @@ fn connection(host: &Arc<Host>, stream: interprocess::local_socket::Stream) {
 ///
 /// # Errors
 /// The system cannot say where it is.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 pub(crate) fn this_program() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }

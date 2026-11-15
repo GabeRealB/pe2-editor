@@ -414,6 +414,10 @@ pub fn sha1_known(path: &HostPath) -> io::Result<pe2_ext::Sha1> {
     if let Some((_, _, hash)) = known.filter(|(at, read, _)| *at == stamp && settled(*read)) {
         return Ok(hash);
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "compared with the times the system stamps files with: the system's own clock"
+    )]
     let read = SystemTime::now();
     let hash = sha1(path)?;
     let mut known = KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -426,9 +430,9 @@ pub fn sha1_known(path: &HostPath) -> io::Result<pe2_ext::Sha1> {
 ///
 /// # Errors
 /// Its chunks cannot be stored.
-pub fn chunked(path: &HostPath, bytes: &[u8]) -> io::Result<Option<String>> {
+pub fn chunked(path: &HostPath, bytes: &[u8], at: std::time::SystemTime) -> io::Result<Option<String>> {
     match Store::of(path) {
-        Some(store) if bytes.len() >= chunks::THRESHOLD => Ok(Some(store.put(bytes)?.render())),
+        Some(store) if bytes.len() >= chunks::THRESHOLD => Ok(Some(store.put(bytes, at)?.render())),
         _ => Ok(None),
     }
 }
@@ -438,22 +442,22 @@ pub fn chunked(path: &HostPath, bytes: &[u8]) -> io::Result<Option<String>> {
 ///
 /// # Errors
 /// Its folder cannot be made, its chunks stored, or it cannot be written.
-pub fn write(path: &HostPath, bytes: &[u8]) -> io::Result<()> {
+pub fn write(path: &HostPath, bytes: &[u8], at: std::time::SystemTime) -> io::Result<()> {
     not_a_record(path)?;
     // A packed layer's file is a line of its listing.
     if let Some((pack, rel)) = crate::pack::Pack::of(path) {
         remove_stored(path)?;
-        return pack.put(&rel, bytes);
+        return pack.put(&rel, bytes, at);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let manifest = chunks::manifest_path(path);
-    let (at, content, other) = match chunked(path, bytes)? {
+    let (to, content, other) = match chunked(path, bytes, at)? {
         Some(text) => (manifest.clone(), text.into_bytes(), path.clone()),
         None => (path.clone(), bytes.to_vec(), manifest),
     };
-    crate::cache::write_atomic(&at, &content).map_err(io::Error::other)?;
+    crate::cache::write_atomic(&to, &content).map_err(io::Error::other)?;
     match std::fs::remove_file(other) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
@@ -722,9 +726,14 @@ pub fn materialize(path: &HostPath) -> io::Result<HostPath> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{exists, head, len, read, read_range, remove, sha1, stored, write};
     use crate::testing::At as _;
+    use std::time::SystemTime;
 
     #[test]
     fn a_files_hash_is_remembered_and_read_again_where_the_file_changed() {
@@ -755,7 +764,7 @@ mod tests {
     fn a_content_reads_whole_and_by_range() {
         let dir = crate::testing::scratch("content");
         let path = dir.at("a/b/c.bin");
-        write(&path, b"0123456789").expect("written");
+        write(&path, b"0123456789", SystemTime::now()).expect("written");
         assert_eq!(read(&path).expect("read"), b"0123456789");
         assert_eq!(read_range(&path, 3, 4).expect("range"), b"3456");
         assert_eq!(read_range(&path, 8, 10).expect("past the end"), b"89");
@@ -769,7 +778,7 @@ mod tests {
         let root = crate::testing::scratch("content-chunked");
         let path = root.at(".layers/top/a.node/native.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        write(&path, &bytes).expect("written");
+        write(&path, &bytes, SystemTime::now()).expect("written");
         assert!(!path.exists() && exists(&path), "stored as its manifest");
         assert_eq!(stored(&path), Some(root.at(".layers/top/a.node/native.str.chunks")));
         assert_eq!(read(&path).expect("read"), bytes);
@@ -777,7 +786,7 @@ mod tests {
         assert_eq!(len(&path).expect("len"), bytes.len() as u64);
         assert_eq!(sha1(&path).expect("sha1"), crate::extract::sha1_of(&bytes));
         // Written small again, it is a file once more.
-        write(&path, b"small").expect("written");
+        write(&path, b"small", SystemTime::now()).expect("written");
         assert!(path.is_file() && stored(&path) == Some(path.clone()));
         remove(&path).expect("removed");
         assert!(!exists(&path));

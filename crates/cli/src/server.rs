@@ -101,7 +101,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
         strays,
         state: Mutex::default(),
         leases: AtomicUsize::new(0),
-        quiet_since: Mutex::new(Instant::now()),
+        quiet_since: Mutex::new(p.io.clock().now()),
         stopping: Arc::new(AtomicBool::new(false)),
         reread: Mutex::default(),
     });
@@ -117,7 +117,7 @@ pub fn run(directory: &Path, backend: Option<&str>, address: Option<&str>, stray
     let stopping = server.stopping.clone();
     ctrlc::set_handler(move || stopping.store(true, Ordering::Relaxed))?;
     let (talking, ids) = (Arc::downgrade(&server), AtomicU64::new(0));
-    let _talking = ROLE.listen(&p.root, server.stopping.clone(), move |stream| {
+    let _talking = ROLE.listen(&p.root, server.stopping.clone(), p.io.clone(), move |stream| {
         if let Some(server) = talking.upgrade() {
             connection(&server, ids.fetch_add(1, Ordering::Relaxed), stream);
         }
@@ -208,6 +208,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Server {
+    /// How long ago that was, by the project's clock: what serving's lifetime is measured by.
+    fn since(&self, then: Instant) -> Duration {
+        self.project.io.clock().now().saturating_duration_since(then)
+    }
+
+    /// Wait this long, by the project's clock.
+    fn pause(&self, duration: Duration) {
+        pe2_io::sleep(self.project.io.clock(), duration);
+    }
+
     /// Read again what these files of the layers are to what is read of the project, where they changed since it
     /// last did: its packs' listings. What its records hold it reads by what is said to be served, not by them.
     fn reread(&self, changed: &[HostPath]) {
@@ -328,6 +338,7 @@ impl Server {
             staging: &staging,
             name: &served_name(p),
             address: self.address,
+            io: p.io.clone(),
         };
         let mount = serving.mount(&job).with_context(|| format!("serving {} by `{}`", p.root, serving.name()))?;
         let at = mount.shown();
@@ -365,13 +376,13 @@ impl Server {
         let says = &self.project.filesystem;
         let kept = vfs::backend::budget(&[says.kept.as_deref(), machine.kept.as_deref()], vfs::backend::KEPT);
         self.serving.collect(&says.at, record, kept);
-        let mut collected = Instant::now();
+        let mut collected = self.project.io.clock().now();
         while !self.stopping.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(500));
-            if collected.elapsed() >= COLLECTING {
+            self.pause(Duration::from_millis(500));
+            if self.since(collected) >= COLLECTING {
                 self.serving.collect(&says.at, record, kept);
                 record.save();
-                collected = Instant::now();
+                collected = self.project.io.clock().now();
             }
         }
         self.serving.collect(&says.at, record, kept);
@@ -381,12 +392,12 @@ impl Server {
     fn keep_going(&self) {
         let mut waiting = false;
         while !self.stopping.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(200));
+            self.pause(Duration::from_millis(200));
             if self.leases.load(Ordering::Relaxed) > 0 {
                 waiting = false;
                 continue;
             }
-            if lock(&self.quiet_since).elapsed() < GRACE {
+            if self.since(*lock(&self.quiet_since)) < GRACE {
                 continue;
             }
             match self.served.open_files() {
@@ -411,7 +422,7 @@ impl Server {
         } else {
             self.leases.fetch_sub(1, Ordering::Relaxed);
         }
-        *lock(&self.quiet_since) = Instant::now();
+        *lock(&self.quiet_since) = self.project.io.clock().now();
     }
 
     /// A connection ended: where it fed the server, nothing does until another lists what is served.
@@ -438,13 +449,13 @@ impl Server {
     /// link lives; where nothing holds it, of a host started to.
     fn ask(&self, request: &mcp::Request) -> Asked {
         let root = &self.project.root;
-        if let Some(reply) = mcp::link::forward_patiently(root, request) {
+        if let Some(reply) = mcp::link::forward_patiently(root, &self.project.io, request) {
             return Asked::Answered(reply);
         }
         if let Err(later) = self.ready() {
             return Asked::Later(later);
         }
-        match mcp::server::ask_holder(root, request) {
+        match mcp::server::ask_holder(root, &self.project.io, request) {
             Some(reply) => Asked::Answered(reply),
             // Taken meanwhile by what answers nothing, or no host could be started to hold it.
             None => match self.ready() {
@@ -550,7 +561,7 @@ impl vfs::write::Owner for Server {
                 break;
             }
             // Taken, and what became of it not said yet: a moment for it to be.
-            std::thread::sleep(Duration::from_millis(50));
+            self.pause(Duration::from_millis(50));
         }
         let told = |answer: Option<vfs::due::Answer>| match answer {
             Some(Ok(label)) => {
@@ -582,8 +593,8 @@ impl vfs::write::Owner for Server {
     /// What was written and nobody took by the time serving ends: set aside beside the folder, by its path there,
     /// as what is not the project's is - the staging is emptied when the folder is next served.
     fn left(&self, path: &project::TreePath, staged: &HostPath) {
-        let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let seconds = seconds.to_string();
+        let now = self.project.io.clock().wall();
+        let seconds = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).to_string();
         let Ok(when) = pe2_path::Name::new(&seconds) else { return };
         let aside = self.project.root.join(&project::SET_ASIDE).join(when).join(path.rel());
         let kept = aside
@@ -626,7 +637,7 @@ fn clear_strays(
     if found.is_empty() {
         return Ok(());
     }
-    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let seconds = p.io.clock().wall().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let aside = p.root.join(&project::SET_ASIDE).join(&pe2_path::Name::new(&seconds.to_string())?);
     let shown = at.to_string();
     match strays {

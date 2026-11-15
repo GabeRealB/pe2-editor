@@ -951,6 +951,7 @@ pub fn mount(served: &Served, writes: Option<Writes>, at: &HostPath, name: &str)
     // or two. Waited for, so that what is given its path can open it.
     let answers = |_| {
         std::fs::metadata(&mounted.at).is_ok() || {
+            #[allow(clippy::disallowed_methods, reason = "the pace Dokany's mount is asked at: the system's")]
             std::thread::sleep(READY_STEP);
             false
         }
@@ -977,6 +978,10 @@ fn tell_changes(served: &Served, instance: usize, at: &HostPath, stop: &AtomicBo
         let _ = wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(());
     });
     while !stop.load(Ordering::Relaxed) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the pace what watches the mount is told at: the system's, as Dokany is"
+        )]
         let _ = woken.recv_timeout(std::time::Duration::from_millis(200));
         while woken.try_recv().is_ok() {}
         // More than is kept to tell of: what watches finds out as it next looks.

@@ -22,7 +22,7 @@
 
 #![allow(
     clippy::disallowed_methods,
-    reason = "it writes what it fetches into a folder it is given: a place on disk of any program's, no storage's"
+    reason = "it writes what it fetches into a folder it is given: a place on disk of any program's, no storage's; that folder is the machine's, shared by every project, and aged by the times the system stamps its files with"
 )]
 
 use std::collections::{BTreeMap, HashMap};

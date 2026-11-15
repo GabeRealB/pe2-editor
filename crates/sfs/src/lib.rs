@@ -22,7 +22,6 @@
 pub mod content;
 pub mod fs;
 pub mod header;
-mod host;
 pub mod log;
 pub mod ops;
 pub mod ring;
@@ -34,8 +33,8 @@ pub mod tree;
 
 pub use content::Content;
 pub use header::Header;
-pub use host::{HostPath, NotWithin};
 pub use log::{Log, Record};
 pub use ops::Op;
+pub use pe2_io::{HostPath, NotWithin};
 pub use space::Space;
 pub use storage::Stored;

@@ -15,6 +15,7 @@ testing = []
 
 [dependencies]
 pe2-path.workspace = true
+pe2-io.workspace = true
 serde.workspace = true
 memmap2 = "0.9"
 crc32fast = "1"

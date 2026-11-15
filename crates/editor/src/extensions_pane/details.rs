@@ -594,7 +594,8 @@ fn adding_ui(ui: &mut egui::Ui, ws: &mut Workspace, present: &[Present], p: &Pre
             let folder = folder.clone();
             let work = move |w: &mut crate::takein::Worker| {
                 // An archive is unpacked first, and copied in as its folder.
-                let unpacked = extensions::archive::is_archive(&folder).then(|| extensions::archive::unpack(&folder));
+                let unpacked = extensions::archive::is_archive(&folder)
+                    .then(|| extensions::archive::unpack(&folder, w.core.project.io.environment()));
                 let unpacked = unpacked.transpose()?;
                 let from = unpacked.as_ref().map_or(&folder, |unpacked| &unpacked.folder);
                 let about = project::switches::add_extension(&w.core.project, from, None, &mut w.history, to)?;

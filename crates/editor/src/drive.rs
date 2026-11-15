@@ -35,6 +35,10 @@ fn acted_id() -> egui::Id {
 const ACTING: Duration = Duration::from_secs(2);
 
 /// Whether what just happened in the window may be an agent's: what only a person may answer refuses it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+)]
 pub fn agent_acting(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Instant>(acted_id())).is_some_and(|at| at.elapsed() < ACTING)
 }
@@ -177,6 +181,10 @@ impl Driver {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     pub fn take(&mut self, ctx: &egui::Context, requests: Vec<Request>) {
         if requests.is_empty() {
             return;
@@ -199,6 +207,10 @@ impl Driver {
     }
 
     /// Advance the requests in progress, at the start of a frame; `drive`: whether agents may act.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     pub fn update(&mut self, ctx: &egui::Context, drive: bool) {
         self.panes = ctx.data_mut(|d| std::mem::take(&mut d.get_temp_mut_or_default::<PaneRects>(panes_id()).0));
         if self.asked.is_some_and(|t| t.elapsed() > KEEP_TREE) && self.pending.is_empty() {
@@ -302,6 +314,10 @@ impl Driver {
     }
 
     /// Queue an action's input, to be answered once it has settled.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn queue(&mut self, tree: &Tree, batches: Vec<Vec<egui::Event>>) -> Job {
         self.acted = Some(Instant::now());
         let before = lines(tree, None, None);

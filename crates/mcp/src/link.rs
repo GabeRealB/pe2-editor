@@ -28,15 +28,20 @@ pub fn listens(root: &HostPath) -> bool {
 
 /// Hand a request to the editor serving the project in `root`; none when no editor is.
 #[must_use]
-pub fn forward(root: &HostPath, request: &Request) -> Option<Reply> {
-    forward_within(root, request, PATIENCE)
+pub fn forward(root: &HostPath, io: &Arc<dyn pe2_io::Io>, request: &Request) -> Option<Reply> {
+    forward_within(root, io, request, PATIENCE)
 }
 
 /// Hand a request to the editor serving the project in `root`, waiting this long for its answer; none when no editor is,
 /// or the holder declines it (the host answers edits alone).
 #[must_use]
-pub fn forward_within(root: &HostPath, request: &Request, patience: Duration) -> Option<Reply> {
-    match forward_to_holder(root, request, patience)? {
+pub fn forward_within(
+    root: &HostPath,
+    io: &Arc<dyn pe2_io::Io>,
+    request: &Request,
+    patience: Duration,
+) -> Option<Reply> {
+    match forward_to_holder(root, io, request, patience)? {
         Reply::Declined => None,
         reply => Some(reply),
     }
@@ -55,14 +60,21 @@ enum Asked {
 
 /// Ask a link again while it closes without answering, a short while: none once nothing listens there any more -
 /// whoever asked goes on as where nothing holds the project - an error where it goes on closing.
-fn until_answered(root: &HostPath, whose: &str, mut ask: impl FnMut() -> Option<Asked>) -> Option<Reply> {
-    let asked = std::time::Instant::now();
+fn until_answered(
+    root: &HostPath,
+    clock: &dyn pe2_io::Clock,
+    whose: &str,
+    mut ask: impl FnMut() -> Option<Asked>,
+) -> Option<Reply> {
+    let asked = clock.now();
     loop {
         match ask()? {
             Asked::Answered(Reply::Declined) => return None,
             Asked::Answered(reply) => return Some(reply),
             Asked::Failed(why) => return Some(Reply::Error(why)),
-            Asked::Closed if asked.elapsed() < LEAVING => std::thread::sleep(Duration::from_millis(20)),
+            Asked::Closed if clock.now().saturating_duration_since(asked) < LEAVING => {
+                pe2_io::sleep(clock, Duration::from_millis(20));
+            }
             Asked::Closed if !listens(root) => return None,
             Asked::Closed => return Some(Reply::Error(format!("{whose} closed its link without answering"))),
         }
@@ -73,8 +85,8 @@ fn until_answered(root: &HostPath, whose: &str, mut ask: impl FnMut() -> Option<
 /// what must not be asked twice - an edit given up on while its holder is still making it would be made again. None
 /// where nothing listens, or the holder declines it.
 #[must_use]
-pub fn forward_patiently(root: &HostPath, request: &Request) -> Option<Reply> {
-    until_answered(root, "the holder", || {
+pub fn forward_patiently(root: &HostPath, io: &Arc<dyn pe2_io::Io>, request: &Request) -> Option<Reply> {
+    until_answered(root, io.clock(), "the holder", || {
         let mut stream = BufReader::new(Stream::connect(name(root).ok()?).ok()?);
         let answered = (|| -> std::io::Result<Option<Reply>> {
             project::wire::send(stream.get_mut(), request)?;
@@ -88,12 +100,17 @@ pub fn forward_patiently(root: &HostPath, request: &Request) -> Option<Reply> {
     })
 }
 
-fn forward_to_holder(root: &HostPath, request: &Request, patience: Duration) -> Option<Reply> {
-    until_answered(root, "the editor", || {
+fn forward_to_holder(
+    root: &HostPath,
+    io: &Arc<dyn pe2_io::Io>,
+    request: &Request,
+    patience: Duration,
+) -> Option<Reply> {
+    until_answered(root, io.clock(), "the editor", || {
         let stream = Stream::connect(name(root).ok()?).ok()?;
         let request = request.clone();
         // Read on a thread of its own, so an editor that does not answer is given up on.
-        let (send, receive) = std::sync::mpsc::channel();
+        let (send, receive) = pe2_io::channel(io.clone());
         std::thread::spawn(move || {
             let mut stream = BufReader::new(stream);
             let result = (|| -> std::io::Result<Option<Reply>> {
@@ -102,7 +119,7 @@ fn forward_to_holder(root: &HostPath, request: &Request, patience: Duration) -> 
             })();
             let _ = send.send(result);
         });
-        Some(match receive.recv_timeout(patience) {
+        Some(match receive.recv_until(Some(io.clock().now() + patience)) {
             Ok(Ok(Some(reply))) => Asked::Answered(reply),
             Ok(Ok(None)) => Asked::Closed,
             Ok(Err(e)) => Asked::Failed(format!("the editor's link failed: {e}")),
@@ -116,7 +133,8 @@ pub struct Listener {
     stop: Arc<AtomicBool>,
     root: HostPath,
     /// Told when the accepting thread ends.
-    ended: std::sync::mpsc::Receiver<()>,
+    ended: pe2_io::Receiver<()>,
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Listener {
@@ -126,12 +144,13 @@ impl Listener {
     /// The socket cannot be made.
     pub fn start(
         root: &HostPath,
+        io: Arc<dyn pe2_io::Io>,
         answer: impl Fn(Request) -> Reply + Send + Sync + 'static,
     ) -> std::io::Result<Listener> {
         // The name is not removed when this ends: by then it may be a newer holder's, which took it over.
         let listener =
             ListenerOptions::new().name(name(root)?).try_overwrite(true).reclaim_name(false).create_sync()?;
-        let (end, ended) = std::sync::mpsc::channel();
+        let (end, ended) = pe2_io::channel(io.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let answer = Arc::new(answer);
         let stopped = stop.clone();
@@ -147,7 +166,7 @@ impl Listener {
             drop(listener);
             let _ = end.send(());
         });
-        Ok(Listener { stop, root: root.clone(), ended })
+        Ok(Listener { stop, root: root.clone(), ended, io })
     }
 }
 
@@ -162,7 +181,7 @@ impl Drop for Listener {
         }
         // Gone once it has stopped answering, for whoever holds the project next to answer - unless the name was taken
         // over meanwhile, and the wake reached the newer listener: then it is left, no longer reached.
-        let _ = self.ended.recv_timeout(Duration::from_secs(1));
+        let _ = self.ended.recv_until(Some(self.io.clock().now() + Duration::from_secs(1)));
     }
 }
 

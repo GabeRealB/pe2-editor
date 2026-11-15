@@ -3,6 +3,10 @@
 //! whether it reflects. What declarations of a model's materials are made from.
 //!
 //! `cargo run -p pe2-model --example model_bindings -- <an inflated package> 760 1504 2148652216`
+#![allow(
+    clippy::disallowed_methods,
+    reason = "an example run by hand: it reads what its arguments and the machine give"
+)]
 
 use pe2_model::model::decode;
 

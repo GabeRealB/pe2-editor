@@ -13,11 +13,6 @@
 //! undoable ones. The rest is read-only: writes wait for the write path, where they become operations in the active
 //! layer.
 
-#![allow(
-    clippy::disallowed_methods,
-    reason = "the editors' presence is kept in the program's own folder: plain paths; a project's places are HostPaths, joined only of checked names"
-)]
-
 pub mod link;
 pub mod presence;
 pub mod server;

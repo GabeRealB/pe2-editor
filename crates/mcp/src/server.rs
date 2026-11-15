@@ -39,23 +39,24 @@ whether this server's program was rebuilt since it started (then it runs older c
 
 /// Answer a request for the project in `root`: through the editor when it serves the project, else here.
 #[must_use]
-pub fn execute(root: &HostPath, request: &Request) -> Reply {
+pub fn execute(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>, request: &Request) -> Reply {
+    let clock = io.clock();
     // The editors and who holds the project: answered here, never through an editor nor under the project's lock.
     if matches!(request, Request::Call { name, .. } if name == "editors") {
         let text = crate::presence::report(root).to_string();
         return Reply::Call(rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]));
     }
-    greet(root);
-    if let Some(reply) = link::forward(root, request) {
+    greet(root, io);
+    if let Some(reply) = link::forward(root, io, request) {
         return reply;
     }
     // An editor opening the project, or holding it with its link not up yet: its, as soon as it listens - never taken
     // from under it.
     if let Some(pid) = crate::presence::claimed_by(root) {
-        let started = std::time::Instant::now();
-        while started.elapsed() < EDITOR_STARTING {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if let Some(reply) = link::forward(root, request) {
+        let started = clock.now();
+        while clock.now().saturating_duration_since(started) < EDITOR_STARTING {
+            pe2_io::sleep(clock, std::time::Duration::from_millis(200));
+            if let Some(reply) = link::forward(root, io, request) {
                 return reply;
             }
         }
@@ -70,16 +71,16 @@ pub fn execute(root: &HostPath, request: &Request) -> Reply {
     // Nothing holds it: a host does, from now on - started where none runs - and answers this and what is asked next
     // with the project open, where each would open it anew here. Where it lent the project, or none can be started,
     // the work is done here, under the lock.
-    if project::host::ensure(root) {
-        let asked = std::time::Instant::now();
-        while asked.elapsed() < HOST_STARTING && project::host::answers(root) {
-            if let Some(reply) = link::forward(root, request) {
+    if project::host::ensure(root, &**io) {
+        let asked = clock.now();
+        while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root) {
+            if let Some(reply) = link::forward(root, io, request) {
                 return reply;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            pe2_io::sleep(clock, std::time::Duration::from_millis(50));
         }
     }
-    let lock = match Lock::acquire_within(root, "pe2-cli mcp", PATIENCE) {
+    let lock = match Lock::acquire_within(root, "pe2-cli mcp", PATIENCE, &**io) {
         Ok(lock) if lock.unprotected().is_some() => {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| eprintln!("warning: {}", lock.unprotected().unwrap_or_default()));
@@ -92,13 +93,13 @@ pub fn execute(root: &HostPath, request: &Request) -> Reply {
         Err(e) => return Reply::Error(e.to_string()),
     };
     if let Request::Edit { op, layer } = request {
-        return edit_here(root, &lock, op, layer.as_deref());
+        return edit_here(root, io, &lock, op, layer.as_deref());
     }
     // What is due is taken by who holds the project to stay, and says what is served: not by a command.
     if matches!(request, Request::Due) {
         return Reply::Declined;
     }
-    let opened = Project::load(root).and_then(|project| {
+    let opened = Project::load_with(root, io.clone()).and_then(|project| {
         let cache = Cache::open(&project, &lock)?;
         let mut index = Index::open(&project, &cache)?;
         // The extensions as the project has them: those it holds and the built-ins, without those it leaves off.
@@ -127,20 +128,21 @@ pub fn execute(root: &HostPath, request: &Request) -> Reply {
 /// must not be asked twice (an edit). None where nothing can hold it for this program (it works under another's lock,
 /// no host can be started) or the holder lent it: whoever asked then does the work itself, or says it is not done.
 #[must_use]
-pub fn ask_holder(root: &HostPath, request: &Request) -> Option<Reply> {
-    greet(root);
-    if let Some(reply) = link::forward_patiently(root, request) {
+pub fn ask_holder(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>, request: &Request) -> Option<Reply> {
+    let clock = io.clock();
+    greet(root, io);
+    if let Some(reply) = link::forward_patiently(root, io, request) {
         return Some(reply);
     }
-    if !project::host::ensure(root) {
+    if !project::host::ensure(root, &**io) {
         return None;
     }
-    let asked = std::time::Instant::now();
-    while asked.elapsed() < HOST_STARTING && project::host::answers(root) {
-        if let Some(reply) = link::forward_patiently(root, request) {
+    let asked = clock.now();
+    while clock.now().saturating_duration_since(asked) < HOST_STARTING && project::host::answers(root) {
+        if let Some(reply) = link::forward_patiently(root, io, request) {
             return Some(reply);
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        pe2_io::sleep(clock, std::time::Duration::from_millis(50));
     }
     None
 }
@@ -149,7 +151,7 @@ pub fn ask_holder(root: &HostPath, request: &Request) -> Option<Reply> {
 /// (another build of it, started with another data folder or another trust) would answer with other code or
 /// settings than its own. One nobody keeps is told to stop, and the one started next is this program's; one that is
 /// kept, or an editor, is only said to differ.
-fn greet(root: &HostPath) {
+fn greet(root: &HostPath, io: &std::sync::Arc<dyn pe2_io::Io>) {
     static GREETED: std::sync::Mutex<Vec<HostPath>> = std::sync::Mutex::new(Vec::new());
     {
         let mut greeted = GREETED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -158,7 +160,7 @@ fn greet(root: &HostPath) {
         }
         greeted.push(root.clone());
     }
-    let Some(Reply::Hello(holder)) = link::forward(root, &Request::Hello) else { return };
+    let Some(Reply::Hello(holder)) = link::forward(root, io, &Request::Hello) else { return };
     if holder.editor {
         let mine = crate::Holder::this(false);
         if holder.data != mine.data {
@@ -167,7 +169,7 @@ fn greet(root: &HostPath) {
         return;
     }
     let Some(why) = holder.differs() else { return };
-    if project::host::replace(root) {
+    if project::host::replace(root, io.clock()) {
         eprintln!("note: the host holding the project (process {}) was stopped: {why}", holder.pid);
     } else {
         eprintln!("note: the host holding the project (process {}) answers, though {why}: it is kept", holder.pid);
@@ -175,14 +177,20 @@ fn greet(root: &HostPath) {
 }
 
 /// Make an edit while holding the project for it alone: a step of a history of its own, which ends with it.
-fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&pe2_path::Name>) -> Reply {
+fn edit_here(
+    root: &HostPath,
+    io: &std::sync::Arc<dyn pe2_io::Io>,
+    lock: &Lock,
+    op: &vfs::ops::Op,
+    layer: Option<&pe2_path::Name>,
+) -> Reply {
     if matches!(op, vfs::ops::Op::Undo | vfs::ops::Op::Redo) {
         return Reply::failed(
             "nothing holds the project: what is taken back is an editor's or a host's history".into(),
         );
     }
     let done = (|| {
-        let project = Project::load(root)?;
+        let project = Project::load_with(root, io.clone())?;
         let cache = Cache::open(&project, lock)?;
         let index = Index::open(&project, &cache)?;
         let layer = match layer {
@@ -204,19 +212,21 @@ fn edit_here(root: &HostPath, lock: &Lock, op: &vfs::ops::Op, layer: Option<&pe2
 #[derive(Clone)]
 pub struct Server {
     root: HostPath,
+    /// The program's I/O.
+    io: std::sync::Arc<dyn pe2_io::Io>,
     /// The tools as last listed: every project's, until the project's holder said its own.
     tools: std::sync::Arc<std::sync::Mutex<Vec<Tool>>>,
 }
 
 impl Server {
     #[must_use]
-    pub fn new(root: HostPath) -> Server {
-        Server { root, tools: std::sync::Arc::new(std::sync::Mutex::new(crate::definitions())) }
+    pub fn new(root: HostPath, io: std::sync::Arc<dyn pe2_io::Io>) -> Server {
+        Server { root, io, tools: std::sync::Arc::new(std::sync::Mutex::new(crate::definitions())) }
     }
 
     async fn execute(&self, request: Request) -> Result<Reply, ErrorData> {
-        let root = self.root.clone();
-        tokio::task::spawn_blocking(move || execute(&root, &request))
+        let (root, io) = (self.root.clone(), self.io.clone());
+        tokio::task::spawn_blocking(move || execute(&root, &io, &request))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
@@ -289,10 +299,10 @@ impl ServerHandler for Server {
 ///
 /// # Errors
 /// The runtime cannot start or the connection fails.
-pub fn serve_stdio(root: HostPath) -> anyhow::Result<()> {
+pub fn serve_stdio(root: HostPath, io: std::sync::Arc<dyn pe2_io::Io>) -> anyhow::Result<()> {
     crate::presence::note_start();
     // Made before the runtime: listing the extensions' tools loads them, and a component's call blocks its thread.
-    let server = Server::new(root);
+    let server = Server::new(root, io);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async move {
         let service = server.serve(rmcp::transport::stdio()).await?;

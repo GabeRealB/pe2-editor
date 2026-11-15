@@ -357,7 +357,7 @@ fn write(
         && !index.entries.contains_key(&bundle_named(folder))
     {
         let declaration = std::str::from_utf8(bytes).context("a declaration is not text")?;
-        let uid = new_uid(index)?;
+        let uid = new_uid(index);
         return edit::create(project, index, layer, uid, folder, (declaration, &[]), history);
     }
     match place(index, path) {
@@ -415,8 +415,8 @@ fn rename(
     }
 }
 
-fn new_uid(index: &Index) -> Result<Uid> {
-    Ok(project::uid::new(|uid| index.by_uid.contains_key(&uid))?)
+fn new_uid(index: &Index) -> Uid {
+    project::uid::new(index.io().random(), |uid| index.by_uid.contains_key(&uid))
 }
 
 #[cfg(test)]

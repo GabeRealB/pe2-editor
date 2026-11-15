@@ -79,6 +79,7 @@ impl Category {
 }
 
 /// The file a tool is given: a BS picture becomes a PNG in the temporary directory; any other file is itself.
+#[allow(clippy::disallowed_methods, reason = "a program the system starts for the user, found as the system finds it")]
 fn openable(file: &Path, name: &str) -> Result<PathBuf, String> {
     if file.extension().is_none_or(|e| e != "bs") {
         return Ok(file.to_path_buf());
@@ -126,6 +127,7 @@ fn words(command: &str) -> Vec<String> {
 }
 
 /// The system's way of opening a file in its default application.
+#[allow(clippy::disallowed_methods, reason = "a program the system starts for the user, found as the system finds it")]
 fn system_default(file: &Path) -> Command {
     if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
@@ -152,6 +154,7 @@ pub fn open_default(file: &Path) -> Result<(), String> {
     system_default(file).spawn().map(drop).map_err(|e| format!("{}: {e}", file.display()))
 }
 
+#[allow(clippy::disallowed_methods, reason = "a program the system starts for the user, found as the system finds it")]
 fn which(program: &str) -> bool {
     let Ok(program) = pe2_path::Name::new(program) else { return false };
     // Each folder the environment names, as the system names it.

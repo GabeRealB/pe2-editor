@@ -24,7 +24,7 @@ use pe2_path::{Name, RelPath};
 use sfs::{HostPath, NotWithin};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 pub use sfs::Stored;
@@ -224,7 +224,10 @@ struct Shared {
     /// Whether room for what waits first is to be made ahead of it (`Storage::prepare`).
     prepare: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
-    wake: Condvar,
+    /// What the thread writing behind and whoever waits for it are told of a change to `state` by, timed by the
+    /// project's clock.
+    signal: pe2_io::Signal,
+    io: Arc<dyn pe2_io::Io>,
     /// Whether the header's word that the log is needed has yet to be had on disk.
     header_unflushed: std::sync::atomic::AtomicBool,
     /// Whether what is to be written behind is held back for now (`Storage::hold_back`).
@@ -304,7 +307,7 @@ impl Shared {
         drop(state);
         // Whether anything serves the project or not: what nobody needs of the log goes.
         self.log.keep();
-        self.wake.notify_all();
+        self.signal.notify_all();
     }
 
     /// Write what was said to be written behind: for all the sets said since this last did - what they name in
@@ -339,8 +342,8 @@ impl Shared {
                 }
                 state.writing = false;
                 drop(state);
-                self.wake.notify_all();
-                std::thread::sleep(Duration::from_millis(200));
+                self.signal.notify_all();
+                pe2_io::sleep(self.io.clock(), Duration::from_millis(200));
                 return;
             }
             Ok(()) => {
@@ -380,7 +383,7 @@ impl Shared {
         // files were last had on disk.
         state.open = state.behind.front().map(|(began, _, _)| *began);
         drop(state);
-        self.wake.notify_all();
+        self.signal.notify_all();
     }
 
     /// Write one file of a set written behind - unless it is not as the set found it: then someone else changed
@@ -423,7 +426,7 @@ impl Shared {
             );
             // Looked at again by whoever watches the project's files.
             if let Ok(theirs) = std::fs::File::options().write(true).open(&file.path) {
-                let _ = theirs.set_modified(std::time::SystemTime::now());
+                let _ = theirs.set_modified(self.io.clock().wall());
             }
             return;
         }
@@ -451,22 +454,19 @@ impl Shared {
     /// then once more, for what was written last. What is to be written behind is written as it comes.
     fn run(&self) {
         // When what was written is next had on disk: every few seconds, however much is written behind meanwhile.
-        let mut due = std::time::Instant::now() + EVERY;
+        let clock = self.io.clock();
+        let mut due = clock.now() + EVERY;
         let mut said_held = None;
         loop {
             self.write_behind();
             let (stopping, checkpoint) = {
-                let mut state = self.lock();
                 let held_back = || self.held_back.load(std::sync::atomic::Ordering::Acquire);
                 let prepare = || self.prepare.load(std::sync::atomic::Ordering::Acquire);
-                while !state.asked && !state.stopping && !prepare() && (state.behind.is_empty() || held_back()) {
-                    let left = due.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
-                        break;
-                    }
-                    state = self.wake.wait_timeout(state, left).unwrap_or_else(PoisonError::into_inner).0;
-                }
-                (state.stopping, state.asked || state.stopping || due <= std::time::Instant::now())
+                let woken = |state: &mut State| {
+                    state.asked || state.stopping || prepare() || (!state.behind.is_empty() && !held_back())
+                };
+                let (state, _) = self.signal.wait_until(&self.state, Some(due), woken);
+                (state.stopping, state.asked || state.stopping || due <= clock.now())
             };
             // Room for what waits first, made here: the first change does not wait for it.
             if self.prepare.swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -480,7 +480,7 @@ impl Shared {
                 continue;
             }
             self.write_behind();
-            due = std::time::Instant::now() + EVERY;
+            due = clock.now() + EVERY;
             self.say_held_long(&mut said_held);
             let waits = !self.lock().unsynced.is_empty() || self.log.header().storage().is_some();
             if waits {
@@ -490,7 +490,7 @@ impl Shared {
                 state.synced += 1;
                 state.asked = false;
                 drop(state);
-                self.wake.notify_all();
+                self.signal.notify_all();
             }
             if stopping {
                 return;
@@ -510,7 +510,7 @@ impl Storage {
     /// The storage of the project in `root`; none where its log cannot be opened - what is written is then written
     /// as it comes, with nothing to take it up from.
     #[must_use]
-    pub fn open(root: &HostPath) -> Option<Storage> {
+    pub fn open(root: &HostPath, io: Arc<dyn pe2_io::Io>) -> Option<Storage> {
         let log = sfs::Log::shared(&log_dir(root), sfs::log::Config::default());
         let log = log.inspect_err(|e| eprintln!("{}: no log to write through: {e}", root.display())).ok()?;
         let shared = Arc::new(Shared {
@@ -519,7 +519,8 @@ impl Storage {
             space: std::sync::OnceLock::new(),
             prepare: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::default(),
-            wake: Condvar::new(),
+            signal: pe2_io::Signal::new(io.clone()),
+            io,
             header_unflushed: std::sync::atomic::AtomicBool::new(false),
             held_back: std::sync::atomic::AtomicBool::new(false),
         });
@@ -620,7 +621,7 @@ impl Storage {
     /// edit waits for none of it; what holds one in passing asks for nothing, and makes none.
     pub fn prepare(&self) {
         self.shared.prepare.store(true, std::sync::atomic::Ordering::Release);
-        self.shared.wake.notify_all();
+        self.shared.signal.notify_all();
     }
 
     /// Say a set of changes whole, to be written behind: said in the log, and its files kept as waiting where
@@ -664,7 +665,7 @@ impl Storage {
         }
         state.behind.push_back((began, label.to_string(), files));
         drop(state);
-        self.shared.wake.notify_all();
+        self.shared.signal.notify_all();
         Ok(began)
     }
 
@@ -672,7 +673,7 @@ impl Storage {
     /// files wait - nothing is waited for (`settle`) while it is held back.
     pub fn hold_back(&self, held: bool) {
         self.shared.held_back.store(held, std::sync::atomic::Ordering::Release);
-        self.shared.wake.notify_all();
+        self.shared.signal.notify_all();
     }
 
     /// Wait for all that was said to be written behind to be written: its files as it left them.
@@ -680,20 +681,13 @@ impl Storage {
         if self.shared.held_back.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let mut state = self.shared.lock();
         if self.syncing.is_none() {
-            drop(state);
             return self.shared.write_behind();
         }
-        while (!state.behind.is_empty() || state.writing) && !state.stopping {
-            self.shared.wake.notify_all();
-            state = self
-                .shared
-                .wake
-                .wait_timeout(state, Duration::from_millis(50))
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
+        // The thread told there is something to write, then waited for until all of it is written.
+        self.shared.signal.notify_all();
+        let written = |state: &mut State| (state.behind.is_empty() && !state.writing) || state.stopping;
+        drop(self.shared.signal.wait_until(&self.shared.state, None, written));
     }
 
     /// A set said whole could not be written, and what it had written was put back: it is not to be written again.
@@ -719,14 +713,22 @@ impl Storage {
         }
         let before = state.synced;
         state.asked = true;
-        self.shared.wake.notify_all();
+        drop(state);
+        self.shared.signal.notify_all();
         // Two: one that was under way when this was asked may not have taken all that was written.
-        while state.synced < before + 2 && !state.stopping {
-            state = self.shared.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
-            if state.synced == before + 1 {
-                state.asked = true;
-                self.shared.wake.notify_all();
+        let mut asked_again = false;
+        loop {
+            let enough = |state: &mut State| {
+                state.synced >= before + 2 || state.stopping || (!asked_again && state.synced == before + 1)
+            };
+            let (mut state, _) = self.shared.signal.wait_until(&self.shared.state, None, enough);
+            if state.synced >= before + 2 || state.stopping {
+                return;
             }
+            state.asked = true;
+            asked_again = true;
+            drop(state);
+            self.shared.signal.notify_all();
         }
     }
 }
@@ -734,7 +736,7 @@ impl Storage {
 impl Drop for Storage {
     fn drop(&mut self) {
         self.shared.lock().stopping = true;
-        self.shared.wake.notify_all();
+        self.shared.signal.notify_all();
         match self.syncing.take() {
             Some(syncing) => drop(syncing.join()),
             None => self.shared.checkpoint(),
@@ -912,7 +914,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let log = sfs::Log::shared(&log_dir(&root), sfs::log::Config::default()).unwrap();
         let needed = || log.header().storage();
-        let mut storage = Storage::open(&root).unwrap();
+        let mut storage = Storage::open(&root, pe2_io::system()).unwrap();
         assert_eq!(needed(), None, "nothing written, nothing needed");
         let file = root.at("a.txt");
         let put = |text: &str| [Stored::Put { path: "a.txt".into(), bytes: text.as_bytes().to_vec() }];

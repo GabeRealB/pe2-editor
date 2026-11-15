@@ -109,6 +109,10 @@ impl ApplicationHandler<eframe::UserEvent> for PointerGate<'_> {
         self.app.user_event(event_loop, event);
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window: WindowId, mut event: WindowEvent) {
         // The first window there is is the main one.
         self.main.get_or_insert(window);
@@ -139,6 +143,10 @@ impl ApplicationHandler<eframe::UserEvent> for PointerGate<'_> {
         self.app.device_event(event_loop, device, event);
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.held.as_ref().is_some_and(|held| held.at.elapsed() >= REST) {
             self.release(event_loop);

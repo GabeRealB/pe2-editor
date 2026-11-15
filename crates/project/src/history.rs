@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sfs::HostPath;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::TreePath;
 use crate::cache::{Cache, write_atomic};
@@ -143,8 +143,8 @@ pub struct Step {
 }
 
 impl Step {
-    fn new(label: String, author: String) -> Step {
-        let at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    /// A step made at `at` (milliseconds since the epoch).
+    fn new(label: String, author: String, at: u64) -> Step {
         Step { label, author, kind: Kind::Edit, at, changes: vec![], edits: vec![], selection: None, merge: None }
     }
 
@@ -254,6 +254,8 @@ pub struct History {
     view: View,
     /// How long after a step was made an edit continuing it still joins it.
     merge_within: Duration,
+    /// The project's I/O: the time its steps are made at, and joined by.
+    io: Arc<dyn pe2_io::Io>,
     /// How many times what it shows changed: counted where the session is written, which every change of its
     /// steps and documents does.
     revision: std::cell::Cell<u64>,
@@ -408,13 +410,14 @@ impl History {
         let mut history = History {
             view: View::new(dir.clone()),
             merge_within: MERGE_WITHIN,
+            io: cache.io.clone(),
             revision: std::cell::Cell::new(0),
             journaled: false,
             appended: std::cell::Cell::new(None),
             author: "user".into(),
             trashed: 0,
             written: vec![],
-            storage: cache.dir.parent().and_then(|root| crate::storage::Storage::open(&root)),
+            storage: cache.dir.parent().and_then(|root| crate::storage::Storage::open(&root, cache.io.clone())),
         };
         let recovered = cache.recovered.clone();
         let left = std::fs::read_to_string(dir.join(&SESSION))
@@ -473,11 +476,14 @@ impl History {
         let _ = std::fs::remove_dir_all(&self.view.dir);
     }
 
-    /// Have an edit continuing a step join it however long after: for a test of what joins, which a slow disk
-    /// under it should not decide.
-    #[cfg(test)]
-    pub(crate) fn merge_whenever(&mut self) {
-        self.merge_within = Duration::MAX;
+    /// The time now, as a step says when it was made: milliseconds since the epoch.
+    fn at(&self) -> u64 {
+        self.io.clock().wall().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
+    }
+
+    /// A step made now.
+    fn step(&self, label: String, author: String) -> Step {
+        Step::new(label, author, self.at())
     }
 
     /// Which of its revisions it is at: another, once what it shows (`view`) changed.
@@ -504,7 +510,7 @@ impl History {
 
     /// Begin a transaction, named as the user will see it in the history.
     pub fn begin(&mut self, label: impl Into<String>) -> Transaction<'_> {
-        let step = Step::new(label.into(), self.author.clone());
+        let step = self.step(label.into(), self.author.clone());
         Transaction { history: self, step, committed: false }
     }
 
@@ -552,9 +558,9 @@ impl History {
         }
         let edit = Edit { uid, path: path.to_owned(), file: file.to_owned(), before, after };
         self.set_working(index, &edit);
-        let mut step = Step::new(label, self.author.clone());
+        let mut step = self.step(label, self.author.clone());
         step.edits.push(edit);
-        step.merge = merge.map(|key| (key, Instant::now()));
+        step.merge = merge.map(|key| (key, self.io.clock().now()));
         self.push(step);
         Ok(true)
     }
@@ -613,7 +619,7 @@ impl History {
     pub fn revert(&mut self, uid: Uid, label: String) {
         let Some(document) = self.view.documents.get(&uid).cloned() else { return };
         let disk = document.stale.as_ref().unwrap_or(&document.base);
-        let mut step = Step::new(label, self.author.clone());
+        let mut step = self.step(label, self.author.clone());
         for (file, working) in &document.working {
             let after = disk.get(file).copied().flatten();
             if *working != after {
@@ -696,7 +702,7 @@ impl History {
     /// # Panics
     /// A step of the log edits an asset it does not say the path of: the log never holds one.
     pub fn restore(&mut self, index: &Index, point: usize, scope: Option<Uid>, label: String) -> bool {
-        let mut step = Step::new(label, self.author.clone());
+        let mut step = self.step(label, self.author.clone());
         for ((uid, file), after) in self.states_at(point, scope) {
             let before = self.current(index, uid, &file);
             if before != after {
@@ -728,14 +734,14 @@ impl History {
                 return Err(format!("{name} was edited since: restore an earlier point instead"));
             }
         }
-        let mut reverting = Step::new(label, self.author.clone());
+        let mut reverting = self.step(label, self.author.clone());
         reverting.edits = step.edits.iter().rev().map(Edit::inverse).collect();
         Ok(self.apply_new(index, reverting))
     }
 
     /// Name the point the log is at, to come back to.
     pub fn checkpoint(&mut self, name: String) {
-        let mut step = Step::new(name, self.author.clone());
+        let mut step = self.step(name, self.author.clone());
         step.kind = Kind::Checkpoint;
         self.push(step);
     }
@@ -826,8 +832,7 @@ impl History {
         let rest = &mut steps[at];
         let (mine, others): (Vec<Edit>, Vec<Edit>) = rest.edits.drain(..).partition(|e| e.uid == uid);
         rest.edits = others;
-        let mut part = Step::new(rest.label.clone(), rest.author.clone());
-        part.at = rest.at;
+        let mut part = Step::new(rest.label.clone(), rest.author.clone(), rest.at);
         part.selection.clone_from(&rest.selection);
         part.edits = mine;
         part
@@ -981,7 +986,7 @@ impl History {
     /// folders.
     fn behind(&self, changes: &[Change]) -> Option<Vec<crate::storage::Behind>> {
         use crate::storage::Behind;
-        let at = crate::storage::stamped(std::time::SystemTime::now());
+        let at = crate::storage::stamped(self.io.clock().wall());
         changes
             .iter()
             .map(|change| match change {
@@ -1133,7 +1138,9 @@ impl History {
         // The documents it edited: written with it.
         let edited: Vec<Uid> = step.edits.iter().map(|edit| edit.uid).collect();
         if let (Some(last), Some((key, _))) = (self.view.done.last_mut(), &step.merge)
-            && last.merge.as_ref().is_some_and(|(k, at)| k == key && at.elapsed() < self.merge_within)
+            && last.merge.as_ref().is_some_and(|(k, at)| {
+                k == key && self.io.clock().now().saturating_duration_since(*at) < self.merge_within
+            })
         {
             // One edit continued: the step keeps where it started from and takes where it ends - the last write of a
             // path continued, a step that wrote a file twice (a copy, then an edit of it) keeping the first.
@@ -1258,7 +1265,7 @@ impl Transaction<'_> {
     /// joins that step.
     #[must_use]
     pub fn merging(mut self, key: impl Into<String>) -> Self {
-        self.step.merge = Some((key.into(), Instant::now()));
+        self.step.merge = Some((key.into(), self.history.io.clock().now()));
         self
     }
 
@@ -1373,7 +1380,7 @@ impl Transaction<'_> {
     pub fn write(&mut self, path: &HostPath, bytes: &[u8]) -> Result<()> {
         // A large content in a layer is stored as chunks: what the step keeps is its manifest, the other form gone.
         let manifest = crate::chunks::manifest_path(path);
-        if let Some(text) = crate::content::chunked(path, bytes)? {
+        if let Some(text) = crate::content::chunked(path, bytes, self.history.io.clock().wall())? {
             self.write_stored(&manifest, text.as_bytes())?;
             self.drop_stored(path)
         } else {
@@ -1494,7 +1501,7 @@ impl Transaction<'_> {
         let paths = self.step.paths();
         self.history.written.extend(paths.iter().cloned());
         if !self.step.changes.is_empty() {
-            let step = std::mem::replace(&mut self.step, Step::new(String::new(), String::new()));
+            let step = std::mem::replace(&mut self.step, Step::new(String::new(), String::new(), 0));
             self.history.push(step);
         }
         Ok(paths)
@@ -1714,7 +1721,7 @@ mod tests {
         let one = root.at("layer/a/one");
         {
             // Said whole, on disk - and its process gone before any file was written.
-            let mut storage = Storage::open(&root).unwrap();
+            let mut storage = Storage::open(&root, pe2_io::system()).unwrap();
             let changes = [
                 Stored::Put { path: "layer/a/one".into(), bytes: b"ONE".to_vec() },
                 Stored::MakeDir { path: "layer/new".into() },

@@ -345,6 +345,8 @@ fn mount(scope: &mut Scope, root: &HostPath, backend: &'static dyn Backend) -> i
             staging: &mounted.staging,
             name: &name,
             address: None,
+            // Read-only, it applies nothing: no time of its decides anything.
+            io: pe2_io::system(),
         };
         mounted.mount = Some(backend.mount(&job)?);
         scope.mounted = Some(mounted);
@@ -353,6 +355,10 @@ fn mount(scope: &mut Scope, root: &HostPath, backend: &'static dyn Backend) -> i
 }
 
 #[cfg(all(test, any(target_os = "linux", windows)))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::Scopes;
     use sfs::HostPath;
@@ -381,7 +387,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let file = root.at(".layers/top/a.node/movie.str");
         let bytes: Vec<u8> = (0..(3u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        project::content::write(&file, &bytes).expect("written");
+        project::content::write(&file, &bytes, std::time::SystemTime::now()).expect("written");
         let scopes = scopes();
         let given = project::content::for_program(&file).expect("given");
         // A backend here: FUSE where the kernel has it, the Projected File System or the Cloud Files API on Windows.
@@ -456,7 +462,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let chunked = root.at(".layers/top/a.node/big.bin");
         let big: Vec<u8> = (0..(2u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-        project::content::write(&chunked, &big).expect("written");
+        project::content::write(&chunked, &big, std::time::SystemTime::now()).expect("written");
         let plain = root.at("plain.h");
         std::fs::write(&plain, "#define A 1\n").unwrap();
         let files = std::collections::BTreeMap::from([

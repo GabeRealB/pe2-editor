@@ -187,6 +187,11 @@ pub fn serve(served: &Served, at: &HostPath) -> io::Result<Projected> {
     let api = api().ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no Projected File System here"))?;
     std::fs::create_dir_all(at)?;
     let root = wide(&at.to_string_lossy());
+    // An instance no other takes, as every process tells it: the system's clock, and this process.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "an id no other instance takes: the system's clock, shared by every process"
+    )]
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let instance = GUID::from_u128(nanos ^ (u128::from(std::process::id()) << 96));
     // SAFETY: a folder's path, no target, no version, an instance id: as documented.

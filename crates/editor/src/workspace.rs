@@ -685,11 +685,12 @@ pub type AgentRequest = (mcp::Request, mpsc::Sender<mcp::Reply>);
 /// of opening it, so that an agent reaches the editor - its window, and what it says of the project - all along.
 fn listen(
     root: &HostPath,
+    io: Arc<dyn pe2_io::Io>,
     to_frames: mpsc::Sender<AgentRequest>,
     ctx: egui::Context,
     outside: Arc<std::sync::OnceLock<crate::takein::Outside>>,
 ) -> std::result::Result<mcp::link::Listener, String> {
-    mcp::link::Listener::start(root, move |request| {
+    mcp::link::Listener::start(root, io, move |request| {
         arrived();
         // An edit, and what is due of what programs did through the served folder, are the worker's: asked of
         // it here, on the link's thread, whatever the window is doing.
@@ -746,15 +747,15 @@ impl Drop for Leaving {
 
 /// Have a host stand by for the project the editor holds (`project::host::stand_by`), off the caller's thread: the
 /// one running, or `pe2-cli` beside the editor started as one. Where that is not there, none does.
-fn stand_by(root: &HostPath) {
-    let Ok(program) = std::env::current_exe() else { return };
-    let program = project::host::cli_beside(&program);
+fn stand_by(root: &HostPath, io: Arc<dyn pe2_io::Io>) {
+    let Ok(program) = io.environment().current_exe() else { return };
+    let program = project::host::cli_beside(&program.into_path_buf());
     if !program.is_file() {
         return;
     }
     let root = root.clone();
     let _ = std::thread::Builder::new().name("standby".into()).spawn(move || {
-        if let Err(e) = project::host::stand_by(&root, &program) {
+        if let Err(e) = project::host::stand_by(&root, &program, io.clock()) {
             eprintln!("no host stands by for {root}: {e:#}");
         }
     });
@@ -804,16 +805,17 @@ impl Workspace {
     /// Its `project.toml` or its assets cannot be read, or another holds it.
     pub fn prepare(
         dir: &HostPath,
+        io: &Arc<dyn pe2_io::Io>,
         report: &project::index::Report<'_>,
         agents: (mpsc::Sender<AgentRequest>, egui::Context),
     ) -> Result<Opened> {
         report("Reading project.toml", 0, 0);
-        let project = Project::load(dir)?;
+        let project = Project::load_with(dir, io.clone())?;
         // An agent's request holds the project for a moment (`pe2-cli mcp`): outlast one, not a real holder.
-        let lock = match Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2)) {
+        let lock = match Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(2), &*project.io) {
             // An agent's server answering a request of its own: brief, if longer than that - it lets go.
             Err(project::lock::LockError::Held(owner)) if owner.starts_with("pe2-cli mcp") => {
-                Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(30))?
+                Lock::acquire_within(&project.root, "pe2-editor", Duration::from_secs(30), &*project.io)?
             }
             locked => locked?,
         };
@@ -824,11 +826,11 @@ impl Workspace {
         // A host stands by where its files are served: holding nothing while the editor has the project, it takes
         // it once the editor lets go, and feeds the server from then on - closing the window ends no serving.
         if files.is_some() {
-            stand_by(&project.root);
+            stand_by(&project.root, project.io.clone());
         }
         // Agents reach it from now on: what they ask of the window is answered as it opens.
         let outside: Arc<std::sync::OnceLock<crate::takein::Outside>> = Arc::default();
-        let link = listen(&project.root, agents.0, agents.1, outside.clone());
+        let link = listen(&project.root, project.io.clone(), agents.0, agents.1, outside.clone());
         if link.is_ok() {
             await_agent(report);
         }
@@ -894,6 +896,10 @@ impl Workspace {
 
     /// The workspace of a project opened (`prepare`): its worker started, its index shown.
     #[expect(clippy::too_many_lines, reason = "what it holds, one line each")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     pub fn from_opened(opened: Opened, requests: mpsc::Receiver<AgentRequest>) -> Workspace {
         let Opened {
             project,
@@ -924,7 +930,7 @@ impl Workspace {
         let layers = index.layers();
         // The worker takes the index from here; the UI shows a snapshot of it, made as the project was opened.
         let pictures = crate::pictures::Pictures::start(shown.clone(), extensions.clone());
-        let outputs = project::ext::requests::Requests::start(shown.clone());
+        let outputs = project::ext::requests::Requests::start(shown.clone(), project.io.clone());
         outputs.set_extensions(&extensions);
         extensions.serve_requests(Some(outputs.clone()));
         let cache_dir = cache.dir.clone();
@@ -1233,7 +1239,7 @@ impl Workspace {
         then: impl FnOnce(&mut crate::app::Editor, Result<(), String>) + 'static,
     ) -> Result<(), String> {
         let layer = self.active_layer().ok_or("no layer is active")?.name.clone();
-        let uid = project::uid::new(|uid| self.index.by_uid.contains_key(&uid)).map_err(|e| e.to_string())?;
+        let uid = project::uid::new(self.index.io().random(), |uid| self.index.by_uid.contains_key(&uid));
         let slug: String =
             name.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let quoted = toml::Value::String(name.to_string());
@@ -1318,7 +1324,7 @@ impl Workspace {
         let stack = self.extensions.stamp(&found, &name)?;
         // A stack naming its own file has the file under that name.
         let name = project::graph::layers::stored_file(&stack).unwrap_or(name);
-        let uid = project::uid::new(|uid| self.index.by_uid.contains_key(&uid)).map_err(|e| e.to_string())?;
+        let uid = project::uid::new(self.index.io().random(), |uid| self.index.by_uid.contains_key(&uid));
         let declaration = format!("uid = \"{uid}\"\n\n{stack}");
         let file = file.map(std::path::Path::to_path_buf);
         let named = if file.is_some() {
@@ -1539,6 +1545,10 @@ impl Workspace {
 
     /// Bring in what changed: other programs' changes collected from the watcher, taken in as they happen (`live`) or
     /// when the window regains focus; and the snapshots the worker made since, swapped in. Returns what they did.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     pub fn update(&mut self, focused: bool, live: bool) -> Update {
         // The project's extensions and where they are kept to be added, and its plans, looked at each second by
         // the worker: none is in the index, and no watch follows them.

@@ -17,6 +17,7 @@ notify.workspace = true
 pe2-ext.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+pe2-io.workspace = true
 tracing.workspace = true
 vfs.workspace = true
 sfs.workspace = true

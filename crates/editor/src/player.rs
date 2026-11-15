@@ -219,6 +219,7 @@ impl Shown {
     }
 
     /// Play from where it is by the clock - the sound to follow, where there is one.
+    #[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
     fn by_clock(&mut self) {
         self.sounding = None;
         self.playing = Some((Instant::now(), self.at));
@@ -262,6 +263,7 @@ struct SoundClock {
 }
 
 impl SoundClock {
+    #[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
     fn new() -> SoundClock {
         SoundClock {
             begun: Instant::now(),
@@ -271,6 +273,7 @@ impl SoundClock {
         }
     }
 
+    #[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
     fn took(&self, at: f64, len: f64) {
         #[expect(clippy::cast_possible_truncation, reason = "nanoseconds of a sound playing")]
         let now = self.begun.elapsed().as_nanos() as u64;
@@ -280,6 +283,7 @@ impl SoundClock {
     }
 
     /// The sample playing now, at `rate` samples a second.
+    #[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
     fn now(&self, rate: f64) -> f64 {
         let at = f64::from_bits(self.at.load(Ordering::Relaxed));
         let len = f64::from_bits(self.len.load(Ordering::Relaxed));
@@ -385,6 +389,7 @@ impl Player {
     }
 
     /// An asset played: its picture where it is, the controls under it.
+    #[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -550,6 +555,7 @@ fn start_sounding(shown: &mut Shown, gain: &Arc<AtomicU32>, failed: &Arc<Mutex<O
 
 /// Where it is: by the sound while it sounds - fed half a second ahead - else by the clock; sounding started while it
 /// plays, unless muted or silent.
+#[allow(clippy::disallowed_methods, reason = "playback keeps to the machine's time, as what is heard does")]
 fn keep_time(
     shown: &mut Shown,
     muted: bool,

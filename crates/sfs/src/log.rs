@@ -184,6 +184,7 @@ impl Log {
             // have open, the locks on it with it.
             let alone = (0..5).any(|again| {
                 if again > 0 {
+                    #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 log.attached.try_lock().is_ok()
@@ -499,6 +500,10 @@ impl Log {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Config, HEAD, Log};
     use crate::HostPath;

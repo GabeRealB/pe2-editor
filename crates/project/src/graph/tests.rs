@@ -513,7 +513,7 @@ fn a_file_the_releases_have_apart_is_read_as_the_release_built_has_it() {
 fn a_kept_output_holds_while_what_it_read_does() {
     let dir = crate::testing::scratch("graph-store");
     let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let node = Bundle::new(STACK, &[("a.txt", "abc")]);
     let (plan, _) = Plan::of(&node.fields, &engine.ops, &[]);
     let first = engine.output(&plan, &node, pe2_path::Asked::constant("source"), false).unwrap();
@@ -540,7 +540,7 @@ fn a_kept_output_holds_while_what_it_read_does() {
 fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
     let dir = crate::testing::scratch("graph-alike");
     let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let one = Bundle::new(STACK, &[("a.txt", "abc")]);
     let two = Bundle { path: "test/other", ..Bundle::new(STACK, &[("a.txt", "abc")]) };
     let (plan, _) = Plan::of(&one.fields, &engine.ops, &[]);
@@ -558,7 +558,7 @@ fn nodes_making_alike_keep_a_trace_each_and_share_the_value() {
 fn a_kinds_output_is_made_from_a_kept_one_and_swept_to_its_newest() {
     let dir = crate::testing::scratch("graph-tail");
     let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
                  [[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let node = Bundle::new(stack, &[("a.txt", "abc"), ("b.txt", "unread")]);
@@ -605,7 +605,7 @@ fn an_outputs_newest_trace_of_each_of_the_last_two_builds_is_kept() {
         let mut ops = ops();
         let upper = (**ops.get("t.upper").unwrap()).clone();
         ops.add(OpDef { version: version.into(), ..upper });
-        Engine::new(ops, Some(Store::at(dir.clone()).unwrap()))
+        Engine::new(ops, Some(Store::at(dir.clone(), pe2_io::system()).unwrap()))
     };
     let (one, two, three) = (built("1"), built("2"), built("3"));
     let stack = "[[stack]]\nop = \"file\"\nfile = \"a.txt\"\n\n[[stack]]\nop = \"t.upper\"\n\n\
@@ -721,7 +721,7 @@ fn what_is_made_from_the_projects_files_is_made_again_when_they_change() {
     std::fs::create_dir_all(dir.at("tree/src")).unwrap();
     std::fs::write(dir.at("tree/src/a.c"), "one").unwrap();
     std::fs::write(dir.at("tree/declaration"), "public = []").unwrap();
-    let engine = Engine::new(ops(), Some(Store::at(dir.at("store")).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.at("store"), pe2_io::system()).unwrap()));
     let declared = "[[stack]]\nop = \"t.tree\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\nretain = \"cache\"\n";
     let world = Tree(Bundle::new(declared, &[]), engine.ops.clone(), dir.at("tree"));
     let reach = super::exec::Reach { engine: &engine, world: &world };
@@ -757,7 +757,7 @@ fn joining(parts: &str) -> String {
 fn a_node_joins_other_nodes_outputs_and_holds_while_they_do() {
     let dir = crate::testing::scratch("graph-reach");
     let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let mut a = Bundle::new(PART, &[("part.bin", "head-")]);
     a.path = "test/a";
     // Past what a writer holds in memory: the joined file is spilled to the store.
@@ -814,7 +814,7 @@ fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() 
     let dir = crate::testing::scratch("graph-run");
     let _ = std::fs::remove_dir_all(&dir);
     // An engine for one run: an epoch's.
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap())).for_a_run();
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap())).for_a_run();
     let named = |path: &'static str, declared: &str, files: &[(&str, &str)]| {
         let mut node = Bundle::new(declared, files);
         node.path = path;
@@ -855,7 +855,7 @@ fn a_run_holds_what_several_read_to_what_it_read_once_until_something_is_made() 
 fn marks_are_kept_as_they_are() {
     let dir = crate::testing::scratch("graph-marks");
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::at(dir.clone()).unwrap();
+    let store = Store::at(dir.clone(), pe2_io::system()).unwrap();
     let rect = pe2_ext::Rect { x: 1.0, y: 2.0, width: 3.0, height: 4.0 };
     let marks = Value::Marks(pe2_ext::Marks {
         boxes: vec![pe2_ext::Mark { name: "a".into(), rect }],
@@ -1067,7 +1067,7 @@ fn what_an_operation_writes_and_does_not_keep_leaves_nothing_in_the_store() {
         let file = call.keep(&kept, pe2_ext::RelPath::constant("made.bin"))?;
         Ok(Value::Typed(Typed { ty: "bytes".into(), files: vec![file], ..Typed::default() }))
     }));
-    let engine = Engine::new(ops, Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops, Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let stack = |op: &str| format!("[[stack]]\nop = \"{op}\"\n\n[[stack]]\nop = \"output\"\nname = \"native\"\n");
     let failing = Bundle::new(&stack("t.spill_fail"), &[]);
     let (plan, _) = Plan::of(&failing.fields, &engine.ops, &[]);
@@ -1088,7 +1088,7 @@ fn a_content_placed_for_a_program_is_where_it_is_kept_or_written_until_let_go_of
     let dir = crate::testing::scratch("graph-placed");
     let _ = std::fs::remove_dir_all(&dir);
     let mut ops = ops();
-    let store = Store::at(dir.clone()).unwrap();
+    let store = Store::at(dir.clone(), pe2_io::system()).unwrap();
     let big: Vec<u8> = (0..100u8).collect();
     let blob = store.keep(&big).unwrap();
     // Each content placed: a stored one is its blob; one held in itself or in memory is written, then gone once let go.
@@ -1123,7 +1123,7 @@ fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
         file.set_modified(std::time::SystemTime::now() - age).unwrap();
     }
     crate::testing::set_modified(&dir.at("tmp/old.expand"), std::time::SystemTime::now() - day);
-    let _store = Store::at(dir.clone()).unwrap();
+    let _store = Store::at(dir.clone(), pe2_io::system()).unwrap();
     // What a stopped process left goes, a folder of it too; what is being written stays.
     assert_eq!(left_in_tmp(&dir), ["2-0"]);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1133,7 +1133,7 @@ fn a_store_opened_sweeps_from_tmp_what_was_not_written_for_a_day() {
 fn a_sweep_is_due_when_none_was_for_a_while_and_something_was_kept_since() {
     let dir = crate::testing::scratch("graph-due");
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::at(dir.clone()).unwrap();
+    let store = Store::at(dir.clone(), pe2_io::system()).unwrap();
     let every = std::time::Duration::from_mins(30);
     assert!(store.sweep_due(every), "never swept");
     store.mark_swept();
@@ -1516,7 +1516,7 @@ fn a_for_each_runs_an_operation_for_each_item_and_makes_each_once() {
              [[stack]]\nop = \"concatenate\"\nname = \"all.txt\"\n\n[[stack]]\nop = \"output\"\nname = \"all\"\nretain = \"cache\"\n"
         )
     };
-    let engine = Engine::new(ops, Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops, Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let made = |texts: &str| {
         let declaration = stack(texts);
         let (plan, problems) = Plan::of(&toml::from_str(&declaration).unwrap(), &engine.ops, &[]);
@@ -1623,7 +1623,7 @@ fn an_operation_is_served_a_folder_of_its_files_for_its_run() {
     let (plan, wrong) = Plan::of(&toml::from_str(stack).unwrap(), &ops(), &[]);
     assert!(wrong.is_empty(), "{wrong:?}");
     let node = Bundle::new(stack, &[("a.txt", "abc")]);
-    let engine = Engine::new(ops(), Some(Store::at(dir.clone()).unwrap()));
+    let engine = Engine::new(ops(), Some(Store::at(dir.clone(), pe2_io::system()).unwrap()));
     let given = engine.output(&plan, &node, pe2_path::Asked::constant("read"), true).unwrap();
     assert_eq!(data(&node, &given.value.unwrap()), b"abc!");
     let tmp = dir.at("tmp");

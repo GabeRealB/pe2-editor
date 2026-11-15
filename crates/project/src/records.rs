@@ -294,7 +294,7 @@ pub fn hold_extensions(project: &crate::Project, layer: &HostPath) -> Result<usi
         if !folder.is_dir() {
             continue;
         }
-        let (tree, _) = store.put_folder(&folder)?;
+        let (tree, _) = store.put_folder(&folder, project.io.clock().wall())?;
         let at = extension_path(layer, &id)?;
         std::fs::create_dir_all(layer.join(&DIR).join(&EXTENSIONS))?;
         crate::cache::write_atomic(&at, extension_record(Some(&tree)).as_bytes())?;
@@ -404,19 +404,22 @@ impl Kind {
     }
 }
 
+/// Where what is not text is kept, and when: the store, and the time its writes stamp.
+pub type Keeping<'a> = (&'a crate::chunks::Store, std::time::SystemTime);
+
 impl Content {
     /// A file's content as a record keeps it: text inline whatever its length, so a layer's history always reads as
     /// text, anything else (bytes that are not UTF-8, or hold a NUL, as git tells binary files) kept in the store.
     ///
     /// # Errors
     /// It cannot be kept.
-    pub fn of(bytes: &[u8], store: &crate::chunks::Store) -> Result<Content> {
+    pub fn of(bytes: &[u8], (store, at): Keeping<'_>) -> Result<Content> {
         if !bytes.contains(&0)
             && let Ok(text) = std::str::from_utf8(bytes)
         {
             return Ok(Content::Text(text.to_string()));
         }
-        let sha1 = store.put_file(bytes)?;
+        let sha1 = store.put_file(bytes, at)?;
         Ok(Content::Stored { sha1, size: bytes.len() as u64 })
     }
 
@@ -1324,7 +1327,7 @@ fn records_of_tree(
     };
     let content = |disk: &HostPath| -> Result<Content> {
         let bytes = crate::content::read(disk).with_context(|| disk.display().to_string())?;
-        Content::of(&bytes, &store)
+        Content::of(&bytes, (&store, project.io.clock().wall()))
     };
     // A bundle's files, by name, as its folder holds them.
     let bundle = |path: &TreePath| -> Result<BTreeMap<Arc<RelPath>, File>> {
@@ -1518,6 +1521,7 @@ pub fn records_for(
 ) -> Result<(BTreeMap<Uid, Record>, Vec<Uid>)> {
     use crate::changeset::Op as Did;
     let store = crate::chunks::Store::at(&project.root);
+    let keeping = (&store, project.io.clock().wall());
     // What the layers below resolve is asked, entry by entry: the layer's own are few beside it.
     let below = index.under(&layer.name);
     let mut uid_at: std::collections::HashMap<Arc<TreePath>, Uid> = std::collections::HashMap::new();
@@ -1578,7 +1582,7 @@ pub fn records_for(
         let mut files = before.map_or_else(BTreeMap::new, |r| r.files.clone());
         for (name, bytes) in written_at(path, kind) {
             match bytes {
-                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, &store)?), was: None }),
+                Some(bytes) => files.insert(name, File { content: Some(Content::of(&bytes, keeping)?), was: None }),
                 None => files.remove(&name),
             };
         }
@@ -1602,7 +1606,7 @@ pub fn records_for(
                 };
                 let now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>> = written_at(&at, kind).into_iter().collect();
                 let held = old.get(uid).filter(|r| r.op == Op::Override).map(|r| &r.files);
-                Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, &store)? }
+                Record { op: Op::Override, kind, parent, name, files: override_files(bases, now, held, keeping)? }
             }
         };
         new.insert(*uid, record);
@@ -1621,7 +1625,7 @@ fn override_files(
     bases: &BTreeMap<Arc<RelPath>, crate::changeset::Base>,
     mut now: BTreeMap<Arc<RelPath>, Option<Vec<u8>>>,
     held: Option<&BTreeMap<Arc<RelPath>, File>>,
-    store: &crate::chunks::Store,
+    keeping: Keeping<'_>,
 ) -> Result<BTreeMap<Arc<RelPath>, File>> {
     let mut files = BTreeMap::new();
     for (file, base) in bases {
@@ -1629,7 +1633,7 @@ fn override_files(
             None
         } else {
             match now.remove(file) {
-                Some(Some(bytes)) => Some(Content::of(&bytes, store)?),
+                Some(Some(bytes)) => Some(Content::of(&bytes, keeping)?),
                 _ => held.and_then(|h| h.get(file)).and_then(|f| f.content.clone()),
             }
         };

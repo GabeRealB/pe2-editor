@@ -53,6 +53,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests;
 
 /// A page's length.
@@ -583,6 +587,7 @@ impl Space {
             // have open, the locks on it with it.
             let alone = (0..5).any(|again| {
                 if again > 0 {
+                    #[allow(clippy::disallowed_methods, reason = "a back-off between tries of a lock another process holds: the tries decide, not the time")]
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 attached.try_lock().is_ok()
@@ -968,6 +973,10 @@ impl Space {
     /// The lowest generation this process reads at, and for how long it has: what a view held long is told by.
     /// It holds back the pages of the commit it reads, and nothing written since.
     #[must_use]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "how long a reader has held a commit: measured, for what says so; nothing decides by it"
+    )]
     pub fn reading_longest(&self) -> Option<(u64, Duration)> {
         lock(&self.pins).iter().next().map(|(generation, reading)| (*generation, reading.since.elapsed()))
     }
@@ -1191,7 +1200,12 @@ impl Space {
             }
             from.store(lowest + 1, Ordering::SeqCst);
         }
-        pins.insert(generation, Reading { readers: 1, cell, since: Instant::now() });
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "how long a reader has held a commit: measured, for what says so; nothing decides by it"
+        )]
+        let since = Instant::now();
+        pins.insert(generation, Reading { readers: 1, cell, since });
     }
 
     fn unpin(&self, generation: u64) {
@@ -1705,9 +1719,14 @@ impl Txn<'_> {
                 return None;
             }
             self.looked = true;
-            if self.writing.is_none_or(|probed| probed.elapsed() >= PROBE) {
+            // How often dead readers are looked for is a cost, by the machine's time: what is found is the same.
+            #[allow(clippy::disallowed_methods, reason = "how often a cost is paid, not what is decided")]
+            let due = self.writing.is_none_or(|probed| probed.elapsed() >= PROBE);
+            if due {
                 // Readers hold every one back: those whose processes are gone, no longer.
-                *self.writing = Some(Instant::now());
+                #[allow(clippy::disallowed_methods, reason = "how often a cost is paid, not what is decided")]
+                let probed = Instant::now();
+                *self.writing = Some(probed);
                 space.clear_gone();
             }
             self.settled();

@@ -159,6 +159,7 @@ struct FdInfo {
 }
 
 impl FdInfo {
+    #[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
     fn read(&mut self) -> Option<Reading> {
         let mut clients: HashMap<String, Client> = HashMap::new();
         let descriptors = Path::new("/proc/self/fd");

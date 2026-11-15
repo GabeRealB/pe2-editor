@@ -2,10 +2,6 @@
 //! It dispatches on its subcommand (`pe2-cli project extract`) or, run under a tool's name (a link in the editor's
 //! own `bin/`), on that name (`project extract`).
 
-#![allow(
-    clippy::disallowed_methods,
-    reason = "what it is given and the program's own files are plain paths; a project's places are HostPaths, joined only of checked names"
-)]
 // The host holds what runs its epochs, whose types are Send through a deep chain: proving it needs a higher limit.
 #![recursion_limit = "256"]
 
@@ -879,7 +875,8 @@ fn blocked(presence: &mcp::presence::Presence) -> Option<String> {
 
 /// Start the editor on a project, and wait until it is up: waiting for an agent, or the project open.
 fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[String]) -> anyhow::Result<()> {
-    let root = &project::Project::load(project)?.root;
+    let p = project::Project::load(project)?;
+    let (root, clock) = (&p.root, p.io.clock());
     if let Some(pid) = mcp::presence::claimed_by(root) {
         anyhow::bail!("{root}: the editor in process {pid} has it open");
     }
@@ -893,7 +890,7 @@ fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[Stri
         .stdout(std::io::stderr());
     let mut child = command.spawn().context("the editor could not be started")?;
     let pid = child.id();
-    let started = std::time::Instant::now();
+    let started = clock.now();
     let mut said = String::new();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -911,10 +908,10 @@ fn start_editor(project: &Path, wait_for_agent: bool, timeout: u64, args: &[Stri
                 return Ok(());
             }
         }
-        if started.elapsed() > std::time::Duration::from_secs(timeout) {
+        if clock.now().saturating_duration_since(started) > std::time::Duration::from_secs(timeout) {
             anyhow::bail!("the editor in process {pid} was not up within {timeout} s{said}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        pe2_io::sleep(clock, std::time::Duration::from_millis(50));
     }
 }
 
@@ -923,7 +920,8 @@ const WAITING_FOR_AGENT: &str = "Waiting for an agent";
 
 /// Wait for the editor that has a project open: until it is idle, or until it exits.
 fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()> {
-    let root = &project::Project::load(project)?.root;
+    let p = project::Project::load(project)?;
+    let (root, clock) = (&p.root, p.io.clock());
     let Some(pid) = mcp::presence::claimed_by(root) else {
         // Waited for to exit, an editor that is not there has.
         if until == Until::Exit {
@@ -931,7 +929,7 @@ fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()>
         }
         anyhow::bail!("{}: no editor has it open", root.display());
     };
-    let started = std::time::Instant::now();
+    let started = clock.now();
     loop {
         match mcp::presence::running().remove(&pid) {
             None if until == Until::Exit => return Ok(()),
@@ -945,10 +943,10 @@ fn wait_editor(project: &Path, until: Until, timeout: u64) -> anyhow::Result<()>
                 }
             }
         }
-        if started.elapsed() > std::time::Duration::from_secs(timeout) {
+        if clock.now().saturating_duration_since(started) > std::time::Duration::from_secs(timeout) {
             anyhow::bail!("the editor in process {pid} did not get there within {timeout} s");
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        pe2_io::sleep(clock, std::time::Duration::from_millis(50));
     }
 }
 
@@ -958,7 +956,7 @@ fn signal(project: &Path, config: Option<&pe2_path::Name>, events: &[&str]) -> a
     // nothing does.
     let events_named: Vec<String> = events.iter().map(ToString::to_string).collect();
     let request = mcp::Request::Signal { events: events_named, config: config.map(ToOwned::to_owned) };
-    if let Some(reply) = mcp::server::ask_holder(&p.root, &request) {
+    if let Some(reply) = mcp::server::ask_holder(&p.root, &p.io, &request) {
         let said = reply.told().map_err(anyhow::Error::msg)?;
         if !said.is_empty() {
             println!("{said}");
@@ -967,7 +965,7 @@ fn signal(project: &Path, config: Option<&pe2_path::Name>, events: &[&str]) -> a
     }
     let chosen = p.configs.iter().find(|c| config.is_none_or(|name| *c.name == *name));
     let chosen = chosen.with_context(|| "no such config in project.toml")?.clone();
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", |owner| {
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     let cache = project::cache::Cache::open(&p, &lock)?;
@@ -1194,7 +1192,8 @@ fn add_from(
     label: String,
 ) -> Result<project::ext::component::About> {
     if extensions::archive::is_archive(from) {
-        let unpacked = extensions::archive::unpack(from).with_context(|| from.display().to_string())?;
+        let unpacked =
+            extensions::archive::unpack(from, p.io.environment()).with_context(|| from.display().to_string())?;
         return project::switches::add_extension(p, &unpacked.folder, into, history, label);
     }
     project::switches::add_extension(p, from, into, history, label)
@@ -1339,7 +1338,7 @@ fn extension(command: ExtensionCommand) -> Result<()> {
         list_extensions(&p);
         return Ok(());
     }
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", |owner| {
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extension", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
@@ -1420,6 +1419,10 @@ fn trust(project: &Path, all: bool, layers: &[Arc<pe2_path::Name>], paths: Vec<P
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's; and how long it took, measured"
+)]
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
     let invoked = std::path::Path::new(&args[0]).file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -1519,7 +1522,7 @@ fn setup_command(command: ProjectCommand) -> Result<()> {
         }
         ProjectCommand::Layer { command: LayerCommand::Import { name, from, project } } => {
             let p = project::Project::load(&project)?;
-            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", |owner| {
+            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project layer import", &*p.io, |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
             })?;
             let cache = project::cache::Cache::open(&p, &lock)?;
@@ -1570,7 +1573,7 @@ fn edit_project(
     edit: impl FnOnce(&project::Project, &mut project::history::History) -> Result<()>,
 ) -> Result<()> {
     let p = project::Project::load(project)?;
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", |owner| {
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     let (mut history, _) = project::history::History::open(&project::cache::Cache::open(&p, &lock)?)?;
@@ -1698,6 +1701,10 @@ fn made_of(command: &ProjectCommand) -> Result<Option<(vfs::ops::Op, &EditAt)>> 
 }
 
 /// Standard input kept in a file, for what applies a write to read: the file's path.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 fn read_stdin_to_file() -> Result<PathBuf> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
@@ -1709,18 +1716,18 @@ fn read_stdin_to_file() -> Result<PathBuf> {
 
 /// Make an edit of a project: by whoever holds it, or - where nothing does - here, holding it for the while.
 fn edit(op: &vfs::ops::Op, at: &EditAt) -> Result<()> {
-    let root = project::Project::load(&at.project)?.root;
+    let p = project::Project::load(&at.project)?;
     let request = mcp::Request::Edit { op: op.clone(), layer: at.layer.clone() };
-    let reply = mcp::server::execute(&root, &request);
+    let reply = mcp::server::execute(&p.root, &p.io, &request);
     println!("{}", reply.told().map_err(anyhow::Error::msg)?);
     Ok(())
 }
 
 /// `pe2-cli project problems`: asked of whoever holds the project, or read here.
 fn problems(project: &Path) -> Result<()> {
-    let root = project::Project::load(project)?.root;
+    let p = project::Project::load(project)?;
     let request = mcp::Request::Call { name: "problems".into(), arguments: serde_json::Map::new() };
-    let told = mcp::server::execute(&root, &request).told().map_err(anyhow::Error::msg)?;
+    let told = mcp::server::execute(&p.root, &p.io, &request).told().map_err(anyhow::Error::msg)?;
     let told: serde_json::Value = serde_json::from_str(&told)?;
     let listed = |key: &str| told[key].as_array().cloned().unwrap_or_default();
     for problem in listed("problems") {
@@ -1747,7 +1754,7 @@ fn outputs(
 ) -> Result<()> {
     use project::graph::{Content, Value};
     let p = project::Project::load(project)?;
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", |owner| {
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project output", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     let cache = project::cache::Cache::open(&p, &lock)?;
@@ -1809,6 +1816,7 @@ fn outputs(
 }
 
 /// `pe2-cli project store`.
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn store(command: &StoreCommand) -> Result<()> {
     let (StoreCommand::Migrate { project }
     | StoreCommand::Gc { project }
@@ -1816,7 +1824,7 @@ fn store(command: &StoreCommand) -> Result<()> {
     | StoreCommand::Unpack { project, .. }
     | StoreCommand::Convert { project, .. }) = command;
     let p = project::Project::load(project)?;
-    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", |owner| {
+    let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project store", &*p.io, |owner| {
         eprintln!("waiting: the project is in use by {owner}");
     })?;
     // Whole MiB with a tenth: what a person reads of a size.
@@ -1876,7 +1884,7 @@ fn serve_project(
         // The server first, and waited for: what programs wrote a moment ago it gives the project as it ends, and
         // whoever holds the project is there to take it.
         let server = project::server::stop(&p.root);
-        if server && !project::server::ROLE.gone_within(&p.root, std::time::Duration::from_secs(60)) {
+        if server && !project::server::ROLE.gone_within(&p.root, std::time::Duration::from_secs(60), p.io.clock()) {
             eprintln!("what serves {} has not stopped yet", p.root);
         }
         let host = Connection::connect(&p.root).is_some_and(|mut host| host.ask(&ToHost::Stop).is_ok());
@@ -1894,7 +1902,7 @@ fn serve_project(
         }
     }
     args.extend(server::Strays::args(strays));
-    let (mut host, started) = project::host::serving(&p.root, &host::this_program()?, &args)?;
+    let (mut host, started) = project::host::serving(&p.root, &host::this_program()?, &args, p.io.clock())?;
     if !started && (backend.is_some() || address.is_some()) {
         eprintln!("a host keeps it served already, as it is: --backend and --address are for one started");
     }
@@ -2131,7 +2139,7 @@ fn run(cli: Cli) -> Result<()> {
                 list => project::plan::Releases::Only(list.split(',').map(|r| r.trim().to_string()).collect()),
             };
             let p = project::Project::load(&project)?;
-            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", |owner| {
+            let lock = project::lock::Lock::acquire(&p.root, "pe2-cli project extract", &*p.io, |owner| {
                 eprintln!("waiting: the project is in use by {owner}");
             })?;
             if let Some(why) = lock.unprotected() {
@@ -2166,8 +2174,8 @@ fn run(cli: Cli) -> Result<()> {
             project::ext::setup::hash_manifest(&manifest, write)?;
         }
         Tool::Mcp { project } => {
-            let root = project::Project::load(&project)?.root;
-            mcp::server::serve_stdio(root)?;
+            let p = project::Project::load(&project)?;
+            mcp::server::serve_stdio(p.root, p.io)?;
         }
         // What is left of the project's commands serve it, edit it, and say its problems.
         Tool::Project { command } => project_command(&command)?,

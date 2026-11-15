@@ -28,6 +28,8 @@ pub struct Says {
     shared: Result<Arc<sfs::Space>, String>,
     /// What is served now, as last said here: none until all of it was, and after `forget`.
     current: Mutex<Option<Listing>>,
+    /// The project's I/O: what a served file's time is told by.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Says {
@@ -36,7 +38,7 @@ impl Says {
     pub fn of(project: &project::Project) -> Says {
         let shared =
             project::shared::space(&project.root).map_err(|e| format!("the space the project's processes share: {e}"));
-        Says { shared, current: Mutex::default() }
+        Says { shared, current: Mutex::default(), io: project.io.clone() }
     }
 
     fn current(&self) -> std::sync::MutexGuard<'_, Option<Listing>> {
@@ -91,17 +93,21 @@ impl Says {
             (Said::Whole(listing), Some(before)) => {
                 let delta = Delta::between(before, &listing);
                 *before = Arc::unwrap_or_clone(listing);
-                if delta.is_empty() { alone(&mut also) } else { project::shared::say_with(space, &delta, &mut also) }
+                if delta.is_empty() {
+                    alone(&mut also)
+                } else {
+                    project::shared::say_with(space, &delta, &mut also, self.io.clock())
+                }
             }
             (Said::Whole(listing), None) => {
                 let _span = tracing::info_span!("served: said whole in the shared filesystem").entered();
-                let said = project::shared::say_whole_with(space, &listing, &mut also);
+                let said = project::shared::say_whole_with(space, &listing, &mut also, self.io.clock());
                 *current = Some(Arc::unwrap_or_clone(listing));
                 said
             }
             (Said::Changed(delta), Some(before)) => {
                 delta.apply(before);
-                project::shared::say_with(space, &delta, &mut also)
+                project::shared::say_with(space, &delta, &mut also, self.io.clock())
             }
             // Part of nothing: whoever holds the project says all of it first.
             (Said::Changed(_) | Said::Unchanged, _) => alone(&mut also),

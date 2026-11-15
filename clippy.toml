@@ -1,11 +1,35 @@
 # Words the docs use that are names, not code: kept as Clippy's defaults are, with these added.
 doc-valid-idents = ["WebDAV", ".."]
-# A place where the filesystem is implemented is made and joined through sfs::HostPath alone (`crates/sfs`): resolved
+# A place where the filesystem is implemented is made and joined through pe2_io::HostPath alone (`crates/io`): resolved
 # once, plain on every system, and joined of checked names - never text joined onto a path. The crates working with
 # plain paths (what they are given, the program's own folders) allow these, each saying why.
 disallowed-methods = [
-    { path = "std::fs::canonicalize", reason = "a place is resolved by sfs::HostPath::new" },
-    { path = "std::path::Path::canonicalize", reason = "a place is resolved by sfs::HostPath::new" },
-    { path = "std::path::Path::join", reason = "a place within another is sfs::HostPath::join of a Name or a RelPath" },
-    { path = "std::path::PathBuf::push", reason = "a place within another is sfs::HostPath::join of a Name or a RelPath" },
+    { path = "std::fs::canonicalize", reason = "a place is resolved by pe2_io::HostPath::new" },
+    { path = "std::path::Path::canonicalize", reason = "a place is resolved by pe2_io::HostPath::new" },
+    { path = "std::path::Path::join", reason = "a place within another is pe2_io::HostPath::join of a Name or a RelPath" },
+    { path = "std::path::PathBuf::push", reason = "a place within another is pe2_io::HostPath::join of a Name or a RelPath" },
+    # The outside world is read through the Io code is given (`pe2_io`), never reached for: the time, waits for it,
+    # randomness and the environment. What measures and decides nothing (profiling, a pane of timings) and a window's
+    # pacing allow these, each saying why.
+    { path = "std::time::Instant::now", reason = "the time is the Io's (pe2_io::Clock::now)" },
+    { path = "std::time::Instant::elapsed", reason = "how long ago is by the Io's clock (pe2_io::Clock::now)" },
+    { path = "std::time::SystemTime::now", reason = "the time of day is the Io's (pe2_io::Clock::wall)" },
+    { path = "std::time::SystemTime::elapsed", reason = "how long ago is by the Io's clock (pe2_io::Clock::wall)" },
+    { path = "std::thread::sleep", reason = "a wait is by the Io's clock (pe2_io::sleep, a pe2_io::Waiter)" },
+    { path = "std::thread::park_timeout", reason = "a wait is by the Io's clock (a pe2_io::Waiter)" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "a timed wait is by the Io's clock (pe2_io::Signal)" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "a timed wait is by the Io's clock (pe2_io::Signal)" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "a timed receive is by the Io's clock (pe2_io::channel)" },
+    { path = "getrandom::fill", reason = "randomness is the Io's (pe2_io::Random)" },
+    { path = "getrandom::u32", reason = "randomness is the Io's (pe2_io::Random)" },
+    { path = "getrandom::u64", reason = "randomness is the Io's (pe2_io::Random)" },
+    { path = "std::env::var", reason = "the environment is the Io's (pe2_io::Environment::var)" },
+    { path = "std::env::var_os", reason = "the environment is the Io's (pe2_io::Environment::var)" },
+    { path = "std::env::vars", reason = "the environment is the Io's (pe2_io::Environment)" },
+    { path = "std::env::vars_os", reason = "the environment is the Io's (pe2_io::Environment)" },
+    { path = "std::env::args", reason = "the program's arguments are the Io's (pe2_io::Environment::args)" },
+    { path = "std::env::args_os", reason = "the program's arguments are the Io's (pe2_io::Environment::args)" },
+    { path = "std::env::temp_dir", reason = "the temporary folder is the Io's (pe2_io::Environment::temp_dir)" },
+    { path = "std::env::current_dir", reason = "the folder started in is the Io's (pe2_io::Environment::current_dir)" },
+    { path = "std::env::current_exe", reason = "the program is the Io's (pe2_io::Environment::current_exe)" },
 ]

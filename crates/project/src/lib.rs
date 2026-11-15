@@ -461,6 +461,9 @@ pub struct Project {
     /// How this machine serves the project as a filesystem while it is open, at its `assets` folder
     /// (`project.local.toml`).
     pub filesystem: Filesystem,
+    /// The I/O what works on the project reads the outside world through: the system's, but where a test gives
+    /// another (`load_with`).
+    pub io: Arc<dyn pe2_io::Io>,
 }
 
 /// The configs, the properties declared and what is wrong with those.
@@ -641,6 +644,14 @@ impl Project {
     /// # Errors
     /// Its `project.toml` cannot be read or parsed.
     pub fn load(directory: &Path) -> Result<Project> {
+        Project::load_with(directory, pe2_io::system())
+    }
+
+    /// As `load`, what works on it reading the outside world through `io`.
+    ///
+    /// # Errors
+    /// As `load`.
+    pub fn load_with(directory: &Path, io: Arc<dyn pe2_io::Io>) -> Result<Project> {
         let root = HostPath::new(directory).with_context(|| format!("{}", directory.display()))?;
         let path = root.join(&FILE);
         let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
@@ -732,6 +743,7 @@ impl Project {
             property_problems,
             links,
             filesystem,
+            io,
         })
     }
 

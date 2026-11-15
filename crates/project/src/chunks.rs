@@ -295,20 +295,20 @@ impl Store {
         sharded(&self.dir.join(&FILES), &sha1.to_string())
     }
 
-    /// Keep a file whole, by its SHA-1 (given), its chunks shared with every other file holding them.
+    /// Keep a file whole, at `at`, by its SHA-1 (given), its chunks shared with every other file holding them.
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_file(&self, bytes: &[u8]) -> io::Result<Sha1> {
+    pub fn put_file(&self, bytes: &[u8], at: SystemTime) -> io::Result<Sha1> {
         let sha1 = crate::extract::sha1_of(bytes);
         let path = self.file_path(&sha1)?;
         if path.exists() {
             // Kept again: as new to a sweep as one written now, its chunks too.
-            let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(SystemTime::now()));
-            let _ = self.put(bytes)?;
+            let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(at));
+            let _ = self.put(bytes, at)?;
             return Ok(sha1);
         }
-        let manifest = self.put(bytes)?;
+        let manifest = self.put(bytes, at)?;
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
         put_in_place(&path, manifest.render().as_bytes())?;
         Ok(sha1)
@@ -344,27 +344,27 @@ impl Store {
         sharded(&self.dir.join(&TREES), &sha1.to_string())
     }
 
-    /// Write `bytes` at `path` once: where it is there already, it is touched instead (as new to a sweep as one written
-    /// now), as what is named by its hash holds the same.
-    fn write_once(&self, path: &HostPath, bytes: &[u8]) -> io::Result<()> {
+    /// Write `bytes` at `path` once, at `at`: where it is there already, it is touched instead (as new to a sweep as one
+    /// written then), as what is named by its hash holds the same.
+    fn write_once(&self, path: &HostPath, bytes: &[u8], at: SystemTime) -> io::Result<()> {
         if path.exists() {
             // A read-only object is touched through a handle opened to read: its owner may set its times.
             let opened = std::fs::File::options().write(true).open(path).or_else(|_| std::fs::File::open(path));
-            let _ = opened.and_then(|f| f.set_modified(SystemTime::now()));
+            let _ = opened.and_then(|f| f.set_modified(at));
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
         put_in_place(path, bytes)
     }
 
-    /// Keep bytes as one whole object, by their SHA-1 (given).
+    /// Keep bytes as one whole object, at `at`, by their SHA-1 (given).
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_object(&self, bytes: &[u8]) -> io::Result<Sha1> {
+    pub fn put_object(&self, bytes: &[u8], at: SystemTime) -> io::Result<Sha1> {
         let sha1 = crate::extract::sha1_of(bytes);
         let path = self.object_path(&sha1)?;
-        self.write_once(&path, bytes)?;
+        self.write_once(&path, bytes, at)?;
         // Read-only: an object is what its hash says, and what reads it in place must not change it.
         let mut permissions = std::fs::metadata(&path)?.permissions();
         if !permissions.readonly() {
@@ -382,14 +382,14 @@ impl Store {
         std::fs::read(self.object_path(sha1)?)
     }
 
-    /// Keep a tree (its objects kept already), by the SHA-1 of its text (given).
+    /// Keep a tree (its objects kept already), at `at`, by the SHA-1 of its text (given).
     ///
     /// # Errors
     /// It cannot be written.
-    pub fn put_tree(&self, tree: &Tree) -> io::Result<Sha1> {
+    pub fn put_tree(&self, tree: &Tree, at: SystemTime) -> io::Result<Sha1> {
         let text = tree.render();
         let sha1 = crate::extract::sha1_of(text.as_bytes());
-        self.write_once(&self.tree_path(&sha1)?, text.as_bytes())?;
+        self.write_once(&self.tree_path(&sha1)?, text.as_bytes(), at)?;
         Ok(sha1)
     }
 
@@ -401,11 +401,11 @@ impl Store {
         Tree::parse(&std::fs::read_to_string(self.tree_path(sha1)?)?)
     }
 
-    /// Keep a folder's files as a tree of whole objects, by the tree's SHA-1 (given), with the tree.
+    /// Keep a folder's files as a tree of whole objects, at `at`, by the tree's SHA-1 (given), with the tree.
     ///
     /// # Errors
     /// A file cannot be read, or kept.
-    pub fn put_folder(&self, folder: &HostPath) -> io::Result<(pe2_ext::Sha1, Tree)> {
+    pub fn put_folder(&self, folder: &HostPath, at: SystemTime) -> io::Result<(pe2_ext::Sha1, Tree)> {
         fn walk(dir: &HostPath, at: &str, out: &mut Vec<(String, HostPath)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
@@ -431,7 +431,7 @@ impl Store {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let sha1 = self.put_object(&bytes)?;
+            let sha1 = self.put_object(&bytes, at)?;
             // A program is run where it is kept: its object says so, whatever else holds the same bytes.
             #[cfg(unix)]
             if executable {
@@ -440,7 +440,7 @@ impl Store {
             }
             tree.files.insert(name, TreeFile { sha1, size: bytes.len() as u64, executable });
         }
-        Ok((self.put_tree(&tree)?, tree))
+        Ok((self.put_tree(&tree, at)?, tree))
     }
 
     /// Every whole object and tree kept, by SHA-1, with where.
@@ -491,20 +491,19 @@ impl Store {
         std::fs::read(self.path(hash)?)
     }
 
-    /// Store a content's chunks - those not stored already - and give its manifest.
+    /// Store a content's chunks - those not stored already - at `at`, and give its manifest.
     ///
     /// # Errors
     /// A chunk cannot be written.
-    pub fn put(&self, bytes: &[u8]) -> io::Result<Manifest> {
+    pub fn put(&self, bytes: &[u8], at: SystemTime) -> io::Result<Manifest> {
         let mut chunks = Vec::new();
         for cut in fastcdc::v2020::FastCDC::new(bytes, MIN, AVG, MAX) {
             let chunk = &bytes[cut.offset..cut.offset + cut.length];
             let hash = blake3::hash(chunk).to_hex().to_string();
             let path = self.path(&hash)?;
             if path.exists() {
-                // Stored again: as new to a sweep as one written now (`sweep_settled`).
-                let _ =
-                    std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(SystemTime::now()));
+                // Stored again: as new to a sweep as one written then (`sweep_settled`).
+                let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(at));
             } else {
                 std::fs::create_dir_all(path.parent().unwrap_or_else(|| self.dir.clone()))?;
                 put_in_place(&path, chunk)?;
@@ -604,7 +603,7 @@ pub fn migrate(project: &crate::Project, index: &crate::index::Index) -> io::Res
         }
         let Some(store) = Store::of(&path) else { continue };
         let bytes = std::fs::read(&path)?;
-        let manifest = store.put(&bytes)?.render();
+        let manifest = store.put(&bytes, project.io.clock().wall())?.render();
         crate::cache::write_atomic(&manifest_path(&path), manifest.as_bytes()).map_err(io::Error::other)?;
         std::fs::remove_file(&path)?;
         pass.files += 1;
@@ -650,7 +649,8 @@ const SWEPT: &Name = Name::constant("chunks.swept");
 #[must_use = "what was swept is the sweep's report"]
 pub fn sweep_if_due(project: &crate::Project) -> Option<io::Result<(usize, u64)>> {
     let marker = project.root.join(&crate::cache::DIR).join(&SWEPT);
-    let age = std::fs::metadata(&marker).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    let now = project.io.clock().wall();
+    let age = std::fs::metadata(&marker).and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok());
     if age.is_some_and(|age| age < SWEEP_EVERY) {
         return None;
     }
@@ -688,9 +688,10 @@ pub fn sweep_settled(project: &crate::Project, settled: Duration) -> io::Result<
         named.extend(crate::pack::Pack::open(&layer.path)?.chunks());
     }
     let store = Store::at(&project.root);
+    let now = project.io.clock().wall();
     let old = |path: &HostPath| {
         let modified = std::fs::metadata(path).and_then(|m| m.modified());
-        settled.is_zero() || modified.ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= settled)
+        settled.is_zero() || modified.ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age >= settled)
     };
     // A tree named keeps its objects; one nothing names goes, and so does an object neither a tree nor a text names.
     let (mut gone_files, mut freed) = (0, 0);
@@ -746,9 +747,14 @@ fn sha1s_in(text: &[u8]) -> Vec<Sha1> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Manifest, Store};
     use crate::testing::At as _;
+    use std::time::SystemTime;
 
     fn content(len: usize, seed: u32) -> Vec<u8> {
         let mut x = seed;
@@ -767,7 +773,7 @@ mod tests {
         let dir = crate::testing::scratch("chunks");
         let store = Store { dir: dir.clone() };
         let bytes = content(3 << 20, 7);
-        let manifest = store.put(&bytes).expect("stored");
+        let manifest = store.put(&bytes, SystemTime::now()).expect("stored");
         assert_eq!(Manifest::parse(&manifest.render()).expect("parsed"), manifest);
         for (offset, len) in [(0, 10), (12_345, 200_000), (bytes.len() - 5, 100), (1 << 20, 1 << 20)] {
             let end = (offset + len).min(bytes.len());
@@ -777,7 +783,7 @@ mod tests {
         let before = store.hashes().len();
         let mut edited = bytes.clone();
         edited[1_500_000..1_500_010].copy_from_slice(b"0123456789");
-        let again = store.put(&edited).expect("stored");
+        let again = store.put(&edited, SystemTime::now()).expect("stored");
         let new = store.hashes().len() - before;
         assert!(new <= 3, "{new} chunks stored for a ten-byte edit");
         assert_eq!(again.read_range(&store, 0, edited.len()).expect("read"), edited);
@@ -792,7 +798,14 @@ mod tests {
         let bytes = content(1 << 20, 11);
         std::thread::scope(|scope| {
             let putting: Vec<_> = (0..16)
-                .map(|_| scope.spawn(|| (store.put_file(&bytes).map(drop), store.put_object(&bytes).map(drop))))
+                .map(|_| {
+                    scope.spawn(|| {
+                        (
+                            store.put_file(&bytes, SystemTime::now()).map(drop),
+                            store.put_object(&bytes, SystemTime::now()).map(drop),
+                        )
+                    })
+                })
                 .collect();
             for put in putting {
                 let (file, object) = put.join().unwrap();
@@ -836,12 +849,12 @@ mod tests {
         std::fs::create_dir_all(folder.at("docs")).unwrap();
         std::fs::write(folder.at("extension.wasm"), content(300_000, 4)).unwrap();
         std::fs::write(folder.at("docs/a b.md"), "# A\n").unwrap();
-        let (sha1, tree) = store.put_folder(&folder).unwrap();
+        let (sha1, tree) = store.put_folder(&folder, SystemTime::now()).unwrap();
         assert_eq!(super::Tree::parse(&tree.render()).unwrap(), tree);
         assert_eq!(store.get_tree(&sha1).unwrap(), tree);
         assert_eq!(store.get_object(&tree.files["docs/a b.md"].sha1).unwrap(), b"# A\n");
         // Kept again: the same hash, nothing new.
-        assert_eq!(store.put_folder(&folder).unwrap().0, sha1);
+        assert_eq!(store.put_folder(&folder, SystemTime::now()).unwrap().0, sha1);
         // Named in a layer's text, the tree and its objects stay; named by nothing, they go.
         let named = root.join(&crate::LAYERS).at("project").at("named.toml");
         std::fs::write(&named, format!("tree = \"{sha1}\"\n")).unwrap();
@@ -867,13 +880,13 @@ mod tests {
                 file.set_modified(SystemTime::now() - by).unwrap();
             }
         };
-        let old = store.put(&old).unwrap();
+        let old = store.put(&old, SystemTime::now()).unwrap();
         age(&old, Duration::from_hours(2));
-        let fresh = store.put(&fresh).unwrap();
+        let fresh = store.put(&fresh, SystemTime::now()).unwrap();
         // Stored long ago, and stored again now (a write reusing it): new again.
-        let again = store.put(&again).unwrap();
+        let again = store.put(&again, SystemTime::now()).unwrap();
         age(&again, Duration::from_hours(2));
-        let again = store.put(&content(200_000, 3)).unwrap();
+        let again = store.put(&content(200_000, 3), SystemTime::now()).unwrap();
         // Named by no manifest: the old ones alone go.
         let (gone, _) = super::sweep_settled(&project, super::SETTLED).unwrap();
         assert_eq!(gone, old.chunks.len());

@@ -1,15 +1,24 @@
 //! A process that only serves a project's files loads no extension, whatever it is given: in a process of its own,
 //! since what it forbids it forbids for good.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
+
 #[test]
 fn a_process_that_forbids_extensions_loads_none() {
     let place = sfs::HostPath::new(&std::env::temp_dir()).unwrap();
     let origin = || project::ext::Origin::Component(place.join(&pe2_path::Name::constant("an.extension")));
     // Not forbidden, what is no component fails as that.
-    let refused = project::ext::component::load_bytes("an.extension", b"not a component", origin()).err().unwrap();
+    let refused = project::ext::component::load_bytes("an.extension", b"not a component", origin(), pe2_io::system())
+        .err()
+        .unwrap();
     assert!(!format!("{refused:#}").contains("loads no extension"), "{refused:#}");
     project::ext::forbid();
     assert!(project::ext::forbidden());
-    let refused = project::ext::component::load_bytes("an.extension", b"not a component", origin()).err().unwrap();
+    let refused = project::ext::component::load_bytes("an.extension", b"not a component", origin(), pe2_io::system())
+        .err()
+        .unwrap();
     assert!(format!("{refused:#}").contains("an.extension: this process loads no extension"), "{refused:#}");
 }

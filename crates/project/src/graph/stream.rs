@@ -273,6 +273,10 @@ impl pe2_ext::StreamSource for InTurn {
                     let settled =
                         state.failed.is_some() || state.item(at).is_some() || state.end.is_some_and(|end| at >= end);
                     if !settled {
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "a wake missed costs at most this: the time decides nothing"
+                        )]
                         let _ = shared.changed.wait_timeout(state, std::time::Duration::from_millis(50));
                     }
                 }
@@ -360,6 +364,10 @@ fn fill(shared: &Shared, mut producer: Box<dyn Producer>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{AHEAD, BATCH, Poll, Producer, Stream};
     use crate::graph::Value;

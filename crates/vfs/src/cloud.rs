@@ -53,6 +53,8 @@ pub struct Cloud {
     _connection: Connection<Filter>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// What wakes the worker.
+    waiter: Arc<dyn pe2_io::Waiter>,
 }
 
 impl Drop for Cloud {
@@ -60,7 +62,7 @@ impl Drop for Cloud {
         self.stop.store(true, Ordering::Relaxed);
         // Waited for: it gives the project what still waits to settle, while the folder is still connected.
         if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
+            self.waiter.wake();
             let _ = worker.join();
         }
     }
@@ -88,6 +90,7 @@ pub fn serve(
     at: &HostPath,
     staging: &HostPath,
     name: &str,
+    io: &Arc<dyn pe2_io::Io>,
 ) -> io::Result<Cloud> {
     // Windows names the folder plainly - `D:\...` - in what it asks and registers; not as canonicalized (`\\?\D:\...`).
     let at = &at.clone();
@@ -108,16 +111,31 @@ pub fn serve(
         id.register(info).map_err(step("registering it"))?;
     }
     let pending = Arc::new(Mutex::new(Pending::default()));
-    let filter = Filter { served: served.clone(), owner: owner.clone(), root: at.clone(), pending: pending.clone() };
+    let filter = Filter {
+        served: served.clone(),
+        owner: owner.clone(),
+        root: at.clone(),
+        pending: pending.clone(),
+        io: io.clone(),
+    };
     let connection = Session::new().connect(at, filter).map_err(step("connecting to it"))?;
     let stopped = Arc::new(AtomicBool::new(false));
-    let worker = Worker { served: served.clone(), owner, root: at.clone(), staging: staging.clone(), pending };
+    let waiter = io.clock().waiter();
+    let worker = Worker {
+        served: served.clone(),
+        owner,
+        root: at.clone(),
+        staging: staging.clone(),
+        pending,
+        io: io.clone(),
+        waiter: waiter.clone(),
+    };
     let stopping = stopped.clone();
     let worker = std::thread::Builder::new().name("cloud".into()).spawn(move || worker.run(&stopping))?;
     // Woken when the tree changes: the folder is brought in step at once, not when the worker next looks.
-    let waking = worker.thread().clone();
-    served.on_change(move || waking.unpark());
-    Ok(Cloud { _connection: connection, stop: stopped, worker: Some(worker) })
+    let waking = waiter.clone();
+    served.on_change(move || waking.wake());
+    Ok(Cloud { _connection: connection, stop: stopped, worker: Some(worker), waiter })
 }
 
 /// Make the placeholders of what is at a path of the tree, all under it and the folders leading to it, where Windows
@@ -248,6 +266,8 @@ struct Filter {
     owner: Option<Arc<dyn Owner>>,
     root: HostPath,
     pending: Arc<Mutex<Pending>>,
+    /// What a change is noted at, to settle by.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Filter {
@@ -313,7 +333,8 @@ impl SyncFilter for Filter {
     fn deleted(&self, request: Request, _info: info::Deleted) {
         // One named so no path takes it was never taken in: its removal is nothing to the project.
         if let Ok(path) = asked_of(&self.root, &request.path()) {
-            self.pending().removed.insert(path, Instant::now());
+            let now = self.io.clock().now();
+            self.pending().removed.insert(path, now);
         }
     }
 
@@ -353,10 +374,11 @@ impl SyncFilter for Filter {
 
     fn state_changed(&self, event: StateWatchEvent) {
         let StateWatchEvent::Changed(paths) = event else { return };
+        let now = self.io.clock().now();
         let mut pending = self.pending();
         for path in paths {
             match placed(&path) {
-                Ok(path) => drop(pending.changed.insert(path, Instant::now())),
+                Ok(path) => drop(pending.changed.insert(path, now)),
                 Err(why) => eprintln!("{why}: changed, and not taken into the project"),
             }
         }
@@ -427,6 +449,9 @@ struct Worker {
     root: HostPath,
     staging: HostPath,
     pending: Arc<Mutex<Pending>>,
+    /// What tells when a change settled, and what it waits on.
+    io: Arc<dyn pe2_io::Io>,
+    waiter: Arc<dyn pe2_io::Waiter>,
 }
 
 impl Worker {
@@ -436,7 +461,7 @@ impl Worker {
         self.sync(&last, &self.root, RelPath::root());
         while !stop.load(Ordering::Relaxed) {
             // Woken sooner by what stops it.
-            std::thread::park_timeout(Duration::from_millis(250));
+            self.waiter.wait_until(Some(self.io.clock().now() + Duration::from_millis(250)));
             self.settle(false);
             let now = self.served.tree();
             if !Arc::ptr_eq(&last, &now) {
@@ -454,7 +479,8 @@ impl Worker {
         // While nobody takes changes - a tool has the project - what waits goes on waiting, as it is in the folder:
         // given once someone does (asked only where something is due). As serving ends it is tried all the same, and
         // what is not taken stays a file there.
-        let due = |at: &Instant| all || at.elapsed() >= SETTLE;
+        let now = self.io.clock().now();
+        let due = |at: &Instant| all || now.saturating_duration_since(*at) >= SETTLE;
         let any = {
             let pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.removed.values().chain(pending.changed.values()).any(&due)
@@ -505,10 +531,7 @@ impl Worker {
         for path in changed {
             if self.waits_for_its_node(&path) {
                 let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending
-                    .changed
-                    .entry(path)
-                    .or_insert_with(|| Instant::now().checked_sub(SETTLE).unwrap_or_else(Instant::now));
+                pending.changed.entry(path).or_insert_with(|| now.checked_sub(SETTLE).unwrap_or(now));
                 continue;
             }
             if let Err(why) = self.take_in(owner.as_ref(), &path) {
@@ -548,7 +571,7 @@ impl Worker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .changed
-                .insert(path.clone(), Instant::now());
+                .insert(path.clone(), self.io.clock().now());
             return Ok(());
         };
         if state.as_ref().is_some_and(PlaceholderInfo::is_in_sync) {
@@ -675,7 +698,7 @@ impl crate::backend::Backend for AsBackend {
 
     fn mount(&self, job: &crate::backend::Job) -> io::Result<Box<dyn crate::backend::Mount>> {
         let read_only = job.owner.is_none();
-        let cloud = serve(job.served, job.owner.clone(), job.at, job.staging, job.name)?;
+        let cloud = serve(job.served, job.owner.clone(), job.at, job.staging, job.name, &job.io)?;
         Ok(Box::new(Kept { _cloud: cloud, root: job.at.clone(), shown: job.at.clone(), read_only }))
     }
 
@@ -871,7 +894,7 @@ impl crate::backend::Backend for Apart {
         // Said once the folder leads to it: one that says so and is led to by nothing is swept.
         std::fs::write(kept.join(&WHOSE), format!("{}\n{}\n", at.display(), job.name))?;
         let read_only = job.owner.is_none();
-        let cloud = serve(job.served, job.owner.clone(), &tree, job.staging, job.name)?;
+        let cloud = serve(job.served, job.owner.clone(), &tree, job.staging, job.name, &job.io)?;
         Ok(Box::new(Kept { _cloud: cloud, root: tree, shown: at, read_only }))
     }
 

@@ -29,6 +29,8 @@ pub const GITIGNORE: &Name = Name::constant(".gitignore");
 #[derive(Clone)]
 pub struct Cache {
     pub dir: HostPath,
+    /// The project's I/O, for what the cache opens (its history, its storage).
+    pub io: std::sync::Arc<dyn pe2_io::Io>,
     /// What was written again from the log as the cache was opened (`storage::redo`), where anything was: changes
     /// whoever held the project before had said whole and may not have had in its files.
     pub recovered: Option<String>,
@@ -65,7 +67,7 @@ impl Cache {
         }
         // Before anything reads the project's files: they are as the log says they are to be.
         let recovered = crate::storage::redo(&project.root)?;
-        Ok(Cache { dir, recovered })
+        Ok(Cache { dir, io: project.io.clone(), recovered })
     }
 
     /// A file of the cache.
@@ -108,6 +110,10 @@ pub fn write_atomic(path: &HostPath, bytes: &[u8]) -> Result<()> {
 /// Remove a test's project, whatever a history still alive in it is writing behind this moment: tried again
 /// until nothing is put there meanwhile.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 pub(crate) fn remove_all(root: &HostPath) {
     for _ in 0..200 {
         match std::fs::remove_dir_all(root) {

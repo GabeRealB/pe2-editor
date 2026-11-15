@@ -2,6 +2,11 @@
 //! holds is answered by a host started for it - one, which the next command finds, with the history the last one
 //! left; its folder is served by a server of its own, which whoever holds the project feeds, and which serves on
 //! as the project changes hands.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 use sfs::HostPath;
 use sfs::testing::At as _;
 use std::process::Command;
@@ -208,7 +213,7 @@ struct StandIn {
 impl StandIn {
     fn take(root: &HostPath) -> StandIn {
         let p = project::Project::load(root).unwrap();
-        let lock = project::lock::Lock::acquire(root, "a stand-in", |_| {}).unwrap();
+        let lock = project::lock::Lock::acquire(root, "a stand-in", &pe2_io::System, |_| {}).unwrap();
         let cache = project::cache::Cache::open(&p, &lock).unwrap();
         let (history, _) = project::history::History::open(&cache).unwrap();
         let index = project::index::Index::open(&p, &cache).unwrap();
@@ -234,7 +239,7 @@ impl StandIn {
                 _ => mcp::Reply::Declined,
             }
         };
-        let link = mcp::link::Listener::start(root, answer).unwrap();
+        let link = mcp::link::Listener::start(root, pe2_io::system(), answer).unwrap();
         StandIn { _link: link, files, made, _held: held, _lock: lock }
     }
 
@@ -439,7 +444,7 @@ fn what_is_written_while_a_tool_has_the_project_is_taken_in_once_it_is_done() {
     let tried = Tried::new("busy");
     let folder = tried.serve();
     // A tool takes the project, as an extraction does: it answers no edits.
-    let tool = project::lock::Lock::acquire(&tried.project(), "a tool", |_| {}).unwrap();
+    let tool = project::lock::Lock::acquire(&tried.project(), "a tool", &pe2_io::System, |_| {}).unwrap();
     assert_eq!(tried.holder().as_deref(), Some("a tool"));
     // What a program writes meanwhile is kept, shown as written, and is nobody's step yet.
     folder.write("meanwhile.txt", "kept");

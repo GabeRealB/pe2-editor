@@ -1,6 +1,10 @@
 //! Every dialogue read and made again: `cargo run -p pe2-dialogue --example dialogue_identity -- <files.txt> <args.json>
 //! [<out folder>]`. The files are the chunks the arguments name by position - a dialogue's own file stands for a bundle
 //! holding it as resource 0 - and the arguments are `extract_dialogues`'s, as JSON.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "an example run by hand: it reads what its arguments and the machine give"
+)]
 use sfs::testing::At as _;
 
 fn main() {

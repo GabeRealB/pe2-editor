@@ -35,7 +35,7 @@ use project::TreePath;
 use sfs::HostPath;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use project::shared::{GONE, JUNK, NEW, NODE, OF_FILES, SERVER, WAITS};
@@ -61,41 +61,6 @@ pub struct Pace {
 impl Default for Pace {
     fn default() -> Pace {
         Pace { least: Duration::from_millis(10), most: Duration::from_millis(250) }
-    }
-}
-
-/// What the writes read the time from, to say when something is due: the system's, or one that stands until it is
-/// moved (`Clock::standing`), which a test moves to say how much time has passed rather than waiting for it.
-#[derive(Clone, Debug, Default)]
-pub struct Clock(Option<Arc<Mutex<Instant>>>);
-
-impl Clock {
-    /// The system's.
-    #[must_use]
-    pub fn system() -> Clock {
-        Clock(None)
-    }
-
-    /// One that stands at this moment until it is moved.
-    #[must_use]
-    pub fn standing() -> Clock {
-        Clock(Some(Arc::new(Mutex::new(Instant::now()))))
-    }
-
-    /// The time now.
-    #[must_use]
-    pub fn now(&self) -> Instant {
-        match &self.0 {
-            None => Instant::now(),
-            Some(at) => *at.lock().unwrap_or_else(PoisonError::into_inner),
-        }
-    }
-
-    /// Moved on by this much: one that stands, that is; the system's goes by itself.
-    pub fn advance(&self, by: Duration) {
-        if let Some(at) = &self.0 {
-            *at.lock().unwrap_or_else(PoisonError::into_inner) += by;
-        }
     }
 }
 
@@ -163,12 +128,20 @@ impl State {
     /// Something is said due, now.
     fn ask(&mut self, due: u64, asked: Asked) {
         self.asked.insert(due, asked);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "how long what was asked waits, measured for what is shown of it: nothing is decided by it"
+        )]
         self.asked_at.insert(due, Instant::now());
     }
 
     /// What was said due under a number is answered: how long that took is kept.
     fn answered(&mut self, due: u64) -> Option<Asked> {
         if let Some(at) = self.asked_at.remove(&due) {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "how long what was asked waits, measured for what is shown of it: nothing is decided by it"
+            )]
             self.waited.push(u32::try_from(at.elapsed().as_micros()).unwrap_or(u32::MAX));
         }
         self.asked.remove(&due)
@@ -293,8 +266,9 @@ struct Inner {
     state: Mutex<State>,
     /// Held by what says things due and reads what became of them: one at a time.
     settling: Mutex<()>,
-    /// What wakes the thread saying things due before it would wake by itself.
-    wake: Arc<(Mutex<bool>, Condvar)>,
+    /// What the thread saying things due waits on, by the writes' clock: woken where something is due before it
+    /// would look by itself.
+    waiter: Arc<dyn pe2_io::Waiter>,
     /// Held while something is done that is said in the log, and in what is served, in the order it was done - a
     /// file begun, removed, renamed, a folder made, a thing said due: the log and what is due have them as they
     /// happened.
@@ -303,7 +277,8 @@ struct Inner {
     /// appended for it. `NOT` otherwise.
     replaying: std::sync::atomic::AtomicU64,
     pace: Pace,
-    clock: Clock,
+    /// What tells the time, which says when each thing is due.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 /// No record is being done again: what is done is appended to the log.
@@ -324,8 +299,9 @@ fn tree(path: &RelPath) -> Arc<TreePath> {
     TreePath::within(path).to_owned()
 }
 
-fn nanos_now() -> u64 {
-    let since = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+/// A time of day, as a node of what is served keeps it.
+fn nanos_of(time: SystemTime) -> u64 {
+    let since = time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -356,10 +332,10 @@ impl Writes {
     /// # Errors
     /// The folder or its log cannot be made, or the tree served is no view of a shared filesystem.
     pub fn new(served: &Served, owner: Arc<dyn Owner>, dir: &HostPath) -> io::Result<Writes> {
-        Writes::with(served, owner, dir, sfs::log::Config::default(), Pace::default(), Clock::system())
+        Writes::with(served, owner, dir, sfs::log::Config::default(), Pace::default(), pe2_io::system())
     }
 
-    /// As `new`, the log laid out, new files paced as said, and when what is due is read from this clock.
+    /// As `new`, the log laid out, new files paced as said, and the time - when each thing is due - read from `io`.
     ///
     /// # Errors
     /// The folder or its log cannot be made, or the tree served is no view of a shared filesystem.
@@ -369,7 +345,7 @@ impl Writes {
         dir: &HostPath,
         log: sfs::log::Config,
         pace: Pace,
-        clock: Clock,
+        io: Arc<dyn pe2_io::Io>,
     ) -> io::Result<Writes> {
         let Some(space) = served.space() else {
             return Err(io::Error::other("what is written through is a view of the shared filesystem"));
@@ -383,7 +359,7 @@ impl Writes {
             let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         }
         let log = sfs::Log::shared(&dir.join(&LOG), log)?;
-        let wake: Arc<(Mutex<bool>, Condvar)> = Arc::default();
+        let waiter = io.clock().waiter();
         let writes = Writes(Arc::new(Inner {
             served: served.clone(),
             space,
@@ -394,11 +370,11 @@ impl Writes {
             pins: Arc::default(),
             state: Mutex::default(),
             settling: Mutex::default(),
-            wake: wake.clone(),
+            waiter: waiter.clone(),
             ordering: Mutex::default(),
             replaying: std::sync::atomic::AtomicU64::new(NOT),
             pace,
-            clock,
+            io,
         }));
         // What a serving before this one left in what is served - made there and never the project's, removed
         // there, moved there - goes: what it left in transit is taken up from the log, which does it again.
@@ -408,17 +384,16 @@ impl Writes {
         // something is due before it would look, asleep until the next is.
         let weak = Arc::downgrade(&writes.0);
         // The tree served changed: what became of what was due may be said.
-        let woken = Arc::downgrade(&wake);
+        let woken = Arc::downgrade(&waiter);
         served.on_change(move || {
-            if let Some(wake) = woken.upgrade() {
-                *wake.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-                wake.1.notify_all();
+            if let Some(waiter) = woken.upgrade() {
+                waiter.wake();
             }
         });
         let _ = std::thread::Builder::new().name("filesystem writes".into()).spawn(move || {
             loop {
                 // Until the next of what waits is due - said, for whoever makes something due before to wake this.
-                let sleep = {
+                let wakes = {
                     let Some(inner) = weak.upgrade() else { return };
                     let writes = Writes(inner);
                     let mut state = writes.lock();
@@ -426,14 +401,10 @@ impl Writes {
                     let next = Writes::next_due(&state);
                     let sleep = next.map_or(IDLE, |due| due.saturating_duration_since(now)).min(IDLE);
                     state.wakes = Some(now + sleep);
-                    sleep
+                    (!sleep.is_zero()).then_some(now + sleep)
                 };
-                {
-                    let mut woken = wake.0.lock().unwrap_or_else(PoisonError::into_inner);
-                    if !*woken && !sleep.is_zero() {
-                        woken = wake.1.wait_timeout(woken, sleep).unwrap_or_else(PoisonError::into_inner).0;
-                    }
-                    *woken = false;
+                if let Some(wakes) = wakes {
+                    waiter.wait_until(Some(wakes));
                 }
                 let Some(inner) = weak.upgrade() else { return };
                 Writes(inner).settle();
@@ -462,12 +433,11 @@ impl Writes {
 
     /// The time now, by the writes' clock.
     fn now(&self) -> Instant {
-        self.0.clock.now()
+        self.0.io.clock().now()
     }
 
     fn wake_now(&self) {
-        *self.0.wake.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        self.0.wake.1.notify_all();
+        self.0.waiter.wake();
     }
 
     /// A new file changed: it is the project's once its burst of changes has ended - the pause since this change
@@ -532,7 +502,7 @@ impl Writes {
     /// Make a node of what is served that is not the project's, at a path whose folder is there: its number.
     fn make(&self, path: &RelPath, folder: bool, flags: u32) -> io::Result<u64> {
         let mut txn = self.0.space.write()?;
-        let number = Self::make_in(&mut txn, path, folder, flags)?;
+        let number = self.make_in(&mut txn, path, folder, flags)?;
         txn.commit()?;
         Ok(number)
     }
@@ -547,7 +517,7 @@ impl Writes {
         above.reverse();
         for folder in above {
             if found(&txn, folder).is_none() {
-                Self::make_in(&mut txn, folder, true, 0)?;
+                self.make_in(&mut txn, folder, true, 0)?;
                 made = true;
             }
         }
@@ -557,13 +527,13 @@ impl Writes {
         Ok(())
     }
 
-    fn make_in(txn: &mut sfs::space::Txn<'_>, path: &RelPath, folder: bool, flags: u32) -> io::Result<u64> {
+    fn make_in(&self, txn: &mut sfs::space::Txn<'_>, path: &RelPath, folder: bool, flags: u32) -> io::Result<u64> {
         let above = there(txn, parent(path)).filter(|(_, node)| node.folder).map(|(number, _)| number);
         let above = above.ok_or_else(not_found)?;
         let node = fs::Node {
             folder,
             flags: NEW | flags,
-            modified: nanos_now(),
+            modified: nanos_of(self.0.io.clock().wall()),
             parent: above,
             name: Some(name(path)?.to_owned()),
             ..fs::Node::default()
@@ -577,9 +547,12 @@ impl Writes {
         let content = if is_junk(path) {
             let mut state = self.lock();
             state.next += 1;
-            sfs::Content::in_memory(state.next)
+            sfs::Content::in_memory(state.next, self.0.io.clock().wall())
         } else {
-            sfs::Content::logged(self.record(&sfs::Op::Began { path: path.to_owned(), emptied })?)
+            sfs::Content::logged(
+                self.record(&sfs::Op::Began { path: path.to_owned(), emptied })?,
+                self.0.io.clock().wall(),
+            )
         };
         let content = Arc::new(RwLock::new(content));
         self.0.contents.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::downgrade(&content));
@@ -855,7 +828,7 @@ impl Writes {
                 if content.is_logged() {
                     self.record(&sfs::Op::Truncated { file: content.id(), len: 0 })?;
                 }
-                content.truncate(0);
+                content.truncate(0, self.0.io.clock().wall());
             }
             return Ok(content);
         }
@@ -870,7 +843,7 @@ impl Writes {
                     if bytes.is_empty() {
                         break;
                     }
-                    filled.fill(&self.0.log, at, &bytes)?;
+                    filled.fill(&self.0.log, at, &bytes, self.0.io.clock().wall())?;
                     at += bytes.len() as u64;
                 }
             }
@@ -1001,7 +974,7 @@ impl Writes {
         };
         // The log first, then the file's ranges: both under the file's own lock, so that two writes to one file
         // are in the file in the order they are in the log.
-        writing(&content).write(&self.0.log, offset, data)?;
+        writing(&content).write(&self.0.log, offset, data, self.0.io.clock().wall())?;
         Ok(data.len())
     }
 
@@ -1020,7 +993,7 @@ impl Writes {
         if content.is_logged() {
             self.record(&sfs::Op::Truncated { file: content.id(), len })?;
         }
-        content.truncate(len);
+        content.truncate(len, self.0.io.clock().wall());
         Ok(())
     }
 
@@ -1158,7 +1131,7 @@ impl Writes {
             return self.make(path, true, if junk { JUNK } else { WAITS }).map(drop);
         }
         let mut txn = self.0.space.write()?;
-        let number = Self::make_in(&mut txn, path, true, 0)?;
+        let number = self.make_in(&mut txn, path, true, 0)?;
         let due = crate::due::put_in(&mut txn, &Op::Folder { path: tree(path) }, None)?;
         txn.commit()?;
         self.lock().ask(due, Asked::Folder { number, said });
@@ -1935,7 +1908,7 @@ impl Writes {
                 }
                 sfs::Op::Truncated { file, len } => {
                     let Some((_, content)) = files.get(&file) else { continue };
-                    writing(content).truncate(len);
+                    writing(content).truncate(len, self.0.io.clock().wall());
                     // What ends a file begun again further on: it is whole, and as its changes said it was.
                     if let Some((_, before)) = moving.remove(&file) {
                         dirty(self, &files, file, before.dirty);
@@ -2068,6 +2041,10 @@ impl Writes {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::Writes;
     use crate::Served;
@@ -2090,13 +2067,27 @@ mod tests {
     }
 
     /// Writes whose clock stands until the test moves it (`passes`), new files paced so: nothing is due by itself.
-    fn standing(served: &Served, owner: Arc<Holder>, dir: &HostPath, pace: super::Pace) -> Writes {
-        Writes::with(served, owner, dir, sfs::log::Config::default(), pace, super::Clock::standing()).unwrap()
+    struct Timed {
+        writes: Writes,
+        clock: pe2_io::Standing,
+    }
+
+    impl std::ops::Deref for Timed {
+        type Target = Writes;
+        fn deref(&self) -> &Writes {
+            &self.writes
+        }
+    }
+
+    fn standing(served: &Served, owner: Arc<Holder>, dir: &HostPath, pace: super::Pace) -> Timed {
+        let clock = pe2_io::Standing::new();
+        let io = Arc::new(pe2_io::Composed { clock: Arc::new(clock.clone()), ..pe2_io::Composed::system() });
+        Timed { writes: Writes::with(served, owner, dir, sfs::log::Config::default(), pace, io).unwrap(), clock }
     }
 
     /// Time passes: what it brings due is said, and taken as the owner takes things, before this returns.
-    fn passes(writes: &Writes, by: Duration) {
-        writes.0.clock.advance(by);
+    fn passes(writes: &Timed, by: Duration) {
+        writes.clock.advance(by);
         writes.settle();
     }
 
@@ -2175,7 +2166,7 @@ mod tests {
                     above(&mut listing, &t(path));
                     listing.insert(t(path), holder.file(text.as_bytes()));
                 }
-                project::shared::say_whole(&holder.space, &listing).unwrap();
+                project::shared::say_whole(&holder.space, &listing, &pe2_io::SystemClock).unwrap();
             }
             Arc::new(holder)
         }
@@ -2301,7 +2292,13 @@ mod tests {
                 answers.push((number, Err(why)));
             }
             let delta = Delta::between(&before, &listing);
-            project::shared::say_with(&self.space, &delta, &mut |txn| Ok(crate::due::answer(txn, &answers)?)).unwrap();
+            project::shared::say_with(
+                &self.space,
+                &delta,
+                &mut |txn| Ok(crate::due::answer(txn, &answers)?),
+                &pe2_io::SystemClock,
+            )
+            .unwrap();
             self.served.told(crate::Changes::of(&before, &delta, &listing));
             self.batches.lock().unwrap().push(took);
             Ok(())
@@ -2357,7 +2354,7 @@ mod tests {
         let owner = Holder::new(&dir, &[], Takes::Nothing);
         let served = owner.served.clone();
         let log = sfs::log::Config { segment: 64 << 10, budget: 1 << 20 };
-        let writes = Writes::with(&served, owner, &dir, log, super::Pace::default(), super::Clock::system()).unwrap();
+        let writes = Writes::with(&served, owner, &dir, log, super::Pace::default(), pe2_io::system()).unwrap();
         let waits = writes.create(p("waits.txt")).unwrap();
         writes.write(waits, 0, b"written first, and kept").unwrap();
         writes.close(waits, true).unwrap();

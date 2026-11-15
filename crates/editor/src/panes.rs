@@ -2451,6 +2451,7 @@ impl SettingsPage {
 /// chosen one's form on the right.
 /// What serves projects as filesystems on this machine: the project's folder, and the files programs are given - each
 /// the best suited, a backend that can do it (one not available here said why), or nothing.
+#[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
 fn served_by_ui(ui: &mut egui::Ui, says: &mut crate::settings::Filesystem, project: Option<&HostPath>) {
     use vfs::backend::{Can, Setting, all, choose};
     // Whether a backend is available is asked of a folder: the project's, or any where none is open.
@@ -2677,6 +2678,7 @@ const PAGES: [SettingsPage; 11] = [
     SettingsPage::ProjectConfigurations,
 ];
 
+#[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
 fn display_server_ui(ui: &mut egui::Ui, chosen: &mut crate::settings::DisplayServer) {
     theme::section(ui, "Display server", |ui| {
         ui.horizontal(|ui| {

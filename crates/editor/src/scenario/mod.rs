@@ -5,6 +5,11 @@
 //!
 //! Work goes on off the window's thread, so that a harness with no repaint to make has not finished: `settle` waits until
 //! the editor says it has nothing going on.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "scenarios are tests run against the window: their fixtures and their waits are the machine's, which nothing tested reads"
+)]
 use sfs::testing::At as _;
 use std::sync::Arc;
 

@@ -92,13 +92,13 @@ impl Drop for Unpacked {
 /// # Errors
 /// It cannot be read, is no extension's archive, names a place outside its folder, its manifest is not its
 /// component's, or it cannot be written.
-pub fn unpack(file: &std::path::Path) -> Result<Unpacked> {
+pub fn unpack(file: &std::path::Path, environment: &dyn pe2_io::Environment) -> Result<Unpacked> {
     static UNPACKED: AtomicUsize = AtomicUsize::new(0);
     let bytes = std::fs::read(file).with_context(|| file.display().to_string())?;
     let archive = open(&bytes)?;
     let top = top(&archive)?;
     let n = UNPACKED.fetch_add(1, Ordering::Relaxed);
-    let temporary = HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?;
+    let temporary = environment.temp_dir().context("the system's folder of temporary files")?;
     let place = temporary.join(&pe2_path::Name::new(&format!("pe2-unpacked-{}-{n}", std::process::id()))?);
     let _ = std::fs::remove_dir_all(&place);
     let unpacked = Unpacked { folder: place.join(&pe2_path::Name::new(&top)?), place };
@@ -130,6 +130,10 @@ pub fn unpack(file: &std::path::Path) -> Result<Unpacked> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{id_of, read, unpack};
     use codecs::zip::{Entry, write};
@@ -151,7 +155,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let refused = |name: &str, entries: &[(&str, &[u8], u32)]| {
             let file = archive(&dir, name, entries);
-            format!("{:#}", unpack(&file).err().expect("refused"))
+            format!("{:#}", unpack(&file, &pe2_io::SystemEnvironment).err().expect("refused"))
         };
         let outside = refused("a-0.1.0.extension.zip", &[("a.extension/../../escaped", b"x", 0)]);
         assert!(outside.contains("not a place within the archive"), "{outside}");
@@ -187,7 +191,7 @@ mod tests {
         );
         let (about, component) = read(&file).unwrap();
         assert_eq!((about.id.as_str(), component.as_slice()), ("pe2.events", bytes));
-        let unpacked = unpack(&file).unwrap();
+        let unpacked = unpack(&file, &pe2_io::SystemEnvironment).unwrap();
         assert!(unpacked.folder.ends_with("pe2.events.extension"));
         #[cfg(unix)]
         {

@@ -3,6 +3,10 @@
 //! its first bank, or its records where it has none.
 //!
 //! `cargo run --release -p pe2-model --example clip_identity -- <a folder of clips>`
+#![allow(
+    clippy::disallowed_methods,
+    reason = "an example run by hand: it reads what its arguments and the machine give"
+)]
 
 use std::path::{Path, PathBuf};
 

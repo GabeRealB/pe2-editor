@@ -853,6 +853,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-io",
  "pe2-path",
  "png",
  "project",
@@ -1518,6 +1519,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-io",
  "pe2-path",
  "pe2-webgpu",
  "png",
@@ -1896,6 +1898,7 @@ dependencies = [
  "pe2-game",
  "pe2-graph",
  "pe2-images",
+ "pe2-io",
  "pe2-movies",
  "pe2-packages",
  "pe2-path",
@@ -2490,6 +2493,7 @@ dependencies = [
  "mcp",
  "notify",
  "pe2-ext",
+ "pe2-io",
  "pe2-path",
  "project",
  "sfs",
@@ -3184,6 +3188,7 @@ dependencies = [
  "extensions",
  "interprocess",
  "pe2-ext",
+ "pe2-io",
  "pe2-path",
  "project",
  "rmcp",
@@ -4126,6 +4131,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe2-io"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "pe2-path",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pe2-manifest"
 version = "0.1.0"
 dependencies = [
@@ -4521,16 +4536,17 @@ dependencies = [
  "codecs",
  "fastcdc",
  "formats",
- "getrandom 0.3.4",
  "interprocess",
  "memmap2",
  "pe2-ext",
+ "pe2-io",
  "pe2-manifest",
  "pe2-path",
  "pe2-setup",
  "pe2-value",
  "png",
  "pollster 0.4.0",
+ "rand_core",
  "serde",
  "serde_json",
  "sfs",
@@ -5114,6 +5130,7 @@ dependencies = [
  "crc32fast",
  "libc",
  "memmap2",
+ "pe2-io",
  "pe2-path",
  "serde",
  "serde_json",
@@ -5928,6 +5945,7 @@ dependencies = [
  "libc",
  "libloading",
  "nt-time",
+ "pe2-io",
  "pe2-path",
  "project",
  "serde",

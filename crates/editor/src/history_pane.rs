@@ -318,6 +318,10 @@ fn short(value: &toml::Value) -> String {
 }
 
 /// How long ago a time was (milliseconds since the epoch), briefly.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+)]
 fn ago(at: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let seconds = u64::try_from(now.saturating_sub(u128::from(at)) / 1000).unwrap_or(u64::MAX);

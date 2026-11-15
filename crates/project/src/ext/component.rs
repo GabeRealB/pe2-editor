@@ -115,6 +115,10 @@ fn tick(engine: &Engine) {
                 if let Ok(mut engines) = engines.lock() {
                     engines.retain(|weak| weak.upgrade().inspect(Engine::increment_epoch).is_some());
                 }
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "what ends a call that would never end: the machine's time, the same for every engine; no call computes by it"
+                )]
                 std::thread::sleep(TICK);
             }
         });
@@ -123,6 +127,70 @@ fn tick(engine: &Engine) {
 
 /// A clock that never moves: an extension's output may not depend on time.
 struct Still;
+
+/// The host's clock, as WASI tells it: the time of day, and nanoseconds since the instance began.
+struct Told {
+    io: Arc<dyn pe2_io::Io>,
+    began: std::time::Instant,
+}
+
+impl HostWallClock for Told {
+    fn resolution(&self) -> Duration {
+        Duration::from_nanos(1)
+    }
+
+    fn now(&self) -> Duration {
+        self.io.clock().wall().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default()
+    }
+}
+
+impl HostMonotonicClock for Told {
+    fn resolution(&self) -> u64 {
+        1
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.io.clock().now().saturating_duration_since(self.began).as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Randomness as WASI draws it: the host's (unsandboxed), or of a seed every instance starts from (sandboxed: the same
+/// inputs make the same output).
+enum Drawn {
+    Host(Arc<dyn pe2_io::Io>),
+    Seeded(pe2_io::Seeded),
+}
+
+/// The seed a sandboxed instance draws from.
+const SEED: u64 = 0x7065_3265_6469_746f;
+
+impl Drawn {
+    fn random(&self) -> &dyn pe2_io::Random {
+        match self {
+            Drawn::Host(io) => io.random(),
+            Drawn::Seeded(seeded) => seeded,
+        }
+    }
+}
+
+impl rand_core::TryRng for Drawn {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut bytes = [0; 4];
+        self.random().fill(&mut bytes);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.random().u64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.random().fill(dst);
+        Ok(())
+    }
+}
 
 impl HostWallClock for Still {
     fn resolution(&self) -> Duration {
@@ -301,6 +369,8 @@ pub struct State {
     settings: Arc<str>,
     /// What it is outside the sandbox, where it is: it alone launches programs.
     unsandboxed: Option<Arc<Unsandboxed>>,
+    /// The host's I/O.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl WasiView for State {
@@ -1038,7 +1108,7 @@ impl State {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name =
             format!("pe2-{}-{}-{n}", self.id.replace(|c: char| !c.is_ascii_alphanumeric(), "-"), std::process::id());
-        let place = HostPath::new(&std::env::temp_dir())?.join(pe2_path::Name::new(&name)?);
+        let place = self.io.environment().temp_dir()?.join(pe2_path::Name::new(&name)?);
         Ok(self.table.push(GivenPath(place))?)
     }
 }
@@ -1807,6 +1877,8 @@ pub struct Shared {
     settings: Arc<str>,
     /// What it is outside the sandbox, where it is.
     unsandboxed: Option<Arc<Unsandboxed>>,
+    /// The host's I/O, which its instances are given.
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl Shared {
@@ -1834,8 +1906,20 @@ impl Shared {
         let mut wasi = WasiCtx::builder();
         wasi.stderr(stderr.clone());
         if self.unsandboxed.is_some() {
-            // It sees the system as a program does.
-            wasi.inherit_env().inherit_network().allow_blocking_current_thread(true);
+            // It sees the system as a program does: the host's clocks, randomness and environment - WASI's is text, so a
+            // variable that is none is not given.
+            let io = &self.io;
+            wasi.wall_clock(Told { io: io.clone(), began: io.clock().now() })
+                .monotonic_clock(Told { io: io.clone(), began: io.clock().now() })
+                .secure_random(Drawn::Host(io.clone()))
+                .insecure_random(Drawn::Host(io.clone()))
+                .insecure_random_seed(u128::from(io.random().u64()) << 64 | u128::from(io.random().u64()));
+            for (name, value) in io.environment().vars() {
+                if let (Some(name), Some(value)) = (name.to_str(), value.to_str()) {
+                    wasi.env(name, value);
+                }
+            }
+            wasi.inherit_network().allow_blocking_current_thread(true);
             if cfg!(windows) {
                 // Each drive a root of its own (`/D:`): what the host's paths are told as (`guest_path`).
                 for letter in 'A'..='Z' {
@@ -1848,7 +1932,11 @@ impl Shared {
                 wasi.preopened_dir("/", "/", wasmtime_wasi::FsPerms::ReadWrite)?;
             }
         } else {
-            wasi.wall_clock(Still).monotonic_clock(Still);
+            wasi.wall_clock(Still)
+                .monotonic_clock(Still)
+                .secure_random(Drawn::Seeded(pe2_io::Seeded::new(SEED)))
+                .insecure_random(Drawn::Seeded(pe2_io::Seeded::new(SEED)))
+                .insecure_random_seed(u128::from(SEED));
         }
         let wasi = wasi.build();
         let meter = Arc::new(Meter::default());
@@ -1866,6 +1954,7 @@ impl Shared {
             found: vec![],
             settings: self.settings.clone(),
             unsandboxed: self.unsandboxed.clone(),
+            io: self.io.clone(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -2974,11 +3063,11 @@ fn content_from_wit(content: types::Content, what: &str, table: &mut ResourceTab
 }
 
 /// Where compiled components are kept: the user's cache (`PE2_CACHE`, else the platform's), shared by every project.
-fn compiled_dir() -> Option<HostPath> {
+fn compiled_dir(environment: &dyn pe2_io::Environment) -> Option<HostPath> {
     const COMPILED: &pe2_path::Name = pe2_path::Name::constant("compiled");
     const EDITOR: &pe2_path::Name = pe2_path::Name::constant("pe2-editor");
     // A folder the environment names, as the system names it.
-    let place = |var: &str| std::env::var_os(var).and_then(|dir| HostPath::new(std::path::Path::new(&dir)).ok());
+    let place = |var: &str| environment.var(var).and_then(|dir| HostPath::new(std::path::Path::new(&dir)).ok());
     if let Some(dir) = place("PE2_CACHE") {
         return Some(dir.join(&COMPILED));
     }
@@ -2994,14 +3083,15 @@ fn compiled_dir() -> Option<HostPath> {
 
 /// Remove compiled components not written for 30 days: those of extensions since rebuilt, mostly; one still used is
 /// compiled again.
-fn sweep(dir: &HostPath) {
+fn sweep(dir: &HostPath, clock: &dyn pe2_io::Clock) {
     const KEPT: Duration = Duration::from_hours(30 * 24);
+    let now = clock.wall();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| t.elapsed().ok())
+            .and_then(|t| now.duration_since(t).ok())
             .is_some_and(|age| age > KEPT);
         if old && std::path::Path::new(&entry.file_name()).extension().is_some_and(|e| e == "cwasm") {
             let _ = std::fs::remove_file(dir.entry(&entry.file_name()));
@@ -3011,13 +3101,15 @@ fn sweep(dir: &HostPath) {
 
 /// A component compiled: read back from the cache, or compiled and kept. A kept file starts with the SHA-1 of the
 /// rest, checked before wasmtime is trusted with it.
-fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
+fn compile(engine: &Engine, bytes: &[u8], io: &dyn pe2_io::Io) -> Result<Component> {
     use sha1::{Digest, Sha1};
     use std::hash::{Hash, Hasher};
     let mut settings = std::hash::DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut settings);
     let key = format!("{}-{:016x}", crate::extract::sha1_hex(bytes), settings.finish());
-    let file = compiled_dir().zip(pe2_path::Name::new(&format!("{key}.cwasm")).ok()).map(|(dir, name)| dir.join(&name));
+    let file = compiled_dir(io.environment())
+        .zip(pe2_path::Name::new(&format!("{key}.cwasm")).ok())
+        .map(|(dir, name)| dir.join(&name));
     if let Some(kept) = file.as_ref().and_then(|f| std::fs::read(f).ok())
         && let Some((digest, code)) = kept.split_at_checked(20)
         && Sha1::digest(code).as_slice() == digest
@@ -3038,7 +3130,7 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
         kept.extend_from_slice(&code);
         if let Some(dir) = file.parent() {
             let _ = std::fs::create_dir_all(&dir);
-            sweep(&dir);
+            sweep(&dir, io.clock());
         }
         let _ = crate::cache::write_atomic(&file, &kept);
     }
@@ -3049,9 +3141,9 @@ fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component> {
 ///
 /// # Errors
 /// It cannot be read, compiled or instantiated, or its registration fails.
-pub fn load(path: &HostPath) -> Result<Loadable> {
+pub fn load(path: &HostPath, io: Arc<dyn pe2_io::Io>) -> Result<Loadable> {
     let bytes = crate::content::read(path).with_context(|| path.display().to_string())?;
-    load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.clone()))
+    load_bytes(&path.display().to_string(), &bytes, Origin::Component(path.clone()), io)
 }
 
 /// Who a component is, as `extension!` writes it into the section the host reads without running it
@@ -3204,8 +3296,8 @@ pub fn runs(contract: &str) -> std::result::Result<(), String> {
 ///
 /// # Errors
 /// One without the section cannot be compiled or instantiated, or its registration fails.
-pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin) -> Result<Loadable> {
-    load_with(name, bytes, origin, None)
+pub fn load_bytes(name: &str, bytes: &[u8], origin: Origin, io: Arc<dyn pe2_io::Io>) -> Result<Loadable> {
+    load_with(name, bytes, origin, None, io)
 }
 
 /// What an unsandboxed extension is, beyond its component.
@@ -3373,11 +3465,23 @@ pub fn load_manifest(about: About, origin: Origin, unsandboxed: Option<Arc<Unsan
 ///
 /// # Errors
 /// As `load_bytes`.
-pub fn load_unsandboxed(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Arc<Unsandboxed>) -> Result<Loadable> {
-    load_with(name, bytes, origin, Some(unsandboxed))
+pub fn load_unsandboxed(
+    name: &str,
+    bytes: &[u8],
+    origin: Origin,
+    unsandboxed: Arc<Unsandboxed>,
+    io: Arc<dyn pe2_io::Io>,
+) -> Result<Loadable> {
+    load_with(name, bytes, origin, Some(unsandboxed), io)
 }
 
-fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<Unsandboxed>>) -> Result<Loadable> {
+fn load_with(
+    name: &str,
+    bytes: &[u8],
+    origin: Origin,
+    unsandboxed: Option<Arc<Unsandboxed>>,
+    io: Arc<dyn pe2_io::Io>,
+) -> Result<Loadable> {
     anyhow::ensure!(!super::forbidden(), "{name}: this process loads no extension (it only serves files)");
     let _span = tracing::info_span!("component loaded", name = %name).entered();
     let trust = unsandboxed.as_ref().map(|u| u.trust.clone());
@@ -3401,7 +3505,7 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
             origin,
             register: Some(Box::new(move |registry| {
                 let settings = Value::Table(registry.stored().clone()).to_string();
-                let (shared, told, registration) = start(&name, &bytes, &settings, unsandboxed.clone())?;
+                let (shared, told, registration) = start(&name, &bytes, &settings, unsandboxed.clone(), io.clone())?;
                 // What counts as it is for the section alone: it is read to know the extension, before it runs.
                 let told = About {
                     setup: said.setup.clone(),
@@ -3425,7 +3529,7 @@ fn load_with(name: &str, bytes: &[u8], origin: Origin, unsandboxed: Option<Arc<U
         });
     }
     // Without its section it is asked who it is now, before the host knows its settings: it registers with none kept.
-    let (shared, about, registration) = start(name, bytes, "{}", unsandboxed)?;
+    let (shared, about, registration) = start(name, bytes, "{}", unsandboxed, io)?;
     let shared = cell.get_or_init(|| shared).clone();
     Ok(Loadable {
         id: about.id,
@@ -3465,9 +3569,10 @@ fn start(
     bytes: &[u8],
     settings: &str,
     unsandboxed: Option<Arc<Unsandboxed>>,
+    io: Arc<dyn pe2_io::Io>,
 ) -> Result<(Arc<Shared>, About, g::Registration)> {
     let engine = new_engine()?;
-    let component = compile(&engine, bytes).with_context(|| name.to_string())?;
+    let component = compile(&engine, bytes, &*io).with_context(|| name.to_string())?;
     let mut linker = Linker::<State>::new(&engine);
     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     bindings::Linked::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
@@ -3490,6 +3595,7 @@ fn start(
         peak: AtomicUsize::new(0),
         settings: settings.into(),
         unsandboxed,
+        io,
     };
     let mut runner = shared.instantiate(MEMORY)?;
     let told = runner.call(LONG, async |accessor, guest| guest.call_describe(accessor).await)?;

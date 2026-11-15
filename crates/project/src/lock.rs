@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use pe2_path::Name;
 use sfs::HostPath;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cache::DIR;
 
@@ -37,9 +37,9 @@ pub struct Lock {
 }
 
 /// Whether a parent process holds the project in `root` for this one.
-pub(crate) fn inherited(root: &HostPath) -> bool {
+pub(crate) fn inherited(root: &HostPath, environment: &dyn pe2_io::Environment) -> bool {
     // The place the environment names, as the system names it.
-    let held = std::env::var_os(HELD).and_then(|held| HostPath::new(std::path::Path::new(&held)).ok());
+    let held = environment.var(HELD).and_then(|held| HostPath::new(std::path::Path::new(&held)).ok());
     held.is_some_and(|held| held == *root)
 }
 
@@ -141,7 +141,7 @@ impl Lock {
     }
 
     /// Lock the project in `root` for `who` - borrowed from the host, where one holds it - or say who holds
-    /// it.
+    /// it. What a parent process lends is not looked at here: `acquire` and `acquire_within` do.
     ///
     /// # Errors
     /// Another process holds the project, or the lock file cannot be made.
@@ -149,18 +149,24 @@ impl Lock {
         Lock::try_lock(root, who, true)
     }
 
-    /// Lock the project in `root` for `who`, borrowing it from nobody: the host's own taking.
+    /// Lock the project in `root` for `who`, borrowing it from nobody: the host's own taking - or what the process
+    /// that started this one lends it (`io`'s environment).
     ///
     /// # Errors
     /// As `try_acquire`.
-    pub fn try_take(root: &HostPath, who: &str) -> Result<Lock, LockError> {
+    pub fn try_take(root: &HostPath, who: &str, io: &dyn pe2_io::Io) -> Result<Lock, LockError> {
+        if inherited(root, io.environment()) {
+            return Ok(Lock::lent());
+        }
         Lock::try_lock(root, who, false)
     }
 
+    /// The lock a parent process lends: held by it, nothing to let go of here.
+    fn lent() -> Lock {
+        Lock { file: None, unprotected: None, _borrowed: None }
+    }
+
     fn try_lock(root: &HostPath, who: &str, borrowing: bool) -> Result<Lock, LockError> {
-        if inherited(root) {
-            return Ok(Lock { file: None, unprotected: None, _borrowed: None });
-        }
         let file = open(root).map_err(LockError::Io)?;
         match file.try_lock() {
             Ok(()) => claim(root, file, who),
@@ -186,11 +192,17 @@ impl Lock {
     ///
     /// # Errors
     /// The project is still held after `limit`, or the lock file cannot be made.
-    pub fn acquire_within(root: &HostPath, who: &str, limit: Duration) -> Result<Lock, LockError> {
-        let start = Instant::now();
+    pub fn acquire_within(root: &HostPath, who: &str, limit: Duration, io: &dyn pe2_io::Io) -> Result<Lock, LockError> {
+        if inherited(root, io.environment()) {
+            return Ok(Lock::lent());
+        }
+        let clock = io.clock();
+        let start = clock.now();
         loop {
             match Lock::try_acquire(root, who) {
-                Err(LockError::Held(_)) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(25)),
+                Err(LockError::Held(_)) if clock.now().saturating_duration_since(start) < limit => {
+                    pe2_io::sleep(clock, Duration::from_millis(25));
+                }
                 other => return other,
             }
         }
@@ -201,7 +213,16 @@ impl Lock {
     ///
     /// # Errors
     /// The lock file cannot be made or locked.
-    pub fn acquire(root: &HostPath, who: &str, waiting: impl FnOnce(&str)) -> Result<Lock, LockError> {
+    pub fn acquire(
+        root: &HostPath,
+        who: &str,
+        io: &dyn pe2_io::Io,
+        waiting: impl FnOnce(&str),
+    ) -> Result<Lock, LockError> {
+        if inherited(root, io.environment()) {
+            return Ok(Lock::lent());
+        }
+        let clock = io.clock();
         let mut waiting = Some(waiting);
         loop {
             match Lock::try_acquire(root, who) {
@@ -209,7 +230,7 @@ impl Lock {
                     if let Some(waiting) = waiting.take() {
                         waiting(&owner);
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    pe2_io::sleep(clock, Duration::from_millis(100));
                 }
                 other => return other,
             }

@@ -31,7 +31,7 @@ pub struct Files {
     /// Where what is served is said, by whoever calls.
     says: Arc<Says>,
     /// That something was said, for the thread telling the server.
-    shown: mpsc::Sender<Shown>,
+    shown: pe2_io::Sender<Shown>,
 }
 
 /// What the thread telling the server is given, once something was said: the files of the layers that changed
@@ -40,7 +40,7 @@ pub struct Files {
 struct Shown {
     changed: Vec<HostPath>,
     failed: Option<String>,
-    served: Option<mpsc::Sender<()>>,
+    served: Option<pe2_io::Sender<()>>,
     then: Option<Then>,
 }
 
@@ -51,7 +51,7 @@ pub type Then = Box<dyn FnOnce() + Send>;
 /// however it does.
 #[derive(Default)]
 struct Waiting {
-    served: Vec<mpsc::Sender<()>>,
+    served: Vec<pe2_io::Sender<()>>,
     then: Vec<Then>,
 }
 
@@ -121,7 +121,7 @@ impl Files {
             let kept = kept(&kept_project, &kept_args);
             *lock(&kept_state) = kept;
         });
-        let (shown, newest) = mpsc::channel();
+        let (shown, newest) = pe2_io::channel(project.io.clone());
         let (sending, sent_of, said) = (state.clone(), project.clone(), says.clone());
         let send = move || send_shown(&sent_of, &sending, &newest, &said);
         let _ = std::thread::Builder::new().name("served".into()).spawn(send);
@@ -147,7 +147,7 @@ impl Files {
         then: Option<Then>,
     ) {
         let failed = self.says.say(said, model, answers).err();
-        let (served, waited) = mpsc::channel();
+        let (served, waited) = pe2_io::channel(self.project.io.clone());
         let wait = wait && matches!(self.state(), State::Served(..));
         // What could not be given to the thread telling it - which is gone - is done with here.
         if let Err(mpsc::SendError(Shown { then: Some(then), .. })) =
@@ -156,7 +156,7 @@ impl Files {
             then();
         }
         if wait {
-            let _ = waited.recv_timeout(PATIENCE);
+            let _ = waited.recv_until(Some(self.project.io.clock().now() + PATIENCE));
         }
     }
 
@@ -188,18 +188,18 @@ impl Files {
 }
 
 /// This program, as it names itself to the server it keeps.
-fn who() -> &'static str {
+fn who(environment: &dyn pe2_io::Environment) -> &'static str {
     static WHO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     WHO.get_or_init(|| {
-        let program = std::env::current_exe().ok();
+        let program = environment.current_exe().ok().map(sfs::HostPath::into_path_buf);
         let name = program.as_deref().and_then(|p| p.file_stem()).map(|n| n.to_string_lossy().into_owned());
         name.unwrap_or_else(|| "a holder".into())
     })
 }
 
 /// `pe2-cli`, which the server is: this program where it is that, else the one beside it.
-fn cli() -> anyhow::Result<std::path::PathBuf> {
-    let program = std::env::current_exe()?;
+fn cli(environment: &dyn pe2_io::Environment) -> anyhow::Result<std::path::PathBuf> {
+    let program = environment.current_exe()?.into_path_buf();
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned());
     let cli = if name.as_deref() == Some("pe2-cli") { program } else { project::host::cli_beside(&program) };
     if !cli.is_file() {
@@ -211,9 +211,12 @@ fn cli() -> anyhow::Result<std::path::PathBuf> {
 /// The server kept, started with `args` where none runs, or why not.
 fn kept(project: &project::Project, args: &[String]) -> Kept {
     // The one running, whatever program this is; one started is `pe2-cli`.
-    let kept = match project::server::keep_running(&project.root, who()) {
+    let environment = project.io.environment();
+    let kept = match project::server::keep_running(&project.root, who(environment)) {
         Some(lease) => Ok(lease),
-        None => cli().and_then(|program| project::server::keep(&project.root, who(), &program, args)),
+        None => cli(environment).and_then(|program| {
+            project::server::keep(&project.root, who(environment), &program, args, project.io.clock())
+        }),
     };
     match kept {
         Ok(lease) => Kept::Leased(Arc::new(Mutex::new(lease)), None),
@@ -235,7 +238,7 @@ fn strays_in(project: &project::Project) -> usize {
 /// Tell the server that what is served was said, as it is: in the filesystem the project's processes share
 /// (`says::Says`, by whoever refreshed) - all of it the first time, and after that what changed; the server reads
 /// it there. What the server is not kept for yet waits for it.
-fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Receiver<Shown>, says: &Says) {
+fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &pe2_io::Receiver<Shown>, says: &Says) {
     // The lease that was told of all of it; and why it could not be said, once it could not.
     let mut told: Option<Arc<Mutex<Lease>>> = None;
     let mut untold = false;
@@ -244,7 +247,8 @@ fn send_shown(project: &project::Project, state: &Mutex<Kept>, newest: &mpsc::Re
     // of - which tells them - once it is, or will not be.
     let (mut changed, mut waiting) = (Vec::new(), Waiting::default());
     loop {
-        let first = match newest.recv_timeout(std::time::Duration::from_millis(250)) {
+        let looks_again = project.io.clock().now() + std::time::Duration::from_millis(250);
+        let first = match newest.recv_until(Some(looks_again)) {
             Ok(shown) => Some(shown),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             // Nothing more is said here: the space is left as whoever next attaches alone may trust it.

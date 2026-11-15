@@ -199,7 +199,7 @@ fn lay_out(call: &exec::Call<'_>, given: &[File]) -> Result<Laid> {
     const OUT: &Name = Name::constant("out");
     let run = format!("pe2-run-{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
     let run = Name::new(&run)?;
-    let folder = HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?.join(&run);
+    let folder = call.io().environment().temp_dir().context("the system's folder of temporary files")?.join(&run);
     let _ = std::fs::remove_dir_all(&folder);
     let laid = Laid { input: folder.join(&IN), output: folder.join(&OUT), folder: Some(folder), files: Vec::new() };
     std::fs::create_dir_all(&laid.output).with_context(|| laid.output.to_string())?;

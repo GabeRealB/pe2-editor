@@ -969,6 +969,10 @@ pub fn files(pages: &impl Pages, root: &HostPath) -> Result<HashMap<HostPath, Re
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
 
     use super::*;

@@ -71,6 +71,8 @@ pub struct Job<'a> {
     pub name: &'a str,
     /// The address it is served at, for a backend serving at one; none is the backend's own.
     pub address: Option<SocketAddr>,
+    /// The I/O what programs change is applied by: what a backend waiting for changes to settle tells the time by.
+    pub io: Arc<dyn pe2_io::Io>,
 }
 
 /// A way to serve a tree.
@@ -362,6 +364,10 @@ pub fn apart_for(at: &HostPath) -> Option<HostPath> {
     let project = at.parent().and_then(|root| project::local_filesystem(&root).cache);
     let machine = || APART.get().and_then(|machine| machine()).and_then(|cache| place(cache.as_os_str()));
     let default = || {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the machine's own folder for what a backend keeps, as the system names it"
+        )]
         let local = place(&std::env::var_os("LOCALAPPDATA")?)?;
         Some(local.join(&pe2_path::RelPath::constant("pe2-editor/served")))
     };

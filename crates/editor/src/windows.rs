@@ -763,6 +763,10 @@ pub fn activate(tree: &mut Tree<Pane>, tile: TileId) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     /// A path of the tree a test names.
     fn t(text: &str) -> std::sync::Arc<project::TreePath> {

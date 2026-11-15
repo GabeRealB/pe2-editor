@@ -45,6 +45,10 @@ pub struct Presence {
 }
 
 /// Where the editors keep their files.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the editors' presence is kept in the program's own folder: plain paths, joined of names it writes"
+)]
 fn folder() -> Option<PathBuf> {
     Some(extensions::data_folder()?.join("editors"))
 }
@@ -72,6 +76,10 @@ pub fn rebuilt(program: Option<&HostPath>, then: Option<u64>) -> bool {
 
 /// This process's program and its time now: what a presence starts with, and the server says of itself.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this process's own program, as the system started it: the process's, no project's"
+)]
 pub fn this_program() -> (Option<HostPath>, Option<u64>) {
     let program = std::env::current_exe().ok().and_then(|program| HostPath::new(&program).ok());
     let built = program.as_ref().and_then(built);
@@ -85,6 +93,8 @@ pub struct Keeper {
     _held: std::fs::File,
     base: Presence,
     written: Option<(Presence, Instant)>,
+    /// What says when it was started, and how lately it wrote.
+    io: std::sync::Arc<dyn pe2_io::Io>,
 }
 
 /// How often a presence that keeps changing is written at most.
@@ -93,7 +103,11 @@ const EVERY: Duration = Duration::from_millis(500);
 impl Keeper {
     /// Begin this process's presence: its lock taken and held; none where there is no data folder or no lock.
     #[must_use]
-    pub fn start() -> Option<Keeper> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the editors' presence is kept in the program's own folder: plain paths, joined of names it writes"
+    )]
+    pub fn start(io: std::sync::Arc<dyn pe2_io::Io>) -> Option<Keeper> {
         let folder = folder()?;
         std::fs::create_dir_all(&folder).ok()?;
         sweep(&folder);
@@ -102,9 +116,9 @@ impl Keeper {
         let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock).ok()?;
         held.try_lock().ok()?;
         let (program, built) = this_program();
-        let base = Presence { pid, program, built, started: seconds(SystemTime::now()), ..Presence::default() };
+        let base = Presence { pid, program, built, started: seconds(io.clock().wall()), ..Presence::default() };
         let json = folder.join(format!("{pid}.json"));
-        Some(Keeper { json, lock, _held: held, base, written: None })
+        Some(Keeper { json, lock, _held: held, base, written: None, io })
     }
 
     /// Say this now, however lately it last said something: what another process must know before it acts - a
@@ -121,14 +135,14 @@ impl Keeper {
         presence.built = self.base.built;
         presence.started = self.base.started;
         if let Some((last, at)) = &self.written
-            && (*last == presence || at.elapsed() < EVERY)
+            && (*last == presence || self.io.clock().now().saturating_duration_since(*at) < EVERY)
         {
             return;
         }
         let Ok(text) = serde_json::to_string_pretty(&presence) else { return };
         let partial = self.json.with_extension("json.part");
         if std::fs::write(&partial, text).is_ok() && std::fs::rename(&partial, &self.json).is_ok() {
-            self.written = Some((presence, Instant::now()));
+            self.written = Some((presence, self.io.clock().now()));
         }
     }
 }
@@ -234,7 +248,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.at("1.lock"), "").unwrap();
         std::fs::write(folder.at("1.json"), "{}").unwrap();
-        let mut keeper = Keeper::start().expect("a presence");
+        let mut keeper = Keeper::start(pe2_io::system()).expect("a presence");
         assert!(!folder.at("1.json").exists(), "what a gone editor left is swept");
         let project = data.at("a project");
         keeper.keep(Presence { project: Some(project.clone()), window: "focused".into(), ..Presence::default() });

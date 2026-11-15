@@ -570,6 +570,10 @@ mod tests {
     /// The banks in a folder (`PE2_SOUND_BANKS`, each file a bank as a disc stores it): each read into its parts and
     /// written back byte for byte, and each sample decoded to input re-encoding to it.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test of the banks in the folder the environment names, where it names one"
+    )]
     fn the_games_banks_are_their_parts_and_their_samples_decode() {
         let Ok(folder) = std::env::var("PE2_SOUND_BANKS") else { return };
         let mut bodies = std::collections::BTreeSet::new();

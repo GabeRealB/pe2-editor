@@ -76,8 +76,10 @@ counting, as that is what it is.
   what the host sends that is none is a broken host, and the guest traps (`guest.rs`, `told_path`).
 - Calls block their thread. They must not be made from an async runtime's thread.
 
-A sandboxed component gets WASI with nothing behind it: clocks fixed, no environment, files or network. What it
-printed to standard error is kept and added to the error if it traps.
+A sandboxed component gets WASI with nothing behind it: clocks fixed, randomness drawn from one seed every instance
+starts from, no environment, files or network - so the same inputs make the same output. An unsandboxed one gets the
+clocks, randomness and environment of the I/O the extensions were loaded with (`pe2_io::Io`: the project's, or the
+system's for the built-ins a process shares), and the system's files and network. What it printed to standard error is kept and added to the error if it traps.
 
 ## How calls arrive
 

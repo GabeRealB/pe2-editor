@@ -29,6 +29,11 @@ pub type Answer = Result<String, String>;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn number() -> u64 {
+    // Across processes: the system's clock, which every process shares, so that one started later gives none again.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a number no process started later gives: the system's clock, shared by every process"
+    )]
     let started = || {
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         u64::try_from(since.as_nanos()).unwrap_or(u64::MAX / 2).max(1)

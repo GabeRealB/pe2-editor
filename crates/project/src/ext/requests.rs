@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use pe2_ext::Requested;
@@ -42,7 +42,9 @@ struct State {
 /// What the threads and those asking share.
 struct Shared {
     state: Mutex<State>,
-    answered: Condvar,
+    /// Told when one is answered, timed by the project's clock.
+    answered: pe2_io::Signal,
+    io: Arc<dyn pe2_io::Io>,
     index: Mutex<Arc<Index>>,
     /// What makes an output: the extensions', held weakly, as they hold this.
     maker: Mutex<Option<Maker>>,
@@ -80,7 +82,8 @@ impl Shared {
             _ => return,
         };
         // How long it was waited for, queued and made: what a view's user sees.
-        crate::profile::record(&format!("answered {}#{}", key.0, key.1), since.elapsed());
+        let waited = self.io.clock().now().saturating_duration_since(since);
+        crate::profile::record(&format!("answered {}#{}", key.0, key.1), waited);
         state.slots.insert(key.clone(), made.map_or_else(Slot::Failed, |bytes| Slot::Made(Arc::new(bytes))));
         state.kept.push_back(key.clone());
         while state.kept.len() > KEPT {
@@ -114,15 +117,16 @@ pub struct Requests {
 impl Requests {
     /// Start the threads, on this project as it is taken in.
     #[must_use]
-    pub fn start(index: Arc<Index>) -> Arc<Requests> {
-        Requests::waiting(index, BUDGET)
+    pub fn start(index: Arc<Index>, io: Arc<dyn pe2_io::Io>) -> Arc<Requests> {
+        Requests::waiting(index, io, BUDGET)
     }
 
-    /// Start the threads, the first to ask waiting this long.
-    fn waiting(index: Arc<Index>, budget: Duration) -> Arc<Requests> {
+    /// Start the threads, the first to ask waiting this long by the clock of `io`.
+    fn waiting(index: Arc<Index>, io: Arc<dyn pe2_io::Io>, budget: Duration) -> Arc<Requests> {
         let shared = Arc::new(Shared {
             state: Mutex::default(),
-            answered: Condvar::new(),
+            answered: pe2_io::Signal::new(io.clone()),
+            io,
             index: Mutex::new(index),
             maker: Mutex::new(None),
             wake: Mutex::new(None),
@@ -207,21 +211,19 @@ impl Asking for Requests {
         if !state.slots.contains_key(&key) {
             state.asked += 1;
             let asked = state.asked;
-            state.slots.insert(key.clone(), Slot::Making { since: Instant::now(), asked });
+            let since = self.shared.io.clock().now();
+            state.slots.insert(key.clone(), Slot::Making { since, asked });
             let _ = self.jobs.lock().unwrap_or_else(PoisonError::into_inner).send((key.clone(), asked));
-            let making = |state: &mut State| matches!(state.slots.get(&key), Some(Slot::Making { .. }));
-            state = self
-                .shared
-                .answered
-                .wait_timeout_while(state, self.budget, making)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            drop(state);
+            let made = |state: &mut State| !matches!(state.slots.get(&key), Some(Slot::Making { .. }));
+            state = self.shared.answered.wait_until(&self.shared.state, Some(since + self.budget), made).0;
         }
         let answer = match state.slots.get(&key) {
             Some(Slot::Made(bytes)) => Requested::Ready(bytes.to_vec()),
             Some(Slot::Failed(why)) => Requested::Failed(why.clone()),
             Some(Slot::Making { since, .. }) => {
-                Requested::Pending { waited: u32::try_from(since.elapsed().as_millis()).unwrap_or(u32::MAX) }
+                let waited = self.shared.io.clock().now().saturating_duration_since(*since);
+                Requested::Pending { waited: u32::try_from(waited.as_millis()).unwrap_or(u32::MAX) }
             }
             None => Requested::Pending { waited: 0 },
         };
@@ -244,6 +246,10 @@ impl Asking for Requests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
     use crate::Project;
@@ -254,6 +260,7 @@ mod tests {
     use pe2_ext::ty::Registered as _;
     use pe2_ext::{Extension, File, Registry, Result, Typed, ty};
     use sfs::HostPath;
+    use std::sync::Condvar;
     use std::sync::atomic::AtomicUsize;
 
     static MADE: AtomicUsize = AtomicUsize::new(0);
@@ -316,7 +323,7 @@ mod tests {
         };
         let extensions = Arc::new(Extensions::load(vec![Loadable::from(extension)], true));
         extensions.keep_in(crate::graph::store::Store::open(&cache).unwrap());
-        let requests = Requests::start(Arc::new(index));
+        let requests = Requests::start(Arc::new(index), pe2_io::system());
         requests.set_extensions(&extensions);
         (root, lock, requests, extensions)
     }
@@ -353,7 +360,7 @@ mod tests {
         // What is made within the wait is there for the one asking: waiting longer than anything here takes, it is
         // answered at once.
         let index = requests.shared.index.lock().unwrap().clone();
-        let waiting = Requests::waiting(index, Duration::from_secs(60));
+        let waiting = Requests::waiting(index, pe2_io::system(), Duration::from_secs(60));
         waiting.set_extensions(&extensions);
         assert_eq!(ask(&waiting), Requested::Ready(b"made".to_vec()), "made within the wait");
         assert_eq!(MADE.load(Ordering::SeqCst), 2);

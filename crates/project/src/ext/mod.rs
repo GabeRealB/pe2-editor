@@ -355,9 +355,21 @@ impl Origin {
     }
 }
 
+/// The host's I/O the extensions run with: the system's where none is given (`Extensions::load_with`).
+#[derive(Clone)]
+struct HostIo(Arc<dyn pe2_io::Io>);
+
+impl Default for HostIo {
+    fn default() -> HostIo {
+        HostIo(pe2_io::system())
+    }
+}
+
 /// The extensions loaded, and what they registered.
 #[derive(Default)]
 pub struct Extensions {
+    /// The host's I/O, which what runs is given.
+    io: HostIo,
     /// The config being built.
     config: std::sync::RwLock<Option<pe2_ext::data::BuildConfig>>,
     /// The assets it leaves out.
@@ -549,7 +561,18 @@ impl Extensions {
     /// Load `extensions` but those a project leaves off (`disabled`, by id) - and those needing them.
     #[must_use]
     pub fn load_without(extensions: Vec<Loadable>, builtin: bool, disabled: &[String]) -> Extensions {
-        let mut out = Extensions::default();
+        Extensions::load_with(extensions, builtin, disabled, pe2_io::system())
+    }
+
+    /// As `load_without`, what runs given `io`.
+    #[must_use]
+    pub fn load_with(
+        extensions: Vec<Loadable>,
+        builtin: bool,
+        disabled: &[String],
+        io: Arc<dyn pe2_io::Io>,
+    ) -> Extensions {
+        let mut out = Extensions { io: HostIo(io), ..Extensions::default() };
         // One an id: the nearest (the project's, the user's, a built-in), its place taken from the others; two from
         // the same place, the first.
         let mut extensions = extensions;
@@ -612,10 +635,12 @@ impl Extensions {
                 }
                 extension.reaches = reaches;
                 progress = true;
+                #[allow(clippy::disallowed_methods, reason = "a measurement, shown: nothing is decided by it")]
                 let started = std::time::Instant::now();
                 let builtin = builtin && (extension.origin.builtin() || standing_in.contains(&extension.id));
                 match out.register(extension, builtin) {
                     Ok(registers) => {
+                        #[allow(clippy::disallowed_methods, reason = "a measurement, shown")]
                         timings.insert(extension.id.clone(), (started.elapsed(), registers));
                         status.insert(extension.id.clone(), Status::Loaded);
                     }
@@ -2173,6 +2198,7 @@ impl Extensions {
 
     fn make_operations(&self) -> graph::Ops {
         let mut ops = graph::Ops::default();
+        ops.io = self.io.0.clone();
         let recognizers = Arc::new(self.recognizers.clone());
         let any_file = pe2_ext::Type::File(Box::new(pe2_ext::Type::Any));
         let by_name = recognizers.clone();
@@ -2649,7 +2675,7 @@ fn start_stream(
     };
     let generator = start(&mut lent)?;
     let node = call.recorder().node();
-    let host = StreamHost { path: node.path().to_owned(), contents };
+    let host = StreamHost { path: node.path().to_owned(), contents, io: call.io().clone() };
     let (settings, parameter) = (call.settings().clone(), call.parameter().map(str::to_string));
     let query = Box::from(call.query());
     Ok(Box::new(Generating { generator, host, settings, carried: lent_carried, parameter, query }))
@@ -2674,6 +2700,7 @@ pub(crate) fn taken(place: &pe2_ext::HostPath) -> Result<HostPath> {
 struct StreamHost {
     path: Arc<crate::TreePath>,
     contents: HashMap<pe2_ext::Sha1, HostPath>,
+    io: Arc<dyn pe2_io::Io>,
 }
 
 impl StreamHost {
@@ -2694,7 +2721,7 @@ impl pe2_ext::CallHost for StreamHost {
                 (crate::content::for_program(StreamHost::path_of(self, sha1)?)?, None)
             }
             held => {
-                let folder = HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?;
+                let folder = self.io.environment().temp_dir().context("the system's folder of temporary files")?;
                 graph::exec::written_for_program(&folder, held.held().unwrap_or_default())?
             }
         };

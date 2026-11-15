@@ -5,11 +5,6 @@
 //! The same crates are linked in too: `PE2_EXTENSIONS=linked` runs them in the host instead of their components, to
 //! step through one in a debugger, profile it, or compare the two; what a project holds still runs as components.
 
-#![allow(
-    clippy::disallowed_methods,
-    reason = "it finds extensions and keeps what the user chose in the program's own folders: plain paths, joined of names it writes; a storage's place is a HostPath, joined only of checked names"
-)]
-
 use project::ext::component::{Described, Unsandboxed};
 use project::ext::{
     EXTENSION_COMPONENT, Extensions, Loadable, Origin, Present, Status, component, folder, unsandboxed,
@@ -41,6 +36,7 @@ pub fn components() -> &'static [(&'static str, &'static [u8])] {
 
 /// A component built here and not embedded, by its file: what a test needs of one that has to be trusted.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn built_apart(file: &str) -> Option<Vec<u8>> {
     let file = pe2_path::Name::new(file).ok()?;
     std::fs::read(Path::new(env!("PE2_BUILT")).join(file.as_str())).ok()
@@ -48,6 +44,7 @@ pub fn built_apart(file: &str) -> Option<Vec<u8>> {
 
 /// The tests of the built-ins, each a `tests/` folder, as the build lays them out.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn built_suites() -> Vec<PathBuf> {
     let Ok(listed) = std::fs::read_dir(env!("PE2_SUITES")) else { return Vec::new() };
     let entries = listed.flatten().map(|entry| entry.path());
@@ -80,7 +77,7 @@ pub fn linked() -> Vec<pe2_ext::Extension> {
 /// Load the built-ins: their components, or with `PE2_EXTENSIONS=linked` their crates.
 #[must_use]
 pub fn load() -> Extensions {
-    load_without(&[], &[], &Kept::new(), None)
+    load_without(&[], &[], &Kept::new(), None, &pe2_io::system())
 }
 
 /// The settings kept for extensions, by id: each a table by scope (`{ project = { ... }, user = { ... } }`).
@@ -103,7 +100,13 @@ pub struct Found {
 /// requiring them; what is kept to be added (yours, beside the editor) is shown, and never run. `requires`, what the
 /// project requires (`[[extension]]`), where there is a project.
 #[must_use]
-pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires: Option<&[Requirement]>) -> Extensions {
+pub fn load_without(
+    found: &[Found],
+    disabled: &[String],
+    kept: &Kept,
+    requires: Option<&[Requirement]>,
+    io: &Arc<dyn pe2_io::Io>,
+) -> Extensions {
     let with_settings = |mut loadable: Vec<Loadable>| {
         for l in &mut loadable {
             l.settings = kept.get(&l.id).cloned().unwrap_or_default();
@@ -182,8 +185,8 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires:
                 };
                 // The first line of what went wrong: the parser's is followed by the bytes it found.
                 let loaded = match held {
-                    Some(held) => component::load_unsandboxed(&name, &bytes, found.origin.clone(), held),
-                    None => component::load_bytes(&name, &bytes, found.origin.clone()),
+                    Some(held) => component::load_unsandboxed(&name, &bytes, found.origin.clone(), held, io.clone()),
+                    None => component::load_bytes(&name, &bytes, found.origin.clone(), io.clone()),
                 };
                 let loaded = loaded.map_err(|e| {
                     let why = format!("{e:#}");
@@ -203,9 +206,9 @@ pub fn load_without(found: &[Found], disabled: &[String], kept: &Kept, requires:
             }
         }
     }
-    builtins(&mut loadable, &mut failed);
+    builtins(&mut loadable, &mut failed, io);
     loadable.extend(TEST_HOST.get().map(|host| host().into()));
-    let mut extensions = Extensions::load_without(with_settings(loadable), true, disabled);
+    let mut extensions = Extensions::load_with(with_settings(loadable), true, disabled, io.clone());
     offering(&mut extensions, offered, unsandboxed_loaded);
     extensions.problems.extend(failed);
     extensions.present.extend(unloadable);
@@ -276,13 +279,13 @@ fn manifest_alone(
 }
 
 /// The built-ins: their crates, linked in, where asked (a native profiler sees into them), else their components.
-fn builtins(loadable: &mut Vec<Loadable>, failed: &mut Vec<String>) {
-    if std::env::var_os("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
+fn builtins(loadable: &mut Vec<Loadable>, failed: &mut Vec<String>, io: &Arc<dyn pe2_io::Io>) {
+    if io.environment().var("PE2_EXTENSIONS").is_some_and(|v| v == "linked") {
         loadable.extend(linked().into_iter().map(Into::into));
         return;
     }
     for (package, bytes) in COMPONENTS {
-        match component::load_bytes(package, bytes, Origin::Builtin) {
+        match component::load_bytes(package, bytes, Origin::Builtin, io.clone()) {
             Ok(extension) => loadable.push(extension),
             Err(e) => failed.push(format!("{package}: {e:#}")),
         }
@@ -304,6 +307,7 @@ fn offering(
 
 /// Where what extensions' setup fetches is kept on this machine: `setup` in the editor's data folder.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn setup_folder() -> Option<PathBuf> {
     Some(data_folder()?.join("setup"))
 }
@@ -477,14 +481,15 @@ pub fn set_unsandboxed_enabled(trust: &str, id: &str, on: bool) -> std::io::Resu
 /// The built-ins, loaded once a process.
 #[must_use]
 pub fn shared() -> Arc<Extensions> {
-    loaded(&[], &[], &Kept::new(), None)
+    loaded(&[], &[], &Kept::new(), None, &pe2_io::system())
 }
 
 /// The extensions as a project has them: those it holds and the built-ins, but those it leaves off, with what is kept
 /// to be added shown - loaded once a process for each such set, so a changed extension loads again.
 #[must_use]
 pub fn for_project(project: &Project) -> Arc<Extensions> {
-    let extensions = loaded(&found(project), &project.disabled_extensions, &kept(project), Some(&project.requires));
+    let extensions =
+        loaded(&found(project), &project.disabled_extensions, &kept(project), Some(&project.requires), &project.io);
     // Its operations run programs only where the user trusts it as a whole.
     let trusted = trust::allowed_by(&Origin::Project(project.root.clone())).is_some();
     extensions.programs_trusted.store(trusted, std::sync::atomic::Ordering::Relaxed);
@@ -526,6 +531,7 @@ pub struct FilesystemDefaults {
 /// What this machine says serves projects (`FilesystemDefaults`); nothing where the settings say nothing, or cannot be
 /// read.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn filesystem_defaults() -> FilesystemDefaults {
     let read = || {
         let text = std::fs::read_to_string(data_folder()?.join(SETTINGS)).ok()?;
@@ -547,6 +553,7 @@ pub fn filesystem_defaults() -> FilesystemDefaults {
 
 /// The user's settings of extensions: `[extensions."<id>"]` in the editor's `settings.toml`, beside its other ones.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn user_settings() -> BTreeMap<String, Table> {
     let Some(file) = data_folder().map(|d| d.join(SETTINGS)) else { return BTreeMap::new() };
     let Ok(text) = std::fs::read_to_string(file) else { return BTreeMap::new() };
@@ -610,7 +617,13 @@ type Sets = Vec<(Key, Arc<Extensions>)>;
 /// The sets loaded lately, newest last: one an extension replaces is dropped in time, its engines with it.
 const KEPT: usize = 4;
 
-fn loaded(found: &[Found], disabled: &[String], kept: &Kept, requires: Option<&[Requirement]>) -> Arc<Extensions> {
+fn loaded(
+    found: &[Found],
+    disabled: &[String],
+    kept: &Kept,
+    requires: Option<&[Requirement]>,
+    io: &Arc<dyn pe2_io::Io>,
+) -> Arc<Extensions> {
     static LOADED: OnceLock<Mutex<Sets>> = OnceLock::new();
     let mut disabled = disabled.to_vec();
     disabled.sort_unstable();
@@ -620,7 +633,7 @@ fn loaded(found: &[Found], disabled: &[String], kept: &Kept, requires: Option<&[
     let mut loaded = loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let extensions = match loaded.iter().position(|(k, _)| *k == key) {
         Some(at) => loaded.remove(at).1,
-        None => Arc::new(load_without(&key.0, &key.1, kept, requires)),
+        None => Arc::new(load_without(&key.0, &key.1, kept, requires, io)),
     };
     loaded.push((key, extensions.clone()));
     if loaded.len() > KEPT {
@@ -631,6 +644,7 @@ fn loaded(found: &[Found], disabled: &[String], kept: &Kept, requires: Option<&[
 
 /// The user's own extensions folder: `extensions` in the editor's data folder.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn user_folder() -> Option<PathBuf> {
     Some(data_folder()?.join(EXTENSIONS))
 }
@@ -638,11 +652,16 @@ pub fn user_folder() -> Option<PathBuf> {
 /// The editor's data folder, as eframe places it: the XDG data folder on Linux, Application Support on macOS, the
 /// roaming application data on Windows.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own data folder, which eframe finds by the system's environment too: the two agree; what it is given and the program's own files are plain paths, joined of names it writes"
+)]
 pub fn data_folder() -> Option<PathBuf> {
     if let Some(folder) = DATA_FOLDER.get() {
         return Some(folder.clone());
     }
-    // A folder the environment names, where it names one: a relative one names none.
+    // A folder the environment names, where it names one: a relative one names none. Read of the system's
+    // environment, as eframe reads it for the same folder: the two agree.
     let place = |path: PathBuf| path.is_absolute().then_some(path);
     let editor = "pe2-editor";
     if cfg!(windows) {
@@ -667,6 +686,10 @@ static DATA_FOLDER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The extensions folder beside the editor.
 #[must_use]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "beside the program as the system started it: the process's own place, no project's"
+)]
 pub fn install_folder() -> Option<PathBuf> {
     Some(std::env::current_exe().ok()?.with_file_name(EXTENSIONS.as_str()))
 }
@@ -742,6 +765,7 @@ pub fn install_components() -> Vec<Found> {
 /// Where an extension of an id is kept to be added: your own extensions' first, then those beside the editor; in each
 /// its folder, else its archive (the last by name, where there are several).
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub fn kept_apart(id: &str) -> Option<PathBuf> {
     let name = format!("{id}{}", folder::SUFFIX);
     let name = pe2_path::Name::new(&name).ok()?;
@@ -798,7 +822,9 @@ mod tests {
         for at in ats {
             older[at..at + name.len()].copy_from_slice(format!("pe2:extension/guest@{before}.0").as_bytes());
         }
-        let refused = component::load_bytes("older", &older, project::ext::Origin::Builtin).err().expect("refused");
+        let refused = component::load_bytes("older", &older, project::ext::Origin::Builtin, pe2_io::system())
+            .err()
+            .expect("refused");
         assert!(format!("{refused:#}").contains("rebuild it with this editor's SDK"), "{refused:#}");
     }
 
@@ -850,7 +876,13 @@ mod tests {
         let held = |o: &Origin| matches!(o, Origin::Project(_));
         let kept = |o: &Origin| matches!(o, Origin::User(_));
         // Held, in place of the built-in of its id.
-        let extensions = super::load_without(&[found(&folder, Origin::Project)], &[], &super::Kept::new(), Some(&[]));
+        let extensions = super::load_without(
+            &[found(&folder, Origin::Project)],
+            &[],
+            &super::Kept::new(),
+            Some(&[]),
+            &pe2_io::system(),
+        );
         assert_eq!(status(&extensions, held), Some(Status::Loaded), "{:?}", extensions.problems);
         assert_eq!(
             extensions.present.iter().find(|p| p.origin == Origin::Builtin && p.id == "pe2.events").map(|p| &p.status),
@@ -858,17 +890,28 @@ mod tests {
         );
         // Kept apart: shown, never run - and required, it is to be added.
         let required = [Requirement { id: "pe2.events".to_string(), version: Some("^7.0".to_string()) }];
-        let extensions =
-            super::load_without(&[found(&folder, Origin::User)], &[], &super::Kept::new(), Some(&required));
+        let extensions = super::load_without(
+            &[found(&folder, Origin::User)],
+            &[],
+            &super::Kept::new(),
+            Some(&required),
+            &pe2_io::system(),
+        );
         assert_eq!(status(&extensions, kept), Some(Status::Available));
         assert!(extensions.unmet[0].1.contains("asks for ^7.0"), "the built-in: {:?}", extensions.unmet);
         let required = [Requirement { id: "my.tool".to_string(), version: None }];
-        let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&required));
+        let extensions = super::load_without(&[], &[], &super::Kept::new(), Some(&required), &pe2_io::system());
         assert_eq!(extensions.unmet, [("my.tool".to_string(), "it was not found".to_string())]);
         // A manifest that is not its component's, and a folder named for another id: refused, problems of the project.
         std::fs::write(folder.at("extension.toml"), "id = \"pe2.events\"\nversion = \"0.1.0\"\nunsandboxed = true\n")
             .unwrap();
-        let extensions = super::load_without(&[found(&folder, Origin::Project)], &[], &super::Kept::new(), Some(&[]));
+        let extensions = super::load_without(
+            &[found(&folder, Origin::Project)],
+            &[],
+            &super::Kept::new(),
+            Some(&[]),
+            &pe2_io::system(),
+        );
         let Some(Status::Refused(why)) = status(&extensions, held) else { panic!("{:?}", extensions.present) };
         assert!(why.contains("is not its component's"), "{why}");
         assert!(extensions.problems.iter().any(|p| p.contains("is not its component's")), "{:?}", extensions.problems);
@@ -877,7 +920,13 @@ mod tests {
         let folder = kept_as(&dir, "pe2-events");
         std::fs::remove_dir_all(&renamed).unwrap();
         std::fs::rename(&folder, &renamed).unwrap();
-        let extensions = super::load_without(&[found(&renamed, Origin::Project)], &[], &super::Kept::new(), Some(&[]));
+        let extensions = super::load_without(
+            &[found(&renamed, Origin::Project)],
+            &[],
+            &super::Kept::new(),
+            Some(&[]),
+            &pe2_io::system(),
+        );
         let Some(Status::Refused(why)) = status(&extensions, held) else { panic!("{:?}", extensions.present) };
         assert!(why.contains("its folder is pe2.events.extension"), "{why}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -930,8 +979,13 @@ mod tests {
             let mode = std::fs::metadata(&tool).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "a program is still one");
         }
-        let extensions =
-            super::load_without(&super::found(&project), &[], &super::Kept::new(), Some(&project.requires));
+        let extensions = super::load_without(
+            &super::found(&project),
+            &[],
+            &super::Kept::new(),
+            Some(&project.requires),
+            &pe2_io::system(),
+        );
         let loaded = extensions.loaded.iter().find(|l| l.id == "pe2.events").unwrap();
         assert_eq!(loaded.origin, project::ext::Origin::Project(held.clone()));
         // Updated: added again, in place of what was there; undone, what was there is back. As it is, it is no step.
@@ -1017,7 +1071,7 @@ mod tests {
         use project::graph::{Content, File, Typed, Value};
         let dir = sfs::testing::scratch("ext-writer");
         let _ = std::fs::remove_dir_all(&dir);
-        let store = project::graph::store::Store::at(dir.clone()).unwrap();
+        let store = project::graph::store::Store::at(dir.clone(), pe2_io::system()).unwrap();
         let extensions = super::load();
         let engine = project::graph::exec::Engine::new(extensions.operations(), Some(store.clone()));
         // Noise, which a PNG cannot make small: the layers written are past what the host holds in memory.

@@ -46,6 +46,7 @@ pub struct Trusted {
 }
 
 /// The file holding what the user enabled and trusts.
+#[allow(clippy::disallowed_methods, reason = "the program's own files: plain paths, joined of names it writes")]
 pub(crate) fn file() -> Option<std::path::PathBuf> {
     Some(data_folder()?.join("unsandboxed.toml"))
 }

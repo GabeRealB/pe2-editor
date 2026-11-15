@@ -875,6 +875,10 @@ fn remove(item: &mut toml_edit::Item, steps: &[&str]) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{resolve, without_derived};
 
@@ -932,6 +936,10 @@ op = "pe2.images@ora"
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod attaching {
     use super::Imports;
     use crate::Project;
@@ -1654,7 +1662,7 @@ mod attaching {
         assert_eq!((attached.made, attached.kept), (1, 0));
         assert!(!index.problems.iter().any(|p| matches!(p, Problem::MissingOutput { .. })));
         // Swept, the old import goes.
-        let store = crate::graph::store::Store::at(root.at(".cache/store")).unwrap();
+        let store = crate::graph::store::Store::at(root.at(".cache/store"), pe2_io::system()).unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         let _ = store.sweep_older(&super::live_nodes(&index), &std::collections::HashSet::new(), later);
         let kept = |sub: &str| std::fs::read_dir(root.at(".cache/store").at(sub)).unwrap().count();

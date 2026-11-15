@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+pe2-io.workspace = true
 sfs.workspace = true
 tracing.workspace = true
 serde.workspace = true

@@ -698,6 +698,10 @@ struct Pending {
 /// A file's record, read now; none when it vanished meanwhile. A file that cannot be parsed is a record with its
 /// error, not a failure: a user may save a half-written `node.toml`.
 fn read(file: &Pending) -> Option<Record> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "compared with the times the system stamps files with: the system's own clock"
+    )]
     let recorded = stamp(SystemTime::now());
     // A declaration is read whole, to be parsed; any other file is only hashed, a piece at a time.
     let (sha1, declaration) = if file.declaration {
@@ -1754,6 +1758,8 @@ pub struct Index {
     opened: crate::model::Delta,
     /// The project's folder.
     root: HostPath,
+    /// The project's I/O.
+    io: Arc<dyn pe2_io::Io>,
     /// What does not add up in the stack, as it was last applied: the stack's own among the problems.
     stack_problems: Vec<Problem>,
     /// What the stack is made of besides what the model holds (`stack_made_of`), and what it said of its
@@ -1798,6 +1804,12 @@ pub struct Index {
 }
 
 impl Index {
+    /// The project's I/O, as the index was opened with it.
+    #[must_use]
+    pub fn io(&self) -> &Arc<dyn pe2_io::Io> {
+        &self.io
+    }
+
     /// The index as it is now, for a snapshot: its maps handed over as copies of their own (`Shared::hand_over`),
     /// so that this one goes on changing them in place whatever holds the snapshot. What a copy costs is paid
     /// here, for the maps that changed since the last was handed over.
@@ -1840,6 +1852,7 @@ impl Index {
             layers: self.layers.clone(),
             opened: crate::model::Delta::default(),
             root: self.root.clone(),
+            io: self.io.clone(),
             stack_problems: self.stack_problems.clone(),
             made_of: self.made_of.clone(),
             stack_said: self.stack_said.clone(),
@@ -2132,6 +2145,7 @@ impl Index {
             objects: crate::chunks::Store::at(&project.root),
             opened,
             root: project.root.clone(),
+            io: project.io.clone(),
             stack_problems: vec![],
             made_of: stack_made_of(project),
             stack_said: Arc::default(),
@@ -3876,7 +3890,7 @@ impl Index {
             if !layer.writable || layer.listing == Listing::Adopted {
                 continue;
             }
-            let listing = self.listing(i, None)?;
+            let listing = self.listing(i, None);
             let layer = &mut self.layers[i];
             if layer.listing == Listing::Once {
                 layer.listing = Listing::Adopted;
@@ -3895,10 +3909,7 @@ impl Index {
     /// last pass) moved there, and keeps its uid; a folder follows when what it held moved under a new name. What is
     /// left gets a new entry, under the uid its `node.toml` names where it names one not taken, a new one otherwise. What
     /// a layer holds at a path a lower layer creates is no entry of its own (an override, or a conflict).
-    ///
-    /// # Errors
-    /// A new uid cannot be made.
-    fn listing(&self, i: usize, only: Option<&[Arc<TreePath>]>) -> Result<Vec<(Uid, Arc<TreePath>)>> {
+    fn listing(&self, i: usize, only: Option<&[Arc<TreePath>]>) -> Vec<(Uid, Arc<TreePath>)> {
         let mut taken: HashSet<Uid> = HashSet::new();
         for layer in &self.layers {
             taken.extend(layer.changeset.entries.keys().copied());
@@ -3916,7 +3927,7 @@ impl Index {
             .map(ToOwned::to_owned)
             .collect();
         if unlisted.is_empty() {
-            return Ok(vec![]);
+            return vec![];
         }
         // Moves: a gone entry's last hash found again at an unlisted path, once.
         let gone: Vec<(Uid, Arc<TreePath>)> = layer
@@ -3975,24 +3986,24 @@ impl Index {
                 .filter(|u| !taken.contains(u));
             let id = match declared {
                 Some(id) => id,
-                None => uid::new(|uid| taken.contains(&uid)).map_err(|e| anyhow::anyhow!("a new uid: {e}"))?,
+                None => uid::new(self.io.random(), |uid| taken.contains(&uid)),
             };
             taken.insert(id);
             out.push((id, path));
         }
-        Ok(out)
+        out
     }
 
     /// How a layer would list what it holds unlisted at and under a path, each by its uid and path: its moves (a gone
     /// entry's uid, at its new path) and its new entries (`listing`).
     ///
     /// # Errors
-    /// There is no such layer, or a new uid cannot be made.
+    /// There is no such layer.
     pub fn adoption(&self, layer: &Name, path: &TreePath) -> Result<Vec<(Uid, Arc<TreePath>)>> {
         let i = anyhow::Context::with_context(self.layers.iter().position(|l| l.name == layer), || {
             format!("no layer {layer}")
         })?;
-        self.listing(i, Some(&[path.to_owned()]))
+        Ok(self.listing(i, Some(&[path.to_owned()])))
     }
 
     /// Where a layer's overrides put their copies: each override's move target, else its entry's path below the
@@ -4353,7 +4364,7 @@ mod tests {
         let files = files.iter().map(|name| {
             let name = rel(name);
             let (_, file) = below.files.iter().find(|(n, _)| *n == name).expect("a file below");
-            store.put_file(&crate::content::read(file).expect("read")).expect("kept");
+            store.put_file(&crate::content::read(file).expect("read"), index.io().clock().wall()).expect("kept");
             let was = below.sha1s.get(&name).copied();
             (name, Base { was, removed: false })
         });

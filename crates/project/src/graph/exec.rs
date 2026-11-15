@@ -466,6 +466,8 @@ pub struct Call<'a> {
     temps: Mutex<Vec<HostPath>>,
     /// The folders it had served to programs (`serve`): served until it is done.
     served: Mutex<Vec<crate::content::Folder>>,
+    /// The host's I/O.
+    io: &'a Arc<dyn pe2_io::Io>,
 }
 
 impl Drop for Call<'_> {
@@ -543,6 +545,12 @@ fn only_files(input: &Input, files: &[String]) -> std::result::Result<Input, Str
 }
 
 impl<'a> Call<'a> {
+    /// The host's I/O, which what it runs is given.
+    #[must_use]
+    pub fn io(&self) -> &'a Arc<dyn pe2_io::Io> {
+        self.io
+    }
+
     /// The value given to a port taking one.
     ///
     /// # Errors
@@ -842,7 +850,7 @@ impl<'a> Call<'a> {
         let project = self.store.and_then(Store::project);
         let fallback = match self.store {
             Some(store) => store.tmp(),
-            None => HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?,
+            None => self.io.environment().temp_dir().context("the system's folder of temporary files")?,
         };
         let folder = crate::content::serve_folder(project.as_ref(), &given, how, &fallback)?;
         let at = folder.at.clone();
@@ -896,7 +904,7 @@ impl<'a> Call<'a> {
         }
         let folder = match self.store {
             Some(store) => store.tmp(),
-            None => HostPath::new(&std::env::temp_dir()).context("the system's folder of temporary files")?,
+            None => self.io.environment().temp_dir().context("the system's folder of temporary files")?,
         };
         written_for_program(&folder, content.held().unwrap_or_default())
     }
@@ -1504,6 +1512,7 @@ impl Evaluation<'_> {
                 parameter,
                 recorder,
                 store: self.store,
+                io: &self.ops.io,
                 reach: self.reach,
                 others,
                 needs: None,
@@ -1557,6 +1566,7 @@ impl Evaluation<'_> {
             parameter,
             recorder,
             store: self.store,
+            io: &self.ops.io,
             reach: self.reach,
             others,
             needs: held,
@@ -1624,6 +1634,7 @@ impl Evaluation<'_> {
                 parameter,
                 recorder,
                 store: self.store,
+                io: &self.ops.io,
                 reach: self.reach,
                 others: self.others,
                 needs: Some(&needs),
@@ -1732,6 +1743,7 @@ impl Evaluation<'_> {
             parameter,
             recorder,
             store: self.store,
+            io: &self.ops.io,
             reach: self.reach,
             others: self.others,
             needs: Some(needs),
@@ -2217,6 +2229,7 @@ impl Engine {
             parameter,
             recorder,
             store: self.store.as_ref(),
+            io: &self.ops.io,
             reach,
             others: &others,
             needs: None,
@@ -2269,6 +2282,7 @@ impl Engine {
             parameter: Asking::none(),
             recorder,
             store: self.store.as_ref(),
+            io: &self.ops.io,
             reach,
             others,
             needs: None,

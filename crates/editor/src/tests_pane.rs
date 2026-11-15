@@ -92,6 +92,10 @@ impl Tests {
         self.job.is_some()
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+    )]
     fn runner(&self) -> Option<PathBuf> {
         let found = || {
             let runner = format!("pe2-test-runner{}", std::env::consts::EXE_SUFFIX);
@@ -214,6 +218,10 @@ impl Tests {
     }
 
     /// Run tests, by name: all with none named.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+    )]
     fn run(&mut self, ctx: &egui::Context, runner: &std::path::Path, mut arguments: Vec<String>, names: &[String]) {
         for test in self.suites.values_mut().flatten() {
             if names.is_empty() || names.contains(&test.name) {
@@ -325,6 +333,10 @@ fn row(ui: &mut egui::Ui, test: &Test, selected: bool, can_run: bool, names: f32
 }
 
 /// The pane.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 pub fn tests_ui(ui: &mut egui::Ui, ws: &mut Workspace) {
     let ctx = ui.ctx().clone();
     ws.tests.take_in();

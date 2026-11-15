@@ -7,7 +7,8 @@
 
 use sfs::HostPath;
 use std::collections::BTreeSet;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use notify::event::ModifyKind;
@@ -50,23 +51,32 @@ pub fn layers(p: &Project, taken: impl Fn(Change) -> bool + Send + 'static) -> a
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("project"));
         at_root || layers.iter().any(|layer| path.starts_with(layer)) || changesets.contains(path)
     };
-    watch(&roots, &shallow, move |path| !ignore.iter().any(|i| path.starts_with(i)) && concerns(path), taken)
+    let wanted = move |path: &HostPath| !ignore.iter().any(|i| path.starts_with(i)) && concerns(path);
+    watch(&p.io, &roots, &shallow, wanted, taken)
 }
 
 /// Watch `roots` recursively, symlinks unfollowed (mounted trees are not the index's), and `shallow` for their own
 /// entries only; of what changes there, what is `wanted` is handed to `taken` a batch at a time, for as long as
-/// it says to go on.
+/// it says to go on. Batches are timed by the clock of `io`.
 ///
 /// # Errors
 /// A folder cannot be watched.
 pub fn watch(
+    io: &Arc<dyn pe2_io::Io>,
     roots: &[HostPath],
     shallow: &[HostPath],
     wanted: impl Fn(&HostPath) -> bool + Send + 'static,
     taken: impl Fn(Change) -> bool + Send + 'static,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (events, received) = mpsc::channel();
-    let mut watcher = RecommendedWatcher::new(events, Config::default().with_follow_symlinks(false))?;
+    // Each event sent, and the batching told of it; told as well when the watcher goes, which drops this.
+    let told = Told { waiter: io.clock().waiter() };
+    let waiter = told.waiter.clone();
+    let handler = move |event: notify::Result<notify::Event>| {
+        let _ = events.send(event);
+        told.waiter.wake();
+    };
+    let mut watcher = RecommendedWatcher::new(handler, Config::default().with_follow_symlinks(false))?;
     let roots: Vec<&HostPath> = roots.iter().filter(|root| root.is_dir()).collect();
     // A root inside another is watched with it.
     for root in roots.iter().filter(|r| !roots.iter().any(|o| o != *r && r.starts_with(o))) {
@@ -79,13 +89,29 @@ pub fn watch(
     for dir in shallow {
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
     }
-    std::thread::Builder::new().name("watch".into()).spawn(move || debounce(&received, &wanted, &taken))?;
+    let io = io.clone();
+    std::thread::Builder::new()
+        .name("watch".into())
+        .spawn(move || debounce(&*io, &*waiter, &received, &wanted, &taken))?;
     Ok(watcher)
 }
 
-/// Gather events into batches until the watcher goes away, or what takes them says to stop. A wait times out once
-/// the layers have been quiet for `QUIET`, or the batch's first change is `LONGEST` old: either way the batch goes.
+/// What wakes the batching for each event, and once more as the watcher goes.
+struct Told {
+    waiter: Arc<dyn pe2_io::Waiter>,
+}
+
+impl Drop for Told {
+    fn drop(&mut self) {
+        self.waiter.wake();
+    }
+}
+
+/// Gather events into batches until the watcher goes away, or what takes them says to stop. A batch goes once the
+/// layers have been quiet for `QUIET`, or its first change is `LONGEST` old, by the clock.
 fn debounce(
+    io: &dyn pe2_io::Io,
+    woken: &dyn pe2_io::Waiter,
     events: &Receiver<notify::Result<notify::Event>>,
     wanted: &dyn Fn(&HostPath) -> bool,
     taken: &dyn Fn(Change) -> bool,
@@ -95,12 +121,23 @@ fn debounce(
         path.extension().is_some_and(|e| e == "tmp")
             && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
     };
+    let clock = io.clock();
     let mut paths = BTreeSet::new();
-    let mut since: Option<Instant> = None;
+    // When the batch's first change came, and its last.
+    let mut since: Option<(Instant, Instant)> = None;
     loop {
-        let wait = since.map_or(Duration::from_secs(3600), |t| QUIET.min(LONGEST.saturating_sub(t.elapsed())));
-        match events.recv_timeout(wait) {
-            Ok(Ok(event)) => {
+        let due = since.map(|(first, last)| (last + QUIET).min(first + LONGEST));
+        let event = match events.try_recv() {
+            Ok(event) => Some(event),
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) if due.is_some_and(|due| clock.now() >= due) => None,
+            Err(TryRecvError::Empty) => {
+                woken.wait_until(due);
+                continue;
+            }
+        };
+        match event {
+            Some(Ok(event)) => {
                 // What is read is no change.
                 if !matches!(event.kind, EventKind::Access(_)) {
                     // A folder told modified is what came or went in it, which its entries' own events say: Windows
@@ -112,21 +149,21 @@ fn debounce(
                     let changed = event.paths.into_iter().filter_map(HostPath::from_plain);
                     for path in changed.filter(|p| !atomic(p) && !listed(p) && wanted(p)) {
                         paths.insert(path);
-                        since.get_or_insert_with(Instant::now);
+                        let now = clock.now();
+                        since = Some(since.map_or((now, now), |(first, _)| (first, now)));
                     }
                 }
-                if since.is_none_or(|t| t.elapsed() < LONGEST) {
+                if since.is_none_or(|(first, _)| clock.now() < first + LONGEST) {
                     continue;
                 }
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 if !taken(Change::Error(e.to_string())) {
                     return;
                 }
                 continue;
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            None => {}
         }
         since = None;
         if !paths.is_empty() && !taken(Change::Paths(std::mem::take(&mut paths).into_iter().collect())) {
@@ -162,7 +199,9 @@ mod tests {
             Change::Paths(paths) => seen.send(paths).is_ok(),
             Change::Error(_) => true,
         };
-        let _watching = watch(std::slice::from_ref(&root), &[], move |path| !path.starts_with(&cache), taken).unwrap();
+        let _watching =
+            watch(&pe2_io::system(), std::slice::from_ref(&root), &[], move |path| !path.starts_with(&cache), taken)
+                .unwrap();
         std::fs::write(root.at(".cache/index.json"), "{}").unwrap();
         std::fs::write(root.at("a.node/.node.toml.1.tmp"), "x").unwrap();
         let declaration = root.at("a.node/node.toml");

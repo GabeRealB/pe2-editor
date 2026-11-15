@@ -98,6 +98,7 @@ fn wanted(ws: &Workspace) -> Option<Arc<Name>> {
 
 /// Run a generated layer's plan, off the window's thread.
 /// Have a generated layer's plan run, as the work graph's only work.
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn start(ws: &mut Workspace, layer: &Name) {
     let Ok(generated) = ws.project.layer(layer).cloned() else { return };
     let progress = Arc::new(Progress::default());
@@ -116,6 +117,7 @@ fn start(ws: &mut Workspace, layer: &Name) {
 }
 
 /// Take what a run made, once it is done: the layer taken in again, its state worked out again. What it did, said.
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn finish(ws: &mut Workspace) -> Option<String> {
     let running = ws.fill.running.as_ref()?;
     let ran = running.done.try_recv().ok()?;

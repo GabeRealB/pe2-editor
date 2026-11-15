@@ -108,7 +108,12 @@ pub fn local_name(root: &HostPath, file: &pe2_path::Name, prefix: &str) -> std::
         } else {
             let name = format!("{prefix}-{}.sock", hashed(root));
             let name = pe2_path::Name::new(&name).map_err(std::io::Error::other)?;
-            HostPath::new(&std::env::temp_dir())?.join(name)
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "where every process looks for the endpoint: the system's folder, as the processes it joins agree"
+            )]
+            let folder = std::env::temp_dir();
+            HostPath::new(&folder)?.join(name)
         };
         path.into_path_buf().to_fs_name::<GenericFilePath>()
     }
@@ -180,18 +185,23 @@ pub fn running(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// No host could be started.
-pub fn serving(root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<(Connection, bool)> {
+pub fn serving(
+    root: &HostPath,
+    program: &std::path::Path,
+    args: &[String],
+    clock: &dyn pe2_io::Clock,
+) -> Result<(Connection, bool)> {
     if let Some(mut host) = Connection::connect(root) {
         match host.ask(&ToHost::Status) {
             Ok(FromHost::Status { serves: false, .. }) => {
                 let _ = host.ask(&ToHost::Stop);
                 drop(host);
-                let _ = ROLE.gone_within(root, STOPPING);
+                let _ = ROLE.gone_within(root, STOPPING, clock);
             }
             _ => return Ok((host, false)),
         }
     }
-    Ok((start(root, program, args)?, true))
+    Ok((start(root, program, args, clock)?, true))
 }
 
 /// The program a host is started as, where this one starts hosts for what is asked of a project (`ensure`).
@@ -206,15 +216,16 @@ pub fn start_hosts_with(program: std::path::PathBuf) {
 /// serving its folder nowhere. Whether one runs. None is started by a program that was not told what a host is
 /// started as (`start_hosts_with`), nor by one working under another's lock - which then does the work itself.
 #[must_use]
-pub fn ensure(root: &HostPath) -> bool {
+pub fn ensure(root: &HostPath, io: &dyn pe2_io::Io) -> bool {
+    let clock = io.clock();
     let Some(program) = STARTER.get() else { return false };
-    if crate::lock::inherited(root) {
+    if crate::lock::inherited(root, io.environment()) {
         return false;
     }
     if Connection::connect(root).is_some() {
         return true;
     }
-    match start(root, program, &["--backend".to_string(), "none".to_string()]) {
+    match start(root, program, &["--backend".to_string(), "none".to_string()], clock) {
         Ok(_) => true,
         Err(e) => {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -230,11 +241,11 @@ pub fn ensure(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// None runs, and none could be started.
-pub fn stand_by(root: &HostPath, program: &std::path::Path) -> Result<()> {
+pub fn stand_by(root: &HostPath, program: &std::path::Path, clock: &dyn pe2_io::Clock) -> Result<()> {
     if Connection::connect(root).is_some() {
         return Ok(());
     }
-    start(root, program, &["--backend".to_string(), "none".to_string()]).map(drop)
+    start(root, program, &["--backend".to_string(), "none".to_string()], clock).map(drop)
 }
 
 /// Tell the host standing by for the project in `root` that this process, which holds it, is about to let go of it:
@@ -252,14 +263,14 @@ pub fn leaving(root: &HostPath, who: &str) -> Option<Lease> {
 /// Tell the host of the project in `root` to stop, where nobody keeps it, and wait for it to be gone: whether it is.
 /// One something keeps - an editor it serves the folder for, `project serve` - is left.
 #[must_use]
-pub fn replace(root: &HostPath) -> bool {
+pub fn replace(root: &HostPath, clock: &dyn pe2_io::Clock) -> bool {
     let Some(mut host) = Connection::connect(root) else { return !running(root) };
     if !matches!(host.ask(&ToHost::Status), Ok(FromHost::Status { leases: 0, .. })) {
         return false;
     }
     let _ = host.ask(&ToHost::Stop);
     drop(host);
-    ROLE.gone_within(root, STOPPING)
+    ROLE.gone_within(root, STOPPING, clock)
 }
 
 /// Whether the host of the project in `root` holds it, or is about to (nobody does): its link answers, or will. Not
@@ -275,8 +286,13 @@ pub fn answers(root: &HostPath) -> bool {
 ///
 /// # Errors
 /// It could not be started, or did not listen in time.
-pub fn start(root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<Connection> {
-    ROLE.start(root, program, args).map(|link| Connection { link })
+pub fn start(
+    root: &HostPath,
+    program: &std::path::Path,
+    args: &[String],
+    clock: &dyn pe2_io::Clock,
+) -> Result<Connection> {
+    ROLE.start(root, program, args, clock).map(|link| Connection { link })
 }
 
 /// Where `pe2-cli` is for a program beside it (the editor): in the same folder.

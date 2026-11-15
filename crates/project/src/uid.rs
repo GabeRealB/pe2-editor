@@ -3,15 +3,12 @@
 
 pub use pe2_path::Uid;
 
-/// A new uid, one `taken` does not hold.
-///
-/// # Errors
-/// The system's random source fails.
-pub fn new(taken: impl Fn(Uid) -> bool) -> Result<Uid, getrandom::Error> {
+/// A new uid, drawn of `random`, one `taken` does not hold.
+pub fn new(random: &dyn pe2_io::Random, taken: impl Fn(Uid) -> bool) -> Uid {
     loop {
-        let drawn = i64::try_from(getrandom::u64()? >> 1).ok().and_then(Uid::from_id);
+        let drawn = i64::try_from(random.u64() >> 1).ok().and_then(Uid::from_id);
         if let Some(uid) = drawn.filter(|&uid| !taken(uid)) {
-            return Ok(uid);
+            return uid;
         }
     }
 }

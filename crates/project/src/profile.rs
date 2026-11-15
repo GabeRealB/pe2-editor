@@ -10,6 +10,8 @@
 //! totals' bookkeeping alone, a lock and a map entry, so spans go on work worth timing - an operation, an asset, a
 //! phase - and never on what runs per pixel or per byte.
 
+#![allow(clippy::disallowed_methods, reason = "profiling: it measures the machine's time, and decides nothing")]
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
@@ -190,6 +192,10 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Totals {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
 

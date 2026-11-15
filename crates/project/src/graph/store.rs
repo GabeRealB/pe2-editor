@@ -163,6 +163,8 @@ impl Kept {
 #[derive(Clone)]
 pub struct Store {
     dir: HostPath,
+    /// The project's I/O: what a sweep tells the time by.
+    io: std::sync::Arc<dyn pe2_io::Io>,
 }
 
 /// The file whose time is when the store was last swept.
@@ -177,19 +179,19 @@ impl Store {
     /// # Errors
     /// Its folder cannot be made.
     pub fn open(cache: &Cache) -> Result<Store> {
-        Store::at(cache.path(DIR))
+        Store::at(cache.path(DIR), cache.io.clone())
     }
 
-    /// A store in a folder of its own.
+    /// A store in a folder of its own, of a project whose I/O is `io`.
     ///
     /// # Errors
     /// The folder cannot be made.
-    pub fn at(dir: HostPath) -> Result<Store> {
+    pub fn at(dir: HostPath, io: std::sync::Arc<dyn pe2_io::Io>) -> Result<Store> {
         for sub in [VALUES, BLOBS, TRACES] {
             let path = dir.join(&sub);
             std::fs::create_dir_all(&path).with_context(|| path.display().to_string())?;
         }
-        let store = Store { dir };
+        let store = Store { dir, io };
         let _ = store.sweep_tmp(STALE);
         Ok(store)
     }
@@ -202,7 +204,7 @@ impl Store {
         match (time(self.dir.join(&SWEPT)), time(self.dir.join(&TRACES))) {
             (None, _) => true,
             (Some(swept), Some(written)) => {
-                written > swept && std::time::SystemTime::now().duration_since(swept).is_ok_and(|age| age >= every)
+                written > swept && self.io.clock().wall().duration_since(swept).is_ok_and(|age| age >= every)
             }
             (Some(_), None) => false,
         }
@@ -219,7 +221,7 @@ impl Store {
     #[must_use = "how many were removed is the sweep's report"]
     pub fn sweep_tmp(&self, stale: std::time::Duration) -> usize {
         let Ok(entries) = std::fs::read_dir(self.dir.join(&TMP)) else { return 0 };
-        let now = std::time::SystemTime::now();
+        let now = self.io.clock().wall();
         let old = |e: &std::fs::DirEntry| {
             let modified = e.metadata().and_then(|m| m.modified());
             modified.is_ok_and(|m| now.duration_since(m).is_ok_and(|age| age >= stale))
@@ -505,7 +507,7 @@ impl Store {
     /// it before its trace).
     #[must_use = "what was swept is the sweep's report"]
     pub fn sweep(&self, live: &HashSet<String>, used: &HashSet<&String>) -> (usize, usize, usize) {
-        self.sweep_older(live, used, std::time::SystemTime::now() - std::time::Duration::from_secs(2))
+        self.sweep_older(live, used, self.io.clock().wall() - std::time::Duration::from_secs(2))
     }
 
     /// Sweep as `sweep` does what was written before `began`.
@@ -531,7 +533,7 @@ impl Store {
             };
             // A trace in use is the newest there is.
             let written = if used.contains(&key) {
-                std::time::SystemTime::now() + std::time::Duration::from_secs(1)
+                self.io.clock().wall() + std::time::Duration::from_secs(1)
             } else {
                 entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH)
             };

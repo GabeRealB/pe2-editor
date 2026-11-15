@@ -38,6 +38,10 @@ pub struct Access {
     read: Mutex<(BTreeMap<Arc<RelPath>, Read>, bool)>,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "what to let go of first, by when it was read: a cost, never what is read"
+)]
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }

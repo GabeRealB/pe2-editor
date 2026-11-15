@@ -26,8 +26,8 @@ So the work is split in two:
 - A folder made, a rename: at once.
 - Temporary files editors leave beside a file are never taken.
 
-When each is due is read from the writes' clock (`vfs::writes::Clock`): the system's, or one that stands until it is
-moved. The tests move a standing one to say how much time has passed - a burst ended, a removal settled, an owner asked
+When each is due is read from the clock of the writes' I/O (`pe2_io::Io`): the system's, or one that stands until it is
+moved (`pe2_io::Standing`), and the writes' thread waits on it (a `Waiter`), never on the machine's time. The tests move a standing one to say how much time has passed - a burst ended, a removal settled, an owner asked
 again - and settle what that brings due, so that none of them reads the time or waits for it.
 
 ## Robustness

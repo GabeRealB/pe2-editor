@@ -1,5 +1,7 @@
 //! Every CAP dialogue in a folder read and written back: `cargo run -p formats --example cap_identity -- <folder>`.
 
+#![allow(clippy::disallowed_methods, reason = "an example: it reads the folder its argument names")]
+
 fn main() {
     let folder = std::env::args().nth(1).expect("a folder of .cap files");
     let mut entries: Vec<_> = std::fs::read_dir(&folder).expect("a folder").flatten().map(|e| e.path()).collect();

@@ -593,6 +593,10 @@ pub fn read(blob: &[u8]) -> Result<Bank> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{Binding, join, read, split};
 

@@ -8,6 +8,11 @@
 //!   and reading a file cost in this crate alone, to tell them from what a backend and the system add.
 //! - `folder`: a project's folder as something serves it now (`PE2_BENCH_FOLDER`): listed, its small files and its
 //!   largest read a first time and again, files written into it and removed.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "benchmarks run by hand: they measure the machine's time, configured by its environment"
+)]
 use sfs::HostPath;
 use sfs::testing::At as _;
 
@@ -306,7 +311,7 @@ fn tree() {
     // A view of the shared filesystem, and that view with pages kept of what is read.
     let listing = index.served();
     let space = std::sync::Arc::new(sfs::Space::private().expect("a space"));
-    project::shared::say_whole(&space, &listing).expect("said");
+    project::shared::say_whole(&space, &listing, &pe2_io::SystemClock).expect("said");
     let ring = std::sync::Arc::new(sfs::ring::Ring::private(256 << 20).expect("a ring"));
     tree_of("a view", indexed, &|| vfs::Served::shared(space.clone(), None));
     tree_of("a view with pages kept", indexed, &|| vfs::Served::shared(space.clone(), Some(ring.clone())));

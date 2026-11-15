@@ -11,7 +11,7 @@ use sfs::HostPath;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cache::DIR;
 
@@ -75,10 +75,10 @@ impl Role {
 
     /// Wait for the one of the project in `root` to be gone, this long at most: whether it is.
     #[must_use]
-    pub fn gone_within(&self, root: &HostPath, limit: Duration) -> bool {
-        let told = Instant::now();
-        while self.running(root) && told.elapsed() < limit {
-            std::thread::sleep(Duration::from_millis(50));
+    pub fn gone_within(&self, root: &HostPath, limit: Duration, clock: &dyn pe2_io::Clock) -> bool {
+        let told = clock.now();
+        while self.running(root) && clock.now().saturating_duration_since(told) < limit {
+            pe2_io::sleep(clock, Duration::from_millis(50));
         }
         !self.running(root)
     }
@@ -95,7 +95,13 @@ impl Role {
     ///
     /// # Errors
     /// It could not be started, or did not listen in time.
-    pub fn start(&self, root: &HostPath, program: &std::path::Path, args: &[String]) -> Result<Link> {
+    pub fn start(
+        &self,
+        root: &HostPath,
+        program: &std::path::Path,
+        args: &[String],
+        clock: &dyn pe2_io::Clock,
+    ) -> Result<Link> {
         crate::cache::make(root)?;
         let log = std::fs::File::create(root.join(&DIR).join(&self.log))?;
         let mut command = std::process::Command::new(program.as_os_str());
@@ -119,7 +125,7 @@ impl Role {
             keep_output_to_ourselves();
         }
         let mut child = command.spawn().with_context(|| format!("starting {}", program.display()))?;
-        let started = Instant::now();
+        let started = clock.now();
         loop {
             if let Some(link) = self.connect(root) {
                 return Ok(link);
@@ -132,10 +138,10 @@ impl Role {
                 let said = std::fs::read_to_string(root.join(&DIR).join(&self.log)).unwrap_or_default();
                 bail!("the {} ended ({status}): {}", self.command, said.trim());
             }
-            if started.elapsed() > STARTING {
+            if clock.now().saturating_duration_since(started) > STARTING {
                 bail!("the {} did not listen within {}s", self.command, STARTING.as_secs());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            pe2_io::sleep(clock, Duration::from_millis(50));
         }
     }
 
@@ -148,6 +154,7 @@ impl Role {
         &'static self,
         root: &HostPath,
         stopping: Arc<AtomicBool>,
+        io: Arc<dyn pe2_io::Io>,
         connection: impl Fn(Stream) + Send + Sync + 'static,
     ) -> Result<Listening> {
         let listener =
@@ -164,7 +171,7 @@ impl Role {
                 let _ = std::thread::Builder::new().name("connection".into()).spawn(move || connection(stream));
             }
         })?;
-        Ok(Listening { role: self, root: root.clone(), stopping, thread: Some(thread) })
+        Ok(Listening { role: self, root: root.clone(), stopping, io, thread: Some(thread) })
     }
 }
 
@@ -197,12 +204,19 @@ impl Link {
 }
 
 /// Listening for what processes say: stopped when dropped.
-#[derive(Debug)]
 pub struct Listening {
     role: &'static Role,
     root: HostPath,
     stopping: Arc<AtomicBool>,
+    /// What its waits are timed by.
+    io: Arc<dyn pe2_io::Io>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for Listening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listening").field("role", &self.role).field("root", &self.root).finish_non_exhaustive()
+    }
 }
 
 impl Drop for Listening {
@@ -221,9 +235,10 @@ impl Drop for Listening {
         }
         // Waited for a moment only: where its socket is gone - the project's cache removed under it - nothing wakes
         // it, and it is left to end with the process.
-        let asked = Instant::now();
-        while !thread.is_finished() && asked.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(5));
+        let clock = self.io.clock();
+        let asked = clock.now();
+        while !thread.is_finished() && clock.now().saturating_duration_since(asked) < Duration::from_secs(2) {
+            pe2_io::sleep(clock, Duration::from_millis(5));
         }
         if thread.is_finished() {
             let _ = thread.join();

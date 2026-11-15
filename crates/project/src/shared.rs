@@ -91,8 +91,8 @@ pub fn rest_all() {
     }
 }
 
-fn now() -> u64 {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+fn now(clock: &dyn pe2_io::Clock) -> u64 {
+    let since = clock.wall().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -100,8 +100,8 @@ fn now() -> u64 {
 ///
 /// # Errors
 /// As `show`.
-pub fn say_whole(space: &sfs::Space, listing: &Listing) -> Result<()> {
-    say_whole_with(space, listing, &mut |_| Ok(()))
+pub fn say_whole(space: &sfs::Space, listing: &Listing, clock: &dyn pe2_io::Clock) -> Result<()> {
+    say_whole_with(space, listing, &mut |_| Ok(()), clock)
 }
 
 /// As `say_whole`, with what else its commit says, said first (as `say_with` says it).
@@ -112,10 +112,11 @@ pub fn say_whole_with(
     space: &sfs::Space,
     listing: &Listing,
     also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>,
+    clock: &dyn pe2_io::Clock,
 ) -> Result<()> {
     let mut txn = space.write()?;
     also(&mut txn)?;
-    show_whole(&mut txn, listing, now())?;
+    show_whole(&mut txn, listing, now(clock))?;
     txn.commit()
 }
 
@@ -123,8 +124,8 @@ pub fn say_whole_with(
 ///
 /// # Errors
 /// As `show`.
-pub fn say(space: &sfs::Space, delta: &Delta) -> Result<()> {
-    say_with(space, delta, &mut |_| Ok(()))
+pub fn say(space: &sfs::Space, delta: &Delta, clock: &dyn pe2_io::Clock) -> Result<()> {
+    say_with(space, delta, &mut |_| Ok(()), clock)
 }
 
 /// As `say`, with what else its commit says: what whoever says it has to say of the same moment - what became of
@@ -132,8 +133,13 @@ pub fn say(space: &sfs::Space, delta: &Delta) -> Result<()> {
 ///
 /// # Errors
 /// As `show`, and what `also` could not do.
-pub fn say_with(space: &sfs::Space, delta: &Delta, also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>) -> Result<()> {
-    say_each_with(space, std::slice::from_ref(delta), also)
+pub fn say_with(
+    space: &sfs::Space,
+    delta: &Delta,
+    also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>,
+    clock: &dyn pe2_io::Clock,
+) -> Result<()> {
+    say_each_with(space, std::slice::from_ref(delta), also, clock)
 }
 
 /// As `say_with`, of several changes one after another, in one commit: what several refreshes changed of what is
@@ -145,12 +151,13 @@ pub fn say_each_with(
     space: &sfs::Space,
     deltas: &[Delta],
     also: &mut dyn FnMut(&mut Txn<'_>) -> Result<()>,
+    clock: &dyn pe2_io::Clock,
 ) -> Result<()> {
     let mut txn = space.write()?;
     // First: a move the project took is no longer one its paths are read through (`moved`), and what is said
     // here is said of the project with that move made.
     also(&mut txn)?;
-    let now = now();
+    let now = now(clock);
     for delta in deltas {
         show(&mut txn, delta, now)?;
     }
@@ -646,6 +653,10 @@ pub fn changed(pages: &impl Pages, after: u64, listing: &Listing) -> Result<Opti
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::*;
     use pe2_path::RelPath;
@@ -692,7 +703,7 @@ mod tests {
     fn what_is_made_through_the_folder_is_not_what_the_project_serves_until_the_project_has_it() {
         let space = Space::private().unwrap();
         let before = small();
-        say_whole(&space, &before).unwrap();
+        say_whole(&space, &before, &pe2_io::SystemClock).unwrap();
         // Whoever serves the folder makes a folder in it, and one in that, a program having asked.
         let mut txn = space.write().unwrap();
         let rooms = fs::at(&txn, SERVED, r("rooms")).unwrap().unwrap();
@@ -715,13 +726,13 @@ mod tests {
         );
         // Said whole again, or a path beside it said gone, it stays; said gone itself - which the project never had
         // - it stays too.
-        say_whole(&space, &before).unwrap();
-        say(&space, &Delta { gone: [t("rooms/made")].into(), ..Delta::default() }).unwrap();
+        say_whole(&space, &before, &pe2_io::SystemClock).unwrap();
+        say(&space, &Delta { gone: [t("rooms/made")].into(), ..Delta::default() }, &pe2_io::SystemClock).unwrap();
         assert_eq!(flags_at(&space, "rooms/made/inside"), Some(NEW));
         // The project has the first: listed from then on, as the node it was made as; the one in it not yet.
         let mut now = before.clone();
         now.insert(t("rooms/made"), Shown::Folder);
-        say(&space, &Delta::between(&before, &now)).unwrap();
+        say(&space, &Delta::between(&before, &now), &pe2_io::SystemClock).unwrap();
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         assert_eq!(
             fs::at(&space.read().unwrap(), SERVED, r("rooms/made")).unwrap(),
@@ -735,7 +746,7 @@ mod tests {
     fn what_was_removed_through_the_folder_stays_so_whatever_the_project_says_of_it_meanwhile() {
         let space = Space::private().unwrap();
         let before = small();
-        say_whole(&space, &before).unwrap();
+        say_whole(&space, &before, &pe2_io::SystemClock).unwrap();
         let mut txn = space.write().unwrap();
         let number = fs::at(&txn, SERVED, r("rooms/a.txt")).unwrap().unwrap();
         let node = fs::node(&txn, SERVED, number).unwrap().unwrap();
@@ -745,11 +756,11 @@ mod tests {
         // The project changes it: removed through the folder all the same.
         let mut now = before.clone();
         now.insert(t("rooms/a.txt"), file(5, 20, false, Source::Disk));
-        say(&space, &Delta::between(&before, &now)).unwrap();
+        say(&space, &Delta::between(&before, &now), &pe2_io::SystemClock).unwrap();
         assert_eq!(flags_at(&space, "rooms/a.txt"), Some(GONE));
         assert_eq!(listed(&space.read().unwrap()).unwrap(), now);
         // The project takes the removal: gone.
-        say(&space, &Delta { gone: [t("rooms/a.txt")].into(), ..Delta::default() }).unwrap();
+        say(&space, &Delta { gone: [t("rooms/a.txt")].into(), ..Delta::default() }, &pe2_io::SystemClock).unwrap();
         assert_eq!(flags_at(&space, "rooms/a.txt"), None);
     }
 
@@ -757,7 +768,7 @@ mod tests {
     fn what_the_project_says_of_a_path_moved_through_the_folder_is_said_where_it_is_now() {
         let space = Space::private().unwrap();
         let before = small();
-        say_whole(&space, &before).unwrap();
+        say_whole(&space, &before, &pe2_io::SystemClock).unwrap();
         // A program renames a folder; whoever serves it moves it at once, and says the project is yet to.
         let mut txn = space.write().unwrap();
         let rooms = fs::at(&txn, SERVED, r("rooms")).unwrap().unwrap();
@@ -773,8 +784,8 @@ mod tests {
         let mut now = before.clone();
         now.insert(t("rooms/a.txt"), file(5, 20, false, Source::Disk));
         now.insert(t("rooms/c.txt"), file(3, 20, false, Source::Disk));
-        say(&space, &Delta::between(&before, &now)).unwrap();
-        say_whole(&space, &now).unwrap();
+        say(&space, &Delta::between(&before, &now), &pe2_io::SystemClock).unwrap();
+        say_whole(&space, &now, &pe2_io::SystemClock).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         let pages = space.read().unwrap();
         let a = fs::at(&pages, SERVED, r("halls/a.txt"))
@@ -786,14 +797,20 @@ mod tests {
         // gone, where it is shown - and nothing of what is there taken away for it.
         let moved_listing: Listing =
             now.iter().map(|(path, it)| (t(&path.as_str().replacen("rooms", "halls", 1)), it.clone())).collect();
-        say_with(&space, &Delta::between(&now, &moved_listing), &mut |txn| unmoved(txn, 7).map(drop)).unwrap();
+        say_with(
+            &space,
+            &Delta::between(&now, &moved_listing),
+            &mut |txn| unmoved(txn, 7).map(drop),
+            &pe2_io::SystemClock,
+        )
+        .unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt"]);
         assert_eq!(listed(&space.read().unwrap()).unwrap(), moved_listing);
         assert_eq!(fs::at(&space.read().unwrap(), SERVED, r("halls")).unwrap(), Some(rooms), "the folder it was");
         // From then on its paths are the project's own again.
         let mut last = moved_listing.clone();
         last.insert(t("rooms"), Shown::Folder);
-        say(&space, &Delta::between(&moved_listing, &last)).unwrap();
+        say(&space, &Delta::between(&moved_listing, &last), &pe2_io::SystemClock).unwrap();
         assert_eq!(there(&space), ["halls", "halls/a.txt", "halls/c.txt", "props", "props/b.txt", "rooms"]);
     }
 
@@ -938,10 +955,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         for (name, space) in [("memory", Space::private().unwrap()), ("files", Space::open(&dir).unwrap())] {
             let whole = std::time::Instant::now();
-            say_whole(&space, &listing).unwrap();
+            say_whole(&space, &listing, &pe2_io::SystemClock).unwrap();
             let whole = whole.elapsed();
             let again = std::time::Instant::now();
-            say_whole(&space, &listing).unwrap();
+            say_whole(&space, &listing, &pe2_io::SystemClock).unwrap();
             let again = again.elapsed();
             let read = std::time::Instant::now();
             let said = listed(&space.read().unwrap()).unwrap();
@@ -954,14 +971,20 @@ mod tests {
             for n in 1..=100 {
                 let other =
                     Shown::File { disk: disk.clone(), size: size + n, modified, of_files, source: source.clone() };
-                say(&space, &Delta { shown: [(path.clone(), other)].into(), gone: [].into() }).unwrap();
+                say(&space, &Delta { shown: [(path.clone(), other)].into(), gone: [].into() }, &pe2_io::SystemClock)
+                    .unwrap();
             }
             let changed = changed.elapsed();
             let added = std::time::Instant::now();
             for n in 0..100 {
                 let new = t(&format!("zz_bench/file-{n}.txt"));
-                say(&space, &Delta { shown: [(new.clone(), shown.clone())].into(), gone: [].into() }).unwrap();
-                say(&space, &Delta { shown: [].into(), gone: [new].into() }).unwrap();
+                say(
+                    &space,
+                    &Delta { shown: [(new.clone(), shown.clone())].into(), gone: [].into() },
+                    &pe2_io::SystemClock,
+                )
+                .unwrap();
+                say(&space, &Delta { shown: [].into(), gone: [new].into() }, &pe2_io::SystemClock).unwrap();
             }
             let added = added.elapsed();
             let usage = space.usage().unwrap();

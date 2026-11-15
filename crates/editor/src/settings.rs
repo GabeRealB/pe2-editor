@@ -232,6 +232,10 @@ pub struct WindowState {
 }
 
 /// Where the settings live: the editor's per-user storage directory.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 pub fn path() -> Option<std::path::PathBuf> {
     extensions::data_folder().map(|d| d.join(FILE))
 }

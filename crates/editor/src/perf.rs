@@ -98,6 +98,7 @@ pub fn note_renderer(name: String, vendor: u32) {
 
 /// The last sample, for an agent, which keeps the GPU sampled for a while.
 #[must_use]
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 pub fn read() -> serde_json::Value {
     let shared = shared();
     *shared.asked.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
@@ -132,6 +133,7 @@ fn spans() -> serde_json::Value {
     serde_json::Value::Array(rows.collect())
 }
 
+#[allow(clippy::disallowed_methods, reason = "measured for what is shown of it: nothing is decided by it")]
 fn sample_forever(shared: &Shared) {
     // Without either, the rest is still worth having.
     let mut system = System::new().ok();

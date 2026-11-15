@@ -106,6 +106,8 @@ struct Opening {
 
 #[expect(clippy::struct_excessive_bools, reason = "each answers for itself")]
 pub struct Editor {
+    /// The program's I/O: what every project it opens reads the outside world through.
+    io: std::sync::Arc<dyn pe2_io::Io>,
     workspace: Option<Workspace>,
     /// What waits for the job of its ticket, in the order it was asked.
     deferred: Vec<(u64, Deferred)>,
@@ -249,6 +251,7 @@ fn active_config(settings: &EditorSettings, project: &project::Project) -> Optio
 
 impl Editor {
     #[expect(clippy::too_many_lines, reason = "what it starts with, one line each")]
+    #[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
     pub fn new(cc: &eframe::CreationContext<'_>, start: Start) -> Editor {
         let stored = |key| cc.storage.and_then(|s| s.get_string(key));
         let layout =
@@ -284,7 +287,9 @@ impl Editor {
         theme::apply(&cc.egui_ctx, &settings.appearance);
         let last = settings.startup.reopen_last_project.then(|| settings.last_project.clone()).flatten();
         let project = start.project.or(last);
+        let io = pe2_io::system();
         let mut editor = Editor {
+            io: io.clone(),
             workspace: None,
             deferred: Vec::new(),
             opening: None,
@@ -343,7 +348,7 @@ impl Editor {
             not_now: None,
             unattended: start.unattended,
             drive: crate::drive::Driver::new(),
-            presence: mcp::presence::Keeper::start(),
+            presence: mcp::presence::Keeper::start(io),
             agents_drive: start.agents_drive,
         };
         if let Some(dir) = project {
@@ -372,6 +377,10 @@ impl Editor {
     }
 
     /// Open a project, off the window's thread. The panes say how far it is, and it is shown once open (`opened`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn open_now(&mut self, dir: &std::path::Path) {
         // Where the project is, as a place: what is said of it and compared with what other processes hold.
         let dir = &match HostPath::new(dir) {
@@ -386,6 +395,7 @@ impl Editor {
         let leaving = self.workspace.take().map(Workspace::leave);
         self.deferred.clear();
         let progress: Arc<std::sync::Mutex<(String, usize, usize)>> = Arc::default();
+        let io = self.io.clone();
         // Said before the lock is taken: an agent's server finding it about to open the project leaves the project to it.
         self.announce_opening(dir);
         let (done, ready) = std::sync::mpsc::channel();
@@ -403,7 +413,7 @@ impl Editor {
             drop(leaving);
             // Opening is the editor's own doing: what the user asks of it meanwhile goes first.
             let group = project::schedule::Group::new(project::schedule::Class::Background, "opening");
-            let _ = done.send(group.enter(|| Workspace::prepare(&dir_owned, &report, (to_frames, link_ctx))));
+            let _ = done.send(group.enter(|| Workspace::prepare(&dir_owned, &io, &report, (to_frames, link_ctx))));
             ctx.request_repaint();
         });
         match started {
@@ -1658,6 +1668,10 @@ impl Editor {
     }
 
     /// Run a command an agent named.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn run_by_id(&mut self, ctx: &egui::Context, id: &str) -> mcp::Reply {
         let Some(command) = self.commands().into_iter().find(|command| command.id() == id) else {
             return mcp::Reply::failed(format!("{id}: no such command (editor_commands lists them)"));
@@ -2399,6 +2413,10 @@ impl Editor {
     /// The status bar; whether its problem count was clicked, what was asked of the unsaved documents, and a pane
     /// asked for.
     /// Whether agents may use the editor, in the status bar, and whether they can connect.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn agents_status(&self, ui: &mut egui::Ui, ws: &Workspace) {
         if ws.link_error.is_none() && (self.agents_drive || self.settings.agents.drive) {
             if extensions::trust::trusts_everything() {
@@ -2991,6 +3009,10 @@ impl eframe::App for Editor {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // The frame before ended where this one begins.
         project::profile::frame();

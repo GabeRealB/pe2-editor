@@ -367,6 +367,8 @@ pub struct Ops {
     pub viewers: Arc<Vec<Type>>,
     /// The operations the project defines, by uid (`uid://...`): laid into each stack using one.
     pub definitions: Arc<Definitions>,
+    /// The host's I/O, which what runs them is given.
+    pub io: Arc<dyn pe2_io::Io>,
 }
 
 /// What a project defines an operation as: a node of this type (`pe2.graph@operation`).
@@ -759,7 +761,12 @@ fn add_lists(ops: &mut Ops) {
 
 impl Default for Ops {
     fn default() -> Ops {
-        let mut ops = Ops { defs: HashMap::new(), viewers: Arc::new(Vec::new()), definitions: Arc::default() };
+        let mut ops = Ops {
+            defs: HashMap::new(),
+            viewers: Arc::new(Vec::new()),
+            definitions: Arc::default(),
+            io: pe2_io::system(),
+        };
         ops.add(OpDef::new(FILE, "Stored file", "1").makes(Type::File(Box::new(Type::Any)), |call| {
             // A file the releases have apart is read as the release being built has it (`<release>/<file>`).
             let name = call.of_release(pe2_path::RelPath::new(call.setting_str("file")?)?);
@@ -2148,4 +2155,8 @@ pub fn import_of(fields: &Table) -> Option<Import<'_>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests;

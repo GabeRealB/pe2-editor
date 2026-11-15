@@ -19,6 +19,10 @@ use crate::workspace::Workspace;
 const READ_AGAIN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The view.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+)]
 pub(super) fn fetched_ui(ui: &mut egui::Ui, ws: &mut Workspace, state: &mut State, message: &mut Option<String>) {
     let Some(store) = extensions::setup_folder() else {
         ui.label(

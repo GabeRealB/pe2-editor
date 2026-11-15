@@ -47,6 +47,10 @@ const SWEEP_ASKED: std::time::Duration = std::time::Duration::from_mins(5);
 
 impl Fetcher {
     /// Go on: a fetch done is taken in, and the next started - what the extensions running require first.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the window's pace: when it looks again or shows something, never what the project becomes"
+    )]
     pub fn tick(&mut self, extensions: &Extensions, ctx: &eframe::egui::Context) {
         if let Some(running) = self.running.take_if(|r| r.done.load(std::sync::atomic::Ordering::Relaxed)) {
             let state = running.state.lock().map(|state| state.clone()).ok();

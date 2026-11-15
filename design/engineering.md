@@ -9,6 +9,12 @@ target the extensions are built for. A normal `cargo build` builds the editor, t
 Every warning is an error, Clippy's pedantic group included (`[workspace.lints]`). `cargo xtask` lays out and
 archives releases, and helps extension authors pin their downloads (see the README).
 
+What code reads of the outside world - the time, a wait for it, randomness, the environment - it reads through the
+I/O its owner was given (`pe2_io::Io`: a project's, the writes', a holder's), never from the system; the build refuses
+the system's own calls (`clippy.toml`). Where one is right - a measurement, the window's pace, what every process
+shares, a test's fixtures - it is allowed where it is made, saying why. `pe2-io` alone reads the system, and the
+setup crate, whose folder is the machine's.
+
 What a build needs that is no crate is pinned in `prepare.toml`, as an extension's `[[setup]]` entries are, and fetched
 by `cargo xtask prepare` into `prepared/<platform>/`; the editor crate's build script fails by name until it is there
 and as pinned, then puts it beside the programs the build makes (`target/<profile>/`), as a release has it beside them

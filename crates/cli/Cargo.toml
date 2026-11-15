@@ -19,6 +19,7 @@ pe2-ext.workspace = true
 codecs.workspace = true
 project.workspace = true
 pe2-path.workspace = true
+pe2-io.workspace = true
 sfs.workspace = true
 mcp.workspace = true
 holder.workspace = true

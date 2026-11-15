@@ -2,6 +2,10 @@
 //! and its glyphs written as PNGs.
 //!
 //! `cargo run --release -p pe2-fonts --example draw_face -- <face.ufo> <out dir> [em texels] [outline texels]`
+#![allow(
+    clippy::disallowed_methods,
+    reason = "an example run by hand: it reads what its arguments and the machine give"
+)]
 use sfs::testing::At as _;
 
 use std::collections::BTreeMap;

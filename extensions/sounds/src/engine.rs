@@ -643,6 +643,10 @@ pub fn score(bank: &Bank, entry: usize, limit: f64) -> anyhow::Result<Score> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod tests {
     use super::{gain, pan_gain, pitch, table_word};
 
@@ -658,6 +662,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod banks {
     /// Every slot of the banks in a folder (`PE2_SOUND_BANKS`) played: each is heard, and each ends by itself or is a
     /// script held or looped until stopped.
@@ -692,6 +700,10 @@ mod banks {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's fixtures: the machine's time, places and environment, which nothing tested reads"
+)]
 mod reverb {
     /// The executable's Studio B mode (`PE2_EXECUTABLE`) read as its node does, and the banks (`PE2_SOUND_BANKS`) played
     /// through it in the default room: what the reverb adds is heard, bounded, and dies away.

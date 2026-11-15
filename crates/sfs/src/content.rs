@@ -51,16 +51,16 @@ enum Held {
 }
 
 impl Content {
-    /// An empty file whose bytes go to the log, under this number.
+    /// An empty file whose bytes go to the log, under this number, made at `at`.
     #[must_use]
-    pub fn logged(id: u64) -> Content {
-        Content { id, held: Held::Logged(BTreeMap::new()), len: 0, modified: SystemTime::now(), changes: 0 }
+    pub fn logged(id: u64, at: SystemTime) -> Content {
+        Content { id, held: Held::Logged(BTreeMap::new()), len: 0, modified: at, changes: 0 }
     }
 
-    /// An empty file kept in memory: never the project's.
+    /// An empty file kept in memory, made at `at`: never the project's.
     #[must_use]
-    pub fn in_memory(id: u64) -> Content {
-        Content { id, held: Held::Memory(Vec::new()), len: 0, modified: SystemTime::now(), changes: 0 }
+    pub fn in_memory(id: u64, at: SystemTime) -> Content {
+        Content { id, held: Held::Memory(Vec::new()), len: 0, modified: at, changes: 0 }
     }
 
     #[must_use]
@@ -119,8 +119,8 @@ impl Content {
     ///
     /// # Errors
     /// As `write`.
-    pub fn fill(&mut self, log: &Log, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.put(log, FILL, offset, data)
+    pub fn fill(&mut self, log: &Log, offset: u64, data: &[u8], at: SystemTime) -> io::Result<()> {
+        self.put(log, FILL, offset, data, at)
     }
 
     /// Where it is in the log: each range's start in the file, its length, and its place in the log. None where it
@@ -135,22 +135,23 @@ impl Content {
         }
     }
 
-    /// The content of this length whose ranges in the log are these: what another process says of a file it wrote.
+    /// The content of this length whose ranges in the log are these: what another process says of a file it wrote,
+    /// to read. Its time is none of its own: what was said of it is its ranges.
     #[must_use]
     pub fn of_ranges(len: u64, ranges: &[(u64, u64, u64)]) -> Content {
         let extents = ranges.iter().map(|(start, len, at)| (*start, Extent { len: *len, at: *at })).collect();
-        Content { id: 0, held: Held::Logged(extents), len, modified: SystemTime::now(), changes: 0 }
+        Content { id: 0, held: Held::Logged(extents), len, modified: SystemTime::UNIX_EPOCH, changes: 0 }
     }
 
-    /// Write bytes at a place in the file: appended to the log first, then found from here.
+    /// Write bytes at a place in the file, at `at`: appended to the log first, then found from here.
     ///
     /// # Errors
     /// The log cannot take them: it is full, or its disk is.
-    pub fn write(&mut self, log: &Log, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.put(log, DATA, offset, data)
+    pub fn write(&mut self, log: &Log, offset: u64, data: &[u8], at: SystemTime) -> io::Result<()> {
+        self.put(log, DATA, offset, data, at)
     }
 
-    fn put(&mut self, log: &Log, kind: u8, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn put(&mut self, log: &Log, kind: u8, offset: u64, data: &[u8], at: SystemTime) -> io::Result<()> {
         match &mut self.held {
             Held::Memory(bytes) => {
                 let (start, end) = (to_usize(offset), to_usize(offset) + data.len());
@@ -170,13 +171,13 @@ impl Content {
             }
         }
         self.len = self.len.max(offset + data.len() as u64);
-        self.modified = SystemTime::now();
+        self.modified = at;
         self.changes += 1;
         Ok(())
     }
 
-    /// Make the file this long: shorter, what is past it is gone; longer, what is added reads as zeros.
-    pub fn truncate(&mut self, len: u64) {
+    /// Make the file this long, at `at`: shorter, what is past it is gone; longer, what is added reads as zeros.
+    pub fn truncate(&mut self, len: u64, at: SystemTime) {
         match &mut self.held {
             Held::Memory(bytes) => bytes.resize(to_usize(len), 0),
             Held::Logged(extents) => {
@@ -189,7 +190,7 @@ impl Content {
             }
         }
         self.len = len;
-        self.modified = SystemTime::now();
+        self.modified = at;
         self.changes += 1;
     }
 
@@ -244,9 +245,10 @@ impl Content {
     /// It cannot be read from the log, or appended to it; it is then as it was.
     pub fn moved_forward(&mut self, log: &Log, id: u64) -> io::Result<()> {
         let Held::Logged(extents) = &self.held else { return Ok(()) };
-        let mut moved = Content::logged(id);
+        // The same file, its time kept.
+        let mut moved = Content::logged(id, self.modified);
         for (start, extent) in extents {
-            moved.write(log, *start, &log.bytes(extent.at, to_usize(extent.len))?)?;
+            moved.write(log, *start, &log.bytes(extent.at, to_usize(extent.len))?, self.modified)?;
         }
         // Its length said too: what no bytes cover at its end is found again by nothing else.
         crate::Op::Truncated { file: id, len: self.len }.append(log)?;
@@ -271,8 +273,7 @@ impl Content {
         self.held = if begun.is_some() { Held::Logged(BTreeMap::new()) } else { Held::Memory(Vec::new()) };
         self.id = begun.unwrap_or(self.id);
         self.len = 0;
-        self.write(log, 0, &bytes)?;
-        self.modified = modified;
+        self.write(log, 0, &bytes, modified)?;
         Ok(())
     }
 }
@@ -323,6 +324,7 @@ mod tests {
     use super::Content;
     use crate::HostPath;
     use crate::log::{Config, Log};
+    use std::time::SystemTime;
 
     fn log(name: &str) -> (HostPath, Log) {
         let dir = crate::testing::scratch(&format!("sfs-content-{name}"));
@@ -341,7 +343,11 @@ mod tests {
     fn what_is_written_is_read_back_whatever_overlaps_it() {
         let (dir, log) = log("overlap");
         // The same writes to a file in the log, to one in memory, and to a plain buffer: all read the same.
-        let (mut logged, mut memory, mut plain) = (Content::logged(1), Content::in_memory(2), Vec::<u8>::new());
+        let (mut logged, mut memory, mut plain) = (
+            Content::logged(1, SystemTime::UNIX_EPOCH),
+            Content::in_memory(2, SystemTime::UNIX_EPOCH),
+            Vec::<u8>::new(),
+        );
         let writes: [(u64, &[u8]); 7] = [
             (0, b"0123456789"),
             (20, b"past a hole"),
@@ -352,8 +358,8 @@ mod tests {
             (3, b"spanning everything written before it, and more....."),
         ];
         for (offset, data) in writes {
-            logged.write(&log, offset, data).unwrap();
-            memory.write(&log, offset, data).unwrap();
+            logged.write(&log, offset, data, SystemTime::UNIX_EPOCH).unwrap();
+            memory.write(&log, offset, data, SystemTime::UNIX_EPOCH).unwrap();
             let end = usize::try_from(offset).unwrap() + data.len();
             if plain.len() < end {
                 plain.resize(end, 0);
@@ -369,8 +375,8 @@ mod tests {
         assert_eq!(logged.read_into(&log, plain.len() as u64, &mut some).unwrap(), 0, "nothing past its end");
         // Made shorter, then longer: what is added reads as zeros.
         for content in [&mut logged, &mut memory] {
-            content.truncate(7);
-            content.truncate(12);
+            content.truncate(7, SystemTime::UNIX_EPOCH);
+            content.truncate(12, SystemTime::UNIX_EPOCH);
         }
         plain.truncate(7);
         plain.resize(12, 0);
@@ -386,7 +392,7 @@ mod tests {
         assert_eq!(logged.first(), Some(ended));
         assert_eq!(all(&logged, &log), plain);
         // Found again from the log's records alone, as by a process that starts: the same.
-        let mut found = Content::logged(ended);
+        let mut found = Content::logged(ended, SystemTime::UNIX_EPOCH);
         for record in log.records(ended) {
             let record = record.unwrap();
             if let Some((file, offset, at, len, _)) = super::data(&record)
@@ -397,7 +403,7 @@ mod tests {
             if let Some(crate::Op::Truncated { file, len }) = crate::Op::of(record.kind, &record.body)
                 && file == ended
             {
-                found.truncate(len);
+                found.truncate(len, SystemTime::UNIX_EPOCH);
             }
         }
         assert_eq!(all(&found, &log), plain);
@@ -412,9 +418,9 @@ mod tests {
     #[test]
     fn a_long_write_is_several_records_and_one_file() {
         let (dir, log) = log("long");
-        let mut content = Content::logged(7);
+        let mut content = Content::logged(7, SystemTime::UNIX_EPOCH);
         let data: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
-        content.write(&log, 0, &data).unwrap();
+        content.write(&log, 0, &data, SystemTime::UNIX_EPOCH).unwrap();
         assert!(log.records(0).count() > 1, "more than a segment's worth is several records");
         assert_eq!(all(&content, &log), data);
         assert_eq!(content.first(), Some(7), "found again from where it began");

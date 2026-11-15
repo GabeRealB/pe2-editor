@@ -21,10 +21,6 @@
 //! Panes moved into windows of their own open as native windows; `PE2_EDITOR_EMBED_WINDOWS=1` draws those windows
 //! inside the main one instead (and so in its screenshots).
 
-#![allow(
-    clippy::disallowed_methods,
-    reason = "what it is given and the program's own files are plain paths; a project's places are HostPaths, joined only of checked names"
-)]
 // wgpu's handles are Send through a deep chain of types: proving it for the player's renderer needs a higher limit.
 #![recursion_limit = "256"]
 
@@ -81,6 +77,10 @@ use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
 /// folder of its own, where it was prepared. Never one found on the PATH - another program's, which may make shaders
 /// Direct3D refuses, which wgpu says as a device lost - nor wgpu's own choice (`Auto`, which looks there). Where there is
 /// none, Direct3D 12 is left out, said once, and another backend serves.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 pub(crate) fn shader_compiler(setup: &mut eframe::egui_wgpu::WgpuSetupCreateNew) {
     const DXC: &str = "dxcompiler.dll";
     static SAID: std::sync::Once = std::sync::Once::new();
@@ -134,11 +134,13 @@ fn wgpu_options(x11: bool) -> WgpuConfiguration {
     config
 }
 
+#[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
 fn is_wslg() -> bool {
     std::path::Path::new("/mnt/wslg").is_dir() || std::env::var_os("WSL_DISTRO_NAME").is_some()
 }
 
 /// Whether the window is reached through X11 rather than Wayland.
+#[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
 fn talks_x11(chosen: settings::DisplayServer) -> bool {
     use settings::DisplayServer;
     let wanted = match std::env::var("PE2_EDITOR_BACKEND").as_deref() {
@@ -151,6 +153,7 @@ fn talks_x11(chosen: settings::DisplayServer) -> bool {
 
 /// The event loop: made here rather than by eframe, as it is what knows the monitors, and a window's place has to be judged by
 /// them before there is a window. On Linux it talks X11 where Wayland is unsafe (`WSLg`) or asked against; elsewhere winit chooses.
+#[allow(clippy::disallowed_methods, reason = "what the window talks to, asked of the machine as it starts")]
 fn event_loop(x11: bool) -> eframe::Result<winit::event_loop::EventLoop<eframe::UserEvent>> {
     let mut builder = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event();
     #[cfg(not(target_os = "linux"))]
@@ -225,6 +228,10 @@ pub type Result = eframe::Result;
 ///
 /// # Errors
 /// Its window could not be made.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the program's own: its arguments, place and files, read once as it starts, no project's"
+)]
 pub fn run() -> Result {
     project::profile::install();
     // A large file a layer holds as chunks is given to a program in a scoped filesystem, mounted when first needed.
